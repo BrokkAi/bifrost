@@ -44,42 +44,6 @@ pub fn record_identity_walk_inputs<'a, A: LanguageAdapter>(
 #[derive(Debug)]
 struct CandidateArenaEvidence {
     receipt: crate::analyzer::i_analyzer::QueryReadReceipt,
-    flows: Vec<(
-        crate::analyzer::semantic::ProcedureId,
-        crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
-    )>,
-}
-
-// Shares the evidence allocation already owned and charged by the arena.
-#[derive(Clone)]
-struct CandidateArenaFlows(Arc<CandidateArenaEvidence>);
-
-impl CandidateArenaFlows {
-    fn from_evidence(evidence: &Arc<dyn std::any::Any + Send + Sync>) -> Self {
-        Self(
-            Arc::clone(evidence)
-                .downcast::<CandidateArenaEvidence>()
-                .expect("candidate evidence type"),
-        )
-    }
-}
-
-impl
-    AsRef<
-        [(
-            crate::analyzer::semantic::ProcedureId,
-            crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
-        )],
-    > for CandidateArenaFlows
-{
-    fn as_ref(
-        &self,
-    ) -> &[(
-        crate::analyzer::semantic::ProcedureId,
-        crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
-    )] {
-        &self.0.flows
-    }
 }
 
 use super::source_admission::{AdmissionStop, SourceAdmissionPolicy, SourceAdmissionRefusal};
@@ -5262,6 +5226,14 @@ pub struct TreeSitterAnalyzer<A> {
         ProcedureFactCacheKey,
         SharedAllocation<Accounted<crate::analyzer::LoopCandidates>>,
     >,
+    /// Partial flows of guarded candidate-macro alternates, solved when a query
+    /// first selects one (#10379). The key is the candidate arena's
+    /// materialization id, which covers every alternate's IR, so an entry is a
+    /// pure function of file content and survives overlays.
+    candidate_alternate_flows_by_procedure: BudgetedValueCache<
+        ProcedureFactCacheKey,
+        SharedAllocation<Accounted<crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>>,
+    >,
     statement_assessments_by_procedure: BudgetedValueCache<
         ProcedureFactCacheKey,
         SharedAllocation<
@@ -5426,6 +5398,9 @@ impl<A: LanguageAdapter> Clone for TreeSitterAnalyzer<A> {
             content_identity_base: self.content_identity_base,
             semantic_cache: self.semantic_cache.clone(),
             loop_candidates_by_procedure: self.loop_candidates_by_procedure.clone(),
+            candidate_alternate_flows_by_procedure: self
+                .candidate_alternate_flows_by_procedure
+                .clone(),
             statement_assessments_by_procedure: self.statement_assessments_by_procedure.clone(),
             semantic_source_digests: self.semantic_source_digests.clone(),
             overlay_variants: self.overlay_variants.clone(),
@@ -6472,6 +6447,55 @@ where
         Ok(present.unwrap_or(false))
     }
 
+    /// The partial flows of a selected candidate alternate. The publication
+    /// does not store them; the first query that selects the alternate solves
+    /// them with the parse-time solver, and later selections reuse the result
+    /// within the retention budget (#10379). The solve reads only the
+    /// alternate's file, so it records no reads. `None` means cancelled.
+    fn candidate_alternate_flows(
+        &self,
+        alternate: &crate::analyzer::semantic::ProcedureHandle,
+        syntax: &PreparedSyntaxTree,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<crate::analyzer::semantic::partial_flow::ProcedurePartialFlows> {
+        use crate::analyzer::semantic::partial_flow::ProcedurePartialFlows;
+        let key = ProcedureFactCacheKey(alternate.artifact().materialization_id(), alternate.id());
+        let (acquisition, _) = self
+            .candidate_alternate_flows_by_procedure
+            .acquire(&key, cancellation);
+        let permit = match acquisition {
+            BudgetedValueAcquisition::Cached { value } => {
+                return Some(ProcedurePartialFlows::clone(value.arc()));
+            }
+            BudgetedValueAcquisition::Leader { permit } => Some(permit),
+            BudgetedValueAcquisition::Rejected => None,
+            BudgetedValueAcquisition::Cancelled => return None,
+        };
+        let Some(flows) =
+            crate::analyzer::semantic::partial_flow::fixpoint::candidate_alternate_partial_flows(
+                alternate,
+                syntax,
+                cancellation,
+            )
+        else {
+            if let Some(permit) = permit {
+                permit.publish_rejected();
+            }
+            return None;
+        };
+        if let Some(permit) = permit {
+            let bytes = flows.retained_bytes();
+            permit.publish_complete(SharedAllocation::new(Arc::new(
+                Accounted::charged_with_bytes(
+                    self.store_context.store.retention_budget(),
+                    flows.clone(),
+                    bytes,
+                ),
+            )));
+        }
+        Some(flows)
+    }
+
     fn prepared_candidate_arena(
         &self,
         analyzer: &dyn crate::analyzer::IAnalyzer,
@@ -6480,7 +6504,7 @@ where
         request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
     ) -> Result<
         crate::analyzer::semantic::SemanticOutcome<
-            Option<crate::analyzer::semantic::StoredCandidateMacroArtifact<CandidateArenaFlows>>,
+            Option<crate::analyzer::semantic::StoredCandidateMacroArtifact>,
         >,
         crate::analyzer::semantic::SemanticProviderError,
     > {
@@ -6514,22 +6538,9 @@ where
                         let mut artifact = Arc::try_unwrap(prepared.artifact)
                             .expect("unpublished candidate arena");
                         let bytes = std::mem::size_of::<CandidateArenaEvidence>()
-                            + receipt.retained_bytes()
-                            + prepared.flows.capacity()
-                                * std::mem::size_of::<(
-                                    crate::analyzer::semantic::ProcedureId,
-                                    crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
-                                )>()
-                            + prepared
-                                .flows
-                                .iter()
-                                .map(|(_, flows)| flows.retained_bytes())
-                                .sum::<usize>();
+                            + receipt.retained_bytes();
                         artifact.attach_candidate_evidence(
-                            Arc::new(CandidateArenaEvidence {
-                                receipt,
-                                flows: prepared.flows,
-                            }),
+                            Arc::new(CandidateArenaEvidence { receipt }),
                             bytes,
                         );
                         artifact.charge_guarded_arena(self.analyzer_store().retention_budget());
@@ -6557,13 +6568,15 @@ where
         let Some(artifact) = arena else {
             return Ok(stopped.expect("candidate fill outcome"));
         };
-        let flows = CandidateArenaFlows::from_evidence(
+        Arc::clone(
             artifact
                 .candidate_evidence()
                 .expect("candidate fill evidence"),
-        );
-        let evidence = &flows.0;
-        evidence.receipt.replay(analyzer);
+        )
+        .downcast::<CandidateArenaEvidence>()
+        .expect("candidate evidence type")
+        .receipt
+        .replay(analyzer);
         if let Err(exceeded) = request.budget.charge_complete_artifact(&artifact) {
             return Ok(SemanticOutcome::ExceededBudget {
                 partial: None,
@@ -6572,10 +6585,7 @@ where
             });
         }
         Ok(SemanticOutcome::Complete {
-            value: Some(crate::analyzer::semantic::StoredCandidateMacroArtifact {
-                artifact,
-                flows,
-            }),
+            value: Some(crate::analyzer::semantic::StoredCandidateMacroArtifact { artifact }),
             work: Default::default(),
         })
     }
@@ -6812,10 +6822,12 @@ where
                 "selected procedure syntax is unavailable".to_owned(),
             )
         })?;
+        let cancellation = request.cancellation;
         let outcome = crate::analyzer::semantic::service::procedure_semantics_and_partial_flows(
             &guarded,
             base,
             base_flows.as_ref(),
+            |alternate| self.candidate_alternate_flows(alternate, &syntax, cancellation),
             crate::analyzer::languages::CandidateMacroAdmissionRequest {
                 analyzer,
                 token,
@@ -7542,6 +7554,12 @@ where
                     .store
                     .retention_budget()
                     .region("analysis.loop_candidates_by_procedure", None),
+            ),
+            candidate_alternate_flows_by_procedure: BudgetedValueCache::new(
+                store_context
+                    .store
+                    .retention_budget()
+                    .region("analysis.candidate_alternate_flows_by_procedure", None),
             ),
             statement_assessments_by_procedure: BudgetedValueCache::new(
                 store_context
@@ -26298,59 +26316,6 @@ mod declaration_candidate_tests;
 
 #[cfg(test)]
 mod build_state_tests;
-
-#[cfg(test)]
-mod candidate_flow_sharing_tests {
-    use super::*;
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "#10972: review: handle selection deep-copied every procedure's flows"
-    )]
-    fn candidate_handle_preparation_shares_stored_flow_collection() {
-        use crate::analyzer::semantic::{
-            ProcedureId,
-            partial_flow::{PartialFlowOutcome, ProcedurePartialFlows},
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let project =
-            Arc::new(crate::analyzer::FilesystemProject::new(temp.path().to_path_buf()).unwrap());
-        let analyzer = crate::analyzer::workspace::EmptyAnalyzer::new(project);
-        let (_, receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(&analyzer, || ());
-        let evidence = Arc::new(CandidateArenaEvidence {
-            receipt,
-            flows: (0..3)
-                .map(|id| {
-                    (
-                        ProcedureId::new(id),
-                        ProcedurePartialFlows::new(
-                            PartialFlowOutcome::Complete,
-                            Some(format!("procedure {id}")),
-                            vec![],
-                            vec![],
-                            false,
-                            true,
-                            vec![],
-                        ),
-                    )
-                })
-                .collect(),
-        });
-        let erased: Arc<dyn std::any::Any + Send + Sync> = evidence.clone();
-        for _ in 0..3 {
-            let shared = CandidateArenaFlows::from_evidence(&erased);
-            assert_eq!(Arc::strong_count(&evidence), 3);
-            assert!(std::ptr::eq(shared.as_ref(), evidence.flows.as_slice()));
-            for (stored, selected) in evidence.flows.iter().zip(shared.as_ref()) {
-                assert_eq!(
-                    stored.1.detail.as_ref().unwrap().as_ptr(),
-                    selected.1.detail.as_ref().unwrap().as_ptr()
-                );
-            }
-        }
-        assert_eq!(Arc::strong_count(&evidence), 2);
-    }
-}
 
 #[cfg(test)]
 mod produced_unseen_branch_index_tests {

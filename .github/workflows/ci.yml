@@ -13,7 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     # A cold runner needs compilation, all workspace libraries, and doctests.
     # Keep that coverage independent of whether a dependency cache is available.
-    timeout-minutes: 90
+    # Public runs 41958451237 and 43023447328 took 79-81 minutes. The v0.15.3
+    # projection's run 43968766724 was cancelled at 90 minutes twice: attempt 1
+    # compiled for 34 minutes and passed 13345 of 13763 lib tests; attempt 2
+    # compiled for 56 minutes on a cold cache and passed 6868. A cold compile
+    # plus the full test run needs about 115 minutes.
+    timeout-minutes: 150
     # One compiler job. The brokk-bifrost-analysis lib and its lib-test
     # harness each peak near 12 GB (max RSS 12.1-12.2 GB in public runs
     # 39188363767 and 39216334491) on a 16 GiB runner. On a cold cache the

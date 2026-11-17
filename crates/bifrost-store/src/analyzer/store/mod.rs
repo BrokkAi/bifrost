@@ -14184,21 +14184,14 @@ pub fn prepare_parse_time_semantic_ir(
         }
         None => None,
     };
-    let candidate_flows = if let Some((artifact, _)) = &lowered {
-        match crate::analyzer::semantic::partial_flow::fixpoint::candidate_macro_partial_flows_with_limits(
-            artifact, prepared, cancellation, Default::default(),
-        ) {
-            Some(flows) => flows,
-            None => return Ok(None),
-        }
-    } else {
-        Vec::new()
-    };
+    // Guarded candidate-macro alternates publish their IR without partial
+    // flows. Solving them here doubled the producer's flow cost for every
+    // procedure with a candidate macro; the query that selects an alternate
+    // solves its flows instead (#10379).
     let _encode = crate::profiling::scope("semantic_ir.encode");
-    let rows = PreparedSemanticIr::prepare_with_candidate_flows(
+    let rows = PreparedSemanticIr::prepare(
         outcome,
         lowered.as_ref().map(|(_, flows)| flows.as_slice()),
-        &candidate_flows,
         &producer_epoch,
         content,
         prepared.source().len(),

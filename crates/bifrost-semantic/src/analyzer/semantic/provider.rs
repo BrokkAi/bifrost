@@ -3617,11 +3617,11 @@ pub trait ProgramSemanticsProvider: Send + Sync {
     }
 }
 
-/// Query-owned guarded artifact and the stored flows paired with each alternate.
-/// This is preparation only: ordinary artifact handles still select the base.
-pub struct StoredCandidateMacroArtifact<F = Vec<(ProcedureId, ProcedurePartialFlows)>> {
+/// Query-owned guarded artifact. This is preparation only: ordinary artifact
+/// handles still select the base. An alternate's partial flows are not stored;
+/// the query that selects it solves them (#10379).
+pub struct StoredCandidateMacroArtifact {
     pub artifact: Arc<SemanticArtifact>,
-    pub flows: F,
 }
 
 /// A [`ProgramSemanticsProvider`] for languages whose lowering is not

@@ -88,30 +88,13 @@ pub struct PreparedSemanticIr {
 impl PreparedSemanticIr {
     /// `partial_flows` holds one entry per procedure of a complete outcome.
     /// Its rows are encoded in the same pass as the IR, because the flows name
-    /// locators and texts that the IR's own interning assigns.
+    /// locators and texts that the IR's own interning assigns. Guarded
+    /// candidate-macro alternates store their IR only; a query that selects one
+    /// solves its partial flows (#10379).
     #[doc(hidden)]
     pub fn prepare(
         outcome: SemanticIrLoweringOutcome,
         partial_flows: Option<&[ProcedurePartialFlows]>,
-        producer_epoch: &str,
-        content: ContentIdentity,
-        source_bytes: usize,
-    ) -> Self {
-        Self::prepare_with_candidate_flows(
-            outcome,
-            partial_flows,
-            &[],
-            producer_epoch,
-            content,
-            source_bytes,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn prepare_with_candidate_flows(
-        outcome: SemanticIrLoweringOutcome,
-        partial_flows: Option<&[ProcedurePartialFlows]>,
-        candidate_flows: &[crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows],
         producer_epoch: &str,
         content: ContentIdentity,
         source_bytes: usize,
@@ -155,8 +138,7 @@ impl PreparedSemanticIr {
                     }
                 }
                 procedure_count = parts.len();
-                (candidate_rows, candidates) =
-                    encode::encode_candidates(&parts, candidate_flows, content);
+                (candidate_rows, candidates) = encode::encode_candidates(&parts, content);
                 let encoded = encode::encode(&parts, partial_flows, content);
                 go_predeclared_builtins = encoded.go_predeclared_builtins;
                 rows = encoded.rows;

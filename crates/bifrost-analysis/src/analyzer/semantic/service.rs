@@ -1175,18 +1175,15 @@ pub(crate) fn stored_candidate_macro_artifact<A: LanguageAdapter>(
         key,
         capabilities,
         |guarded, source_bytes| {
-            let mut work = SemanticWork {
+            let work = SemanticWork {
                 source_bytes,
                 ..Default::default()
             };
-            let mut flows = Vec::with_capacity(guarded.len());
-            let mut alternates = Vec::with_capacity(guarded.len());
-            for guarded in guarded {
-                work = work.saturating_add(guarded.flows.semantic_work());
-                flows.push((guarded.parts.id, guarded.flows));
-                alternates.push((guarded.parts, guarded.candidates.into_boxed_slice()));
-            }
-            (flows, alternates, work)
+            let alternates = guarded
+                .into_iter()
+                .map(|guarded| (guarded.parts, guarded.candidates.into_boxed_slice()))
+                .collect();
+            (alternates, work)
         },
         request,
     )
@@ -1201,7 +1198,6 @@ fn stored_candidate_macro_with_projection<A: LanguageAdapter>(
         Vec<crate::analyzer::store::semantic_ir::GuardedProcedure>,
         usize,
     ) -> (
-        Vec<(ProcedureId, ProcedurePartialFlows)>,
         Vec<(
             ProcedureSemanticsParts,
             Box<[crate::analyzer::semantic::CandidateRecord]>,
@@ -1271,7 +1267,7 @@ fn stored_candidate_macro_with_projection<A: LanguageAdapter>(
     let StoredSemanticIrPublicationHead::Present { source_bytes, .. } = observation.head else {
         unreachable!()
     };
-    let (flows, alternates, read_work) = project(guarded, source_bytes);
+    let (alternates, read_work) = project(guarded, source_bytes);
     if let Err(exceeded) = request.budget.admit_artifact_rows(read_work) {
         return Ok(SemanticOutcome::ExceededBudget {
             partial: None,
@@ -1322,7 +1318,7 @@ fn stored_candidate_macro_with_projection<A: LanguageAdapter>(
     request.budget.track_resident_artifact(&artifact);
     Ok(SemanticOutcome::Complete {
         work,
-        value: Some(crate::analyzer::semantic::StoredCandidateMacroArtifact { artifact, flows }),
+        value: Some(crate::analyzer::semantic::StoredCandidateMacroArtifact { artifact }),
     })
 }
 
@@ -2354,12 +2350,13 @@ fn acquire_owned_procedure(
 
 /// Select a whole guarded procedure using the registered language's admission proof.
 /// Callers retain the ordered answers and receipts with the selected IR/flow pair.
+/// `alternate_flows` solves (or recalls) the partial flows of the alternate
+/// when the admission selects it; it is not called for the base side.
 pub fn procedure_semantics_and_partial_flows(
-    prepared: &crate::analyzer::semantic::StoredCandidateMacroArtifact<
-        impl AsRef<[(ProcedureId, ProcedurePartialFlows)]>,
-    >,
+    prepared: &crate::analyzer::semantic::StoredCandidateMacroArtifact,
     base: &ProcedureHandle,
     base_flows: Option<&ProcedurePartialFlows>,
+    alternate_flows: impl FnOnce(&ProcedureHandle) -> Option<ProcedurePartialFlows>,
     context: crate::analyzer::languages::CandidateMacroAdmissionRequest<'_>,
     request: &mut SemanticRequest<'_>,
 ) -> Result<
@@ -2395,6 +2392,7 @@ pub fn procedure_semantics_and_partial_flows(
         prepared,
         base,
         base_flows,
+        alternate_flows,
         |_, _| match side {
             CandidateProcedureSide::Alternate => CandidateProcedureSelection::Alternate(answers),
             CandidateProcedureSide::Base => CandidateProcedureSelection::Base(answers),
@@ -2509,9 +2507,7 @@ type CandidateAdmission = Result<
 >;
 
 fn candidate_macro_admission(
-    prepared: &crate::analyzer::semantic::StoredCandidateMacroArtifact<
-        impl AsRef<[(ProcedureId, ProcedurePartialFlows)]>,
-    >,
+    prepared: &crate::analyzer::semantic::StoredCandidateMacroArtifact,
     base: &ProcedureHandle,
     context: &crate::analyzer::languages::CandidateMacroAdmissionRequest<'_>,
 ) -> (
@@ -2653,9 +2649,7 @@ pub(crate) struct QuerySelectedProcedure {
 }
 
 pub(crate) fn candidate_procedure_decision(
-    prepared: &crate::analyzer::semantic::StoredCandidateMacroArtifact<
-        impl AsRef<[(ProcedureId, ProcedurePartialFlows)]>,
-    >,
+    prepared: &crate::analyzer::semantic::StoredCandidateMacroArtifact,
     base: &ProcedureHandle,
     context: crate::analyzer::languages::CandidateMacroAdmissionRequest<'_>,
     request: &mut SemanticRequest<'_>,

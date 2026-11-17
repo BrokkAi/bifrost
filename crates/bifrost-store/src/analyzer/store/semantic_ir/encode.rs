@@ -165,7 +165,6 @@ pub(super) fn encode<'a>(
 /// Encode only candidate-bearing procedures using the shared typed codec.
 pub(super) fn encode_candidates(
     parts: &[ProcedureSemanticsParts],
-    flows: &[crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows],
     content: ContentIdentity,
 ) -> (
     EncodedRows,
@@ -187,13 +186,6 @@ pub(super) fn encode_candidates(
         if let Some((alternate, records)) = procedure.candidate_macro_alternate_parts() {
             encoder.procedure(alternate);
             candidates.extend(records.iter().map(|record| (alternate.id.get(), *record)));
-            if !flows.is_empty() {
-                let paired = flows
-                    .iter()
-                    .find(|flow| flow.procedure.id() == alternate.id)
-                    .expect("every alternate has paired flows");
-                encoder.partial_flows(alternate.id.get(), &paired.partial, &alternate.gaps);
-            }
         }
     }
     (encoder.rows, candidates)

@@ -3517,7 +3517,8 @@ fn call_control_coverage_reader_requires_complete_scoped_publication() {
 }
 
 /// Exercise the shared typed decoder with a sparse guarded procedure ID and
-/// populated child/flow rows, retaining references to ordinary procedures.
+/// populated child rows, retaining references to ordinary procedures. Guarded
+/// alternates store no partial flows (#10379), so none are copied.
 #[test]
 fn guarded_semantic_ir_sparse_typed_rows_round_trip() {
     use row_fixture::{fixture, insert, prepare};
@@ -3549,10 +3550,15 @@ fn guarded_semantic_ir_sparse_typed_rows_round_trip() {
         .remove(0);
     expected.id = crate::analyzer::semantic::ProcedureId::new(7);
     expected.go_predeclared_builtin_assumptions.clear();
-    let expected_flows = super::decode::read_partial_flows(&conn, blob_id, &fixture.scope, 0)
-        .unwrap()
-        .unwrap();
     for &table in super::Table::ALL {
+        if matches!(
+            table,
+            super::Table::PartialPorts
+                | super::Table::PartialFlows
+                | super::Table::PartialFlowHeads
+        ) {
+            continue;
+        }
         let spec = table.spec();
         let target = table.candidate_spec();
         let columns = spec.columns.join(", ");
@@ -3585,10 +3591,6 @@ fn guarded_semantic_ir_sparse_typed_rows_round_trip() {
     assert_eq!(decoded.len(), 1);
     let decoded = decoded.remove(0);
     assert_eq!(format!("{:?}", expected), format!("{:?}", decoded.parts));
-    assert_eq!(
-        format!("{:?}", expected_flows),
-        format!("{:?}", decoded.flows)
-    );
     assert_eq!(decoded.candidates, vec![record]);
     for table in ["semantic_ir_gaps", "candidate_macro_semantic_ir_gaps"] {
         let count: i64 = conn
@@ -3870,12 +3872,11 @@ fn candidate_macro_rows_cascade_with_publication_deletion() {
     let record =
         crate::analyzer::semantic::CandidateRecord::same_call(&alternate, CallSiteId::new(0));
     fixture.parts[0].attach_candidate_macro_alternate(alternate, vec![record].into_boxed_slice());
-    let prepared = super::PreparedSemanticIr::prepare_with_candidate_flows(
+    let prepared = super::PreparedSemanticIr::prepare(
         SemanticIrLoweringOutcome::Complete {
             parts: fixture.parts,
         },
         Some(&fixture.flows),
-        &[],
         EPOCH,
         fixture.scope.content,
         row_fixture::SOURCE_BYTES,

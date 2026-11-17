@@ -3973,6 +3973,27 @@ pub fn candidate_macro_partial_flows_with_limits(
     )
 }
 
+/// The partial flows of one guarded candidate-macro alternate. They are not
+/// stored with the publication: a query that selects the alternate solves
+/// them on first use, with the same file-local host, limits and budgets as the
+/// parse-time producer's base flows, so they equal what an eager solve
+/// returns (#10379). `None` means the request was cancelled.
+pub fn candidate_alternate_partial_flows(
+    alternate: &crate::analyzer::semantic::ir::ProcedureHandle,
+    syntax: &PreparedSyntaxTree,
+    cancellation: &CancellationToken,
+) -> Option<ProcedurePartialFlows> {
+    assert!(alternate.is_candidate_alternate());
+    let mut flows = solve_parse_time_handles(
+        std::iter::once(alternate.clone()),
+        syntax,
+        cancellation,
+        OracleLimits::default(),
+    )?;
+    assert_eq!(flows.len(), 1);
+    flows.pop()
+}
+
 fn solve_parse_time_handles(
     handles: impl Iterator<Item = crate::analyzer::semantic::ir::ProcedureHandle>,
     syntax: &PreparedSyntaxTree,

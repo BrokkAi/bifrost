@@ -1973,17 +1973,15 @@ pub fn reseal_selected_candidate(
 
 /// The sole query-time mint for executable guarded procedure handles.
 /// The callback owns admission policy; this owner keeps semantics and flows paired.
+/// `alternate_flows` supplies the selected alternate's partial flows, which
+/// are solved on demand rather than stored; it returns `None` when cancelled.
 pub fn select_candidate_procedure<T>(
-    prepared: &super::StoredCandidateMacroArtifact<
-        impl AsRef<
-            [(
-                super::ProcedureId,
-                super::partial_flow::ProcedurePartialFlows,
-            )],
-        >,
-    >,
+    prepared: &super::StoredCandidateMacroArtifact,
     base: &super::ProcedureHandle,
     base_flows: Option<&super::partial_flow::ProcedurePartialFlows>,
+    alternate_flows: impl FnOnce(
+        &super::ProcedureHandle,
+    ) -> Option<super::partial_flow::ProcedurePartialFlows>,
     select: impl FnOnce(
         &super::ProcedureSemantics,
         &[super::CandidateRecord],
@@ -2024,25 +2022,23 @@ pub fn select_candidate_procedure<T>(
         side = CandidateProcedureSide::Base;
     }
     let (handle, stored) = match side {
-        CandidateProcedureSide::Base => (base.base_interpretation(), base_flows),
-        CandidateProcedureSide::Alternate => (
-            prepared
+        CandidateProcedureSide::Base => (base.base_interpretation(), base_flows.cloned()),
+        CandidateProcedureSide::Alternate => {
+            let handle = prepared
                 .artifact
                 .candidate_alternate_handle(base.id())
-                .expect("validated alternate"),
-            prepared
-                .flows
-                .as_ref()
-                .iter()
-                .find(|(id, _)| *id == base.id())
-                .map(|(_, flows)| flows),
-        ),
+                .expect("validated alternate");
+            let Some(flows) = alternate_flows(&handle) else {
+                return Ok(CandidateProcedureOutcome::Cancelled);
+            };
+            (handle, Some(flows))
+        }
     };
     let flows = if let Some(stored) = stored {
         if let Err(exceeded) = request.budget.admit(stored.semantic_work()) {
             return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
         }
-        stored.clone()
+        stored
     } else {
         let projected =
             file_local_procedure_relations(&handle, &super::OracleCallContext::empty(), request);

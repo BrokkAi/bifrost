@@ -499,12 +499,12 @@ pub(super) fn read_and_decode(
     Ok(Some(parts))
 }
 
-/// Paired guarded publication. No production reader is enabled before M4.
+/// One guarded alternate and its candidate records. Its partial flows are not
+/// stored; the query that selects the alternate solves them (#10379).
 #[doc(hidden)]
 pub struct GuardedProcedure {
     pub parts: ProcedureSemanticsParts,
     pub candidates: Vec<crate::analyzer::semantic::CandidateRecord>,
-    pub flows: ProcedurePartialFlows,
 }
 
 /// The sole guarded-row decoder. Procedure IDs retain their original sparse
@@ -527,7 +527,7 @@ pub(super) fn read_guarded(
     let mut decoder = Decoder::new(blob_id, scope);
     decoder.table_spec = Table::candidate_spec;
     decoder.read(tx)?;
-    let mut pairs = Vec::new();
+    let mut records = Vec::new();
     for parts in &decoder.parts {
         let procedure = parts.id.get();
         let candidates = tx.prepare_cached(
@@ -553,24 +553,13 @@ pub(super) fn read_guarded(
             !candidates.is_empty(),
             "guarded procedure has no candidates"
         );
-        let head = tx.prepare_cached(&format!(
-            "SELECT outcome, detail, open, relations_complete, port_count, flow_count, json(discharged_gaps) FROM {} WHERE blob_id = ?1 AND procedure = ?2",
-            Table::PartialFlowHeads.candidate_spec().name,
-        ))?.query_row(rusqlite::params![blob_id, procedure], |row| partial_flow_head(row, 0))?;
-        pairs.push((
-            candidates,
-            decode_partial_flows(tx, &decoder, procedure, head)?,
-        ));
+        records.push(candidates);
     }
     Ok(decoder
         .finish()
         .into_iter()
-        .zip(pairs)
-        .map(|(parts, (candidates, flows))| GuardedProcedure {
-            parts,
-            candidates,
-            flows,
-        })
+        .zip(records)
+        .map(|(parts, candidates)| GuardedProcedure { parts, candidates })
         .collect())
 }
 

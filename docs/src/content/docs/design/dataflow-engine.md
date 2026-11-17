@@ -679,11 +679,17 @@ interior run can seed one explicitly.
 
 For a non-standard-library macro whose syntax resembles a supported built-in,
 the base procedure stays opaque until the selected workspace proves the macro's
-identity. Its exact alternate events and matching partial flows are stored
-separately from the base rows. A query selects that alternate only when every
-candidate macro in the procedure is admitted; otherwise it uses the complete
-opaque base procedure and its matching flows. Admission reads are retained with
-the query-local selection and replayed when that selection is reused.
+identity. Its exact alternate events are stored separately from the base rows.
+A query selects that alternate only when every candidate macro in the
+procedure is admitted; otherwise it uses the complete opaque base procedure and
+its matching flows. Admission reads are retained with the query-local
+selection and replayed when that selection is reused. The alternate's partial
+flows are not stored. Most queries never select an alternate, so solving its
+flows when the file is published would roughly double the publication's flow
+cost for no answer. The first query that selects an alternate solves its flows
+with the same file-local fixpoint and limits as the stored base flows, so the
+result is the one an eager solve would store, and keeps it within the memory
+budget, keyed by the materialization of the alternate's artifact.
 
 A file-local fixpoint computes the partial flows. Its result must equal the
 solver's own propagation inside one procedure, and a differential test over the

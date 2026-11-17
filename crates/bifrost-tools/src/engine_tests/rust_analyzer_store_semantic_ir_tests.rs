@@ -150,6 +150,9 @@ fn emit(mut target: u32, value: u32) {
         key: crate::analyzer::store::BlobKey,
         scope: SemanticIrMountScope,
         artifact: Arc<SemanticArtifact>,
+        syntax: PreparedSyntaxTree,
+        /// The alternates' flows solved eagerly on the lowered artifact, the
+        /// oracle that flows solved on demand must equal (#10379).
         candidate_flows:
             Vec<crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows>,
     }
@@ -198,10 +201,9 @@ fn emit(mut target: u32, value: u32) {
         .expect("candidate flows solve");
         assert!(!candidate_flows.is_empty(), "fixture has candidate macros");
         let epoch = semantic_ir_producer_epoch(&RustSemanticLowerer.identity());
-        let rows = PreparedSemanticIr::prepare_with_candidate_flows(
+        let rows = PreparedSemanticIr::prepare(
             SemanticIrLoweringOutcome::Complete { parts },
             Some(&flows),
-            &candidate_flows,
             &epoch,
             content,
             source.len(),
@@ -245,8 +247,25 @@ fn emit(mut target: u32, value: u32) {
             blob_id,
             scope,
             artifact,
+            syntax: prepared,
             candidate_flows,
         }
+    }
+
+    /// Solve one decoded alternate's flows on demand, as a selecting query does.
+    fn lazy_alternate_flows(
+        publication: &CandidatePublication,
+        artifact: &Arc<SemanticArtifact>,
+        procedure: crate::analyzer::semantic::ProcedureId,
+    ) -> ProcedurePartialFlows {
+        crate::analyzer::semantic::partial_flow::fixpoint::candidate_alternate_partial_flows(
+            &artifact
+                .candidate_alternate_handle(procedure)
+                .expect("decoded alternate"),
+            &publication.syntax,
+            &CancellationToken::default(),
+        )
+        .expect("alternate flows solve")
     }
 
     fn artifact_with_guarded_parts(
@@ -1742,14 +1761,9 @@ fn emit(mut target: u32, value: u32) {
                     .unwrap(),
                 );
                 let id = guarded[0].parts.id;
-                let prepared: crate::analyzer::semantic::StoredCandidateMacroArtifact =
-                    crate::analyzer::semantic::StoredCandidateMacroArtifact {
-                        artifact: artifact.clone(),
-                        flows: guarded
-                            .into_iter()
-                            .map(|row| (row.parts.id, row.flows))
-                            .collect(),
-                    };
+                let prepared = crate::analyzer::semantic::StoredCandidateMacroArtifact {
+                    artifact: artifact.clone(),
+                };
                 if let Some(head) = &prior_head {
                     assert_eq!(head, artifact.key());
                 }
@@ -1789,17 +1803,19 @@ fn emit(mut target: u32, value: u32) {
                         candidate_macro_overlay_receipt().is_none(),
                         "new query cannot reuse prior entries"
                     );
-                    let missing = crate::analyzer::semantic::StoredCandidateMacroArtifact {
-                        artifact: artifact.clone(),
-                        flows: Vec::new(),
+                    let solve = |alternate: &crate::analyzer::semantic::ProcedureHandle| {
+                        crate::analyzer::semantic::partial_flow::fixpoint::candidate_alternate_partial_flows(
+                            alternate, &syntax, &live,
+                        )
                     };
                     let mut limits = SemanticBudget::default().limits();
                     limits.nested_entries = 1;
                     let mut tight = SemanticBudget::new(limits).unwrap();
                     let stopped = procedure_semantics_and_partial_flows(
-                        &missing,
+                        &prepared,
                         &base,
                         None,
+                        solve,
                         CandidateMacroAdmissionRequest {
                             analyzer: workspace.analyzer(),
                             token: scope.token(),
@@ -1905,6 +1921,7 @@ fn emit(mut target: u32, value: u32) {
                                         &prepared,
                                         &base,
                                         Some(&base_flows[id.index()]),
+                                        solve,
                                         CandidateMacroAdmissionRequest {
                                             analyzer: workspace.analyzer(),
                                             token: scope.token(),
@@ -2232,7 +2249,9 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                 .1
                 .unwrap();
             // The caller is the last guarded procedure in source order.
-            let flows = &guarded.last().expect("caller alternate").flows;
+            let caller = guarded.last().expect("caller alternate").parts.id;
+            let reconstructed = Arc::new(artifact_with_guarded_parts(&publication, &guarded));
+            let flows = &lazy_alternate_flows(&publication, &reconstructed, caller);
             assert_eq!(flows.outcome, PartialFlowOutcome::Complete);
             if let Some(previous) = &caller_flows {
                 assert_eq!(
@@ -2554,12 +2573,8 @@ fn emit(target: &mut Target, value: u32) -> u32 {
             .unwrap(),
         );
         let id = guarded[0].parts.id;
-        let prepared: StoredCandidateMacroArtifact = StoredCandidateMacroArtifact {
+        let prepared = StoredCandidateMacroArtifact {
             artifact: artifact.clone(),
-            flows: guarded
-                .into_iter()
-                .map(|row| (row.parts.id, row.flows))
-                .collect(),
         };
         let base = artifact.procedure_handle(id).unwrap();
         let file = ProjectFile::new(
@@ -2570,12 +2585,24 @@ fn emit(target: &mut Target, value: u32) -> u32 {
         let live = CancellationToken::default();
         let base_flows = parse_time_partial_flows(&artifact, &syntax, &live).unwrap();
         let expected_base = &base_flows[id.index()];
+        let expected_alternate = &publication
+            .candidate_flows
+            .iter()
+            .find(|flows| flows.procedure.id() == id)
+            .expect("eager alternate flows")
+            .partial;
+        let solve = |alternate: &crate::analyzer::semantic::ProcedureHandle| {
+            crate::analyzer::semantic::partial_flow::fixpoint::candidate_alternate_partial_flows(
+                alternate, &syntax, &live,
+            )
+        };
         for admitted in [vec![true, true], vec![false, false], vec![true, false]] {
             let mut budget = SemanticBudget::default();
             let outcome = select_candidate_procedure(
                 &prepared,
                 &base,
                 Some(expected_base),
+                solve,
                 |_, ids| {
                     assert_eq!(ids.len(), admitted.len());
                     if admitted.iter().all(|answer| *answer) {
@@ -2613,7 +2640,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                         .flat_map(|point| &point.events)
                         .any(|event| matches!(event.effect, SemanticEffect::Assignment { .. }))
                 );
-                assert_eq!(selected.flows, prepared.flows[0].1);
+                assert_eq!(selected.flows, *expected_alternate);
                 assert!(selected.flows.ports.len() > expected_base.ports.len());
                 assert!(selected.flows.ports.iter().any(|port| matches!(
                     port,
@@ -2644,6 +2671,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                 &prepared,
                 &base,
                 None,
+                solve,
                 |_, _| CandidateProcedureSelection::Alternate(()),
                 &mut SemanticRequest::new(&mut budget, &cancelled)
             )
@@ -2656,6 +2684,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                 &prepared,
                 &base,
                 None,
+                solve,
                 |_, _| CandidateProcedureSelection::Alternate(()),
                 &mut SemanticRequest::new(&mut tiny, &live)
             )
@@ -2668,6 +2697,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
             &prepared,
             &base,
             None,
+            solve,
             |_, _| CandidateProcedureSelection::Base(()),
             &mut SemanticRequest::new(&mut budget, &live),
         )
@@ -2676,22 +2706,6 @@ fn emit(target: &mut Target, value: u32) -> u32 {
         };
         assert_eq!(recomputed.flows, *expected_base);
 
-        let missing = StoredCandidateMacroArtifact {
-            artifact: artifact.clone(),
-            flows: Vec::new(),
-        };
-        let mut budget = SemanticBudget::default();
-        let CandidateProcedureOutcome::Selected(recomputed) = select_candidate_procedure(
-            &missing,
-            &base,
-            None,
-            |_, _| CandidateProcedureSelection::Alternate(()),
-            &mut SemanticRequest::new(&mut budget, &live),
-        )
-        .unwrap() else {
-            panic!("alternate fallback stopped");
-        };
-        assert_eq!(recomputed.flows, prepared.flows[0].1);
         let during_admission = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         assert!(matches!(
@@ -2699,6 +2713,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                 &prepared,
                 &base,
                 Some(expected_base),
+                solve,
                 |_, _| {
                     during_admission.cancel();
                     CandidateProcedureSelection::Alternate(())
@@ -2787,6 +2802,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
         )
         .expect("decoded alternates validate in their base artifact context");
         assert_eq!(attach_budget.used(), reconstructed.work());
+        let reconstructed = Arc::new(reconstructed);
         let mut refused_budget = SemanticBudget::uniform(1).unwrap();
         let before = refused_budget.used();
         let refused = SemanticArtifact::try_new_with_candidate_alternates_and_budget(
@@ -2817,7 +2833,10 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                 .candidate_macro_alternate()
                 .expect("candidate procedure has a full alternate");
             assert_eq!(&decoded.candidates, candidate_ids);
-            assert_eq!(&decoded.flows, &expected.partial);
+            // Flows solved on demand over the decoded alternate equal the
+            // flows an eager solve of the lowered artifact returns (#10379).
+            let lazy = lazy_alternate_flows(&publication, &reconstructed, decoded.parts.id);
+            assert_eq!(&lazy, &expected.partial);
             assert_eq!(
                 reconstructed
                     .procedure(decoded.parts.id)
@@ -2826,7 +2845,7 @@ fn emit(target: &mut Target, value: u32) -> u32 {
                     .unwrap(),
                 alternate.parts_materialization_id()
             );
-            assert_eq!(crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows::materialization_id_for(reconstructed.procedure(decoded.parts.id).unwrap().candidate_macro_alternate_materialization_id().unwrap(), decoded.parts.id, &decoded.flows), expected.materialization_id());
+            assert_eq!(crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows::materialization_id_for(reconstructed.procedure(decoded.parts.id).unwrap().candidate_macro_alternate_materialization_id().unwrap(), decoded.parts.id, &lazy), expected.materialization_id());
             assert_eq!(
                 publication
                     .artifact
