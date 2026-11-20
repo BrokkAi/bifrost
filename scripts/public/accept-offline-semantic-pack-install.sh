@@ -237,15 +237,23 @@ for (const label of ["missing", "corrupt", "incompatible"]) {
   }
 }
 
-// Without JAVA_HOME the run is Bifrost's own inconclusive verdict, which is
-// advisory and exits 0. An unreadable or too-new catalog is an error-severity
-// pack-activation-failed diagnostic, which still exits 2.
+// Without JAVA_HOME no JDK pack binds Runtime.exec or System.getenv, so both
+// flow roles are empty under incomplete discovery. No empty side is proven
+// empty, so the run fails with endpoint_role_unresolved and exits 2 instead
+// of claiming a vacuous clean result. An unreadable or too-new catalog is an
+// error-severity pack-activation-failed diagnostic, which also exits 2.
 const missingStatus = readStatus("missing");
 const missing = readJson("missing");
 const missingRun = missing.runs?.find((entry) => entry.policy_id === run.policy_id);
-if (missingStatus !== 0 || missingRun?.completion?.type !== "inconclusive") {
+const missingReasons = missingRun?.completion?.reasons ?? [];
+if (
+  missingStatus !== 2 ||
+  missingRun?.completion?.type !== "failed" ||
+  missingReasons.length !== 1 ||
+  missingReasons[0] !== "endpoint_role_unresolved"
+) {
   throw new Error(
-    `missing-JAVA_HOME acceptance was not an advisory inconclusive run: exit=${missingStatus} completion=${JSON.stringify(missingRun?.completion)}`,
+    `missing-JAVA_HOME acceptance did not fail with endpoint_role_unresolved: exit=${missingStatus} completion=${JSON.stringify(missingRun?.completion)}`,
   );
 }
 for (const label of ["corrupt", "incompatible"]) {

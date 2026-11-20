@@ -220,7 +220,11 @@ randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
 # binary builds without it on every platform.
 python = ["dep:pyo3"]
 # Benchmark and release artifact tooling. Keep it out of normal runtime builds.
-release-tooling = ["brokk-bifrost-semantic-packs/release-tooling"]
+# The summary-foundry harnesses use test retention budgets for fixture evaluation.
+release-tooling = [
+    "brokk-bifrost-semantic-packs/release-tooling",
+    "brokk-bifrost-analysis/test-support",
+]
 # Suppresses libpython linkage, which a Python extension needs (the host
 # interpreter supplies `Py*` at load time) and an executable cannot tolerate
 # (the symbols stay undefined and the link fails). Kept out of `python` so

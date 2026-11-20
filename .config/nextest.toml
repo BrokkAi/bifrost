@@ -89,16 +89,18 @@ threads-required = "num-cpus"
 # persisted open under five seconds: 1.5s scoped, panicked at 7.9s in the
 # saturated 2026-08-29 run.
 #
-# cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class holds the
-# cold, warm, and edited policy CLI runs to the five-second interactive class:
-# 0.89s / 0.83s / 0.86s scoped, but 9.3s and then 12.7s cold in two saturated
-# runs. It also bounds warm and edited against the cold run it just measured, so
-# a starved cold run corrupts the relative limit as well as the absolute one.
-#
 # light_lookup_overtakes_long_usage_scan asserts that a light request overtakes
 # an in-flight heavy scan. It is an ordering assertion rather than a duration
 # threshold, but the ordering it observes is produced by the scheduler, and on
 # an oversubscribed box the observation says nothing about the scheduler.
+#
+# The Go typestate CLI latency guard (#14735, now
+# cli_reruns_reuse_stored_work_and_one_file_edit_rederives_only_its_units) and
+# c_wide_translation_unit_indexes_in_linear_time (#14738) left this list: the
+# first asserts the work each CLI run does, the second a same-run CPU-time
+# ratio, so neither depends on host load. Prefer that shape to a reservation.
+# deeply_nested_javascript_extraction_is_linear followed (#14777) on the shared
+# CPU-ratio guard in tests/common/cpu_scaling.rs.
 #
 # The rest are absolute or relative wall-clock bounds found by sweeping the
 # suites for elapsed-time assertions, reserved as a class rather than one at a
@@ -107,17 +109,14 @@ threads-required = "num-cpus"
 # very large margins are deliberately NOT here -- load cannot plausibly flip
 # them, and reserving the machine for them would cost more than it protects.
 #
-# c_wide_translation_unit_indexes_in_linear_time    6.2s against a 5s bound.
 # large_rust_file_definition_stays_interactive      5s interactive bound.
-# deeply_nested_javascript_extraction_is_linear     60s super-linearity ceiling;
-#     a starved box can cross a guard meant to catch algorithmic blowup.
 # exact_go_source_set_produces_and_compiles_api_pack   two 5s lookup bounds.
 # explicit_file_fifo_is_rejected_without_blocking and
 # directory_entries_reject_fifo_replacement_without_blocking   1s, each racing a
 #     peer thread that sleeps 2s; scheduler starvation can spuriously delay the
 #     non-blocking open these discriminate on.
 [[profile.default.overrides]]
-filter = 'test(persisted_open_populates_a_cache_the_reopen_hydrates_from) | test(cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class) | test(light_lookup_overtakes_long_usage_scan) | test(c_wide_translation_unit_indexes_in_linear_time) | test(large_rust_file_definition_stays_interactive) | test(deeply_nested_javascript_extraction_is_linear) | test(exact_go_source_set_produces_and_compiles_api_pack) | test(explicit_file_fifo_is_rejected_without_blocking) | test(directory_entries_reject_fifo_replacement_without_blocking)'
+filter = 'test(persisted_open_populates_a_cache_the_reopen_hydrates_from) | test(light_lookup_overtakes_long_usage_scan) | test(large_rust_file_definition_stays_interactive) | test(exact_go_source_set_produces_and_compiles_api_pack) | test(explicit_file_fifo_is_rejected_without_blocking) | test(directory_entries_reject_fifo_replacement_without_blocking)'
 threads-required = "num-cpus"
 
 # activation_pins_the_release_coverage_it_bootstraps_with (#14097) synchronously
