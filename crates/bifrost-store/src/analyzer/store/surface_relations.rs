@@ -36,12 +36,15 @@ pub enum RelationSource {
     /// A structured, same-blob SELECT. Its complete SQL definition enters
     /// list_digest, so changing an edge definition invalidates older products.
     Derived(&'static str),
+    /// Same-blob construction SQL, materialized before the consumer runs.
+    /// Unlike Derived, generated accessors never evaluate its raw fact reads.
+    Materialized(&'static str),
 }
 impl RelationSource {
     fn qualified_name(self, relation_name: &str) -> String {
         match self {
             Self::Table(table) => format!("main.{table}"),
-            Self::Derived(_) => format!("temp.{relation_name}_source"),
+            Self::Derived(_) | Self::Materialized(_) => format!("temp.{relation_name}_source"),
         }
     }
 }
@@ -288,18 +291,9 @@ pub static PYTHON_RELATIONS: &[Relation] = &[
 // Seeds include items in every lexical context, modules, imports, impl headers,
 // macro definitions/classifications, item expansions and inner attributes.
 // Initializer values and alias targets are not unconditional seeds.
-// deferred to M3: these derivation joins read spans or path traversals not exposed here:
-// LOCAL_PARENTS_SQL / resolution_paths owner-parent traversal; local declaration
-// owner containment; impl/import innermost module placement; macro mount lookup,
-// inherited/exported textual visibility and latest-definition byte ordering.
-// Item-context parent edges are part of that deferred placement projection.
-// Node keys are encounter-order handles: inserting match arms can reorder keys
-// for unchanged scopes. Never rank them. Project member scope heads through the
-// same-blob catalog to the source scope used by the reading derivation.
-// Implementation relation handles likewise project to impl_site rather than
-// forming an independent ID space.
-// Nodes without a source scope or definition site are deferred to M3: they do
-// not denote a surface entity. Native path/route node keys remain deferred too.
+// Consumer ownership and event order are constructed once before fingerprinting
+// or staging. Only their materialized, coordinate-free outputs enter accessors.
+// Native node keys remain construction locators, never fingerprint values.
 // Both writers preserve the native facts.sites index: fact_lowering.rs builds
 // LoweredSemanticSite from identifier.site; prepare_site_rows writes site().get().
 // prepare_gap_rows writes identities.gap_reasons' site.get() (including sites
@@ -520,6 +514,7 @@ pub static RUST_RELATIONS: &[Relation] = &[
         membership: O(2, "declaration_id"),
         seed: Some("1"),
         columns: &[
+            ("context_occurrence_id", R(3)),
             ("declaration_id", R(2)),
             ("target_type_occurrence_id", R(3)),
             ("trait_type_occurrence_id", R(3)),
@@ -762,8 +757,8 @@ pub static RUST_RELATIONS: &[Relation] = &[
     },
     Relation {
         name: "surface_rust_member_scopes",
-        source: RelationSource::Derived(
-            "SELECT p.blob_id,p.definition_semantic_key,p.scope_kind,n.source_scope FROM resolution_member_scope_properties p JOIN resolution_node_catalog n ON n.blob_id=p.blob_id AND n.local_key=p.scope_head_node_key",
+        source: RelationSource::Materialized(
+            "SELECT p.blob_id,p.definition_semantic_key,n.source_scope,p.scope_kind FROM main.resolution_member_scope_properties p JOIN main.resolution_node_catalog n ON n.blob_id=p.blob_id AND n.local_key=p.scope_head_node_key WHERE p.blob_id=?1",
         ),
         language: "rust",
         membership: M(1, "definition_semantic_key"),
@@ -775,12 +770,190 @@ pub static RUST_RELATIONS: &[Relation] = &[
         ],
     },
     Relation {
+        // The module a trait or inherent impl header is placed in. A header a
+        // macro replays has no impl declaration row at its call site, so
+        // `surface_rust_declaration_owners` cannot place it; its own byte span
+        // does, with the innermost-module rule of that relation.
+        name: "surface_rust_impl_owners",
+        source: RelationSource::Materialized(
+            "WITH impls AS (SELECT blob_id,impl_site,impl_start_byte,impl_end_byte FROM main.resolution_trait_implementations WHERE blob_id=?1 UNION SELECT blob_id,impl_site,impl_start_byte,impl_end_byte FROM main.resolution_inherent_implementations WHERE blob_id=?1) SELECT DISTINCT impl.blob_id,impl.impl_site,COALESCE(module.ordinal,0) AS module_scope FROM impls AS impl LEFT JOIN main.rust_module_scopes AS module ON module.blob_id=impl.blob_id AND impl.impl_start_byte>=module.body_start AND impl.impl_end_byte<=module.body_end AND NOT EXISTS(SELECT 1 FROM main.rust_module_scopes AS inner_module WHERE inner_module.blob_id=impl.blob_id AND impl.impl_start_byte>=inner_module.body_start AND impl.impl_end_byte<=inner_module.body_end AND inner_module.body_start>module.body_start)",
+        ),
+        language: "rust",
+        membership: O(0, "impl_site"),
+        seed: Some("1"),
+        columns: &[("impl_site", R(0)), ("module_scope", R(7))],
+    },
+    Relation {
         name: "surface_rust_gaps",
         source: RelationSource::Table("resolution_gap_reasons"),
         language: "rust",
         membership: M(0, "site"),
         seed: None,
         columns: &[("site", R(0)), ("origin", V)],
+    },
+    Relation {
+        name: "surface_rust_lexical_declarations",
+        source: RelationSource::Materialized(include_str!("surface_rust_lexical_declarations.sql")),
+        language: "rust",
+        membership: M(5, "scope"),
+        seed: Some("1"),
+        columns: &[
+            ("scope", R(5)),
+            ("semantic_key", R(1)),
+            ("namespace", V),
+            ("spelling", V),
+        ],
+    },
+    Relation {
+        name: "surface_rust_declaration_owners",
+        // The declaration is the membership identity. A NULL owner_scope retains
+        // unknown native attachment in the admitted row and its fingerprint;
+        // lexical consumers must not treat it as a known module/root scope.
+        source: RelationSource::Materialized(include_str!("surface_rust_declaration_owners.sql")),
+        language: "rust",
+        membership: O(2, "declaration_id"),
+        seed: Some("1"),
+        columns: &[
+            ("declaration_id", R(2)),
+            ("module_scope", R(7)),
+            ("owner_scope", R(5)),
+        ],
+    },
+    Relation {
+        name: "surface_rust_import_owners",
+        source: RelationSource::Materialized(include_str!("surface_rust_import_owners.sql")),
+        language: "rust",
+        membership: O(12, "import_ordinal"),
+        seed: Some("1"),
+        columns: &[
+            ("import_ordinal", R(12)),
+            ("module_scope", R(7)),
+            ("owner_scope", R(5)),
+            ("module_import", V),
+            ("extern_root_eligible", V),
+        ],
+    },
+    Relation {
+        name: "surface_rust_lexical_owners",
+        source: RelationSource::Materialized(include_str!("surface_rust_lexical_owners.sql")),
+        language: "rust",
+        membership: O(5, "scope"),
+        seed: Some("1"),
+        columns: &[
+            ("scope", R(5)),
+            ("parent_scope", R(5)),
+            ("module_scope", R(7)),
+            ("member_body", V),
+        ],
+    },
+    Relation {
+        name: "surface_rust_expansion_owners",
+        source: RelationSource::Materialized(include_str!("surface_rust_expansion_owners.sql")),
+        language: "rust",
+        membership: O(3, "invocation"),
+        seed: Some("1"),
+        columns: &[
+            ("invocation", R(3)),
+            ("module_scope", R(7)),
+            ("context", R(3)),
+            ("item_position", V),
+        ],
+    },
+    Relation {
+        name: "surface_rust_source_rust_item_contexts",
+        source: RelationSource::Table("source_rust_item_contexts"),
+        language: "rust",
+        membership: O(3, "occurrence_id"),
+        // Every item context that owns a declaration is admitted, so an empty
+        // `struct S;` or `trait T {}` stays visible to macro and open-inventory
+        // ancestry. Body-only block contexts stay unseeded.
+        seed: Some("b.owner_declaration_id IS NOT NULL"),
+        columns: &[
+            ("occurrence_id", R(3)),
+            ("parent_occurrence_id", R(3)),
+            ("owner_declaration_id", R(2)),
+            ("context_kind", V),
+            ("start_byte", X),
+            ("end_byte", X),
+            ("ordinal", X),
+        ],
+    },
+    Relation {
+        name: "surface_rust_resolution_rust_reference_contexts",
+        source: RelationSource::Table("resolution_rust_reference_contexts"),
+        language: "rust",
+        membership: O(1, "semantic_key"),
+        seed: Some(
+            "EXISTS(SELECT 1 FROM main.resolution_trait_implementations impl WHERE impl.blob_id=b.blob_id AND impl.impl_site=b.semantic_key)",
+        ),
+        columns: &[("semantic_key", R(1)), ("source_occurrence", R(3))],
+    },
+    Relation {
+        name: "surface_rust_macro_events",
+        source: RelationSource::Materialized(include_str!("surface_rust_macro_events.sql")),
+        language: "rust",
+        membership: M(3, "context"),
+        seed: Some("1"),
+        columns: &[
+            ("context", R(3)),
+            ("event", R(3)),
+            ("event_kind", V),
+            ("order_in_context", V),
+            ("definition", R(2)),
+        ],
+    },
+    Relation {
+        name: "surface_rust_include_edges",
+        source: RelationSource::Materialized(include_str!("surface_rust_include_edges.sql")),
+        language: "rust",
+        membership: O(3, "invocation"),
+        seed: Some("1"),
+        columns: &[
+            ("invocation", R(3)),
+            ("including_owner", R(3)),
+            ("relative_path", V),
+        ],
+    },
+    Relation {
+        name: "surface_rust_source_rust_item_import_contexts",
+        source: RelationSource::Table("source_rust_item_import_contexts"),
+        language: "rust",
+        membership: M(3, "context_occurrence_id"),
+        seed: Some("1"),
+        columns: &[("context_occurrence_id", R(3))],
+    },
+    Relation {
+        name: "surface_rust_source_rust_item_body_children",
+        source: RelationSource::Table("source_rust_item_body_children"),
+        language: "rust",
+        membership: M(2, "owner_declaration_id"),
+        seed: None,
+        columns: &[
+            ("owner_declaration_id", R(2)),
+            ("occurrence_id", R(3)),
+            ("declaration_id", R(2)),
+            ("syntax_kind", V),
+            ("ordinal", X),
+            ("start_byte", X),
+            ("end_byte", X),
+        ],
+    },
+    Relation {
+        name: "surface_rust_source_rust_item_generic_parameters",
+        source: RelationSource::Table("source_rust_item_generic_parameters"),
+        language: "rust",
+        membership: M(2, "declaration_id"),
+        seed: None,
+        columns: &[
+            ("declaration_id", R(2)),
+            ("occurrence_id", R(3)),
+            ("syntax_kind", V),
+            ("name_occurrence_id", R(3)),
+            ("name", V),
+            ("ordinal", V),
+            ("start_byte", X),
+            ("end_byte", X),
+        ],
     },
 ];
 
@@ -1005,6 +1178,21 @@ pub(super) fn members_current_sql(
     )
 }
 
+/// Both directions of one selected member set, including role. Input equality
+/// remains the existing members_current_sql predicate above.
+pub(super) fn member_set_current_sql(summary: &str, current: &str) -> String {
+    format!(
+        "NOT EXISTS(SELECT 1 FROM ({current}) selected
+              WHERE NOT EXISTS(SELECT 1 FROM main.resolution_unit_summary_members recorded
+                WHERE recorded.summary_id={summary} AND recorded.rel_path=selected.rel_path
+                  AND recorded.source_role=selected.source_role))
+      AND NOT EXISTS(SELECT 1 FROM main.resolution_unit_summary_members recorded
+              WHERE recorded.summary_id={summary} AND NOT EXISTS(
+                SELECT 1 FROM ({current}) selected WHERE selected.rel_path=recorded.rel_path
+                  AND selected.source_role=recorded.source_role))"
+    )
+}
+
 /// Resolve summary members before selected mounts exist, at one workspace revision.
 pub fn member_blobs_at_revision(
     conn: &Connection,
@@ -1182,8 +1370,12 @@ pub fn list_digest(relations: &[Relation]) -> [u8; 32] {
             }
             // Length-delimited exact SQL is the canonical definition of this
             // static entry; even an SQL edit preserving columns changes the list.
-            RelationSource::Derived(sql) => {
-                h.value(&[1]);
+            RelationSource::Derived(sql) | RelationSource::Materialized(sql) => {
+                h.value(&[if matches!(r.source, RelationSource::Materialized(_)) {
+                    2
+                } else {
+                    1
+                }]);
                 h.value(sql.as_bytes());
             }
         }
@@ -1234,8 +1426,172 @@ fn create_source_views(conn: &Connection, relations: &[Relation]) -> rusqlite::R
     Ok(())
 }
 
+// Schema construction and publication follow catalog order, so a projection
+// can consume an earlier projection. The SELECTs are never accessor definitions.
+fn create_materialized_sources(conn: &Connection, relations: &[Relation]) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS surface_published_blob(blob_id INTEGER PRIMARY KEY) WITHOUT ROWID, STRICT",
+    )?;
+    for relation in relations {
+        if let RelationSource::Materialized(_) = relation.source {
+            // Accessor installation declares only the projected schema. It must
+            // not prepare construction reads before the publisher is invoked.
+            let columns = relation
+                .columns
+                .iter()
+                .map(|(column, kind)| match kind {
+                    // Id columns compare with INTEGER surface_ids columns, so an
+                    // untyped column would keep the planner from seeking its index.
+                    ColumnKind::Ref(_) => format!("{column} INTEGER"),
+                    _ => (*column).to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            // Views seek a projection row by its owner id within a blob, so the
+            // owner column follows blob_id in the index.
+            let (_, owner) = relation.membership.parts();
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {name}_source(blob_id INTEGER,{columns})",
+                name = relation.name,
+            ))?;
+            conn.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS temp.{name}_source_owner ON {name}_source(blob_id,{owner})",
+                name = relation.name,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Stage the materialized projections of `blobs`, replacing only those blobs'
+/// rows. The temp tables are shared by every publisher on a connection: an
+/// operation publishes its whole blob set, and a lazy `ensure_surface_set` for
+/// one more blob publishes that blob while fingerprinting it. A truncate-all
+/// here would let the lazy publication silently empty the operation's rows.
+/// Replacing per blob is correct because a blob's rows are a pure function of
+/// its immutable facts, and every view joins `surface_sets` on its own
+/// blob_id, so rows of blobs outside a set are never read. The refusal check
+/// is scoped to `blobs` for the same reason: another publisher's blob must not
+/// make this publication fail, and this publication's blobs always do.
+fn publish_materialized_sources(
+    conn: &Connection,
+    relations: &[Relation],
+    blobs: &[i64],
+) -> rusqlite::Result<()> {
+    create_materialized_sources(conn, relations)?;
+    for relation in relations {
+        if let RelationSource::Materialized(sql) = relation.source {
+            let mut delete = conn.prepare_cached(&format!(
+                "DELETE FROM temp.{}_source WHERE blob_id=?1",
+                relation.name
+            ))?;
+            let mut insert =
+                conn.prepare_cached(&format!("INSERT INTO temp.{}_source {sql}", relation.name,))?;
+            let (_, owner) = relation.membership.parts();
+            let mut unknown = conn.prepare_cached(&format!(
+                "SELECT 1 FROM temp.{}_source WHERE blob_id=?1 AND {owner} IS NULL LIMIT 1",
+                relation.name
+            ))?;
+            for blob in blobs {
+                delete.execute([blob])?;
+                insert.execute([blob])?;
+                if unknown.exists([blob])? {
+                    return Err(rusqlite::Error::UserFunctionError(Box::new(
+                        UnknownSurfaceOwner {
+                            relation: relation.name,
+                            blob_id: *blob,
+                        },
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Construct the shared Rust consumer projections before entering the closure
+/// read guard. This replaces operation-local staging, including on a newly
+/// opened connection; a persisted surface set does not imply staged rows exist.
+/// Fingerprint publication uses the same catalog SELECTs. Accessor views read
+/// the materialization, never the construction SQL or its geometry.
+///
+/// No rows survive in main, and no recompute/snapshot choice is assumed. The
+/// caller owns the operation's connection and must not replace these rows while
+/// a consumer is running. It must also keep the main fact/set snapshot fixed
+/// across publication and consumption (normally in the enclosing transaction),
+/// so dense rows cannot be translated through a different set's ordinals.
+/// Failure restores the previous complete staging.
+///
+/// Residency is bounded: after this call the staging tables hold exactly the
+/// rows of `blobs` (recorded in `surface_published_blob`), so a warm connection
+/// does not accumulate rows of blobs from earlier operations or earlier edits.
+/// A later fingerprint publication adds one transient blob and removes it again.
+pub fn publish_rust_consumer_projections(conn: &Connection, blobs: &[i64]) -> rusqlite::Result<()> {
+    conn.execute_batch("SAVEPOINT rust_surface_projection_publication")?;
+    match publish_materialized_sources(conn, RUST_RELATIONS, blobs)
+        .and_then(|()| record_published_blobs(conn, RUST_RELATIONS, blobs))
+    {
+        Ok(()) => conn.execute_batch("RELEASE rust_surface_projection_publication"),
+        Err(error) => {
+            conn.execute_batch("ROLLBACK TO rust_surface_projection_publication; RELEASE rust_surface_projection_publication")?;
+            Err(error)
+        }
+    }
+}
+
+/// Make the staged rows exactly those of `blobs`: record them as the
+/// operation's published set and evict every other blob's rows.
+fn record_published_blobs(
+    conn: &Connection,
+    relations: &[Relation],
+    blobs: &[i64],
+) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM temp.surface_published_blob", [])?;
+    let mut record = conn
+        .prepare_cached("INSERT OR IGNORE INTO temp.surface_published_blob(blob_id) VALUES(?1)")?;
+    for blob in blobs {
+        record.execute([blob])?;
+    }
+    evict_unpublished_blobs(conn, relations)
+}
+
+/// Delete the staged rows of every blob outside the operation's published set.
+fn evict_unpublished_blobs(conn: &Connection, relations: &[Relation]) -> rusqlite::Result<()> {
+    for relation in relations {
+        if let RelationSource::Materialized(_) = relation.source {
+            conn.prepare_cached(&format!(
+                "DELETE FROM temp.{}_source WHERE blob_id NOT IN (SELECT blob_id FROM temp.surface_published_blob)",
+                relation.name
+            ))?
+            .execute([])?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete one transient blob's staged rows unless the operation published it.
+/// The predicate is a key seek on the (blob_id, owner) index, so a fingerprint
+/// does not scan the operation's resident rows.
+fn evict_transient_blob(
+    conn: &Connection,
+    relations: &[Relation],
+    blob_id: i64,
+) -> rusqlite::Result<()> {
+    for relation in relations {
+        if let RelationSource::Materialized(_) = relation.source {
+            conn.prepare_cached(&format!(
+                "DELETE FROM temp.{}_source WHERE blob_id=?1 AND blob_id NOT IN (SELECT blob_id FROM temp.surface_published_blob)",
+                relation.name
+            ))?
+            .execute([blob_id])?;
+        }
+    }
+    Ok(())
+}
+
 /// Generate views for exactly this binary's list, without exposing coordinates.
 pub fn create_surface_views(conn: &Connection, relations: &[Relation]) -> rusqlite::Result<()> {
+    create_materialized_sources(conn, relations)?;
     let digest = lower_hex_string(&list_digest(relations));
     for r in relations {
         let (space, column) = r.membership.parts();
@@ -1253,6 +1609,7 @@ pub fn create_surface_views(conn: &Connection, relations: &[Relation]) -> rusqli
         let source = match r.source {
             RelationSource::Table(table) => format!("main.{table}"),
             RelationSource::Derived(sql) => format!("({sql})"),
+            RelationSource::Materialized(_) => format!("temp.{}_source", r.name),
         };
         conn.execute_batch(&format!("DROP VIEW IF EXISTS temp.{name}; CREATE TEMP VIEW {name} AS SELECT {projection} FROM {source} b JOIN main.surface_sets sets ON sets.blob_id=b.blob_id AND sets.list_digest=x'{digest}' JOIN main.surface_ids owner ON owner.set_id=sets.set_id AND owner.id_space={space} AND owner.dense_id=b.{column}",name=r.name,projection=projections.join(","),source=source))?;
     }
@@ -1319,8 +1676,26 @@ impl std::fmt::Display for DanglingSurfaceRef {
 }
 impl std::error::Error for DanglingSurfaceRef {}
 
+/// A relation's required membership identity is unknown in this publication.
+/// In particular, an include with a NULL invocation must not disappear from
+/// the fingerprint or acquire a made-up root/occurrence identity.
+/// Nullable attachment references are different: their NULL value remains in
+/// the admitted row and fingerprint, and consumers needing that attachment must
+/// report it unknown rather than infer a scope from publication success.
+#[derive(Debug)]
+pub struct UnknownSurfaceOwner {
+    pub relation: &'static str,
+    pub blob_id: i64,
+}
+impl std::fmt::Display for UnknownSurfaceOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown surface owner: {self:?}")
+    }
+}
+impl std::error::Error for UnknownSurfaceOwner {}
+
 fn is_refusal(error: &rusqlite::Error) -> bool {
-    matches!(error, rusqlite::Error::UserFunctionError(cause) if cause.is::<DanglingSurfaceRef>())
+    matches!(error, rusqlite::Error::UserFunctionError(cause) if cause.is::<DanglingSurfaceRef>() || cause.is::<UnknownSurfaceOwner>())
 }
 
 /// Compute and atomically replace this list's set. Absent facts have no set.
@@ -1344,7 +1719,32 @@ pub(super) fn ensure_surface_set_tx(
     tx: &rusqlite::Transaction<'_>,
     blob_id: i64,
 ) -> rusqlite::Result<(Option<[u8; 32]>, super::PersistedMutationCost)> {
-    match compute_surface_set_tx(tx, blob_id) {
+    surface_publication_result(compute_surface_set_tx(tx, blob_id))
+}
+
+/// The writer already validated this exact publication in its transaction.
+/// Reuse its parent scalars instead of selecting the blob again.
+pub(super) fn ensure_surface_set_for_publication_tx(
+    tx: &rusqlite::Transaction<'_>,
+    publication: &super::SourcePublicationWitness,
+) -> rusqlite::Result<(Option<[u8; 32]>, super::PersistedMutationCost)> {
+    let key = publication.key();
+    let Some(description) = description(&key.lang) else {
+        return Ok((None, super::PersistedMutationCost::default()));
+    };
+    surface_publication_result(compute_surface_input_tx(
+        tx,
+        publication.blob_id(),
+        &key.oid.to_string(),
+        publication.generation().get(),
+        description,
+    ))
+}
+
+fn surface_publication_result(
+    result: rusqlite::Result<(Option<[u8; 32]>, super::PersistedMutationCost)>,
+) -> rusqlite::Result<(Option<[u8; 32]>, super::PersistedMutationCost)> {
+    match result {
         Err(error) if is_refusal(&error) => {
             // The refused set was retired; keep the fact publication.
             Ok((None, super::PersistedMutationCost::default()))
@@ -1473,7 +1873,25 @@ pub(super) fn member_has_admitted_facts(conn: &Connection, blob_id: i64) -> rusq
     Ok(admitted_surface_identity(conn, blob_id, &oid, generation, &description)?.is_some())
 }
 
+/// Fingerprint one blob. Its projection rows are staged only to be read, so
+/// they are evicted again afterwards (success or refusal) unless the blob
+/// belongs to the operation's published set; the rows an operation published
+/// stay, and at most one transient blob is resident beyond them.
 fn compute_surface_input_tx(
+    tx: &rusqlite::Transaction<'_>,
+    blob_id: i64,
+    oid: &str,
+    generation: i64,
+    description: SurfaceDescription<'_>,
+) -> rusqlite::Result<(Option<[u8; 32]>, super::PersistedMutationCost)> {
+    let relations = description.relations;
+    create_materialized_sources(tx, relations)?;
+    let result = stage_and_fingerprint_tx(tx, blob_id, oid, generation, description);
+    evict_transient_blob(tx, relations, blob_id)?;
+    result
+}
+
+fn stage_and_fingerprint_tx(
     tx: &rusqlite::Transaction<'_>,
     blob_id: i64,
     oid: &str,
@@ -1507,6 +1925,12 @@ fn compute_surface_input_tx(
         return Ok((Some(fingerprint), super::PersistedMutationCost::default()));
     }
     create_source_views(tx, relations)?;
+    if let Err(error) = publish_materialized_sources(tx, relations, &[blob_id]) {
+        if is_refusal(&error) {
+            tx.execute("DELETE FROM surface_sets WHERE blob_id=?1", [blob_id])?;
+        }
+        return Err(error);
+    }
     let mut ids: BTreeMap<u32, BTreeSet<i64>> = BTreeMap::new();
     let mut rows = Vec::new();
     for r in relations {
@@ -1535,7 +1959,8 @@ fn compute_surface_input_tx(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (owner, seed, _) in &values {
             if *seed {
-                assert!(matches!(r.membership, Membership::Own(..)));
+                // A seeded Member admits its structural owner, without giving
+                // the member row an independent identity space.
                 ids.entry(space).or_default().insert(*owner);
             }
         }
@@ -1733,15 +2158,16 @@ pub fn install_surface_authorizer(
     // views, not base tables. FENCE_SCHEMA records the production catalog, so
     // a fixture that materializes a source as a table would otherwise fall
     // outside the denied set. Name every relation source explicitly.
-    let denied: BTreeSet<&'static str> = FENCE_SCHEMA
+    let denied: BTreeSet<String> = FENCE_SCHEMA
         .0
         .iter()
-        .map(String::as_str)
+        .cloned()
         .chain(
             relations
                 .iter()
                 .filter_map(|relation| match relation.source {
-                    RelationSource::Table(source) => Some(source),
+                    RelationSource::Table(source) => Some(source.to_owned()),
+                    RelationSource::Materialized(_) => Some(format!("{}_source", relation.name)),
                     RelationSource::Derived(_) => None,
                 }),
         )
@@ -2129,5 +2555,45 @@ mod summary_translation_tests {
             0,
             "a member without a selected revision has no blob translation"
         );
+    }
+}
+
+#[cfg(test)]
+mod lexical_owner_plan_tests {
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use brokk_bifrost_test_macros::hardwon;
+
+    use super::super::AnalyzerStore;
+    use super::super::planner_statistics::pinned_plans::{
+        explain_pin, pinned, prepare_pin_context,
+    };
+
+    #[test]
+    #[hardwon("#14394: lexical-owner hops scanned every blob path per hop and stalled a cold warm")]
+    fn lexical_owner_hops_seek_paths_by_start_node() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        store
+            .select_writer_workspace_snapshots(&conn, &Default::default())
+            .unwrap();
+        prepare_pin_context(&conn);
+        let query = pinned("surface_rust_lexical_owners");
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let plan = explain_pin(&conn, &query);
+            // The base and recursive hop steps each read one node's paths. A
+            // blob-wide path range inside the recursion is quadratic per file.
+            let path_steps = plan
+                .iter()
+                .filter(|step| step.starts_with("SEARCH path ") || step.starts_with("SCAN path"))
+                .collect::<Vec<_>>();
+            assert_eq!(path_steps.len(), 2, "{state:?}: {plan:?}");
+            for step in path_steps {
+                assert!(
+                    step.contains("resolution_paths_forward (blob_id=? AND start_node=?"),
+                    "{state:?}: {step} in {plan:?}"
+                );
+            }
+        }
     }
 }

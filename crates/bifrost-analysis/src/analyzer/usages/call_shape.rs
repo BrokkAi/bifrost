@@ -93,13 +93,17 @@ pub struct ArgumentRow {
     pub name: Option<String>,
     /// Whether the argument expands a pack (`*args`, `xs: _*`, `...xs`).
     pub spread: bool,
-    /// Decoded value when the argument is a normalized string literal.
-    ///
-    /// This is deliberately optional: an argument can be a non-literal,
-    /// dynamic expression, or a language-specific shape that has no backing
-    /// structural fact. Policies must keep those cases structured
-    /// incomplete rather than treating them as a literal mismatch.
-    pub literal_value: Option<String>,
+    /// The normalized structural node of the written argument, when the
+    /// argument expression has a normalized kind. `None` for arguments with no
+    /// normalized node and for rows that do not name one written expression
+    /// (expanded result slots, admitted macro candidates). Consumers read the
+    /// argument's constant value from this node.
+    pub node: Option<u32>,
+    /// Zero-based written position of the argument in its application's
+    /// argument list, counting positional and keyword arguments in source
+    /// order. `None` for an admitted macro candidate argument, which has no
+    /// written argument list.
+    pub position: Option<usize>,
     pub range: Range,
 }
 
@@ -130,7 +134,7 @@ impl CallShapeReport {
             .map(|argument_index| ArgumentRow {
                 id: argument_row_id(&group.id, argument_index),
                 argument_index,
-                literal_value: None,
+                node: None,
                 ..argument.clone()
             })
             .collect();
@@ -232,7 +236,8 @@ pub fn call_shape_for_call(
                         argument_index,
                         name: member.name.clone(),
                         spread: member.spread,
-                        literal_value: member.literal_value.clone(),
+                        node: member.node,
+                        position: Some(member.position),
                         range: member.range,
                     });
                 }
@@ -274,7 +279,8 @@ pub fn call_shape_for_call(
                 argument_index,
                 name: argument.keyword.as_deref().map(str::to_owned),
                 spread: false,
-                literal_value: None,
+                node: None,
+                position: None,
                 range,
             });
         }
@@ -468,7 +474,9 @@ struct ArgumentMember {
     range: Range,
     name: Option<String>,
     spread: bool,
-    literal_value: Option<String>,
+    node: Option<u32>,
+    /// Written position in this application's argument list.
+    position: usize,
 }
 
 /// The positional and named groups one application node contributes.
@@ -478,16 +486,21 @@ fn argument_groups_of(
 ) -> [(ArgumentListKind, Vec<ArgumentMember>); 2] {
     let mut positional = Vec::new();
     let mut named = Vec::new();
+    let mut written_position = 0usize;
     for target in facts.roles(call_id) {
+        if !matches!(target.role, Role::Arg | Role::Kwarg) {
+            continue;
+        }
+        let position = written_position;
+        written_position += 1;
         let member = ArgumentMember {
             range: super::range_for_span(facts, target.span),
             name: target
                 .keyword
                 .map(|keyword| keyword.text(facts.source()).to_owned()),
             spread: target.mode.is_spread(),
-            literal_value: target
-                .node
-                .and_then(|node| facts.node(node).string_value.clone()),
+            node: target.node,
+            position,
         };
         match target.role {
             Role::Arg => positional.push(member),

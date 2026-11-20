@@ -447,6 +447,7 @@ pub(crate) mod tests {
 
         outer.values = vec![
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(0),
@@ -455,6 +456,7 @@ pub(crate) mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(1),
@@ -466,6 +468,7 @@ pub(crate) mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(2),
@@ -474,6 +477,7 @@ pub(crate) mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(3),
@@ -482,6 +486,7 @@ pub(crate) mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(4),

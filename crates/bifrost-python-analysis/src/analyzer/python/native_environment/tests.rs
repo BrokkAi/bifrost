@@ -499,6 +499,10 @@ fn module_rebindings_retained_temporal_selection() {
 #[brokk_bifrost_test_macros::hardwon(
     "#6108: cold bulk publication skipped Python native binding rows"
 )]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn python_production_cold_index_publishes_scoped_blobs() {
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
     use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
@@ -577,6 +581,10 @@ fn python_configuration_input_names_agree_with_staging() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn python_workspace_native_environment_lifecycle() {
     use super::super::PythonAnalyzer;
     use super::super::native_request::{PythonNativeOpen, open_python_native_request};
@@ -921,7 +929,6 @@ fn stopped_python_native_half_remains_cancelled() {
         .unwrap();
     assert!(receipt.failed.is_empty(), "{receipt:?}");
     let budget = ReceiverAnalysisBudget {
-        max_scope_nodes: usize::MAX,
         max_summary_expansions: usize::MAX,
         max_resolution_rounds: usize::MAX,
         ..ReceiverAnalysisBudget::default()
@@ -933,13 +940,8 @@ fn stopped_python_native_half_remains_cancelled() {
     let work = baseline.finish(()).work();
     let mut stopped_demand = false;
     for cutoff in 0..work.scope_nodes {
-        let session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: cutoff,
-                ..budget
-            },
-            None,
-        );
+        let cancellation = CancellationToken::cancel_after_checks_for_test(cutoff);
+        let session = ResolutionSession::bounded(budget, Some(&cancellation));
         let result =
             environment.route_probe_in_session(fixture.project_dyn().as_ref(), revision, &session);
         if result.as_ref().err().is_some_and(|error| {
@@ -949,7 +951,7 @@ fn stopped_python_native_half_remains_cancelled() {
         }) {
             assert!(matches!(
                 session.finish(result),
-                BoundedResolution::Exceeded { .. }
+                BoundedResolution::Cancelled { .. }
             ));
             stopped_demand = true;
             break;
@@ -957,6 +959,6 @@ fn stopped_python_native_half_remains_cancelled() {
     }
     assert!(
         stopped_demand,
-        "budget cutoff must stop a demand half; baseline={work:?}"
+        "a cancellation cutoff must stop a demand half; baseline={work:?}"
     );
 }

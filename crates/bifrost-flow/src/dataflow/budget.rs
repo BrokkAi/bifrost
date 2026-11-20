@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt};
 
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::analyzer::semantic::CancellationToken;
 use brokk_bifrost_core::analyzer::work_budget::{
     BudgetLedger, WorkBudgetExceeded, define_work_dimensions,
@@ -57,6 +58,9 @@ pub struct SolverBudgetExceeded {
     dimension: SolverBudgetDimension,
     limit: usize,
     attempted: usize,
+    // A refused ledger charge carries its `BudgetRefused` verdict. A limit
+    // the caller compared itself, without a refusal, carries `Content`.
+    reuse: ReuseVerdict,
 }
 
 impl SolverBudgetExceeded {
@@ -64,11 +68,13 @@ impl SolverBudgetExceeded {
         dimension: SolverBudgetDimension,
         limit: usize,
         attempted: usize,
+        reuse: ReuseVerdict,
     ) -> Self {
         Self {
             dimension,
             limit,
             attempted,
+            reuse,
         }
     }
 
@@ -91,7 +97,14 @@ impl From<WorkBudgetExceeded<SolverBudgetDimension>> for SolverBudgetExceeded {
             dimension: exceeded.dimension(),
             limit: exceeded.limit(),
             attempted: exceeded.attempted(),
+            reuse: exceeded.reuse_verdict(),
         }
+    }
+}
+
+impl CarriesReuseVerdict for SolverBudgetExceeded {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
     }
 }
 

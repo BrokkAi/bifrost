@@ -31,17 +31,47 @@ impl NativeWorkspaceGraphProvider for PythonNativeWorkspaceGraphProvider {
     fn id(&self) -> EdgePassId {
         EdgePassId::Python
     }
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        resolve_analyzer::<PythonAnalyzer>(analyzer).map_or_else(
+            || Ok(Vec::new()),
+            |python| python.inner.selected_graph_source_exclusions(),
+        )
+    }
     fn input_failure(
         &self,
         analyzer: &dyn IAnalyzer,
         files: &[ProjectFile],
     ) -> Option<LanguageEdgeFailure> {
         let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+        // A refused source is never analyzed, but it is an explained
+        // exclusion that `excluded_sources` names, not missing facts: counting
+        // it here made the whole Python pass unavailable (#13870), as Go's
+        // `graph_inventory_complete_with_named_refusals` avoids.
+        let refused =
+            match python.inner.selected_graph_source_exclusions() {
+                Ok(exclusions) => exclusions
+                    .into_iter()
+                    .map(|(file, _)| file)
+                    .collect::<HashSet<_>>(),
+                Err(error) => {
+                    python.inner.record_store_error(error.context(
+                        "reading Python source admission refusals before graph projection",
+                    ));
+                    return Some(LanguageEdgeFailure {
+                        reason: "Python source admission refusals could not be read",
+                        files: Vec::new(),
+                    });
+                }
+            };
         let missing = files
             .iter()
             .filter(|file| {
                 brokk_bifrost_core::analyzer::common::language_for_file(file)
                     == brokk_bifrost_core::analyzer::Language::Python
+                    && !refused.contains(*file)
                     && !python.inner.is_analyzed(file)
             })
             .cloned()

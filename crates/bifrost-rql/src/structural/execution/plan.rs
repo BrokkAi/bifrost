@@ -159,9 +159,17 @@ pub(crate) struct LogicalQueryNode {
     operator: LogicalQueryOperator,
     output_kind: QueryValueKind,
     depth_bound_key: Option<String>,
+    /// Zero-based position of a step node in the `steps` array of the
+    /// authored plan that owns it. Kept off the operator so plan JSON is
+    /// unchanged.
+    authored_step_index: Option<usize>,
 }
 
 impl LogicalQueryNode {
+    pub(crate) const fn authored_step_index(&self) -> Option<usize> {
+        self.authored_step_index
+    }
+
     pub(crate) fn depth_bound_key(&self) -> Option<&str> {
         self.depth_bound_key.as_deref()
     }
@@ -501,6 +509,7 @@ impl LogicalQueryPlanBuilder {
                 },
                 step_output,
             );
+            self.nodes[input.index()].authored_step_index = Some(step_index);
             if matches!(step, QueryStep::Callers(_) | QueryStep::Callees(_)) {
                 self.nodes[input.index()].depth_bound_key = Some(depth_bound_traversal_key(
                     plan,
@@ -530,6 +539,7 @@ impl LogicalQueryPlanBuilder {
             operator,
             output_kind,
             depth_bound_key: None,
+            authored_step_index: None,
         });
         id
     }

@@ -557,6 +557,10 @@ mod cpp_extraction_tests {
         /// TEMP objects on each connection; a projection that lost its `TEMP` would
         /// land in `main` and survive the process, which is what this pins.
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn a_worked_store_holds_exactly_the_baseline_schema() {
             let baseline_temp = tempfile::TempDir::new().unwrap();
             let baseline_path = baseline_temp
@@ -820,6 +824,10 @@ mod cpp_extraction_tests {
         /// as partial, with every recovered declaration kept. ABI 15 now reads the
         /// original one- and two-header linkage witnesses as complete positives.
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn a_parse_left_inside_an_unclosed_construct_persists_as_partial() {
             let one = format!(
                 "#include <stdarg.h>\n{}int sqlite3_open(void) {{ return 0; }}\n",
@@ -1488,9 +1496,7 @@ mod cpp_extraction_tests {
                     .unwrap()
             );
 
-            let current = store
-                .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-                .unwrap();
+            let current = store.ensure_language_epoch(&CppAdapter).unwrap();
             assert_ne!(current, prior_generation);
             assert!(
                 !store

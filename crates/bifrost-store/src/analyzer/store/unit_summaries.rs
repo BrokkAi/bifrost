@@ -530,6 +530,19 @@ pub trait UnitSummaryLanguage {
     /// the work table.
     fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()>;
 
+    /// Certify unchanged units in one bulk pass, after all units are staged.
+    /// Rows in unit_summary_candidates also identify affected units, with a
+    /// NULL summary_id, so output changes can invalidate recorded consumers.
+    /// The default performs the ordinary full reconciliation.
+    fn stage_unchanged(
+        &self,
+        _conn: &Connection,
+        _snapshot: &WorkspaceSnapshotId,
+        _producer_epoch: &str,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Clear language-owned TEMP rows before this query-scoped reconcile
     /// returns. The default is enough for adapters that stage directly into
     /// the shared work and edge tables.
@@ -628,6 +641,9 @@ pub trait UnitSummaryLanguage {
 #[doc(hidden)]
 pub struct UnitSummaryReconciliation {
     pub units: usize,
+    /// Distinct units admitted to inputs/validation, including fixpoint visits.
+    pub admitted: usize,
+    pub(crate) admitted_units: std::collections::HashSet<i64>,
     /// Units whose live version row already pointed at the digest's summary.
     pub unchanged: usize,
     /// Units rebound to an existing summary, without derivation.
@@ -839,6 +855,8 @@ macro_rules! summary_intact {
     };
 }
 
+pub(crate) use summary_intact;
+
 /// The summary with this identity digest `?1` other than `?2` (the header being
 /// written), for a derivation that arrived at an identity that exists already.
 pub(super) const FIND_SUMMARY_SQL: &str = concat!(
@@ -875,6 +893,51 @@ pub(super) const CONSUMED_UNITS_CURRENT_SQL: &str = concat!(
          AND EXISTS (SELECT 1 FROM temp.unit_summary_order AS settled
                      WHERE settled.unit_key = consumed.consumed_unit_key)) END)"
 );
+
+/// Recorded dependency outputs before the ordered pass, for a candidate summary
+/// `candidate.summary_id`. It accepts what the per-unit path accepts, minus the
+/// "settled in this pass" test, which cannot hold before the pass runs. A
+/// workspace or consumed unit must be staged in this pass (an open version of a
+/// unit with no selected inputs now is not a live output), and a staged unit's
+/// later output change invalidates this unit through this pass's edges and
+/// replayed reads. An `external` or `standard` dependency records the provider's
+/// digest, which the language hook compares against the current provider
+/// (`$provider_current`, over `dependency`).
+macro_rules! bulk_dependencies_current_sql {
+    ($provider_current:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM resolution_unit_summary_dependencies dependency
+       WHERE dependency.summary_id=candidate.summary_id AND NOT CASE dependency.boundary
+         WHEN 'workspace' THEN EXISTS (SELECT 1 FROM temp.unit_summary_candidates staged
+                WHERE staged.unit_key=dependency.dependency_unit_key)
+           AND EXISTS (",
+            $crate::analyzer::store::unit_summaries::live_summary_select!(
+                "?8",
+                "dependency.dependency_unit_key"
+            ),
+            " AND summaries.output_digest=dependency.consumed_output_digest)
+         ELSE ",
+            $provider_current,
+            " END)
+     AND NOT EXISTS (SELECT 1 FROM resolution_unit_summary_consumed_units consumed
+       WHERE consumed.summary_id=candidate.summary_id AND NOT CASE
+         WHEN consumed.consumed_output_digest=zeroblob(32) THEN NOT EXISTS (",
+            $crate::analyzer::store::unit_summaries::live_summary_select!(
+                "?8",
+                "consumed.consumed_unit_key"
+            ),
+            ") ELSE EXISTS (SELECT 1 FROM temp.unit_summary_candidates staged
+                WHERE staged.unit_key=consumed.consumed_unit_key)
+           AND EXISTS (",
+            $crate::analyzer::store::unit_summaries::live_summary_select!(
+                "?8",
+                "consumed.consumed_unit_key"
+            ),
+            " AND summaries.output_digest=consumed.consumed_output_digest) END)"
+        )
+    };
+}
+pub(crate) use bulk_dependencies_current_sql;
 
 /// The open summary `?2` as a candidate for the lookup digest `?1`: its id when
 /// it carries that digest and is intact, and whether it recorded any consumed
@@ -928,6 +991,11 @@ pub(crate) const LATER_OPEN_VERSION_SQL: &str =
        AND profile_digest = ?5 AND valid_until IS NULL AND valid_from > ?4)";
 
 const STAGING_SCHEMA_SQL: &str = "
+CREATE TEMP TABLE IF NOT EXISTS unit_summary_candidates(
+  unit_id INTEGER PRIMARY KEY,
+  unit_key BLOB NOT NULL UNIQUE,
+  summary_id INTEGER
+) STRICT;
 CREATE TEMP TABLE IF NOT EXISTS unit_summary_work(unit_id INTEGER PRIMARY KEY) STRICT;
 CREATE TEMP TABLE IF NOT EXISTS unit_summary_edges(
   unit_id INTEGER NOT NULL,
@@ -963,6 +1031,7 @@ CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(
   unit_id INTEGER NOT NULL UNIQUE,
   unit_key BLOB UNIQUE
 ) STRICT;
+DELETE FROM temp.unit_summary_candidates;
 DELETE FROM temp.unit_summary_work;
 DELETE FROM temp.unit_summary_edges;
 DELETE FROM temp.unit_summary_reads;
@@ -970,6 +1039,7 @@ DELETE FROM temp.unit_summary_fixpoint;
 DELETE FROM temp.unit_summary_order;";
 
 const CLEAR_STAGING_SQL: &str = "
+DELETE FROM temp.unit_summary_candidates;
 DELETE FROM temp.unit_summary_work;
 DELETE FROM temp.unit_summary_edges;
 DELETE FROM temp.unit_summary_reads;
@@ -1007,9 +1077,13 @@ const MARK_DEPENDENTS_SQL: &str = "INSERT OR IGNORE INTO temp.unit_summary_fixpo
      SELECT ?2, edges.unit_id FROM temp.unit_summary_edges AS edges
      WHERE edges.dependency_unit_id = ?1
      UNION ALL
-     SELECT ?2, reads.unit_id FROM temp.unit_summary_order AS moved
+     SELECT ?2, reads.unit_id FROM (SELECT ordered.unit_id, COALESCE(ordered.unit_key, candidates.unit_key) AS unit_key
+           FROM temp.unit_summary_order ordered LEFT JOIN temp.unit_summary_candidates candidates
+             ON candidates.unit_id=ordered.unit_id) AS moved
      JOIN temp.unit_summary_reads AS reads ON reads.read_unit_key = moved.unit_key
      WHERE moved.unit_id = ?1";
+const CLEAR_ROUND_ZERO_MARK_SQL: &str =
+    "DELETE FROM temp.unit_summary_fixpoint WHERE round=0 AND unit_id=?1";
 const NEXT_FIXPOINT_UNIT_SQL: &str = "SELECT ordered.ordinal, ordered.unit_id
      FROM temp.unit_summary_fixpoint AS fixpoint
      JOIN temp.unit_summary_order AS ordered ON ordered.unit_id = fixpoint.unit_id
@@ -1048,8 +1122,14 @@ const STRANDED_UNITS_SQL: &str = "WITH RECURSIVE stranded(unit_id) AS (
      WHERE ordered.unit_key IS NOT NULL ORDER BY ordered.ordinal";
 const UNSETTLE_UNIT_SQL: &str =
     "UPDATE temp.unit_summary_order SET unit_key = NULL WHERE unit_id = ?1";
-const NEXT_UNIT_SQL: &str = "SELECT ordinal, unit_id FROM temp.unit_summary_order
-     WHERE ordinal > ?1 ORDER BY ordinal LIMIT 1";
+const NEXT_UNIT_SQL: &str = "SELECT ordered.ordinal, ordered.unit_id,
+       CASE WHEN NOT EXISTS (SELECT 1 FROM temp.unit_summary_fixpoint dirty
+                             WHERE dirty.round=0 AND dirty.unit_id=ordered.unit_id)
+         THEN candidates.summary_id END,
+       candidates.unit_key
+     FROM temp.unit_summary_order ordered
+     LEFT JOIN temp.unit_summary_candidates candidates ON candidates.unit_id=ordered.unit_id
+     WHERE ordered.ordinal > ?1 ORDER BY ordered.ordinal LIMIT 1";
 const SETTLE_UNIT_SQL: &str = "UPDATE temp.unit_summary_order SET unit_key = ?2 WHERE unit_id = ?1";
 /// Has this pass settled the unit with key `?1`? (`unit_key` is NULL until it has.)
 pub(crate) const SETTLED_KEY_SQL: &str =
@@ -1194,6 +1274,20 @@ fn reconcile_staged(
     statements: &StatementCounter,
 ) -> Result<UnitSummaryReconciliation> {
     let mut state = begin_staged_pass(conn, snapshot, language)?;
+    let bulk = if let Some(epoch) = state.producer_epoch.as_deref() {
+        language.stage_unchanged(conn, snapshot, epoch)? > 0
+    } else {
+        false
+    };
+    if bulk {
+        conn.execute(
+            "INSERT INTO temp.unit_summary_reads(unit_id,read_unit_key,unavailable)
+       SELECT candidates.unit_id,reads.consumed_unit_key,reads.consumed_output_digest=zeroblob(32)
+       FROM temp.unit_summary_candidates candidates
+       JOIN resolution_unit_summary_consumed_units reads ON reads.summary_id=candidates.summary_id",
+            [],
+        )?;
+    }
     if state.report.units > 0 {
         let mut after = 0_i64;
         loop {
@@ -1201,21 +1295,66 @@ fn reconcile_staged(
                 state.report.cancelled = true;
                 break;
             }
-            let next: Option<(i64, i64)> = conn
-                .query_row(NEXT_UNIT_SQL, [after], |row| Ok((row.get(0)?, row.get(1)?)))
+            struct ScheduledUnit {
+                ordinal: i64,
+                unit_id: i64,
+                unchanged: Option<i64>,
+                key: Option<Vec<u8>>,
+            }
+            let next = conn
+                .query_row(NEXT_UNIT_SQL, [after], |row| {
+                    Ok(ScheduledUnit {
+                        ordinal: row.get(0)?,
+                        unit_id: row.get(1)?,
+                        unchanged: row.get(2)?,
+                        key: row.get(3)?,
+                    })
+                })
                 .optional()?;
-            let Some((ordinal, unit_id)) = next else {
+            let Some(ScheduledUnit {
+                ordinal,
+                unit_id,
+                unchanged,
+                key,
+            }) = next
+            else {
                 break;
             };
             after = ordinal;
             let statements_before = statements.count();
-            let mut pass = state.context(snapshot, language, cancellation);
-            publish_unit(conn, &mut pass, unit_id)?;
+            if unchanged.is_some() {
+                conn.prepare_cached(SETTLE_UNIT_SQL)?.execute(params![
+                    unit_id,
+                    key.expect("a certified candidate has a key")
+                ])?;
+                state.report.unchanged += 1;
+            } else {
+                let failures = state.report.failed.len();
+                let mut pass = state.context(snapshot, language, cancellation);
+                let published = publish_unit(conn, &mut pass, unit_id)?;
+                if bulk && (published.output_moved || state.report.failed.len() != failures) {
+                    conn.prepare_cached(MARK_DEPENDENTS_SQL)?
+                        .execute(params![unit_id, 0])?;
+                }
+                if bulk {
+                    conn.prepare_cached(CLEAR_ROUND_ZERO_MARK_SQL)?
+                        .execute([unit_id])?;
+                }
+            }
             state.report.max_unit_statements = state
                 .report
                 .max_unit_statements
                 .max(statements.count() - statements_before);
         }
+    }
+    // Consumers already visited need the ordinary fixpoint. Consumers visited
+    // later were invalidated before their ordered visit and removed their mark.
+    if bulk {
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.unit_summary_fixpoint(round,unit_id)
+                  SELECT 1,unit_id FROM temp.unit_summary_fixpoint WHERE round=0",
+            [],
+        )?;
     }
     finish_pass(conn, state, snapshot, language, cancellation, statements)
 }
@@ -1326,6 +1465,7 @@ pub(super) fn finish_pass(
     ] {
         keys.sort_unstable();
     }
+    report.admitted_units = Default::default();
     Ok(report)
 }
 
@@ -1455,8 +1595,7 @@ fn reconcile_fixpoint(
 pub struct Published {
     /// The unit's summary was replaced or rebound.
     republished: bool,
-    /// The replaced summary of this same revision had a different output digest,
-    /// so the units that consumed it are stale.
+    /// A summary appeared or its output changed, so its consumers are stale.
     output_moved: bool,
 }
 
@@ -1496,6 +1635,9 @@ pub(super) fn publish_unit(
         republished: false,
         output_moved: false,
     };
+    if report.admitted_units.insert(unit_id) {
+        report.admitted += 1;
+    }
     let mut unit = match language.inputs(conn, snapshot, unit_id) {
         Ok(unit) => unit,
         Err(error) => {
@@ -1718,7 +1860,7 @@ pub(super) fn publish_unit(
         report.transaction_max = report.transaction_max.max(held);
         report.max_unit_rows = report.max_unit_rows.max(rows_written);
         output_moved = match (&previous_output, open) {
-            (Some(previous), Some((_, opened))) if opened == snapshot.revision => {
+            (Some(previous), Some(_)) => {
                 let current: Vec<u8> = match &derived_output {
                     Some(output_digest) => output_digest.to_vec(),
                     None => conn.query_row(
@@ -1729,6 +1871,7 @@ pub(super) fn publish_unit(
                 };
                 *previous != current
             }
+            (None, None) => true,
             _ => false,
         };
         match derived_output {

@@ -206,6 +206,7 @@ impl RustRules<'_, '_, '_> {
 }
 
 impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn reverse_dependencies(
         &mut self,
         endpoint: &EndpointSignature,

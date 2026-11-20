@@ -669,6 +669,7 @@ fn scala_entry_facts(
             });
         }
         let fact = TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -684,6 +685,7 @@ fn scala_entry_facts(
             type_kind,
             visibility,
             is_abstract: type_kind == TypeKind::Trait || declaration_source.is_explicitly_abstract,
+            is_final: None,
             is_sealed: declaration_source.is_sealed,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -902,6 +904,8 @@ fn scala_entry_facts(
             &mut hidden_members
         };
         routed.push(MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -955,6 +959,8 @@ fn scala_entry_facts(
 /// no contextual role of its own.
 fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
     MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -985,6 +991,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         callable_family_complete: false,
         exact_return_classes: Vec::new(),
         signature: Some(Signature {
+            bounds: None,
             type_parameters: Vec::new(),
             parameters: Vec::new(),
             returns: None,
@@ -1166,6 +1173,7 @@ fn scala_signature(
         .as_ref()
         .map(|path| scala_type_ref(path, &available_type_parameters));
     Some(Signature {
+        bounds: None,
         type_parameters,
         parameters,
         returns,

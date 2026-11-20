@@ -58,11 +58,23 @@ pub enum ReuseValidity {
     Reusable,
     NotReusable(NotReusableCause),
 }
+/// A query could not establish a complete answer; no stored-data corruption is implied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IncompleteReason {
+    Answer,
+    InventoryUnavailable,
+    InventoryStale,
+    ActiveOperationUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UnavailableCause {
     StratumViolation,
     ChildUnavailable,
     ValidationFailed,
+    Incomplete(IncompleteReason),
+    /// The original store error was already recorded by its producer.
+    StoreFailure,
     /// Configuration-only facts cannot answer a configuration overlay or stage.
     ConfigurationOverlaid,
     /// An active selected operation was queried without its matching read frame.
@@ -1227,6 +1239,8 @@ where
                     }
                     UnavailableCause::StratumViolation
                     | UnavailableCause::ValidationFailed
+                    | UnavailableCause::Incomplete(_)
+                    | UnavailableCause::StoreFailure
                     | UnavailableCause::MissingOperationReadFrame
                     | UnavailableCause::Failed(_) => NotReusableCause::InvalidDependencyEvidence,
                 };

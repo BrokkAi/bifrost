@@ -334,6 +334,7 @@ pub(super) static DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
 
 impl SelectedResolutionMountInventory<'_> {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_lexical_definitions(
         &self,
         definitions: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
@@ -497,6 +498,7 @@ impl SelectedResolutionMountInventory<'_> {
     /// The caller compares the hydrated units with an analyzer-owned target;
     /// this reader deliberately stays in stored identity space and does not
     /// reconstruct a declaration from rendered names.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn selected_definition_semantics_for_mount(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -511,6 +513,7 @@ impl SelectedResolutionMountInventory<'_> {
 
     /// Hydrate one immutable blob's declaration crosswalk. An overlay reader
     /// uses its masked file version to locate the persisted base explicitly.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn hierarchy_definition_semantics_for_mount(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -531,6 +534,7 @@ impl SelectedResolutionMountInventory<'_> {
         self.read_definition_semantics(blob, &DEFINITION_SEMANTICS_SQL, cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_definition_semantics(
         &self,
         blob: i64,
@@ -620,6 +624,7 @@ impl SelectedResolutionMountInventory<'_> {
 
     /// See [`SELECTED_MACRO_ITEM_UNIT_SQL`]. `None` when cancelled; an empty
     /// row when the staged definition is not a crate-declared item.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn selected_macro_item_unit(
         &self,
         host: SelectedResolutionMountOrdinal,
@@ -681,6 +686,7 @@ impl SelectedResolutionMountInventory<'_> {
         self.read_selected_units_by_coordinate(sql, definitions, cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_selected_units_by_coordinate(
         &self,
         sql: &str,

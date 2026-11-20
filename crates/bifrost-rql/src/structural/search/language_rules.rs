@@ -1,5 +1,6 @@
 use super::results::{CodeQueryDiagnostic, CodeQueryDiagnosticImpact};
 use crate::analyzer::{ProjectFile, Range};
+use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
 
 /// Result of one language-owned relation over one source file.
 ///
@@ -52,16 +53,31 @@ impl LanguageRuleMatch {
 pub(super) struct UndecidedSite {
     site: String,
     reason: &'static str,
+    /// The operational stop behind the reason; `None` for a gap in what the
+    /// analysis models (Content).
+    cause: Option<DerivationExecutionCause>,
 }
 
 impl UndecidedSite {
     pub(super) fn at(range: Range, reason: &'static str) -> Self {
         Self {
-            site: format!(
-                "lines {}-{} bytes {}..{}",
-                range.start_line, range.end_line, range.start_byte, range.end_byte
-            ),
+            site: range_label(range),
             reason,
+            cause: None,
+        }
+    }
+
+    /// A site that an operational stop (cancellation, a budget, a provider
+    /// that could not answer) left undecided.
+    pub(super) fn stopped(
+        range: Range,
+        reason: &'static str,
+        cause: DerivationExecutionCause,
+    ) -> Self {
+        Self {
+            site: range_label(range),
+            reason,
+            cause: Some(cause),
         }
     }
 
@@ -69,8 +85,16 @@ impl UndecidedSite {
         Self {
             site: super::rel_path_string(file),
             reason,
+            cause: None,
         }
     }
+}
+
+fn range_label(range: Range) -> String {
+    format!(
+        "lines {}-{} bytes {}..{}",
+        range.start_line, range.end_line, range.start_byte, range.end_byte
+    )
 }
 
 impl LanguageRuleMatches {
@@ -103,6 +127,10 @@ impl LanguageRuleMatches {
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             })],
         }
     }
@@ -138,19 +166,39 @@ impl LanguageRuleMatches {
                 diagnostics: Vec::new(),
             };
         }
-        let sites = undecided
-            .iter()
-            .map(|site| format!("{}: {}", site.site, site.reason))
-            .collect::<Vec<_>>();
-        let message = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
-            format_args!(
-                "{rule} is incomplete for {}: the relation could not be decided at {sites:?}",
-                super::rel_path_string(file),
-            ),
-            format_args!("{rule} is incomplete for {}", super::rel_path_string(file)),
-            sites.iter(),
-        );
-        Self::incomplete(matches, language, message)
+        // One diagnostic per cause, so an operational stop is never reported
+        // as a content gap or merged with one.
+        let mut causes = undecided.iter().map(|site| site.cause).collect::<Vec<_>>();
+        causes.sort_unstable();
+        causes.dedup();
+        let mut result = Self {
+            matches,
+            diagnostics: Vec::new(),
+        };
+        for cause in causes {
+            let sites = undecided
+                .iter()
+                .filter(|site| site.cause == cause)
+                .map(|site| format!("{}: {}", site.site, site.reason))
+                .collect::<Vec<_>>();
+            let message = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "{rule} is incomplete for {}: the relation could not be decided at {sites:?}",
+                    super::rel_path_string(file),
+                ),
+                format_args!("{rule} is incomplete for {}", super::rel_path_string(file)),
+                sites.iter(),
+            );
+            let mut diagnostics =
+                Self::incomplete(Vec::<Range>::new(), language, message).diagnostics;
+            if let Some(cause) = cause {
+                for diagnostic in &mut diagnostics {
+                    diagnostic.incompleteness = super::results::Incompleteness::Operational(cause);
+                }
+            }
+            result.diagnostics.extend(diagnostics);
+        }
+        result
     }
 }
 
@@ -164,7 +212,6 @@ pub(super) fn selected_syntax(
     LanguageRuleMatches,
 > {
     use crate::analyzer::common::language_for_file;
-    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
     use brokk_bifrost_analysis::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
     let language = language_for_file(file);
     let outcome = analyzer

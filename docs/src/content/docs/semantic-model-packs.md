@@ -521,12 +521,21 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports: `2`
-through `22`, or `26` through `40`. Versions `23`, `24`, and `25` are explicitly unsupported.
+through `22`, `26` through `32`, `35`, `37` through `41`, or `43` through `45`. All gaps are unsupported.
 The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
+
+Schema `43` adds optional class `is_final` to declaration facts and generator
+emissions. True proves class finality, false records a non-final declaration,
+and null/absence is unknown. New JVM producers read class access flags and
+retain `PermittedSubclasses` separately in `is_sealed`; legacy JVM records
+below 43 keep their combined sealed-or-final bit. Complete declaration JSON
+carries the optional scalar through compiled shards and catalog rows.
+
+Schema `41` adds optional `Signature.bounds`. An absent field means unknown; a present list records all declared signature predicates. A parameter absent from that list is unbounded. JVM class-file producers retain method type-parameter bounds and select schema `41` when they emit them.
 
 Schema `40` adds optional `rust_stability` on Rust type, member and implemented-trait facts. A certificate records a stable release, a nonempty sorted unstable feature set, or an uncertified result. Missing evidence remains uncertified; non-Rust packs cannot carry this field. Rust dependency production uses schema `40`.
 
@@ -538,7 +547,7 @@ path against the bound authoritative declaration. An unbound target or a failed
 check refuses that transfer with a typed diagnostic naming the pack and record;
 the rest of the pack applies. Pack repositories should test activation against
 the pinned standard-library pack in CI before release. Aggregate-to-all-fields propagation is rejected; select each intended
-field explicitly. See [endpoint paths](./reference/semantic-packs/#endpoint-paths-schema-35)
+field explicitly. See [endpoint paths](./reference/semantic-packs/#endpoint-paths-schemas-35-and-37)
 for the JSON steps and `Result::Ok` payload examples.
 
 Schema `32` carries optional structured `alias_target` facts over each alias's
@@ -611,7 +620,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v40.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v40.schema.json).
+[`schemas/semantic-model-pack-v45.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v45.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen
@@ -1182,6 +1191,30 @@ and authoring validation rejects the claim on variadic members until their
 multi-arity completeness can be represented explicitly. Omit the field (its
 default is `false`) whenever that exact family has not been exhaustively
 reviewed.
+
+An authored member may also set `target_independent: true` (schema 44, only
+beside `callable_family_complete`) to state, as a reviewed claim, that the
+family has the same members on every target the declared toolchain builds for.
+When a standard-library pack is activated approximately because the project's
+target is unknown, the authored family claim survives only if it declares
+`target_independent` and the target is the only uncertainty. A claim never
+survives an unknown toolchain version, an unverified standard-library build
+mode, or a nearby-version dependency artifact. Generated and extraction packs
+cannot carry the field, and validation rejects it there.
+
+A Rust inherent member may record `inherent_impl_self_arguments` (schema 45):
+the type arguments of the impl block that declares it, one for each type
+parameter of the owner. A parameter of the impl block is a `type_parameter`,
+whatever its bounds, so `impl<R: Read + Seek> ZipArchive<R>` records
+`[{"kind": "type_parameter", "name": "R"}]`; an impl for one instantiation
+records the type it fixes. Without this evidence Bifrost does not select an
+inherent member when the receiver's type arguments are unknown, because a
+member declared on `impl Owner<u8>` does not apply to every `Owner<T>`: the call
+stays unresolved and the run is inconclusive. With it, the call binds when the
+family is `callable_family_complete` and every inherent member of that name
+records pairwise distinct impl parameters. This covers a receiver whose
+argument type no active pack declares, and a constructor path such as
+`Archive::new(reader)` that writes no type arguments.
 
 <!-- semantic-model-doc-test:tests/fixtures/semantic-model-packs/declarations-v1.yaml -->
 ```yaml

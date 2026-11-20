@@ -9,8 +9,8 @@ use super::demand_closure::*;
 use super::package_context::SelectedPackageRows;
 use super::*;
 use crate::analyzer::resolution::{
-    DemandReferenceKey, DemandRootUnavailableReason, EndpointSignature, FactResolutionAnswer,
-    SharedNameInterner,
+    DemandMemberSelectionRequest, DemandReferenceKey, DemandRootUnavailableReason,
+    EndpointSignature, FactResolutionAnswer, SharedNameInterner,
 };
 use crate::analyzer::store::WorkspaceSnapshotId;
 use crate::analyzer::store::resolution_lexical::NodeSourceScopes;
@@ -26,7 +26,6 @@ pub const NAMESPACE_ROUTE: &str = "SELECT s.spelling FROM main.resolution_packag
  LEFT JOIN main.resolution_package_route_segments s ON s.blob_id=r.blob_id AND s.package_scope_node_key=r.package_scope_node_key
  WHERE r.blob_id=?1 AND r.package_scope_node_key=?2 ORDER BY s.ordinal";
 
-// The declaration extractor records only authored base-list entries here.
 pub const TYPE_WITH_EXPLICIT_BASES: &str = "SELECT unit.identifier
  FROM main.resolution_member_scope_properties AS scope
  CROSS JOIN main.resolution_semantic_sites AS semantic
@@ -39,6 +38,28 @@ pub const TYPE_WITH_EXPLICIT_BASES: &str = "SELECT unit.identifier
  WHERE scope.blob_id=?1 AND scope.scope_head_node_key=?2 AND scope.scope_kind='type_body'
  AND EXISTS(SELECT 1 FROM main.unit_supertypes AS base
  WHERE base.blob_id=unit.blob_id AND base.unit_key=unit.unit_key)";
+
+// Native parents prove authored presence. A missing declaration projection,
+// or written bases without native parent facts, cannot prove an empty set.
+pub const TYPE_INHERITANCE_OWNER: &str = "SELECT scope.definition_semantic_key,
+ CASE
+ WHEN EXISTS(SELECT 1 FROM main.resolution_supertypes parent
+   WHERE parent.blob_id=scope.blob_id AND parent.definition=scope.definition_semantic_key) THEN 1
+ WHEN MAX(unit.unit_key IS NOT NULL)=0 THEN NULL
+ WHEN MAX(EXISTS(SELECT 1 FROM main.unit_supertypes base
+   WHERE base.blob_id=unit.blob_id AND base.unit_key=unit.unit_key))=1 THEN NULL
+ ELSE 0 END
+ FROM main.resolution_member_scope_properties AS scope
+ LEFT JOIN main.resolution_semantic_sites AS semantic
+ ON semantic.blob_id=scope.blob_id AND semantic.semantic_key=scope.definition_semantic_key AND semantic.semantic_role='definition'
+ LEFT JOIN main.source_native_declaration_bridges AS native
+ ON native.blob_id=semantic.blob_id AND native.source_site=semantic.source_site
+ LEFT JOIN main.source_declaration_units AS mapping
+ ON mapping.blob_id=native.blob_id AND mapping.declaration_id=native.declaration_id
+ LEFT JOIN main.code_units AS unit
+ ON unit.blob_id=mapping.blob_id AND unit.unit_key=mapping.unit_key AND unit.kind=0
+ WHERE scope.blob_id=?1 AND scope.scope_head_node_key=?2 AND scope.scope_kind='type_body'
+ GROUP BY scope.definition_semantic_key";
 
 const METHOD_OWNER_HEAD: &str = "SELECT member_name, owner_scope_head_node_key
  FROM main.resolution_member_owner_properties
@@ -71,6 +92,58 @@ pub struct CSharpUsingTierGap {
     pub namespace: Option<Vec<String>>,
 }
 
+#[derive(Debug)]
+struct CSharpNestedTypeHierarchy;
+static CSHARP_NESTED_TYPE_HIERARCHY: CSharpNestedTypeHierarchy = CSharpNestedTypeHierarchy;
+impl crate::analyzer::resolution::HierarchyPolicy for CSharpNestedTypeHierarchy {
+    fn identity(&self) -> crate::analyzer::resolution::HierarchyPolicyId {
+        crate::analyzer::resolution::HierarchyPolicyId(0x4353_0001)
+    }
+    fn edge_provider(&self) -> &'static dyn crate::analyzer::resolution::HierarchyEdgeProvider {
+        &CSHARP_NESTED_TYPE_HIERARCHY
+    }
+    fn includes_parent_kind(
+        &self,
+        kind: Option<crate::analyzer::resolution::ClassifiedSupertypeKind>,
+    ) -> bool {
+        matches!(
+            kind,
+            Some(crate::analyzer::resolution::ClassifiedSupertypeKind::Superclass)
+        )
+    }
+}
+
+// Nested lookup follows written class parents. Implicit-root nested lookup
+// already fell through to namespaces on the merge base; #12698 owns that
+// pre-existing source-corlib gap and its required absence-proof contract.
+impl crate::analyzer::resolution::HierarchyEdgeProvider for CSharpNestedTypeHierarchy {
+    fn implicit_base(
+        &self,
+        owner: SemanticId,
+        written: &[crate::analyzer::resolution::fact_resolution::WrittenHierarchyBase<'_>],
+        source: &dyn crate::analyzer::resolution::SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::analyzer::resolution::ImplicitBaseRead>> {
+        // Reuse the explicit provider's empty implicit-base answer, bypassing
+        // its language-specific implicit-reference preparation.
+        crate::analyzer::resolution::HierarchyPolicy::edge_provider(
+            &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
+        )
+        .implicit_base(owner, written, source, cancellation)
+    }
+}
+
+struct CSharpNestedTypeMember {
+    definition: SemanticId,
+    endpoint: BindingNodeId,
+    completion: ResolutionCompletion,
+}
+enum CSharpNestedOwner {
+    Class,
+    Empty,
+    Open(&'static str),
+}
+
 struct CSharpCallerDemand;
 struct CSharpDemandInstaller;
 
@@ -83,6 +156,7 @@ impl DemandInstall for CSharpDemandInstaller {
         Ok(ready.certified_csharp_view()?.is_some())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn selected_target_completion(
         &self,
         preparation: &dyn std::any::Any,
@@ -141,6 +215,7 @@ impl DemandInstall for CSharpDemandInstaller {
         ]))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_caller(
         &self,
         operation: &SelectedResolutionOperation<'_, '_>,
@@ -233,6 +308,7 @@ impl DemandInstall for CSharpDemandInstaller {
             using_gaps: &using_gaps,
             external_gaps: &external_gaps,
             external_observations: std::cell::Cell::new(0),
+            placement_answers: RefCell::new(HashMap::default()),
             arena: &arena,
             #[cfg(any(test, feature = "test-support"))]
             visited: &visited,
@@ -250,6 +326,7 @@ impl DemandInstall for CSharpDemandInstaller {
             completion: &ResolutionCompletion::Complete,
         };
         let mut provider = DemandProvider::new(shared);
+        let blueprint = super::csharp_access::with_declaration_access(ready, blueprint.clone());
         match artifacts {
             Some(artifacts) => blueprint.with_forward_operation_in_session_using_artifacts(
                 &source,
@@ -287,6 +364,9 @@ struct CSharpRules<'a, 'store, 'input> {
     // Query-local observation history, not authority or a cross-request cache.
     // Count attempts too: distinct directives can share a deduplicated reason.
     external_observations: std::cell::Cell<u64>,
+    // Placement agreement survives rebuilding the borrowed half after a wait.
+    // These are the existing point-query results, never cross-request authority.
+    placement_answers: RefCell<HashMap<(CandidatePathIdentity, i64), CSharpPlacementAnswer>>,
     arena: &'a RefCell<super::demand::ClosedRelations>,
     #[cfg(any(test, feature = "test-support"))]
     visited: &'a RefCell<Vec<Option<Vec<String>>>>,
@@ -438,15 +518,14 @@ impl CSharpImportTarget {
         Ok(target)
     }
 }
+type CSharpPlacementAnswer = (String, HashSet<SemanticId>);
+
 struct CSharpHalf<'a, 'store, 'input> {
     rules: &'a CSharpRules<'a, 'store, 'input>,
     source: &'a SourceHalf,
     fragment: BindingFragmentId,
     scope: ResolutionScopeId,
     placements: Vec<CSharpUnitPlacement>,
-    // Derived results for this source-half query only, never authority or a
-    // cross-request memo. Empty placements participate in agreement too.
-    answers: RefCell<HashMap<i64, (String, HashSet<SemanticId>)>>,
     units: RefCell<CSharpUnitReader<'a, 'store>>,
     open: Option<OpenHalf>,
 }
@@ -455,7 +534,7 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
     type Target = RouteLocation;
     type Member = ();
     type Provider = ();
-    type MemberRow = ();
+    type MemberRow = CSharpNestedTypeMember;
     type PlacementObservations = CollectedPlacementObservations;
     type Rank = Rank;
     type Half<'a>
@@ -561,6 +640,7 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
                 .certified_csharp_view()?
                 .ok_or_else(|| StoreError::corrupt("C# demand lost certified view"))?,
             &self.ready.context_identities,
+            self.ready.csharp_services()?,
         )?;
         if let SelectedCSharpMembership::Proven(membership) =
             units.compilation_membership(record.persisted_relative_path())?
@@ -720,12 +800,26 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
             source,
             fragment: *fragment,
             scope: *scope,
-            placements: if open.is_some() {
-                Vec::new()
-            } else {
+            // Ordinary member source halves may enumerate their selected
+            // placements, but cannot prove access before declaration rules do.
+            placements: if open.is_none()
+                || (!source.is_import
+                    && matches!(
+                        source.anchor,
+                        ResolutionRootImportAnchor::Lexical
+                            | ResolutionRootImportAnchor::Absolute
+                            | ResolutionRootImportAnchor::AliasQualified
+                    )
+                    && matches!(
+                        source.demand.namespace(),
+                        ResolutionNamespace::Callable
+                            | ResolutionNamespace::Value
+                            | ResolutionNamespace::TypeOrValue
+                    )) {
                 placements
+            } else {
+                Vec::new()
             },
-            answers: RefCell::new(HashMap::default()),
             units: RefCell::new(units),
             open,
         }))
@@ -736,7 +830,7 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
     type Target = RouteLocation;
     type Member = ();
     type Provider = ();
-    type MemberRow = ();
+    type MemberRow = CSharpNestedTypeMember;
     type Rank = Rank;
     type LexicalTiers = Vec<LexicalStartTier<Rank, ()>>;
     fn language(&self) -> Language {
@@ -780,16 +874,21 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
             self.placement_disagreement()
                 .map(ResolutionIncompleteReason::UnsupportedSemantic),
         );
-        (!reasons.is_empty()).then(|| ResolutionCompletion::incomplete(reasons))
+        let mut completion = self.initial_completion();
+        if !reasons.is_empty() {
+            completion = completion.combine(&ResolutionCompletion::incomplete(reasons));
+        }
+        (completion != ResolutionCompletion::Complete).then_some(completion)
     }
     fn placement(
         &self,
         placement: &Self::Placement,
         tag: ClosureTag,
     ) -> Option<PlacementFacts<Self::Target>> {
-        self.answers
+        self.rules
+            .placement_answers
             .borrow_mut()
-            .entry(placement.compilation_id)
+            .entry((self.source.identity, placement.compilation_id))
             .or_insert_with(|| {
                 (
                     super::super::csharp_compilation::framework_qualified_label(
@@ -803,7 +902,9 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
             });
         Some(PlacementFacts {
             tag,
-            completion: ResolutionCompletion::Complete,
+            // Every target/export proof derived by the shared driver inherits
+            // this access gap, independently of initial/endpoint observation.
+            completion: self.initial_completion(),
             targets: Vec::new(),
             members: Vec::new(),
         })
@@ -826,6 +927,232 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
             self.rules.cancellation,
         )
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn lexical_member_request(
+        &self,
+        _: &Self::Placement,
+        scope: ResolutionScopeId,
+        lookup: &ResolutionLookupSemanticRecipe,
+    ) -> Result<Read<Option<DemandMemberSelectionRequest>>> {
+        if lookup.namespace() != ResolutionNamespace::Type {
+            return Ok(Read::ready(None));
+        }
+        let rules = self.rules;
+        if rules.cancellation.is_cancelled() || !rules.session.scope_step() {
+            return Ok(Read::Cancelled(cancelled_completion()));
+        }
+        let lexical = rules.ready.lexical_source();
+        let Some(head) = lexical.scope_head_node_of(self.fragment, scope, rules.cancellation)?
+        else {
+            return Ok(Read::Cancelled(cancelled_completion()));
+        };
+        let mount =
+            rules
+                .ready
+                .inventory
+                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(
+                    self.fragment.ordinal(),
+                ))?;
+        // This lookup models written parents only, matching baseline implicit
+        // root behavior. #12698 tracks source-defined implicit-root lookup.
+        let owner = rules
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(TYPE_INHERITANCE_OWNER)?
+            .query_row(
+                rusqlite::params![mount.blob_id(), head.local_key()],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<bool>>(1)?)),
+            )
+            .optional()?;
+        let Some((owner, has_authored_bases)) = owner else {
+            return Ok(Read::ready(None));
+        };
+        let owner = SemanticId::local(self.fragment.ordinal(), owner);
+        let typed = rules.ready.typed_source();
+        // The producer keeps this owner's formals in the immediately enclosing
+        // header scope. Let that lexical tier bind before asking inherited types.
+        if let Some(parent) =
+            lexical.lookup_scope_parent(self.fragment, scope, rules.cancellation)?
+        {
+            let Some(parent_head) =
+                lexical.scope_head_node_of(self.fragment, parent, rules.cancellation)?
+            else {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            };
+            let Some((paths, _)) = scope_binding_paths(
+                rules.base,
+                parent_head,
+                lookup.semantic(&rules.ready.shared_names()),
+                rules.cancellation,
+            )?
+            else {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            };
+            let mut definitions = Vec::new();
+            for path in paths {
+                if rules.cancellation.is_cancelled() || !rules.session.scope_step() {
+                    return Ok(Read::Cancelled(cancelled_completion()));
+                }
+                if !path.end().symbols().fixed().is_empty() {
+                    continue;
+                }
+                for row in rules
+                    .base
+                    .classify_endpoint_nodes(&[path.end().node()], rules.cancellation)?
+                {
+                    if let Some(definition) = row.definition() {
+                        definitions.push(definition);
+                    }
+                }
+            }
+            definitions.sort_unstable();
+            definitions.dedup();
+            let Some(parameters) =
+                typed.generic_parameter_declarations(&definitions, rules.cancellation)?
+            else {
+                return Ok(if rules.cancellation.is_cancelled() {
+                    Read::Cancelled(cancelled_completion())
+                } else {
+                    self.inherited_types_open(
+                        scope,
+                        "the enclosing formal inventory is unavailable",
+                    )
+                });
+            };
+            if !parameters.is_empty() {
+                return Ok(Read::ready(None));
+            }
+        }
+
+        let Some(source) = typed.declaration_source_facts(owner, rules.cancellation)? else {
+            return Ok(if rules.cancellation.is_cancelled() {
+                Read::Cancelled(cancelled_completion())
+            } else {
+                self.inherited_types_open(scope, "selected owner source facts are unavailable")
+            });
+        };
+        match self.nested_type_owner(source, has_authored_bases)? {
+            Read::Ready {
+                value: CSharpNestedOwner::Class,
+                completion,
+            } => Ok(Read::Ready {
+                value: Some(self.nested_type_request(owner, lookup)),
+                completion,
+            }),
+            Read::Ready {
+                value: CSharpNestedOwner::Empty,
+                completion,
+            } => Ok(Read::Ready {
+                value: None,
+                completion,
+            }),
+            Read::Ready {
+                value: CSharpNestedOwner::Open(evidence),
+                ..
+            } => Ok(self.inherited_types_open(scope, evidence)),
+            Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+            Read::Unavailable { reason, completion } => {
+                Ok(Read::Unavailable { reason, completion })
+            }
+        }
+    }
+
+    fn lexical_member_reply(
+        &self,
+        placement: &Self::Placement,
+        _: ResolutionScopeId,
+        depth: u32,
+        lookup: &ResolutionLookupSemanticRecipe,
+        owner: SemanticId,
+        _: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
+    ) -> Result<Read<HalfLexicalMemberTiers<Self>>> {
+        match self.nested_type_rows(placement, lookup, owner)? {
+            Read::Ready {
+                value: rows,
+                completion,
+            } => {
+                let edges = rows
+                    .into_iter()
+                    .map(|row| RouteLocation::Owner {
+                        definition: row.definition,
+                        scope: Some(row.endpoint),
+                    })
+                    .collect();
+                Ok(Read::ready(vec![LexicalStartTier {
+                    ranked: RankedLexicalTier {
+                        rank: Rank { depth, rank: 0 },
+                        tier: RouteEdgeTier {
+                            edges,
+                            coverage: completion,
+                            ..Default::default()
+                        },
+                        providers: Vec::new(),
+                    },
+                    head: None,
+                }]))
+            }
+            Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+            Read::Unavailable { reason, completion } => {
+                Ok(Read::Unavailable { reason, completion })
+            }
+        }
+    }
+
+    fn terminal_member_request(
+        &self,
+        placement: &Self::Placement,
+        context: &SourceTargetContext<'_, Self::Rank>,
+    ) -> Result<Read<Option<DemandMemberSelectionRequest>>> {
+        // An unqualified lexical hit already names the requested type. Only a
+        // qualified route still needs a member of its selected owner here.
+        if self.source.route.is_empty() {
+            return Ok(Read::ready(None));
+        }
+        let route = CSharpRouteRules {
+            half: self,
+            fragment: self.fragment,
+            placement,
+        };
+        route.member_request(context.cursor, context.lookup)
+    }
+
+    fn member_rows(
+        &self,
+        placement: &Self::Placement,
+        context: &MemberRouteContext<'_, Self::Rank>,
+        owner: SemanticId,
+    ) -> Result<Read<Vec<Self::MemberRow>>> {
+        self.nested_type_rows(placement, context.lookup, owner)
+    }
+
+    fn member_target(
+        &self,
+        _: &Self::Placement,
+        context: &MemberRouteContext<'_, Self::Rank>,
+        row: &Self::MemberRow,
+    ) -> Result<Read<Option<SelectedMemberRouteTarget>>> {
+        Ok(Read::ready(Some(SelectedMemberRouteTarget {
+            target: SelectedMemberTarget {
+                fragment: BindingFragmentId::at_ordinal(
+                    row.endpoint
+                        .ordinal()
+                        .expect("source nested type has a fragment"),
+                ),
+                token: row.definition,
+                definition: row.endpoint,
+                lookup: context.lookup.clone(),
+                completion: row.completion.clone(),
+            },
+            location: RouteLocation::Owner {
+                definition: row.definition,
+                scope: Some(row.endpoint),
+            },
+            namespace: ResolutionNamespace::Type,
+            material: BridgeMaterial::same_language(Language::CSharp),
+        })))
+    }
+
     fn lexical_tier(
         &self,
         placement: &Self::Placement,
@@ -1135,7 +1462,7 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
         if self.rules.cancellation.is_cancelled() {
             return Ok(None);
         }
-        let mut completion = observation.completion.clone();
+        let mut completion = context_publishable_qualifier_completion(&observation.completion);
         let has_external_gap = self
             .rules
             .external_gaps
@@ -1191,15 +1518,152 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
 }
 
 impl CSharpHalf<'_, '_, '_> {
+    fn inherited_types_open(
+        &self,
+        scope: ResolutionScopeId,
+        evidence: &str,
+    ) -> Read<Option<DemandMemberSelectionRequest>> {
+        let reason = self.record_obligation(scope, "csharp_inherited_types_unmodeled", evidence);
+        // An open simple-name tier retains its reason while outer lexical
+        // tiers may still supply best-effort candidates.
+        Read::Ready {
+            value: None,
+            completion: ResolutionCompletion::incomplete([
+                crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(
+                    reason,
+                ),
+            ]),
+        }
+    }
+
+    fn nested_type_owner(
+        &self,
+        source: super::super::resolution_typed::SelectedDeclarationSourceFacts,
+        has_authored_bases: Option<bool>,
+    ) -> Result<Read<CSharpNestedOwner>> {
+        use crate::analyzer::resolution::NominalParentTargetKind as Kind;
+        use crate::analyzer::resolution::fact_source::SelectedTypedFactSource;
+        if source.partial != Some(false) {
+            return Ok(Read::ready(CSharpNestedOwner::Open(
+                "inherited nested-type inventory is unproven for a partial or unestablished owner",
+            )));
+        }
+        if has_authored_bases == Some(false) {
+            return Ok(Read::ready(CSharpNestedOwner::Empty));
+        }
+        let typed = self.rules.ready.typed_source();
+        let Some(kinds) =
+            typed.nominal_parent_target_kinds(&[source.definition], self.rules.cancellation)?
+        else {
+            return Ok(if self.rules.cancellation.is_cancelled() {
+                Read::Cancelled(cancelled_completion())
+            } else {
+                Read::ready(CSharpNestedOwner::Open(
+                    "selected owner kind is unavailable",
+                ))
+            });
+        };
+        let [(selected, kind)] = kinds.as_slice() else {
+            panic!("one owner has one kind result: {kinds:?}");
+        };
+        assert_eq!(*selected, source.definition);
+        Ok(Read::ready(match kind {
+            Kind::Class if has_authored_bases == Some(true) => CSharpNestedOwner::Class,
+            Kind::Class => CSharpNestedOwner::Open("authored parent inventory is unavailable"),
+            Kind::Struct | Kind::Enum | Kind::NonBase => CSharpNestedOwner::Empty,
+            Kind::Interface => {
+                CSharpNestedOwner::Open("interface-inherited nested types are not modeled")
+            }
+            Kind::Missing | Kind::Ambiguous | Kind::Incomplete => {
+                CSharpNestedOwner::Open("inherited nested types require a proven class owner")
+            }
+        }))
+    }
+
+    fn nested_type_request(
+        &self,
+        owner: SemanticId,
+        lookup: &ResolutionLookupSemanticRecipe,
+    ) -> DemandMemberSelectionRequest {
+        let lookup = ResolutionLookupSemanticRecipe::new_in_domain(
+            lookup.identity_domain(),
+            ResolutionNamespace::Type,
+            lookup.spelling(),
+        )
+        .semantic(&self.rules.ready.shared_names());
+        DemandMemberSelectionRequest {
+            policy: &CSHARP_NESTED_TYPE_HIERARCHY,
+            order: None,
+            reference: self.source.token,
+            values: vec![
+                crate::analyzer::resolution::ResolutionSlotValue::type_object(
+                    crate::analyzer::resolution::ResolutionTypeRef::new(owner, 0),
+                ),
+            ],
+            lookup,
+            namespace: ResolutionNamespace::Type,
+            language: Language::CSharp,
+        }
+    }
+
+    fn nested_type_rows(
+        &self,
+        placement: &CSharpUnitPlacement,
+        lookup: &ResolutionLookupSemanticRecipe,
+        owner: SemanticId,
+    ) -> Result<Read<Vec<CSharpNestedTypeMember>>> {
+        let route = CSharpRouteRules {
+            half: self,
+            fragment: self.fragment,
+            placement,
+        };
+        match route.step(
+            &RouteLocation::Owner {
+                definition: owner,
+                scope: None,
+            },
+            lookup,
+        )? {
+            Read::Ready { value, completion } => {
+                let completion = completion.combine(&value.coverage);
+                let mut rows = Vec::new();
+                for edge in value.edges {
+                    let RouteLocation::Owner {
+                        definition,
+                        scope: Some(endpoint),
+                    } = edge
+                    else {
+                        panic!("a nested type has its exact source endpoint");
+                    };
+                    rows.push(CSharpNestedTypeMember {
+                        definition,
+                        endpoint,
+                        completion: completion.clone(),
+                    });
+                }
+                Ok(Read::Ready {
+                    value: rows,
+                    completion,
+                })
+            }
+            Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+            Read::Unavailable { reason, completion } => {
+                Ok(Read::Unavailable { reason, completion })
+            }
+        }
+    }
+
     fn placement_disagreement(&self) -> Option<SemanticId> {
-        let answers = self.answers.borrow();
-        let (_, first) = answers.values().next()?;
-        if answers.values().all(|(_, selected)| selected == first) {
+        let all_answers = self.rules.placement_answers.borrow();
+        let answers = all_answers
+            .iter()
+            .filter(|((source, _), _)| *source == self.source.identity);
+        let (_, (_, first)) = answers.clone().next()?;
+        if answers.clone().all(|(_, (_, selected))| selected == first) {
             return None;
         }
         let mut ordered = answers
-            .iter()
-            .map(|(id, (name, selected))| {
+            .map(|((_, id), (name, selected))| {
                 let mut targets = selected.iter().copied().collect::<Vec<_>>();
                 targets.sort_unstable();
                 (*id, name.as_str(), targets)
@@ -1223,9 +1687,10 @@ impl CSharpHalf<'_, '_, '_> {
         Some(reason)
     }
     fn record_target(&self, placement: &CSharpUnitPlacement, definition: SemanticId) {
-        self.answers
+        self.rules
+            .placement_answers
             .borrow_mut()
-            .get_mut(&placement.compilation_id)
+            .get_mut(&(self.source.identity, placement.compilation_id))
             .expect("placement registered before reading its targets")
             .1
             .insert(definition);
@@ -1398,6 +1863,7 @@ impl CSharpHalf<'_, '_, '_> {
         })
     }
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn alias_tier(
         &self,
         fragment: BindingFragmentId,
@@ -1590,6 +2056,7 @@ impl CSharpHalf<'_, '_, '_> {
         }))
     }
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn alias_qualified_tiers(
         &self,
         fragment: BindingFragmentId,
@@ -1678,6 +2145,7 @@ impl CSharpHalf<'_, '_, '_> {
         }]))
     }
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn lookup_tiers(
         &self,
         fragment: BindingFragmentId,
@@ -1768,7 +2236,7 @@ impl CSharpHalf<'_, '_, '_> {
                     }
                 }
             }
-            if tier.edges.is_empty() {
+            if tier.edges.is_empty() && lookup.namespace() != ResolutionNamespace::Type {
                 let mut statement = rules
                     .ready
                     .inventory
@@ -1779,9 +2247,9 @@ impl CSharpHalf<'_, '_, '_> {
                     |row| row.get::<_, String>(0),
                 )?;
                 for name in types {
-                    // Inherited nested types are M6, including source bases.
-                    // Without an explicit base list the implicit System.Object,
-                    // System.ValueType or System.Enum base has no nested types.
+                    // Ambiguous value/type lookup still lacks inherited value-member proof.
+                    // This tier follows written class parents. #12698 owns the
+                    // deferred nested lookup through source-defined implicit roots.
                     self.record_obligation(
                         scope,
                         "csharp_inherited_types_unmodeled",
@@ -1863,6 +2331,7 @@ impl CSharpHalf<'_, '_, '_> {
         Ok(Read::ready(tiers))
     }
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn using_tier(
         &self,
         fragment: BindingFragmentId,
@@ -2051,7 +2520,12 @@ impl CSharpHalf<'_, '_, '_> {
         }
         ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(reason)])
     }
-    fn record_obligation(&self, scope: ResolutionScopeId, label: &'static str, evidence: &str) {
+    fn record_obligation(
+        &self,
+        scope: ResolutionScopeId,
+        label: &'static str,
+        evidence: &str,
+    ) -> SemanticId {
         if label == "csharp_external_unindexed" {
             self.rules
                 .external_observations
@@ -2073,6 +2547,7 @@ impl CSharpHalf<'_, '_, '_> {
         if !gaps.contains(&gap) {
             gaps.push(gap);
         }
+        reason
     }
 }
 
@@ -2082,6 +2557,95 @@ struct CSharpRouteRules<'a, 'half, 'store, 'input> {
     placement: &'a CSharpUnitPlacement,
 }
 impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for CSharpRouteRules<'_, '_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn member_request(
+        &self,
+        cursor: &WalkCursor<T>,
+        lookup: &ResolutionLookupSemanticRecipe,
+    ) -> Result<Read<Option<DemandMemberSelectionRequest>>> {
+        if lookup.namespace() != ResolutionNamespace::Type {
+            return Ok(Read::ready(None));
+        }
+        let RouteLocation::Owner { definition, .. } = cursor.location else {
+            return Ok(Read::ready(None));
+        };
+        let rules = self.half.rules;
+        if rules.cancellation.is_cancelled() || !rules.session.scope_step() {
+            return Ok(Read::Cancelled(cancelled_completion()));
+        }
+        let typed = rules.ready.typed_source();
+        let Some(source) = typed.declaration_source_facts(definition, rules.cancellation)? else {
+            return Ok(if rules.cancellation.is_cancelled() {
+                Read::Cancelled(cancelled_completion())
+            } else {
+                Read::ready(None)
+            });
+        };
+        if source.partial != Some(false) {
+            return Ok(Read::ready(None));
+        }
+        match self.step(&cursor.location, lookup)? {
+            Read::Ready { value, completion }
+                if value.edges.is_empty()
+                    && value.coverage == ResolutionCompletion::Complete
+                    && completion == ResolutionCompletion::Complete => {}
+            Read::Ready { .. } | Read::Unavailable { .. } => return Ok(Read::ready(None)),
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+        }
+        let heads = match self.owner_heads(definition)? {
+            Read::Ready {
+                value,
+                completion: ResolutionCompletion::Complete,
+            } => value,
+            Read::Ready { .. } | Read::Unavailable { .. } => return Ok(Read::ready(None)),
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+        };
+        let mount =
+            rules
+                .ready
+                .inventory
+                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(
+                    definition
+                        .ordinal()
+                        .expect("selected source owner has a mounted coordinate"),
+                ))?;
+        let mut has_authored_bases = Some(false);
+        for head in heads {
+            if rules.cancellation.is_cancelled() || !rules.session.scope_step() {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            }
+            let row = rules
+                .ready
+                .inventory
+                .connection()
+                .prepare_cached(TYPE_INHERITANCE_OWNER)?
+                .query_row(
+                    rusqlite::params![mount.blob_id(), head.local_key()],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<bool>>(1)?)),
+                )
+                .optional()?;
+            let Some((owner, has_bases)) = row else {
+                return Ok(Read::ready(None));
+            };
+            assert_eq!(Some(owner), definition.local_key());
+            has_authored_bases = match (has_authored_bases, has_bases) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+        }
+        match self.half.nested_type_owner(source, has_authored_bases)? {
+            Read::Ready {
+                value: CSharpNestedOwner::Class,
+                completion,
+            } => Ok(Read::Ready {
+                value: Some(self.half.nested_type_request(definition, lookup)),
+                completion,
+            }),
+            Read::Ready { .. } | Read::Unavailable { .. } => Ok(Read::ready(None)),
+            Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+        }
+    }
     fn root_starts(
         &self,
         start: &WalkCursor<T>,
@@ -2127,6 +2691,7 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for CSharpRouteRules<'_, '_,
 }
 
 impl CSharpRouteRules<'_, '_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn step(
         &self,
         location: &RouteLocation,
@@ -2317,6 +2882,7 @@ impl CSharpRouteRules<'_, '_, '_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn missing(
         &self,
         location: &RouteLocation,
@@ -2442,9 +3008,467 @@ impl CSharpRouteRules<'_, '_, '_, '_> {
     }
 }
 
+/// Actual receiver result from the normal native demand/typed-worklist funnel.
+/// This test transport never constructs a slot, value, proof or completion.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CSharpReceiverFrontierProbe {
+    pub reference: SemanticId,
+    pub application: SemanticId,
+    pub receiver: SemanticId,
+    /// Producer-published syntax gaps, selected before the query can close them.
+    pub expected_receiver_syntax_gaps: std::collections::BTreeSet<SemanticId>,
+    pub answer: FactResolutionAnswer,
+}
+
+/// Select the published current-instance Receiver slot, then request that exact
+/// frontier through the existing native query-result mechanism. Unsupported or
+/// incomplete source authority yields no probe, rather than an invented value.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn probe_current_instance_receiver_frontier(
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    locator: &SelectedSemanticLocator,
+    cancellation: &CancellationToken,
+) -> Result<
+    Option<
+        SelectedResolutionOperationOutcome<SelectedResolutionLocated<CSharpReceiverFrontierProbe>>,
+    >,
+> {
+    use crate::analyzer::resolution::{
+        LoweredTypeTransfer, LoweringGapOrigin, ResolutionIncompleteReason, ResolutionQuery,
+        SelectedGapReasonProvenance, SelectedQualifiedRoute, SelectedTypedFactSource,
+        TypedFactInventoryEvidence, TypedFactReadOutcome, TypedFactRequest,
+    };
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionCallableReceiverOrigin, ResolutionGapKind, ResolutionTypeTransferKind,
+    };
+    if cancellation.is_cancelled() {
+        return Ok(Some(SelectedResolutionOperationOutcome::Cancelled(
+            cancelled_completion(),
+        )));
+    }
+    let complete_inventory = |outcome: TypedFactReadOutcome| {
+        outcome.is_exhausted()
+            && matches!(
+                outcome.inventory_evidence(),
+                TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete)
+            )
+            && outcome.into_parts().1 == ResolutionCompletion::Complete
+    };
+    let (reference, application, receiver, expected_receiver_syntax_gaps) = {
+        let ready = &operation.ready;
+        let lexical = ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = ready.typed_source();
+        let Some(source) = typed.selected_access_reference(reference, cancellation)? else {
+            return Ok(None);
+        };
+        if source.source.language != Language::CSharp || source.owner.flatten().is_none() {
+            return Ok(None);
+        }
+        let seeds =
+            lexical.lookup_reference_seeds(&[ResolutionQuery::new(reference)], cancellation)?;
+        if !seeds.is_exhausted()
+            || seeds.evidence() != &ResolutionCompletion::Complete
+            || seeds.rows().len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(seed) = seeds.rows()[0].seed() else {
+            return Ok(None);
+        };
+        let Some(metadata) = seed.site_metadata() else {
+            return Ok(None);
+        };
+        if metadata.receiver_origin() != Some(ResolutionCallableReceiverOrigin::CurrentInstance)
+            || metadata.reference_owner() != source.owner
+        {
+            return Ok(None);
+        }
+        let mut routes = Vec::new();
+        let outcome = typed.visit_qualified_route_pages_for_references(
+            TypedFactRequest::new(&[reference]),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedQualifiedRoute]| {
+                routes.extend_from_slice(page);
+                Ok(true)
+            }),
+        )?;
+        if !complete_inventory(outcome) {
+            return Ok(None);
+        }
+        let [route] = routes.as_slice() else {
+            return Ok(None);
+        };
+        if route.language() != Language::CSharp || route.row().reference() != reference {
+            return Ok(None);
+        }
+        let receiver = route.row().qualifier_slot();
+        let mut transfers = Vec::new();
+        let outcome = typed.visit_type_transfer_pages_to_targets(
+            TypedFactRequest::new(&[receiver]),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<LoweredTypeTransfer>]| {
+                transfers.extend_from_slice(page);
+                Ok(true)
+            }),
+        )?;
+        if !complete_inventory(outcome) {
+            return Ok(None);
+        }
+        let [transfer] = transfers.as_slice() else {
+            return Ok(None);
+        };
+        let transfer = transfer.row();
+        if transfer.kind() != ResolutionTypeTransferKind::Receiver
+            || transfer.rule().target_slot() != receiver
+            || !matches!(
+                transfer.rule().value_transform(),
+                crate::analyzer::resolution::TypeTransferValueTransform::ToRuntime {
+                    addressable: false
+                }
+            )
+        {
+            return Ok(None);
+        }
+        // This independent source oracle reads the already-selected raw rule,
+        // then exact producer provenance. It never uses the solver's discharged
+        // set, and runs before normal evaluation can close stage reasons.
+        let reasons = match transfer.rule().completion() {
+            ResolutionCompletion::Complete => Vec::new(),
+            ResolutionCompletion::Incomplete(reasons) => reasons
+                .iter()
+                .filter_map(|reason| match reason {
+                    ResolutionIncompleteReason::UnsupportedSemantic(reason) => Some(*reason),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        };
+        let mut expected_receiver_syntax_gaps = std::collections::BTreeSet::new();
+        for chunk in reasons.chunks(crate::analyzer::resolution::MAX_TYPED_FACT_REQUESTS_PER_BATCH)
+        {
+            let mut provenance = Vec::new();
+            let outcome = typed.visit_gap_reason_provenance_pages_for_reasons(
+                TypedFactRequest::new(chunk),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page: &[SelectedGapReasonProvenance]| {
+                    provenance.extend_from_slice(page);
+                    Ok(true)
+                }),
+            )?;
+            if !complete_inventory(outcome) {
+                return Ok(None);
+            }
+            for row in provenance {
+                if row.fragment() == seed.fragment()
+                    && row.source_site() == metadata.site()
+                    && row.origin()
+                        == LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedTypeSyntax)
+                {
+                    expected_receiver_syntax_gaps.insert(row.reason());
+                }
+            }
+        }
+        (
+            reference,
+            transfer.source_slot(),
+            receiver,
+            expected_receiver_syntax_gaps,
+        )
+    };
+    let outcome = probe_published_frontier(
+        operation,
+        locator,
+        reference,
+        receiver,
+        cancellation,
+        |answer| CSharpReceiverFrontierProbe {
+            reference,
+            application,
+            receiver,
+            expected_receiver_syntax_gaps,
+            answer,
+        },
+    )?;
+    Ok(Some(outcome))
+}
+
+/// Normal query transport shared by the two grammar-specific test selectors.
+#[cfg(any(test, feature = "test-support"))]
+fn probe_published_frontier<T>(
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    locator: &SelectedSemanticLocator,
+    reference: SemanticId,
+    slot: SemanticId,
+    cancellation: &CancellationToken,
+    project: impl FnOnce(FactResolutionAnswer) -> T,
+) -> Result<SelectedResolutionOperationOutcome<SelectedResolutionLocated<T>>> {
+    let context = operation.empty_contexts(&ResolutionCompletion::Complete)?;
+    let mut context_metrics = SelectedResolutionContextMetrics;
+    let session = ResolutionSession::unbounded();
+    operation.resolve_reference_with_projection(
+        NativeReferenceQuery {
+            context,
+            locator,
+            cancellation,
+            context_metrics: &mut context_metrics,
+            session: &session,
+            artifacts: None,
+            language_demand: NativeLanguageDemand::None,
+            selected_import_gap: None,
+            query_result_slot: Some(slot),
+            point_metrics: None,
+        },
+        |_, _, actual_reference, answer| {
+            assert_eq!(
+                actual_reference, reference,
+                "published frontier belongs to the located reference"
+            );
+            Ok(project(answer))
+        },
+    )
+}
+
+/// Independent expression output and outer receiver observations. The receiver
+/// is demanded first, before the supplementary input query can warm its state.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CSharpExpressionReceiverProbe {
+    pub reference: SemanticId,
+    pub owner: SemanticId,
+    pub input: SemanticId,
+    pub receiver: SemanticId,
+    pub transfer_completion: ResolutionCompletion,
+    /// Raw diagnostic inventory; it does not authorize a seed or a proof.
+    pub role_read: crate::analyzer::resolution::TypedFactReadOutcome,
+    pub observed_roles: Vec<SelectedTypedRow<crate::analyzer::resolution::LoweredTypedFrontier>>,
+    pub receiver_gap_provenance: Vec<crate::analyzer::resolution::SelectedGapReasonProvenance>,
+    pub receiver_answer:
+        SelectedResolutionOperationOutcome<SelectedResolutionLocated<FactResolutionAnswer>>,
+    pub input_answer:
+        SelectedResolutionOperationOutcome<SelectedResolutionLocated<FactResolutionAnswer>>,
+}
+
+/// Locate an actual ExplicitExpression route and its published Preserve input.
+/// Source inventory authority is checked independently of semantic row gaps;
+/// the latter are retained in the ordinary solver results, never discharged here.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn probe_expression_receiver_frontier(
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    locator: &SelectedSemanticLocator,
+    cancellation: &CancellationToken,
+) -> Result<Option<CSharpExpressionReceiverProbe>> {
+    use crate::analyzer::resolution::{
+        LoweredTypeTransfer, LoweredTypedFrontier, ResolutionQuery, SelectedGapReasonProvenance,
+        SelectedQualifiedRoute, SelectedTypedFactSource, TypeTransferValueTransform,
+        TypedFactInventoryEvidence, TypedFactReadOutcome, TypedFactRequest,
+    };
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionCallableReceiverOrigin, ResolutionSiteKind, ResolutionTypeTransferKind,
+    };
+    let complete_inventory = |outcome: TypedFactReadOutcome| {
+        outcome.is_exhausted()
+            && matches!(
+                outcome.inventory_evidence(),
+                TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete)
+            )
+            && outcome.into_parts().1 == ResolutionCompletion::Complete
+    };
+    let (reference, owner, input, receiver, transfer_completion, role_read, observed_roles) = {
+        let ready = &operation.ready;
+        let lexical = ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            eprintln!("EXPRESSION_PROBE_REFUSAL locator {locator:?}");
+            return Ok(None);
+        };
+        let typed = ready.typed_source();
+        let Some(source) = typed.selected_access_reference(reference, cancellation)? else {
+            eprintln!("EXPRESSION_PROBE_REFUSAL access_reference {reference:?}");
+            return Ok(None);
+        };
+        eprintln!(
+            "EXPRESSION_PROBE_ACCESS {reference:?} language={:?} owner={:?}",
+            source.source.language, source.owner
+        );
+        if source.source.language != Language::CSharp || source.owner.flatten().is_none() {
+            return Ok(None);
+        }
+        let owner = source
+            .owner
+            .flatten()
+            .expect("checked selected source owner");
+        let seeds =
+            lexical.lookup_reference_seeds(&[ResolutionQuery::new(reference)], cancellation)?;
+        eprintln!(
+            "EXPRESSION_PROBE_SEEDS {reference:?} exhausted={} evidence={:?} rows={}",
+            seeds.is_exhausted(),
+            seeds.evidence(),
+            seeds.rows().len()
+        );
+        if !seeds.is_exhausted()
+            || seeds.evidence() != &ResolutionCompletion::Complete
+            || seeds.rows().len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(metadata) = seeds.rows()[0].seed().and_then(|seed| seed.site_metadata()) else {
+            return Ok(None);
+        };
+        eprintln!("EXPRESSION_PROBE_METADATA {reference:?} {metadata:?}");
+        if metadata.site_kind() != ResolutionSiteKind::MemberReference
+            || metadata.receiver_origin()
+                != Some(ResolutionCallableReceiverOrigin::ExplicitExpression)
+            || metadata.reference_owner() != source.owner
+        {
+            return Ok(None);
+        }
+        let mut routes = Vec::new();
+        let outcome = typed.visit_qualified_route_pages_for_references(
+            TypedFactRequest::new(&[reference]),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedQualifiedRoute]| {
+                routes.extend_from_slice(page);
+                Ok(true)
+            }),
+        )?;
+        eprintln!("EXPRESSION_PROBE_ROUTES {reference:?} {outcome:?} {routes:?}");
+        if !complete_inventory(outcome) || routes.is_empty() {
+            return Ok(None);
+        }
+        let receiver = routes[0].row().qualifier_slot();
+        if routes.iter().any(|route| {
+            route.language() != Language::CSharp
+                || route.row().reference() != reference
+                || route.row().qualifier_slot() != receiver
+        }) {
+            return Ok(None);
+        }
+        let mut transfers = Vec::new();
+        let outcome = typed.visit_type_transfer_pages_to_targets(
+            TypedFactRequest::new(&[receiver]),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<LoweredTypeTransfer>]| {
+                transfers.extend_from_slice(page);
+                Ok(true)
+            }),
+        )?;
+        eprintln!("EXPRESSION_PROBE_TRANSFERS {reference:?} {outcome:?} {transfers:?}");
+        if !complete_inventory(outcome) {
+            return Ok(None);
+        }
+        let [transfer] = transfers.as_slice() else {
+            return Ok(None);
+        };
+        let transfer = transfer.row();
+        if transfer.kind() != ResolutionTypeTransferKind::Receiver
+            || transfer.rule().target_slot() != receiver
+            || transfer.rule().value_transform() != TypeTransferValueTransform::Preserve
+        {
+            return Ok(None);
+        }
+        let input = transfer.source_slot();
+        let mut frontiers = Vec::new();
+        let outcome = typed.visit_typed_frontier_pages(
+            TypedFactRequest::new(&[input, receiver]),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<LoweredTypedFrontier>]| {
+                frontiers.extend_from_slice(page);
+                Ok(true)
+            }),
+        )?;
+        eprintln!("EXPRESSION_PROBE_FRONTIERS {reference:?} {outcome:?} {frontiers:?}");
+        // Route and transfer inventories above establish the two actual slot
+        // identities. Role enumeration is supplementary observation, not a
+        // proof predicate: retain its independent inventory authority verbatim.
+        (
+            reference,
+            owner,
+            input,
+            receiver,
+            transfer.rule().completion().clone(),
+            outcome,
+            frontiers,
+        )
+    };
+    let receiver_answer = probe_published_frontier(
+        operation,
+        locator,
+        reference,
+        receiver,
+        cancellation,
+        |answer| answer,
+    )?;
+    let input_answer = probe_published_frontier(
+        operation,
+        locator,
+        reference,
+        input,
+        cancellation,
+        |answer| answer,
+    )?;
+    eprintln!(
+        "EXPRESSION_PROBE_ACTUAL_ANSWERS reference={reference:?} input={input:?} receiver={receiver:?}\nRECEIVER {receiver_answer:#?}\nINPUT {input_answer:#?}"
+    );
+    let mut receiver_gap_provenance = Vec::new();
+    if let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answer)) =
+        &receiver_answer
+    {
+        let reasons = answer.projected_frontiers().iter().flat_map(|frontier| match frontier.completion() {
+            ResolutionCompletion::Complete => Vec::new(),
+            ResolutionCompletion::Incomplete(reasons) => reasons.iter().filter_map(|reason| match reason {
+                crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(reason) => Some(*reason),
+                _ => None,
+            }).collect(),
+        }).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        for chunk in reasons.chunks(crate::analyzer::resolution::MAX_TYPED_FACT_REQUESTS_PER_BATCH)
+        {
+            let outcome = operation
+                .ready
+                .typed_source()
+                .visit_gap_reason_provenance_pages_for_reasons(
+                    TypedFactRequest::new(chunk),
+                    cancellation,
+                    &mut FactPageVisitor::new(&mut |page: &[SelectedGapReasonProvenance]| {
+                        receiver_gap_provenance.extend_from_slice(page);
+                        Ok(true)
+                    }),
+                )?;
+            eprintln!(
+                "EXPRESSION_PROBE_GAP_PROVENANCE {reference:?} {outcome:?} {receiver_gap_provenance:?}"
+            );
+            if !complete_inventory(outcome) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(CSharpExpressionReceiverProbe {
+        reference,
+        owner,
+        input,
+        receiver,
+        transfer_completion,
+        role_read,
+        observed_roles,
+        receiver_gap_provenance,
+        receiver_answer,
+        input_answer,
+    }))
+}
+
 /// Selected declarations and the scope visits of the dormant probe.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+#[derive(Debug)]
 pub struct CSharpDemandProbe {
     pub using_gaps: Vec<CSharpUsingTierGap>,
     pub completion: ResolutionCompletion,
@@ -2462,14 +3486,48 @@ pub fn probe_type(
     locator: &SelectedSemanticLocator,
     cancellation: &CancellationToken,
 ) -> Result<Option<CSharpDemandProbe>> {
+    let probe = probe_references(
+        operation,
+        snapshot,
+        std::slice::from_ref(locator),
+        cancellation,
+    )?
+    .map(|mut probes| probes.remove(0));
+    if let Some(probe) = &probe {
+        assert!(
+            !probe.visited.is_empty()
+                || probe.named_reasons.iter().any(|(name, evidence)| *name
+                    == "csharp_compilation_usings_incomplete"
+                    && (evidence.starts_with("membership_unproven:")
+                        || evidence.starts_with("configuration_replaced:"))),
+            "probe reached a C# source half or its membership refusal"
+        );
+    }
+    Ok(probe)
+}
+
+/// Resolve a bounded list through ONE real provider and FactResolutionOperation.
+/// This is test support for retained hierarchy-view isolation in request order.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn probe_references(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    snapshot: &WorkspaceSnapshotId,
+    locators: &[SelectedSemanticLocator],
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<CSharpDemandProbe>>> {
     use super::demand::{ClosedForwardSource, ClosedRelations};
     let ready = &operation.ready;
     let lexical = ready.lexical_source();
-    let LocatedSemantic::Found(reference) =
-        ready.lookup_locator(&lexical, locator, cancellation)?
-    else {
-        return Ok(None);
-    };
+    let mut references = Vec::with_capacity(locators.len());
+    for locator in locators {
+        let LocatedSemantic::Found(reference) =
+            ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        references.push(reference);
+    }
     let context = operation.empty_contexts(&ResolutionCompletion::Complete)?;
     let SelectedResolutionContextValidationOutcome::Ready(inputs) =
         operation.prepare_context(context, cancellation, &SelectedResolutionContextMetrics)?
@@ -2481,6 +3539,9 @@ pub fn probe_type(
     else {
         return Ok(None);
     };
+    // Exercise the identical installed policy as native run_point; this
+    // existing probe retains one real operation across its supplied references.
+    let blueprint = super::csharp_access::with_declaration_access(ready, blueprint);
     let arena = RefCell::new(ClosedRelations::default());
     let session = ResolutionSession::unbounded();
     let source = ClosedForwardSource::new(
@@ -2502,6 +3563,7 @@ pub fn probe_type(
         using_gaps: &using_gaps,
         external_gaps: &external_gaps,
         external_observations: std::cell::Cell::new(0),
+        placement_answers: RefCell::new(HashMap::default()),
         arena: &arena,
         visited: &visited,
     };
@@ -2527,62 +3589,59 @@ pub fn probe_type(
             cancellation,
             &session,
             |facts| {
-                let crate::analyzer::resolution::FactDemandResolution::Ready(answer) =
-                    facts.resolve_reference_by_demand(reference, &mut provider)?
-                else {
-                    return Ok(None);
-                };
-
-                let SelectedNativeDefinitions::Ready(projected) =
-                    native_units::project_native_definition_units(
-                        ready,
-                        answer.binding().targets(),
-                        cancellation,
-                        &session,
-                    )?
-                else {
-                    return Ok(None);
-                };
-                let mut targets = Vec::new();
-                for (_, target) in projected {
-                    let SelectedNativeDefinition::Unit(unit) = target else {
-                        return Err(StoreError::corrupt("C# source target has no unit"));
+                let mut results = Vec::with_capacity(references.len());
+                for reference in references {
+                    let crate::analyzer::resolution::FactDemandResolution::Ready(answer) =
+                        facts.resolve_reference_by_demand(reference, &mut provider)?
+                    else {
+                        return Ok(None);
                     };
-                    targets.push((
-                        brokk_bifrost_core::path_utils::rel_path_string(unit.source()),
-                        unit.fq_name_str().to_owned(),
-                    ));
+
+                    let SelectedNativeDefinitions::Ready(projected) =
+                        native_units::project_native_definition_units(
+                            ready,
+                            answer.binding().targets(),
+                            cancellation,
+                            &session,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let mut targets = Vec::new();
+                    for (_, target) in projected {
+                        let SelectedNativeDefinition::Unit(unit) = target else {
+                            return Err(StoreError::corrupt("C# source target has no unit"));
+                        };
+                        targets.push((
+                            brokk_bifrost_core::path_utils::rel_path_string(unit.source()),
+                            unit.fq_name_str().to_owned(),
+                        ));
+                    }
+                    targets.sort_unstable();
+                    targets.dedup();
+                    let mut named_reasons =
+                        named_reason_details(ready, answer.binding().completion())?;
+                    // Level obligations accompany the binding as structured C# gaps.
+                    // Their names belong to those records, even when the generic
+                    // binding channel reports only the enclosing boundary.
+                    for gap in using_gaps.borrow().iter() {
+                        let (name, evidence) = ready
+                            .context_identities
+                            .named_reason(gap.reason)
+                            .expect("a C# using-tier gap has named evidence");
+                        named_reasons.push((name, evidence.to_string()));
+                    }
+                    named_reasons.sort_unstable();
+                    named_reasons.dedup();
+                    results.push(CSharpDemandProbe {
+                        using_gaps: using_gaps.borrow().clone(),
+                        completion: answer.binding().completion().clone(),
+                        named_reasons,
+                        targets,
+                        visited: visited.borrow().clone(),
+                    });
                 }
-                targets.sort_unstable();
-                targets.dedup();
-                let mut named_reasons = named_reason_details(ready, answer.binding().completion())?;
-                // Level obligations accompany the binding as structured C# gaps.
-                // Their names belong to those records, even when the generic
-                // binding channel reports only the enclosing boundary.
-                for gap in using_gaps.borrow().iter() {
-                    let (name, evidence) = ready
-                        .context_identities
-                        .named_reason(gap.reason)
-                        .expect("a C# using-tier gap has named evidence");
-                    named_reasons.push((name, evidence.to_string()));
-                }
-                named_reasons.sort_unstable();
-                named_reasons.dedup();
-                assert!(
-                    !visited.borrow().is_empty()
-                        || named_reasons.iter().any(|(name, evidence)| *name
-                            == "csharp_compilation_usings_incomplete"
-                            && (evidence.starts_with("membership_unproven:")
-                                || evidence.starts_with("configuration_replaced:"))),
-                    "probe reached a C# source half or its membership refusal"
-                );
-                Ok(Some(CSharpDemandProbe {
-                    using_gaps: using_gaps.borrow().clone(),
-                    completion: answer.binding().completion().clone(),
-                    named_reasons,
-                    targets,
-                    visited: visited.borrow().clone(),
-                }))
+                Ok(Some(results))
             },
         )
     }
@@ -2615,6 +3674,7 @@ pub fn probe_certified_reader_receipt(
         ready.snapshot("csharp").expect("C# snapshot"),
         &certified,
         &ready.context_identities,
+        ready.csharp_services()?,
     )?;
     let placements = units.placements(caller)?.expect("selected fixture");
     for placement in &placements {

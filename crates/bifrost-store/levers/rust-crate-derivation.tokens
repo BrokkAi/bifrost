@@ -34,3 +34,10 @@
 12748-unknown-acquisition-cfg-atoms
 12830-detached-edition
 13016-body-local-macro-inventory
+13383-rust-fact-producer-identity
+13606-explicit-import-shadows-glob
+12914-cargo-config-source-effect
+13259-census-macro-paths
+13400-target-root-unavailable
+13400-same-package-unavailable-library
+13400-manifest-binding-intervals

@@ -154,6 +154,11 @@ fn ensure_inline_local_policy(
     let local_endpoint_ids = match &definition.analysis {
         PolicyAnalysis::Match { spec } => {
             ensure_inline_selector(&spec.selector)?;
+            for guard in &spec.guards.barriers {
+                for (_, selector) in guard.selectors(TAINT_SET_SEGMENTS) {
+                    ensure_inline_selector(selector)?;
+                }
+            }
             HashSet::new()
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
@@ -214,11 +219,32 @@ fn ensure_inline_local_policy(
 fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
     let mut paths = HashSet::new();
     match &definition.analysis {
-        PolicyAnalysis::Match { .. } => {
+        PolicyAnalysis::Match { spec } => {
             paths.insert("/analysis/selector".to_string());
+            for guard in &spec.guards.barriers {
+                paths.extend(
+                    guard
+                        .selectors(TAINT_SET_SEGMENTS)
+                        .into_iter()
+                        .map(|(path, _)| path),
+                );
+            }
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
             let segments = definition.analysis.set_segments();
+            for guard in &spec.guards.barriers {
+                paths.extend(guard.selectors(segments).into_iter().map(|(path, _)| path));
+            }
+            if let Some(without) = &spec.without_flow {
+                for guard in &without.guards.barriers {
+                    paths.extend(
+                        guard
+                            .selectors(WITHOUT_FLOW_SET_SEGMENTS)
+                            .into_iter()
+                            .map(|(path, _)| path),
+                    );
+                }
+            }
             extend_taint_selector_paths(&mut paths, segments.sources, &spec.sources.entries);
             extend_taint_selector_paths(&mut paths, segments.sinks, &spec.sinks.entries);
             extend_taint_selector_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries);
@@ -253,6 +279,12 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
                     json_pointer_segment(subject.id.as_str())
                 )
             }));
+            paths.extend(
+                spec.automaton
+                    .transfers
+                    .iter()
+                    .map(|transfer| typestate_transfer_selector_path(&transfer.id)),
+            );
             paths.extend(
                 spec.automaton
                     .events
@@ -332,6 +364,11 @@ fn ensure_inline_local_taint(
     for sink in &spec.sinks.entries {
         ensure_inline_selector(&sink.selector)?;
     }
+    for guard in &spec.guards.barriers {
+        for (_, selector) in guard.selectors(TAINT_SET_SEGMENTS) {
+            ensure_inline_selector(selector)?;
+        }
+    }
     for sanitizer in &spec.sanitizers.entries {
         ensure_inline_selector(&sanitizer.selector)?;
         for (_, selector) in sanitizer.kind.requirement_selectors() {
@@ -374,6 +411,9 @@ fn ensure_inline_local_typestate(
     }
     for subject in &spec.subjects.entries {
         ensure_inline_selector(&subject.selector)?;
+    }
+    for transfer in &spec.automaton.transfers {
+        ensure_inline_selector(&transfer.selector)?;
     }
     for event in &spec.automaton.events {
         match &event.trigger {
@@ -820,6 +860,17 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
         PolicyAnalysis::Match { spec } => {
             let mut object = tagged("match");
             insert(&mut object, "selector", selector_to_json(&spec.selector));
+            if !spec.guards.barriers.is_empty() {
+                insert(
+                    &mut object,
+                    "guard_barriers",
+                    sorted_typed_values(
+                        spec.guards.barriers.iter(),
+                        |left, right| left.id.cmp(&right.id),
+                        guard_barrier_to_json,
+                    ),
+                );
+            }
             Value::Object(object)
         }
         PolicyAnalysis::Taint { spec } => {
@@ -901,6 +952,17 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                         &spec.barriers,
                         |left, right| left.id.cmp(&right.id),
                         taint_barrier_to_json,
+                    ),
+                );
+            }
+            if !spec.guards.barriers.is_empty() {
+                insert(
+                    &mut object,
+                    "guard_barriers",
+                    sorted_typed_values(
+                        spec.guards.barriers.iter(),
+                        |left, right| left.id.cmp(&right.id),
+                        guard_barrier_to_json,
                     ),
                 );
             }
@@ -997,6 +1059,17 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                         taint_external_model_to_json,
                     ),
                 );
+                if !without.guards.barriers.is_empty() {
+                    insert(
+                        &mut secondary,
+                        "guard_barriers",
+                        sorted_typed_values(
+                            without.guards.barriers.iter(),
+                            |left, right| left.id.cmp(&right.id),
+                            guard_barrier_to_json,
+                        ),
+                    );
+                }
                 insert(&mut object, "without_flow", Value::Object(secondary));
             }
             Value::Object(object)
@@ -2149,6 +2222,34 @@ pub(crate) fn value_type_predicate_to_json(predicate: ValueTypePredicate) -> Val
     }
 }
 
+pub(crate) fn guard_barrier_to_json(guard: &TaintGuardBarrierSpec) -> Value {
+    let predicate = match &guard.predicate {
+        TaintGuardPredicate::Comparison(spec) => {
+            json!({"type": "comparison", "relation": spec.relation.label(), "operand": spec.operand.label()})
+        }
+        TaintGuardPredicate::Call {
+            selector,
+            operand,
+            requires,
+        } => {
+            let mut requirements = requires
+                .iter()
+                .map(sanitizer_requirement_to_json)
+                .collect::<Vec<_>>();
+            requirements.sort_by_cached_key(|value| {
+                serde_json_canonicalizer::to_vec(value).expect("guard requirements encode as JSON")
+            });
+            requirements.dedup();
+            json!({
+                "type": "call", "selector": selector_to_json(selector), "operand": sanitizer_operand_to_json(*operand),
+                "requires": requirements,
+            })
+        }
+    };
+    json!({"id": guard.id.as_str(), "predicate": predicate, "clean_when": guard.clean_when,
+        "removes": id_set(guard.removes.iter().map(TaintLabel::as_str))})
+}
+
 fn taint_barrier_to_json(barrier: &TaintBarrierSpec) -> Value {
     json!({ "id": barrier.id.as_str(), "value_type": value_type_predicate_to_json(barrier.value_type) })
 }
@@ -2447,6 +2548,13 @@ fn typestate_automaton_to_json(automaton: &TypestateAutomatonSpec) -> Value {
             typestate_terminal_expectation_to_json,
         ),
     );
+    if !automaton.transfers.is_empty() {
+        value["transfers"] = sorted_typed_values(
+            automaton.transfers.iter(),
+            |left, right| left.id.cmp(&right.id),
+            |transfer| json!({ "id": transfer.id.as_str(), "calls": { "selector": selector_to_json(&transfer.selector), "from": typestate_call_binding_to_json(&transfer.from), "to": "return-value" } }),
+        );
+    }
     if let Some(set) = &automaton.event_set {
         value["event_set"] =
             json!({"name": set.name, "version": set.version, "effects": set.effects});
@@ -3164,6 +3272,7 @@ mod tests {
                 metadata: metadata(),
                 analysis: PolicyAnalysis::Match {
                     spec: MatchPolicySpec {
+                        guards: Default::default(),
                         selector: inline_selector(),
                     },
                 },
@@ -3297,6 +3406,7 @@ mod tests {
                 analysis: PolicyAnalysis::Taint {
                     spec: TaintPolicySpec {
                         barriers: TaintEndpointSet::default(),
+                        guards: PolicyGuardConfiguration::default(),
                         mode: MayMode::May,
                         call_modeling: CallModelingSpec {
                             unmodeled:
@@ -3420,6 +3530,7 @@ mod tests {
                             escape: InconclusivePolicy::Inconclusive,
                         },
                         automaton: TypestateAutomatonSpec {
+                            transfers: Vec::new(),
                             event_set: None,
                             states: vec![closed.clone(), open.clone()],
                             initial: open.clone(),
@@ -3647,6 +3758,7 @@ mod tests {
             metadata: metadata(),
             analysis: PolicyAnalysis::Match {
                 spec: MatchPolicySpec {
+                    guards: Default::default(),
                     selector: inline_selector(),
                 },
             },

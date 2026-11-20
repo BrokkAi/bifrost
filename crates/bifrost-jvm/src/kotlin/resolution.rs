@@ -500,8 +500,9 @@ impl<'source, 'collector, 'declarations>
                     if let Some(body) = first_named_child_of_kind(node, "class_body") {
                         let site =
                             self.add_site(body, ResolutionSiteKind::TypeDeclaration, context.scope);
-                        let name =
-                            self.intern_name(&crate::anonymous_type::AnonymousTypeBody::name(body));
+                        let name = self.intern_synthetic(
+                            &crate::anonymous_type::AnonymousTypeBody::name(body),
+                        );
                         let anonymous = crate::anonymous_type::AnonymousTypeBody { site, name };
                         anonymous.declare(&mut self.facts);
                         assert!(self.anonymous_type_owners.insert(site));
@@ -757,17 +758,16 @@ impl<'source, 'collector, 'declarations>
         id
     }
 
-    fn intern_name(&mut self, spelling: &str) -> ResolutionNameId {
-        assert!(!spelling.is_empty(), "Kotlin resolution names are nonempty");
-        if let Some(id) = self.names.get(spelling) {
-            return *id;
-        }
-        let id = ResolutionNameId::try_from_index(self.facts.names.len())
-            .expect("Kotlin resolution name count fits u32");
-        let spelling = spelling.to_owned();
-        self.names.insert(spelling.clone(), id);
-        self.facts.names.push(ResolutionNameFact { id, spelling });
-        id
+    /// An empty spelling (a MISSING token, empty backticks) is not a name.
+    fn intern_name(&mut self, spelling: &str) -> Option<ResolutionNameId> {
+        self.facts.intern_name(&mut self.names, spelling)
+    }
+
+    /// A name the producer synthesizes (a literal, a `format!` of non-empty
+    /// parts, or a declaration's own checked name) is non-empty by construction.
+    fn intern_synthetic(&mut self, spelling: &str) -> ResolutionNameId {
+        self.intern_name(spelling)
+            .expect("synthetic resolution name is non-empty")
     }
 
     fn add_identifier(
@@ -781,9 +781,16 @@ impl<'source, 'collector, 'declarations>
     ) -> ResolutionSiteId {
         let site = self.add_site(node, kind, scope);
         let spelling = kotlin_identifier_text(node, self.source);
-        let name = self.intern_name(spelling);
         self.handled_identifiers.insert(node.id());
         self.sites_by_node.insert(node.id(), site);
+        // A MISSING or empty-backtick identifier has no name.
+        let Some(name) = self.intern_name(spelling) else {
+            self.facts.gaps.push(ResolutionGapFact::new(
+                site,
+                ResolutionGapKind::MalformedSyntax,
+            ));
+            return site;
+        };
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -869,7 +876,7 @@ impl<'source, 'collector, 'declarations>
                 .and_then(|stem| stem.to_str())
                 .map(|stem| format!("{}Kt", uppercase_first(stem)))
         });
-        self.facade_name = facade.map(|name| self.intern_name(&name));
+        self.facade_name = facade.map(|name| self.intern_synthetic(&name));
         let declaration = first_named_child_of_kind(root, "package_header").map(|header| {
             self.add_site(
                 header,
@@ -886,21 +893,40 @@ impl<'source, 'collector, 'declarations>
             && !header.has_error()
             && let Some(path) = first_named_child_of_kind(header, "identifier")
         {
-            for (ordinal, segment) in named_children(path)
+            let segments = named_children(path)
                 .into_iter()
                 .filter(|child| child.kind() == "simple_identifier")
-                .enumerate()
-            {
+                .collect::<Vec<_>>();
+            for segment in &segments {
                 self.handled_identifiers.insert(segment.id());
-                let name = self.intern_name(kotlin_identifier_text(segment, self.source));
-                self.facts
-                    .package_segments
-                    .push(ResolutionPackageSegmentFact {
-                        root_scope: self.package_scope,
-                        ordinal: u32::try_from(ordinal).expect("Kotlin package path fits u32"),
-                        name,
-                    });
-                self.package_names.push(name);
+            }
+            // One segment without a spelling leaves the whole package path
+            // unread: a shorter prefix would place the file in the wrong package.
+            let names = segments
+                .iter()
+                .map(|segment| self.intern_name(kotlin_identifier_text(*segment, self.source)))
+                .collect::<Option<Vec<_>>>();
+            if let Some(names) = names {
+                for (ordinal, name) in names.into_iter().enumerate() {
+                    self.facts
+                        .package_segments
+                        .push(ResolutionPackageSegmentFact {
+                            root_scope: self.package_scope,
+                            ordinal: u32::try_from(ordinal).expect("Kotlin package path fits u32"),
+                            name,
+                        });
+                    self.package_names.push(name);
+                }
+            } else {
+                let site = self.add_site(
+                    path,
+                    ResolutionSiteKind::UnsupportedRoute,
+                    self.package_scope,
+                );
+                self.facts.gaps.push(ResolutionGapFact::new(
+                    site,
+                    ResolutionGapKind::MalformedSyntax,
+                ));
             }
         }
         if file_annotation.is_some() && self.facade_name.is_none() {
@@ -958,7 +984,7 @@ impl<'source, 'collector, 'declarations>
         }
         let names = segments
             .iter()
-            .map(|segment| self.intern_name(kotlin_identifier_text(*segment, self.source)))
+            .map(|segment| self.intern_synthetic(kotlin_identifier_text(*segment, self.source)))
             .collect::<Vec<_>>();
         let alias = first_named_child_of_kind(node, "import_alias")
             .and_then(|alias| first_named_child_of_kind(alias, "type_identifier"));
@@ -967,7 +993,7 @@ impl<'source, 'collector, 'declarations>
         }
         let source_name = names.last().copied();
         let local_name = alias
-            .map(|name| self.intern_name(kotlin_identifier_text(name, self.source)))
+            .map(|name| self.intern_synthetic(kotlin_identifier_text(name, self.source)))
             .or(source_name);
         self.facts.import_routes.push(ResolutionImportRouteFact {
             site,
@@ -1088,7 +1114,7 @@ impl<'source, 'collector, 'declarations>
             )
         } else {
             let site = self.add_site(node, ResolutionSiteKind::TypeDeclaration, context.scope);
-            let name_id = self.intern_name(&name);
+            let name_id = self.intern_synthetic(&name);
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site,
                 name: name_id,
@@ -1103,7 +1129,7 @@ impl<'source, 'collector, 'declarations>
         self.type_scope_ranges
             .insert(site, (node.start_byte(), node.end_byte()));
         self.type_scope_parents.insert(site, context.scope);
-        let name_id = self.intern_name(&name);
+        let name_id = self.intern_synthetic(&name);
         self.type_names.insert(site, name_id);
         self.type_simple_names.insert(
             site,
@@ -1143,10 +1169,10 @@ impl<'source, 'collector, 'declarations>
                     enclosing_type: context.owner_type,
                     kind,
                 });
-            let instance_name = self.intern_name("INSTANCE");
+            let instance_name = self.intern_synthetic("INSTANCE");
             if kind == ResolutionSingletonRelationKind::Companion {
                 self.companion_types.insert(site);
-                let companion_name = self.intern_name(&name);
+                let companion_name = self.intern_synthetic(&name);
                 if let Some(owner_segments) = self.jvm_owner_segments(context.owner_type) {
                     self.add_jvm_alias(
                         site,
@@ -1284,7 +1310,7 @@ impl<'source, 'collector, 'declarations>
     ) -> ResolutionSiteId {
         let anchor = first_named_child_of_kind(class, "type_identifier")
             .expect("a synthetic member owner has a name");
-        let name_id = self.intern_name(name);
+        let name_id = self.intern_synthetic(name);
         let site = self.add_site(anchor, ResolutionSiteKind::CallableDeclaration, scope);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
@@ -1335,7 +1361,7 @@ impl<'source, 'collector, 'declarations>
         name: &str,
         parameters: &[SyntheticParameter<'source>],
     ) -> Option<ResolutionSiteId> {
-        let name_id = self.intern_name(name);
+        let name_id = self.intern_synthetic(name);
         if crate::synthetic_members::declares_callable(
             &self.facts,
             scope,
@@ -1357,7 +1383,7 @@ impl<'source, 'collector, 'declarations>
                 .expect("a synthetic member owner has a name");
             let parameter_site =
                 self.add_site(anchor, ResolutionSiteKind::ValueDeclaration, param_scope);
-            let label = self.intern_name(parameter.name);
+            let label = self.intern_synthetic(parameter.name);
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site: parameter_site,
                 name: label,
@@ -1407,7 +1433,7 @@ impl<'source, 'collector, 'declarations>
                         role: DeclarationTypeRole::Parameter,
                     });
                 if let Some(type_name) = parameter.intrinsic_type {
-                    let name = self.intern_name(type_name);
+                    let name = self.intern_synthetic(type_name);
                     let input =
                         self.add_slot(parameter_site, ResolutionTypeSlotRole::TargetTypeIdentity);
                     self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
@@ -1526,7 +1552,7 @@ impl<'source, 'collector, 'declarations>
         scope: ResolutionScopeId,
         name: &str,
     ) {
-        let name_id = self.intern_name(name);
+        let name_id = self.intern_synthetic(name);
         if self.facts.identifiers.iter().any(|identifier| {
             identifier.role == ResolutionIdentifierRole::Declaration
                 && identifier.name == name_id
@@ -1571,7 +1597,7 @@ impl<'source, 'collector, 'declarations>
         );
         self.add_declaration_source(node, Some(name_node), site);
         self.type_sites.insert(node.id(), site);
-        let name = self.intern_name(kotlin_identifier_text(name_node, self.source));
+        let name = self.intern_synthetic(kotlin_identifier_text(name_node, self.source));
         self.type_names.insert(site, name);
         self.type_parents.insert(site, context.owner_type);
         self.add_binder(site, context.scope, ResolutionBinderKind::Type, true);
@@ -1707,7 +1733,7 @@ impl<'source, 'collector, 'declarations>
                     ));
                 }
                 _ => {
-                    let name = self.intern_name("kotlin.Unit");
+                    let name = self.intern_synthetic("kotlin.Unit");
                     let seed = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
                     self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                         output: seed,
@@ -2080,7 +2106,7 @@ impl<'source, 'collector, 'declarations>
                 value_type,
                 repeated: self.parameter_is_vararg(node),
             });
-        let label = self.intern_name(kotlin_identifier_text(name_node, self.source));
+        let label = self.intern_synthetic(kotlin_identifier_text(name_node, self.source));
         self.facts
             .callable_parameter_semantics
             .push(ResolutionCallableParameterSemanticsFact {
@@ -2225,7 +2251,7 @@ impl<'source, 'collector, 'declarations>
         let mut reference_sites = Vec::with_capacity(segments.len());
         for &(segment, spelling) in segments {
             let site = self.add_site(segment, ResolutionSiteKind::TypeReference, context.scope);
-            let name = self.intern_name(spelling);
+            let name = self.intern_synthetic(spelling);
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site,
                 name,
@@ -2357,7 +2383,7 @@ impl<'source, 'collector, 'declarations>
                 };
                 let arity = u32::try_from(arity).expect("Kotlin function type arity fits u32");
                 self.pending_applied_types.push((slot, node, scope, owner));
-                let function_name = self.intern_name(&format!("kotlin.Function{arity}"));
+                let function_name = self.intern_synthetic(&format!("kotlin.Function{arity}"));
                 self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                     output: slot,
                     name: function_name,
@@ -2634,7 +2660,7 @@ impl<'source, 'collector, 'declarations>
             .map(|name| self.facts.names[name.index()].spelling.as_str())
             .collect::<Vec<_>>()
             .join("$");
-        segments.push(self.intern_name(&binary_name));
+        segments.push(self.intern_synthetic(&binary_name));
         Some(segments)
     }
 
@@ -2669,7 +2695,7 @@ impl<'source, 'collector, 'declarations>
             ResolutionBinaryOwnerRoute::Exact(mut segments) => {
                 let owner = segments.pop().expect("interface binary owner");
                 let owner = format!("{}$DefaultImpls", self.facts.names[owner.index()].spelling);
-                segments.push(self.intern_name(&owner));
+                segments.push(self.intern_synthetic(&owner));
                 ResolutionBinaryOwnerRoute::Exact(segments)
             }
             unknown => unknown,
@@ -2910,7 +2936,7 @@ impl<'source, 'collector, 'declarations>
             }
         }
         let status = self.jvm_alias_status(node, context, context.owner_type.is_none());
-        let name = self.intern_name(&member_name);
+        let name = self.intern_synthetic(&member_name);
         let kind = if constructor {
             ResolutionJvmAliasKind::Constructor
         } else {
@@ -2957,7 +2983,7 @@ impl<'source, 'collector, 'declarations>
                     let owner = owner_segments.pop().expect("interface binary owner");
                     let owner =
                         format!("{}$DefaultImpls", self.facts.names[owner.index()].spelling);
-                    owner_segments.push(self.intern_name(&owner));
+                    owner_segments.push(self.intern_synthetic(&owner));
                     self.add_jvm_alias(
                         declaration,
                         name,
@@ -3037,7 +3063,7 @@ impl<'source, 'collector, 'declarations>
         if self.has_unresolved_jvm_annotation(node, None, &["kotlin", "jvm", "JvmField"])
             && !has_jvm_field
         {
-            let name = self.intern_name(source_name);
+            let name = self.intern_synthetic(source_name);
             self.add_unsupported_route_gap(
                 declaration,
                 field_owner,
@@ -3052,7 +3078,7 @@ impl<'source, 'collector, 'declarations>
                     getter_annotation.and_then(|getter| self.jvm_name_override(getter, None))
                 })
                 .unwrap_or_else(|| Some(kotlin_getter_name(source_name)));
-            let getter = getter.map(|name| self.intern_name(&name));
+            let getter = getter.map(|name| self.intern_synthetic(&name));
             self.add_unsupported_route_gap(
                 declaration,
                 context.owner_type,
@@ -3075,7 +3101,7 @@ impl<'source, 'collector, 'declarations>
                         setter_annotation.and_then(|setter| self.jvm_name_override(setter, None))
                     })
                     .unwrap_or_else(|| Some(kotlin_setter_name(source_name)));
-                let setter = setter.map(|name| self.intern_name(&name));
+                let setter = setter.map(|name| self.intern_synthetic(&name));
                 self.add_unsupported_route_gap(
                     declaration,
                     context.owner_type,
@@ -3096,7 +3122,7 @@ impl<'source, 'collector, 'declarations>
         }
         if has_jvm_field || const_property {
             let owner = field_owner;
-            let name = self.intern_name(source_name);
+            let name = self.intern_synthetic(source_name);
             self.add_jvm_alias_for_owner(
                 declaration,
                 name,
@@ -3137,7 +3163,7 @@ impl<'source, 'collector, 'declarations>
         };
         let status = self.jvm_alias_status(node, context, top_level);
         if let Some(getter_name) = getter_name {
-            let getter_id = self.intern_name(&getter_name);
+            let getter_id = self.intern_synthetic(&getter_name);
             self.add_jvm_alias_for_owner(
                 declaration,
                 getter_id,
@@ -3194,7 +3220,7 @@ impl<'source, 'collector, 'declarations>
             }
             None => kotlin_setter_name(source_name),
         };
-        let setter_id = self.intern_name(&setter_name);
+        let setter_id = self.intern_synthetic(&setter_name);
         let setter_parameters = receiver_parameters
             .checked_add(1)
             .expect("Kotlin property setter parameter count fits u32");
@@ -3815,7 +3841,7 @@ impl<'source, 'collector, 'declarations>
                 _ => None,
             };
             if let Some((name, kind)) = intrinsic {
-                let name = self.intern_name(name);
+                let name = self.intern_synthetic(name);
                 self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                     output,
                     name,
@@ -3847,7 +3873,7 @@ impl<'source, 'collector, 'declarations>
             let output = self.add_slot(site, role);
             if let Some(arity) = kotlin_lambda_parameter_count(expression, self.source) {
                 let arity = u32::try_from(arity).expect("Kotlin lambda arity fits u32");
-                let name = self.intern_name(&format!("kotlin.Function{arity}"));
+                let name = self.intern_synthetic(&format!("kotlin.Function{arity}"));
                 self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                     output,
                     name,
@@ -4305,7 +4331,7 @@ impl<'source, 'collector, 'declarations>
                             "simple_identifier" | "type_identifier"
                         )
                         .then(|| {
-                            self.intern_name(kotlin_identifier_text(callee_name, self.source))
+                            self.intern_synthetic(kotlin_identifier_text(callee_name, self.source))
                         }),
                         namespace: Some(ResolutionNamespace::Callable),
                     };
@@ -4439,7 +4465,8 @@ impl<'source, 'collector, 'declarations>
                         .copied()
                         .expect("Kotlin value argument has an expression");
                     let label = label_node.map(|label| {
-                        let name = self.intern_name(kotlin_identifier_text(label, self.source));
+                        let name =
+                            self.intern_synthetic(kotlin_identifier_text(label, self.source));
                         let reference = self.add_identifier(
                             label,
                             ResolutionSiteKind::ValueReference,
@@ -4511,7 +4538,7 @@ impl<'source, 'collector, 'declarations>
                 ));
                 continue;
             }
-            let name = self.intern_name(kotlin_identifier_text(name_node, self.source));
+            let name = self.intern_synthetic(kotlin_identifier_text(name_node, self.source));
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site: alias,
                 name,
@@ -4874,8 +4901,8 @@ impl<'source, 'collector, 'declarations>
                     let scope = self.facts.sites[subtype.index()].scope;
                     let reference =
                         self.add_site(node, ResolutionSiteKind::SyntheticReference, scope);
-                    let name = self.intern_name(name);
-                    let prefix = [self.intern_name("kotlin")];
+                    let name = self.intern_synthetic(name);
+                    let prefix = [self.intern_synthetic("kotlin")];
                     crate::implicit_supertype::publish_implicit_supertype(
                         &mut self.facts,
                         brokk_bifrost_core::analyzer::Language::Kotlin,
@@ -6718,5 +6745,39 @@ fun original() {}
         assert!(!shadowed_facts.gaps.iter().any(|gap| {
             gap.site == declaration.site && gap.kind == ResolutionGapKind::UnsupportedRoute
         }));
+    }
+
+    /// A MISSING, zero-width or empty-backtick name leaves a gap and no empty
+    /// spelling (counterpart of Rust's `missing_names_leave_gaps_not_empty_spellings`,
+    /// #4286).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: a MISSING or empty-backtick Kotlin name panicked the producer on an empty spelling"
+    )]
+    fn missing_names_leave_gaps_not_empty_spellings() {
+        let mut saw_missing = false;
+        for source in ["val = 1", "typealias = Int", "import .\nclass C"] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&crate::kotlin::language::LANGUAGE.into())
+                .expect("Kotlin grammar");
+            let tree = parser.parse(source, None).expect("Kotlin tree");
+            let sexp = tree.root_node().to_sexp();
+            saw_missing |= sexp.contains("MISSING");
+            let file = ProjectFile::new(
+                std::env::temp_dir().join("kotlin-native-resolution"),
+                "Fixture.kt",
+            );
+            let facts = parse_kotlin_file(&file, source, &tree).resolution_facts;
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}"
+            );
+            assert!(
+                !facts.gaps.is_empty(),
+                "the recovered tree keeps gap evidence for {source:?}"
+            );
+        }
+        assert!(saw_missing, "recovery inserts a MISSING node in this table");
     }
 }

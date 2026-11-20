@@ -43,9 +43,26 @@ pub enum ConfigurationCertificate {
     Uncertified,
 }
 
+/// Exact selected input behind a deterministic canonical parser span. This
+/// certificate covers the whole file, not a digest of the returned span.
+#[derive(Debug)]
+pub struct SelectedSourceFileCertificate<'a> {
+    pub file: &'a ProjectFile,
+    pub oid: git2::Oid,
+    pub parse_variant: brokk_bifrost_core::gitblob::ParseVariant,
+    pub producer_epoch: &'a str,
+}
+
 pub trait SelectedAnalyzerServices:
     brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal
 {
+    /// Retain a separate File dependency outside declaration-candidate capture
+    /// replacement. False refuses authority and retained read reuse.
+    fn certify_selected_source_file(&self, _expected: &SelectedSourceFileCertificate<'_>) -> bool {
+        self.refuse_read_reuse();
+        false
+    }
+
     fn selected_read_recorder(
         &self,
     ) -> Option<super::super::selected_read::SelectedReadRecorder<'_>>;
@@ -90,11 +107,57 @@ pub trait SelectedAnalyzerServices:
         SelectedExternalBindingRead::unavailable()
     }
 
+    /// Record the complete canonical selected metadata answer without opening
+    /// another reader. None is a proven absent declaration, not empty metadata.
+    fn record_selected_signature_metadata(
+        &self,
+        _declaration: &CodeUnit,
+        _metadata: Option<&[brokk_bifrost_core::analyzer::model::SignatureMetadata]>,
+    ) {
+        self.refuse_read_reuse();
+    }
+
+    /// Record one canonical source observation through the ordinary ledger.
+    fn record_selected_receiver_proof(
+        &self,
+        _question: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+        _answer: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer,
+    ) {
+        self.refuse_read_reuse();
+    }
+
+    fn capture_selected_receiver_proof(
+        &self,
+        read: &mut dyn FnMut() -> super::super::Result<()>,
+    ) -> (
+        super::super::Result<()>,
+        Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) {
+        self.refuse_read_reuse();
+        (read(), None)
+    }
+
+    fn replay_selected_receiver_proof(
+        &self,
+        _receipt: &(dyn std::any::Any + Send + Sync),
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.refuse_read_reuse();
+        None
+    }
+
     fn declarations_named(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit>;
     fn verified_declaration(&self, expected: &CodeUnit) -> Option<CodeUnit>;
-    fn external_inventory_providers(&self) -> Vec<String>;
+    /// Inventory providers visible to this operation. `models` is the
+    /// operation's own model authority set: it gates request-owned providers,
+    /// so the services never consult their analyzer snapshot for it.
+    fn external_inventory_providers(&self, models: &ResolvedActiveSemanticModels) -> Vec<String>;
     fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>>;
     fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>>;
+    fn record_model_family_open(
+        &self,
+        _open: crate::analyzer::semantic_model::runtime::FamilyOpen,
+    ) {
+    }
     /// The selected operation read this source file. A consumer that cannot
     /// name the file must record an unattributed read instead, never reuse.
     fn record_source_read(&self, _file: &ProjectFile) {}
@@ -123,6 +186,7 @@ pub trait SelectedAnalyzerServices:
 pub trait SelectedMacroFrontierReads: Send + Sync {
     fn capture(
         &self,
+        active_model_set_hash: Option<&str>,
         prepare: &mut dyn FnMut() -> super::super::Result<super::SelectedResolutionStageOutcome>,
     ) -> (
         super::super::Result<super::SelectedResolutionStageOutcome>,
@@ -134,7 +198,11 @@ pub trait SelectedMacroFrontierReads: Send + Sync {
     fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize;
 
     /// The front's own capture must be complete independently of its consumer.
-    fn receipt_is_reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool;
+    fn receipt_is_reusable(
+        &self,
+        receipt: &(dyn std::any::Any + Send + Sync),
+        active_model_set_hash: Option<&str>,
+    ) -> bool;
 
     fn policy_unit_label(&self) -> Option<String>;
 }
@@ -225,33 +293,123 @@ pub(in crate::analyzer::store) fn selected_jvm_declaration_owner(
     authority: Option<&(dyn SelectedModelAuthority + Send + Sync)>,
     providers: &[String],
     fqn: &str,
+    generation: i64,
 ) -> super::super::Result<Option<Option<ExternalOwnerIdentity>>> {
-    use rusqlite::OptionalExtension;
+    selected_jvm_declaration_owner_with_memo_proof(
+        relations, connection, authority, providers, fqn, generation,
+    )
+    .map(super::super::jvm_external_publication::JvmInventoryMemoValue::into_value)
+}
 
+pub(in crate::analyzer::store) fn selected_jvm_declaration_owner_with_memo_proof(
+    relations: &super::nominal_rules::ExternalOwnerRelations,
+    connection: &rusqlite::Connection,
+    authority: Option<&(dyn SelectedModelAuthority + Send + Sync)>,
+    providers: &[String],
+    fqn: &str,
+    generation: i64,
+) -> super::super::Result<
+    super::super::jvm_external_publication::JvmInventoryMemoValue<
+        Option<Option<ExternalOwnerIdentity>>,
+    >,
+> {
+    use super::super::jvm_external_publication::{JvmInventoryMemoProof, JvmInventoryMemoValue};
     if let Some(authority) = authority {
         if let Some(owner) = authority.declared_jvm_owner(fqn) {
-            return Ok(Some(Some(owner)));
+            return Ok(JvmInventoryMemoValue::new(
+                Some(Some(owner)),
+                JvmInventoryMemoProof::Immutable,
+            ));
         }
         if authority.declares_jvm_type(fqn) {
-            return Ok(Some(None));
+            return Ok(JvmInventoryMemoValue::new(
+                Some(None),
+                JvmInventoryMemoProof::Immutable,
+            ));
         }
     }
     if providers.is_empty() {
-        return Ok(None);
+        return Ok(JvmInventoryMemoValue::new(
+            None,
+            JvmInventoryMemoProof::Immutable,
+        ));
     }
     let providers = serde_json::to_string(providers).expect("string provider identities serialize");
-    // No aggregate row means absence; a NULL provider means ambiguity.
-    let provider: Option<Option<String>> = connection
-        .query_row(
-            relations.declaration_owner,
-            rusqlite::params![fqn, providers],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(provider.map(|provider| {
-        provider.map(|provider| ExternalOwnerIdentity {
-            provider_id: Arc::from(provider),
-            owner_fqn: Arc::from(fqn),
-        })
-    }))
+    // Inventory drift is unavailable, distinct from competing selected owners.
+    let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_memo_sql(
+        relations.declaration_owner,
+        3,
+        2,
+        4,
+    );
+    let (provider, present, current, sealed): (Option<String>, Option<i64>, bool, bool) =
+        connection.query_row(
+            &guarded,
+            rusqlite::params![
+                fqn,
+                providers,
+                generation,
+                super::super::jvm_external_publication::jvm_external_projection_identity()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    if !current {
+        return Err(super::super::StoreError::stale_resolution(
+            "JVM provider inventory changed during the request",
+        ));
+    }
+    let provider = present.map(|_| provider);
+    Ok(JvmInventoryMemoValue::new(
+        provider.map(|provider| {
+            provider.map(|provider| ExternalOwnerIdentity {
+                provider_id: Arc::from(provider),
+                owner_fqn: Arc::from(fqn),
+            })
+        }),
+        JvmInventoryMemoProof::from_sealed(sealed, generation),
+    ))
+}
+
+/// Direct reader fixtures: services that record nothing, so every selected
+/// read refuses reuse and answers as it would without a ledger.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct UnrecordedSelectedServices;
+
+#[cfg(any(test, feature = "test-support"))]
+impl brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal
+    for UnrecordedSelectedServices
+{
+    fn refuse_read_reuse(&self) {}
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SelectedAnalyzerServices for UnrecordedSelectedServices {
+    fn selected_read_recorder(
+        &self,
+    ) -> Option<super::super::selected_read::SelectedReadRecorder<'_>> {
+        None
+    }
+    fn record_selected_dependency(
+        &self,
+        _dependency: &super::super::selected_read::SelectedDependency,
+    ) -> super::super::Result<()> {
+        Ok(())
+    }
+    fn declarations_named(&self, _file: &ProjectFile, _name: &str) -> Vec<CodeUnit> {
+        Vec::new()
+    }
+    fn verified_declaration(&self, _expected: &CodeUnit) -> Option<CodeUnit> {
+        None
+    }
+    fn external_inventory_providers(&self, _models: &ResolvedActiveSemanticModels) -> Vec<String> {
+        Vec::new()
+    }
+    fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>> {
+        None
+    }
+    fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>> {
+        None
+    }
 }

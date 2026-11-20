@@ -598,11 +598,21 @@ pub struct LoweredPackageObjectExport {
     pub member: ResolutionSiteId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoweredImplicitRootCandidate {
+    pub(crate) definition: ResolutionSiteId,
+    pub(crate) reference: ResolutionSiteId,
+    pub(crate) frontier: SemanticId,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct LoweredSharedLanguageFacts {
     pub(crate) aliases: Vec<LoweredJvmAlias>,
     pub(crate) extern_aliases: Vec<(u32, u32, String)>,
+    pub(crate) implicit_root_candidates: Vec<LoweredImplicitRootCandidate>,
+    pub(crate) declaration_modifiers:
+        Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionDeclarationModifierFact>,
     pub(crate) csharp_friend_attributes:
         Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionCSharpFriendAttributeFact>,
     pub(crate) compilation_imports:
@@ -1432,6 +1442,20 @@ fn lower_shared_language_facts(
 
     LoweredSharedLanguageFacts {
         aliases: lowered_aliases,
+        implicit_root_candidates: facts.implicit_root_candidates.iter().map(|fact| {
+            assert!(declarations.contains(&fact.definition));
+            assert!(references.contains(&fact.reference));
+            assert!(type_slots.contains(&fact.frontier));
+            assert!(facts.binding_projections.iter().any(|projection|
+                projection.reference == fact.reference && projection.output == fact.frontier
+                && projection.kind == brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetTypeIdentity));
+            LoweredImplicitRootCandidate {
+                definition: fact.definition,
+                reference: fact.reference,
+                frontier: identities.type_slot_semantic(fact.frontier),
+            }
+        }).collect(),
+        declaration_modifiers: facts.declaration_modifiers.clone(),
         csharp_friend_attributes: facts.csharp_friend_attributes.clone(),
         extern_aliases: facts
             .extern_aliases
@@ -1456,7 +1480,10 @@ pub(crate) fn lower_common_resolution_facts(
     identities: &mut ResolutionIdentityCatalogBuilder,
     language: Language,
     facts: &FileResolutionFacts,
-) -> LoweredCommonFacts {
+) -> (
+    LoweredCommonFacts,
+    crate::analyzer::span_index::SpanScanWork,
+) {
     let names = facts
         .names
         .iter()
@@ -1832,7 +1859,7 @@ pub(crate) fn lower_common_resolution_facts(
             }
         }
     }
-    let rust_reverse_gap_candidates = if language == Language::Rust {
+    let (rust_reverse_gap_candidates, rust_gap_scan_work) = if language == Language::Rust {
         let mut gap_sites = BTreeSet::new();
         let mut macro_frontier_sites = BTreeSet::new();
         // Reverse candidate inventory can remain open for a positioned
@@ -1907,13 +1934,26 @@ pub(crate) fn lower_common_resolution_facts(
                 .or_default()
                 .push(segment);
         }
-        let mut gap_routes = BTreeMap::new();
+        let mut rust_gap_scan_work = crate::analyzer::span_index::SpanScanWork {
+            indexed_entries: identifiers_by_start.len()
+                + facts.root_reference_segments.len()
+                + facts.gaps.len(),
+            query_steps: 0,
+        };
+        // Routes sorted by site and searched below with a counted binary
+        // search, so the scaling guard charges every gap record the lookup
+        // examines; a per-gap scan of all gaps (#12997) would show as
+        // quadratic query steps. The stable sort and dedup keep find_map's
+        // first nonempty route at each site.
+        let mut gap_routes = Vec::new();
         for gap in &facts.gaps {
-            // Preserve find_map's first nonempty route at each site.
+            rust_gap_scan_work.query_steps += 1;
             if let Some(route) = gap.route() {
-                gap_routes.entry(gap.site).or_insert(route);
+                gap_routes.push((gap.site, route));
             }
         }
+        gap_routes.sort_by_key(|(site, _)| *site);
+        gap_routes.dedup_by_key(|(site, _)| *site);
         let mut gap_candidates =
             BTreeMap::<ResolutionSiteId, BTreeSet<(String, Option<ResolutionNamespace>)>>::new();
         for gap_site in &gap_sites {
@@ -1921,7 +1961,15 @@ pub(crate) fn lower_common_resolution_facts(
                 .get(gap_site)
                 .unwrap_or_else(|| panic!("reverse inventory gap names unknown site {gap_site}"));
             let candidates = gap_candidates.entry(*gap_site).or_default();
-            if let Some(route) = gap_routes.get(gap_site).cloned() && let brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::OmittedReference { terminal, namespace, .. } = route {
+            let route_index = gap_routes.partition_point(|(site, _)| {
+                rust_gap_scan_work.query_steps += 1;
+                site < gap_site
+            });
+            let route = gap_routes
+                .get(route_index)
+                .filter(|(site, _)| site == gap_site)
+                .map(|(_, route)| route.clone());
+            if let Some(route) = route && let brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::OmittedReference { terminal, namespace, .. } = route {
                 // The omitted route's terminal is stronger evidence than any
                 // other positioned identifiers retained inside its syntax.
                 // No known terminal keeps the wildcard nomination, not a list
@@ -1935,10 +1983,15 @@ pub(crate) fn lower_common_resolution_facts(
                 gap_span.start_byte <= gap_span.end_byte,
                 "unordered gap: {gap_span:?}"
             );
-            let first = identifiers_by_start
-                .partition_point(|(source, _)| source.start_byte < gap_span.start_byte);
-            let last = identifiers_by_start
-                .partition_point(|(source, _)| source.start_byte <= gap_span.end_byte);
+            let first = identifiers_by_start.partition_point(|(source, _)| {
+                rust_gap_scan_work.query_steps += 1;
+                source.start_byte < gap_span.start_byte
+            });
+            let last = identifiers_by_start.partition_point(|(source, _)| {
+                rust_gap_scan_work.query_steps += 1;
+                source.start_byte <= gap_span.end_byte
+            });
+            rust_gap_scan_work.query_steps += last - first;
             for (_, identifier) in identifiers_by_start[first..last]
                 .iter()
                 .filter(|(source, _)| source.end_byte <= gap_span.end_byte)
@@ -1965,6 +2018,7 @@ pub(crate) fn lower_common_resolution_facts(
                     .into_iter()
                     .flatten()
                 {
+                    rust_gap_scan_work.query_steps += 1;
                     candidates.insert((
                         names[&segment.name].to_owned(),
                         Some(ResolutionNamespace::Type),
@@ -1975,6 +2029,7 @@ pub(crate) fn lower_common_resolution_facts(
                 }
             }
         }
+        rust_gap_scan_work.record_index(&routes_by_span);
         let mut rust_reverse_gap_candidates = Vec::new();
         for gap_site in gap_sites {
             let macro_frontier = macro_frontier_sites.contains(&gap_site);
@@ -1997,9 +2052,12 @@ pub(crate) fn lower_common_resolution_facts(
                 ));
             }
         }
-        rust_reverse_gap_candidates
+        (rust_reverse_gap_candidates, rust_gap_scan_work)
     } else {
-        Vec::new()
+        (
+            Vec::new(),
+            crate::analyzer::span_index::SpanScanWork::default(),
+        )
     };
     let mut structural_trait_impls = Vec::new();
     let mut trait_implementations = Vec::new();
@@ -2120,28 +2178,31 @@ pub(crate) fn lower_common_resolution_facts(
     let go_package_imports =
         super::fact_lowering::package::lower_import_metadata(identities, language, facts);
     let shared_language = lower_shared_language_facts(identities, facts, &names);
-    LoweredCommonFacts::new(
-        lower_root_imports(facts, &names),
-        additional_definition_namespaces,
-        definition_unit_crosswalks,
-        deferred_member_owners,
-        name_lookups,
-        declared_type_relations,
-        relation_members,
-        declared_root_routes,
-        root_import_provenance,
-        package_references,
-        facts.reference_execution_contexts.clone(),
-        facts.lexical_package_contexts.clone(),
-        package_members,
-        package_routes,
-        go_package_imports,
-        reference_lookup_identities,
-        rust_reverse_gap_candidates,
-        structural_trait_impls,
-        trait_implementations,
-        inherent_implementations,
-        shared_language,
+    (
+        LoweredCommonFacts::new(
+            lower_root_imports(facts, &names),
+            additional_definition_namespaces,
+            definition_unit_crosswalks,
+            deferred_member_owners,
+            name_lookups,
+            declared_type_relations,
+            relation_members,
+            declared_root_routes,
+            root_import_provenance,
+            package_references,
+            facts.reference_execution_contexts.clone(),
+            facts.lexical_package_contexts.clone(),
+            package_members,
+            package_routes,
+            go_package_imports,
+            reference_lookup_identities,
+            rust_reverse_gap_candidates,
+            structural_trait_impls,
+            trait_implementations,
+            inherent_implementations,
+            shared_language,
+        ),
+        rust_gap_scan_work,
     )
 }
 
@@ -2328,7 +2389,7 @@ mod tests {
             BindingFragmentId::for_test(b"rust-gap-span-containment"),
             crate::analyzer::resolution::test_shared_names(),
         );
-        let lowered = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
+        let (lowered, _) = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
         let candidates = lowered
             .rust_reverse_gap_candidates
             .iter()
@@ -2385,7 +2446,7 @@ mod tests {
             BindingFragmentId::for_test(b"scala-extractor-roles"),
             crate::analyzer::resolution::test_shared_names(),
         );
-        let lowered = lower_common_resolution_facts(&mut identities, Language::Scala, facts);
+        let (lowered, _) = lower_common_resolution_facts(&mut identities, Language::Scala, facts);
         // The row names the head reference, carries the role, and has neither a
         // receiver nor a result slot; it has no argument count.
         let rows = lowered
@@ -2467,7 +2528,7 @@ mod tests {
             BindingFragmentId::for_test(b"generated-item-surface-gap"),
             crate::analyzer::resolution::test_shared_names(),
         );
-        let lowered = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
+        let (lowered, _) = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
         assert_eq!(
             lowered
                 .rust_reverse_gap_candidates
@@ -2592,7 +2653,7 @@ mod tests {
             BindingFragmentId::for_test(b"digest-7"),
             crate::analyzer::resolution::test_shared_names(),
         );
-        let lowered = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
+        let (lowered, _) = lower_common_resolution_facts(&mut identities, Language::Rust, &facts);
 
         assert_eq!(lowered.additional_definition_namespaces.len(), 1);
         assert_eq!(lowered.definition_unit_crosswalks[0].unit, unit);

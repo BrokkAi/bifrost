@@ -507,6 +507,19 @@ structural type productions.
 The 0447 candidate header also records lexical import interference as a checked
 Boolean source fact. Named imports, unclosed globs and attributed imports block
 standard-macro fallback certification at the invocation.
+
+Migration `0518-rust-function-shapes.sql` is BREAKING: older readers do not know
+that a type slot can carry a written function-family bound (`F: FnMut(A) -> B`,
+`impl Fn(A)`, `dyn Fn(A)`), nor that a closure argument publishes identifier
+binder slots whose types a contextual signature fills. They would ignore both
+and could reuse a binder answer that a newer reader derives from them. It adds
+four scalar relations, all foreign keys into `resolution_semantic_catalog`: a
+shape header per bounded type (trait head slot, optional result slot with its
+written reference layers) and one row per written parameter; and a closure
+literal header per closure written as a call argument (complete flag, optional
+declared result slot) with member rows for its identifier binders and its
+`ReturnValue` slots. A closure is not a declaration: no definition, catalog node
+or callable signature exists for it. Its version is 0518.
 Migration `0420-rust-drop-inventory-read-keys.sql` adds typed Drop inventory
 questions to both general read ledgers. The five scalar columns are present
 only for rust_drop_inventory lookups. It also widens both semantic IR gap
@@ -522,3 +535,56 @@ IR tables while preserving every retained row and ID. The new tags are
 reader-breaking: older row decoders reject them, and the version-suffixed
 store files and user_version check fence those readers without raising the
 oldest importable cache version.
+Migration `0467-clear-jvm-external-inventory.sql` is Compatible: it clears a
+derived JVM cache. Step 3d's `jvm-external-projection` token rotates the
+projection identity. Publications, members, supertypes and owners are removed
+in child-before-parent order, including when the upgrader runs with foreign
+keys off. Providers republish on first use. Migration 0425 clears the same
+tables, but a store can run 0425, re-project rows under master's identity and
+only then upgrade here (#12445). Until #12245 scopes JVM provider ids by
+projection identity, those rows would be served under the rotated identity, so
+this purge stays. It runs before 0468 creates the inventory generation
+triggers, so the deleted rows do not advance the generation.
+
+Migration `0468-summary-lookup-question-shapes.sql` aligns summary lookup questions
+with the general policy ledger, including name-only derivations. Compatible:
+the constraint is relaxed and existing rows are unchanged. Stores are version
+suffixed (`cache_db_file_name_for_version` in `src/cache_db.rs`), and
+`newest_importable_store` excludes versions at or above the binary's current
+version, so binaries before 0468 never read rows written under it. The rebuild
+preserves column order, WITHOUT ROWID, STRICT, the foreign key, and the sole
+explicit index; the table has no triggers.
+
+0468 also adds the singleton JVM external inventory generation and row triggers
+on owners, members, supertypes and publication certificates. This is additive,
+leaves existing rows unchanged, and uses the same version-suffixed writer
+isolation described above. Every committed inventory mutation advances the
+generation in the same transaction, including writes from other connections.
+
+Migration 0493 is BREAKING: it clears JVM publication and inventory rows, adds
+identity-scoped provider keys with a unique semantic SHA/projection identity pair,
+and cascades publication deletion through owners, members and supertypes.
+An AUTOINCREMENT publication sequence orders retention independently of identity.
+The schema user_version fences older readers; durable catalog inputs republish.
+Publication state is explicitly uncertified or sealed. Only sealed rows have
+certificate digest/counts. Legacy writers create uncertified parents. Certified
+activation atomically replaces an uncertified parent and its cascading inventory
+with a new sealed publication; it never updates the old parent in place.
+Both states share newest-two retention.
+The rebuilt owner, member and supertype tables keep 0425's nullable generic-surface
+columns (`type_parameters_jsonb`, `type_arguments_jsonb`), and the 0468 generation
+triggers are recreated. Scoping provider ids by projection identity means a later
+projection-identity rotation needs no purge migration like 0467: the old identity's
+rows stay under their own provider ids until retention removes them.
+
+Migration `0500-rust-impl-scopes-and-include-invocations.sql` (#11183) adds the
+shared canonical impl-declaration carrier and the include invocation occurrence
+bridge. An impl's NULL `enclosing_scope` means its native attachment is unknown,
+including macro-replayed impls; it never means the impl has no enclosing scope.
+Readers must fail closed on that value. Existing include rows receive NULL
+invocation identity and likewise cannot establish a structured invocation.
+The Rust resolution bundle lever refreshes the impl bridge; the Rust source
+salt refreshes the occurrence-backed include facts. Final number 0500 was assigned
+by the native-engine coordinator; validate its landing order after the final
+master merge. #13040 adds its
+impl owner columns to this carrier in a later migration.

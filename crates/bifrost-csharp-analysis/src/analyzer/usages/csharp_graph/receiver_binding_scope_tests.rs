@@ -328,14 +328,9 @@ fn aliased_base_hierarchies_complete_under_bounded_forward_and_usage_queries() {
     let analyzer = fixture.analyzer.analyzer();
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).unwrap();
     let scope = AnalyzerQueryScope::new(analyzer);
-    for usage in [false, true] {
-        // Two physical declarations have one direct base between them. This
-        // finite allowance completes their store reads once, but cannot pay
-        // for expanding a duplicate owner appended to its persisted parts.
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 38,
-            ..ReceiverAnalysisBudget::default()
-        };
+    for (usage, exact_steps) in [(false, 38), (true, 6)] {
+        // Two physical declarations have one direct base between them.
+        let budget = ReceiverAnalysisBudget::default();
         let session = ResolutionSession::bounded(budget, None);
         let result = compatible_receiver_type_names(
             csharp,
@@ -346,8 +341,16 @@ fn aliased_base_hierarchies_complete_under_bounded_forward_and_usage_queries() {
             Some(&session),
         );
         assert!(result.contains("Lib.Base"), "usage={usage}: {result:?}");
+        // The exact scope steps (measured; deterministic per mode): the forward
+        // query reads the store once in 38 steps, the usage query in 6. The old
+        // forward allowance was exactly 38 and could not pay for expanding a
+        // duplicate owner; a second expansion now shows as extra reported work.
         let outcome = session.finish(result);
-        assert!(matches!(outcome, BoundedResolution::Complete { .. }));
+        assert!(
+            matches!(&outcome, BoundedResolution::Complete { work, .. } if work.scope_nodes == exact_steps),
+            "usage={usage}: {:?}",
+            outcome.work()
+        );
     }
 }
 
@@ -441,17 +444,12 @@ fn bounded_extension_return_preserves_forward_provider_accounting() {
     // This forward store path charges 65 source/scope steps. The usage path
     // materializes candidates through uncapped providers and charges only 39;
     // routing a forward request there would incorrectly complete at this limit.
-    let limited = ResolutionSession::bounded(
-        ReceiverAnalysisBudget {
-            max_scope_nodes: 48,
-            ..ReceiverAnalysisBudget::default()
-        },
-        None,
-    );
+    let limited =
+        ResolutionSession::bounded_with_total_work(ReceiverAnalysisBudget::default(), 48, None);
     let result = query(&limited);
     assert!(result.is_none(), "{result:?}");
     assert!(matches!(limited.finish(result), BoundedResolution::Exceeded {
-        limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::ScopeNodes,
+        limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
         ..
     }));
 }

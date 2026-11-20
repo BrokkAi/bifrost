@@ -66,6 +66,7 @@ pub trait DataflowOutput<T> {
 #[derive(Debug, Clone, Copy)]
 pub struct DataflowEdge<'graph, Fact = ()> {
     caller_conversion_may_run_user_code: bool,
+    analyzed_family_arm: bool,
     kind: IcfgEdgeKind,
     origin: Option<&'graph CallSiteHandle>,
     source: &'graph ProgramPointHandle,
@@ -108,6 +109,7 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
     ) -> Self {
         Self {
             caller_conversion_may_run_user_code: false,
+            analyzed_family_arm: false,
             kind,
             origin,
             source,
@@ -129,6 +131,18 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
 
     pub(crate) const fn caller_conversion_may_run_user_code(&self) -> bool {
         self.caller_conversion_may_run_user_code
+    }
+
+    pub(crate) const fn with_analyzed_family_arm(mut self, arm: bool) -> Self {
+        self.analyzed_family_arm = arm;
+        self
+    }
+
+    /// Whether this call or matched-return edge crosses one arm of a sealed
+    /// dispatch family whose every arm the solve analyzes (#11296). Its proof
+    /// stays the arm's own: only selection made it Unproven.
+    pub(crate) const fn analyzed_family_arm(&self) -> bool {
+        self.analyzed_family_arm
     }
 
     pub const fn with_boundary(mut self, boundary: &'graph DispatchBoundaryKind) -> Self {
@@ -283,6 +297,17 @@ pub trait DistributiveDataflowProblem {
     /// of on the dispatch boundary's edges. The boundary is still retained
     /// for completion accounting.
     fn call_replaced_by_proven_model(&self, _call: &CallSiteHandle) -> bool {
+        false
+    }
+
+    /// Whether this problem analyzes every arm of a sealed dispatch family
+    /// for the same subject (#11296). The solver then discharges only the
+    /// selection weakness that the family certificate accounts for: the
+    /// family's open-remainder and abstract-declaration boundaries, and the
+    /// selection-induced incompleteness of each arm's call edge. Each arm
+    /// stays an Unproven may-target, so a violation through one arm remains a
+    /// possible witness.
+    fn closes_analyzed_dispatch_families(&self) -> bool {
         false
     }
 

@@ -842,6 +842,7 @@ pub trait ProgramSemanticsLowerer: Send + Sync {
         prepared: &PreparedSyntaxTree,
         budget: &crate::analyzer::semantic::SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>;
 }
 
@@ -1841,6 +1842,13 @@ impl ArtifactRetentionCensus {
         self.arenas.insert(identity, bytes);
         self.arena_bytes = self.arena_bytes.saturating_add(bytes as u64);
         true
+    }
+
+    /// Include an immutable owned allocation alongside its artifact pins.
+    /// Identity is local to this short-lived, allocation-deduplicating census.
+    #[doc(hidden)]
+    pub fn allocation(&mut self, identity: usize, bytes: usize) {
+        self.arena(identity, || bytes);
     }
 
     pub fn context(&mut self, context: &crate::analyzer::semantic::OracleCallContext) {

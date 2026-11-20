@@ -33,7 +33,7 @@ and [Configuration Files](/reference/configuration-files/).
 
 | Variable | Values | Default | Effect | Invalid value |
 | --- | --- | --- | --- | --- |
-| `BIFROST_CACHE_DIR` | Directory | Not set | Use exactly this directory for the analyzer database `bifrost_cache.v<N>.db` and the semantic-pack catalog. Every repository that a process opens uses the same directory. Takes precedence over `BIFROST_CACHE_ROOT` for the repository cache. | An empty value is treated as not set. An unwritable directory is an error when the cache opens. |
+| `BIFROST_CACHE_DIR` | Directory | Not set | Use this directory for the analyzer database `bifrost_cache.v<N>.db` and the semantic-pack catalog, which Bifrost keeps in its own child `bifrost-store/` with a self-ignoring `.gitignore`. A database of any schema version that an earlier version left directly in this directory is no longer used, and neither is a `semantic-pack-catalog.v<N>` directory left beside it; Bifrost warns about them on every run and deletes neither. There is no warning when the directory is also where a run without this variable keeps its store: a `BIFROST_CACHE_ROOT` child, or, when that variable is not set, a repository's `.bifrost/cache`. Every repository that a process opens uses the same directory. Takes precedence over `BIFROST_CACHE_ROOT` for the repository cache. | An empty value is treated as not set. An unwritable directory is an error when the cache opens. |
 | `BIFROST_CACHE_ROOT` | Directory | Not set | Relocate every Bifrost cache to one machine-local root. Each primary repository gets the child `<repository-name>-<hash>/`. The machine-level cache also moves to this root. | An empty value is treated as not set. |
 | `BIFROST_ALLOW_UNSAFE_NETWORK_CACHE` | `1` | Not set | On Linux, allow the SQLite cache on NFS or SMB. Without it, Bifrost refuses to create the cache there. | Any other value is the same as not set. |
 | `BIFROST_CACHE_GC` | `0`, `off`, or `disabled` turn it off | On | Turn off automatic collection of unreachable data in the analyzer cache. Use it for a cache that several repositories share on purpose. | Any other value leaves collection on. |
@@ -53,7 +53,7 @@ semantic packs for a workspace. That happens in the MCP server, `--tool`,
 
 | Variable | Values | Default | Effect | Invalid value |
 | --- | --- | --- | --- | --- |
-| `BIFROST_MCP_REQUEST_BUDGET_SECS` | Positive integer number of seconds | Not set: 60 s for most tools, 240 s for `run_policy`, 4.5 s for most tools while the workspace is still building, and no budget for `refresh`, `activate_workspace`, `update_paths`, and `get_active_workspace` | One time budget for every analyzer request. | The server does not start; exit 1. |
+| `BIFROST_MCP_REQUEST_BUDGET_SECS` | Positive integer number of seconds | Not set: 60 s for most tools, 240 s for `run_policy`, and no budget for `refresh`, `activate_workspace`, `update_paths`, and `get_active_workspace` | One time budget for analyzer admission and execution. Initial workspace preparation returns workspace_not_ready immediately. | The server does not start; exit 1. |
 | `BIFROST_MCP_TASK_TTL_MS` | Integer of 1 or more, in milliseconds | `600000` (10 minutes) | Lifetime and execution deadline of an MCP task for `run_policy`. | Ignored with a warning on stderr; the default applies. |
 | `BIFROST_MCP_FILE_WATCHER` | `on` or `off` | `on` | `off` stops the server from watching workspace files. Call the `refresh` tool after edits. | The server does not start; exit 1. |
 | `BIFROST_MCP_LOG` | `off`, `error`, `warn`, `info`, `debug`, or `trace` | `warn` | Level of MCP protocol diagnostics written to stderr. | The server does not start; exit 1. |
@@ -87,7 +87,7 @@ Bifrost reads these standard variables. It does not change them.
 | `HOME` (`USERPROFILE` on Windows) | Cache, JVM and .NET discovery, REPL, `--install`, `~/` in Git paths | Locates `~/.cache/bifrost`, `~/Library/Caches/bifrost`, `~/.m2/repository`, `~/.gradle/caches`, `~/.nuget/packages`, and `~/.bifrost_code_query_repl_history`. |
 | `XDG_CACHE_HOME` | Machine-level cache on Linux and other Unix systems | Machine-level cache is `$XDG_CACHE_HOME/bifrost` when set. |
 | `LOCALAPPDATA` | Machine-level cache on Windows | Machine-level cache is `%LOCALAPPDATA%\bifrost\cache`. |
-| `JAVA_HOME` | JVM standard-library discovery | The JDK at `JAVA_HOME` is a candidate source of JDK declarations. It does not bind a JDK to source files; `.bifrost/jvm-toolchains.json` does that. |
+| `JAVA_HOME` | JVM standard-library discovery | The JDK at `JAVA_HOME` is a candidate source of JDK declarations. When `JAVA_HOME` is unset, Bifrost uses the JDK that the first `java` on `PATH` resolves to, after following symlinks, and ignores it when that home is not a usable JDK. A `JAVA_HOME` that is set to an empty value turns JDK discovery from the environment off. It does not bind a JDK to source files; `.bifrost/jvm-toolchains.json` does that. |
 | `GRADLE_USER_HOME` | JVM dependency discovery | Gradle module cache is `$GRADLE_USER_HOME/caches/modules-2/files-2.1` instead of `~/.gradle/caches/modules-2/files-2.1`. |
 | `NUGET_PACKAGES` | C# dependency discovery | An additional approved NuGet package root. |
 | `PATH`, `PATHEXT` | `--install`; `git` subprocesses | Find coding-host commands and the `git` executable. |

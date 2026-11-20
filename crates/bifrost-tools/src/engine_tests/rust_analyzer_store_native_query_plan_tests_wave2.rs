@@ -68,6 +68,10 @@ mod rust_departing_wave2_root_tests {
 
     #[test]
     #[hardwon("#5638+#5658: unbounded views and macro-hidden scheduler SQL escaped plan coverage")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn native_query_plan_registry() {
         let fixture = RustRootResolutionOperationFixture::new();
         let cancellation = CancellationToken::new();
@@ -118,7 +122,9 @@ mod rust_departing_wave2_root_tests {
         // The selected inventory is read-only. Recreate these exact current
         // schema objects in a writable fixture so the populated plan is real.
         let plan_conn = rusqlite::Connection::open_in_memory().unwrap();
+        plan_conn.pragma_update(None, "foreign_keys", true).unwrap();
         for name in [
+            "jvm_external_provider_publications",
             "jvm_external_owners",
             "jvm_external_owner_members",
             "jvm_external_owner_members_by_name",
@@ -133,6 +139,7 @@ mod rust_departing_wave2_root_tests {
             plan_conn.execute_batch(&ddl).unwrap();
         }
         for provider in ["plan-provider", "other-provider"] {
+            plan_conn.execute("INSERT INTO jvm_external_provider_publications(provider_id,semantic_sha256,source_identity,projection_identity,publication_state) VALUES(?1,?1,'fixture',zeroblob(32),'uncertified')", [provider]).unwrap();
             for owner in ["plan.package", "plan.other", "plan.third"] {
                 plan_conn.execute(
                     "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES(?1,?2,1,1,0,0)",
@@ -360,5 +367,64 @@ mod rust_departing_wave2_root_tests {
             failures.is_empty(),
             "native SQL plan regressions: {failures:#?}"
         );
+    }
+
+    #[test]
+    #[hardwon("#12898: crate completion rescanned full TEMP relations on every propagation pass")]
+    fn rust_crate_completion_plans_in_both_statistics_states() {
+        use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+        use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+        let registered = registry();
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            brokk_bifrost_analysis::analyzer::store::rust_crates::derivation::prepare_tables(&conn)
+                .unwrap();
+            state.install(&conn);
+            for name in [
+                "rust_binding_path_complete",
+                "rust_binding_import_complete",
+                "rust_crate_derivation_sql_cr_gaps_9",
+            ] {
+                let (_, sql) = registered
+                    .statements
+                    .iter()
+                    .find(|(registered, _)| registered == name)
+                    .unwrap();
+                let plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                if name == "rust_crate_derivation_sql_cr_gaps_9" {
+                    assert!(
+                        plan.iter().any(|row| row.contains(
+                            "cr_imports_source (module_path=? AND blob_id=? AND import_ordinal=?)"
+                        )),
+                        "{state}: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().any(|row| row.contains(
+                            "cr_exports_name (crate_key=? AND module_path=? AND name=?)"
+                        )),
+                        "{state}: {plan:?}"
+                    );
+                } else {
+                    assert!(
+                        plan.iter().any(|row| row.starts_with("SCAN dirty")),
+                        "{state}: dirty completion driver: {plan:?}"
+                    );
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|row| row.starts_with("SCAN source")
+                                || row.starts_with("SCAN done")),
+                        "{state}: full completion input scan: {plan:?}"
+                    );
+                }
+            }
+        }
     }
 }

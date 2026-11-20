@@ -28,6 +28,10 @@ end
 "#;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ruby_source_facts_reopen_with_exact_loads_and_structural_identity() {
         let fixture = InlineTestProject::with_language(Language::Ruby)
             .file("main.rb", SOURCE)
@@ -212,6 +216,10 @@ end
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ruby_source_publication_lookup_seeks_before_and_after_statistics() {
         use rusqlite::params;
         let fixture = InlineTestProject::with_language(Language::Ruby)

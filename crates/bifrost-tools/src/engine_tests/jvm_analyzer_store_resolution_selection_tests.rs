@@ -81,6 +81,10 @@ mod jvm_extraction_tests {
     use brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId;
 
     #[track_caller]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn check_interior_count(
         ready: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
         expected: usize,
@@ -115,6 +119,10 @@ mod jvm_extraction_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn retained_interior_certificates_track_main_commits_and_temp_ddl() {
         use brokk_bifrost_analysis::analyzer::store::resolution_lexical::SelectedResolutionLexicalSource;
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_sql_trace::{
@@ -209,6 +217,10 @@ mod jvm_extraction_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_inventory_handles_zero_one_and_page_boundaries() {
         for count in [0, 1, 256, 257] {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_language(
@@ -346,6 +358,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_input_routing_collision_rebuilds_exact_relational_selection() {
         let (_temp, mut fixture) =
             crate::selection_fixture_support::JvmSelectionFixture::persistent(1);
@@ -413,6 +429,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn alternating_exact_selection_keys_retain_their_own_reader_and_temp_inventory() {
         let (_temp, fixture) = crate::selection_fixture_support::JvmSelectionFixture::persistent(2);
         let removal = SelectedResolutionOverlayMask::removal("java", "src/0000.java");
@@ -454,20 +474,192 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
-    fn concurrent_same_key_returns_keep_one_retained_reader() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13847: a nested same-key operation opened and staged a new reader every time"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn nested_same_key_operations_keep_both_readers_warm() {
         let (_temp, fixture) = crate::selection_fixture_support::JvmSelectionFixture::persistent(1);
-        let first = fixture.open_ready(&[]);
-        let concurrent = fixture.open_ready(&[]);
-        drop(first);
-        drop(concurrent);
+        let cache_size = |ready: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>| {
+            ready
+                .connection()
+                .pragma_query_value(None, "cache_size", |row| row.get::<_, i32>(0))
+                .unwrap()
+        };
+        {
+            // A connection-local pragma identifies each reader without changing
+            // its schema or data freshness stamp.
+            let outer = fixture.open_ready(&[]);
+            outer
+                .connection()
+                .pragma_update(None, "cache_size", -8193)
+                .unwrap();
+            let nested = fixture.open_ready(&[]);
+            nested
+                .connection()
+                .pragma_update(None, "cache_size", -8194)
+                .unwrap();
+        }
+        for _ in 0..3 {
+            let outer = fixture.open_ready(&[]);
+            let nested = fixture.open_ready(&[]);
+            let mut readers = [cache_size(&outer), cache_size(&nested)];
+            readers.sort_unstable();
+            assert_eq!(readers, [-8194, -8193]);
+        }
+        // A distinct selection evicts the second copy, not the other selection.
+        let removal = SelectedResolutionOverlayMask::removal("java", "src/0000.java");
+        drop(fixture.open_ready(std::slice::from_ref(&removal)));
         let state = fixture.store.active_readers.state.lock().unwrap();
+        let retained = state
+            .idle
+            .iter()
+            .filter_map(|reader| reader.resolution_selection.as_ref())
+            .map(|selection| selection.routing_digest)
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert_ne!(retained[0], retained[1]);
+    }
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn rust_selection_epoch_move_restages_unchanged_mounts() {
+        // Staging fills the Rust unit tables, which the mount fingerprint does
+        // not cover; a Main commit that only moves their inputs must restage.
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_store(
+            AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap(),
+            1,
+            "rust",
+            Language::Rust,
+            false,
+            false,
+            Some("pub struct Model;"),
+        );
+        {
+            let ready = fixture.open_ready(&[]);
+            assert_eq!(ready.persisted_mount_count(), 1);
+        }
+        let snapshot = fixture.snapshots.get("rust").unwrap().clone();
+        fixture
+            .store
+            .conn
+            .execute(move |writer| {
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(writer);
+                writer.execute(
+                    "INSERT INTO main.workspace_selection_epochs(workspace_id, lang, generation, revision, epoch)
+                     VALUES(?1, 'rust', ?2, ?3, 1)
+                     ON CONFLICT DO UPDATE SET epoch=epoch+1",
+                    rusqlite::params![
+                        snapshot.workspace_id.as_str(),
+                        snapshot.generation.0,
+                        snapshot.revision
+                    ],
+                )
+            })
+            .unwrap();
+        let ready = fixture.open_ready(&[]);
+        assert_eq!(ready.persisted_mount_count(), 1);
         assert_eq!(
-            state
-                .idle
-                .iter()
-                .filter(|reader| reader.resolution_selection.is_some())
-                .count(),
-            1
+            ready.retained_rust_selection_epoch_for_test(),
+            ready
+                .connection()
+                .query_row(
+                    "SELECT epoch FROM main.workspace_selection_epochs WHERE lang='rust'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            "the reused selection was filled under the current Rust epoch"
+        );
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13847: a Main commit that left the selected mounts unchanged restaged the retained selection"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn main_commit_outside_the_inventory_keeps_the_retained_selection() {
+        let (_temp, fixture) = crate::selection_fixture_support::JvmSelectionFixture::persistent(1);
+        {
+            let conn = fixture.store.active_read_conn().unwrap();
+            ensure_revisioned_workspace_views(&conn).unwrap();
+            conn.execute_batch(selected_resolution_temp_schema_sql())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TEMP TABLE selection_materialization_probe(insertions INTEGER NOT NULL);
+                 CREATE TEMP TRIGGER count_selected_resolution_materialization
+                 AFTER INSERT ON selected_resolution_context
+                 BEGIN
+                   INSERT INTO selection_materialization_probe VALUES(1);
+                 END;",
+            )
+            .unwrap();
+        }
+        // Read on the operation's own reader: a general checkout may clear it.
+        let materializations = |ready: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>| {
+            assert_eq!(ready.persisted_mount_count(), 1);
+            ready
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM temp.selection_materialization_probe",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        };
+        let data_version = |ready: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>| {
+            ready
+                .connection()
+                .query_row("PRAGMA main.data_version", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = data_version(&fixture.open_ready(&[]));
+        fixture.store.conn.execute(|writer| {
+            writer
+                .execute(
+                    "INSERT INTO main.reference_fact_epochs(lang, epoch) VALUES('unselected', 1)",
+                    [],
+                )
+                .unwrap();
+        });
+        {
+            let ready = fixture.open_ready(&[]);
+            assert_ne!(
+                data_version(&ready),
+                before,
+                "the reader saw the Main commit"
+            );
+            assert_eq!(
+                materializations(&ready),
+                1,
+                "a commit that leaves the selected inventory unchanged keeps the TEMP selection"
+            );
+        }
+        fixture
+            .store
+            .conn
+            .execute(|writer| {
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(writer);
+                writer.execute(
+                    "UPDATE main.resolution_fragment_interiors SET payload_bytes=payload_bytes+1",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            materializations(&fixture.open_ready(&[])),
+            2,
+            "a commit that changes a selected mount rebuilds the TEMP selection"
         );
     }
     #[test]
@@ -509,6 +701,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cached_content_mount_lookup_seeks_published_rows_before_and_after_statistics() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(128);
         let request = SelectedResolutionContentMountRequest::new(
@@ -844,6 +1040,10 @@ mod jvm_extraction_tests {
         assert!(error.to_string().contains("overlapping file versions"));
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn read_change_stamp_observes_schema_external_and_same_connection_changes() {
         // Pooled readers write TEMP; the writer performs main schema changes.
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_store(
@@ -1092,6 +1292,10 @@ mod jvm_extraction_tests {
         ));
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn interrupted_stage_dml_rolls_back_and_releases_reader_cancellation() {
         use brokk_bifrost_analysis::analyzer::store::resolution::with_resolution_read_progress_handler;
         use std::sync::Arc;
@@ -1192,6 +1396,10 @@ mod jvm_extraction_tests {
         assert!(reused.connection().is_autocommit());
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn temp_state_clears_before_active_reader_reuse() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let ready = fixture.open_ready(&[]);
@@ -1224,6 +1432,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_mount_blob_index_is_recreated_and_survives_retained_state() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let ready = fixture.open_ready(&[]);
@@ -1289,6 +1501,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn simultaneous_ready_sessions_keep_connection_local_workspace_state() {
         let (_temp, fixture) = crate::selection_fixture_support::JvmSelectionFixture::persistent(1);
         let other_workspace =
@@ -1419,6 +1635,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_query_plans_restore_the_pooled_readers_previous_setting() {
         use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
 
@@ -1463,6 +1683,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn retained_selection_checkout_preserves_prepared_query_plans() {
         use rusqlite::StatementStatus;
         use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
@@ -1492,6 +1716,10 @@ mod jvm_extraction_tests {
         assert!(!ordinary.db_config(SQLITE_DBCONFIG_ENABLE_QPSG).unwrap());
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cleanup_failure_discards_pooled_reader() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let ready = fixture.open_ready(&[]);
@@ -1535,6 +1763,10 @@ mod jvm_extraction_tests {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn assert_selected_query_plans(
         statistics: brokk_bifrost_core::cache_gc::PlannerStatisticsState,
     ) {
@@ -1879,6 +2111,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn named_manifest_counts_round_trip_in_family_order() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let ready = fixture.open_ready(&[]);

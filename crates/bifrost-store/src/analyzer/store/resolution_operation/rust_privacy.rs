@@ -96,6 +96,7 @@ pub(super) fn complete_access_source_read(
 /// through the mount's interior first: the source site is the only key this
 /// authority chain admits.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn read_selected_rust_declaration_authority_with_cancellation(
     inventory: &SelectedResolutionMountInventory<'_>,
     requests: &[(SelectedResolutionMountOrdinal, ResolutionSiteId)],

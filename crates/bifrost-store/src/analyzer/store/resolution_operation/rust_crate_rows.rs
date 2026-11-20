@@ -65,6 +65,7 @@ impl SelectedResolutionOperation<'_, '_> {
 }
 
 impl ReadySelectedResolution<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn rust_absolute_root(
         &self,
         file: &ProjectFile,
@@ -111,6 +112,7 @@ impl ReadySelectedResolution<'_, '_> {
 
 impl SelectedResolutionOperation<'_, '_> {
     /// Whether selected import facts need configuration authority at all.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_rust_imports_have_cfg(
         &self,
         file: &ProjectFile,
@@ -143,6 +145,7 @@ impl SelectedResolutionOperation<'_, '_> {
 impl ReadySelectedResolution<'_, '_> {
     /// Import facts pinned by this selection.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn selected_rust_import_infos(
         &self,
         file: &ProjectFile,
@@ -386,6 +389,10 @@ impl<'a> CrateStageMemos<'a> {
 }
 
 impl Drop for CrateStageMemos<'_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn drop(&mut self) {
         self.rows.take();
         self.access.take();
@@ -1029,6 +1036,7 @@ pub(super) const MODULE_DEFINITIONS: &str = "SELECT DISTINCT json_extract(asked.
 
 /// The definitions among `definitions` (each with its mount ordinal and
 /// semantic key) that declare a module.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn module_definitions(
     selection: &SelectedResolutionMountInventory<'_>,
     definitions: &[(SemanticId, SelectedResolutionMountOrdinal, i64)],
@@ -1092,6 +1100,7 @@ pub(crate) fn module_definitions(
 /// `Foo::member()`; this asks the same question for a type the member route
 /// evaluated rather than one a path prefix named. `owner` and `reference` are
 /// each a mount ordinal and a semantic key with ordinary provenance.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn implemented_traits_nameable_at(
     selection: &SelectedResolutionMountInventory<'_>,
     owner: (SelectedResolutionMountOrdinal, i64),
@@ -1196,6 +1205,7 @@ const OWNER_PLACEMENTS: &str = "SELECT placement.topology_id, placement.containe
 /// injects the name. That is the derive-helper absence proof
 /// ([`super::rust_derive_helpers`]) asked of the derive name itself. Each
 /// placement of the declaration must prove every name.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn builtin_derive_member(
     selection: &SelectedResolutionMountInventory<'_>,
     owner: (SelectedResolutionMountOrdinal, i64),
@@ -1306,6 +1316,7 @@ pub(crate) fn builtin_derive_member(
 }
 
 /// Nameability of a known trait does not require an indexed impl subject.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn trait_nameable_at(
     selection: &SelectedResolutionMountInventory<'_>,
     owner: (SelectedResolutionMountOrdinal, i64),
@@ -1475,6 +1486,7 @@ pub(super) const IMPL_ITEM_TRAITS: &str = concat!(
 /// bridge the impl to one impl item. The caller then resolves the impl's
 /// header as it would without the rows. `member` is a mount ordinal and a
 /// semantic key with ordinary provenance.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn impl_item_traits(
     selection: &SelectedResolutionMountInventory<'_>,
     member: (SelectedResolutionMountOrdinal, i64),
@@ -1528,6 +1540,7 @@ pub(super) const EXTERNAL_TYPE_IDENTITY: &str = "SELECT 1
  CROSS JOIN resolution_identities AS identity ON identity.id=binding.root_terminal
  WHERE mount.mount_ordinal=?1 AND identity.namespace=?3 LIMIT 1";
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn external_type_identities(
     selection: &SelectedResolutionMountInventory<'_>,
     boundary: (SelectedResolutionMountOrdinal, i64),
@@ -1559,6 +1572,7 @@ pub(crate) fn external_type_identities(
 }
 
 /// Read one external type import through its explicit token-to-route site.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn external_type_import_path(
     selection: &SelectedResolutionMountInventory<'_>,
     boundary: (SelectedResolutionMountOrdinal, i64),
@@ -1591,6 +1605,7 @@ pub(crate) fn external_type_import_path(
 
 /// Keep cfg alternatives separate: a boundary closes only when every route
 /// names the same itemless standard marker.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn external_type_import_paths_for_binding(
     selection: &SelectedResolutionMountInventory<'_>,
     blob: i64,
@@ -1643,6 +1658,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// cannot supply an alternate `crate::` root for that same source. Both
     /// Rust forward routes read this, which is why it lives beside the crate
     /// rows rather than in either one.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn modules_for_mount(
         &self,
         mounts: SelectedMountTable<'_, '_>,
@@ -1701,6 +1717,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// `selected_blob` is the blob of the mount selected for `path`, which
     /// every caller already read while resolving that mount, so this asks the
     /// selection nothing of its own.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn crate_overlay_import_completion(
         &self,
         blob: i64,
@@ -1781,6 +1798,7 @@ impl RustCrateRows<'_, '_, '_> {
     }
 
     /// Does the selected target module export this imported name to its caller?
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn crate_import_target_is_exported(
         &self,
         blob: i64,
@@ -1850,6 +1868,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// crate's other impls are never enumerated: the read seeks the two subject
     /// columns of a covering index.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn crate_trait_member_bridges(
         &self,
         mounts: &SelectedMountTable<'_, '_>,
@@ -2031,6 +2050,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// A module owner's exact set comes from the published authority, with
     /// access checked at the binding: only a mixed-visibility group substitutes
     /// an independently exact set.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn crate_binding_inventory(
         &self,
         requester: &Module,
@@ -2133,6 +2153,7 @@ impl RustCrateRows<'_, '_, '_> {
         )?)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn binding_details(
         &self,
         topology: i64,
@@ -2195,6 +2216,7 @@ impl RustCrateRows<'_, '_, '_> {
         Ok(binding)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn import_details(
         &self,
         requester: &Module,
@@ -2222,6 +2244,7 @@ impl RustCrateRows<'_, '_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn crate_inventory_completion(
         &self,
         requester: &Module,
@@ -2273,6 +2296,7 @@ impl RustCrateRows<'_, '_, '_> {
         self.inventory_completion(details)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn binding_inventory(&self, details: Vec<String>) -> Result<RustBindingInventory> {
         let mut targets = None;
         for detail in &details {
@@ -2340,6 +2364,7 @@ impl RustCrateRows<'_, '_, '_> {
 
     /// The native import scopes of one module scope
     /// (`rust_crate_point_scopes.sql`), remembered for the crate stage.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn module_import_scopes(&self, blob: i64, scope: u32) -> Result<Vec<u32>> {
         if let Some(scopes) = self
             .ready
@@ -2379,6 +2404,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// A crate root is written by no `mod` item and therefore contributes no
     /// target: a caret on the `crate` of `crate::x` has no declaration to
     /// stand on.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn anchor_declaration_targets(
         &self,
         targets: Vec<(i64, String, String)>,
@@ -2442,6 +2468,7 @@ impl RustCrateRows<'_, '_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn crate_exports(
         &self,
         requester: &Module,
@@ -2519,6 +2546,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// The original external import tokens reached through named/glob routes.
     /// Retaining the originating binding makes a local reimport share its type
     /// identity with uses of that binding in the parent module.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn crate_external_bindings(
         &self,
         requester: &Module,
@@ -2563,6 +2591,7 @@ impl RustCrateRows<'_, '_, '_> {
         Ok(identities)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn absolute_root(
         &self,
         topology: i64,
@@ -2837,6 +2866,7 @@ impl RustCrateRows<'_, '_, '_> {
     /// A route can miss at a middle segment (`RouteRules::dead_end`) or at the
     /// demanded name after the keyword is consumed (`crate::missing`); both ask
     /// this one question.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn unmounted_keyword_root_completion(
         &self,
         requester: &Module,
@@ -2989,6 +3019,7 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for RustRouteRules<'_, '_, '
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn route_tier(
         &self,
         cursor: &WalkCursor<T>,
@@ -3147,6 +3178,7 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for RustRouteRules<'_, '_, '
 impl RustRouteRules<'_, '_, '_> {
     /// What a miss at `name` leaves open: the unmounted-file boundary, the
     /// name's inventory and any macro-opened route.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn dead_end_at<T>(&self, cursor: &WalkCursor<T>, name: &str) -> Result<ResolutionCompletion> {
         let RouteLocation::Container {
             unit: topology,
@@ -3375,6 +3407,42 @@ impl GapEvidenceReason {
             Wire::Unknown => Self::Unclassified,
         }
     }
+}
+
+/// Read the producer kind at an exact selected definition, recording its path.
+/// Item declarations have a property row; non-item/staged identities may not.
+pub(super) fn selected_declaration_kind(
+    ready: &ReadySelectedResolution<'_, '_>,
+    identity: SemanticId,
+    cancellation: &CancellationToken,
+) -> Result<Option<brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind>> {
+    use super::super::selected_read::queries::rust::{
+        DeclarationKind, DeclarationKindKey, SourceSemantic,
+    };
+    let Some(SelectedSemanticProvenance::FragmentLocal(provenance)) = ready
+        .lexical_source()
+        .semantic_provenance(identity, cancellation)?
+    else {
+        return Ok(None);
+    };
+    let mount =
+        SelectedMountTable::new(&ready.inventory).mount_by_ordinal(provenance.mount().ordinal())?;
+    if mount.semantic_language() != Language::Rust {
+        return Ok(None);
+    }
+    let Some(read) = ready.rust_model_selected_read() else {
+        return Ok(None);
+    };
+    let Some(content) = read.mount_by_path(Language::Rust, mount.persisted_relative_path())? else {
+        return Ok(None);
+    };
+    read.selection::<DeclarationKind>(&DeclarationKindKey {
+        source: SourceSemantic {
+            content,
+            key: provenance.local_key().get(),
+        },
+        mount_ordinal: provenance.mount().ordinal().get(),
+    })
 }
 
 #[cfg(test)]

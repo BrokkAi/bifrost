@@ -75,8 +75,21 @@ impl Scan {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SCHEMA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Full schema-content scans this thread ran since the last call.
+#[cfg(test)]
+pub fn take_schema_scans_for_test() -> usize {
+    SCHEMA_SCANS.with(|count| count.replace(0))
+}
+
 fn scan(conn: &Connection, schema: &str) -> rusqlite::Result<Scan> {
     assert!(schema == "main" || schema == "temp");
+    #[cfg(test)]
+    SCHEMA_SCANS.with(|count| count.set(count.get() + 1));
     let mut statement = conn.prepare_cached(&format!(
         "SELECT type, name, tbl_name, sql FROM {schema}.sqlite_schema ORDER BY type, name"
     ))?;

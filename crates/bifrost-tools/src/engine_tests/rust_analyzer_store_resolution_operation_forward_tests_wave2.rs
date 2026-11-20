@@ -107,16 +107,14 @@ mod rust_departing_wave2_root_tests {
     }
 
     #[test]
-    fn selected_rust_forward_zero_scope_budget_cannot_publish_prefix() {
+    fn selected_rust_forward_zero_scope_budget_stops_before_staging_callback() {
         let fixture = RustRootResolutionOperationFixture::new();
         let cancellation = CancellationToken::new();
         let operation = fixture.open_ready(&cancellation);
         let (context, crate_keys) = rust_crate_resolution_context(&operation, &cancellation);
-        let session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let session = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            0,
             Some(&cancellation),
         );
         let mut callback_called = false;
@@ -145,7 +143,7 @@ mod rust_departing_wave2_root_tests {
         assert!(matches!(
             session.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::TotalWork,
                 ..
             }
         ));

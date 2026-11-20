@@ -366,6 +366,7 @@ pub(crate) mod tests {
 
     fn go_test_type(id: &str, name: &str, kind: TypeKind, symbol: &str) -> TypeFact {
         TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -375,6 +376,7 @@ pub(crate) mod tests {
             type_kind: kind,
             visibility: Visibility::Public,
             is_abstract: false,
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -411,6 +413,8 @@ pub(crate) mod tests {
         returns: Option<brokk_bifrost_analysis::analyzer::semantic_model::model::TypeRef>,
     ) -> brokk_bifrost_analysis::analyzer::semantic_model::model::MemberFact {
         brokk_bifrost_analysis::analyzer::semantic_model::model::MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             id: id.to_owned(),
             owner: owner.to_owned(),
             name: name.to_owned(),
@@ -431,6 +435,7 @@ pub(crate) mod tests {
             exact_return_classes: Vec::new(),
             signature: Some(
                 brokk_bifrost_analysis::analyzer::semantic_model::model::Signature {
+                    bounds: None,
                     type_parameters: Vec::new(),
                     parameters,
                     returns,
@@ -1882,6 +1887,7 @@ pub(crate) mod tests {
         };
         relations.clear();
         types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -1897,6 +1903,7 @@ pub(crate) mod tests {
             type_kind: TypeKind::Class,
             visibility: Visibility::Public,
             is_abstract: false,
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -2033,7 +2040,9 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        let activation = |sha256: String| SemanticModelActivationRequest {
+        let activation = |sha256: String| {
+            SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -2047,10 +2056,12 @@ pub(crate) mod tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: Some(sha256),
+                production_input_digest: None,
+verified_raw_artifacts: (Some(sha256)).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
             }],
             controls: Vec::new(),
             limits: Default::default(),
+        }
         };
         let active = match resolve_active_semantic_models(
             &catalog,
@@ -2181,6 +2192,7 @@ pub(crate) mod tests {
                 drop_glue: None,
                 drop_effects: None,
                 drop_review: None,
+                interior_mutability: None,
             });
             (type_id, member_id)
         };
@@ -2838,6 +2850,7 @@ pub(crate) mod tests {
                 drop_glue: None,
                 drop_effects: None,
                 drop_review: None,
+                interior_mutability: None,
             });
         }
         let exported = export_authored_csmi_pack(&value_semantics, &artifact, &options)
@@ -4643,7 +4656,8 @@ pub(crate) mod tests {
                 },
             )
             .expect("whole-pack admission verifies both shards");
-        let row = |purl: &str, digest: String| SemanticModelActivationEvidence {
+        let row = |purl: &str, digest: String| {
+            SemanticModelActivationEvidence {
             language: "python".to_owned(),
             ecosystem: "python".to_owned(),
             package: Some(CatalogCoordinate {
@@ -4654,7 +4668,9 @@ pub(crate) mod tests {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: Some(digest),
+            production_input_digest: None,
+verified_raw_artifacts: (Some(digest)).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::PythonSource, &sha256)).collect(),
+        }
         };
         let summary = ProcedureSummaryTargetKey::new(
             "python",
@@ -4692,6 +4708,7 @@ pub(crate) mod tests {
             ),
         ] {
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence,
@@ -4779,7 +4796,8 @@ pub(crate) mod tests {
         .unwrap();
         let stub_purl = "pkg:pypi/types-beautifulsoup4@4.13.0";
         let runtime_purl = "pkg:pypi/beautifulsoup4@4.13.0";
-        let row = |purl: &str, digest: String| SemanticModelActivationEvidence {
+        let row = |purl: &str, digest: String| {
+            SemanticModelActivationEvidence {
             language: "python".to_owned(),
             ecosystem: "python".to_owned(),
             package: Some(CatalogCoordinate {
@@ -4790,7 +4808,9 @@ pub(crate) mod tests {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: Some(digest),
+            production_input_digest: None,
+verified_raw_artifacts: (Some(digest)).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::PythonSource, &sha256)).collect(),
+        }
         };
         let target = ProcedureSummaryTargetKey::new("python", "bs4", "bs4.parse", false, 1);
         for (evidence, expected_summaries) in [
@@ -4812,6 +4832,7 @@ pub(crate) mod tests {
             ),
         ] {
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence,

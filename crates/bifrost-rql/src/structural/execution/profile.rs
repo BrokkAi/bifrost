@@ -1265,7 +1265,7 @@ mod public_contract_tests {
             session_subset: None,
             results: Vec::new(),
             truncated: true,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
         }
     }
 

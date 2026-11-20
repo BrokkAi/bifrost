@@ -86,6 +86,10 @@ mod jvm_extraction_tests {
 
     use git2::ObjectType;
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn signature_metadata_pairs_round_trip_for_java_synthetic_units() {
         let source = "interface Dual { void run() {} }\nclass Dual { void run() {} Object make() { return new Object() { void inside() {} }; } }\n";
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
@@ -240,6 +244,10 @@ mod jvm_extraction_tests {
     /// over one column of an on-disk store file, which is precisely what a
     /// consumer had to decode two million bincode blobs to learn before.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_persisted_java_field_initializer_is_readable_as_plain_sql() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -1980,12 +1988,7 @@ mod jvm_extraction_tests {
                 .unwrap()
         );
 
-        let current_generation = store
-            .ensure_language_epoch(
-                Language::Scala,
-                &brokk_bifrost_jvm_analysis::analyzer::scala::language::LANGUAGE.into(),
-            )
-            .unwrap();
+        let current_generation = store.ensure_language_epoch(&ScalaAdapter).unwrap();
         assert_ne!(current_generation, prior_generation);
         assert!(
             !store
@@ -2014,12 +2017,7 @@ mod jvm_extraction_tests {
                 state.as_ref(),
             )
             .unwrap();
-        let reused_generation = store
-            .ensure_language_epoch(
-                Language::Scala,
-                &brokk_bifrost_jvm_analysis::analyzer::scala::language::LANGUAGE.into(),
-            )
-            .unwrap();
+        let reused_generation = store.ensure_language_epoch(&ScalaAdapter).unwrap();
         assert_eq!(reused_generation, current_generation);
         assert!(
             store
@@ -2268,6 +2266,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn hydration_read_snapshot_keeps_meta_and_satellites_on_one_generation() {
         let temp = tempfile::TempDir::new().unwrap();
         let db = temp.path().join("cache.db");

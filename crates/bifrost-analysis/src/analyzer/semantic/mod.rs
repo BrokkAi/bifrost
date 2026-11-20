@@ -43,7 +43,7 @@ macro_rules! impl_program_semantics_provider {
                     brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope), file,
                 ).expect("test source is prepared");
                 $crate::analyzer::semantic::service::ProgramSemanticsLowerer::lower(
-                    &lowerer, file, &prepared, budget, cancellation,
+                    &lowerer, file, &prepared, budget, cancellation, self.inner.analyzer_store().retention_budget(),
                 )
             }
             fn capabilities(&self) -> $crate::analyzer::semantic::SemanticCapabilities {
@@ -85,7 +85,7 @@ macro_rules! impl_program_semantics_provider {
                 file: &$crate::analyzer::ProjectFile,
                 max_source_bytes: usize,
             ) -> Result<
-                Option<$crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+                $crate::analyzer::semantic::SemanticArtifactSourceOutcome<$crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
                 $crate::analyzer::semantic::SemanticProviderError,
             > {
                 let $context = self;
@@ -198,6 +198,20 @@ macro_rules! impl_program_semantics_provider {
                 request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
             ) -> Result<$crate::analyzer::semantic::service::CandidateProcedureOutcome<()>, $crate::analyzer::semantic::SemanticProviderError> {
                 self.inner.selected_procedure_and_flows(self, file, base, request)
+            }
+
+            fn selected_candidate_alternate_flows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                procedure: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::SemanticOutcome<
+                    Option<$crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>,
+                >,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.selected_candidate_alternate_flows(self, file, procedure, request)
             }
 
             fn stored_candidate_macro_artifact(
@@ -243,7 +257,7 @@ macro_rules! impl_program_semantics_provider {
                     brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope), file,
                 ).expect("test source is prepared");
                 $crate::analyzer::semantic::service::ProgramSemanticsLowerer::lower(
-                    &lowerer, file, &prepared, budget, cancellation,
+                    &lowerer, file, &prepared, budget, cancellation, self.inner.analyzer_store().retention_budget(),
                 )
             }
             fn capabilities(&self) -> $crate::analyzer::semantic::SemanticCapabilities {
@@ -256,7 +270,7 @@ macro_rules! impl_program_semantics_provider {
                 file: &$crate::analyzer::ProjectFile,
                 max_source_bytes: usize,
             ) -> Result<
-                Option<$crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+                $crate::analyzer::semantic::SemanticArtifactSourceOutcome<$crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
                 $crate::analyzer::semantic::SemanticProviderError,
             > {
                 let lowerer = $lowerer;
@@ -367,6 +381,20 @@ macro_rules! impl_program_semantics_provider {
                 request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
             ) -> Result<$crate::analyzer::semantic::service::CandidateProcedureOutcome<()>, $crate::analyzer::semantic::SemanticProviderError> {
                 self.inner.selected_procedure_and_flows(self, file, base, request)
+            }
+
+            fn selected_candidate_alternate_flows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                procedure: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::SemanticOutcome<
+                    Option<$crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>,
+                >,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.selected_candidate_alternate_flows(self, file, procedure, request)
             }
 
             fn stored_candidate_macro_artifact(

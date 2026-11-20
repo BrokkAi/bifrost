@@ -468,6 +468,7 @@ fn project_constant(
     };
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -483,6 +484,7 @@ fn project_constant(
             type_kind: TypeKind::Class,
             visibility: Visibility::Public,
             is_abstract: false,
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -517,11 +519,14 @@ pub(crate) fn constant_member_fact(
     locator: Locator,
 ) -> MemberFact {
     let signature = Signature {
+        bounds: None,
         type_parameters: Vec::new(),
         parameters: Vec::new(),
         returns: Some(return_type.clone()),
     };
     MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -833,6 +838,7 @@ fn project_type(
         }
     }
     types.push(TypeFact {
+        type_parameter_kinds: Vec::new(),
         alias_target: None,
         tuple_fields: None,
         implemented_traits_complete: false,
@@ -848,6 +854,7 @@ fn project_type(
         type_kind,
         visibility: Visibility::Public,
         is_abstract: false,
+        is_final: None,
         is_sealed: false,
         callable_surface_complete: false,
         has_explicit_type_terms: false,
@@ -913,11 +920,14 @@ fn project_attribute(
         None => TypeRef::named("untyped"),
     };
     let signature = Signature {
+        bounds: None,
         type_parameters: Vec::new(),
         parameters: Vec::new(),
         returns: Some(property_type),
     };
     Ok(MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -1054,6 +1064,8 @@ fn project_method(
             return_type: signature.returns.as_ref(),
         });
         projected.push(MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -1117,6 +1129,7 @@ fn function_signature(
         None => None,
     };
     Ok(Signature {
+        bounds: None,
         type_parameters: method_type_parameters,
         parameters,
         returns,

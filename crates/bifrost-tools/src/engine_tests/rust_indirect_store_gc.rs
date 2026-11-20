@@ -23,6 +23,10 @@ mod rust_indirect_table_tests {
     #[hardwon(
         "d78f9a16030c: readers kept stale query plans after garbage collection changed planner statistics"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_collection_that_drops_rows_recycles_this_stores_readers() {
         let _statistics = brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
             .lock()

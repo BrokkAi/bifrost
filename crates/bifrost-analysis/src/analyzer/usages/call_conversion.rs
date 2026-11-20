@@ -1277,15 +1277,17 @@ impl CallArgumentConversion {
 type IndexedConversionProof = (usize, Result<ArgumentTypeConversion, ConversionUnknown>);
 
 pub struct ConversionSource {
-    macro_inventories: std::sync::OnceLock<
-        HashMap<usize, brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory>,
+    source_owner: Option<
+        brokk_bifrost_core::retention_budget::BudgetedValue<
+            super::prepared_macro_source::PreparedMacroSource,
+        >,
     >,
     embedded: Result<
-        crate::analyzer::structural::spec::EmbeddedSyntaxForest,
+        Arc<crate::analyzer::structural::spec::EmbeddedSyntaxForest>,
         crate::analyzer::structural::spec::EmbeddedSyntaxStop,
     >,
     pub source: Arc<str>,
-    pub tree: tree_sitter::Tree,
+    pub tree: Arc<tree_sitter::Tree>,
     pub(crate) preparation: super::get_definition::PreparedDefinitionSource,
     parse_census: StableDigest,
     pub(crate) shape_census: StableDigest,
@@ -1296,34 +1298,60 @@ impl ConversionSource {
         &self,
         tree: &tree_sitter::Tree,
     ) -> &brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory {
-        self.macro_inventories
-            .get_or_init(|| {
-                let mut inventories = HashMap::default();
-                let fragments = self
-                    .embedded
-                    .as_ref()
-                    .ok()
-                    .into_iter()
-                    .flat_map(|forest| forest.trees().iter().map(|fragment| &fragment.tree));
-                for tree in std::iter::once(&self.tree).chain(fragments) {
-                    let inventory =
-                        brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory::build(
-                            tree,
-                            &self.source,
-                            &|| true,
-                        )
-                        .expect("conversion syntax has no cancellation token");
-                    inventories.insert(tree.root_node().id(), inventory);
-                }
-                inventories
-            })
-            .get(&tree.root_node().id())
-            .expect("conversion tree belongs to this source")
+        self.source_owner
+            .as_ref()
+            .expect("macro inventories belong to Rust conversion syntax")
+            .macro_inventory(tree)
+    }
+
+    fn from_prepared_macro_source(
+        file: &ProjectFile,
+        source: brokk_bifrost_core::retention_budget::BudgetedValue<
+            super::prepared_macro_source::PreparedMacroSource,
+        >,
+    ) -> Self {
+        let text = Arc::clone(&source.source);
+        let tree = source.prepared.shared_tree();
+        let embedded = source.embedded.clone();
+        Self::from_parts(file, text, tree, embedded, Some(source))
     }
 
     /// The census names the file as well as its content: each file holds its
     /// own source and tree, so files with identical bytes are charged once each.
     fn new(file: &ProjectFile, source: Arc<str>, tree: tree_sitter::Tree) -> Self {
+        if let Some(support) = crate::analyzer::languages::language_support(language_for_file(file))
+            && let Some(backing) = support
+                .exact_macro_source(&source, &tree, None)
+                .expect("caller-owned conversion source has no cancellation token")
+        {
+            return Self::from_prepared_macro_source(file, backing);
+        }
+        let embedded = crate::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
+            crate::analyzer::structural_spec_for(language_for_file(file))
+                .expect("conversion source has a registered structural adapter"),
+            tree.root_node(),
+            &source,
+            200_000,
+            None,
+        )
+        .map(Arc::new);
+        Self::from_parts(file, source, Arc::new(tree), embedded, None)
+    }
+
+    fn from_parts(
+        file: &ProjectFile,
+        source: Arc<str>,
+        tree: Arc<tree_sitter::Tree>,
+        embedded: Result<
+            Arc<crate::analyzer::structural::spec::EmbeddedSyntaxForest>,
+            crate::analyzer::structural::spec::EmbeddedSyntaxStop,
+        >,
+        source_owner: Option<
+            brokk_bifrost_core::retention_budget::BudgetedValue<
+                super::prepared_macro_source::PreparedMacroSource,
+            >,
+        >,
+    ) -> Self {
         let content = StableDigest::sha256(source.as_bytes());
         let path = file.rel_path().to_string_lossy();
         let mut parse = LengthDelimitedDigest::new(b"bifrost.rust.conversion-parse-census.v2");
@@ -1332,18 +1360,12 @@ impl ConversionSource {
         let mut shape = LengthDelimitedDigest::new(b"bifrost.rust.conversion-shape-census.v2");
         shape.push(path.as_bytes());
         shape.push(content.as_bytes());
-        let preparation =
-            super::get_definition::PreparedDefinitionSource::new(Arc::clone(&source), tree.clone());
-        let embedded = crate::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
-            crate::analyzer::structural_spec_for(language_for_file(file))
-                .expect("conversion source has a registered structural adapter"),
-            tree.root_node(),
-            &source,
-            200_000,
-            None,
+        let preparation = super::get_definition::PreparedDefinitionSource::new(
+            Arc::clone(&source),
+            tree.as_ref().clone(),
         );
         Self {
-            macro_inventories: std::sync::OnceLock::new(),
+            source_owner,
             embedded,
             source,
             tree,
@@ -2125,7 +2147,7 @@ fn conversion_request_cancelled(analyzer: &dyn IAnalyzer) -> bool {
 // source coordinates, even when an alias erases to a primitive or source type.
 fn rust_conversion_model_set(analyzer: &dyn IAnalyzer) -> StableDigest {
     let snapshot = analyzer.active_semantic_model_snapshot();
-    crate::analyzer::i_analyzer::current_model_set_digest(
+    analyzer.model_set_digest(
         snapshot
             .as_ref()
             .map(|snapshot| snapshot.active_models().active_model_set_hash()),
@@ -2312,7 +2334,7 @@ impl CallConversionCache {
             depth,
             rust_conversion_model_set(analyzer),
         );
-        let value = super::common::query_reentrant_memo_value(
+        let value = super::common::query_reentrant_request_local_memo_value(
             &self.rust_expressions,
             analyzer,
             &key,
@@ -2574,6 +2596,26 @@ impl CallConversionCache {
             #[cfg(any(test, feature = "test-support"))]
             self.source_builds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(support) =
+                crate::analyzer::languages::language_support(language_for_file(file))
+            {
+                let backing = match support.prepared_macro_source(analyzer, file, None) {
+                    Ok(backing) => backing,
+                    Err(super::prepared_macro_source::SourceCancelled) => {
+                        analyzer.record_query_incomplete(
+                            crate::analyzer::QueryReadIncomplete::Cancelled,
+                        );
+                        return None;
+                    }
+                };
+                if let Some(backing) = backing {
+                    return Some(Arc::new(ConversionSource::from_prepared_macro_source(
+                        file, backing,
+                    )));
+                }
+                // A source-only analyzer can supply conversion syntax without
+                // the language's indexed prepared-syntax service.
+            }
             let source = analyzer.indexed_source(file)?;
             let tree = parse_tree_for_language(file, language_for_file(file), &source)?;
             Some(Arc::new(ConversionSource::new(
@@ -3288,7 +3330,8 @@ mod tests {
             &source,
             0,
             None,
-        );
+        )
+        .map(Arc::new);
         assert!(matches!(
             parsed.embedded,
             Err(crate::analyzer::structural::spec::EmbeddedSyntaxStop::Exceeded)

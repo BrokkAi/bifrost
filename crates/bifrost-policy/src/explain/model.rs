@@ -13,8 +13,10 @@
 //! is producer order, and a node identifier is a hash of the node's structural
 //! position, its own content, and its children's identifiers.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -27,8 +29,11 @@ use crate::finding_identity::PolicyFindingId;
 use crate::identity::PolicySemanticHash;
 use crate::retained::{RetainedSize, retained_extra};
 
-use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePathError;
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    PendingSemanticPackAcquisition, SemanticModelActivationRead, SemanticModelOverlayStatus,
+};
+use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, IAnalyzer};
 
 /// The versioned format tag every explanation document carries.
 ///
@@ -559,6 +564,10 @@ pub struct PolicyExplanation {
     node_count: u64,
     root: ExplanationNode,
     truncation: ExplanationTruncation,
+    /// Whether the semantic models the workspace selected were active when
+    /// this answer was computed. Anything but `ready` or `no_models` makes
+    /// every model-dependent conclusion `unknown` (#13182).
+    semantic_models: SemanticModelOverlayStatus,
     /// The workspace generation this answer was produced under, when the
     /// surface that produced it knew one. A caller reads it once and pins it
     /// on every later question about the same report.
@@ -598,6 +607,9 @@ impl PolicyExplanation {
     pub const fn truncation(&self) -> &ExplanationTruncation {
         &self.truncation
     }
+    pub const fn semantic_models(&self) -> &SemanticModelOverlayStatus {
+        &self.semantic_models
+    }
     pub const fn workspace_generation(&self) -> Option<ExplanationGeneration> {
         self.workspace_generation
     }
@@ -634,7 +646,7 @@ impl PolicyExplanation {
 /// through [`ExplanationTruncation`]. A caller that raises a bound gets more
 /// nodes; a caller that lowers one gets a smaller but still well-formed and
 /// still honestly-labelled document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplanationLimits {
     max_nodes: usize,
     max_depth: usize,
@@ -645,6 +657,14 @@ pub struct ExplanationLimits {
     max_relation_executions: usize,
     max_near_miss_candidates: usize,
     max_near_miss_executions: usize,
+    /// The semantic-model activation the answer is computed under. Set by the
+    /// host entry points from one captured activation read. `None` only for a
+    /// caller that invokes an adapter directly: an adapter that has an
+    /// analyzer then states that analyzer's publication
+    /// ([`Self::stating_semantic_models_of`]). `explain_finding` reads only a
+    /// run, which does not record its activation, so it takes the status as
+    /// an argument.
+    semantic_models: Option<Arc<SemanticModelOverlayStatus>>,
 }
 
 impl Default for ExplanationLimits {
@@ -666,11 +686,70 @@ impl Default for ExplanationLimits {
             // pattern declares far fewer than 16 predicates in practice, and a
             // relational plan's extra row bindings draw on the same total.
             max_near_miss_executions: 16,
+            semantic_models: None,
         }
     }
 }
 
+/// The limits an explanation adapter answers under, together with the pin
+/// that holds the publication their status describes.
+pub(super) struct AdapterSemanticModels<'a> {
+    limits: Cow<'a, ExplanationLimits>,
+    _pin: Option<AnalyzerQueryScope<'a>>,
+}
+
+impl AdapterSemanticModels<'_> {
+    pub(super) fn limits(&self) -> &ExplanationLimits {
+        &self.limits
+    }
+}
+
+static NO_MODELS: SemanticModelOverlayStatus = SemanticModelOverlayStatus::NoModels;
+
 impl ExplanationLimits {
+    /// The semantic-model status the answer is computed under.
+    pub fn semantic_models(&self) -> &SemanticModelOverlayStatus {
+        self.semantic_models.as_deref().unwrap_or(&NO_MODELS)
+    }
+
+    /// State the activation a host captured for this question.
+    #[must_use]
+    pub(super) fn under_semantic_models(&self, status: &SemanticModelOverlayStatus) -> Self {
+        Self {
+            semantic_models: Some(Arc::new(status.clone())),
+            ..self.clone()
+        }
+    }
+
+    /// The limits an adapter answers under. A host entry point has already
+    /// stated its captured activation and pinned that publication. A caller
+    /// that invokes an adapter directly gets the status of the publication
+    /// `analyzer` serves now, and that publication stays pinned until the
+    /// returned value drops, so the status describes the model set the
+    /// answer is computed with.
+    ///
+    /// # Errors
+    ///
+    /// [`ExplainError::PolicyUnavailable`] when the question scope cannot be
+    /// opened, as for a host question.
+    pub(super) fn stating_semantic_models_of<'a>(
+        &'a self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Result<AdapterSemanticModels<'a>, ExplainError> {
+        if self.semantic_models.is_some() {
+            return Ok(AdapterSemanticModels {
+                limits: Cow::Borrowed(self),
+                _pin: None,
+            });
+        }
+        let read = SemanticModelActivationRead::capture(analyzer);
+        let pin = super::value_flow_question_scope(analyzer, read.snapshot().cloned())?;
+        Ok(AdapterSemanticModels {
+            limits: Cow::Owned(self.under_semantic_models(read.status())),
+            _pin: Some(pin),
+        })
+    }
+
     /// The root counts as depth 1, so `max_depth` is a level count.
     pub const fn max_depth(&self) -> usize {
         self.max_depth
@@ -1106,7 +1185,7 @@ pub(super) fn build_explanation(
     policy_hash: PolicySemanticHash,
     analysis_type: PolicyAnalysisType,
     subject: ExplanationSubject,
-    root: RawNode,
+    mut root: RawNode,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
     if limits.max_nodes == 0 {
@@ -1119,13 +1198,29 @@ pub(super) fn build_explanation(
             limit: ExplanationBudgetLimit::Depth,
         });
     }
-    let outcome = root.outcome;
     let mut bounded = Bounded {
         limits,
         nodes_used: 0,
         bytes_used: 0,
         truncation: ExplanationTruncation::default(),
     };
+    // The status is charged first and is never dropped: a document that cannot
+    // hold it is an error, not a silent omission.
+    let semantic_models = bounded_semantic_models(limits, &mut |bytes| {
+        bounded.truncation.omit_text_bytes(bytes);
+    });
+    bounded.bytes_used = status_bytes(&semantic_models);
+    if bounded.bytes_used > limits.max_retained_bytes {
+        return Err(ExplainError::BudgetExhausted {
+            limit: ExplanationBudgetLimit::RetainedBytes,
+        });
+    }
+    // Project the gap before retention and before identifiers exist, so the
+    // identifiers and the root outcome describe the projected tree.
+    if let Some(cause) = semantic_models_cause(limits) {
+        project_model_gap(&mut root, &cause);
+    }
+    let outcome = root.outcome;
     let Some(retained) = bounded.retain(root, 1) else {
         return Err(ExplainError::BudgetExhausted {
             limit: ExplanationBudgetLimit::RetainedBytes,
@@ -1145,8 +1240,112 @@ pub(super) fn build_explanation(
         node_count,
         root,
         truncation,
+        semantic_models,
         workspace_generation: None,
     })
+}
+
+/// The cause to state when the question's activation is not model-complete.
+pub(super) fn semantic_models_cause(limits: &ExplanationLimits) -> Option<String> {
+    limits.semantic_models().cause()
+}
+
+/// Cut every string of the status to `max_text_bytes`, recording the bytes.
+pub(super) fn bounded_semantic_models(
+    limits: &ExplanationLimits,
+    omit_text_bytes: &mut dyn FnMut(u64),
+) -> SemanticModelOverlayStatus {
+    let mut cut = |text: &mut String| {
+        omit_text_bytes(truncate_text_to(text, limits.max_text_bytes));
+    };
+    let mut status = limits.semantic_models().clone();
+    match &mut status {
+        SemanticModelOverlayStatus::Ready | SemanticModelOverlayStatus::NoModels => {}
+        SemanticModelOverlayStatus::Pending {
+            pending_acquisitions,
+            shipped_pack_acquisition,
+            ..
+        } => {
+            for pending in pending_acquisitions {
+                cut(&mut pending.ecosystem);
+                cut(&mut pending.dependency_id);
+            }
+            if let Some(shipped) = shipped_pack_acquisition {
+                cut(shipped);
+            }
+        }
+        SemanticModelOverlayStatus::Partial { reasons } => reasons.iter_mut().for_each(cut),
+        SemanticModelOverlayStatus::Unavailable { reason, .. } => cut(reason),
+    }
+    status
+}
+
+/// The extra bytes a gap-bearing status adds to the document. A complete status
+/// is a fixed tag and adds nothing, so an ordinary answer's budget is unchanged.
+pub(super) fn status_bytes(status: &SemanticModelOverlayStatus) -> usize {
+    if status.is_model_complete() {
+        return 0;
+    }
+    size_of::<SemanticModelOverlayStatus>().saturating_add(match status {
+        SemanticModelOverlayStatus::Ready | SemanticModelOverlayStatus::NoModels => 0,
+        SemanticModelOverlayStatus::Pending {
+            pending_acquisitions,
+            shipped_pack_acquisition,
+            ..
+        } => pending_acquisitions
+            .iter()
+            .map(|pending| {
+                size_of::<PendingSemanticPackAcquisition>()
+                    .saturating_add(pending.ecosystem.len())
+                    .saturating_add(pending.dependency_id.len())
+            })
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(shipped_pack_acquisition.as_ref().map_or(0, String::len)),
+        SemanticModelOverlayStatus::Partial { reasons } => reasons
+            .iter()
+            .map(|reason| size_of::<String>().saturating_add(reason.len()))
+            .fold(0usize, usize::saturating_add),
+        SemanticModelOverlayStatus::Unavailable { reason, .. } => reason.len(),
+    })
+}
+
+/// Make every conclusion that may depend on models `unknown` (#13182).
+///
+/// Independence from models is not proved, so every failed node becomes
+/// unknown with the partial-discovery reason, the root becomes unknown, and a
+/// leading coverage obligation names the cause. Satisfied nodes (source facts,
+/// rows the analysis did find) keep their outcome. The walk uses an explicit
+/// stack.
+fn project_model_gap(root: &mut RawNode, cause: &str) {
+    let mark = |node: &mut RawNode| {
+        if !node
+            .reasons
+            .contains(&PolicyIncompleteReason::PartialDiscovery)
+        {
+            node.reasons.push(PolicyIncompleteReason::PartialDiscovery);
+            node.reasons.sort();
+        }
+    };
+    let mut stack = vec![&mut *root];
+    while let Some(node) = stack.pop() {
+        if node.outcome == ExplanationOutcome::Failed {
+            node.outcome = ExplanationOutcome::Unknown;
+            mark(node);
+        }
+        stack.extend(node.children.iter_mut());
+    }
+    root.outcome = ExplanationOutcome::Unknown;
+    mark(root);
+    let mut obligation = RawNode::new(
+        ExplanationNodeKind::CoverageObligation,
+        ExplanationOutcome::Unknown,
+        "semantic_model_activation",
+    )
+    .with_expected("the semantic models selected for this workspace are active")
+    .with_actual(cause)
+    .with_reasons(vec![PolicyIncompleteReason::PartialDiscovery]);
+    obligation.location = None;
+    root.children.insert(0, obligation);
 }
 
 /// A node that survived the limits but has no identifier yet.

@@ -10,7 +10,9 @@ use crate::analyzer::store::active_models::FamilyRows;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::CatalogError;
 pub(super) use decoded::SelectedDecodedReads;
 pub use rows::RowCompositionReads;
-pub(super) use rows::{GroupInput, GroupProjection};
+#[cfg(test)]
+pub(super) use rows::SEARCH_OWNER_IDS_FOR_GROUPS;
+pub(super) use rows::{CompositionScopeIdentity, GroupInput, GroupProjection, admits_row_relation};
 type ReadResult<T> = Result<T, CatalogError>;
 
 fn check_composition_cancellation(
@@ -310,14 +312,35 @@ pub fn representative_identity(
     Ok(result)
 }
 
-fn finish(
+/// The symbol merge of one alias group, without relations. Search needs only
+/// these; a full `ComposedGroup` adds the rewritten relations.
+pub(super) struct ComposedSymbols {
+    pub(super) symbols: Vec<SemanticModelSymbol>,
+    source_indices: Vec<usize>,
+    diagnostics: Vec<SemanticModelCompositionDiagnostic>,
+    representative: RepresentativeIdentity,
+}
+
+impl ComposedSymbols {
+    fn with_relations(self, relations: Vec<(usize, SemanticModelRelation)>) -> ComposedGroup {
+        ComposedGroup {
+            symbols: self.symbols,
+            source_indices: self.source_indices,
+            // Round-trip through boxed slices so retained vectors have no spare slots.
+            relations: relations.into_boxed_slice().into_vec(),
+            diagnostics: self.diagnostics,
+            representative: self.representative,
+        }
+    }
+}
+
+fn finish_symbols(
     mut symbols: Vec<SemanticModelSymbol>,
-    relations: Vec<(usize, SemanticModelRelation)>,
     removed: HashSet<usize>,
     mut diagnostics: Vec<SemanticModelCompositionDiagnostic>,
     representative: RepresentativeIdentity,
-) -> ComposedGroup {
-    let source_indices = (0..symbols.len())
+) -> ComposedSymbols {
+    let source_indices: Vec<_> = (0..symbols.len())
         .filter(|i| !removed.contains(i))
         .collect();
     let mut index = 0;
@@ -327,11 +350,11 @@ fn finish(
         keep
     });
     normalize_diagnostics(&mut diagnostics);
-    ComposedGroup {
-        symbols,
-        source_indices,
-        relations,
-        diagnostics,
+    ComposedSymbols {
+        // Round-trip through boxed slices so retained vectors have no spare slots.
+        symbols: symbols.into_boxed_slice().into_vec(),
+        source_indices: source_indices.into_boxed_slice().into_vec(),
+        diagnostics: diagnostics.into_boxed_slice().into_vec(),
         representative,
     }
 }
@@ -374,13 +397,29 @@ pub(super) fn record_origin_identities(
 /// with each owner, member and relation. Outside reads never inspect another
 /// group's composed members.
 pub(super) fn compose(
-    mut symbols: Vec<SemanticModelSymbol>,
+    symbols: Vec<SemanticModelSymbol>,
     relations: Vec<(usize, SemanticModelRelation)>,
     active: &(impl CompositionReads + ?Sized),
     representatives: &HashMap<(String, String), String>,
     composed_owners: &HashSet<(String, String)>,
     origin_identities: &OriginRewrites,
 ) -> ReadResult<ComposedGroup> {
+    Ok(
+        compose_symbols(symbols, active)?.with_relations(rewrite_relations(
+            relations,
+            representatives,
+            composed_owners,
+            origin_identities,
+        )),
+    )
+}
+
+/// The one symbol merge. Relations never influence it: the full composition and
+/// the symbols-only search entry both go through here.
+pub(super) fn compose_symbols(
+    mut symbols: Vec<SemanticModelSymbol>,
+    active: &(impl CompositionReads + ?Sized),
+) -> ReadResult<ComposedSymbols> {
     let group = symbols
         .iter()
         .enumerate()
@@ -408,28 +447,16 @@ pub(super) fn compose(
         .filter(|index| symbols[*index].provenance.extraction.is_some())
         .collect::<Vec<_>>();
     let Some(&selected) = artifacts.first() else {
-        return Ok(finish(
+        return Ok(finish_symbols(
             symbols,
-            rewrite_relations(
-                relations,
-                representatives,
-                composed_owners,
-                origin_identities,
-            ),
             removed,
             diagnostics,
             representative,
         ));
     };
     if group.len() == 1 {
-        return Ok(finish(
+        return Ok(finish_symbols(
             symbols,
-            rewrite_relations(
-                relations,
-                representatives,
-                composed_owners,
-                origin_identities,
-            ),
             removed,
             diagnostics,
             representative,
@@ -446,14 +473,8 @@ pub(super) fn compose(
                 symbols[index].provenance.ambiguous = true;
             }
         }
-        return Ok(finish(
+        return Ok(finish_symbols(
             symbols,
-            rewrite_relations(
-                relations,
-                representatives,
-                composed_owners,
-                origin_identities,
-            ),
             removed,
             diagnostics,
             representative,
@@ -673,7 +694,12 @@ pub(super) fn compose(
             let artifact = &mut symbols[artifact_index];
             structural_diagnostics(&curated, artifact, active, &mut diagnostics)?;
             fill_semantics(artifact, &curated);
-            if preserve_authored_family && !artifact.provenance.activation.approximate {
+            if preserve_authored_family
+                && authored_family_survives(
+                    artifact.provenance.activation.approximation,
+                    curated.callable_family_target_independent,
+                )
+            {
                 artifact.callable_family_complete = true;
             }
             artifact
@@ -694,14 +720,8 @@ pub(super) fn compose(
         )?;
         removed.insert(index);
     }
-    Ok(finish(
+    Ok(finish_symbols(
         symbols,
-        rewrite_relations(
-            relations,
-            representatives,
-            composed_owners,
-            origin_identities,
-        ),
         removed,
         diagnostics,
         representative,
@@ -1429,6 +1449,11 @@ pub(super) fn freeze_symbol_order(symbols: &mut [SemanticModelSymbol]) {
     }
 }
 
+pub(super) fn owned_symbol_source_key(symbol: &SemanticModelSymbol) -> (String, String, String) {
+    let (name, id, digest) = semantic_symbol_source_key(symbol);
+    (name.to_owned(), id.to_owned(), digest.to_owned())
+}
+
 pub(super) fn symbol_source_order(
     left: &SemanticModelSymbol,
     right: &SemanticModelSymbol,
@@ -1564,7 +1589,16 @@ pub(super) fn assert_group_parity(
             .collect::<HashSet<_>>();
         let mut input_relations: Vec<(usize, SemanticModelRelation)> = relations
             .iter()
-            .filter(|r| origin_ids.contains(&(r.provenance.pack_digest.as_str(), r.from.as_str())))
+            // The eager oracle includes decoded-owned relations. The row
+            // stream owns only the admitted subset, while its owner symbols
+            // still include decoded declarations for endpoint rewriting.
+            .filter(|r| {
+                origin_ids.contains(&(r.provenance.pack_digest.as_str(), r.from.as_str()))
+                    && active
+                        .shards
+                        .iter()
+                        .any(|shard| admits_row_relation(shard, &r.provenance.pack_digest))
+            })
             .cloned()
             .enumerate()
             .collect();
@@ -1605,4 +1639,60 @@ pub(super) fn assert_group_parity(
         assert_eq!(expected, actual, "group relations {key:?}");
     }
     (groups.len(), generated_groups)
+}
+
+/// Whether an authored `callable_family_complete` claim survives onto an
+/// authored or artifact member activated with `approximation`. Exact activation
+/// keeps it.
+/// An approximate one keeps it only when the claim is reviewed as
+/// target-independent and every reason is an unknown target; any version
+/// uncertainty withholds it (#12360).
+pub(super) fn authored_family_survives(
+    approximation: Option<brokk_bifrost_semantic::analyzer::semantic_model::ApproximationReasons>,
+    claim_is_target_independent: bool,
+) -> bool {
+    match approximation {
+        None => true,
+        Some(reasons) => claim_is_target_independent && reasons.target_unknown_only(),
+    }
+}
+
+#[cfg(test)]
+mod authored_family_survival_tests {
+    use super::authored_family_survives;
+    use brokk_bifrost_semantic::analyzer::semantic_model::{
+        ApproximationReason::{
+            DependencyVersionApproximate, StdlibBuildUnverified, TargetUnknown,
+            ToolchainVersionUnknown,
+        },
+        ApproximationReasons,
+    };
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13674: approximate activation survival is exact only for target-independent claims under target-only uncertainty"
+    )]
+    fn survival_requires_exact_or_target_only_with_a_reviewed_claim() {
+        let only = ApproximationReasons::only;
+        for claim in [false, true] {
+            assert!(authored_family_survives(None, claim));
+        }
+        assert!(authored_family_survives(Some(only(TargetUnknown)), true));
+        assert!(!authored_family_survives(Some(only(TargetUnknown)), false));
+        for reasons in [
+            only(ToolchainVersionUnknown),
+            only(StdlibBuildUnverified),
+            only(DependencyVersionApproximate),
+            only(TargetUnknown).with(ToolchainVersionUnknown),
+            only(TargetUnknown).with(StdlibBuildUnverified),
+            only(TargetUnknown).with(DependencyVersionApproximate),
+        ] {
+            for claim in [false, true] {
+                assert!(
+                    !authored_family_survives(Some(reasons), claim),
+                    "{reasons:?}"
+                );
+            }
+        }
+    }
 }

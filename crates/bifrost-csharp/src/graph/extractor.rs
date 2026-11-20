@@ -1,6 +1,6 @@
 use crate::graph::CSharpGraphSource;
 use crate::graph::hits::{push_hit, push_self_receiver_hit, push_unproven_hit};
-use crate::graph::membership_scope::{DoubtMemo, MembershipScopedSource, SiteDoubt};
+use crate::graph::membership_scope::{DoubtMemo, MembershipScopedSource, Obligation, SiteMark};
 use crate::graph::resolver::{
     CSharpBuiltinValueArguments, CSharpCallArgumentOwners, CSharpInitializerOwnerLookups,
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
@@ -150,7 +150,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) membership: &'a MembershipScopedSource<'a>,
     /// Doubt admitted before the node now being scanned: a hit whose
     /// derivation admitted more is not proven.
-    pub(super) site_doubt: SiteDoubt,
+    pub(super) site_mark: SiteMark,
     pub(super) graph: &'a CSharpGraphSource<'a>,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
@@ -185,7 +185,7 @@ impl<'a> ScanCtx<'a> {
         Self {
             csharp,
             membership,
-            site_doubt: SiteDoubt::default(),
+            site_mark: SiteMark::default(),
             graph,
             file,
             source: &prepared.source,
@@ -260,7 +260,7 @@ fn scan_nodes<'tree>(root: Node<'tree>, token: QueryToken<'_>, contexts: &mut [S
             if ctx.usages.limit_reached() {
                 continue;
             }
-            ctx.site_doubt = ctx.membership.site();
+            ctx.site_mark = ctx.membership.site();
             match ctx.spec.kind {
                 TargetKind::Type => scan_type_reference(node, token, ctx),
                 TargetKind::Constructor => scan_constructor_reference(node, token, ctx),
@@ -847,7 +847,9 @@ fn derive_extension_target_resolution(
         explicit_generic_arity,
     );
     if candidates.open.is_some() {
-        membership.add_doubt();
+        membership.record(Obligation::NoExtensionMember {
+            receiver_type: format!("{receiver_type_names:?}"),
+        });
     }
     if candidates.candidates.contains(&spec.target) {
         TargetMemberResolution::MatchesTarget

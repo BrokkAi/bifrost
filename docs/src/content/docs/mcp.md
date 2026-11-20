@@ -179,15 +179,56 @@ The durability boundary is the process. Bifrost's MCP transport is stdio, so one
 
 ## Request budget
 
+Analyzer-backed MCP calls do not wait for initial workspace preparation.
+While preparation runs, synchronous calls (including `search_symbols` and
+`run_policy`) return `isError: true` with no `structuredContent` and
+`_meta["io.bifrost/incomplete"]` containing status `inconclusive`, completion
+`{type: "inconclusive", reasons: ["workspace_not_ready"]}`, stage
+`workspace_readiness`, the current `phase`, `partial: false`, and
+`workspace_preparation: "continues"`. This is not a deadline expiry and does
+not cancel the shared build. Check `get_active_workspace` or retry; named
+workspace mode exposes only retry. A failed build reports its real error.
+
+`get_active_workspace` also reports the full `retiring_workspaces` list, with
+`root`, `generation`, and the teardown `phase` for every retained workspace.
+Each service permits the installed session plus one replacement in flight.
+A further activation returns `workspace_not_ready` at stage
+`workspace_activation` without changing the active root or generation; retry
+when retirement drains. Revocation is always permitted. Existing semantic warm
+and build cancellation tokens are cancelled on retirement. Index and usage
+warms retain their slot until they finish; cancellable teardown is tracked by
+#13507.
+
+The probe never waits for the connection, session, or lifecycle locks. An unbound
+probe may await its own client roots reply, with no server guard held during
+that round trip; it rechecks the binding after the reply and returns `busy` if
+the binding changes during observation. On platforms where a queued writer
+prevents a read attempt, or while the lifecycle lock is busy, it returns an
+inconclusive tool result with reason `busy` and stage `workspace_activation`.
+Retry the probe; writer preference depends on the platform. These activation
+results include the full `retiring_workspaces` list in incomplete metadata.
+
+`get_active_workspace` is a non-blocking readiness probe. `analyzer_ready`
+means the analyzer has been installed. `workspace_build` reports `status`
+(`running`, `completed`, or `failed`), `generation`, optional `phase`, and an
+`error` on failure. Before installation, usage and semantic readiness are
+false and the semantic overlay is pending. `activate_workspace` binds and
+starts preparation, returning success without waiting. Re-activating the same
+workspace after preparation failed starts a fresh generation; ordinary probes
+retain failures, and activation never restarts a building or ready workspace. A cold `refresh` or
+`update_paths` returns not-ready without applying the operation; retry it.
+Once warm, both operations complete their publication fences before success.
+
+This contract concerns initial analyzer construction only. Later snapshot
+settling, usage catch-up, and semantic warm-up retain their correctness waits.
+Durable Tasks return a handle immediately and their workers may wait for
+initial preparation.
+
 Every tool call except `refresh`, `activate_workspace`,
-`get_active_workspace`, and `list_policies` has a wall-clock budget. The budget covers the wait for workspace readiness, the wait for an analyzer slot,
-and execution.
+`get_active_workspace`, and `list_policies` has a wall-clock budget. The budget covers readiness observation, the wait for an analyzer slot, and execution. Readiness observation does not wait for an unfinished build.
 
 - Without configuration, an ordinary call gets 60 seconds, and a synchronous
   `run_policy` call gets 240 seconds.
-- While the workspace is still building, every tool except `search_symbols`
-  fails after 4.5 seconds with a typed error that says the workspace is not
-  ready. Retry the call after the build has had time to progress.
 - `BIFROST_MCP_REQUEST_BUDGET_SECS` sets one budget, in whole seconds, for
   every tool except `list_policies`, including `run_policy` and the three
   workspace tools. The value must be
@@ -316,11 +357,6 @@ exhausted search appears in `missing_functions`; cancelled, incomplete,
 unresolved, ambiguous, and unproven searches appear in
 `indeterminate_functions`. The result is static reachability evidence, not
 runtime coverage.
-
-`relation_brief` uses the same endpoints to summarize target-anchored callers,
-two-hop incoming use chains and changed outgoing calls. Every item includes a
-location outside changed lines. Typed completeness and budget omissions stay
-visible; Value flow is explicitly not computed. Tests are excluded by default.
 
 `score_diff` shares those endpoint rules and returns a deterministic vector of
 raw named features describing how hard a revision range makes future

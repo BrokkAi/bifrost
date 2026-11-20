@@ -315,6 +315,19 @@ impl PersistentFileSetProject {
 }
 
 impl Project for PersistentFileSetProject {
+    fn retained_ignore_observation(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation {
+        self.sources.retained_ignore_observation()
+    }
+
+    fn listing_ignore_inputs_verified(
+        &self,
+        listing: &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+    ) -> bool {
+        self.sources.listing_ignore_inputs_verified(listing)
+    }
+
     fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()

@@ -19,6 +19,9 @@ use super::{
     SeedMatch, seed_range,
 };
 use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
+use crate::analyzer::semantic::workspace_oracle::dispatch::{
+    ProcedureLookupProgress, ProcedureSourceRangeIndex,
+};
 use crate::analyzer::semantic::workspace_oracle::{
     PreparedSourceDispatchSession, ProcedureRangeLookupStatus, RuntimeKeyedReadFilter,
     RuntimeKeyedReadResult, procedures_for_definition_with_limits, procedures_for_source_ranges,
@@ -34,12 +37,12 @@ use crate::analyzer::semantic::{
     ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactLeaseChild,
     SemanticArtifactLeaseError, SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseSet,
     SemanticArtifactLeaseSnapshot, SemanticArtifactLeaseWindow, SemanticBudget,
-    SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite, SemanticCapability,
-    SemanticEffect, SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot,
-    SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticRole, SemanticValue,
-    SemanticWork, SourceMapping, SourceMappingKind, SourceSpan, StructuralNodeIdentity,
-    ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind, ValueHandle, ValueId,
-    WorkspaceMountId,
+    SemanticBudgetDimension, SemanticBudgetExceeded, SemanticBudgetScopeSnapshot, SemanticCallSite,
+    SemanticCapability, SemanticEffect, SemanticEvent, SemanticExecutionBudget,
+    SemanticExecutionBudgetSnapshot, SemanticGap, SemanticLocator, SemanticOutcome,
+    SemanticRequest, SemanticRole, SemanticValue, SemanticWork, SourceMapping, SourceMappingKind,
+    SourceSpan, StructuralNodeIdentity, ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle,
+    ValueFlowRelationKind, ValueHandle, ValueId, WorkspaceMountId,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledConcurrencyEffect, CompiledSummaryInput, Completeness,
@@ -295,10 +298,27 @@ enum CachedSemanticMaterialization {
     Outcome {
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
         source: Option<SemanticSourceSnapshot>,
+        /// Why `source` is `None` although the outcome has an artifact. A
+        /// source-requiring hit refuses with it; an artifact-only hit ignores
+        /// it and derives from the native outcome.
+        source_refusal: Option<ArtifactUnavailable>,
     },
     ProviderFailed(Arc<str>),
     FileBudgetExhausted,
     RetainedBudgetExhausted,
+}
+
+impl CachedSemanticMaterialization {
+    /// The producer failure a non-outcome entry records.
+    fn refusal(&self) -> Option<ArtifactUnavailable> {
+        match self {
+            Self::Outcome { .. } => None,
+            Self::ProviderFailed(_) => Some(ArtifactUnavailable::PROVIDER),
+            Self::FileBudgetExhausted | Self::RetainedBudgetExhausted => {
+                Some(ArtifactUnavailable::BUDGET)
+            }
+        }
+    }
 }
 
 /// Most files whose parsed exact syntax one query retains for call-site
@@ -319,10 +339,72 @@ struct ProcedureRangeLookupDiagnostics {
     cancellation_message: &'static str,
 }
 
-/// Why a file's semantic artifact could not be had under the query's budget.
-pub(super) enum ArtifactUnavailable {
-    BudgetExhausted,
-    Unavailable,
+/// Why a file's semantic artifact could not be had, as the typed diagnostic
+/// code and incompleteness class of the actual producer failure. The producer
+/// has already attached the matching diagnostic to the query when a caller
+/// receives this, so a consumer that emits no rows still reports the cause. A
+/// consumer must not rebuild a cause from the sticky `budget_exhausted` flag or
+/// from an absent cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ArtifactUnavailable {
+    code: CodeQueryDiagnosticCode,
+    cause: Incompleteness,
+}
+
+impl ArtifactUnavailable {
+    const BUDGET: Self = Self {
+        code: CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+        cause: Incompleteness::Operational(DerivationExecutionCause::Budget),
+    };
+    const PROVIDER: Self = Self {
+        code: CodeQueryDiagnosticCode::SemanticProviderFailed,
+        cause: Incompleteness::Operational(DerivationExecutionCause::Provider),
+    };
+    const SNAPSHOT: Self = Self {
+        code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+        cause: Incompleteness::Operational(DerivationExecutionCause::Snapshot),
+    };
+    const CANCELLED: Self = Self {
+        code: CodeQueryDiagnosticCode::Cancelled,
+        cause: Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+    };
+
+    /// The diagnostic code the producer attached.
+    pub(super) fn code(self) -> CodeQueryDiagnosticCode {
+        self.code
+    }
+
+    /// The incompleteness class the producer attached.
+    pub(super) fn cause(self) -> Incompleteness {
+        self.cause
+    }
+
+    /// Whether the refusal is a semantic budget stop, as opposed to a
+    /// cancellation, provider, snapshot, capability or content refusal.
+    pub(super) fn is_budget_exhausted(self) -> bool {
+        self.cause == Incompleteness::Operational(DerivationExecutionCause::Budget)
+    }
+
+    /// The code and cause the native outcome reports. The shape mirrors
+    /// [`SemanticQueryContext::report_incomplete_outcome`], which publishes
+    /// the same pair.
+    fn of_outcome<T>(outcome: &SemanticOutcome<T>) -> Self {
+        match outcome {
+            SemanticOutcome::Cancelled { .. } => Self::CANCELLED,
+            SemanticOutcome::ExceededBudget { .. } => Self::BUDGET,
+            SemanticOutcome::Unsupported { .. } => Self {
+                code: CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                cause: Incompleteness::Content,
+            },
+            SemanticOutcome::Complete { .. }
+            | SemanticOutcome::Ambiguous { .. }
+            | SemanticOutcome::Unknown { .. }
+            | SemanticOutcome::Unproven { .. } => Self {
+                code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                cause: Incompleteness::Content,
+            },
+        }
+    }
 }
 
 pub(super) struct SemanticQueryContext<'a> {
@@ -354,6 +436,14 @@ pub(super) struct SemanticQueryContext<'a> {
     // the rejected owner can die, so no unpinned address can be reused.
     selected_pattern_heap: Option<RetainedHeap>,
     materialized_files: HashSet<ProjectFile>,
+    /// Distinct files admitted against `max_materialized_files`. A file whose
+    /// artifact was released and is re-acquired keeps its first admission.
+    admitted_files: HashSet<ProjectFile>,
+    /// The artifact key first materialized for each file in this request. It
+    /// survives window release so a re-acquisition proves the same snapshot.
+    pinned_artifact_keys: HashMap<ProjectFile, crate::analyzer::semantic::SemanticArtifactKey>,
+    /// Outer plan frames whose retained rows borrow semantic artifact handles.
+    pinned_downstream_row_holders: usize,
     cache_hits: usize,
     active_retained_bytes: usize,
     peak_retained_bytes: usize,
@@ -368,6 +458,7 @@ pub(super) struct SemanticQueryContext<'a> {
     value_flow: ValueFlowQueryState,
     taint: TaintQueryState,
     type_flow: super::type_flow::TypeFlowQueryState,
+    guard_bindings: Option<Arc<dyn super::MatchGuardBindingSource>>,
     /// The execution dependences this context marked; the query result joins
     /// it into its reuse verdict.
     reuse: ReuseVerdict,
@@ -536,6 +627,13 @@ impl<'a> SemanticQueryContext<'a> {
 
     pub(super) fn analyzer(&self) -> &'a dyn crate::analyzer::IAnalyzer {
         self.workspace.analyzer()
+    }
+
+    /// The request's retention owner for source-site admission.
+    pub(super) fn site_admission(&self) -> brokk_bifrost_tools::site_context::SiteAdmission<'_> {
+        brokk_bifrost_tools::site_context::SiteAdmission::new(Some(
+            self.workspace.retention_budget(),
+        ))
     }
 
     pub(super) fn prefetch_call_bindings(
@@ -772,6 +870,9 @@ impl<'a> SemanticQueryContext<'a> {
             promote_artifact_windows,
             selected_pattern_heap: Some(selected_pattern_heap),
             materialized_files: HashSet::default(),
+            admitted_files: HashSet::default(),
+            pinned_artifact_keys: HashMap::default(),
+            pinned_downstream_row_holders: 0,
             cache_hits: 0,
             active_retained_bytes: 0,
             peak_retained_bytes: artifact_lease_bytes,
@@ -780,6 +881,7 @@ impl<'a> SemanticQueryContext<'a> {
             source_call_indexes: CaptureScopedMemo::default(),
             prepared_source_dispatch: CaptureScopedMemo::default(),
             budget_exhausted: false,
+            guard_bindings: None,
             reuse: ReuseVerdict::Content,
             effect_work: super::CodeQueryEffectWork::default(),
             typestate: TypestateQueryState::default(),
@@ -795,6 +897,13 @@ impl<'a> SemanticQueryContext<'a> {
 
     pub(super) fn set_root_memo(&mut self, memo: Option<super::TypeFlowRootMemo>) {
         self.type_flow.set_root_memo(memo);
+    }
+
+    pub(super) fn set_guard_bindings(
+        &mut self,
+        guard_bindings: Option<Arc<dyn super::MatchGuardBindingSource>>,
+    ) {
+        self.guard_bindings = guard_bindings;
     }
 
     pub(super) fn cfg(&mut self) -> CfgQueryAdapter<'_, 'a> {
@@ -1201,23 +1310,11 @@ impl<'a> SemanticQueryContext<'a> {
                         Incompleteness::Operational(DerivationExecutionCause::Budget),
                     );
                 }
-                if self.materialize(file).is_none() {
+                if let Err(refusal) = self.materialize(file) {
                     let (outcome, unsupported) = self.materialization_gate(file);
-                    let incompleteness = match self.cache.get(file) {
-                        Some(CachedSemanticMaterialization::Outcome { outcome, .. }) => {
-                            Self::partial_outcome_code(outcome).1
-                        }
-                        Some(
-                            CachedSemanticMaterialization::FileBudgetExhausted
-                            | CachedSemanticMaterialization::RetainedBudgetExhausted,
-                        ) => Incompleteness::Operational(DerivationExecutionCause::Budget),
-                        Some(CachedSemanticMaterialization::ProviderFailed(_)) | None => {
-                            Incompleteness::Operational(DerivationExecutionCause::Provider)
-                        }
-                    };
                     return (
                         DispatchSiteAnswer::interrupted(outcome, unsupported, None),
-                        incompleteness,
+                        refusal.cause(),
                     );
                 }
                 let materialized = match self.cache.get(file) {
@@ -1275,7 +1372,7 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         call: &brokk_bifrost_flow::value_flow::DurableCallSiteKey,
     ) -> Option<crate::analyzer::semantic::CallSiteHandle> {
-        let outcome = self.materialized_outcome(file)?;
+        let outcome = self.materialized_outcome(file).ok()?;
         let artifact = outcome.available_value()?;
         if artifact.key() != &call.0.0 {
             return None;
@@ -1495,7 +1592,7 @@ impl<'a> SemanticQueryContext<'a> {
             self.budget_exhausted = true;
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                Incompleteness::Content,
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 &exceeded.to_string(),
@@ -1681,7 +1778,7 @@ impl<'a> SemanticQueryContext<'a> {
         site_id: &str,
         site_ast_id: &str,
     ) -> Vec<SemanticCallResultValue> {
-        let Some((artifact, source, quality)) = self.materialize(file) else {
+        let Ok((artifact, source, quality)) = self.materialize(file) else {
             return Vec::new();
         };
         let Some(index) = self.source_call_index(file, &artifact) else {
@@ -1799,7 +1896,7 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         range: crate::analyzer::Range,
     ) -> Option<usize> {
-        let (artifact, _, _) = self.materialize(file)?;
+        let (artifact, _, _) = self.materialize(file).ok()?;
         let index = self.source_call_index(file, &artifact)?;
         let key = (range.start_byte, range.end_byte);
         let start = index
@@ -1830,7 +1927,7 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         range: crate::analyzer::Range,
     ) -> Option<(String, String)> {
-        let (artifact, _, _) = self.materialize(file)?;
+        let (artifact, _, _) = self.materialize(file).ok()?;
         let index = self.source_call_index(file, &artifact)?;
         let exact_key = (range.start_byte, range.end_byte);
         let start = index
@@ -1871,7 +1968,7 @@ impl<'a> SemanticQueryContext<'a> {
         CallSiteHandle,
         Vec<crate::analyzer::semantic::service::CandidateMacroRefusalEvidence>,
     )> {
-        let (artifact, _, quality) = self.materialize(file)?;
+        let (artifact, _, quality) = self.materialize(file).ok()?;
         if source_identity != artifact.key().revision().content() {
             self.push_source_generation_changed(file);
             return None;
@@ -1903,7 +2000,7 @@ impl<'a> SemanticQueryContext<'a> {
         range: crate::analyzer::Range,
         source_identity: ContentIdentity,
     ) -> bool {
-        let Some((artifact, _, quality)) = self.materialize(file) else {
+        let Ok((artifact, _, quality)) = self.materialize(file) else {
             return false;
         };
         if source_identity != artifact.key().revision().content() {
@@ -2064,7 +2161,7 @@ impl<'a> SemanticQueryContext<'a> {
         let outcome = match self.prepared_dispatch_at_source(file, range) {
             Some(outcome) => outcome,
             None => {
-                let Some(materialized) = self.materialized_outcome(file) else {
+                let Ok(materialized) = self.materialized_outcome(file) else {
                     return SourceCallableResult::Unavailable;
                 };
                 self.begin_prepared_dispatch_at_source(file, materialized, range)
@@ -2195,20 +2292,44 @@ impl<'a> SemanticQueryContext<'a> {
     /// artifact with the same durable key. Handle identity intentionally
     /// distinguishes those allocations when a complete artifact was evicted
     /// or the provider returned a partial outcome.
+    ///
+    /// The first request for a file materializes once and forwards the
+    /// producer's typed failure immediately, even when a source failure left
+    /// an available outcome in the cache. A later request is a cache hit: it
+    /// returns the native outcome whenever it holds an artifact, whatever its
+    /// source or its Cancelled/partial verdict, without re-materializing or
+    /// re-admitting its input. That first-miss/later-hit asymmetry is inherited
+    /// from the previous Option contract and tracked separately in #14170.
+    /// Either way the producer or the hit has attached the diagnostic for the
+    /// outcome's actual cause before this returns.
     pub(super) fn materialized_outcome(
         &mut self,
         file: &ProjectFile,
-    ) -> Option<SemanticOutcome<Arc<SemanticArtifact>>> {
-        if !self.cache.contains_key(file) {
+    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, ArtifactUnavailable> {
+        let hit = self.cache.contains_key(file);
+        if !hit {
             self.materialize(file)?;
         }
-        match self.cache.get(file) {
-            Some(CachedSemanticMaterialization::Outcome { outcome, .. })
-                if outcome.available_value().is_some() =>
-            {
-                Some(outcome.clone())
+        let cached = self
+            .cache
+            .get(file)
+            .cloned()
+            .expect("a successful materialization is cached");
+        match cached {
+            CachedSemanticMaterialization::Outcome { outcome, .. } => {
+                if hit {
+                    self.publish_outcome_diagnostics(file, &outcome);
+                }
+                if outcome.available_value().is_some() {
+                    Ok(outcome)
+                } else {
+                    Err(ArtifactUnavailable::of_outcome(&outcome))
+                }
             }
-            _ => None,
+            refused => {
+                assert!(hit, "a successful materialization caches an outcome");
+                Err(self.publish_cached_refusal(file, &refused))
+            }
         }
     }
 
@@ -2228,16 +2349,10 @@ impl<'a> SemanticQueryContext<'a> {
             &mut SemanticRequest<'_>,
         ) -> R,
     ) -> Result<R, ArtifactUnavailable> {
-        let Some(outcome) = self.materialized_outcome(file) else {
-            return Err(if self.budget_exhausted {
-                ArtifactUnavailable::BudgetExhausted
-            } else {
-                ArtifactUnavailable::Unavailable
-            });
-        };
-        let Some(artifact) = outcome.available_value() else {
-            return Err(ArtifactUnavailable::Unavailable);
-        };
+        let outcome = self.materialized_outcome(file)?;
+        let artifact = outcome
+            .available_value()
+            .expect("a materialized outcome holds an artifact");
         let workspace = self.workspace;
         let snapshot = self.active_semantic_model_snapshot.clone();
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
@@ -2321,7 +2436,7 @@ impl<'a> SemanticQueryContext<'a> {
         true
     }
 
-    /// How many files this query has materialized so far.
+    /// How many uncached semantic materialization attempts this query has made.
     #[cfg(test)]
     pub(super) fn materialization_attempts(&self) -> usize {
         self.attempts
@@ -2361,7 +2476,7 @@ impl<'a> SemanticQueryContext<'a> {
         {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::Cancelled,
-                Incompleteness::Content,
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 "semantic call-result lookup was cancelled",
@@ -2414,7 +2529,9 @@ impl<'a> SemanticQueryContext<'a> {
             if cancellation.is_cancelled() {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::Cancelled,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     "semantic call-result lookup was cancelled",
@@ -2797,7 +2914,7 @@ impl<'a> SemanticQueryContext<'a> {
         source_identity: ContentIdentity,
     ) -> Vec<SemanticProcedureValue> {
         let ranges = [range];
-        let Some((artifact, source, quality)) = self.materialize(file) else {
+        let Ok((artifact, source, quality)) = self.materialize(file) else {
             return Vec::new();
         };
         if source_identity != artifact.key().revision().content() {
@@ -2831,6 +2948,149 @@ impl<'a> SemanticQueryContext<'a> {
         )
     }
 
+    /// Rank each range's base candidates without acquiring executable views.
+    /// Optional index storage is released before the caller can select those
+    /// views. `visitor_retained_bytes` covers the caller's accumulation buffers
+    /// that coexist with the index. A refusal invalidates earlier visits;
+    /// publish only after success.
+    pub(super) fn visit_procedure_candidates_of_source_ranges(
+        &mut self,
+        file: &ProjectFile,
+        ranges: &[crate::analyzer::Range],
+        source_identity: ContentIdentity,
+        visitor_retained_bytes: usize,
+        mut visit: impl FnMut(crate::analyzer::Range, Vec<ProcedureHandle>),
+    ) -> Option<()> {
+        let (artifact, source, quality) = self.materialize(file).ok()?;
+        if source_identity != artifact.key().revision().content() {
+            self.push_source_generation_changed(file);
+            return None;
+        }
+        let quality = quality.combine(&self.capability_quality(
+            file,
+            artifact.as_ref(),
+            &[SemanticCapability::Procedures],
+        ));
+        let diagnostics = ProcedureRangeLookupDiagnostics {
+            budget_reason: "enclosing-procedure lookup",
+            cancellation_message: "enclosing-procedure lookup was cancelled",
+        };
+        // Compare total work, including index construction and searches.
+        // For tiny procedure sets, searches alone cost more than a scan;
+        // increasing the usage count cannot amortize that disadvantage.
+        let procedures = artifact.procedures().len();
+        let sort_passes = (usize::BITS - procedures.saturating_sub(1).leading_zeros()) as usize;
+        let scan_work = procedures.saturating_mul(2).saturating_mul(ranges.len());
+        let index_work = procedures
+            .saturating_mul(sort_passes.saturating_add(3))
+            .saturating_add(ranges.len().saturating_mul(1 + 4 * sort_passes.max(1)));
+        let index_bytes = if index_work < scan_work {
+            match ProcedureSourceRangeIndex::reservation_bytes(artifact.procedures().len()) {
+                Ok(bytes) => bytes.checked_add(visitor_retained_bytes),
+                Err(error) => {
+                    debug_assert_eq!(error, SemanticArtifactLeaseError::RetainedBytesOverflow);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // The index is optional. A capacity miss selects non-refusing scans
+        // instead of changing whether this file can return complete results.
+        // Seed-unit merging treats a peak equal to the cap as exhaustion;
+        // optional scratch must stay strictly below that retry threshold.
+        let index_grant = index_bytes.and_then(|bytes| {
+            if bytes
+                >= self
+                    .limits
+                    .max_retained_bytes
+                    .saturating_sub(self.physical_retained_bytes())
+            {
+                return None;
+            }
+            let reservation = if let Some(window) = self.artifact_window.as_ref() {
+                match window.try_reserve_other_live_bytes(bytes) {
+                    Ok(reservation) => Some(reservation),
+                    Err(_) => return None,
+                }
+            } else {
+                None
+            };
+            Some((bytes, reservation))
+        });
+        // An earlier mandatory failure remains a refusal; an optional index
+        // miss does not mark either the context or its window incomplete.
+        if !self.artifact_window_fits(file) {
+            return None;
+        }
+        let Some((index_bytes, index_reservation)) = index_grant else {
+            for range in ranges {
+                let lookup = procedures_for_source_ranges(
+                    &artifact,
+                    &[*range],
+                    usize::MAX,
+                    self.cancellation.unwrap_or(&self.uncancelled),
+                );
+                self.traversal_steps = self.traversal_steps.saturating_add(lookup.examined);
+                if lookup.status != ProcedureRangeLookupStatus::Complete {
+                    self.finish_procedure_range_lookup(
+                        file,
+                        source,
+                        quality,
+                        Vec::new(),
+                        lookup.status,
+                        diagnostics,
+                    );
+                    return None;
+                }
+                let (procedures, _) =
+                    self.rank_procedure_lookup(file, lookup.handles, quality.clone());
+                visit(*range, procedures);
+            }
+            return Some(());
+        };
+        // Charge the index only through ranking. Executable acquisition is
+        // a separate caller phase, after this storage and grant are dropped.
+        self.record_active_retained_bytes(index_bytes);
+        // Own the token so candidate finishing can mutably use this context
+        // while the index's progress tracker stays live.
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled).clone();
+        let mut progress = ProcedureLookupProgress::new(usize::MAX, &cancellation);
+        let result = (|| {
+            let index = ProcedureSourceRangeIndex::new(&artifact, &mut progress)?;
+            assert!(
+                index.retained_bytes() <= index_bytes,
+                "procedure index exceeded its pre-allocation reservation"
+            );
+            for range in ranges {
+                let handles = index.lookup(range, &mut progress)?;
+                let procedures = self.rank_procedure_lookup(file, handles, quality.clone()).0;
+                visit(*range, procedures);
+            }
+            Ok(())
+        })();
+        self.active_retained_bytes = self
+            .active_retained_bytes
+            .checked_sub(index_bytes)
+            .expect("live procedure index bytes are charged until lookup completes");
+        drop(index_reservation);
+        self.traversal_steps = self.traversal_steps.saturating_add(progress.examined);
+        match result {
+            Ok(()) => Some(()),
+            Err(status) => {
+                self.finish_procedure_range_lookup(
+                    file,
+                    source,
+                    quality,
+                    Vec::new(),
+                    status,
+                    diagnostics,
+                );
+                None
+            }
+        }
+    }
+
     fn finish_procedure_range_lookup(
         &mut self,
         file: &ProjectFile,
@@ -2851,7 +3111,9 @@ impl<'a> SemanticQueryContext<'a> {
             ProcedureRangeLookupStatus::Cancelled => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::Cancelled,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     diagnostics.cancellation_message,
@@ -2882,36 +3144,20 @@ impl<'a> SemanticQueryContext<'a> {
                 &[SemanticCapability::ProgramPoints],
             ));
             let semantics = procedure.handle.semantics();
-            for point in semantics.points() {
-                if !self.charge_consumer_traversal(&procedure.file, 1, "program-point selection") {
-                    return Vec::new();
-                }
-                let point_matches = semantics
-                    .source_mapping(point.source)
-                    .is_some_and(|mapping| mapping.ast_identity == Some(identity));
-                if !point_matches {
-                    continue;
-                }
-                if is_await {
-                    let mut suspend_matches = false;
-                    for event in &point.events {
-                        if !self.charge_consumer_traversal(
-                            &procedure.file,
-                            1,
-                            "program-point suspend selection",
-                        ) {
-                            return Vec::new();
-                        }
-                        if matches!(event.effect, SemanticEffect::AsyncSuspend { .. }) {
-                            suspend_matches = true;
-                            break;
-                        }
-                    }
-                    if !suspend_matches {
-                        continue;
-                    }
-                }
-                if let Some(mut value) = procedure.point_value(point.id) {
+            // The shared selector owns the source mapping; this loop only
+            // charges the pipeline's traversal budget per examined point and
+            // event.
+            let file = &procedure.file;
+            let Some(ids) = brokk_bifrost_tools::program_point_selection::source_mapped_points(
+                semantics,
+                identity,
+                is_await,
+                &mut |operation| self.charge_consumer_traversal(file, 1, operation),
+            ) else {
+                return Vec::new();
+            };
+            for id in ids {
+                if let Some(mut value) = procedure.point_value(id) {
                     value.quality = quality.clone();
                     points.push(value);
                 }
@@ -3058,16 +3304,30 @@ impl<'a> SemanticQueryContext<'a> {
         let Some(provider) = self.workspace.program_semantics_provider_for_file(file) else {
             return Vec::new();
         };
-        let snapshot = match provider.current_artifact_source(file, self.limits.max_source_bytes) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                self.exhaust_traversal_budget(file, "procedure inventory source bytes");
+        let source = provider
+            .current_artifact_source(file, self.limits.max_source_bytes)
+            .and_then(|source| source.on_budget(&self.budget));
+        let snapshot = match source {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(exceeded)) => {
+                self.budget_exhausted = true;
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Budget,
+                    ),
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    &exceeded.to_string(),
+                );
                 return Vec::new();
             }
             Err(error) => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     &error.to_string(),
@@ -3085,7 +3345,9 @@ impl<'a> SemanticQueryContext<'a> {
             Err(error) => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     &error.to_string(),
@@ -3198,7 +3460,7 @@ impl<'a> SemanticQueryContext<'a> {
         &mut self,
         reference: &SemanticProcedureReferenceValue,
     ) -> Option<SemanticProcedureValue> {
-        let (artifact, source, quality) = self.materialize(&reference.file)?;
+        let (artifact, source, quality) = self.materialize(&reference.file).ok()?;
         if artifact.key() != &reference.key {
             self.push_source_generation_changed(&reference.file);
             return None;
@@ -3294,7 +3556,7 @@ impl<'a> SemanticQueryContext<'a> {
             return None;
         }
         let file = super::witness_projection::locator_file(self.workspace, locator);
-        let (artifact, source, quality) = self.materialize(&file)?;
+        let (artifact, source, quality) = self.materialize(&file).ok()?;
         if !quality.is_complete() {
             return None;
         }
@@ -3322,7 +3584,7 @@ impl<'a> SemanticQueryContext<'a> {
         declaration: &DeclarationValue,
     ) -> Vec<SemanticProcedureValue> {
         let file = declaration.unit.source();
-        let Some((artifact, source, quality)) = self.materialize(file) else {
+        let Ok((artifact, source, quality)) = self.materialize(file) else {
             return Vec::new();
         };
         let quality = quality.combine(&self.capability_quality(
@@ -3416,7 +3678,7 @@ impl<'a> SemanticQueryContext<'a> {
         {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::Cancelled,
-                Incompleteness::Content,
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 &format!("semantic traversal was cancelled during {operation}"),
@@ -3531,6 +3793,11 @@ impl<'a> SemanticQueryContext<'a> {
         diagnostics.extend(self.taint.take_diagnostics());
         diagnostics.extend(self.type_flow.take_diagnostics());
         diagnostics
+    }
+
+    #[cfg(test)]
+    pub(super) fn resident_for_test(&self) -> (SemanticWork, usize) {
+        (self.budget.resident(), self.physical_retained_bytes())
     }
 
     pub(super) fn work(&self) -> CodeQuerySemanticWork {
@@ -3919,7 +4186,9 @@ impl<'a> SemanticQueryContext<'a> {
                     pending_diagnostics.push((
                         (
                             CodeQueryDiagnosticCode::SemanticProviderFailed,
-                            Incompleteness::Content,
+                            Incompleteness::Operational(
+                                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                            ),
                         ),
                         format!("callback dispatch resolution failed: {error}"),
                     ));
@@ -3992,7 +4261,9 @@ impl<'a> SemanticQueryContext<'a> {
                         pending_diagnostics.push((
                             (
                                 CodeQueryDiagnosticCode::SemanticProviderFailed,
-                                Incompleteness::Content,
+                                Incompleteness::Operational(
+                                    brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                                ),
                             ),
                             format!("callback body value-flow query failed: {error}"),
                         ));
@@ -4037,7 +4308,9 @@ impl<'a> SemanticQueryContext<'a> {
                             pending_diagnostics.push((
                                 (
                                     CodeQueryDiagnosticCode::SemanticProviderFailed,
-                                    Incompleteness::Content,
+                                    Incompleteness::Operational(
+                                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                                    ),
                                 ),
                                 format!("callback call-binding query failed: {error}"),
                             ));
@@ -4129,7 +4402,9 @@ impl<'a> SemanticQueryContext<'a> {
                                 pending_diagnostics.push((
                                     (
                                         CodeQueryDiagnosticCode::SemanticProviderFailed,
-                                        Incompleteness::Content,
+                                        Incompleteness::Operational(
+                                            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                                        ),
                                     ),
                                     format!("callback invocation points-to query failed: {error}"),
                                 ));
@@ -4185,12 +4460,14 @@ impl<'a> SemanticQueryContext<'a> {
                                 Ok(outcome) => outcome,
                                 Err(error) => {
                                     pending_diagnostics.push((
-                                        (
-                                            CodeQueryDiagnosticCode::SemanticProviderFailed,
-                                            Incompleteness::Content,
+                                    (
+                                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                        Incompleteness::Operational(
+                                            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
                                         ),
-                                        format!("callback actual points-to query failed: {error}"),
-                                    ));
+                                    ),
+                                    format!("callback actual points-to query failed: {error}"),
+                                ));
                                     continue;
                                 }
                             };
@@ -4388,7 +4665,7 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         range: crate::analyzer::Range,
     ) -> super::type_flow::ReceiverDispatchAssessment {
-        let Some((artifact, _, _)) = self.materialize(file) else {
+        let Ok((artifact, _, _)) = self.materialize(file) else {
             return super::type_flow::ReceiverDispatchAssessment::NotApplicable;
         };
         let source_identity = artifact.key().revision().content();
@@ -4501,11 +4778,89 @@ impl<'a> SemanticQueryContext<'a> {
         else {
             return Vec::new();
         };
+        let compiled_guards = {
+            let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+            match self
+                .guard_bindings
+                .as_ref()
+                .map(|source| {
+                    source.bindings_for_procedure(self.workspace, cancellation, &ownership)
+                })
+                .transpose()
+            {
+                Ok(guards) => guards,
+                Err(error) => {
+                    let incompleteness = if cancellation.is_cancelled() {
+                        Incompleteness::Operational(
+                            brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled,
+                        )
+                    } else {
+                        Incompleteness::Operational(
+                            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                        )
+                    };
+                    self.push_diagnostic(
+                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                        incompleteness,
+                        CodeQueryDiagnosticImpact::Incomplete,
+                        procedure.file(),
+                        &format!("Rust pointer guard binding failed: {error}"),
+                    );
+                    // Guard kills are optional. Preserve ordinary findings
+                    // when their compiler fails, alongside the diagnostic.
+                    None
+                }
+            }
+        };
+        if let Some(declines) = compiled_guards.as_ref().filter(|g| !g.declines.is_empty()) {
+            let detail = declines
+                .declines
+                .iter()
+                .map(|decline| format!("guard `{}` is undecided: {:?}", decline.id, decline.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            // A stop caused by cancellation or the budget is operational, as on
+            // the taint surface; every other decline is a content gap.
+            use crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason;
+            let has = |reason: GuardBindingReason| {
+                declines
+                    .declines
+                    .iter()
+                    .any(|decline| decline.reason == reason)
+            };
+            let incompleteness = if has(GuardBindingReason::Cancelled) {
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled)
+            } else if has(GuardBindingReason::BudgetExceeded) {
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget)
+            } else if let Some(cause) =
+                declines
+                    .declines
+                    .iter()
+                    .find_map(|decline| match decline.reason {
+                        GuardBindingReason::GuardSelectorOperational(cause) => Some(cause),
+                        _ => None,
+                    })
+            {
+                Incompleteness::Operational(cause)
+            } else if has(GuardBindingReason::GuardSelectorResultCap) {
+                Incompleteness::ConfiguredCap
+            } else {
+                Incompleteness::Content
+            };
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                incompleteness,
+                CodeQueryDiagnosticImpact::Incomplete,
+                procedure.file(),
+                &detail,
+            );
+        }
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         match super::rust_pointer_safety::analyze(
             self.workspace,
             &ownership,
             self.active_semantic_model_snapshot.clone(),
+            compiled_guards.as_ref(),
             &mut self.budget,
             self.value_flow_limits.solver_work,
             max_source_bytes,
@@ -4529,7 +4884,9 @@ impl<'a> SemanticQueryContext<'a> {
             Err(error) => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     procedure.file(),
                     &format!("Rust pointer provenance failed: {error}"),
@@ -4537,6 +4894,34 @@ impl<'a> SemanticQueryContext<'a> {
                 Vec::new()
             }
         }
+    }
+
+    /// The property-reaching relation of one exact procedure, through the
+    /// single acquisition path flow-state derivation also uses. The query's
+    /// semantic budget pays for the value-flow snapshot, and the query's
+    /// cancellation stops it.
+    pub(super) fn property_reaching_of(
+        &mut self,
+        procedure: &ProcedureHandle,
+    ) -> Result<
+        crate::analyzer::semantic::PropertyReachingResult,
+        brokk_bifrost_flow::flow_state::FlowStateIncompleteReason,
+    > {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let request = brokk_bifrost_flow::flow_state::FlowStateRequest::new(
+            cancellation,
+            brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(
+                self.workspace.retention_budget(),
+            ),
+        );
+        let (result, reuse) = brokk_bifrost_flow::flow_state::property_reaching_for_procedure(
+            self.workspace,
+            procedure,
+            &request,
+            &mut self.budget,
+        );
+        self.join_reuse(reuse);
+        result
     }
 
     pub(super) fn report_no_enclosing_procedure(&mut self, file: &ProjectFile) {
@@ -4553,9 +4938,28 @@ impl<'a> SemanticQueryContext<'a> {
         &mut self,
         file: &ProjectFile,
         source: SemanticSourceSnapshot,
+        candidates: Vec<ProcedureHandle>,
+        quality: SemanticQueryQuality,
+    ) -> Vec<SemanticProcedureValue> {
+        let (candidates, quality) = self.rank_procedure_lookup(file, candidates, quality);
+        candidates
+            .into_iter()
+            .filter_map(|handle| self.select_procedure(file, handle))
+            .map(|handle| SemanticProcedureValue {
+                handle,
+                file: file.clone(),
+                source: source.clone(),
+                quality: quality.clone(),
+            })
+            .collect()
+    }
+
+    fn rank_procedure_lookup(
+        &mut self,
+        file: &ProjectFile,
         mut candidates: Vec<ProcedureHandle>,
         mut quality: SemanticQueryQuality,
-    ) -> Vec<SemanticProcedureValue> {
+    ) -> (Vec<ProcedureHandle>, SemanticQueryQuality) {
         let procedure_span = |candidate: &ProcedureHandle| {
             candidate
                 .semantics()
@@ -4605,16 +5009,7 @@ impl<'a> SemanticQueryContext<'a> {
         } else if candidates.is_empty() && quality.is_complete() {
             self.report_no_enclosing_procedure(file);
         }
-        candidates
-            .into_iter()
-            .filter_map(|handle| self.select_procedure(file, handle))
-            .map(|handle| SemanticProcedureValue {
-                handle,
-                file: file.clone(),
-                source: source.clone(),
-                quality: quality.clone(),
-            })
-            .collect()
+        (candidates, quality)
     }
 
     fn cfg_edges(
@@ -4672,7 +5067,9 @@ impl<'a> SemanticQueryContext<'a> {
             {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::Cancelled,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     &point.file,
                     "control-edge traversal was cancelled",
@@ -4816,6 +5213,52 @@ impl<'a> SemanticQueryContext<'a> {
             .max(self.physical_retained_bytes().saturating_add(bytes));
     }
 
+    /// Admit a compact control-relation cache allocation against this query's
+    /// existing retained pool: the 256 MiB floor was calibrated in #2523.
+    /// Only retained products (the cached compact facts) are admitted against
+    /// the pool; transient per-derivation structures, such as work queues and
+    /// scratch workspaces, are not charged and die with the derivation.
+    /// A family capacity refusal must not poison unrelated requested families.
+    pub(super) fn admit_control_relation_bytes(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), super::control_relations::ControlRelationCapacity> {
+        // Control-relation products are optional caches like the prepared
+        // dispatch syntax, so displace that syntax only when the allocation
+        // does not fit beside it; evicting on every admission would reparse
+        // the retained files once per procedure.
+        let mut available_bytes = self
+            .limits
+            .max_retained_bytes
+            .saturating_sub(self.physical_retained_bytes());
+        if bytes > available_bytes {
+            self.evict_prepared_source_dispatch();
+            available_bytes = self
+                .limits
+                .max_retained_bytes
+                .saturating_sub(self.physical_retained_bytes());
+        }
+        if bytes > available_bytes {
+            return Err(super::control_relations::ControlRelationCapacity {
+                requested_bytes: bytes,
+                available_bytes,
+            });
+        }
+        if let Some(window) = &self.artifact_window {
+            let reservation = window
+                .reserve_other_live_bytes(bytes)
+                .expect("the same physical resident census admitted this exact allocation");
+            reservation.retain_exact(bytes);
+        }
+        self.record_active_retained_bytes(bytes);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_remaining_control_relation_bytes_for_test(&mut self, bytes: usize) {
+        self.limits.max_retained_bytes = self.physical_retained_bytes() + bytes;
+    }
+
     fn admit_active_retained_bytes(&mut self, file: &ProjectFile, bytes: usize) -> bool {
         if !self.active_retained_bytes_fit(file, bytes) {
             return false;
@@ -4853,7 +5296,7 @@ impl<'a> SemanticQueryContext<'a> {
                 "semantic artifact source is unavailable for public range conversion".into();
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticProviderFailed,
-                Incompleteness::Content,
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 reason.as_ref(),
@@ -4879,7 +5322,7 @@ impl<'a> SemanticQueryContext<'a> {
 
     /// Select at the procedure boundary before minting any executable local ID.
     /// The workspace owner replays the complete admission receipt on every read.
-    fn select_procedure(
+    pub(super) fn select_procedure(
         &mut self,
         file: &ProjectFile,
         base: ProcedureHandle,
@@ -4998,7 +5441,9 @@ impl<'a> SemanticQueryContext<'a> {
             Ok(SemanticOutcome::Cancelled { .. }) => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::Cancelled,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     "procedure selection was cancelled",
@@ -5013,7 +5458,9 @@ impl<'a> SemanticQueryContext<'a> {
             Err(error) => {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    ),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     &error.to_string(),
@@ -5026,25 +5473,31 @@ impl<'a> SemanticQueryContext<'a> {
     fn materialize(
         &mut self,
         file: &ProjectFile,
-    ) -> Option<(
-        Arc<SemanticArtifact>,
-        SemanticSourceSnapshot,
-        SemanticQueryQuality,
-    )> {
+    ) -> Result<
+        (
+            Arc<SemanticArtifact>,
+            SemanticSourceSnapshot,
+            SemanticQueryQuality,
+        ),
+        ArtifactUnavailable,
+    > {
         if !self.initial_artifact_leases_fit(file) {
             self.cache.insert(
                 file.clone(),
                 CachedSemanticMaterialization::RetainedBudgetExhausted,
             );
-            return None;
+            return Err(ArtifactUnavailable::BUDGET);
         }
         if let Some(cached) = self.cache.get(file).cloned() {
             self.cache_hits = self.cache_hits.saturating_add(1);
             return self.cached_value(file, cached);
         }
+        let already_admitted = self.admitted_files.contains(file);
         let admitted = match &self.receipt_execution {
             Some((_, execution)) => execution.admit_materialization(file),
-            None => self.attempts < self.limits.max_materialized_files,
+            None => {
+                already_admitted || self.admitted_files.len() < self.limits.max_materialized_files
+            }
         };
         if !admitted {
             self.budget_exhausted = true;
@@ -5058,7 +5511,7 @@ impl<'a> SemanticQueryContext<'a> {
                 .receipt_execution
                 .is_none()
                 .then_some(CodeQueryExhaustedCharge {
-                    attempted: self.attempts.saturating_add(1),
+                    attempted: self.admitted_files.len().saturating_add(1),
                     limit: self.limits.max_materialized_files,
                 });
             self.push_exhausted_diagnostic(
@@ -5067,15 +5520,19 @@ impl<'a> SemanticQueryContext<'a> {
                 "semantic/files",
                 charge,
             );
-            return None;
+            return Err(ArtifactUnavailable::BUDGET);
         }
 
+        self.admitted_files.insert(file.clone());
         self.attempts = self.attempts.saturating_add(1);
         let window_source = match self.prepare_artifact_window_source(file) {
             Ok(source) => source,
             Err(cached) => {
+                let refusal = cached
+                    .refusal()
+                    .expect("window preparation refuses with a non-outcome entry");
                 self.cache.insert(file.clone(), *cached);
-                return None;
+                return Err(refusal);
             }
         };
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
@@ -5087,27 +5544,66 @@ impl<'a> SemanticQueryContext<'a> {
         if let Some(collector) = &artifact_collector {
             request = request.with_artifact_collector(collector);
         }
+        // Re-acquisition after a release must read the request's pinned
+        // semantic-model snapshot, not whatever is published now.
+        let _models = self
+            .workspace
+            .analyzer()
+            .active_query_semantic_model_overlay()
+            .is_none()
+            .then(|| {
+                crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                    self.workspace.analyzer(),
+                    self.active_semantic_model_snapshot.clone(),
+                )
+            });
         let outcome = self
             .workspace
             .materialize_program_semantics(file, &mut request);
         drop(request);
+        drop(_models);
         let artifact_window_fits = self.artifact_window_fits(file);
         match outcome {
             Ok(outcome) => {
+                if let Some(artifact) = outcome.available_value() {
+                    match self.pinned_artifact_keys.get(file) {
+                        Some(pinned) if artifact.key() != pinned => {
+                            if !self.artifact_leases.contains_exact(artifact) {
+                                self.budget.release_artifact_allocation(artifact);
+                            }
+                            drop(outcome);
+                            if let Some(window) = self.artifact_window.take() {
+                                window.discard();
+                            }
+                            self.push_source_generation_changed(file);
+                            return Err(ArtifactUnavailable::SNAPSHOT);
+                        }
+                        Some(_) => {}
+                        None => {
+                            self.pinned_artifact_keys
+                                .insert(file.clone(), artifact.key().clone());
+                        }
+                    }
+                }
                 if !artifact_window_fits {
                     self.cache.insert(
                         file.clone(),
                         CachedSemanticMaterialization::RetainedBudgetExhausted,
                     );
-                    return None;
+                    return Err(ArtifactUnavailable::BUDGET);
                 }
                 let complete = outcome.is_complete();
-                let source = match outcome.available_value() {
-                    Some(artifact) => match window_source.clone() {
-                        Some(source) => self.exact_source_snapshot(file, artifact, source),
-                        None => self.exact_source(file, artifact),
-                    },
-                    None => None,
+                let source =
+                    outcome
+                        .available_value()
+                        .map(|artifact| match window_source.clone() {
+                            Some(source) => self.exact_source_snapshot(file, artifact, source),
+                            None => self.exact_source(file, artifact),
+                        });
+                let (source, source_refusal) = match source {
+                    Some(Ok(source)) => (Some(source), None),
+                    Some(Err(refusal)) => (None, Some(refusal)),
+                    None => (None, None),
                 };
                 if let (Some(artifact), Some(source)) = (outcome.available_value(), source.as_ref())
                 {
@@ -5132,7 +5628,7 @@ impl<'a> SemanticQueryContext<'a> {
                             file.clone(),
                             CachedSemanticMaterialization::RetainedBudgetExhausted,
                         );
-                        return None;
+                        return Err(ArtifactUnavailable::BUDGET);
                     }
                     self.materialized_files.insert(file.clone());
                 } else if let Some(artifact) = outcome.available_value() {
@@ -5150,10 +5646,14 @@ impl<'a> SemanticQueryContext<'a> {
                             file.clone(),
                             CachedSemanticMaterialization::RetainedBudgetExhausted,
                         );
-                        return None;
+                        return Err(ArtifactUnavailable::BUDGET);
                     }
                 }
-                let cached = CachedSemanticMaterialization::Outcome { outcome, source };
+                let cached = CachedSemanticMaterialization::Outcome {
+                    outcome,
+                    source,
+                    source_refusal,
+                };
                 self.cache.insert(file.clone(), cached.clone());
                 self.cached_value(file, cached)
             }
@@ -5163,7 +5663,7 @@ impl<'a> SemanticQueryContext<'a> {
                         file.clone(),
                         CachedSemanticMaterialization::RetainedBudgetExhausted,
                     );
-                    return None;
+                    return Err(ArtifactUnavailable::BUDGET);
                 }
                 let reason: Arc<str> = error.to_string().into();
                 self.cache.insert(
@@ -5171,13 +5671,13 @@ impl<'a> SemanticQueryContext<'a> {
                     CachedSemanticMaterialization::ProviderFailed(Arc::clone(&reason)),
                 );
                 self.push_diagnostic(
-                    CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    ArtifactUnavailable::PROVIDER.code,
+                    ArtifactUnavailable::PROVIDER.cause,
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     reason.as_ref(),
                 );
-                None
+                Err(ArtifactUnavailable::PROVIDER)
             }
         }
     }
@@ -5186,7 +5686,12 @@ impl<'a> SemanticQueryContext<'a> {
     /// retention in file windows without releasing an artifact already used by
     /// an earlier semantic row family.
     pub(super) fn can_start_artifact_windows(&self) -> bool {
-        self.cache.is_empty()
+        // A live seed row or a sibling operand that holds a procedure handle
+        // pins its exact artifact allocation. Releasing a window would drop
+        // that allocation and make the handle's pointer-equality check fail,
+        // so a pinned request never starts one even when its cache is empty.
+        self.pinned_downstream_row_holders == 0
+            && self.cache.is_empty()
             && self
                 .indexed_source_identities
                 .read(&memo_attribution(self.workspace.analyzer()), |memo| {
@@ -5246,7 +5751,7 @@ impl<'a> SemanticQueryContext<'a> {
                 .expect("an artifact window retains its designated file");
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                Incompleteness::Content,
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                 CodeQueryDiagnosticImpact::Incomplete,
                 &file,
                 &error.to_string(),
@@ -5256,9 +5761,15 @@ impl<'a> SemanticQueryContext<'a> {
 
     /// Drop one artifact-independent step's completed file window while
     /// retaining cumulative request work, diagnostics, and the peak live byte
-    /// charge. Callers must ensure no emitted pipeline value or trace owns a
-    /// handle into these artifacts.
+    /// charge. Callers must ensure no downstream native row or sibling operand
+    /// owns a handle into these artifacts. Legacy provenance traces can still
+    /// retain unpinned handles; they never seed semantic work and remain an
+    /// existing exception to the resident meter.
     pub(super) fn release_artifact_window(&mut self) {
+        debug_assert_eq!(
+            self.pinned_downstream_row_holders, 0,
+            "a window release must not drop an artifact a live row or sibling operand holds"
+        );
         self.type_flow.release_file_window();
         self.typestate.release_file_window();
         self.value_flow.release_file_window();
@@ -5279,6 +5790,22 @@ impl<'a> SemanticQueryContext<'a> {
             self.artifact_leases.retained_bytes(),
             "releasing a window retains only parent-pinned and promoted dependencies"
         );
+    }
+
+    pub(super) fn set_pinned_downstream_row_holders(&mut self, count: usize) {
+        self.pinned_downstream_row_holders = count;
+    }
+
+    /// Drop every artifact this request holds when no emitted row or sibling
+    /// operand borrows a handle into one. A later row re-acquires its file
+    /// through the pinned key, so the resident meter follows live artifacts.
+    pub(super) fn release_unreferenced_artifacts(&mut self) {
+        if self.pinned_downstream_row_holders == 0
+            && self.artifact_window.is_none()
+            && self.artifact_window_file.is_none()
+        {
+            self.release_artifact_window();
+        }
     }
 
     pub(super) fn into_receipt(mut self) -> Option<CodeQuerySemanticReceipt> {
@@ -5317,38 +5844,77 @@ impl<'a> SemanticQueryContext<'a> {
         &mut self,
         file: &ProjectFile,
         cached: CachedSemanticMaterialization,
-    ) -> Option<(
-        Arc<SemanticArtifact>,
-        SemanticSourceSnapshot,
-        SemanticQueryQuality,
-    )> {
+    ) -> Result<
+        (
+            Arc<SemanticArtifact>,
+            SemanticSourceSnapshot,
+            SemanticQueryQuality,
+        ),
+        ArtifactUnavailable,
+    > {
         match cached {
-            CachedSemanticMaterialization::Outcome { outcome, source } => {
-                let value = outcome.available_value().cloned();
+            CachedSemanticMaterialization::Outcome {
+                outcome,
+                source,
+                source_refusal,
+            } => {
+                let quality = self.publish_outcome_diagnostics(file, &outcome);
                 if matches!(outcome, SemanticOutcome::Cancelled { .. }) {
-                    self.report_cancelled_outcome(file, "semantic materialization was cancelled");
-                    return None;
+                    return Err(ArtifactUnavailable::CANCELLED);
                 }
-                let quality = self
-                    .report_incomplete_outcome(&outcome, file, "artifact")
-                    .map_or_else(
-                        SemanticQueryQuality::default,
-                        SemanticQueryQuality::unproven_partial,
-                    );
-                value
-                    .zip(source)
-                    .map(|(value, source)| (value, source, quality))
+                let Some(value) = outcome.available_value().cloned() else {
+                    return Err(ArtifactUnavailable::of_outcome(&outcome));
+                };
+                match source {
+                    Some(source) => Ok((value, source, quality)),
+                    None => Err(source_refusal
+                        .expect("an artifact outcome without a source records its source refusal")),
+                }
+            }
+            refused => Err(self.publish_cached_refusal(file, &refused)),
+        }
+    }
+
+    /// Publish the diagnostic for a cached outcome's native cause and return
+    /// its quality. Both the source-requiring and the artifact-only cache-hit
+    /// adapters publish through here; the hit never re-materializes, so the
+    /// diagnostic is deduplicated against the one the producer attached.
+    fn publish_outcome_diagnostics(
+        &mut self,
+        file: &ProjectFile,
+        outcome: &SemanticOutcome<Arc<SemanticArtifact>>,
+    ) -> SemanticQueryQuality {
+        if matches!(outcome, SemanticOutcome::Cancelled { .. }) {
+            self.report_cancelled_outcome(file, "semantic materialization was cancelled");
+            return SemanticQueryQuality::default();
+        }
+        self.report_incomplete_outcome(outcome, file, "artifact")
+            .map_or_else(
+                SemanticQueryQuality::default,
+                SemanticQueryQuality::unproven_partial,
+            )
+    }
+
+    /// Publish the diagnostic of a cached non-outcome failure and return its
+    /// typed cause.
+    fn publish_cached_refusal(
+        &mut self,
+        file: &ProjectFile,
+        cached: &CachedSemanticMaterialization,
+    ) -> ArtifactUnavailable {
+        match cached {
+            CachedSemanticMaterialization::Outcome { .. } => {
+                unreachable!("a cached outcome is published by publish_outcome_diagnostics")
             }
             CachedSemanticMaterialization::ProviderFailed(reason) => {
                 self.mark_execution_dependent();
                 self.push_diagnostic(
-                    CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    ArtifactUnavailable::PROVIDER.code(),
+                    ArtifactUnavailable::PROVIDER.cause,
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     reason.as_ref(),
                 );
-                None
             }
             CachedSemanticMaterialization::FileBudgetExhausted => {
                 self.push_exhausted_diagnostic(
@@ -5357,7 +5923,6 @@ impl<'a> SemanticQueryContext<'a> {
                     "semantic/files",
                     None,
                 );
-                None
             }
             CachedSemanticMaterialization::RetainedBudgetExhausted => {
                 self.push_exhausted_diagnostic(
@@ -5366,9 +5931,11 @@ impl<'a> SemanticQueryContext<'a> {
                     "semantic/retained_bytes",
                     None,
                 );
-                None
             }
         }
+        cached
+            .refusal()
+            .expect("a non-outcome cache entry records a refusal")
     }
 
     fn partial_outcome_code<T>(
@@ -5394,16 +5961,16 @@ impl<'a> SemanticQueryContext<'a> {
         &mut self,
         file: &ProjectFile,
         artifact: &SemanticArtifact,
-    ) -> Option<SemanticSourceSnapshot> {
+    ) -> Result<SemanticSourceSnapshot, ArtifactUnavailable> {
         let Some(source) = self.workspace.analyzer().indexed_source(file) else {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::SemanticProviderFailed,
-                Incompleteness::Content,
+                Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 "semantic artifact source is unavailable for public range conversion",
             );
-            return None;
+            return Err(ArtifactUnavailable::PROVIDER);
         };
         self.exact_source_snapshot(file, artifact, SemanticSourceSnapshot::new(source))
     }
@@ -5413,10 +5980,10 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         artifact: &SemanticArtifact,
         source: SemanticSourceSnapshot,
-    ) -> Option<SemanticSourceSnapshot> {
+    ) -> Result<SemanticSourceSnapshot, ArtifactUnavailable> {
         let Some(variant) = self.workspace.analyzer().selected_parse_variant(file) else {
             self.push_source_generation_changed(file);
-            return None;
+            return Err(ArtifactUnavailable::SNAPSHOT);
         };
         if ContentIdentity::from_source_bytes(source.source.as_bytes(), file.language(), variant)
             != artifact.key().revision().content()
@@ -5428,9 +5995,9 @@ impl<'a> SemanticQueryContext<'a> {
                 file,
                 "source generation changed before semantic result projection; retry the query for a coherent snapshot",
             );
-            return None;
+            return Err(ArtifactUnavailable::SNAPSHOT);
         }
-        Some(source)
+        Ok(source)
     }
 
     pub(super) fn push_source_generation_changed(&mut self, file: &ProjectFile) {
@@ -5455,7 +6022,7 @@ impl<'a> SemanticQueryContext<'a> {
         self.budget_exhausted = true;
         self.push_diagnostic(
             CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            Incompleteness::Content,
+            Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
             CodeQueryDiagnosticImpact::Incomplete,
             file,
             &format!("semantic input capacity exhausted during {operation}"),
@@ -5500,6 +6067,24 @@ impl<'a> SemanticQueryContext<'a> {
             }
         }
         quality
+    }
+
+    /// Publish the refusal from the flow operation's independent grant.
+    /// The query ledger still owns its own admission and traversal.
+    pub(super) fn report_seed_admission_refusal(
+        &mut self,
+        file: &ProjectFile,
+        exceeded: SemanticBudgetExceeded,
+    ) {
+        self.push_exhausted_diagnostic(
+            file,
+            "flow seed artifact admission exhausted",
+            &format!("semantic/{}", exceeded.dimension().label()),
+            Some(CodeQueryExhaustedCharge {
+                attempted: exceeded.attempted(),
+                limit: exceeded.limit(),
+            }),
+        );
     }
 
     /// Push one diagnostic that attributes exhausted work to this file.
@@ -5590,7 +6175,7 @@ impl<'a> SemanticQueryContext<'a> {
         };
         self.push_diagnostic(
             code,
-            Incompleteness::Content,
+            Self::partial_outcome_code(outcome).1,
             CodeQueryDiagnosticImpact::Incomplete,
             file,
             &reason,
@@ -5602,14 +6187,14 @@ impl<'a> SemanticQueryContext<'a> {
         self.mark_execution_dependent();
         self.push_diagnostic(
             CodeQueryDiagnosticCode::Cancelled,
-            Incompleteness::Content,
+            Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled),
             CodeQueryDiagnosticImpact::Incomplete,
             file,
             message,
         );
     }
 
-    fn push_diagnostic(
+    pub(super) fn push_diagnostic(
         &mut self,
         code: CodeQueryDiagnosticCode,
         incompleteness: Incompleteness,
@@ -5664,6 +6249,10 @@ impl<'a> SemanticQueryContext<'a> {
                 message,
                 exhausted_roots,
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }),
             incompleteness.execution_cause(),
         );
@@ -5904,6 +6493,7 @@ impl SemanticProcedureValue {
                         gaps,
                         ..
                     } => gaps.as_slice(),
+                    brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. } => &[],
                     _ => &[],
                 })
                 .map(|id| {
@@ -6741,6 +7331,57 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#13901: a prior row refusal replaced the current source admission diagnostic")]
+    fn source_admission_diagnostic_preserves_current_cause_after_an_earlier_row_refusal() {
+        use brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause;
+        let (project, workspace) = receipt_workspace();
+        let file = project.file("subject.go");
+        let mut context = SemanticQueryContext::new(
+            &workspace,
+            None,
+            CodeQuerySemanticLimits {
+                max_source_bytes: 1,
+                ..Default::default()
+            },
+        );
+        let old = context
+            .budget
+            .check_admission(SemanticWork {
+                program_points: context.budget.limits().program_points + 1,
+                ..SemanticWork::default()
+            })
+            .expect_err("an earlier operation refused rows");
+        let cancellation = CancellationToken::default();
+        let mut capture_budget = SemanticBudget::default();
+        let (rows, observed) = SemanticRequest::new(&mut capture_budget, &cancellation)
+            .judged_with_refusal(|_| context.procedure_references(&file));
+        assert!(rows.value.is_empty());
+        assert_eq!(
+            rows.reuse,
+            ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal)
+        );
+        let exceeded = observed.expect("this inventory refused source").exceeded;
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::SourceBytes);
+        assert_eq!(exceeded.limit(), 1);
+        assert_eq!(exceeded.attempted(), 2);
+        assert_eq!(context.budget.first_refusal().unwrap().exceeded, old);
+        assert_eq!(context.budget.refusal_count(), 2);
+        assert!(context.budget_exhausted);
+        assert_eq!(context.diagnostics.len(), 1);
+        let diagnostic = &context.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        );
+        assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+        assert_eq!(
+            diagnostic.incompleteness,
+            Incompleteness::Operational(DerivationExecutionCause::Budget)
+        );
+        assert_eq!(diagnostic.message, exceeded.to_string());
+    }
+
+    #[test]
     #[hardwon(
         "#11532: an unavailable ownership refinement must preserve master's base pointer findings"
     )]
@@ -6786,6 +7427,7 @@ mod tests {
         let baseline = super::super::rust_pointer_safety::analyze(
             &workspace,
             &base,
+            None,
             None,
             &mut baseline_budget,
             context.value_flow_limits.solver_work,
@@ -7128,6 +7770,288 @@ mod tests {
         assert!(!reads.is_bounded());
     }
 
+    #[test]
+    fn held_complete_seed_survives_ordinary_eviction_and_root_dispatch() {
+        use crate::analyzer::semantic::WorkspaceIcfgProvider;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "subject.go",
+                "package subject\n\nfunc callee() {}\nfunc subject() { callee() }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let file = project.file("subject.go");
+        let token = CancellationToken::new();
+        let mut seed_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: seed, .. } = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut seed_budget, &token),
+            )
+            .expect("seed provider acquisition")
+        else {
+            panic!("the single-file fixture must have complete native semantics");
+        };
+        let procedure = seed
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .expect("the fixture has a structured ordinary call");
+        let seed_handle = seed.procedure_handle(procedure.id()).expect("seed handle");
+        let call = &procedure.call_sites()[0];
+        let span = procedure
+            .source_mapping(call.source)
+            .expect("the call has a structured source mapping")
+            .locator
+            .anchor()
+            .span();
+        let range = super::super::type_flow::source_range(span);
+
+        // This fixture performs no source, model, stored-publication or
+        // interpretation change between touches. Only ordinary cache eviction
+        // varies; a different built_from provenance is a separate contract.
+        let mut legacy_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: legacy, .. } = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut legacy_budget, &token),
+            )
+            .expect("legacy fresh-ledger provider acquisition")
+        else {
+            panic!("the legacy entry must admit this complete artifact");
+        };
+        assert!(Arc::ptr_eq(&legacy, &seed));
+        let legacy_census = legacy_budget.resident_census();
+        let legacy_remaining = legacy_budget.remaining();
+        assert_eq!(legacy_budget.refusal_count(), 0);
+        let hooks = workspace.analyzer().test_hooks();
+        let materializations = hooks.semantic_materialization_census_for_test();
+        let (_, initial_file_work) = materializations
+            .iter()
+            .find(|(path, _)| path == seed.key().path())
+            .expect("the actual provider records the fixture's materialization");
+        let initial_file_work = *initial_file_work;
+        let mut runs = Vec::new();
+
+        for evict in [false, true] {
+            // One fresh default grant per independent comparison arm, never
+            // replaced between held admission, file lookup and dispatch.
+            let mut budget = SemanticBudget::default();
+            budget.admit_held_artifact(&seed).expect("held seed fits");
+            assert_eq!(budget.resident_census(), legacy_census);
+            assert_eq!(budget.remaining(), legacy_remaining);
+            assert_eq!(budget.refusal_count(), 0);
+            let census_before = budget.resident_census();
+            let remaining_before = budget.remaining();
+            if evict {
+                hooks.arm_evaluation_root_continuation_semantic_cache_invalidation_for_test();
+                hooks.invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
+                assert_eq!(
+                    hooks
+                        .evaluation_root_continuation_semantic_cache_revival_census_for_test()
+                        .operations,
+                    0,
+                    "the armed ordinary-eviction witness starts before revival"
+                );
+            }
+            let SemanticOutcome::Complete {
+                value: looked_up, ..
+            } = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &token),
+                )
+                .expect("actual workspace file lookup after held admission")
+            else {
+                panic!("ordinary eviction must not change a complete seed lookup");
+            };
+            assert!(Arc::ptr_eq(&looked_up, seed_handle.artifact()));
+            assert_eq!(budget.resident_census(), census_before);
+            assert_eq!(budget.remaining(), remaining_before);
+            assert_eq!(budget.refusal_count(), 0);
+            if evict {
+                let revival =
+                    hooks.evaluation_root_continuation_semantic_cache_revival_census_for_test();
+                assert!(
+                    revival.operations > 0,
+                    "the file lookup must actually revive"
+                );
+                assert_eq!(revival.distinct_artifacts, 1);
+                // Force a second real miss at the root dispatch's file-key
+                // acquisition, rather than letting the first lookup warm it.
+                hooks.arm_evaluation_root_continuation_semantic_cache_invalidation_for_test();
+                hooks.invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
+            }
+            let provider = WorkspaceIcfgProvider::new(&workspace);
+            let SemanticOutcome::Complete {
+                value: dispatch, ..
+            } = provider
+                .oracle()
+                .dispatch_at_source(&file, range, &mut SemanticRequest::new(&mut budget, &token))
+                .expect("actual root dispatch performs its provider file lookup")
+            else {
+                panic!("the same-file ordinary call must have complete dispatch");
+            };
+            assert!(!dispatch.observations().is_empty());
+            assert!(dispatch.target_candidates().next().is_some());
+            for observation in dispatch.observations() {
+                assert!(Arc::ptr_eq(
+                    observation.call().procedure().artifact(),
+                    seed_handle.artifact()
+                ));
+            }
+            assert_eq!(budget.refusal_count(), 0);
+            if evict {
+                let revival =
+                    hooks.evaluation_root_continuation_semantic_cache_revival_census_for_test();
+                assert!(
+                    revival.operations > 0,
+                    "dispatch must actually revive its root"
+                );
+                assert_eq!(revival.distinct_artifacts, 1);
+            }
+            let materializations = hooks.semantic_materialization_census_for_test();
+            let (_, file_work) = materializations
+                .iter()
+                .find(|(path, _)| path == seed.key().path())
+                .expect("the root still has provider materialization telemetry");
+            assert_eq!(
+                file_work.lowerings, initial_file_work.lowerings,
+                "ordinary eviction cannot lower a still-held root again"
+            );
+            assert!(
+                file_work.repeat_hits > initial_file_work.repeat_hits,
+                "the same admitted allocation is served by the actual provider"
+            );
+            // Dispatch can retain additional legitimate oracle state. Compare
+            // its matched stage, not the pre-dispatch root-only census, and
+            // compare resident allowance rather than repeat-lookup telemetry.
+            runs.push((
+                budget.resident_census(),
+                budget.remaining(),
+                budget.refusal_count(),
+                dispatch,
+            ));
+        }
+        let (normal_census, normal_remaining, normal_refusals, normal_dispatch) = &runs[0];
+        let (evicted_census, evicted_remaining, evicted_refusals, evicted_dispatch) = &runs[1];
+        assert_eq!(normal_census, evicted_census);
+        assert_eq!(normal_remaining, evicted_remaining);
+        assert_eq!(normal_refusals, evicted_refusals);
+        assert_eq!(normal_dispatch.coverage(), evicted_dispatch.coverage());
+        assert_eq!(
+            normal_dispatch.observations().len(),
+            evicted_dispatch.observations().len()
+        );
+        for (normal, evicted) in normal_dispatch
+            .observations()
+            .iter()
+            .zip(evicted_dispatch.observations())
+        {
+            assert_eq!(normal.call(), evicted.call(), "exact native call identity");
+            assert_eq!(normal.quality, evicted.quality);
+            assert_eq!(
+                normal
+                    .dispatch()
+                    .candidates()
+                    .iter()
+                    .map(|candidate| &candidate.target)
+                    .collect::<Vec<_>>(),
+                evicted
+                    .dispatch()
+                    .candidates()
+                    .iter()
+                    .map(|candidate| &candidate.target)
+                    .collect::<Vec<_>>(),
+                "native target artifact and interpretation identities remain exact"
+            );
+            // Each independent oracle may allocate its own relation arena.
+            // The shared comparator checks its complete owner/record content
+            // and relation ordinals while preserving exact native target
+            // equality, proof, completeness, boundaries and coverage.
+            assert!(
+                normal.dispatch().has_same_content(evicted.dispatch()),
+                "ordinary eviction preserves the full dispatch answer: {normal:#?} vs {evicted:#?}"
+            );
+            if normal.dispatch() != evicted.dispatch() {
+                let normal_arena = normal
+                    .dispatch()
+                    .relation_anchor()
+                    .expect("the fixture's dispatch retains relation provenance");
+                let evicted_arena = evicted
+                    .dispatch()
+                    .relation_anchor()
+                    .expect("the matched dispatch retains relation provenance");
+                assert!(normal_arena.has_same_arena_content(evicted_arena));
+                assert!(
+                    !normal_arena.same_arena(evicted_arena),
+                    "the remaining native equality difference is the independent relation arena"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14156: artifact admission refusal lost its operational Budget cause"
+    )]
+    fn flow_seed_refusal_reports_exact_charge_without_stopping_query_traversal() {
+        let (project, workspace) = receipt_workspace();
+        let file = project.file("subject.go");
+        let mut semantic =
+            SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+        let (artifact, _, _) = semantic.materialize(&file).expect("real native artifact");
+        let points = artifact.work().program_points;
+        assert!(points > 1, "the fixture must exceed a positive row limit");
+        let mut operation_budget = SemanticBudget::new(SemanticWork {
+            program_points: points - 1,
+            ..SemanticWork::default_limits()
+        })
+        .expect("positive operation limits");
+        let exceeded = operation_budget
+            .admit_held_artifact(&artifact)
+            .expect_err("the native census exceeds the operation's point limit");
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::ProgramPoints);
+        let _ = semantic.take_diagnostics();
+        for _ in 0..2 {
+            semantic.report_seed_admission_refusal(&file, exceeded);
+            let diagnostics = semantic.take_diagnostics();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("one diagnostic for the refused seed: {diagnostics:?}");
+            };
+            assert_eq!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            );
+            assert_eq!(
+                diagnostic.incompleteness.execution_cause(),
+                Some(DerivationExecutionCause::Budget)
+            );
+            let [root] = diagnostic.exhausted_roots.as_slice() else {
+                panic!("one exhausted root: {diagnostic:?}");
+            };
+            assert_eq!(root.path, "subject.go");
+            assert_eq!(
+                root.lane,
+                format!("semantic/{}", exceeded.dimension().label())
+            );
+            assert_eq!(
+                root.charge,
+                Some(CodeQueryExhaustedCharge {
+                    attempted: points,
+                    limit: points - 1,
+                })
+            );
+        }
+        assert_eq!(operation_budget.refusal_count(), 1);
+        assert_eq!(semantic.budget.refusal_count(), 0);
+        assert!(semantic.charge_consumer_traversal(&file, 1, "separate semantic consumer"));
+    }
+
     fn receipt_workspace() -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
         let project = InlineTestProject::with_language(Language::Go)
             .file("subject.go", "package subject\n\nfunc subject() {}\n")
@@ -7155,6 +8079,272 @@ mod tests {
         (project, workspace)
     }
 
+    fn assert_independent_row_keeps_the_window_pinned(
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        source_artifact: &Arc<SemanticArtifact>,
+        value: super::super::PipelineValue,
+    ) {
+        let row = super::super::PipelineRow {
+            call_path_evidence: None,
+            value,
+            traces: Vec::new(),
+            provenance_truncated: false,
+            row_projection: Vec::new(),
+        };
+        let mut context =
+            SemanticQueryContext::new(workspace, None, CodeQuerySemanticLimits::default());
+        assert!(context.can_start_artifact_windows());
+        context.set_pinned_downstream_row_holders(usize::from(
+            super::super::pipeline_row_retains_semantic_artifact(&row),
+        ));
+        assert!(context.cache.is_empty());
+        assert!(
+            !context.can_start_artifact_windows(),
+            "a holder from another allocation prevents a window even with an empty cache"
+        );
+
+        let (local_artifact, _, _) = context.materialize(file).expect("the local file fits");
+        assert!(
+            !Arc::ptr_eq(source_artifact, &local_artifact),
+            "the native payload is independent of this context's allocation"
+        );
+        let local = Arc::downgrade(&local_artifact);
+        drop(local_artifact);
+        context.release_unreferenced_artifacts();
+        let retained = context
+            .materialized_outcome(file)
+            .expect("a guarded release retains the cached outcome");
+        assert!(Arc::ptr_eq(
+            retained.available_value().expect("retained artifact"),
+            &local.upgrade().expect("the registration remains live")
+        ));
+        assert_eq!(context.work().materialization_attempts, 1);
+        drop(retained);
+
+        // This is the operand-drain boundary: no native row remains when its
+        // registration is reset, and ordinary release can close the window.
+        drop(row);
+        context.set_pinned_downstream_row_holders(0);
+        context.release_unreferenced_artifacts();
+        assert!(context.cache.is_empty());
+        assert_eq!(context.physical_retained_bytes(), 0);
+        assert!(context.can_start_artifact_windows());
+        drop(
+            context
+                .materialize(file)
+                .expect("a later operand re-acquires"),
+        );
+        assert_eq!(context.work().materialization_attempts, 2);
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: full and partial native row holders outside the semantic cache could start an unmetered artifact window"
+    )]
+    fn independent_native_observations_pin_full_and_partial_artifact_windows() {
+        use super::super::{
+            PipelineValue, ReceiverAnalysisOutcome, ReceiverAnalysisValue, ReceiverQueryAnalysis,
+            ReceiverQueryOperation, ReceiverQueryReport,
+        };
+        use crate::analyzer::semantic::{
+            CandidateCoverage, ObservationPhase, OracleCallContext, OracleLimits, PointsToResult,
+            SemanticValueKind, SourcePointsToResult, ValueAtPoint,
+        };
+        use crate::analyzer::usages::receiver_query::ReceiverQuerySite;
+
+        let source = "package subject\nfunc subject(input int) int { value := input; if value > 0 { return value }; return 0 }\n";
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("subject.go", source)
+            .build();
+        let source_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let local_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("subject.go");
+
+        for partial in [false, true] {
+            let mut context = SemanticQueryContext::new(
+                &source_workspace,
+                None,
+                CodeQuerySemanticLimits::default(),
+            );
+            let (artifact, _, _) = context.materialize(&file).expect("real Go artifact");
+            if partial {
+                let Some(CachedSemanticMaterialization::Outcome { outcome, .. }) =
+                    context.cache.get_mut(&file)
+                else {
+                    panic!("the real materialization retained its outcome");
+                };
+                // A conservative partial envelope around the same real IR:
+                // this changes no handles, source, admission or artifact rows.
+                *outcome = SemanticOutcome::Unknown {
+                    partial: Some(Arc::clone(&artifact)),
+                    work: SemanticWork::default(),
+                };
+            }
+            let (_, source_snapshot, quality) = context
+                .materialize(&file)
+                .expect("available native payload");
+            let outcome = context.materialized_outcome(&file).expect("native outcome");
+            assert_eq!(outcome.is_complete(), !partial);
+            let semantics = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .values()
+                        .iter()
+                        .any(|value| matches!(&value.kind, SemanticValueKind::Parameter { .. }))
+                })
+                .expect("the fixture has a parameter-bearing procedure");
+            let handle = artifact.procedure_handle(semantics.id()).unwrap();
+            let parameter = semantics
+                .values()
+                .iter()
+                .find(|value| matches!(&value.kind, SemanticValueKind::Parameter { .. }))
+                .unwrap();
+            let point = semantics.points().first().expect("entry point");
+            let observation = ValueAtPoint::new(
+                handle.value_handle(parameter.id).unwrap(),
+                handle.point_handle(point.id).unwrap(),
+                ObservationPhase::BeforeEffects,
+                OracleCallContext::empty(),
+            )
+            .unwrap();
+            let coverage = if partial {
+                CandidateCoverage::Open
+            } else {
+                CandidateCoverage::Exhaustive
+            };
+            let points_to = PointsToResult::new(
+                observation,
+                std::iter::empty(),
+                coverage,
+                OracleLimits::default(),
+            )
+            .unwrap();
+            let receiver = ReceiverAnalysisValue {
+                report: ReceiverQueryReport {
+                    operation: ReceiverQueryOperation::PointsTo,
+                    site: ReceiverQuerySite {
+                        file: file.clone(),
+                        language: Language::Go,
+                        range: crate::analyzer::Range {
+                            start_byte: 0,
+                            end_byte: source.len(),
+                            start_line: 1,
+                            end_line: 3,
+                        },
+                        text: source.to_string(),
+                        syntax_kind: "identifier".to_string(),
+                        member_name: None,
+                    },
+                    analysis: ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(
+                        Vec::new(),
+                    )),
+                    member_range: None,
+                    work: Default::default(),
+                    candidates_truncated: false,
+                    semantic_unsupported: None,
+                    definition_diagnostics: Vec::new(),
+                    possible_candidates_suppressed: false,
+                    points_to: Some(SourcePointsToResult {
+                        observations: Box::new([points_to]),
+                        coverage,
+                        source_observations_complete: !partial,
+                    }),
+                },
+                capture: None,
+                site_id: "fixture-observation".to_string(),
+                site_ast_id: None,
+                member_forms: Vec::new(),
+            };
+            assert!(receiver.report.points_to.as_ref().unwrap().is_empty());
+            assert_eq!(
+                receiver
+                    .report
+                    .points_to
+                    .as_ref()
+                    .unwrap()
+                    .observations()
+                    .len(),
+                1,
+                "an empty object set still holds the observation's handles"
+            );
+
+            let procedure = SemanticProcedureValue {
+                handle: handle.clone(),
+                file: file.clone(),
+                source: source_snapshot,
+                quality,
+            };
+            let mut cache = super::super::flow_state::FlowStateTraversalCache::new(
+                context.active_semantic_model_snapshot.clone(),
+            );
+            let state =
+                cache.for_materialized_procedure(&source_workspace, &file, outcome, &handle, None);
+            let index = state
+                .procedures
+                .iter()
+                .position(|derived| derived.procedure == handle.id())
+                .unwrap();
+            assert!(!state.procedures[index].events.is_empty());
+            assert!(!state.procedures[index].relations.is_empty());
+            let id: Arc<str> = Arc::from(procedure.wire_id());
+            let mut values = vec![
+                PipelineValue::StateEvent(Box::new(super::super::flow_state::StateEventValue {
+                    file_state: Arc::clone(&state),
+                    procedure_index: index,
+                    event: 0,
+                    file: file.clone(),
+                    procedure_id: Arc::clone(&id),
+                    procedure: handle.clone(),
+                    diagnostic_procedure: procedure.clone(),
+                    selected_property_origin: None,
+                })),
+                PipelineValue::FlowRelation(Box::new(
+                    super::super::flow_state::FlowRelationValue {
+                        file_state: state,
+                        procedure_index: index,
+                        relation: 0,
+                        file: file.clone(),
+                        procedure_id: id,
+                        procedure: handle.clone(),
+                        diagnostic_procedure: procedure.clone(),
+                        selected_property: None,
+                    },
+                )),
+                PipelineValue::ReceiverAnalysis(receiver.clone()),
+                PipelineValue::CrossDomain(Box::new(
+                    super::super::cross_domain::CrossDomainValue::CodeWitness(Box::new(
+                        PipelineValue::CrossDomain(Box::new(
+                            super::super::cross_domain::CrossDomainValue::CodeWitness(Box::new(
+                                PipelineValue::ReceiverAnalysis(receiver),
+                            )),
+                        )),
+                    )),
+                )),
+            ];
+            let guard = semantics
+                .guard_facts()
+                .first()
+                .expect("the if has a real guard");
+            values.push(PipelineValue::Guard(Box::new(
+                super::super::guards::GuardValue {
+                    procedure,
+                    guard: guard.id,
+                },
+            )));
+            for value in values {
+                assert_independent_row_keeps_the_window_pinned(
+                    &local_workspace,
+                    &file,
+                    &artifact,
+                    value,
+                );
+            }
+        }
+    }
+
     #[test]
     #[hardwon("#8962: one 3,616-line file exceeded the default per-lane event grant")]
     fn one_large_file_fits_its_own_artifact_window() {
@@ -7175,7 +8365,7 @@ mod tests {
         let mut context = SemanticQueryContext::new(&workspace, None, limits);
         let default_event_grant = context.budget.limits().events;
         context.start_artifact_window(file.clone());
-        let (artifact, _, _) = context.materialize(&file).unwrap_or_else(|| {
+        let (artifact, _, _) = context.materialize(&file).unwrap_or_else(|_| {
             panic!(
                 "one large file fits its own window: {:?}",
                 context.diagnostics
@@ -7190,6 +8380,159 @@ mod tests {
         context.release_artifact_window();
         assert_eq!(context.budget.limits().events, default_event_grant);
         assert!(!context.budget_exhausted);
+    }
+
+    #[test]
+    fn released_artifact_refunds_its_exact_resident_work_and_reacquires_free() {
+        let calls = "    sink()\n".repeat(32);
+        let source = format!("package subject\nfunc sink() {{}}\nfunc subject() {{\n{calls}}}\n");
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("subject.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let file = project.file("subject.go");
+        let mut context =
+            SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+        let artifact = context.materialize(&file).expect("file materializes").0;
+        let work = artifact.work();
+        assert_eq!(context.budget.resident(), work);
+        drop(artifact);
+
+        context.release_unreferenced_artifacts();
+        assert_eq!(context.budget.resident(), SemanticWork::default());
+
+        let artifact = context.materialize(&file).expect("file re-acquires").0;
+        assert_eq!(context.budget.resident(), work);
+        assert_eq!(context.work().materialization_attempts, 2);
+        drop(artifact);
+        context.release_unreferenced_artifacts();
+        assert_eq!(context.budget.resident(), SemanticWork::default());
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a missing semantic artifact reported no typed cause, and a later hit hid the native outcome"
+    )]
+    fn artifact_requests_report_the_producer_cause_and_hits_keep_the_native_outcome() {
+        let (project, workspace) = receipt_workspace();
+        let subject = project.file("subject.go");
+        let refused = project.file("first.unsupported");
+        let mut context =
+            SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+        let (artifact, _, _) = context
+            .materialize(&subject)
+            .expect("the Go subject materializes");
+
+        // An outcome without an artifact refuses with the cause its own
+        // diagnostic carries, on the first miss and on the hit after it.
+        let first = context
+            .materialized_outcome(&refused)
+            .expect_err("a file without a semantic artifact is refused");
+        assert_eq!(context.materialized_outcome(&refused).err(), Some(first));
+        assert!(context.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == first.code() && diagnostic.incompleteness == first.cause()
+        }));
+
+        // A cached Cancelled partial keeps its artifact for an artifact-only
+        // hit and still refuses a consumer that needs source.
+        let work = SemanticWork::default();
+        context.cache.insert(
+            subject.clone(),
+            CachedSemanticMaterialization::Outcome {
+                outcome: SemanticOutcome::Cancelled {
+                    partial: Some(Arc::clone(&artifact)),
+                    work,
+                },
+                source: None,
+                source_refusal: Some(ArtifactUnavailable::SNAPSHOT),
+            },
+        );
+        let hit = context
+            .materialized_outcome(&subject)
+            .expect("an artifact-only hit keeps the cancelled partial");
+        assert!(matches!(hit, SemanticOutcome::Cancelled { .. }));
+        assert!(Arc::ptr_eq(
+            hit.available_value().expect("partial artifact"),
+            &artifact
+        ));
+        assert_eq!(
+            context.materialize(&subject).err(),
+            Some(ArtifactUnavailable::CANCELLED)
+        );
+        assert!(context.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::Cancelled
+                && diagnostic.incompleteness
+                    == Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+        }));
+
+        // A complete outcome whose source was refused derives artifact-only
+        // and refuses a source consumer with the recorded snapshot cause.
+        context.cache.insert(
+            subject.clone(),
+            CachedSemanticMaterialization::Outcome {
+                outcome: SemanticOutcome::Complete {
+                    value: Arc::clone(&artifact),
+                    work: SemanticWork::default(),
+                },
+                source: None,
+                source_refusal: Some(ArtifactUnavailable::SNAPSHOT),
+            },
+        );
+        let hit = context
+            .materialized_outcome(&subject)
+            .expect("an artifact-only hit keeps the complete outcome");
+        assert!(hit.is_complete());
+        assert_eq!(
+            context.materialize(&subject).err(),
+            Some(ArtifactUnavailable::SNAPSHOT)
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a snapshot refusal before caching was indistinguishable from an absent artifact"
+    )]
+    fn reacquisition_refuses_a_source_that_moved_since_the_first_materialization() {
+        let original = "function target() { const first = 1; }\n";
+        let changed = "function target() { const other = 2; }\n";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/app.ts");
+        file.write(original).expect("write original source");
+        let overlay = Arc::new(crate::analyzer::OverlayProject::new(Arc::new(
+            crate::analyzer::TestProject::new(root, Language::TypeScript),
+        )));
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>,
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let mut context =
+            SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+        drop(context.materialize(&file).expect("original materializes"));
+        context.release_unreferenced_artifacts();
+
+        assert!(overlay.set(file.abs_path(), changed.to_string()));
+        assert_eq!(
+            context.materialize(&file).err(),
+            Some(ArtifactUnavailable::SNAPSHOT)
+        );
+        // The mismatch returns before any cache insertion, so the typed cause
+        // comes from the producer on every request.
+        assert!(context.cache.is_empty());
+        assert_eq!(
+            context.materialized_outcome(&file).err(),
+            Some(ArtifactUnavailable::SNAPSHOT)
+        );
+        assert!(context.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                && diagnostic.incompleteness
+                    == Incompleteness::Operational(DerivationExecutionCause::Snapshot)
+        }));
+        assert_eq!(context.budget.resident(), SemanticWork::default());
     }
 
     #[test]
@@ -7222,7 +8565,7 @@ mod tests {
         assert!(artifact.work().events > default_grant);
         drop(artifact);
         let remaining_before_target = context.budget.remaining();
-        let (target, _, _) = context.materialize(&target_file).unwrap_or_else(|| {
+        let (target, _, _) = context.materialize(&target_file).unwrap_or_else(|_| {
             panic!(
                 "target artifact should fit the byte cap: {:?}",
                 context.diagnostics
@@ -7250,7 +8593,7 @@ mod tests {
             .expect("source fits byte cap");
         drop(source);
         let before_refusal = refusing.budget.remaining();
-        assert!(refusing.materialize(&target_file).is_none());
+        assert!(refusing.materialize(&target_file).is_err());
         assert!(
             refusing.diagnostics.iter().any(|diagnostic| {
                 diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted
@@ -7278,7 +8621,7 @@ mod tests {
         };
         let mut context = SemanticQueryContext::new(&workspace, None, limits);
         context.start_artifact_window(file.clone());
-        assert!(context.materialize(&file).is_none());
+        assert!(context.materialize(&file).is_err());
         assert_eq!(context.budget.limits().events, 1);
         context.release_artifact_window();
         assert_eq!(context.budget.limits().events, 1);
@@ -7750,6 +9093,218 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#14365: indexing tiny procedure sets cost more than scanning every usage")]
+    fn tiny_procedure_sets_keep_linear_range_lookup_work() {
+        for procedures in [1, 2] {
+            let calls = "    println(1)\n".repeat(32);
+            let bodies = (0..procedures)
+                .map(|i| format!("func subject{i}() {{\n{calls}}}\n"))
+                .collect::<String>();
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("subject.go", format!("package subject\n{bodies}"))
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let file = project.file("subject.go");
+            let provider = workspace
+                .analyzer()
+                .structural_fact_providers()
+                .into_iter()
+                .find(|p| p.structural_language() == Language::Go)
+                .expect("Go provider");
+            let facts = provider.structural_facts(&file).expect("source facts");
+            let ranges: Vec<_> = facts
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == crate::structural::NormalizedKind::Call)
+                .map(|node| node.range)
+                .collect();
+            assert_eq!(ranges.len(), procedures * 32);
+            let mut context =
+                SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+            let (artifact, _, _) = context.materialize(&file).expect("tiny artifact");
+            assert_eq!(artifact.procedures().len(), procedures);
+            let cancellation = CancellationToken::new();
+            let scan_work: usize = ranges
+                .iter()
+                .map(|range| {
+                    procedures_for_source_ranges(&artifact, &[*range], usize::MAX, &cancellation)
+                        .examined
+                })
+                .sum();
+            let before = context.work().traversal_steps;
+            let mut visited = 0;
+            context
+                .visit_procedure_candidates_of_source_ranges(
+                    &file,
+                    &ranges,
+                    facts.source_identity(),
+                    0,
+                    |_, candidates| {
+                        assert_eq!(candidates.len(), 1);
+                        visited += 1;
+                    },
+                )
+                .expect("tiny file remains complete");
+            assert_eq!(visited, ranges.len());
+            assert_eq!(context.work().traversal_steps - before, scan_work as u64);
+            eprintln!(
+                "#14365 tiny procedure set (procedures={procedures}, usages={visited}, scan work={scan_work})"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#14365: optional procedure indexes exceeded resident limits or falsely refused scans"
+    )]
+    fn procedure_index_reserves_and_refunds_its_live_bytes() {
+        assert_eq!(
+            ProcedureSourceRangeIndex::reservation_bytes(usize::MAX),
+            Err(SemanticArtifactLeaseError::RetainedBytesOverflow)
+        );
+        let calls = "    sink()\n".repeat(32);
+        let extras = (0..16)
+            .map(|i| format!("func extra{i}() {{}}\n"))
+            .collect::<String>();
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "subject.go",
+                format!(
+                    "package subject\nfunc sink() {{}}\nfunc subject() {{\n{calls}}}\n{extras}"
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("subject.go");
+        let provider = workspace
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Go)
+            .expect("Go provider");
+        let facts = provider.structural_facts(&file).expect("source facts");
+        let ranges: Vec<_> = facts
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == crate::structural::NormalizedKind::Call)
+            .map(|node| node.range)
+            .collect();
+        assert_eq!(ranges.len(), 32);
+        // Preserve the semantic row grant while narrowing physical bytes,
+        // as production continuations do. Standalone caps price both pools.
+        let parent_semantic = SemanticBudget::default();
+        let parent_execution =
+            SemanticExecutionBudget::new(CodeQuerySemanticLimits::default().max_materialized_files);
+        for windowed in [false, true] {
+            let mut calibration =
+                SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+            if windowed {
+                calibration.start_artifact_window(file.clone());
+            }
+            let (artifact, _, _) = calibration
+                .materialize(&file)
+                .expect("calibration artifact");
+            let base_bytes = calibration.physical_retained_bytes();
+            let index_bytes =
+                ProcedureSourceRangeIndex::reservation_bytes(artifact.procedures().len())
+                    .expect("index footprint fits usize");
+            let visitor_bytes =
+                std::mem::size_of::<Vec<usize>>() + ranges.len() * std::mem::size_of::<usize>();
+            let lookup_bytes = index_bytes + visitor_bytes;
+            drop(artifact);
+            if windowed {
+                calibration.release_artifact_window();
+            }
+            let mut expected_owners = None;
+            for headroom in [lookup_bytes + 1, lookup_bytes, lookup_bytes - 1] {
+                let mut context = continuation_context(
+                    &workspace,
+                    &parent_semantic,
+                    &parent_execution,
+                    CodeQuerySemanticLimits {
+                        max_retained_bytes: base_bytes + headroom,
+                        ..Default::default()
+                    },
+                );
+                if windowed {
+                    context.start_artifact_window(file.clone());
+                }
+                let (artifact, _, _) = context.materialize(&file).unwrap_or_else(|error| {
+                    panic!("artifact fits before index: windowed={windowed}, base_bytes={base_bytes}, headroom={headroom}, error={error:?}, diagnostics={:?}", context.diagnostics)
+                });
+                assert_eq!(context.physical_retained_bytes(), base_bytes);
+                drop(artifact);
+                let mut visited = 0;
+                let mut owners = Vec::with_capacity(ranges.len());
+                let completed = context.visit_procedure_candidates_of_source_ranges(
+                    &file,
+                    &ranges,
+                    facts.source_identity(),
+                    visitor_bytes,
+                    |_, candidates| {
+                        assert_eq!(candidates.len(), 1);
+                        owners.push(candidates[0].id().index());
+                        visited += 1;
+                    },
+                );
+                assert_eq!(
+                    context.physical_retained_bytes(),
+                    base_bytes,
+                    "index reservation is refunded after completion or refusal"
+                );
+                assert!(
+                    completed.is_some(),
+                    "lookup remains complete: {:?}",
+                    context.diagnostics
+                );
+                assert_eq!(visited, ranges.len());
+                assert!(!context.budget_exhausted);
+                assert!(!context.take_diagnostics().iter().any(|diagnostic| {
+                    diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted
+                }));
+                assert!(
+                    context
+                        .artifact_window
+                        .as_ref()
+                        .is_none_or(|window| window.overflow().is_none())
+                );
+                if headroom > lookup_bytes {
+                    assert_eq!(
+                        context.work().retained_bytes,
+                        (base_bytes + lookup_bytes) as u64,
+                        "the receipt includes live index and visitor storage"
+                    );
+                    expected_owners = Some(owners);
+                } else {
+                    assert_eq!(
+                        context.work().retained_bytes,
+                        base_bytes as u64,
+                        "scanning does not allocate the optional index"
+                    );
+                    assert_eq!(owners, *expected_owners.as_ref().expect("indexed baseline"));
+                }
+                assert!(
+                    context.work().retained_bytes < (base_bytes + headroom) as u64,
+                    "optional lookup must not reach the seed-unit whole-query retry threshold"
+                );
+                // Mandatory acquisition runs only after ranked candidates
+                // have been returned and the optional index is gone. A live
+                // index would consume this entire grant and latch overflow.
+                if let Some(window) = context.artifact_window.as_ref() {
+                    let mandatory = window
+                        .reserve_other_live_bytes(headroom)
+                        .expect("all index headroom is available to mandatory acquisition");
+                    assert!(window.overflow().is_none());
+                    drop(mandatory);
+                }
+                if windowed {
+                    context.release_artifact_window();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn source_call_index_reserves_window_headroom_before_retaining_handle_metadata() {
         assert_eq!(
             SemanticSourceCallIndex::reservation_bytes(usize::MAX),
@@ -7881,7 +9436,7 @@ mod tests {
         );
         assert_eq!(context.artifact_leases.retained_bytes(), 0);
         context.start_artifact_window(file.clone());
-        assert!(context.materialize(&file).is_none());
+        assert!(context.materialize(&file).is_err());
         assert_eq!(
             context.budget.used(),
             SemanticWork::default(),
@@ -7952,7 +9507,7 @@ mod tests {
             &parent_leases,
         );
         assert!(
-            narrowed.materialize(&file).is_none(),
+            narrowed.materialize(&file).is_err(),
             "a nonwindowed request refuses an already-over-cap retained base"
         );
         assert_eq!(narrowed.work().materialization_attempts, 0);
@@ -8011,7 +9566,7 @@ mod tests {
             &parent_execution,
             CodeQuerySemanticLimits::default(),
         );
-        assert!(first_context.materialize(&first).is_none());
+        assert!(first_context.materialize(&first).is_err());
         let first_work = first_context.work();
         assert_eq!(first_work.materialization_attempts, 1);
         assert_eq!(first_work.unique_materialized_files, 0);
@@ -8028,7 +9583,7 @@ mod tests {
             &parent_execution,
             zero_new_limits,
         );
-        assert!(revisit_context.materialize(&first).is_none());
+        assert!(revisit_context.materialize(&first).is_err());
         assert_eq!(revisit_context.work().materialization_attempts, 1);
         import_context_charge(&mut parent_semantic, &parent_execution, revisit_context);
         assert_eq!(parent_execution.work().materialized_files, 1);
@@ -8039,7 +9594,10 @@ mod tests {
             &parent_execution,
             zero_new_limits,
         );
-        assert!(refused_context.materialize(&second).is_none());
+        assert_eq!(
+            refused_context.materialize(&second).err(),
+            Some(ArtifactUnavailable::BUDGET)
+        );
         let refused_work = refused_context.work();
         assert_eq!(refused_work.materialization_attempts, 0);
         assert!(refused_work.budget_exhausted);
@@ -8069,7 +9627,7 @@ mod tests {
             &parent_execution,
             retained_rejecting_limits,
         );
-        assert!(rejected_context.materialize(&file).is_none());
+        assert!(rejected_context.materialize(&file).is_err());
         let rejected_work = rejected_context.work();
         assert_eq!(rejected_work.materialization_attempts, 1);
         assert_eq!(rejected_work.unique_materialized_files, 0);
@@ -8097,7 +9655,7 @@ mod tests {
             &parent_execution,
             revisit_limits,
         );
-        assert!(revisit_context.materialize(&file).is_some());
+        assert!(revisit_context.materialize(&file).is_ok());
         let revisit_work = revisit_context.work();
         assert_eq!(revisit_work.procedures, 0);
         assert_eq!(revisit_work.nested_entries, 1);
@@ -8197,7 +9755,7 @@ mod tests {
             revisit.start_artifact_window(file.clone());
             let revisited_artifact = revisit
                 .materialize(&file)
-                .unwrap_or_else(|| panic!("overlapping selector {ordinal} fits one physical cap"))
+                .unwrap_or_else(|_| panic!("overlapping selector {ordinal} fits one physical cap"))
                 .0;
             assert!(Arc::ptr_eq(&revisited_artifact, &first_artifact));
             assert_eq!(

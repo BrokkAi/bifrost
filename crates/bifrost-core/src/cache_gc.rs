@@ -1495,7 +1495,7 @@ fn ignored_workspace_file_oids(
         // The analyzer identifies a working file by hashing its raw bytes
         // (`Liveness::oids_for_files`), so the retained identity must be the
         // same raw-byte hash.
-        if let Ok(oid) = crate::gitblob::working_tree_file_oid(&abs) {
+        if let Ok(Some(oid)) = crate::gitblob::working_tree_file_oid(&abs) {
             out.insert(oid.to_string());
         }
     }
@@ -1916,6 +1916,122 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(remaining, vec![live_oid]);
+    }
+
+    /// Issue #13703. POSIX advisory locks belong to the process, and closing
+    /// any descriptor on a file releases all of the process's locks on it. A
+    /// collection that opened and closed the live `-shm` (hashing every
+    /// untracked worktree file) silently dropped the long-lived connection's
+    /// wal-index lock. A second process then believed it was the last
+    /// connection, so it recovered the WAL and unlinked `-wal` and `-shm` on
+    /// exit, and the first process kept writing to a deleted WAL.
+    ///
+    /// The parent opens the store, runs a collection, lets a child process
+    /// write and exit, writes again, and a fresh connection must read it all.
+    fn parent_writes_survive_a_child_writer_after_collection(
+        test_name: &str,
+        store_path: impl FnOnce(&Path, &Path) -> PathBuf,
+    ) {
+        const CHILD_DB: &str = "BIFROST_13703_CHILD_DB";
+        let insert_blob = |conn: &Connection, oid: &str| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+                [oid],
+            )
+            .unwrap();
+        };
+        if let Some(db_path) = std::env::var_os(CHILD_DB) {
+            let conn = cache_db::open_unified_connection(Path::new(&db_path)).unwrap();
+            insert_blob(&conn, "3333333333333333333333333333333333333333");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let outside = tempfile::tempdir().unwrap();
+        let db_path = store_path(&repo_root, outside.path());
+        let parent = cache_db::open_unified_connection(&db_path).unwrap();
+        parent
+            .execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('go', 'a', 1)",
+                [],
+            )
+            .unwrap();
+        insert_blob(&parent, "1111111111111111111111111111111111111111");
+        force_gc(&db_path, &repo, &repo_root).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_DB, &db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child writer failed: {output:?}"
+        );
+
+        insert_blob(&parent, "4444444444444444444444444444444444444444");
+        let fresh = Connection::open(&db_path).unwrap();
+        let report: Vec<String> = fresh
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(report, vec!["ok".to_string()]);
+        let blobs: Vec<String> = fresh
+            .prepare("SELECT blob_oid FROM blobs WHERE blob_oid IN (?1, ?2) ORDER BY blob_oid")
+            .unwrap()
+            .query_map(
+                [
+                    "3333333333333333333333333333333333333333",
+                    "4444444444444444444444444444444444444444",
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            blobs.len(),
+            2,
+            "the child's and the parent's later writes are visible: {blobs:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13703: a child writer's exit left the parent's next write unreadable to fresh connections"
+    )]
+    fn collection_keeps_the_parents_wal_locks_across_a_child_writer() {
+        // A store directly in the worktree is untracked and not ignored, so
+        // the working-tree liveness scan reaches it and its sidecars.
+        parent_writes_survive_a_child_writer_after_collection(
+            "cache_gc::tests::collection_keeps_the_parents_wal_locks_across_a_child_writer",
+            |root, _| root.join("cache.db"),
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13703: a child writer's exit left the parent's next write unreadable to fresh connections"
+    )]
+    fn collection_keeps_the_parents_wal_locks_at_the_default_store_location() {
+        parent_writes_survive_a_child_writer_after_collection(
+            "cache_gc::tests::collection_keeps_the_parents_wal_locks_at_the_default_store_location",
+            |root, _| gitblob::cache_db_path(root),
+        );
+    }
+
+    /// Control for the two tests above: a store outside the worktree was never
+    /// reachable by the liveness scan, so this passes with or without the fix.
+    #[test]
+    fn collection_keeps_the_parents_wal_locks_for_a_store_outside_the_worktree() {
+        parent_writes_survive_a_child_writer_after_collection(
+            "cache_gc::tests::collection_keeps_the_parents_wal_locks_for_a_store_outside_the_worktree",
+            |_, outside| outside.join("cache.db"),
+        );
     }
 
     /// One blob row and an analysis epoch: the smallest store a collection has

@@ -114,9 +114,12 @@ class SearchToolsClient:
         manual: bool = False,
         sources: list[str] | None = None,
         revision: str | None = None,
+        without_project_build: bool = False,
     ) -> None:
         # manual=True: no file watcher; caller drives incremental updates via
         # update_paths(). For batch consumers reusing one session across revisions.
+        if without_project_build and sources is None:
+            raise ValueError("without_project_build requires sources")
         if sources is not None and manual:
             raise ValueError(
                 "manual=True cannot be combined with sources; scoped sessions are already manual"
@@ -126,6 +129,7 @@ class SearchToolsClient:
         self._manual = manual
         self._sources = list(sources) if sources is not None else None
         self._revision = revision
+        self._without_project_build = without_project_build
         self.root = Path(root).expanduser().resolve()
         self._library_path = (
             Path(library_path).expanduser().resolve() if library_path is not None else None
@@ -1173,6 +1177,7 @@ class SearchToolsClient:
                     self._manual,
                     self._sources,
                     self._revision,
+                    self._without_project_build,
                 )
             except Exception as exc:
                 raise SearchToolsError(

@@ -600,16 +600,7 @@ pub fn language_root_member_inventory(
 /// evidence. The interface rule supplies its own declared modifiers.
 pub use brokk_bifrost_core::analyzer::capabilities::PlatformInventoryMethod as JvmImplicitInterfaceMethod;
 
-/// Language knowledge for an interface's lookup-only member root. Other JVM
-/// languages opt in independently; this is not a nominal inheritance edge.
-#[derive(Debug)]
-pub struct JvmImplicitInterfaceMembers {
-    pub owner: &'static str,
-    pub simple_name: &'static str,
-    pub methods: &'static [JvmImplicitInterfaceMethod],
-    pub visibility: brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility,
-    pub is_abstract: bool,
-}
+pub use brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers as JvmImplicitInterfaceMembers;
 
 /// JLS 9.2 implicitly declares Object's public instance methods. Protected
 /// clone/finalize are deliberately absent. No Kotlin/Scala rule is assumed.
@@ -619,13 +610,29 @@ pub fn implicit_interface_members(
     static JAVA: JvmImplicitInterfaceMembers = JvmImplicitInterfaceMembers {
         owner: "java.lang.Object",
         simple_name: "Object",
-        methods: &JAVA_OBJECT_PUBLIC_METHODS,
-        visibility:
-            brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility::Public,
-        is_abstract: true,
+        methods: Some(&JAVA_OBJECT_PUBLIC_METHODS),
+        declaration: Some(
+            brokk_bifrost_core::analyzer::capabilities::ImplicitMemberDeclarationRules {
+                visibility:
+                    brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility::Public,
+                is_abstract: true,
+            },
+        ),
     };
     match language {
         Language::Java => Some(&JAVA),
+        _ => None,
+    }
+}
+
+/// JLS 10.7: an array type's members are `length`, a public `clone` whose
+/// result is the array type, and every member inherited from `Object` except
+/// `clone`. This is the owner whose public inventory an array receiver
+/// inherits; the array `clone` and `length` are not part of it and stay with
+/// the caller. No Kotlin/Scala rule is assumed.
+pub fn array_receiver_member_root(language: Language) -> Option<&'static str> {
+    match language {
+        Language::Java => Some("java.lang.Object"),
         _ => None,
     }
 }

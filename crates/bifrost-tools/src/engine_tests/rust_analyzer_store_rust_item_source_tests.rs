@@ -71,6 +71,201 @@ mod outer {
 "#
     );
 
+    #[test]
+    fn rust_macro_argument_keys_cross_the_source_store_boundary() {
+        use brokk_bifrost_core::analyzer::rust_facts::{
+            RustImplCensusBoundaryKind, RustMacroArgumentKey,
+        };
+        use brokk_bifrost_core::gitblob::BlobKey;
+        let source = include_str!("fixtures/rust-macro-arguments/lib.rs");
+        let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
+        let facts = &state.source_facts.as_ref().unwrap().rust_items;
+        let boundaries = facts.impl_census_boundaries.clone();
+        let expected_arguments = facts.macro_arguments.clone();
+        let key = BlobKey::unvaried(oid_for(source.as_bytes()), "rust");
+        let database = fixture.root().join("macro-arguments.db");
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        store
+            .write_parsed_blob(&key, &RustAdapter::for_tests(), &state)
+            .unwrap();
+        let generation = store.current_generation("rust").unwrap();
+        drop(store);
+        drop(state);
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        let restored = store
+            .rust_hierarchy_source_facts(
+                key.oid,
+                generation,
+                &RustAdapter::for_tests(),
+                &fixture.file("src/lib.rs"),
+                &|| true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.items.macro_arguments, expected_arguments);
+        let mut derives = Vec::new();
+        let mut expanding = Vec::new();
+        for (ordinal, boundary) in boundaries.iter().enumerate() {
+            let attributes = store
+                .rust_macro_argument_attributes(
+                    &key,
+                    generation,
+                    ordinal,
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .unwrap();
+            let rendered = attributes
+                .iter()
+                .map(|attribute| {
+                    (
+                        attribute
+                            .path
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        attribute.from_cfg_attr,
+                        attribute
+                            .keys
+                            .iter()
+                            .map(|key| match key {
+                                RustMacroArgumentKey::Ident(name) => name.as_str(),
+                                RustMacroArgumentKey::Unparsed => "<unparsed>",
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if boundary.kind == RustImplCensusBoundaryKind::Derive {
+                derives.push(
+                    rendered
+                        .iter()
+                        .map(|(path, cfg, keys)| {
+                            (
+                                path.join("::"),
+                                *cfg,
+                                keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            if boundary.kind == RustImplCensusBoundaryKind::ExpandingAttribute
+                && rendered
+                    .iter()
+                    .any(|(path, _, _)| path == &["fixture", "test"])
+            {
+                expanding.push(
+                    rendered
+                        .iter()
+                        .map(|(path, cfg, keys)| {
+                            (
+                                path.join("::"),
+                                *cfg,
+                                keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let expected = |path: &str, cfg: bool, keys: &[&str]| {
+            (
+                path.to_owned(),
+                cfg,
+                keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            derives,
+            vec![
+                vec![
+                    expected("fx", false, &["rename", "default"]),
+                    expected("fx", true, &["crate"]),
+                    expected("fx", false, &["<unparsed>", "<unparsed>"]),
+                    expected("marker", false, &[]),
+                    expected("fx", false, &["<unparsed>"]),
+                    expected("fx", true, &["<unparsed>"]),
+                    expected("fx", false, &["skip"])
+                ],
+                vec![
+                    expected("fx", false, &["rename"]),
+                    expected("fx", false, &["skip"]),
+                    expected("fx", false, &["default"])
+                ],
+                vec![expected("fx", false, &["skip"])],
+            ]
+        );
+        assert_eq!(
+            expanding,
+            vec![
+                vec![expected("fixture::test", false, &["flavor", "start"])],
+                vec![expected("fixture::test", false, &[])]
+            ]
+        );
+        store.conn.execute(|conn| {
+            for statement in [
+                "UPDATE source_rust_macro_attributes SET from_cfg_attr=0",
+                "UPDATE source_rust_macro_attribute_paths SET segment='changed'",
+                "DELETE FROM source_rust_macro_argument_keys",
+            ] {
+                assert!(
+                    conn.execute(statement, []).is_err(),
+                    "sealed rows accepted {statement}"
+                );
+            }
+        });
+        assert!(
+            store
+                .rust_macro_argument_attributes(
+                    &key,
+                    generation,
+                    boundaries.len(),
+                    &CancellationToken::new()
+                )
+                .unwrap()
+                .is_none()
+        );
+        let oid_text = key.oid.to_string();
+        store.conn.execute(move |conn| {
+            // Historical producers published sealed censuses without an
+            // arguments_version. Bypass immutability only to recreate that marker.
+            conn.execute_batch("DROP TRIGGER source_rust_impl_census_files_no_update_after_seal")
+                .unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE source_rust_impl_census_files SET arguments_version=NULL
+                 WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')",
+                    [oid_text],
+                )
+                .unwrap(),
+                1
+            );
+        });
+        assert!(
+            store
+                .rust_macro_argument_attributes(&key, generation, 0, &CancellationToken::new(),)
+                .unwrap()
+                .is_none()
+        );
+        let unavailable = store
+            .rust_hierarchy_source_facts(
+                key.oid,
+                generation,
+                &RustAdapter::for_tests(),
+                &fixture.file("src/lib.rs"),
+                &|| true,
+            )
+            .unwrap_err();
+        assert!(
+            unavailable
+                .to_string()
+                .contains("unavailable macro argument facts marker None"),
+            "{unavailable}"
+        );
+    }
+
     fn canonical_order(items: &mut RustItemSourceFacts, types: &mut [RustTypeSourceFact]) {
         // Family roots are sets keyed by source identity. Context and nested-child
         // vector order is part of the publication contract and is not normalized.
@@ -1200,13 +1395,13 @@ fn nested() { qualified::nested!(); }
             .syntax
             .clear();
         assert!(
-            store
-                .write_parsed_blob(
-                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter::for_tests(),
-                    &missing_syntax
-                )
-                .is_err()
+            crate::engine_tests::repair_parsed_source(
+                &store,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter::for_tests(),
+                &missing_syntax
+            )
+            .is_err()
         );
         assert_eq!(
             store
@@ -1226,13 +1421,13 @@ fn nested() { qualified::nested!(); }
         let context = &mut cycle.source_facts.as_mut().unwrap().rust_items.contexts[1];
         context.parent = Some(context.context);
         assert!(
-            store
-                .write_parsed_blob(
-                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter::for_tests(),
-                    &cycle
-                )
-                .is_err()
+            crate::engine_tests::repair_parsed_source(
+                &store,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter::for_tests(),
+                &cycle
+            )
+            .is_err()
         );
         assert_eq!(
             store
@@ -1253,13 +1448,13 @@ fn nested() { qualified::nested!(); }
         let replacement = items.traits[0].declaration;
         items.callables[0].declaration = replacement;
         assert!(
-            store
-                .write_parsed_blob(
-                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter::for_tests(),
-                    &wrong_owner
-                )
-                .is_err()
+            crate::engine_tests::repair_parsed_source(
+                &store,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter::for_tests(),
+                &wrong_owner
+            )
+            .is_err()
         );
         assert_eq!(
             store
@@ -1359,11 +1554,13 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
             )
             .unwrap();
             let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
-            let (outcomes, stats) = store.persist_prepared_blobs_with_cancellation(
-                vec![prepared],
-                &cancellation,
-                PersistBatchTargets::PRODUCTION,
-            );
+            let (outcomes, stats) =
+                brokk_bifrost_analysis::analyzer::store::test_support::repair_prepared_blobs(
+                    &store,
+                    vec![prepared],
+                    &cancellation,
+                    PersistBatchTargets::PRODUCTION,
+                );
             assert!(
                 cancellation.is_cancelled(),
                 "cancellation checkpoint {checks}"

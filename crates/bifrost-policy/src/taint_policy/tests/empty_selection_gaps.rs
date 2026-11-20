@@ -135,14 +135,19 @@ fn a_selection_that_binds_nothing_is_complete_and_says_so() {
 #[hardwon(
     "#12571: a rejected file hid every sink, so the never-run source side counted as empty and the sink gap was cleared"
 )]
-fn a_rejected_file_that_hid_every_sink_keeps_the_run_inconclusive_on_both_sides() {
+#[hardwon("#13215: empty roles hidden by a provider failure passed as advisory inconclusive")]
+fn a_rejected_file_that_hid_every_sink_fails_with_both_sides_diagnosed() {
     // The source selector matches nothing and is active; the only sink calls
     // sit in the file whose artifact the validator rejects.
     let rejected = "src/bin/hidden_12571.rs";
     let _rejection =
         brokk_bifrost_analysis::analyzer::semantic::reject_artifacts_at_path_for_test(rejected);
     let outcome = run(&[(rejected, PROBE)], &policy("never_12571", "sink_12571"));
-    outcome.assert_inconclusive();
+    assert_eq!(
+        outcome.completion,
+        PolicyRunCompletion::failed(vec![crate::PolicyFailureReason::EndpointRoleUnresolved])
+            .unwrap()
+    );
     assert_eq!(outcome.findings, 0);
     assert!(
         outcome.run_incomplete_mentions(SINKS_PATH),

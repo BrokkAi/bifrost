@@ -78,24 +78,24 @@ use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
 use brokk_bifrost_analysis::analyzer::semantic::{
     AbstractObject, AccessPath, AccessPathAtPoint, AccessPathRoot, AliasQuery, AliasRelation,
     ArgumentCardinality, CallArgumentEndpoint, CallBinding, CallInvocationMode, CallSiteHandle,
-    CallSiteId, CallTransferSet, CandidateCoverage, DispatchOracle, DispatchResult,
-    EvidenceCompleteness, FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle,
-    IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits,
-    ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle,
-    ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
-    SemanticArtifactCollector, SemanticArtifactLeaseChild, SemanticArtifactLeaseError,
-    SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticEffect,
-    SemanticExecutionBudget, SemanticExecutionWork, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, ValueAtPoint,
-    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelationKind, ValueHandle,
-    WorkspaceIcfgProvider,
+    CallSiteId, CallTransferSet, CandidateCoverage, DeclarationSegmentKind, DispatchOracle,
+    DispatchResult, EvidenceCompleteness, FreshObjectPublicationKind, FreshObjectPublicationQuery,
+    HeapOracle, IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot,
+    IcfgSnapshotLimits, ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus,
+    SemanticArtifact, SemanticArtifactCollector, SemanticArtifactLeaseChild,
+    SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
+    SemanticBudgetScopeSnapshot, SemanticEffect, SemanticExecutionBudget, SemanticExecutionWork,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
+    SemanticWork, ValueAtPoint, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
+    ValueFlowRelationKind, ValueHandle, WorkspaceIcfgProvider,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivatedProcedureSummary, ActiveSemanticModelSnapshot, AuthoredCoverageSubject,
     AuthoredSummaryExitKind, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryOutput,
-    Completeness, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
-    SemanticModelMatchDisposition,
+    CompiledProcedureSummary, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryOutput, Completeness, MemberKind, ProcedureSummaryMemberKey,
+    ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
@@ -129,7 +129,8 @@ use brokk_bifrost_flow::typestate::{
     TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey, TypestateSummaryResult,
     TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
     UnprovenEventRelation, collect_summary_findings_with_limits, direct_scalar_source,
-    project_workspace_root_call_closure, solve_typestate_with_production_summaries,
+    direct_snapshot_of, project_workspace_root_call_closure,
+    solve_typestate_with_production_summaries,
 };
 use brokk_bifrost_flow::typestate::{TypestateComposeLabels, judge_object_roots};
 use brokk_bifrost_flow::value_flow::{ValueFlowCache, WorkspaceValueFlowProvider};
@@ -699,6 +700,12 @@ pub(crate) struct TypestatePolicyCompiler<'a> {
     syntax_trees: HashMap<ProjectFile, tree_sitter::Tree>,
     formal_names: HashMap<FormalPortKey, Box<[String]>>,
     selected_template_targets: HashMap<TemplateCallKey, Option<TemplateTarget>>,
+    /// The dispatch answer's receiver preparation for each call a lifecycle
+    /// coverage claim asks about.
+    receiver_preparations: HashMap<
+        TemplateCallKey,
+        Option<brokk_bifrost_analysis::analyzer::semantic::MemberReceiverPreparation>,
+    >,
     /// Close contracts already computed, keyed by the formal they answer for
     /// and the recursion depth that was still available when they were asked.
     ///
@@ -837,6 +844,13 @@ struct ArgumentFormReleaseEvent {
 /// the same question in the same words, so they share this answer: which
 /// workspace procedure receives `object` in which of its formal parameters at
 /// which call site.
+/// The exact bindings of one call, and the arms of its dispatch family when
+/// the call dispatches through one.
+struct ExactArgumentBindings {
+    bindings: Vec<ExactArgumentBinding>,
+    family_arms: Option<Vec<ProcedureHandle>>,
+}
+
 #[derive(Clone)]
 struct ExactArgumentBinding {
     call: CallSiteHandle,
@@ -902,6 +916,14 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
 
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         self.inner.behavior_identity()
+    }
+
+    fn infeasible_control_edges(
+        &self,
+        procedure: &ProcedureHandle,
+        cancellation: &CancellationToken,
+    ) -> Vec<brokk_bifrost_analysis::analyzer::semantic::ControlEdgeId> {
+        self.inner.infeasible_control_edges(procedure, cancellation)
     }
 
     fn call_transfers(
@@ -1844,6 +1866,15 @@ pub(crate) enum TypestateGap {
     SemanticArtifactCapacity,
     CallClosureBudgetStop,
     CallControlCoverageRefused,
+    /// A precise callee summary at a call may first initialize its declaring
+    /// type, and no fact proves that initialization cannot affect the
+    /// protocol's state (#13668). Callee summaries do not cover class
+    /// initialization. A proof that the tracked resource never escapes
+    /// caller-local state would close the gap for resource lifecycle; no such
+    /// fact exists yet (#13547), so the gap stays open and fails closed.
+    ClassInitializationOpen {
+        classes: Vec<String>,
+    },
     SummaryProjectionRefused,
     BindingsIncomplete,
     /// Solved facts carry uncertainty, named by their stable typestate codes,
@@ -1883,6 +1914,9 @@ impl RetainedSize for TypestateGap {
                 .saturating_add(phase.capacity())
                 .saturating_add(reason.capacity()),
             Self::BindingOmitted { omission } => omission.capacity(),
+            Self::ClassInitializationOpen { classes } => classes
+                .retained_size()
+                .saturating_sub(std::mem::size_of_val(classes)),
             _ => 0,
         })
     }
@@ -1913,6 +1947,7 @@ impl TypestateGap {
             Self::SemanticArtifactCapacity => "semantic_artifact_capacity",
             Self::CallClosureBudgetStop => "call_closure_budget_stop",
             Self::CallControlCoverageRefused => "call_control_coverage_refused",
+            Self::ClassInitializationOpen { .. } => "class_initialization_open",
             Self::SummaryProjectionRefused => "summary_projection_refused",
             Self::BindingsIncomplete => "bindings_incomplete",
             Self::SolveUncertain { .. } => "solve_uncertain",
@@ -1945,6 +1980,7 @@ impl TypestateGap {
             Self::BindingOmitted { .. } => CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
             Self::FindingAnalysisIncomplete
             | Self::CallControlCoverageRefused
+            | Self::ClassInitializationOpen { .. }
             | Self::SummaryProjectionRefused
             | Self::BindingsIncomplete
             | Self::SolveUncertain { .. }
@@ -2002,6 +2038,11 @@ impl TypestateGap {
             Self::CallControlCoverageRefused => {
                 output.write_str("scoped call/control coverage was refused, so the summaries a root consumes are not proven complete")
             }
+            Self::ClassInitializationOpen { classes } => write!(
+                output,
+                "a callee summary does not cover class initialization of {classes:?}, and nothing \
+                 proves that initialization cannot affect the protocol state"
+            ),
             Self::SummaryProjectionRefused => {
                 output.write_str("typestate summary projection was refused at a call/control boundary")
             }
@@ -2109,6 +2150,28 @@ const TYPESTATE_UNCERTAINTY_CODES: [(TypestateUncertainty, &str); 7] = [
         "typestate-conditional-alias",
     ),
 ];
+
+/// The open class-initialization gap of a root's call closure, one per root
+/// naming every type involved (#13668).
+fn class_initialization_gap(closure: &RootCallClosure) -> Option<TypestateGap> {
+    let mut classes = closure
+        .class_initializations()
+        .iter()
+        .map(|initialization| {
+            initialization
+                .class
+                .segments()
+                .iter()
+                .filter(|segment| segment.kind() == DeclarationSegmentKind::Type)
+                .filter_map(|segment| segment.name())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect::<Vec<_>>();
+    classes.sort_unstable();
+    classes.dedup();
+    (!classes.is_empty()).then_some(TypestateGap::ClassInitializationOpen { classes })
+}
 
 /// One gap per unproven event relation whose observing procedure the root's
 /// call closure does not exclude.
@@ -2392,6 +2455,7 @@ impl RootPassState {
         {
             root_gaps.push(TypestateGap::CallControlCoverageRefused);
         }
+        root_gaps.extend(class_initialization_gap(production.root_call_closure()));
         let fixed_point = match solved.result().termination() {
             SolverTermination::FixedPoint => true,
             SolverTermination::Cancelled => {
@@ -2690,6 +2754,7 @@ impl RootPassState {
         if !closure.summary_completeness_justified() {
             root_gaps.push(TypestateGap::CallControlCoverageRefused);
         }
+        root_gaps.extend(class_initialization_gap(&closure));
         root_gaps.extend(unproven_relation_gaps(&inputs.compiled.bindings, &closure));
         let mut root_work = RootWork::default();
         for subject in inputs.compiled.bindings.subjects() {
@@ -2704,7 +2769,12 @@ impl RootPassState {
                         }
                     }
             });
-            if !rooted_here {
+            let transferred_here = inputs
+                .compiled
+                .bindings
+                .state_transfers_to(subject.id())
+                .any(|transfer| transfer.call.procedure().durable_key() == root.durable_key());
+            if !rooted_here && !transferred_here {
                 continue;
             }
             let discovery = WorkspaceCompositionDiscovery::new(
@@ -4669,12 +4739,37 @@ fn project_finding(
         .find(|dependency| dependency.identity() == &subject.endpoint)
         .ok_or_else(|| "typestate finding subject endpoint metadata is absent".to_owned())?;
     let site = finding.site();
+    // A copied subject begins at the transfer's normal return, rather than
+    // at a fresh initial-state seed. Retain these sites through projection.
+    let transfer_starts = compiled
+        .bindings
+        .state_transfers_to(finding.subject())
+        .filter_map(|transfer| {
+            let procedure = transfer.call.procedure();
+            let call = procedure
+                .semantics()
+                .call_site(transfer.call.id())
+                .expect("transfer call exists");
+            let point = procedure
+                .point_handle(call.normal_continuation.target()?)
+                .expect("normal continuation belongs to the procedure");
+            Some(TypestateObservationSite::program_point(
+                point,
+                TypestateBindingContext::root(),
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut acquisitions = compiled
         .bindings
         .initial_seeds()
         .iter()
         .filter(|seed| seed.subject() == finding.subject())
         .map(|seed| seed.site().identity())
+        .chain(
+            transfer_starts
+                .iter()
+                .map(TypestateObservationSite::identity),
+        )
         .collect::<Vec<_>>();
     acquisitions.sort_unstable();
     acquisitions.dedup();
@@ -5462,6 +5557,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             syntax_trees: HashMap::new(),
             formal_names: HashMap::new(),
             selected_template_targets: HashMap::new(),
+            receiver_preparations: HashMap::new(),
             close_contracts: HashMap::new(),
             close_contract_stack: Vec::new(),
             binding_omissions: Vec::new(),
@@ -5770,6 +5866,72 @@ impl<'a> TypestatePolicyCompiler<'a> {
             });
         }
 
+        let mut pending_transfers = Vec::new();
+        for transfer in &spec.automaton.transfers {
+            let selected = self.select(
+                selector(&selectors, &transfer.selector_path)?,
+                &SelectorBinding::ReturnValue,
+            )?;
+            for selection in selected {
+                let selected_site = (selection.file.clone(), selection.subject_span.clone());
+                for resolved in self.resolve_selection(
+                    selection,
+                    &SelectorBinding::ReturnValue,
+                    Some(EndpointObservationPhase::AfterNormalReturn),
+                )? {
+                    let Some(call) = resolved.call.as_ref() else {
+                        continue;
+                    };
+                    let from = match transfer.from {
+                        TypestateCallBinding::Receiver => TypestateEventPort::Receiver,
+                        TypestateCallBinding::ArgumentIndex { index } => {
+                            TypestateEventPort::Argument { ordinal: index }
+                        }
+                        _ => unreachable!("decoded transfer source"),
+                    };
+                    let workspace = self.selectors.workspace();
+                    let discovery = WorkspaceCompositionDiscovery::new(
+                        workspace,
+                        WorkspaceValueFlowProvider::new(workspace, ValueFlowCache::default()),
+                    );
+                    let continuation = self
+                        .selectors
+                        .continue_semantic(|request| {
+                            let value =
+                                brokk_bifrost_flow::typestate::ordered::selected_transfer_source(
+                                    &discovery,
+                                    call,
+                                    from,
+                                    &OracleCallContext::empty(),
+                                    request,
+                                )?;
+                            Ok(SemanticOutcome::Complete {
+                                value,
+                                work: SemanticWork::default(),
+                            })
+                        })
+                        .map_err(typestate_selector_error)?;
+                    let source = continuation.outcome().available_value().cloned();
+                    continuation
+                        .finish_scalar((), "typestate transfer source")
+                        .map_err(typestate_selector_error)?;
+                    use brokk_bifrost_flow::typestate::ordered::TypestateTransferSource;
+                    if matches!(source, Some(TypestateTransferSource::NoSource)) {
+                        continue;
+                    }
+                    pending_transfers.push((source, resolved, selected_site.clone()));
+                }
+            }
+        }
+        let (state_transfers, omissions) = discover_transfer_subjects(
+            &pending_transfers,
+            &mut subjects,
+            &mut subject_specs,
+            &mut roots,
+            &mut subject_indexes,
+        );
+        self.binding_omissions.extend(omissions);
+
         // The protocol's release events are identified from the automaton, not
         // from an event name, so a policy that spells its close differently
         // still gets an interprocedural contract for as long as the close
@@ -5791,6 +5953,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             (TypestateSubjectKey, CallSiteHandle),
             Option<(ActivatedProcedureSummary, String)>,
         >::new();
+        let mut receiver_references = HashSet::<(TypestateSubjectKey, CallSiteHandle)>::new();
         for (event_order, event) in spec.automaton.events.iter().enumerate() {
             let order = u32::try_from(event_order).map_err(|_| {
                 TypestatePolicyCompileError::UnsupportedBinding(
@@ -5843,14 +6006,19 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     &trigger.binding,
                     Some(trigger.phase),
                 )? {
-                    let condition_matches = argument_condition
-                        .map(|condition| evaluate_argument_condition(&resolved, condition));
+                    let condition_matches = argument_condition.map(|condition| {
+                        evaluate_argument_condition(resolved.call.as_ref(), condition)
+                    });
                     let condition_unknown = matches!(condition_matches, Some(None));
                     if condition_unknown {
-                        self.binding_omissions.push(format!(
-                            "typestate event {} argument Boolean value is unknown at {:?}",
-                            event.id,
+                        let location = super::semantic_identity::locator_label(
+                            self.selectors.workspace(),
                             resolved.procedure.semantics().locator(),
+                        )
+                        .map_err(TypestatePolicyCompileError::SemanticUnavailable)?;
+                        self.binding_omissions.push(format!(
+                            "typestate event {} argument Boolean value is unknown at {location}",
+                            event.id,
                         ));
                     }
                     let flow_condition = argument_condition.map(|condition| {
@@ -5938,6 +6106,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 let selected = self
                                     .authored_external_summary(&resolved)
                                     .zip(resolved.modeled_member_id.clone());
+                                if selected.is_some()
+                                    && self.receiver_handed_by_reference(&resolved, call)?
+                                {
+                                    receiver_references.insert((subject.key.clone(), call.clone()));
+                                }
                                 coverage_selections
                                     .entry((subject.key.clone(), call.clone()))
                                     .and_modify(|prior| {
@@ -5955,7 +6128,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                             {
                                 TypestateBindingQuality::proven_unique()
                             } else {
-                                object.quality.clone()
+                                object.binding_quality()
                             };
                             let quality = if condition_unknown {
                                 condition_incomplete_quality(quality)
@@ -6109,7 +6282,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                             site,
                                             phase: TerminalObservationPhase::Endpoint(*phase),
                                             role,
-                                            quality: object.quality.clone(),
+                                            quality: object.binding_quality(),
                                             endpoint: Some(endpoint.clone()),
                                             alias_derived: false,
                                         });
@@ -6266,9 +6439,6 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         AuthoredSummaryExitKind::Exceptional,
                     ),
                 ] {
-                    let candidates = coverage_candidate_groups.iter().find(|group| {
-                        group.subject == subject && group.site == site && group.phase == phase
-                    });
                     let record = selected.as_ref().map(|(summary, member_id)| {
                         let shard = &summary.shard;
                         CoverageRecordKey {
@@ -6291,14 +6461,18 @@ impl<'a> TypestatePolicyCompiler<'a> {
                             witness_ids: Vec::new(),
                         }
                     });
+                    let subject_groups = coverage_candidate_groups
+                        .iter()
+                        .filter(|group| group.subject == subject && group.site == site)
+                        .collect::<Vec<_>>();
                     let kind = adjudicate_lifecycle_coverage(
                         &call,
-                        &site,
                         selected.as_ref().map(|(summary, _)| summary),
                         record,
                         event_set,
                         exit,
-                        candidates,
+                        &subject_groups,
+                        receiver_references.contains(&(subject.clone(), call.clone())),
                     );
                     coverage_decisions.push(CoverageDecisionSpec {
                         subject: subject.clone(),
@@ -6307,6 +6481,22 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         kind,
                     });
                 }
+            }
+        }
+        // A Covered arm closes the call's dispatch boundary for that subject
+        // through the same marker the legacy whole-call closure uses. The flow
+        // client still consults the per-arm decision, so a Refused sibling arm
+        // keeps its uncertainty, and both traversals read one certificate.
+        for decision in &coverage_decisions {
+            let CoverageDecisionKind::Covered { record } = &decision.kind else {
+                continue;
+            };
+            for binding in events.iter_mut().filter(|binding| {
+                binding.subject == decision.subject
+                    && binding.site == decision.site
+                    && !binding.alias_derived
+            }) {
+                binding.modeled_external_effect = Some(record.model_id.clone());
             }
         }
         let escape_event =
@@ -6499,6 +6689,8 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     unproven_relations: std::mem::take(&mut self.unproven_relations),
                 },
             )
+            .map_err(TypestatePolicyCompileError::BindingPlan)?
+            .with_state_transfers(&protocol, state_transfers)
             .map_err(TypestatePolicyCompileError::BindingPlan)?,
         );
         let event_endpoints = bindings
@@ -6757,7 +6949,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
     ) -> Result<Vec<SelectedSite>, TypestatePolicyCompileError> {
         let sites = self
             .selectors
-            .select_with_artifact_continuation(selector)
+            .select_for_binding(selector, matches!(binding, SelectorBinding::Receiver))
             .map_err(typestate_selector_error)?;
         Ok(Self::bound_selected_sites(sites, binding))
     }
@@ -7032,7 +7224,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
             );
             let multiplicity = quality.multiplicity();
             (
-                vec![ResolvedObject { object, quality }],
+                vec![ResolvedObject {
+                    object,
+                    quality,
+                    snapshot_quality: None,
+                }],
                 CandidateCoverage::Exhaustive,
                 multiplicity,
                 false,
@@ -7065,9 +7261,24 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 .result_contract
                 .as_ref()
                 .is_some_and(|contract| contract.fresh_allocation);
-            let exact_call_result_identity = result.objects().candidates().len() == 1
-                && result.objects().candidates()[0].value().identity()
-                    == &AccessPathRoot::Value(at_point.value().clone());
+            // A construction expression's result is the allocation it creates
+            // (`constructor_call_result`), so the heap names that allocation
+            // rather than the call-result value.
+            let exact_call_result_identity = match result.objects().candidates() {
+                [candidate] => match candidate.value().identity() {
+                    AccessPathRoot::Value(value) => value == at_point.value(),
+                    AccessPathRoot::Allocation(allocation) => {
+                        allocation.procedure() == at_point.value().procedure()
+                            && allocation
+                                .procedure()
+                                .semantics()
+                                .allocation(allocation.id())
+                                .is_some_and(|site| site.result == at_point.value().id())
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
             let modeled_fresh_result =
                 self.authored_external_summary_fresh_result_for_call(selection, &call);
             let fresh_result_identity = (reviewed_fresh_result || modeled_fresh_result)
@@ -7107,6 +7318,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                             effective_multiplicity,
                         )
                     },
+                    snapshot_quality: None,
                 })
                 .collect();
             let coverage = result.objects().coverage();
@@ -7148,7 +7360,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 }
             }
         }
-        let resolved = ResolvedSelection {
+        let mut resolved = ResolvedSelection {
             procedure,
             selected_operand: selected_port
                 .map(|port| TypestateSelectedOperand::new(call.clone(), port)),
@@ -7196,6 +7408,21 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 .commit(&mut self.selectors, "heap analysis")
                 .map_err(typestate_selector_error)?;
             drop(outcome);
+        }
+        let mut selection_quality: Option<Arc<TypestateBindingQuality>> = None;
+        for object in &mut resolved.objects {
+            let Some(quality) = snapshot_object_quality(
+                &resolved.procedure,
+                &resolved.observation,
+                &selection.proof,
+                &selection.completeness,
+                object,
+            ) else {
+                continue;
+            };
+            object.snapshot_quality = Some(Arc::clone(
+                selection_quality.get_or_insert_with(|| Arc::new(quality)),
+            ));
         }
         Ok(Some(resolved))
     }
@@ -7255,9 +7482,10 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     conjoin_completeness(&selection.completeness, candidate.completeness()),
                     multiplicity,
                 ),
+                snapshot_quality: None,
             })
             .collect();
-        let resolved = ResolvedSelection {
+        let mut resolved = ResolvedSelection {
             procedure: observation.query().point().procedure().clone(),
             call: None,
             selected_operand: None,
@@ -7290,6 +7518,21 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .commit(&mut self.selectors, "matched source heap analysis")
             .map_err(typestate_selector_error)?;
         drop(outcome);
+        let mut selection_quality: Option<Arc<TypestateBindingQuality>> = None;
+        for object in &mut resolved.objects {
+            let Some(quality) = snapshot_object_quality(
+                &resolved.procedure,
+                &resolved.observation,
+                &selection.proof,
+                &selection.completeness,
+                object,
+            ) else {
+                continue;
+            };
+            object.snapshot_quality = Some(Arc::clone(
+                selection_quality.get_or_insert_with(|| Arc::new(quality)),
+            ));
+        }
         Ok(resolved)
     }
 
@@ -7979,14 +8222,6 @@ impl<'a> TypestatePolicyCompiler<'a> {
     /// The answer is memoized per formal and remaining depth, and guarded by an
     /// in-progress stack, so a helper that closes through itself answers
     /// `Cycle` instead of recursing without end.
-    fn close_contract(
-        &mut self,
-        formal: &ProcedurePortHandle,
-        close_sites: &[CloseSiteFact],
-    ) -> Result<CloseContract, TypestatePolicyCompileError> {
-        self.close_contract_at_depth(formal, close_sites, close_contract_depth())
-    }
-
     fn close_contract_at_depth(
         &mut self,
         formal: &ProcedurePortHandle,
@@ -8072,13 +8307,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .collect::<Vec<_>>();
         let mut nested_undecided = false;
         for call in calls {
-            let bindings = self.exact_argument_bindings(&call, &handed)?;
-            for binding in bindings {
-                let nested = self.close_contract_at_depth(
-                    &binding.formal,
-                    close_sites,
-                    remaining_depth - 1,
-                )?;
+            for (binding, nested) in
+                self.call_close_contracts(&call, &handed, close_sites, remaining_depth - 1)?
+            {
                 if nested == CloseContract::Discharged {
                     barriers.push(binding.point.id());
                 } else if nested != CloseContract::NoEvidence {
@@ -8145,7 +8376,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
         &mut self,
         call: &CallSiteHandle,
         object: &AccessPathRoot,
-    ) -> Result<Vec<ExactArgumentBinding>, TypestatePolicyCompileError> {
+    ) -> Result<ExactArgumentBindings, TypestatePolicyCompileError> {
         let object_identity = object
             .durable_identity()
             .map_err(|error| TypestatePolicyCompileError::UnsupportedBinding(error.to_string()))?;
@@ -8306,6 +8537,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             vec![object_identity]
         };
         let mut found: Vec<ExactArgumentBinding> = Vec::new();
+        let family_arms;
         {
             let dispatch_outcome = self
                 .selectors
@@ -8315,25 +8547,39 @@ impl<'a> TypestatePolicyCompiler<'a> {
             self.selectors
                 .require_execution_budget("close-contract dispatch")
                 .map_err(typestate_selector_error)?;
-            let dispatch = dispatch_outcome
-                .is_complete()
-                .then(|| dispatch_outcome.available_value())
-                .flatten()
-                .filter(|dispatch| {
-                    dispatch.coverage() == CandidateCoverage::Exhaustive
+            // A sealed family whose only weakness is runtime selection
+            // (#11296) names every arm; the caller discharges the call only
+            // when each arm closes the object.
+            family_arms = dispatch_outcome
+                .available_value()
+                .filter(|dispatch| dispatch.analyzed_family().is_some())
+                .map(|dispatch| {
+                    dispatch
+                        .candidates()
+                        .iter()
+                        .map(|candidate| candidate.target().clone())
+                        .collect::<Vec<_>>()
+                });
+            let dispatch = dispatch_outcome.available_value().filter(|dispatch| {
+                family_arms.is_some()
+                    || (dispatch_outcome.is_complete()
+                        && dispatch.coverage() == CandidateCoverage::Exhaustive
                         && !dispatch.candidates().is_empty()
                         && dispatch.boundaries().is_empty()
                         && dispatch
                             .candidates()
                             .iter()
-                            .all(|candidate| matches!(candidate.proof(), ProofStatus::Proven))
-                });
+                            .all(|candidate| matches!(candidate.proof(), ProofStatus::Proven)))
+            });
             let Some(dispatch) = dispatch else {
                 drop(dispatch_outcome);
                 leases
                     .finish_scalar((), "close-contract dispatch")
                     .map_err(typestate_selector_error)?;
-                return Ok(found);
+                return Ok(ExactArgumentBindings {
+                    bindings: found,
+                    family_arms: None,
+                });
             };
             for candidate in dispatch.candidates() {
                 let bindings_outcome = self
@@ -8520,7 +8766,57 @@ impl<'a> TypestatePolicyCompiler<'a> {
         leases
             .finish_scalar((), "close-contract argument binding")
             .map_err(typestate_selector_error)?;
-        Ok(found)
+        Ok(ExactArgumentBindings {
+            bindings: found,
+            family_arms,
+        })
+    }
+
+    /// The close contract each exact binding of `object` at `call` meets.
+    /// A dispatch family closes the object only when every arm hands it to a
+    /// formal whose contract is discharged: then the call answers once as
+    /// discharged. Otherwise only its arms' undischarged contracts remain, so
+    /// an arm that closes never stands in for one that does not.
+    fn call_close_contracts(
+        &mut self,
+        call: &CallSiteHandle,
+        object: &AccessPathRoot,
+        close_sites: &[CloseSiteFact],
+        remaining_depth: u32,
+    ) -> Result<Vec<(ExactArgumentBinding, CloseContract)>, TypestatePolicyCompileError> {
+        let ExactArgumentBindings {
+            bindings,
+            family_arms,
+        } = self.exact_argument_bindings(call, object)?;
+        let mut contracts = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let contract =
+                self.close_contract_at_depth(&binding.formal, close_sites, remaining_depth)?;
+            contracts.push((binding, contract));
+        }
+        let Some(arms) = family_arms else {
+            return Ok(contracts);
+        };
+        // A family with no executable arm hands the object to no formal, so
+        // it closes nothing; `all` alone would accept it vacuously.
+        let every_arm_closes = !arms.is_empty()
+            && arms.iter().all(|arm| {
+                contracts.iter().any(|(binding, contract)| {
+                    binding.formal.procedure() == arm && *contract == CloseContract::Discharged
+                })
+            });
+        if every_arm_closes {
+            // One discharged binding stands for the call: the release sits at
+            // the call site, whichever formal each arm closes.
+            let discharged = contracts
+                .into_iter()
+                .find(|(_, contract)| *contract == CloseContract::Discharged)
+                .expect("a non-empty family whose every arm closes has a discharged binding");
+            contracts = vec![discharged];
+        } else {
+            contracts.retain(|(_, contract)| *contract != CloseContract::Discharged);
+        }
+        Ok(contracts)
     }
 
     /// Discharge each tracked subject whose own analysis root hands it to a
@@ -8555,9 +8851,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 .filter_map(|row| subject.root.call_site_handle(row.id))
                 .collect::<Vec<_>>();
             for call in calls {
-                let bindings = self.exact_argument_bindings(&call, &object)?;
-                for binding in bindings {
-                    let contract = self.close_contract(&binding.formal, close_sites)?;
+                for (binding, contract) in
+                    self.call_close_contracts(&call, &object, close_sites, close_contract_depth())?
+                {
                     if contract == CloseContract::Discharged {
                         let site = TypestateObservationSite::call_site(
                             call.clone(),
@@ -8664,7 +8960,8 @@ struct SelectedSite {
     file: ProjectFile,
     span: ByteRange<usize>,
     /// The selected call's whole span when the row binds an argument of it,
-    /// so a subject verdict names the call, as an undecided candidate does.
+    /// so a subject verdict names the call, as an undecided candidate does,
+    /// and call lookup finds that call rather than one written as the actual.
     subject_span: ByteRange<usize>,
     require_exact_call: bool,
     proof: ProofStatus,
@@ -8730,10 +9027,10 @@ fn authored_argument_condition(
 }
 
 fn evaluate_argument_condition(
-    resolved: &ResolvedSelection,
+    call: Option<&CallSiteHandle>,
     condition: TypestateArgumentCondition,
 ) -> Option<bool> {
-    let call = resolved.call.as_ref()?;
+    let call = call?;
     let semantics = call.procedure().semantics();
     let call_row = semantics.call_site(call.id())?;
     let argument = call_row.arguments.get(condition.index as usize)?;
@@ -8882,6 +9179,60 @@ impl<'a> TypestatePolicyCompiler<'a> {
         Ok(target)
     }
 
+    /// #9378 S4-R receiver handoff: the call hands its receiver operand to
+    /// the selected method by reference, so the method acts on the bound
+    /// object rather than a copy. For a Go model method that is a pointer
+    /// operand to a pointer-receiver method; a copied value or pointee never
+    /// qualifies. A Go interface call publishes `Reference` for its whole
+    /// open family, as a may-write fact for whichever implementation runs;
+    /// that selects no method and does not prove the handoff, so it stays
+    /// refused.
+    fn receiver_handed_by_reference(
+        &mut self,
+        resolved: &ResolvedSelection,
+        call: &CallSiteHandle,
+    ) -> Result<bool, TypestatePolicyCompileError> {
+        Ok(resolved.role == TypestateObjectRole::Receiver
+            && self.call_receiver_preparation(call)?
+                == Some(
+                    brokk_bifrost_analysis::analyzer::semantic::MemberReceiverPreparation::Reference,
+                ))
+    }
+
+    fn call_receiver_preparation(
+        &mut self,
+        call: &CallSiteHandle,
+    ) -> Result<
+        Option<brokk_bifrost_analysis::analyzer::semantic::MemberReceiverPreparation>,
+        TypestatePolicyCompileError,
+    > {
+        let key = call.exact_key();
+        if let Some(preparation) = self.receiver_preparations.get(&key) {
+            return Ok(*preparation);
+        }
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
+        let continuation = self
+            .selectors
+            .continue_semantic(|request| oracle.resolve_call(call, request))
+            .map_err(typestate_selector_error)?;
+        require_uninterrupted_semantic_outcome(continuation.outcome(), "receiver preparation")?;
+        self.selectors
+            .require_execution_budget("receiver preparation")
+            .map_err(typestate_selector_error)?;
+        let preparation = continuation
+            .outcome()
+            .is_complete()
+            .then(|| continuation.outcome().available_value())
+            .flatten()
+            .filter(|dispatch| !dispatch.receiver_family_open())
+            .and_then(|dispatch| dispatch.member_receiver_preparation());
+        continuation
+            .finish_scalar((), "receiver preparation")
+            .map_err(typestate_selector_error)?;
+        self.receiver_preparations.insert(key, preparation);
+        Ok(preparation)
+    }
+
     fn modeled_external_effect_id(
         &self,
         subject: &CompiledTypestateSubject,
@@ -8973,11 +9324,16 @@ impl<'a> TypestatePolicyCompiler<'a> {
         };
         let semantic_call = call.procedure().semantics().call_site(call.id())?;
         let parameter_count = u32::try_from(semantic_call.arguments.len()).ok()?;
+        // A constructor summary targets the construction expression, not a
+        // receiver (the summary foundry's convention), and a constructor is
+        // never inherited, so it needs no override coverage.
+        let has_receiver =
+            !member.record.is_static && member.record.member_kind != MemberKind::Constructor;
         let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
             language,
             &owner.record.name,
             &member.record.name,
-            !member.record.is_static,
+            has_receiver,
             parameter_count,
         ));
         if matched.disposition != SemanticModelMatchDisposition::Unique {
@@ -8987,7 +9343,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             return None;
         };
         if summary.record.completeness != Completeness::Complete
-            || (!member.record.is_static && !summary.record.covers_overrides)
+            || (has_receiver && !summary.record.covers_overrides)
         {
             return None;
         }
@@ -9068,19 +9424,19 @@ fn same_coverage_selection(
     }
 }
 
-/// Compile-root adjudication of one selected call, subject, and exit. S4-R
-/// must supply a full #9378 selected-receiver reference certificate before a
-/// participating record can ever close uncertainty; this slice produces only
-/// named refusals. The order below is stable so the first failed obligation
-/// is the published reason.
+/// Compile-root adjudication of one selected call, subject, and exit. The
+/// order below is stable so the first failed obligation is the published
+/// reason. `Covered` needs every claim check and the receiver-transport
+/// certificate (`receiver_transport_certified`); anything missing is a named
+/// refusal that leaves the arm uncertain.
 fn adjudicate_lifecycle_coverage(
     call: &CallSiteHandle,
-    site: &TypestateObservationSite,
     selected: Option<&ActivatedProcedureSummary>,
     record: Option<CoverageRecordKey>,
     event_set: &TypestateEventSetSpec,
     exit: AuthoredSummaryExitKind,
-    group: Option<&CoverageCandidateGroupSpec>,
+    subject_groups: &[&CoverageCandidateGroupSpec],
+    receiver_reference: bool,
 ) -> CoverageDecisionKind {
     use CoverageRefusalReason as Reason;
     let Some(selected) = selected else {
@@ -9090,6 +9446,7 @@ fn adjudicate_lifecycle_coverage(
         };
     };
     let mut record = record.expect("selected summary has record provenance");
+    let site = TypestateObservationSite::call_site(call.clone(), TypestateBindingContext::root());
     if site.context() != &TypestateBindingContext::root() || site.context().was_truncated() {
         return CoverageDecisionKind::Refused {
             reason: Reason::MissingContext,
@@ -9136,8 +9493,28 @@ fn adjudicate_lifecycle_coverage(
         if semantic_call.is_none_or(|call| call.receiver.is_none() || !call.arguments.is_empty()) {
             Some(Reason::ExtraActual)
         } else {
-            let candidates = group.map_or(&[][..], |group| group.candidates.as_slice());
-            if candidates.len() > 1 {
+            let phase = match exit {
+                AuthoredSummaryExitKind::Normal => CoverageCandidatePhase::AfterNormalReturn,
+                AuthoredSummaryExitKind::Exceptional => {
+                    CoverageCandidatePhase::AfterExceptionalReturn
+                }
+            };
+            let candidates = subject_groups
+                .iter()
+                .find(|group| group.phase == phase)
+                .map_or(&[][..], |group| group.candidates.as_slice());
+            // A claim speaks only about the call's exits. A policy event the
+            // subject observes at another phase of this call (before it, at
+            // the match) is outside every claim, so no exit may be Covered.
+            if subject_groups.iter().any(|group| {
+                !matches!(
+                    group.phase,
+                    CoverageCandidatePhase::AfterNormalReturn
+                        | CoverageCandidatePhase::AfterExceptionalReturn
+                )
+            }) {
+                Some(Reason::PhaseOutsideClaim)
+            } else if candidates.len() > 1 {
                 Some(Reason::MultipleCandidates)
             } else if candidates
                 .first()
@@ -9170,17 +9547,82 @@ fn adjudicate_lifecycle_coverage(
                 {
                     Some(Reason::WitnessNotDefinite)
                 } else {
-                    Some(Reason::ReceiverTransportUnproven)
+                    None
                 }
             } else {
-                Some(Reason::ReceiverTransportUnproven)
+                None
             }
         }
     };
-    CoverageDecisionKind::Refused {
-        reason: reason.expect("participating record cannot be Covered before S4-R"),
-        record: Some(record),
+    let reason = reason.or_else(|| {
+        (!receiver_transport_certified(&selected.record, subject_groups, receiver_reference))
+            .then_some(Reason::ReceiverTransportUnproven)
+    });
+    match reason {
+        Some(reason) => CoverageDecisionKind::Refused {
+            reason,
+            record: Some(record),
+        },
+        None => CoverageDecisionKind::Covered { record },
     }
+}
+
+/// The receiver-transport certificate of #9378 S4-R for a receiver coverage
+/// claim at a call whose only actual is its receiver (the caller checks the
+/// actual set). It proves the claim speaks about the tracked subject and that
+/// nothing outside the claim can reach the subject through the call:
+///
+/// - every candidate binding of the subject at this call, in any phase, was
+///   selected through the call's receiver operand, and each is definitive and
+///   not alias-derived, so the subject is exactly the receiver value; a
+///   definitive heap binding to an external producer's result needs that
+///   producer's reviewed summary to declare the result fresh;
+/// - the dispatch answer hands the receiver to the method by reference
+///   (`receiver_handed_by_reference`), so the method acts on the subject and
+///   not on a copy;
+/// - alias-footprint closure over the record's rows: every transfer reads the
+///   receiver and writes only the receiver or a result, every effect is a
+///   fresh allocation, the record returns no callable and has no conditional
+///   indirect-write rows, and it affirmatively claims `no_concurrency_effects`
+///   (an empty concurrency list is not proof that the method retains nothing
+///   for later work). A row that stores, escapes
+///   or hands the receiver to other code would let later code act on the
+///   subject outside the claim.
+///
+/// Override and target applicability come from the selected record itself:
+/// `authored_external_summary_for_call` admits an instance member only when
+/// its unique Complete summary claims `covers_overrides`.
+fn receiver_transport_certified(
+    summary: &CompiledProcedureSummary,
+    subject_groups: &[&CoverageCandidateGroupSpec],
+    receiver_by_reference: bool,
+) -> bool {
+    let mut candidates = subject_groups
+        .iter()
+        .flat_map(|group| group.candidates.iter())
+        .peekable();
+    let receiver_bound = candidates.peek().is_some()
+        && candidates.all(|candidate| {
+            candidate.role == TypestateObjectRole::Receiver && candidate.is_definitive()
+        });
+    let receiver_output = |output: &CompiledSummaryOutput| {
+        matches!(
+            output,
+            CompiledSummaryOutput::Receiver { .. }
+                | CompiledSummaryOutput::NormalReturn { .. }
+                | CompiledSummaryOutput::IndexedNormalReturn { .. }
+                | CompiledSummaryOutput::ExceptionalReturn { .. }
+        )
+    };
+    let footprint_closed = summary.transfers.iter().all(|transfer| {
+        matches!(transfer.input, CompiledSummaryInput::Receiver { .. })
+            && receiver_output(&transfer.output)
+    }) && summary.effects.iter().all(|effect| {
+        matches!(effect, CompiledSummaryEffect::Allocation { output, .. } if receiver_output(output))
+    }) && summary.returned_callables.is_empty()
+        && summary.no_concurrency_effects
+        && summary.conditional_indirect_writes.is_empty();
+    receiver_bound && receiver_by_reference && footprint_closed
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -9238,6 +9680,7 @@ fn record_coverage_candidate(
         semantic_effect: binding.semantic_effect.clone(),
         quality: binding.quality.clone(),
         alias_derived: binding.alias_derived,
+        role: binding.role,
     });
 }
 
@@ -9416,7 +9859,7 @@ fn reduce_precedence_bindings<Binding, GroupKey, Key>(
     precedence_key: impl Fn(&Binding) -> Key,
     endpoint: impl Fn(&Binding) -> Option<ResolvedEndpointIdentity>,
     endpoint_precedence: &PrecedenceGraph<ResolvedEndpointIdentity>,
-    choose_winner: impl Fn(Vec<Key>) -> Result<Key, TypestatePolicyCompileError>,
+    choose_winner: impl Fn(&[(Key, Binding)]) -> Result<Key, TypestatePolicyCompileError>,
     winner_invariant: &'static str,
 ) -> Result<Vec<Binding>, TypestatePolicyCompileError>
 where
@@ -9445,7 +9888,7 @@ where
             let winner = endpoint_winner_index(&endpoints, endpoint_precedence)?;
             key_candidates.push((key, candidates.swap_remove(winner)));
         }
-        let winner = choose_winner(key_candidates.iter().map(|(key, _)| key.clone()).collect())?;
+        let winner = choose_winner(&key_candidates)?;
         reduced.push(
             key_candidates
                 .into_iter()
@@ -9473,8 +9916,29 @@ fn reduce_event_bindings(
         |candidate| candidate.endpoint.clone(),
         endpoint_precedence,
         |candidates| {
+            // Known-false events must not suppress a matching reset. If no
+            // event can fire, retain the inert reviewed binding: it still
+            // classifies the call for call-modeling coverage.
+            let mut eligible = candidates
+                .iter()
+                .filter(|(_, candidate)| {
+                    candidate.condition.is_none_or(|condition| {
+                        evaluate_argument_condition(
+                            candidate.site.call_site_handle(),
+                            TypestateArgumentCondition {
+                                index: condition.argument_index(),
+                                equals: condition.expected(),
+                            },
+                        ) != Some(false)
+                    })
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            if eligible.is_empty() {
+                eligible.extend(candidates.iter().map(|(key, _)| key.clone()));
+            }
             event_precedence
-                .unique_winner(candidates)
+                .unique_winner(eligible)
                 .map_err(|error| {
                     TypestatePolicyCompileError::AmbiguousSemanticSite(format!(
                         "same-site typestate event precedence is undecidable: {error}"
@@ -9551,7 +10015,7 @@ fn reduce_terminal_bindings(
         endpoint_precedence,
         |candidates| {
             expectation_precedence
-                .unique_winner(candidates)
+                .unique_winner(candidates.iter().map(|(key, _)| key.clone()))
                 .map_err(|error| {
                     TypestatePolicyCompileError::AmbiguousSemanticSite(format!(
                         "same-site typestate expectation precedence is undecidable: {error}"
@@ -9570,6 +10034,22 @@ fn reduce_terminal_bindings(
 struct ResolvedObject {
     object: AbstractObject,
     quality: TypestateBindingQuality,
+    /// The selector's own evidence when the observed value is an immutable
+    /// snapshot of the value this object's identity names. It lives here, on
+    /// the heap with the object, rather than inline in `ResolvedSelection`:
+    /// `compile_inner` holds several resolved selections by value, and two
+    /// inline evidence fields per value added 320 bytes to its debug frame,
+    /// which overflowed the 2 MiB Windows test-thread stack (#14001).
+    snapshot_quality: Option<Arc<TypestateBindingQuality>>,
+}
+
+impl ResolvedObject {
+    fn binding_quality(&self) -> TypestateBindingQuality {
+        self.snapshot_quality
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| self.quality.clone())
+    }
 }
 
 /// The applicable subjects this observation's own object set did not name.
@@ -9635,6 +10115,153 @@ fn may_alias_quality(multiplicity: TypestateBindingMultiplicity) -> TypestateBin
     )
 }
 
+type SelectedTypestateTransfer = (
+    Option<brokk_bifrost_flow::typestate::ordered::TypestateTransferSource>,
+    ResolvedSelection,
+    (ProjectFile, ByteRange<usize>),
+);
+
+// This stage consumes selected/certified semantic facts; it does not decide
+// certification. Keep the class closure shared by the compiler and its flow
+// regression so late cross-procedure classes exercise the actual worklist.
+fn discover_transfer_subjects(
+    pending_transfers: &[SelectedTypestateTransfer],
+    subjects: &mut Vec<CompiledTypestateSubject>,
+    subject_specs: &mut Vec<BoundTypestateSubjectSpec>,
+    roots: &mut Vec<ProcedureHandle>,
+    subject_indexes: &mut HashMap<TypestateSubjectKey, usize>,
+) -> (
+    Vec<brokk_bifrost_flow::typestate::TypestateStateTransferSpec>,
+    Vec<String>,
+) {
+    let result_bound = pending_transfers
+        .iter()
+        .map(|(_, resolved, _)| resolved.objects.len())
+        .sum::<usize>();
+    let class_count = subjects
+        .iter()
+        .map(|subject| subject.key.class())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let mut fallback_active = vec![false; pending_transfers.len()];
+    let mut state_transfers = Vec::new();
+    // No transfer creates a class. At most C * R new (class, result
+    // object) subjects can be inserted, including newly present classes
+    // discovered by active fallbacks. R counts all selected result
+    // objects (including duplicates). Recomputing templates is idempotent;
+    // each productive round inserts at least one new subject key.
+    // Between productive rounds there is at most one certified-only stable
+    // round enabling fallback, plus the final stable fallback round. Thus
+    // 2 * (C * R + 1) rounds suffice, even when fallback starts a new chain.
+    let round_bound = 2 * (class_count * result_bound + 1);
+    let mut allow_fallback = false;
+    let mut converged = false;
+    let mut final_omissions = Vec::new();
+    for _round in 0..round_bound {
+        let before = subjects.len();
+        state_transfers.clear();
+        final_omissions.clear();
+        for (index, (source, resolved, selected_site)) in pending_transfers.iter().enumerate() {
+            let call = resolved.call.as_ref().expect("selected transfer call");
+            use brokk_bifrost_flow::typestate::ordered::TypestateTransferSource;
+            let tracked = match source {
+                Some(TypestateTransferSource::Certified(object)) => subjects
+                    .iter()
+                    .filter(|subject| {
+                        subject.key.object()
+                            == TypestateSubjectKey::for_object(subject.key.class().clone(), object)
+                                .object()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            if tracked.is_empty() && !allow_fallback && !fallback_active[index] {
+                continue;
+            }
+            let templates = if tracked.is_empty() {
+                fallback_active[index] = true;
+                // Only class and endpoint are inherited. The class hash
+                // includes endpoint identity; choose the lowest subject key
+                // per class deterministically as new subjects arrive.
+                let mut by_class = std::collections::BTreeMap::new();
+                for subject in subjects
+                    .iter()
+                    .filter(|subject| subject.root == resolved.procedure)
+                {
+                    let template = by_class
+                        .entry(subject.key.class().clone())
+                        .or_insert(subject);
+                    if subject.key < template.key {
+                        *template = subject;
+                    }
+                }
+                by_class.into_values().cloned().collect::<Vec<_>>()
+            } else {
+                tracked.clone()
+            };
+            for template in templates {
+                for object in &resolved.objects {
+                    let key = TypestateSubjectKey::for_object(
+                        template.key.class().clone(),
+                        &object.object,
+                    );
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        subject_indexes.entry(key.clone())
+                    {
+                        let index = subjects.len();
+                        entry.insert(index);
+                        subject_specs.push(BoundTypestateSubjectSpec::new(
+                            template.key.class().clone(),
+                            object.object.clone(),
+                            object.quality.clone(),
+                        ));
+                        roots.push(resolved.procedure.clone());
+                        subjects.push(CompiledTypestateSubject {
+                            key: key.clone(),
+                            endpoint: template.endpoint.clone(),
+                            root: resolved.procedure.clone(),
+                            object: object.object.clone(),
+                            member_contracts: resolved.member_contracts.clone(),
+                            fresh_result: false,
+                            publication_starts: vec![resolved.observation_point.clone()],
+                            selected_sites: vec![selected_site.clone()],
+                            escape_starts: Vec::new(),
+                        });
+                    }
+                    state_transfers.push(
+                        brokk_bifrost_flow::typestate::TypestateStateTransferSpec {
+                            call: call.clone(),
+                            source: (!tracked.is_empty()).then(|| template.key.clone()),
+                            result: key,
+                        },
+                    );
+                }
+            }
+            if tracked.is_empty() {
+                final_omissions.push(format!(
+                    "uncertified or untracked typestate transfer source at {} {:?}",
+                    call.procedure().artifact().key().path(),
+                    call.id()
+                ));
+            }
+        }
+        if subjects.len() != before {
+            allow_fallback = false;
+        } else if allow_fallback {
+            converged = true;
+            break;
+        } else {
+            allow_fallback = true;
+        }
+    }
+    assert!(
+        converged,
+        "transfer subject discovery must converge within the class/result bound"
+    );
+    (state_transfers, final_omissions)
+}
+
 struct ResolvedSelection {
     procedure: ProcedureHandle,
     call: Option<CallSiteHandle>,
@@ -9663,6 +10290,60 @@ struct ResolvedSelection {
     modeled_target_origin: Option<&'static str>,
     fresh_result_identity: bool,
     retained_incomplete_result_contract_query: bool,
+}
+
+/// The quality of the claim that this observation acts on `object`, one of
+/// the objects the heap oracle named for the observed value.
+///
+/// A named object carries the evidence of where it came from. The result
+/// of a call whose dispatch stays open never closes that evidence, and it
+/// says nothing about which value this site observed. When the observed
+/// value is an immutable snapshot of the value the object's identity
+/// names, the observation denotes that object on every path, whichever
+/// object it turns out to be, so only the selector row's own evidence
+/// qualifies the claim. Whether the object belongs to the policy
+/// population is the subject's seed quality, which this does not change.
+///
+/// The claim needs the written operand to be the object the callee acts
+/// on. A language that requires a selected receiver witness adjusts the
+/// operand before the callee sees it (a Rust autoref or `Deref`, a Go
+/// promotion), and a call can rewrite the operand's place through that
+/// borrow, so there the named object's own evidence stands.
+///
+/// The caller keeps this quality beside the object instead of in
+/// `ResolvedSelection`, so `compile_inner`'s debug frame keeps its previous
+/// size (#14001).
+fn snapshot_object_quality(
+    procedure: &ProcedureHandle,
+    observation: &ValueAtPoint,
+    selection_proof: &ProofStatus,
+    selection_completeness: &EvidenceCompleteness,
+    object: &ResolvedObject,
+) -> Option<TypestateBindingQuality> {
+    if object.quality.is_definitive()
+        || brokk_bifrost_analysis::analyzer::languages::language_support(
+            procedure.artifact().key().language().language(),
+        )
+        .is_none_or(|support| support.requires_selected_receiver_witness())
+    {
+        return None;
+    }
+    let named = match object.object.identity() {
+        AccessPathRoot::Value(value) => value,
+        AccessPathRoot::CallResult(result) => result.result(),
+        _ => return None,
+    };
+    if named.procedure() != procedure
+        || !direct_snapshot_of(procedure, observation.value().id(), named.id())
+    {
+        return None;
+    }
+    Some(TypestateBindingQuality::new(
+        selection_proof.clone(),
+        selection_completeness.clone(),
+        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1)
+            .expect("one observed value has valid multiplicity"),
+    ))
 }
 
 impl ResolvedSelection {
@@ -9727,6 +10408,9 @@ fn select_calls(
     procedures: &[ProcedureHandle],
     selection: &SelectedSite,
 ) -> Result<Vec<(ProcedureHandle, CallSiteHandle)>, TypestatePolicyCompileError> {
+    // A call-binding row spans one actual, not its call; looking the call up
+    // by that span would select a call written as the actual (#14295).
+    let selected_call_span = &selection.subject_span;
     let mut candidates = Vec::new();
     for procedure in procedures {
         for call in procedure.semantics().call_sites() {
@@ -9750,13 +10434,13 @@ fn select_calls(
                     .expect("validated semantic point has a source mapping");
                 let point_span = point_mapping.locator.anchor().span();
                 let point_range = point_span.start_byte() as usize..point_span.end_byte() as usize;
-                if point_range == selection.span {
+                if point_range == *selected_call_span {
                     call_range = point_range;
                 }
             }
-            let exact = call_range == selection.span;
-            let enclosing =
-                call_range.start <= selection.span.start && call_range.end >= selection.span.end;
+            let exact = call_range == *selected_call_span;
+            let enclosing = call_range.start <= selected_call_span.start
+                && call_range.end >= selected_call_span.end;
             if exact || (!selection.require_exact_call && enclosing) {
                 let handle = procedure
                     .call_site_handle(call.id)
@@ -10277,6 +10961,317 @@ mod tests {
     use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    #[hardwon("#12769: active fallback omitted a class introduced in its root by a later transfer")]
+    fn active_fallback_tracks_late_root_classes() {
+        use crate::definition::{PolicyId, TaintEntryId};
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            IcfgEdgeKind, SemanticBudget, SemanticRequest,
+        };
+        use brokk_bifrost_flow::dataflow::{
+            DataflowEdge, DataflowOutput, DistributiveDataflowProblem,
+        };
+        use brokk_bifrost_flow::typestate::ordered::TypestateTransferSource;
+        use brokk_bifrost_flow::typestate::{TypestateFact, TypestateFlowProblem};
+
+        // These are selected semantic facts at the compiler's certification
+        // boundary. Cross-procedure certification is deliberately not under
+        // test: one source already has the certified identity rooted elsewhere.
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("main.ts", "function root(a: object, shared: object) { const x = untracked(a); const y = copied(shared); used(x); }\nfunction elsewhere(b: object) { const shared = exposed(b); }\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("main.ts"),
+                &mut SemanticRequest::new(
+                    &mut SemanticBudget::default(),
+                    &CancellationToken::default(),
+                ),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = |name: &str| {
+            let row = artifact
+                .procedures()
+                .iter()
+                .find(|p| {
+                    p.locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|s| s.name())
+                        == Some(name)
+                })
+                .unwrap();
+            artifact.procedure_handle(row.id()).unwrap()
+        };
+        let root = procedure("root");
+        let elsewhere = procedure("elsewhere");
+        let unknown = root
+            .call_site_handle(root.semantics().call_sites()[0].id)
+            .unwrap();
+        let copied = root
+            .call_site_handle(root.semantics().call_sites()[1].id)
+            .unwrap();
+        let exposed = elsewhere
+            .call_site_handle(elsewhere.semantics().call_sites()[0].id)
+            .unwrap();
+        let object_at_result = |call: &CallSiteHandle| {
+            let row = call.procedure().semantics().call_site(call.id()).unwrap();
+            AbstractObject::new(
+                AccessPathRoot::Value(call.procedure().value_handle(row.result.unwrap()).unwrap()),
+                brokk_bifrost_analysis::analyzer::semantic::ObjectCardinality::Singleton,
+            )
+            .unwrap()
+        };
+        let x = object_at_result(&unknown);
+        let shared = object_at_result(&exposed);
+        let y = object_at_result(&copied);
+        let selected = |source, call: &CallSiteHandle, object: &AbstractObject| {
+            let row = call.procedure().semantics().call_site(call.id()).unwrap();
+            let point = call
+                .procedure()
+                .point_handle(row.normal_continuation.target().unwrap())
+                .unwrap();
+            let value = call.procedure().value_handle(row.result.unwrap()).unwrap();
+            let span = call
+                .procedure()
+                .semantics()
+                .source_mapping(row.source)
+                .unwrap()
+                .locator
+                .anchor()
+                .span();
+            (
+                Some(source),
+                ResolvedSelection {
+                    procedure: call.procedure().clone(),
+                    call: Some(call.clone()),
+                    selected_operand: None,
+                    observation_point: point.clone(),
+                    role: TypestateObjectRole::NormalReturn,
+                    objects: vec![ResolvedObject {
+                        object: object.clone(),
+                        quality: TypestateBindingQuality::proven_unique(),
+                        snapshot_quality: None,
+                    }],
+                    observation: ValueAtPoint::new(
+                        value,
+                        point,
+                        ObservationPhase::AfterEffects,
+                        OracleCallContext::empty(),
+                    )
+                    .unwrap(),
+                    coverage: CandidateCoverage::Exhaustive,
+                    multiplicity: TypestateBindingMultiplicity::new(
+                        CandidateCoverage::Exhaustive,
+                        1,
+                    )
+                    .unwrap(),
+                    activation_edges: Vec::new(),
+                    member_contracts: Vec::new(),
+                    call_shape: None,
+                    modeled_member_id: None,
+                    modeled_target_origin: None,
+                    fresh_result_identity: false,
+                    retained_incomplete_result_contract_query: false,
+                },
+                (
+                    project.file("main.ts"),
+                    span.start_byte() as usize..span.end_byte() as usize,
+                ),
+            )
+        };
+        let initial_subject = |name: &str, procedure: &ProcedureHandle| {
+            let value = procedure.semantics().call_sites()[0].arguments[0].value;
+            let object = AbstractObject::new(
+                AccessPathRoot::Value(procedure.value_handle(value).unwrap()),
+                brokk_bifrost_analysis::analyzer::semantic::ObjectCardinality::Singleton,
+            )
+            .unwrap();
+            let class = TypestateSubjectClassKey::new(name).unwrap();
+            CompiledTypestateSubject {
+                key: TypestateSubjectKey::for_object(class, &object),
+                object,
+                endpoint: ResolvedEndpointIdentity::Local {
+                    policy_id: PolicyId::new("test.late-class").unwrap(),
+                    entry_id: TaintEntryId::new(name).unwrap(),
+                },
+                root: procedure.clone(),
+                member_contracts: Vec::new(),
+                fresh_result: false,
+                publication_starts: Vec::new(),
+                selected_sites: Vec::new(),
+                escape_starts: Vec::new(),
+            }
+        };
+        let protocol = ProtocolSpec::from_json(br#"{
+            "schema_version":1,"states":["insecure","violated"],"initial_state":"insecure",
+            "accepting_states":["insecure"],"error_states":["violated"],
+            "events":[{"id":"use","observation":{"occurrence":{"type":"endpoint","phase":"at_match"}}}],
+            "transitions":[{"from":"insecure","on":"use","to":"violated"}],"terminal_expectations":[],
+            "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state","uncertainty":{"ambiguous_dispatch":"preserve_uncertainty","unknown_call":"preserve_uncertainty","external_call":"preserve_uncertainty","escape":"preserve_uncertainty","incomplete_analysis":"preserve_uncertainty"}}
+        }"#).unwrap().compile().unwrap();
+        let point = root
+            .point_handle(
+                root.semantics()
+                    .call_site(unknown.id())
+                    .unwrap()
+                    .normal_continuation
+                    .target()
+                    .unwrap(),
+            )
+            .unwrap();
+        let use_point = root
+            .point_handle(root.semantics().call_sites()[2].point)
+            .unwrap();
+        let mut counts = Vec::new();
+        for order in ["unknown-first", "certified-first"] {
+            let mut pending = vec![
+                selected(TypestateTransferSource::Uncertified, &unknown, &x),
+                selected(TypestateTransferSource::Uncertified, &exposed, &shared),
+                selected(
+                    TypestateTransferSource::Certified(Box::new(shared.clone())),
+                    &copied,
+                    &y,
+                ),
+            ];
+            if order == "certified-first" {
+                pending.rotate_left(1);
+            }
+            let mut subjects = vec![
+                initial_subject("a", &root),
+                initial_subject("b", &elsewhere),
+            ];
+            let mut specs = subjects
+                .iter()
+                .map(|s| {
+                    BoundTypestateSubjectSpec::new(
+                        s.key.class().clone(),
+                        s.object.clone(),
+                        TypestateBindingQuality::proven_unique(),
+                    )
+                })
+                .collect();
+            let mut roots = subjects.iter().map(|s| s.root.clone()).collect();
+            let mut indexes = subjects
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.key.clone(), i))
+                .collect();
+            let (transfers, omissions) = discover_transfer_subjects(
+                &pending,
+                &mut subjects,
+                &mut specs,
+                &mut roots,
+                &mut indexes,
+            );
+            assert_eq!(
+                omissions.len(),
+                2,
+                "only the two uncertified sources remain omitted: {omissions:?}"
+            );
+            let events = subjects
+                .iter()
+                .filter(|s| {
+                    s.key.object()
+                        == TypestateSubjectKey::for_object(s.key.class().clone(), &x).object()
+                })
+                .map(|s| {
+                    TypestateEventBindingSpec::new(
+                        ProtocolEventKey::new("use").unwrap(),
+                        s.key.clone(),
+                        TypestateObservationSite::program_point(
+                            use_point.clone(),
+                            TypestateBindingContext::root(),
+                        ),
+                        0,
+                        TypestateObjectRole::MatchedValue,
+                        TypestateBindingQuality::proven_unique(),
+                    )
+                })
+                .collect();
+            let bindings =
+                TypestateBindingPlan::try_new(&protocol, specs, Vec::new(), events, Vec::new())
+                    .unwrap()
+                    .with_state_transfers(&protocol, transfers)
+                    .unwrap();
+            #[derive(Default)]
+            struct Facts(Vec<TypestateFact>);
+            impl DataflowOutput<TypestateFact> for Facts {
+                fn emit(&mut self, fact: TypestateFact) -> bool {
+                    self.0.push(fact);
+                    true
+                }
+            }
+            let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+            let mut output = Facts::default();
+            problem.normal_flow(
+                DataflowEdge::new(
+                    IcfgEdgeKind::Intraprocedural(
+                        brokk_bifrost_analysis::analyzer::semantic::ControlEdgeKind::Normal,
+                    ),
+                    None,
+                    &point,
+                    &point,
+                    &ProofStatus::Proven,
+                    &EvidenceCompleteness::Complete,
+                ),
+                TypestateFact::zero(),
+                &mut output,
+            );
+            // The selected use is a distinct AST call after both transfers.
+            let mut observed = Facts::default();
+            for fact in output.0 {
+                problem.normal_flow(
+                    DataflowEdge::new(
+                        IcfgEdgeKind::Intraprocedural(
+                            brokk_bifrost_analysis::analyzer::semantic::ControlEdgeKind::Normal,
+                        ),
+                        None,
+                        &use_point,
+                        &use_point,
+                        &ProofStatus::Proven,
+                        &EvidenceCompleteness::Complete,
+                    ),
+                    fact,
+                    &mut observed,
+                );
+            }
+            let possible = observed
+                .0
+                .iter()
+                .filter(|fact| fact.violation().is_some())
+                .map(|fact| {
+                    assert!(
+                        !fact.uncertainty().is_empty(),
+                        "unknown fallback cannot report certainty: {fact:?}"
+                    );
+                    bindings
+                        .subject(fact.subject().unwrap())
+                        .unwrap()
+                        .key()
+                        .class()
+                        .clone()
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            counts.push((order, possible));
+        }
+        let both = [
+            TypestateSubjectClassKey::new("a").unwrap(),
+            TypestateSubjectClassKey::new("b").unwrap(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            counts.iter().all(|(_, classes)| classes == &both),
+            "both classes need possible violations in each processing order: {counts:?}"
+        );
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum CoverageCompileCase {
         Baseline,
@@ -10745,6 +11740,7 @@ mod tests {
                 .unwrap();
         }
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -10755,7 +11751,8 @@ mod tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: [
                 "test.go-model-interface-dispatch-declarations",
@@ -11650,6 +12647,7 @@ mod tests {
                 escape: InconclusivePolicy::Inconclusive,
             },
             ResolvedTypestateAutomatonSpec {
+                transfers: Vec::new(),
                 event_set: None,
                 states: vec![open.clone()],
                 initial: open.clone(),

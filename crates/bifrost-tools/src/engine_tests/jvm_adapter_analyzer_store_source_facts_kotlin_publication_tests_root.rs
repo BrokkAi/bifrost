@@ -133,6 +133,10 @@ mod jvm_extraction_tests {
             .unwrap();
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn kotlin_canonical_publication_reopens_metadata_imports_and_structural_rows() {
         let source = "package sample\nimport other.Widget as Alias\nclass Box(val seed: Int) {\nconstructor(): this(0)\nfun read(value: Int = seed): Int = value\n}\n";
         let fixture = InlineTestProject::with_language(Language::Kotlin)

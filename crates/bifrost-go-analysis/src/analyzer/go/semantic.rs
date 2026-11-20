@@ -115,120 +115,131 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (
-            specs,
-            package_shadowing,
-            package_values,
-            package_value_locators,
-            direct_struct_fields,
-            named_type_definitions,
-            method_inventory,
-            indirect_callable_targets,
-            initial_work,
-        ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete {
-                value,
-                initial_work,
-                ..
-            } => (
-                value.specs,
-                value.package_shadowing,
-                value.package_values,
-                value.package_value_locators,
-                value.direct_struct_fields,
-                value.named_type_definitions,
-                value.method_inventory,
-                value.indirect_callable_targets,
-                initial_work,
-            ),
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled { work } => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Unknown { work } => {
-                return Ok(SemanticOutcome::Unknown {
-                    partial: None,
-                    work,
-                });
-            }
-        };
-
-        let import_bindings = go_import_bindings(prepared.tree().root_node(), prepared.source());
-        let mut package_functions = HashMap::<Box<str>, Option<(ProcedureId, Node<'_>)>>::default();
-        for spec in specs.iter().filter(|spec| {
-            spec.lexical_parent.is_none() && spec.callable.kind() == "function_declaration"
-        }) {
-            if let Some(name) = spec
-                .callable
-                .child_by_field_name("name")
-                .and_then(|name| nonempty_node_text(prepared.source(), name))
-            {
-                package_functions
-                    .entry(name.into())
-                    .and_modify(|target| *target = None)
-                    .or_insert(Some((spec.id, spec.callable)));
-            }
-        }
-        let procedure_targets = specs
-            .iter()
-            .map(|spec| {
-                (
-                    spec.callable.id(),
-                    GoProcedureTarget {
-                        id: spec.id,
-                        captures: spec
-                            .captures
-                            .iter()
-                            .map(|capture| GoTargetCapture {
-                                name: capture.name.clone(),
-                                binding: capture.binding,
-                                storage: capture.storage,
-                            })
-                            .collect(),
-                        omitted_capture_names: spec.omitted_capture_names.clone(),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let struct_field_anchors = go_struct_field_anchors(prepared);
-
-        lower_procedure_batch(
-            &specs,
-            initial_work,
-            budget,
-            cancellation,
-            |spec, staged_budget, cancellation| {
-                lower_procedure(
-                    prepared,
-                    &struct_field_anchors,
-                    spec,
-                    package_shadowing,
-                    &package_values,
-                    &package_value_locators,
-                    &direct_struct_fields,
-                    &named_type_definitions,
-                    &import_bindings,
-                    &package_functions,
-                    &method_inventory,
-                    &procedure_targets,
-                    &specs,
-                    &indirect_callable_targets,
-                    staged_budget,
-                    cancellation,
-                )
-            },
-        )
+        // Go adds no contextual provenance storage; SemanticBudget admissions are unchanged.
+        lower_go_file(file, prepared, budget, cancellation)
     }
+}
+
+fn lower_go_file(
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+    let (
+        specs,
+        package_shadowing,
+        package_values,
+        package_value_locators,
+        direct_struct_fields,
+        named_type_definitions,
+        method_inventory,
+        indirect_callable_targets,
+        initial_work,
+    ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
+        ProcedureEnumeration::Complete {
+            value,
+            initial_work,
+            ..
+        } => (
+            value.specs,
+            value.package_shadowing,
+            value.package_values,
+            value.package_value_locators,
+            value.direct_struct_fields,
+            value.named_type_definitions,
+            value.method_inventory,
+            value.indirect_callable_targets,
+            initial_work,
+        ),
+        ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        ProcedureEnumeration::Cancelled { work } => {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+        ProcedureEnumeration::Unknown { work } => {
+            return Ok(SemanticOutcome::Unknown {
+                partial: None,
+                work,
+            });
+        }
+    };
+
+    let import_bindings = go_import_bindings(prepared.tree().root_node(), prepared.source());
+    let mut package_functions = HashMap::<Box<str>, Option<(ProcedureId, Node<'_>)>>::default();
+    for spec in specs.iter().filter(|spec| {
+        spec.lexical_parent.is_none() && spec.callable.kind() == "function_declaration"
+    }) {
+        if let Some(name) = spec
+            .callable
+            .child_by_field_name("name")
+            .and_then(|name| nonempty_node_text(prepared.source(), name))
+        {
+            package_functions
+                .entry(name.into())
+                .and_modify(|target| *target = None)
+                .or_insert(Some((spec.id, spec.callable)));
+        }
+    }
+    let procedure_targets = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.callable.id(),
+                GoProcedureTarget {
+                    id: spec.id,
+                    captures: spec
+                        .captures
+                        .iter()
+                        .map(|capture| GoTargetCapture {
+                            name: capture.name.clone(),
+                            binding: capture.binding,
+                            storage: capture.storage,
+                        })
+                        .collect(),
+                    omitted_capture_names: spec.omitted_capture_names.clone(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let struct_field_anchors = go_struct_field_anchors(prepared);
+
+    lower_procedure_batch(
+        &specs,
+        initial_work,
+        budget,
+        cancellation,
+        |spec, staged_budget, cancellation| {
+            lower_procedure(
+                prepared,
+                &struct_field_anchors,
+                spec,
+                package_shadowing,
+                &package_values,
+                &package_value_locators,
+                &direct_struct_fields,
+                &named_type_definitions,
+                &import_bindings,
+                &package_functions,
+                &method_inventory,
+                &procedure_targets,
+                &specs,
+                &indirect_callable_targets,
+                staged_budget,
+                cancellation,
+            )
+        },
+    )
 }
 
 /// Lower one caller-supplied exact Go source file through the ordinary Go
@@ -313,7 +324,7 @@ pub(crate) fn lower_exact_go_file(
             identity.dependencies,
         );
         staged_budget.start_lowering_work();
-        let lowered = lowerer.lower(file, &prepared, &staged_budget, request.cancellation);
+        let lowered = lower_go_file(file, &prepared, &staged_budget, request.cancellation);
         staged_budget.finish_lowering_work();
         let lowered = lowered?;
         let observed_work = source_work.component_max(lowered.work());
@@ -578,6 +589,44 @@ struct ProcedureSpec<'tree> {
     /// Concrete initializer expressions that introduce the reference payload
     /// used by one of this procedure's exact interface dispatches.
     reference_boxing_initializers: HashSet<usize>,
+    /// Stable local bindings initialized with a method-value selection on an
+    /// identifier receiver and called in this procedure.
+    bound_method_values: Vec<GoBoundMethodValueSpec<'tree>>,
+    /// Call-expression callee nodes in this procedure that invoke one of
+    /// `bound_method_values`, mapped to `(declaration, declaration_start)`.
+    bound_method_value_calls: HashMap<usize, (usize, usize)>,
+    /// Direct identifier byte span `(start_byte, end_byte)` -> selector byte
+    /// span `(start_byte, end_byte)` for special call-site dispatch.
+    bound_method_value_call_spans: HashMap<(usize, usize), (usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoPrepassMethodValueKind {
+    LocalMethod {
+        pointer_receiver: bool,
+        target: ProcedureId,
+    },
+    OpenSelector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GoPrepassMethodValueCandidate {
+    selector_start: usize,
+    selector_end: usize,
+    kind: GoPrepassMethodValueKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoBoundMethodValueSpec<'tree> {
+    declaration: usize,
+    declaration_start: usize,
+    selector: Node<'tree>,
+    primary_call_function: Node<'tree>,
+    kind: GoPrepassMethodValueKind,
+    /// True when every reference to this local binding across the entire
+    /// lexical tree is a lowered non-concurrent call callee in the same
+    /// procedure.
+    unexposed: bool,
 }
 
 #[derive(Clone)]
@@ -1184,27 +1233,22 @@ pub fn workspace_reference_assertion_accepts_payload(
     };
     let scope = AnalyzerQueryScope::new(workspace.analyzer());
     let limit = request.budget.limits().source_bytes;
-    let Some((file, source)) =
-        brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_source_for_procedure(
+    let (file, source) = match brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_source_for_procedure(
             workspace,
             assertion.procedure(),
             limit,
-        )?
-    else {
-        let work = SemanticWork {
-            source_bytes: limit.saturating_add(1),
-            ..SemanticWork::default()
-        };
-        let exceeded = request
-            .budget
-            .check_admission(work)
-            .expect_err("source limit exceeded");
+        )?.on_budget(request.budget)? {
+ Ok(source) => source,
+ Err(exceeded) => {
+        let work = SemanticWork::default();
         return Ok(SemanticOutcome::ExceededBudget {
             partial: None,
             exceeded,
             work,
         });
-    };
+
+ }
+};
     let source_work = SemanticWork {
         source_bytes: source.len(),
         ..SemanticWork::default()
@@ -1255,6 +1299,94 @@ pub fn workspace_reference_assertion_accepts_payload(
     };
     *work = source_work.conservative_add(*work);
     Ok(outcome)
+}
+
+/// Whether the file holds any selector expression with an identifier operand
+/// in the initializer of a local `var` or short-variable declaration — the
+/// only shapes that can initialize a bound method-value local the prepass
+/// collects. One walk per dispatch batch; the caller memoizes the outcome.
+fn go_file_has_bound_method_value_candidate(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "selector_expression" {
+            let mut value = node;
+            while let Some(parent) = value.parent() {
+                if parent.kind() == "parenthesized_expression" {
+                    value = parent;
+                    continue;
+                }
+                break;
+            }
+            let in_declaration_initializer = value
+                .parent()
+                .filter(|parent| parent.kind() == "expression_list")
+                .and_then(|list| list.parent())
+                .is_some_and(|declaration| {
+                    let initializer = value.parent().expect("expression_list parent");
+                    (declaration.kind() == "short_var_declaration"
+                        && declaration
+                            .child_by_field_name("right")
+                            .is_some_and(|right| right.id() == initializer.id()))
+                        || (declaration.kind() == "var_spec"
+                            && declaration
+                                .child_by_field_name("value")
+                                .is_some_and(|field| field.id() == initializer.id()))
+                });
+            if in_declaration_initializer
+                && node.child_by_field_name("operand").is_some_and(|operand| {
+                    transparent_parenthesized_expression(operand).kind() == "identifier"
+                })
+            {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+/// Enumerate the file's procedures once and return every bound method-value
+/// call's callee span mapped to the byte range `(start_byte, end_byte)` of
+/// the selection's `selector_expression` in `tree`. The query-time dispatch
+/// hook memoizes the returned map per file and dispatch batch, so a file with
+/// many identifier calls pays one enumeration per batch, not one per call.
+pub(crate) fn go_bound_method_value_file_call_selectors(
+    file: &ProjectFile,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Option<HashMap<(usize, usize), (usize, usize)>> {
+    if tree.root_node().has_error() || !go_file_has_bound_method_value_candidate(tree.root_node()) {
+        return None;
+    }
+    let prepared = PreparedSyntaxTree::new(
+        PreparedSyntaxSource::Exact(Arc::from(source)),
+        tree.clone(),
+        compute_line_starts(source),
+        LanguageDialect::for_path(Language::Go, file.rel_path()),
+        PreparedSourceOrigin::Disk,
+        None,
+    );
+    let budget = SemanticBudget::default();
+    let default_token = CancellationToken::default();
+    let token = cancellation.unwrap_or(&default_token);
+    let ProcedureEnumeration::Complete { value: facts, .. } =
+        enumerate_procedures(file, &prepared, &budget, token).ok()?
+    else {
+        return None;
+    };
+    let mut spans = HashMap::default();
+    for spec in &facts.specs {
+        spans.extend(
+            spec.bound_method_value_call_spans
+                .iter()
+                .map(|(callee, selector)| (*callee, *selector)),
+        );
+    }
+    Some(spans)
 }
 
 /// Positive same-source type evidence for an invocation-proven boxed payload.
@@ -1572,6 +1704,9 @@ fn enumerate_procedures<'tree>(
                 reference_identity_preserving_assertions: HashSet::default(),
                 interface_dispatches: HashMap::default(),
                 reference_boxing_initializers: HashSet::default(),
+                bound_method_values: Vec::new(),
+                bound_method_value_calls: HashMap::default(),
+                bound_method_value_call_spans: HashMap::default(),
             });
             callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
             callable_result_scope = frame
@@ -2108,9 +2243,58 @@ fn populate_capture_specs<'tree>(
         }
     }
 
+    let (bound_method_values, bound_method_value_calls, bound_method_value_call_spans) =
+        collect_bound_method_values(
+            specs,
+            &lexical_bindings,
+            &capture_mutable_bindings,
+            source,
+            inventory,
+            cancellation,
+        )?;
+
     // A potential method borrow needs a stable cell before member resolution,
     // without asserting that the variable's address actually escapes.
     let mut shared_bindings = receiver_places;
+    for (procedure_index, mvs) in bound_method_values.iter().enumerate() {
+        for mv in mvs {
+            if mv.kind != GoPrepassMethodValueKind::OpenSelector {
+                continue;
+            }
+            let Some(operand) = mv
+                .selector
+                .child_by_field_name("operand")
+                .map(transparent_parenthesized_expression)
+            else {
+                continue;
+            };
+            let Some(name) = node_text(source, operand).filter(|name| *name != "_") else {
+                continue;
+            };
+            if let Some(binding) = resolve_go_binding(
+                specs,
+                &lexical_bindings,
+                procedure_index,
+                name,
+                operand.start_byte(),
+                inventory,
+                cancellation,
+            )? {
+                let static_type = lexical_bindings
+                    .get(resolved_binding_procedure(binding).index())
+                    .and_then(|bindings| bindings.receiver_types.get(&binding.identity()));
+                if !static_type.is_some_and(|identity| identity.pointer_depth > 0) {
+                    shared_bindings[resolved_binding_procedure(binding).index()].push(
+                        GoSharedBindingSpec {
+                            name: name.into(),
+                            binding,
+                            receiver_only: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
     // Taking a binding's address exposes its storage even without a closure.
     // Resolve the exact lexical owner before allocating the cell; package
     // globals and addresses of members retain their existing open boundaries.
@@ -2179,18 +2363,25 @@ fn populate_capture_specs<'tree>(
         omitted.sort_unstable();
         omitted.dedup();
     }
-    for ((((spec, captured), shared), omitted), exposures) in specs
-        .iter_mut()
-        .zip(captures)
-        .zip(shared_bindings)
-        .zip(omitted_capture_names)
-        .zip(call_exposure_origins)
+    for (((((((spec, captured), shared), omitted), exposures), mvs), mv_calls), mv_call_spans) in
+        specs
+            .iter_mut()
+            .zip(captures)
+            .zip(shared_bindings)
+            .zip(omitted_capture_names)
+            .zip(call_exposure_origins)
+            .zip(bound_method_values)
+            .zip(bound_method_value_calls)
+            .zip(bound_method_value_call_spans)
     {
         charge_go_inventory_prepass(inventory, cancellation)?;
         spec.captures = captured.into_boxed_slice();
         spec.shared_bindings = shared.into_boxed_slice();
         spec.omitted_capture_names = omitted.into_boxed_slice();
         spec.call_exposure_origins = exposures.into_boxed_slice();
+        spec.bound_method_values = mvs;
+        spec.bound_method_value_calls = mv_calls;
+        spec.bound_method_value_call_spans = mv_call_spans;
     }
     // After the mutable-binding set is complete, so a binding assigned later
     // in the same body cannot be read as stable here.
@@ -2582,6 +2773,11 @@ struct GoCallableLexicalBindings {
     /// The method declaration a binding is exactly initialized with a
     /// method-value selection of, for the bindings that have one.
     callable_methods: HashMap<GoBindingIdentity, ProcedureId>,
+    /// Method-value initializer candidates on an identifier lexical receiver,
+    /// including selectors whose receiver type is resolved at query time.
+    callable_method_values: HashMap<GoBindingIdentity, GoPrepassMethodValueCandidate>,
+    /// Lexical bindings declared with a known interface type.
+    interface_bindings: HashSet<GoBindingIdentity>,
 }
 
 fn visible_go_binding<T>(
@@ -2846,6 +3042,96 @@ fn go_prepass_method_value_target(
             | GoSelectorResolution::Unknown => None,
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn go_prepass_method_value_candidate(
+    selector: Node<'_>,
+    bindings: &GoCallableLexicalBindings,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    direct_struct_fields: &DirectStructFields,
+    method_inventory: &GoMethodInventory,
+    byte: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<GoPrepassMethodValueCandidate>, GoInventoryPrepassStop> {
+    let Some(operand) = selector
+        .child_by_field_name("operand")
+        .map(transparent_parenthesized_expression)
+    else {
+        return Ok(None);
+    };
+    if operand.kind() != "identifier" {
+        return Ok(None);
+    }
+    let Some(operand_name) = node_text(source, operand).filter(|name| *name != "_") else {
+        return Ok(None);
+    };
+    let Some(operand_binding) = bindings.binding_at(operand_name, byte) else {
+        return Ok(None);
+    };
+    if bindings
+        .interface_bindings
+        .contains(&operand_binding.identity())
+    {
+        return Ok(None);
+    }
+    let receiver_type = go_prepass_expression_receiver_type(
+        operand,
+        bindings,
+        source,
+        named_types,
+        byte,
+        inventory,
+        cancellation,
+    )?;
+    let receiver_is_interface = receiver_type
+        .as_ref()
+        .filter(|identity| identity.pointer_depth == 0)
+        .and_then(|identity| identity.declaration)
+        .and_then(|declaration| {
+            named_types
+                .definitions
+                .values()
+                .flatten()
+                .find(|definition| definition.declaration == declaration)
+        })
+        .is_some_and(|definition| {
+            go_type_is_interface(definition.underlying, source, named_types, byte)
+        });
+    if receiver_is_interface {
+        return Ok(None);
+    }
+    let Some(field_name) = selector
+        .child_by_field_name("field")
+        .and_then(|field| nonempty_node_text(source, field))
+    else {
+        return Ok(None);
+    };
+    let kind = match go_same_file_selector_resolution(
+        receiver_type.and_then(|identity| identity.declaration),
+        Some(field_name),
+        direct_struct_fields,
+        method_inventory,
+    ) {
+        GoSelectorResolution::Method {
+            pointer_receiver,
+            target,
+        } => GoPrepassMethodValueKind::LocalMethod {
+            pointer_receiver,
+            target,
+        },
+        GoSelectorResolution::Unknown => GoPrepassMethodValueKind::OpenSelector,
+        GoSelectorResolution::Package
+        | GoSelectorResolution::Field
+        | GoSelectorResolution::InterfaceMethod { .. } => return Ok(None),
+    };
+    Ok(Some(GoPrepassMethodValueCandidate {
+        selector_start: selector.start_byte(),
+        selector_end: selector.end_byte(),
+        kind,
+    }))
 }
 
 /// A type parameter shadows package types and universe names. A closer local
@@ -3992,6 +4278,8 @@ fn go_callable_lexical_bindings(
         declaration_targets: HashMap::default(),
         callable_literals: HashMap::default(),
         callable_methods: HashMap::default(),
+        callable_method_values: HashMap::default(),
+        interface_bindings: HashSet::default(),
     };
     if let Some(slots) =
         formal_parameter_slots_for_owner_with_nodes(Language::Go, spec.callable, source)
@@ -4050,6 +4338,14 @@ fn go_callable_lexical_bindings(
                     declaration.start_byte(),
                 )
             });
+            let is_interface_formal = declaration.child_by_field_name("type").is_some_and(|kind| {
+                go_type_is_interface(
+                    kind,
+                    source,
+                    named_type_definitions,
+                    declaration.start_byte(),
+                )
+            });
             for name in slot.names {
                 charge_go_inventory_prepass(inventory, cancellation)?;
                 if name == "_" {
@@ -4065,6 +4361,9 @@ fn go_callable_lexical_bindings(
                     declaration_start: declaration_node.start_byte(),
                 };
                 bindings.formals.insert(name.into_boxed_str(), identity);
+                if is_interface_formal {
+                    bindings.interface_bindings.insert(identity);
+                }
                 if let Some(value_type) = &value_type {
                     bindings.receiver_types.insert(identity, value_type.clone());
                 }
@@ -4229,7 +4528,11 @@ fn go_callable_lexical_bindings(
                 || (node.kind() == "var_spec"
                     && declared_value
                         .map(transparent_parenthesized_expression)
-                        .is_some_and(|value| value.kind() == "func_literal"));
+                        .is_some_and(|value| {
+                            value.kind() == "func_literal"
+                                || (node.child_by_field_name("type").is_none()
+                                    && value.kind() == "selector_expression")
+                        }));
             if !is_go_binding_reference_kind(name_node.kind()) {
                 continue;
             }
@@ -4321,6 +4624,11 @@ fn go_callable_lexical_bindings(
                 if let Some(receiver_type) = receiver_type {
                     bindings.receiver_types.insert(identity, receiver_type);
                 }
+                if node.child_by_field_name("type").is_some_and(|kind| {
+                    go_type_is_interface(kind, source, named_type_definitions, node.start_byte())
+                }) {
+                    bindings.interface_bindings.insert(identity);
+                }
                 if exact_value_candidate
                     && let Some(literal) = declared_value
                         .map(transparent_parenthesized_expression)
@@ -4332,7 +4640,8 @@ fn go_callable_lexical_bindings(
                     && let Some(selector) = declared_value
                         .map(transparent_parenthesized_expression)
                         .filter(|value| value.kind() == "selector_expression")
-                    && let Some(method) = go_prepass_method_value_target(
+                {
+                    if let Some(method) = go_prepass_method_value_target(
                         selector,
                         &bindings,
                         source,
@@ -4342,9 +4651,22 @@ fn go_callable_lexical_bindings(
                         node.start_byte(),
                         inventory,
                         cancellation,
-                    )?
-                {
-                    bindings.callable_methods.insert(identity, method);
+                    )? {
+                        bindings.callable_methods.insert(identity, method);
+                    }
+                    if let Some(candidate) = go_prepass_method_value_candidate(
+                        selector,
+                        &bindings,
+                        source,
+                        named_type_definitions,
+                        direct_struct_fields,
+                        method_inventory,
+                        node.start_byte(),
+                        inventory,
+                        cancellation,
+                    )? {
+                        bindings.callable_method_values.insert(identity, candidate);
+                    }
                 }
             }
             let storage = if let Some(kind) = node.child_by_field_name("type") {
@@ -4623,6 +4945,187 @@ fn collect_indirect_callable_targets(
         })?;
     }
     Ok(targets)
+}
+
+type GoCollectedBoundMethodValues<'tree> = (
+    Vec<Vec<GoBoundMethodValueSpec<'tree>>>,
+    Vec<HashMap<usize, (usize, usize)>>,
+    Vec<HashMap<(usize, usize), (usize, usize)>>,
+);
+
+fn collect_bound_method_values<'tree>(
+    specs: &[ProcedureSpec<'tree>],
+    lexical_bindings: &[GoCallableLexicalBindings],
+    capture_mutable_bindings: &HashSet<GoResolvedBinding>,
+    source: &str,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &CancellationToken,
+) -> Result<GoCollectedBoundMethodValues<'tree>, GoInventoryPrepassStop> {
+    let mut eligible: HashMap<GoBindingIdentity, (Node<'tree>, GoPrepassMethodValueKind)> =
+        HashMap::default();
+    for (procedure_index, bindings) in lexical_bindings.iter().enumerate() {
+        let body = specs[procedure_index].body;
+        for (&identity, &candidate) in &bindings.callable_method_values {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if !immutable_captured_binding(
+                lexical_bindings,
+                GoResolvedBinding::Local(identity),
+                capture_mutable_bindings,
+            ) {
+                continue;
+            }
+            let Some(mut current) = body
+                .named_descendant_for_byte_range(candidate.selector_start, candidate.selector_end)
+            else {
+                continue;
+            };
+            let selector = loop {
+                if current.kind() == "selector_expression"
+                    && current.start_byte() == candidate.selector_start
+                    && current.end_byte() == candidate.selector_end
+                {
+                    break Some(current);
+                }
+                let Some(parent) = current.parent() else {
+                    break None;
+                };
+                if parent.id() == body.id() {
+                    break None;
+                }
+                current = parent;
+            };
+            let Some(selector) = selector else {
+                continue;
+            };
+            if !go_callable_creation_is_lowered(selector, body, inventory, cancellation)? {
+                continue;
+            }
+            eligible.insert(identity, (selector, candidate.kind));
+        }
+    }
+
+    let mut per_proc_specs = vec![Vec::new(); specs.len()];
+    let mut per_proc_calls = vec![HashMap::default(); specs.len()];
+    let mut per_proc_spans = vec![HashMap::default(); specs.len()];
+    if eligible.is_empty() {
+        return Ok((per_proc_specs, per_proc_calls, per_proc_spans));
+    }
+
+    let mut represented_calls: HashMap<GoBindingIdentity, Vec<(Node<'tree>, Node<'tree>)>> =
+        HashMap::default();
+    let mut exposed: HashSet<GoBindingIdentity> = HashSet::default();
+
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if !is_go_binding_reference_kind(node.kind()) {
+                return Ok(WalkControl::Continue);
+            }
+            if lexical_bindings[procedure_index]
+                .declaration_targets
+                .contains_key(&node.id())
+            {
+                return Ok(WalkControl::Continue);
+            }
+            let Some(name) = node_text(source, node).filter(|name| *name != "_") else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(GoResolvedBinding::Local(identity)) = resolve_go_binding(
+                specs,
+                lexical_bindings,
+                procedure_index,
+                name,
+                node.start_byte(),
+                inventory,
+                cancellation,
+            )?
+            else {
+                return Ok(WalkControl::Continue);
+            };
+            if !eligible.contains_key(&identity) {
+                return Ok(WalkControl::Continue);
+            }
+            let mut top_callee = node;
+            while let Some(parent) = top_callee.parent() {
+                if parent.kind() == "parenthesized_expression" {
+                    top_callee = parent;
+                } else {
+                    break;
+                }
+            }
+            let represented = if procedure_index == identity.procedure.index()
+                && let Some(call) = top_callee.parent()
+                && call.kind() == "call_expression"
+                && field_matches(call, "function", top_callee)
+                && !call
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "go_statement")
+                && go_callable_creation_is_lowered(call, spec.body, inventory, cancellation)?
+            {
+                if let Some(defer_node) = call
+                    .parent()
+                    .filter(|parent| parent.kind() == "defer_statement")
+                {
+                    !go_has_ancestor_kind_before(defer_node, spec.body, "for_statement")
+                        && !go_has_ancestor_kind_before(
+                            defer_node,
+                            spec.body,
+                            "expression_switch_statement",
+                        )
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            if represented {
+                represented_calls
+                    .entry(identity)
+                    .or_default()
+                    .push((top_callee, node));
+            } else {
+                exposed.insert(identity);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+
+    let mut ordered_identities = eligible.keys().copied().collect::<Vec<_>>();
+    ordered_identities
+        .sort_by_key(|identity| (identity.procedure.index(), identity.declaration_start));
+    for identity in ordered_identities {
+        let Some(calls) = represented_calls.get_mut(&identity) else {
+            continue;
+        };
+        if calls.is_empty() {
+            continue;
+        }
+        calls.sort_by_key(|(top, _)| top.start_byte());
+        let (selector, kind) = eligible[&identity];
+        let key = (identity.declaration, identity.declaration_start);
+        let proc_idx = identity.procedure.index();
+        for &(top_callee, direct_ident) in calls.iter() {
+            per_proc_calls[proc_idx].insert(top_callee.id(), key);
+            per_proc_calls[proc_idx].insert(direct_ident.id(), key);
+            per_proc_spans[proc_idx].insert(
+                (direct_ident.start_byte(), direct_ident.end_byte()),
+                (selector.start_byte(), selector.end_byte()),
+            );
+        }
+        per_proc_specs[proc_idx].push(GoBoundMethodValueSpec {
+            declaration: identity.declaration,
+            declaration_start: identity.declaration_start,
+            selector,
+            primary_call_function: calls[0].0,
+            kind,
+            unexposed: !exposed.contains(&identity),
+        });
+    }
+
+    Ok((per_proc_specs, per_proc_calls, per_proc_spans))
 }
 
 fn resolve_go_binding(
@@ -5000,8 +5503,22 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     /// Callee AST node -> the function literal it provably denotes, proven by
     /// the prepass for calls through a stable function-valued binding.
     indirect_callable_targets: &'imports HashMap<usize, GoIndirectCallableTarget>,
+    bound_method_value_calls: &'procedure HashMap<usize, (usize, usize)>,
+    bound_method_value_selectors: HashMap<usize, (usize, usize)>,
+    lowered_bound_method_values: HashMap<(usize, usize), LoweredBoundMethodValue>,
+    preallocated_bound_callees: HashMap<usize, ValueId>,
+    represented_method_value_selectors: HashSet<usize>,
     package_shadowing: PredeclaredShadowing,
     predeclared_shadowed: PredeclaredShadowing,
+}
+
+#[derive(Debug, Clone)]
+struct LoweredBoundMethodValue {
+    captured_receiver: ValueId,
+    primary_callee: ValueId,
+    member_selection: Option<Box<DeferredMemberSelection>>,
+    kind: GoPrepassMethodValueKind,
+    unexposed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5314,6 +5831,11 @@ fn lower_procedure<'tree>(
         procedure_targets,
         procedure_specs,
         indirect_callable_targets,
+        bound_method_value_calls: &spec.bound_method_value_calls,
+        bound_method_value_selectors: HashMap::default(),
+        lowered_bound_method_values: HashMap::default(),
+        preallocated_bound_callees: HashMap::default(),
+        represented_method_value_selectors: HashSet::default(),
         package_shadowing,
         // Exact and omitted capture inventories below distinguish the
         // enclosing bindings a nested literal actually sees. Keep package and
@@ -5342,6 +5864,7 @@ fn lower_procedure<'tree>(
     context.emit_local_bindings(&mut builder, spec.body)?;
     context.emit_shared_binding_cells(&mut builder, entry, spec)?;
     context.collect_call_exposed_bindings(&builder)?;
+    context.prepare_bound_method_values(&mut builder, entry, spec)?;
 
     if spec.lexical_parent.is_some() && !spec.omitted_capture_names.is_empty() {
         context.session.footprint_class(
@@ -5564,10 +6087,16 @@ fn lower_procedure<'tree>(
     }
     let predeclared_dispositions = &context.predeclared_dispositions;
     let literal_dispositions = &context.literal_dispositions;
+    let represented_method_value_selectors = &context.represented_method_value_selectors;
     context
         .session
         .assemble_footprint(&mut parts, spec.callable, |node| {
-            if matches!(node.kind(), "nil" | "true" | "false") {
+            if represented_method_value_selectors.contains(&node.id()) {
+                (
+                    CallControlKind::ImplicitAccess,
+                    CallControlDisposition::Represented,
+                )
+            } else if matches!(node.kind(), "nil" | "true" | "false") {
                 let disposition = predeclared_dispositions.get(&node.id()).copied().unwrap_or(
                     CallControlDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
                 );
@@ -6103,6 +6632,72 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     self.parameters.insert(name.into_boxed_str(), value);
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn prepare_bound_method_values(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), GoLoweringError> {
+        for mv in &spec.bound_method_values {
+            let key = (mv.declaration, mv.declaration_start);
+            let operand = required_field(mv.selector, "operand")?;
+            let receiver_node = transparent_parenthesized_expression(operand);
+            let captured_receiver = self.session.add_node_value(
+                builder,
+                receiver_node,
+                SemanticValueKind::LanguageDefined("go.defer_capture".into()),
+            )?;
+            if let Some(name) = node_text(self.prepared.source(), receiver_node)
+                && let Some(binding_val) = self.binding_value(name, receiver_node.start_byte())
+            {
+                if let Some(identity) = self.value_types.get(&binding_val).cloned() {
+                    self.value_types.insert(captured_receiver, identity);
+                }
+                if let Some(storage) = self.value_storage_kinds.get(&binding_val).copied() {
+                    self.value_storage_kinds.insert(captured_receiver, storage);
+                }
+            }
+            let primary_callee = self.session.add_node_value(
+                builder,
+                mv.primary_call_function,
+                SemanticValueKind::Callable,
+            )?;
+            self.preallocated_bound_callees
+                .insert(mv.primary_call_function.id(), primary_callee);
+            let member_selection = match mv.kind {
+                GoPrepassMethodValueKind::OpenSelector => {
+                    let member = required_field(mv.selector, "field")?;
+                    Some(Box::new(DeferredMemberSelection {
+                        member: nonempty_node_text(self.prepared.source(), member)
+                            .ok_or_else(|| missing_field(mv.selector, "member name"))?
+                            .into(),
+                        receiver_place: self.receiver_place(builder, entry, receiver_node)?,
+                        receiver_pointer_depth: self
+                            .expression_type_identity(receiver_node, receiver_node.start_byte())
+                            .map(|identity| {
+                                u32::try_from(identity.pointer_depth)
+                                    .expect("Go pointer depth fits u32")
+                            }),
+                    }))
+                }
+                GoPrepassMethodValueKind::LocalMethod { .. } => None,
+            };
+            self.bound_method_value_selectors
+                .insert(mv.selector.id(), key);
+            self.lowered_bound_method_values.insert(
+                key,
+                LoweredBoundMethodValue {
+                    captured_receiver,
+                    primary_callee,
+                    member_selection,
+                    kind: mv.kind,
+                    unexposed: mv.unexposed,
+                },
+            );
         }
         Ok(())
     }
@@ -12545,7 +13140,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     ) -> Result<(), GoLoweringError> {
         let operand = first_runtime_named_child(node)
             .ok_or_else(|| missing_field(node, "call expression"))?;
-        let defer_call = supported_defer_call(node, self.procedure_targets);
+        let defer_call =
+            supported_defer_call(node, self.procedure_targets, self.bound_method_value_calls);
         let inside_loop = node.kind() == "defer_statement" && self.defer_is_inside_loop(node);
         let inside_switch =
             node.kind() == "defer_statement" && self.defer_is_inside_expression_switch(node);
@@ -14757,6 +15353,186 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 Ok(())
             }
             "selector_expression"
+                if self.bound_method_value_selectors.contains_key(&node.id())
+                    && !is_assignment_target(node) =>
+            {
+                let mv_key = self.bound_method_value_selectors[&node.id()];
+                let mv_info = self
+                    .lowered_bound_method_values
+                    .get(&mv_key)
+                    .cloned()
+                    .expect("bound method value selector was pre-registered");
+                let operand = required_field(node, "operand")?;
+                let receiver_node = transparent_parenthesized_expression(operand);
+                if mv_info.unexposed {
+                    self.session.footprint_refuse_node_for_scoped(node);
+                    if let Some(field) = node.child_by_field_name("field") {
+                        self.session.footprint_refuse_node_for_scoped(field);
+                    }
+                    self.represented_method_value_selectors.insert(node.id());
+                }
+                let boundary = self.selector_evaluation_point(builder, node)?;
+                let receiver_val = self.expression_value(
+                    builder,
+                    receiver_node,
+                    self.expression_value_kind(receiver_node),
+                )?;
+                let prepared_receiver = match mv_info.kind {
+                    GoPrepassMethodValueKind::LocalMethod {
+                        pointer_receiver, ..
+                    } => self.prepare_method_receiver(
+                        builder,
+                        boundary,
+                        receiver_node,
+                        receiver_val,
+                        pointer_receiver,
+                    )?,
+                    GoPrepassMethodValueKind::OpenSelector => receiver_val,
+                };
+                let flow_kind = if self
+                    .value_types
+                    .get(&prepared_receiver)
+                    .is_some_and(|identity| identity.pointer_depth > 0)
+                    || matches!(
+                        mv_info.kind,
+                        GoPrepassMethodValueKind::LocalMethod {
+                            pointer_receiver: true,
+                            ..
+                        }
+                    ) {
+                    ValueFlowKind::Local
+                } else {
+                    ValueFlowKind::LanguageDefined
+                };
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: flow_kind,
+                        source: prepared_receiver,
+                        target: mv_info.captured_receiver,
+                    },
+                )?;
+                let operand_is_pointer = self
+                    .expression_type_identity(operand, node.start_byte())
+                    .is_some_and(|identity| identity.pointer_depth > 0);
+                if mv_info.unexposed {
+                    match mv_info.kind {
+                        GoPrepassMethodValueKind::LocalMethod {
+                            pointer_receiver: false,
+                            ..
+                        } if operand_is_pointer => {
+                            self.add_non_rejoining_exceptional_exit_gap(
+                                builder,
+                                scope,
+                                boundary,
+                                SemanticGapSubject::Value(mv_info.primary_callee),
+                                SemanticGapKind::Unknown,
+                                "a value-receiver method selected through a pointer operand may require an implicit dereference",
+                            )?;
+                        }
+                        GoPrepassMethodValueKind::OpenSelector => {
+                            self.session.record_gap(
+                                builder,
+                                boundary,
+                                SemanticGapSubject::Value(mv_info.primary_callee),
+                                SemanticCapability::CallableReferences,
+                                SemanticGapKind::Unknown,
+                                "selected callable target requires whole-program dispatch refinement",
+                            )?;
+                        }
+                        GoPrepassMethodValueKind::LocalMethod { .. } => {}
+                    }
+                } else {
+                    match mv_info.kind {
+                        GoPrepassMethodValueKind::LocalMethod {
+                            pointer_receiver,
+                            target,
+                        } => {
+                            let metadata = self.metadata(boundary)?;
+                            self.append_effect(
+                                builder,
+                                boundary,
+                                SemanticEffect::CallableReference {
+                                    result,
+                                    callable: CallableValue {
+                                        kind: CallableReferenceKind::BoundMethod,
+                                        targets: CallableTargetResolution::Proven(
+                                            CallableTarget::Local(target),
+                                        ),
+                                        target_evidence: metadata.evidence,
+                                        bound_receiver: Some(prepared_receiver),
+                                        environment: None,
+                                    },
+                                },
+                            )?;
+                            if !pointer_receiver && operand_is_pointer {
+                                self.add_non_rejoining_exceptional_exit_gap(
+                                    builder,
+                                    scope,
+                                    boundary,
+                                    SemanticGapSubject::Value(result),
+                                    SemanticGapKind::Unknown,
+                                    "a value-receiver method value selected through a pointer operand may require an implicit dereference",
+                                )?;
+                            }
+                            self.session.record_gap(
+                                builder,
+                                boundary,
+                                SemanticGapSubject::Value(result),
+                                SemanticCapability::DynamicDispatch,
+                                SemanticGapKind::Unknown,
+                                "Go method-value dispatch requires complete method-set refinement",
+                            )?;
+                        }
+                        GoPrepassMethodValueKind::OpenSelector => {
+                            let Some((kind, location)) =
+                                self.memory_access_location(builder, boundary, node)?
+                            else {
+                                unreachable!("an open selector load denotes a field location");
+                            };
+                            debug_assert_eq!(kind, MemoryAccessKind::Field);
+                            self.append_effect(
+                                builder,
+                                boundary,
+                                SemanticEffect::MemoryLoad {
+                                    kind,
+                                    location,
+                                    result,
+                                },
+                            )?;
+                            self.session.record_gap(
+                                builder,
+                                boundary,
+                                SemanticGapSubject::Value(result),
+                                SemanticCapability::CallableReferences,
+                                SemanticGapKind::Unknown,
+                                "Go selector load may denote a method value, but its callable interpretation is unresolved",
+                            )?;
+                            if !self.is_direct_value_field(node) {
+                                self.add_non_rejoining_exceptional_exit_gap(
+                                    builder,
+                                    scope,
+                                    boundary,
+                                    SemanticGapSubject::Value(result),
+                                    SemanticGapKind::Unsupported,
+                                    "selection may panic on a nil operand",
+                                )?;
+                            }
+                        }
+                    }
+                }
+                self.session.add_target_edge(builder, boundary, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[operand],
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "selector_expression"
                 if matches!(
                     self.evaluated_selector_resolution(builder, node),
                     GoSelectorResolution::Method { .. }
@@ -15586,7 +16362,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
         let invoke = self.session.add_node_point(builder, node, Vec::new())?;
         let normal = self.session.add_node_point(builder, node, Vec::new())?;
-        let operands = self.lower_call_operands(builder, node, invoke, None)?;
+        let operands = self.lower_call_operands(builder, node, invoke, None, true)?;
         let call_site = self.session.add_spawned_call_site(
             builder,
             SpawnedCallSiteScaffold {
@@ -15912,210 +16688,48 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         node: Node<'tree>,
         invoke: ProgramPointId,
         capture: Option<&DeferredCapture>,
+        is_spawned: bool,
     ) -> Result<LoweredCallOperands, GoLoweringError> {
         let function = required_field(node, "function")?;
-        let callee = self.expression_value(builder, function, SemanticValueKind::Callable)?;
         let direct_function = transparent_parenthesized_expression(function);
-        let selector_resolution = (function.kind() == "selector_expression")
-            .then(|| self.evaluated_selector_resolution(builder, function));
-        let interface_dispatch = self.interface_dispatches.get(&function.id()).cloned();
-        let selection_point = if matches!(
-            selector_resolution,
-            Some(GoSelectorResolution::Method { .. } | GoSelectorResolution::Unknown)
-        ) {
-            self.selector_evaluation_point(builder, function)?
-        } else {
-            invoke
-        };
-        let receiver_node = selector_resolution
-            .and_then(|resolution| match resolution {
-                GoSelectorResolution::Method { .. }
-                | GoSelectorResolution::InterfaceMethod { .. }
-                | GoSelectorResolution::Unknown => function.child_by_field_name("operand"),
-                GoSelectorResolution::Package | GoSelectorResolution::Field => None,
+        let bound_method_value = (!is_spawned)
+            .then(|| {
+                self.bound_method_value_calls
+                    .get(&direct_function.id())
+                    .copied()
             })
-            .map(transparent_parenthesized_expression);
-        let member_selection = if selector_resolution == Some(GoSelectorResolution::Unknown) {
-            let receiver_node = receiver_node.expect("an open selector has a receiver");
-            let member = required_field(function, "field")?;
-            Some(Box::new(DeferredMemberSelection {
-                member: nonempty_node_text(self.prepared.source(), member)
-                    .ok_or_else(|| missing_field(function, "member name"))?
-                    .into(),
-                receiver_place: self.receiver_place(builder, invoke, receiver_node)?,
-                receiver_pointer_depth: self
-                    .expression_type_identity(receiver_node, receiver_node.start_byte())
-                    .map(|identity| {
-                        u32::try_from(identity.pointer_depth).expect("Go pointer depth fits u32")
+            .flatten()
+            .and_then(|key| self.lowered_bound_method_values.get(&key).cloned());
+        let lowered_callee = if let Some(mv_info) = bound_method_value {
+            let callee = match self.preallocated_bound_callees.get(&function.id()).copied() {
+                Some(callee) => callee,
+                None => {
+                    self.session
+                        .add_node_value(builder, function, SemanticValueKind::Callable)?
+                }
+            };
+            let receiver = Some(mv_info.captured_receiver);
+            let (resolution, selector_resolution) = match mv_info.kind {
+                GoPrepassMethodValueKind::LocalMethod {
+                    pointer_receiver,
+                    target,
+                } => (
+                    CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                    Some(GoSelectorResolution::Method {
+                        pointer_receiver,
+                        target,
                     }),
-            }))
-        } else {
-            None
-        };
-        let evaluated_receiver = if let Some(captured) =
-            capture.and_then(|capture| capture.receiver.map(|captured| captured.target))
-        {
-            Some(captured)
-        } else {
-            receiver_node
-                .map(|receiver| {
-                    self.expression_value(builder, receiver, self.expression_value_kind(receiver))
-                })
-                .transpose()?
-        };
-        let receiver = if let (Some(proof), Some(wrapper), Some(receiver_node)) = (
-            interface_dispatch.as_ref(),
-            evaluated_receiver,
-            receiver_node,
-        ) {
-            let extracted = self.session.add_node_value(
-                builder,
-                receiver_node,
-                SemanticValueKind::LanguageDefined("go.interface_method_receiver".into()),
-            )?;
-            self.value_types
-                .insert(extracted, proof.receiver_type.clone());
-            self.append_effect(
-                builder,
-                selection_point,
-                SemanticEffect::Assignment {
-                    target: extracted,
-                    value: wrapper,
-                },
-            )?;
-            self.append_effect(
-                builder,
-                selection_point,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::ReferenceUnboxing,
-                    source: wrapper,
-                    target: extracted,
-                },
-            )?;
-            Some(extracted)
-        } else {
-            evaluated_receiver
-        };
-        let receiver = if capture.is_none()
-            && let (
-                Some(GoSelectorResolution::Method {
-                    pointer_receiver, ..
-                }),
-                Some(node),
-                Some(source),
-            ) = (selector_resolution, receiver_node, receiver)
-        {
-            Some(self.prepare_method_receiver(
-                builder,
-                selection_point,
-                node,
-                source,
-                pointer_receiver,
-            )?)
-        } else {
-            receiver
-        };
-        let callable_kind = if receiver.is_some() {
-            CallableReferenceKind::BoundMethod
-        } else {
-            CallableReferenceKind::Function
-        };
-        // A call denotes a local procedure either by immediate literal syntax
-        // or through a binding the prepass proved stable and function-valued.
-        // Both reach the same `GoProcedureTarget`, so the two spellings of one
-        // call cannot disagree about what it denotes.
-        let callable = if direct_function.kind() == "func_literal" {
-            Some(GoIndirectCallableTarget::Literal(direct_function.id()))
-        } else {
-            self.indirect_callable_targets
-                .get(&direct_function.id())
-                .copied()
-        };
-        let resolution = interface_dispatch
-            .as_ref()
-            .map(|proof| CallableTargetResolution::Proven(CallableTarget::Local(proof.target)))
-            .or_else(|| match callable {
-                Some(GoIndirectCallableTarget::Literal(literal)) => {
-                    self.procedure_targets.get(&literal).map(|target| {
-                        CallableTargetResolution::Proven(CallableTarget::Local(target.id))
-                    })
-                }
-                Some(GoIndirectCallableTarget::Method(target)) => Some(
-                    CallableTargetResolution::Proven(CallableTarget::Local(target)),
                 ),
-                None => None,
-            })
-            .or(match selector_resolution {
-                Some(GoSelectorResolution::Method { target, .. }) => Some(
-                    CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                GoPrepassMethodValueKind::OpenSelector => (
+                    CallableTargetResolution::Unknown,
+                    Some(GoSelectorResolution::Unknown),
                 ),
-                _ => None,
-            })
-            .or_else(|| {
-                self.package_function_target(direct_function)
-                    .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target)))
-            })
-            .unwrap_or_else(|| {
-                let is_function_value_binding = match direct_function.kind() {
-                    "identifier" => {
-                        node_text(self.prepared.source(), direct_function).is_some_and(|name| {
-                            self.binding_value(name, direct_function.start_byte())
-                                .is_some()
-                        })
-                    }
-                    "selector_expression" => self.selector_field_type(direct_function).is_some(),
-                    _ => false,
-                };
-                let is_function_typed = is_function_value_binding
-                    && self
-                        .expression_type_node(direct_function, direct_function.start_byte())
-                        .and_then(|type_node| {
-                            self.file_underlying_type(type_node, direct_function.start_byte())
-                        })
-                        .is_some_and(|type_node| type_node.kind() == "function_type");
-                if is_function_typed {
-                    // The Go adapter has identified a function-valued
-                    // expression, but its target set is assembled later by
-                    // invocation-local value flow. Keep this distinct from a
-                    // direct unresolved name without claiming an unproven
-                    // candidate set at this semantic point.
-                    CallableTargetResolution::Unsupported
-                } else {
-                    CallableTargetResolution::Unknown
-                }
-            });
-        if selection_point == invoke || self.published_selector_references.insert(function.id()) {
-            let metadata = self.metadata(selection_point)?;
-            if selection_point != invoke {
-                let kind = match &resolution {
-                    CallableTargetResolution::Proven(_) => None,
-                    CallableTargetResolution::Ambiguous(_) => Some(SemanticGapKind::Ambiguous),
-                    CallableTargetResolution::Unknown => Some(SemanticGapKind::Unknown),
-                    CallableTargetResolution::Unsupported => Some(SemanticGapKind::Unsupported),
-                    CallableTargetResolution::Unproven(_) => Some(SemanticGapKind::Unproven),
-                    CallableTargetResolution::ExceededBudget(_) => {
-                        Some(SemanticGapKind::ExceededBudget)
-                    }
-                };
-                if let Some(kind) = kind {
-                    self.session.record_gap(
-                        builder,
-                        selection_point,
-                        SemanticGapSubject::Value(callee),
-                        SemanticCapability::CallableReferences,
-                        kind,
-                        "selected callable target requires whole-program dispatch refinement",
-                    )?;
-                }
-            }
+            };
+            let metadata = self.metadata(invoke)?;
             if selector_resolution == Some(GoSelectorResolution::Unknown) {
-                // The selector can still denote a function-valued field. Retain
-                // that alternative beside the bound-method interpretation so the
-                // call row carries the receiver candidate without certifying that
-                // one receiver binding exists.
                 self.append_effect(
                     builder,
-                    selection_point,
+                    invoke,
                     SemanticEffect::CallableReference {
                         result: callee,
                         callable: CallableValue {
@@ -16130,27 +16744,279 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             }
             self.append_effect(
                 builder,
-                selection_point,
+                invoke,
                 SemanticEffect::CallableReference {
                     result: callee,
                     callable: CallableValue {
-                        kind: callable_kind,
+                        kind: CallableReferenceKind::BoundMethod,
                         targets: resolution.clone(),
                         target_evidence: metadata.evidence,
-                        bound_receiver: if selection_point == invoke {
-                            receiver
-                        } else {
-                            capture
-                                .and_then(|capture| {
-                                    capture.receiver.map(|receiver| receiver.source)
-                                })
-                                .or(receiver)
-                        },
+                        bound_receiver: receiver,
                         environment: None,
                     },
                 },
             )?;
-        }
+            (
+                callee,
+                receiver,
+                mv_info.member_selection,
+                resolution,
+                selector_resolution,
+            )
+        } else {
+            let callee = self.expression_value(builder, function, SemanticValueKind::Callable)?;
+            let selector_resolution = (function.kind() == "selector_expression")
+                .then(|| self.evaluated_selector_resolution(builder, function));
+            let interface_dispatch = self.interface_dispatches.get(&function.id()).cloned();
+            let selection_point = if matches!(
+                selector_resolution,
+                Some(GoSelectorResolution::Method { .. } | GoSelectorResolution::Unknown)
+            ) {
+                self.selector_evaluation_point(builder, function)?
+            } else {
+                invoke
+            };
+            let receiver_node = selector_resolution
+                .and_then(|resolution| match resolution {
+                    GoSelectorResolution::Method { .. }
+                    | GoSelectorResolution::InterfaceMethod { .. }
+                    | GoSelectorResolution::Unknown => function.child_by_field_name("operand"),
+                    GoSelectorResolution::Package | GoSelectorResolution::Field => None,
+                })
+                .map(transparent_parenthesized_expression);
+            let member_selection = if selector_resolution == Some(GoSelectorResolution::Unknown) {
+                let receiver_node = receiver_node.expect("an open selector has a receiver");
+                let member = required_field(function, "field")?;
+                Some(Box::new(DeferredMemberSelection {
+                    member: nonempty_node_text(self.prepared.source(), member)
+                        .ok_or_else(|| missing_field(function, "member name"))?
+                        .into(),
+                    receiver_place: self.receiver_place(builder, invoke, receiver_node)?,
+                    receiver_pointer_depth: self
+                        .expression_type_identity(receiver_node, receiver_node.start_byte())
+                        .map(|identity| {
+                            u32::try_from(identity.pointer_depth)
+                                .expect("Go pointer depth fits u32")
+                        }),
+                }))
+            } else {
+                None
+            };
+            let evaluated_receiver = if let Some(captured) =
+                capture.and_then(|capture| capture.receiver.map(|captured| captured.target))
+            {
+                Some(captured)
+            } else {
+                receiver_node
+                    .map(|receiver| {
+                        self.expression_value(
+                            builder,
+                            receiver,
+                            self.expression_value_kind(receiver),
+                        )
+                    })
+                    .transpose()?
+            };
+            let receiver = if let (Some(proof), Some(wrapper), Some(receiver_node)) = (
+                interface_dispatch.as_ref(),
+                evaluated_receiver,
+                receiver_node,
+            ) {
+                let extracted = self.session.add_node_value(
+                    builder,
+                    receiver_node,
+                    SemanticValueKind::LanguageDefined("go.interface_method_receiver".into()),
+                )?;
+                self.value_types
+                    .insert(extracted, proof.receiver_type.clone());
+                self.append_effect(
+                    builder,
+                    selection_point,
+                    SemanticEffect::Assignment {
+                        target: extracted,
+                        value: wrapper,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    selection_point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceUnboxing,
+                        source: wrapper,
+                        target: extracted,
+                    },
+                )?;
+                Some(extracted)
+            } else {
+                evaluated_receiver
+            };
+            let receiver = if capture.is_none()
+                && let (
+                    Some(GoSelectorResolution::Method {
+                        pointer_receiver, ..
+                    }),
+                    Some(node),
+                    Some(source),
+                ) = (selector_resolution, receiver_node, receiver)
+            {
+                Some(self.prepare_method_receiver(
+                    builder,
+                    selection_point,
+                    node,
+                    source,
+                    pointer_receiver,
+                )?)
+            } else {
+                receiver
+            };
+            let callable_kind = if receiver.is_some() {
+                CallableReferenceKind::BoundMethod
+            } else {
+                CallableReferenceKind::Function
+            };
+            // A call denotes a local procedure either by immediate literal syntax
+            // or through a binding the prepass proved stable and function-valued.
+            // Both reach the same `GoProcedureTarget`, so the two spellings of one
+            // call cannot disagree about what it denotes.
+            let callable = if direct_function.kind() == "func_literal" {
+                Some(GoIndirectCallableTarget::Literal(direct_function.id()))
+            } else {
+                self.indirect_callable_targets
+                    .get(&direct_function.id())
+                    .copied()
+            };
+            let resolution = interface_dispatch
+                .as_ref()
+                .map(|proof| CallableTargetResolution::Proven(CallableTarget::Local(proof.target)))
+                .or_else(|| match callable {
+                    Some(GoIndirectCallableTarget::Literal(literal)) => {
+                        self.procedure_targets.get(&literal).map(|target| {
+                            CallableTargetResolution::Proven(CallableTarget::Local(target.id))
+                        })
+                    }
+                    Some(GoIndirectCallableTarget::Method(target)) => Some(
+                        CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                    ),
+                    None => None,
+                })
+                .or(match selector_resolution {
+                    Some(GoSelectorResolution::Method { target, .. }) => Some(
+                        CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                    ),
+                    _ => None,
+                })
+                .or_else(|| {
+                    self.package_function_target(direct_function).map(|target| {
+                        CallableTargetResolution::Proven(CallableTarget::Local(target))
+                    })
+                })
+                .unwrap_or_else(|| {
+                    let is_function_value_binding = match direct_function.kind() {
+                        "identifier" => node_text(self.prepared.source(), direct_function)
+                            .is_some_and(|name| {
+                                self.binding_value(name, direct_function.start_byte())
+                                    .is_some()
+                            }),
+                        "selector_expression" => {
+                            self.selector_field_type(direct_function).is_some()
+                        }
+                        _ => false,
+                    };
+                    let is_function_typed = is_function_value_binding
+                        && self
+                            .expression_type_node(direct_function, direct_function.start_byte())
+                            .and_then(|type_node| {
+                                self.file_underlying_type(type_node, direct_function.start_byte())
+                            })
+                            .is_some_and(|type_node| type_node.kind() == "function_type");
+                    if is_function_typed {
+                        // The Go adapter has identified a function-valued
+                        // expression, but its target set is assembled later by
+                        // invocation-local value flow. Keep this distinct from a
+                        // direct unresolved name without claiming an unproven
+                        // candidate set at this semantic point.
+                        CallableTargetResolution::Unsupported
+                    } else {
+                        CallableTargetResolution::Unknown
+                    }
+                });
+            if selection_point == invoke || self.published_selector_references.insert(function.id())
+            {
+                let metadata = self.metadata(selection_point)?;
+                if selection_point != invoke {
+                    let kind = match &resolution {
+                        CallableTargetResolution::Proven(_) => None,
+                        CallableTargetResolution::Ambiguous(_) => Some(SemanticGapKind::Ambiguous),
+                        CallableTargetResolution::Unknown => Some(SemanticGapKind::Unknown),
+                        CallableTargetResolution::Unsupported => Some(SemanticGapKind::Unsupported),
+                        CallableTargetResolution::Unproven(_) => Some(SemanticGapKind::Unproven),
+                        CallableTargetResolution::ExceededBudget(_) => {
+                            Some(SemanticGapKind::ExceededBudget)
+                        }
+                    };
+                    if let Some(kind) = kind {
+                        self.session.record_gap(
+                            builder,
+                            selection_point,
+                            SemanticGapSubject::Value(callee),
+                            SemanticCapability::CallableReferences,
+                            kind,
+                            "selected callable target requires whole-program dispatch refinement",
+                        )?;
+                    }
+                }
+                if selector_resolution == Some(GoSelectorResolution::Unknown) {
+                    // The selector can still denote a function-valued field. Retain
+                    // that alternative beside the bound-method interpretation so the
+                    // call row carries the receiver candidate without certifying that
+                    // one receiver binding exists.
+                    self.append_effect(
+                        builder,
+                        selection_point,
+                        SemanticEffect::CallableReference {
+                            result: callee,
+                            callable: CallableValue {
+                                kind: CallableReferenceKind::Function,
+                                targets: resolution.clone(),
+                                target_evidence: metadata.evidence,
+                                bound_receiver: None,
+                                environment: None,
+                            },
+                        },
+                    )?;
+                }
+                self.append_effect(
+                    builder,
+                    selection_point,
+                    SemanticEffect::CallableReference {
+                        result: callee,
+                        callable: CallableValue {
+                            kind: callable_kind,
+                            targets: resolution.clone(),
+                            target_evidence: metadata.evidence,
+                            bound_receiver: if selection_point == invoke {
+                                receiver
+                            } else {
+                                capture
+                                    .and_then(|capture| {
+                                        capture.receiver.map(|receiver| receiver.source)
+                                    })
+                                    .or(receiver)
+                            },
+                            environment: None,
+                        },
+                    },
+                )?;
+            }
+            (
+                callee,
+                receiver,
+                member_selection,
+                resolution,
+                selector_resolution,
+            )
+        };
+        let (callee, receiver, member_selection, resolution, selector_resolution) = lowered_callee;
 
         let arguments = call_arguments(node);
         let expanded = self.expanded_call_argument_values(builder, node)?;
@@ -16251,7 +17117,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let capture = deferred
             .then(|| self.deferred_captures.get(&node.id()).cloned())
             .flatten();
-        let operands = self.lower_call_operands(builder, node, invoke, capture.as_ref())?;
+        let operands = self.lower_call_operands(builder, node, invoke, capture.as_ref(), false)?;
         let scaffold = CallSiteScaffold {
             point: invoke,
             callee: operands.callee,
@@ -17967,6 +18833,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
 
     fn has_stable_deferred_callable(&self, call: Node<'tree>) -> Result<bool, GoLoweringError> {
         let function = required_field(call, "function")?;
+        let direct_function = transparent_parenthesized_expression(function);
+        if self
+            .bound_method_value_calls
+            .contains_key(&direct_function.id())
+        {
+            return Ok(true);
+        }
         if function.kind() == "selector_expression" {
             return Ok(matches!(
                 self.selector_resolution(function),
@@ -18398,6 +19271,7 @@ fn all_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
 fn supported_defer_call<'tree>(
     node: Node<'tree>,
     procedure_targets: &HashMap<usize, GoProcedureTarget>,
+    bound_method_value_calls: &HashMap<usize, (usize, usize)>,
 ) -> Option<Node<'tree>> {
     if node.kind() != "defer_statement" {
         return None;
@@ -18411,6 +19285,9 @@ fn supported_defer_call<'tree>(
         return Some(call);
     }
     let direct_function = transparent_parenthesized_expression(function);
+    if bound_method_value_calls.contains_key(&direct_function.id()) {
+        return Some(call);
+    }
     (direct_function.kind() == "func_literal"
         && procedure_targets.contains_key(&direct_function.id()))
     .then_some(call)
@@ -19260,7 +20137,13 @@ mod tests {
         let prepared = prepared_fixture(source);
         let file = ProjectFile::new(std::env::temp_dir(), "fixture.go");
         GoSemanticLowerer
-            .lower(&file, &prepared, budget, &CancellationToken::default())
+            .lower(
+                &file,
+                &prepared,
+                budget,
+                &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+            )
             .expect("Go lowering succeeds")
     }
 
@@ -24691,6 +25574,7 @@ func initialize(m map[string]*Resource, key string, x any) {{
                 &prepared,
                 &SemanticBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
             )
             .expect("cross-file caller lowers")
         else {

@@ -327,7 +327,7 @@ impl TaintQueryState {
         };
         self.push_diagnostic(
             code,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            super::context_error_incompleteness(&error),
             error.to_string(),
         );
     }

@@ -435,6 +435,40 @@ pub trait LanguageKnowledge: Send + Sync {
         None
     }
 
+    /// For an aggregate-literal member initializer node (such as Rust
+    /// `Foo { f: expr }` or shorthand `Foo { f }`), return
+    /// `(member_key_node, value_node)`. For a shorthand initializer where one
+    /// identifier is both the member name and the value expression, return
+    /// `(ident, ident)`.
+    fn aggregate_member_initializer<'t>(
+        &self,
+        _node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        None
+    }
+
+    /// For an increment or decrement expression node (such as Java `x++` or
+    /// `--this.x`), return the operand it updates in place. Languages without
+    /// such an expression, or that model it as an assignment, return `None`.
+    fn update_operand<'t>(&self, _node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+        None
+    }
+
+    /// Unmodeled derive or attribute macros on `owner` (or `field`) that may
+    /// generate hidden reads or writes of `field` without source occurrences.
+    /// Each entry is the spelling of one code-generating macro or annotation.
+    /// Inert attributes and macros that generate no field access are not
+    /// listed.
+    fn unmodeled_field_access_macros<'t>(
+        &self,
+        _root: tree_sitter::Node<'t>,
+        _owner: Option<tree_sitter::Node<'t>>,
+        _field: Option<tree_sitter::Node<'t>>,
+        _source: &str,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The identifier a declaration names, for languages whose grammar names it
     /// positionally rather than by field, or `None` when the field lookup or
     /// document-order search already finds it.

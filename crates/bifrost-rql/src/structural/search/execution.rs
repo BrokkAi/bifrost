@@ -17,17 +17,19 @@ fn subtree_has_bounded_call_step(plan: &PhysicalQueryPlan, root: PhysicalQueryNo
     false
 }
 
-/// Only a proof that every seed is scoped to absent languages can remove a
-/// branch's pipeline share. Unknown domains and unscoped seeds keep a share.
-/// Walk the plan iteratively, including nested set operands, without changing
-/// which branches execute or which diagnostics they produce.
-fn branch_has_applicable_language(
+/// The declared source languages of this physical subtree. An unconstrained
+/// seed or a domain whose source languages are unknown cannot prove exclusion.
+fn branch_code_languages(
     plan: &PhysicalQueryPlan,
     root: PhysicalQueryNodeId,
-    scanned_languages: &HashSet<Language>,
-) -> bool {
+) -> Option<BTreeSet<Language>> {
+    let mut selected = BTreeSet::new();
+    let mut seen = HashSet::default();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
         let languages = match plan.logical_node(node).operator() {
             LogicalQueryOperator::Seed(seed) => &seed.languages,
             LogicalQueryOperator::OccurrenceSeed(seed) => &seed.languages,
@@ -46,17 +48,28 @@ fn branch_has_applicable_language(
             LogicalQueryOperator::ConfigurationFactsSeed(_)
             | LogicalQueryOperator::DependencyEvidenceSeed(_)
             | LogicalQueryOperator::Correlate { .. }
-            | LogicalQueryOperator::RequireBoth { .. } => return true,
+            | LogicalQueryOperator::RequireBoth { .. } => return None,
         };
-        if languages.is_empty()
-            || languages
-                .iter()
-                .any(|language| scanned_languages.contains(language))
-        {
-            return true;
+        if languages.is_empty() {
+            return None;
         }
+        selected.extend(languages.iter().copied());
     }
-    false
+    Some(selected)
+}
+
+/// Only a proof that every seed is scoped to absent languages can remove a
+/// branch's pipeline share. Unknown domains and unscoped seeds keep a share.
+fn branch_has_applicable_language(
+    plan: &PhysicalQueryPlan,
+    root: PhysicalQueryNodeId,
+    scanned_languages: &HashSet<Language>,
+) -> bool {
+    branch_code_languages(plan, root).is_none_or(|languages| {
+        languages
+            .iter()
+            .any(|language| scanned_languages.contains(language))
+    })
 }
 
 struct UnaryPlanContinuation {
@@ -310,6 +323,9 @@ fn execute_plan_node(
     let mut cache_started = state.cache_profile;
     let mut own_diagnostic_start = diagnostics.len();
 
+    // Completed sibling operands pin their handle-bearing rows only while this
+    // operator runs; the entry count is restored when it finishes.
+    let pinned_at_entry = state.pinned_row_artifacts;
     let execution = match (physical_operator, logical_operator) {
         (PhysicalQueryOperator::OccurrenceScan, LogicalQueryOperator::OccurrenceSeed(seed)) => {
             if state
@@ -647,6 +663,22 @@ fn execute_plan_node(
                     ..child
                 }
             } else {
+                if matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
+                    let languages = if step == &QueryStep::ImportersOf {
+                        // Reverse imports cover every possible importing source,
+                        // including languages absent from the seed frontier.
+                        Language::ANALYZABLE.to_vec()
+                    } else {
+                        branch_code_languages(plan, node_id)
+                            .map(|languages| languages.into_iter().collect::<Vec<_>>())
+                            .unwrap_or_else(|| Language::ANALYZABLE.to_vec())
+                    };
+                    if let Err(error) = state.analyzer.require_workspace_languages(&languages) {
+                        state.analyzer.record_query_incomplete(
+                            crate::analyzer::QueryReadIncomplete::StoreFailure(error),
+                        );
+                    }
+                }
                 let mut instrumentation = profiling.then(QueryStepInstrumentation::default);
                 let depth_answer_start = state.depth_answers.len();
                 let child_truncated = child.is_truncated();
@@ -695,6 +727,15 @@ fn execute_plan_node(
                 if stepped.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
+                attribute_step_diagnostics(
+                    plan.logical_node(node_id).authored_step_index(),
+                    step,
+                    input_rows,
+                    &stepped,
+                    state,
+                    own_diagnostic_start,
+                    diagnostics,
+                );
                 if child_truncated {
                     stepped.mark_truncated();
                 }
@@ -903,6 +944,7 @@ fn execute_plan_node(
                         depth_bound_status: child_depth_status,
                         depth_answers: child_depth_answers,
                     });
+                    state.pin_rows_if_retaining(&child.rows);
                     branch_rows.push(child.rows);
                     if ends_operator {
                         empty_operand = true;
@@ -1056,6 +1098,7 @@ fn execute_plan_node(
                             .saturating_sub(branch_rows[index].len())
                             .saturating_add(child.rows.len());
                         branch_attempts[index].truncated = child.is_truncated();
+                        state.pin_rows_if_retaining(&child.rows);
                         branch_rows[index] = child.rows;
                         branch_diagnostics[index] = retry_diagnostics;
                         branch_attempts[index].starved = false;
@@ -1336,6 +1379,7 @@ fn execute_plan_node(
                         cancelled_child = Some(child);
                         break;
                     }
+                    state.pin_rows_if_retaining(&child.rows);
                     inputs.push(child);
                 }
                 work_started = profiling.then(|| state_execution_work_snapshot(state));
@@ -1414,6 +1458,15 @@ fn execute_plan_node(
         }
         _ => unreachable!("physical operator must implement its logical query node"),
     };
+
+    state.set_pinned_row_artifacts(pinned_at_entry);
+    if !execution
+        .rows
+        .iter()
+        .any(pipeline_row_retains_semantic_artifact)
+    {
+        state.release_unreferenced_semantic_artifacts();
+    }
 
     // The rows an anchor seed emitted are the plan's candidates, counted before
     // any later step filters them. Read from the emitted rows, never from the
@@ -1625,6 +1678,7 @@ pub(super) fn execute_parallel_seed_union(
                     receiver_facts: HashMap::default(),
                     receiver_service: None,
                     semantic: None,
+                    pinned_row_artifacts: 0,
                     semantic_factory: Box::new(|| None),
                     call_shape_work: CodeQuerySemanticWork::default(),
                     import_graph: None,
@@ -2006,12 +2060,115 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::HierarchyIncomplete
             | CodeQueryDiagnosticCode::WorkspaceSemanticModelsNotLoaded
             | CodeQueryDiagnosticCode::PolicyDeclaredProvenSubset
-            | CodeQueryDiagnosticCode::BroadQuery => None,
+            | CodeQueryDiagnosticCode::BroadQuery
+            | CodeQueryDiagnosticCode::StepProducedNoRows
+            | CodeQueryDiagnosticCode::DerivedCacheRebuilt
+            | CodeQueryDiagnosticCode::PresentationRowsRefused
+            | CodeQueryDiagnosticCode::PresentationOwnerUnavailable => None,
         };
         if let Some(termination) = termination {
             push_operator_termination(terminations, termination);
         }
     }
+}
+
+/// Attribute the diagnostics one authored step just pushed to that step, and
+/// say why the step turned a non-empty input into no rows.
+///
+/// Only a whole-query execution reports the empty step: one seed-file unit
+/// producing nothing is normal when another file produces rows, so a unit
+/// slice stays silent and the whole execution is the single reporter.
+fn attribute_step_diagnostics(
+    authored_step_index: Option<usize>,
+    step: &QueryStep,
+    input_rows: usize,
+    stepped: &PlanExecution,
+    state: &QueryExecutionState<'_>,
+    own_diagnostic_start: usize,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) {
+    let step_index = authored_step_index.expect("an authored step node records its index");
+    let step_op = step.label();
+    for diagnostic in &mut diagnostics[own_diagnostic_start..] {
+        if diagnostic.step_index.is_none() {
+            diagnostic.step_index = Some(step_index);
+            diagnostic.step_op = Some(step_op.to_string());
+        }
+    }
+    if input_rows == 0
+        || !stepped.rows.is_empty()
+        || stepped.is_cancelled()
+        || state.scope.seed_files().is_some()
+        || state.scope.intersect_prefix_capture().is_some()
+    {
+        return;
+    }
+    let mut cause_codes = Vec::new();
+    for diagnostic in &diagnostics[own_diagnostic_start..] {
+        if diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+            && !cause_codes.contains(&diagnostic.code)
+        {
+            cause_codes.push(diagnostic.code);
+        }
+    }
+    // A step that stopped on its own bound without a typed reason still left
+    // its answer open, so it is not a proof that nothing matched.
+    let (no_rows_reason, message) = if !cause_codes.is_empty() || stepped.is_truncated() {
+        (
+            CodeQueryStepNoRowsReason::Incomplete,
+            format!(
+                "step `{step_op}` produced 0 rows from {input_rows} input row(s) after incomplete step execution"
+            ),
+        )
+    } else if step_selects_input_rows(step) {
+        (
+            CodeQueryStepNoRowsReason::AllInputsFiltered,
+            format!("step `{step_op}` rejected all {input_rows} input row(s)"),
+        )
+    } else {
+        (
+            CodeQueryStepNoRowsReason::NoMatchingRows,
+            format!("step `{step_op}` found no rows for {input_rows} input row(s)"),
+        )
+    };
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
+        incompleteness: Incompleteness::Content,
+        code: CodeQueryDiagnosticCode::StepProducedNoRows,
+        impact: CodeQueryDiagnosticImpact::Advisory,
+        branch: Vec::new(),
+        language: "workspace",
+        message,
+        source: None,
+        related: Vec::new(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+        step_index: Some(step_index),
+        step_op: Some(step_op.to_string()),
+        no_rows_reason: Some(no_rows_reason),
+        cause_codes: if no_rows_reason == CodeQueryStepNoRowsReason::Incomplete {
+            cause_codes
+        } else {
+            Vec::new()
+        },
+    }));
+}
+
+/// A step whose own predicate keeps or rejects each input row, so its input
+/// rows are exactly the candidates it can reject. Relation steps expand their
+/// input into candidates internally and report no pre-filter count.
+fn step_selects_input_rows(step: &QueryStep) -> bool {
+    matches!(
+        step,
+        QueryStep::Filter(_)
+            | QueryStep::IdenticalCaptures { .. }
+            | QueryStep::ResolvedCall(_)
+            | QueryStep::ResolvedValue(_)
+            | QueryStep::CallArgument(_)
+    )
 }
 
 /// A transient row-equivalence proof shared by whole and seed-unit unions.

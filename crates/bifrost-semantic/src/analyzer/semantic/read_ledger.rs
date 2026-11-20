@@ -33,6 +33,163 @@ pub enum StoredSemanticIrParseVariant {
     Digest([u8; 32]),
 }
 
+/// The shared Empty/Digest wire contract. The original name remains valid for
+/// stored semantic IR callers and retains its existing canonical encoding.
+pub type StoredParseVariant = StoredSemanticIrParseVariant;
+
+/// One ordinary FragmentLocal catalog identity, not a mounted runtime ID.
+/// Callers establish ordinary selected catalog provenance before constructing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LocalResolutionIdentityDigest([u8; 32]);
+
+impl LocalResolutionIdentityDigest {
+    pub const fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// The exact selected source publication in which local proof locators apply.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SelectedProofSource {
+    pub storage_language: Box<str>,
+    pub rel_path: Box<str>,
+    pub blob_oid: [u8; 20],
+    pub parse_variant: StoredParseVariant,
+    pub producer_epoch: Box<str>,
+}
+
+impl SelectedProofSource {
+    /// Hash the content-only publication locator, independently of its mount.
+    pub fn hash_fields(&self, hash: &mut CanonicalHasher) {
+        hash.field("storage_language", self.storage_language.as_bytes());
+        hash.field("rel_path", self.rel_path.as_bytes());
+        hash.field("blob_oid", &self.blob_oid);
+        match self.parse_variant {
+            StoredParseVariant::Empty => hash.field("parse_variant_kind", b"empty"),
+            StoredParseVariant::Digest(digest) => {
+                hash.field("parse_variant_kind", b"digest");
+                hash.field("parse_variant_digest", &digest);
+            }
+        }
+        hash.field("producer_epoch", self.producer_epoch.as_bytes());
+    }
+
+    pub fn canonical_digest(&self) -> StableDigest {
+        let mut hash = CanonicalHasher::new(b"bifrost-selected-proof-source:v1");
+        self.hash_fields(&mut hash);
+        StableDigest::from_array(hash.finish())
+    }
+}
+
+/// Separate application and transfer questions share the selected source.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SelectedReceiverProofQuestion {
+    BaseReceiverContext {
+        source: SelectedProofSource,
+        reference: LocalResolutionIdentityDigest,
+    },
+    OwnerApplication {
+        source: SelectedProofSource,
+        application: LocalResolutionIdentityDigest,
+    },
+    CurrentInstanceTransfer {
+        source: SelectedProofSource,
+        application: LocalResolutionIdentityDigest,
+        receiver: LocalResolutionIdentityDigest,
+        transfer_rule: LocalResolutionIdentityDigest,
+    },
+}
+
+impl SelectedReceiverProofQuestion {
+    pub fn source(&self) -> &SelectedProofSource {
+        match self {
+            Self::OwnerApplication { source, .. }
+            | Self::CurrentInstanceTransfer { source, .. }
+            | Self::BaseReceiverContext { source, .. } => source,
+        }
+    }
+
+    pub const fn stable_label(&self) -> &'static str {
+        match self {
+            Self::BaseReceiverContext { .. } => "base_receiver_context",
+            Self::OwnerApplication { .. } => "owner_application",
+            Self::CurrentInstanceTransfer { .. } => "current_instance_transfer",
+        }
+    }
+
+    pub fn canonical_digest(&self) -> StableDigest {
+        let mut hash = CanonicalHasher::new(b"bifrost-selected-receiver-proof:question:v1");
+        hash.field("question", self.stable_label().as_bytes());
+        let source = self.source();
+        source.hash_fields(&mut hash);
+        match self {
+            Self::BaseReceiverContext { reference, .. } => {
+                hash.field("reference", reference.as_bytes());
+            }
+            Self::OwnerApplication { application, .. } => {
+                hash.field("application", application.as_bytes());
+            }
+            Self::CurrentInstanceTransfer {
+                application,
+                receiver,
+                transfer_rule,
+                ..
+            } => {
+                hash.field("application", application.as_bytes());
+                hash.field("receiver", receiver.as_bytes());
+                hash.field("transfer_rule", transfer_rule.as_bytes());
+            }
+        }
+        StableDigest::from_array(hash.finish())
+    }
+}
+
+/// Completeness of the consumed input inventories, not permission to seed a type.
+/// Refused observations, including cancellation, are never encoded as answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedReceiverProofAnswer {
+    ExhaustedComplete {
+        consumed_inventory_digest: StableDigest,
+    },
+    ExhaustedIncomplete {
+        consumed_inventory_digest: StableDigest,
+        reasons_digest: StableDigest,
+    },
+}
+
+impl SelectedReceiverProofAnswer {
+    pub fn canonical_digest(&self) -> StableDigest {
+        let mut hash = CanonicalHasher::new(b"bifrost-selected-receiver-proof:answer:v1");
+        match self {
+            Self::ExhaustedComplete {
+                consumed_inventory_digest,
+            } => {
+                hash.field("answer", b"exhausted_complete");
+                hash.field(
+                    "consumed_inventory_digest",
+                    consumed_inventory_digest.as_bytes(),
+                );
+            }
+            Self::ExhaustedIncomplete {
+                consumed_inventory_digest,
+                reasons_digest,
+            } => {
+                hash.field("answer", b"exhausted_incomplete");
+                hash.field(
+                    "consumed_inventory_digest",
+                    consumed_inventory_digest.as_bytes(),
+                );
+                hash.field("reasons_digest", reasons_digest.as_bytes());
+            }
+        }
+        StableDigest::from_array(hash.finish())
+    }
+}
+
 /// Cache provenance only for artifacts lowered from source after a refused read.
 /// This domain is distinct from every verified built-from question and answer.
 pub static REFUSED_PROVENANCE: std::sync::LazyLock<StableDigest> = std::sync::LazyLock::new(|| {
@@ -157,6 +314,7 @@ impl IndexFamily {
 /// Closed workspace-authority families. Stable labels are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WorkspaceFactFamily {
+    SelectedDependencyEvidence,
     CSharpDeadCodeUsageEdges,
     CSharpReachability,
     CSharpNamespaceByFile,
@@ -289,7 +447,20 @@ pub enum WorkspaceFactFamily {
     ScalaReverseImportIndex,
     ScalaSamePackageReferenceIndex,
     JavaImportedTypeResolution,
+    /// The visible JVM dependency inputs (#12745): the workspace paths a JVM
+    /// external index build can read, after ignore rules and overlays.
+    JvmDependencyInputs,
+    /// The jars a JVM external index decodes and the scan that found them
+    /// (#12745), wherever they live: their stat identities and the probes
+    /// that located them.
+    JvmArtifactInputs,
+    /// Exact consumed assets/XML content and selected C# dependency outcomes.
+    CSharpDependencyInputs,
+    /// Selected assembly paths and SHA-256, bound to the discovery outcome.
+    CSharpArtifactInputs,
     CSharpCompilationMembershipCompleteness,
+    JavaExternalRootDescendants,
+    CSharpCompilationGlobalUsings,
 }
 
 impl WorkspaceFactFamily {
@@ -298,8 +469,11 @@ impl WorkspaceFactFamily {
     pub fn is_selection_authority(self) -> bool {
         matches!(
             self,
-            Self::GoBuildSelection
+            Self::SelectedDependencyEvidence
+                | Self::GoBuildSelection
                 | Self::CSharpCompilationConfiguration
+                | Self::CSharpDependencyInputs
+                | Self::CSharpArtifactInputs
                 | Self::CSharpCompilationMembershipCompleteness
                 | Self::JvmSelectedRootPresence
                 | Self::JvmExternalGaps
@@ -596,6 +770,10 @@ impl WorkspaceFactFamily {
             Self::RuntimeRootWriteFootprint,
             "runtime_root_write_footprint",
         ),
+        (
+            Self::SelectedDependencyEvidence,
+            "selected_dependency_evidence",
+        ),
         (Self::WorkspaceFileListing, "workspace_file_listing"),
         (Self::DefinitionParents, "definition_parents"),
         (Self::PathSyntheticModules, "path_synthetic_modules"),
@@ -646,9 +824,21 @@ impl WorkspaceFactFamily {
             Self::JavaImportedTypeResolution,
             "java_imported_type_resolution",
         ),
+        (Self::JvmDependencyInputs, "jvm_dependency_inputs"),
+        (Self::JvmArtifactInputs, "jvm_artifact_inputs"),
+        (Self::CSharpDependencyInputs, "csharp_dependency_inputs"),
+        (Self::CSharpArtifactInputs, "csharp_artifact_inputs"),
         (
             Self::CSharpCompilationMembershipCompleteness,
             "csharp_compilation_membership",
+        ),
+        (
+            Self::JavaExternalRootDescendants,
+            "java_external_root_descendants",
+        ),
+        (
+            Self::CSharpCompilationGlobalUsings,
+            "csharp_compilation_global_usings",
         ),
     ];
 
@@ -758,6 +948,7 @@ pub enum LookupKind {
     /// Certified composite answer to a definition probe.
     CertifiedDefinitionAnswer,
     StoredSemanticIrPublication,
+    SelectedReceiverProof,
     /// A registered dependency-tracked derivation.
     Derivation(crate::analyzer::semantic::derivation::DerivationKindId),
     /// The exact rendered-name answer of the shared resolver, including its
@@ -887,6 +1078,14 @@ impl PersistedDerivationFamily {
     /// registered kind cannot be persisted without an explicit decision.
     pub fn of(label: &str) -> Option<Self> {
         let (id, language, subject, rel_path, name, memory_only) = match label {
+            "derivation:jvm_external_provider_inventory:v1" => (
+                "derivation:jvm_external_provider_inventory:v1",
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
             "derivation:rust_candidate_macro_procedure_overlay:v1" => (
                 "derivation:rust_candidate_macro_procedure_overlay:v1",
                 true,
@@ -900,6 +1099,22 @@ impl PersistedDerivationFamily {
                 true,
                 true,
                 false,
+                false,
+                false,
+            ),
+            "derivation:rust_name_availability:v1" => (
+                "derivation:rust_name_availability:v1",
+                true,
+                false,
+                false,
+                true,
+                false,
+            ),
+            "derivation:rust_file_availability:v1" => (
+                "derivation:rust_file_availability:v1",
+                true,
+                false,
+                true,
                 false,
                 false,
             ),
@@ -993,6 +1208,14 @@ impl PersistedDerivationFamily {
             ),
             "derivation:rust_unit_inputs:v2" => (
                 "derivation:rust_unit_inputs:v2",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_inputs:v3" => (
+                "derivation:rust_unit_inputs:v3",
                 true,
                 true,
                 false,
@@ -1127,6 +1350,7 @@ impl LookupKind {
         match self {
             Self::CertifiedDefinitionAnswer => "certified_definition_answer",
             Self::StoredSemanticIrPublication => "stored_semantic_ir_publication",
+            Self::SelectedReceiverProof => "selected_receiver_proof",
             Self::Derivation(id) => id.0,
             Self::ResolvedName => "resolved_name",
             Self::Definitions => "definitions",
@@ -1486,6 +1710,7 @@ pub enum LookupQuestion {
         normalization_version: Option<u32>,
     },
     StoredSemanticIrPublication(StoredSemanticIrPublicationQuestion),
+    SelectedReceiverProof(SelectedReceiverProofQuestion),
     /// Mount-free key of a registered derivation.
     Derivation(crate::analyzer::semantic::derivation::DerivationQuestion),
     RustMacroInvocations {
@@ -1678,6 +1903,7 @@ impl LookupQuestion {
         match self {
             Self::CertifiedDefinition { .. } => "certified_definition",
             Self::StoredSemanticIrPublication(..) => "stored_semantic_ir_publication",
+            Self::SelectedReceiverProof(..) => "selected_receiver_proof",
             Self::Derivation(_) => "derivation",
             Self::Name { .. } => "name",
             Self::RustPlacedDeclaration { .. } => "rust_placed_declaration",
@@ -1702,6 +1928,7 @@ impl LookupQuestion {
     pub fn rel_path(&self) -> Option<&str> {
         match self {
             Self::StoredSemanticIrPublication(question) => Some(&question.rel_path),
+            Self::SelectedReceiverProof(question) => Some(&question.source().rel_path),
             Self::CertifiedDefinition { .. } => None,
             Self::Derivation(question) => question.rel_path.as_deref(),
             Self::Name { .. }
@@ -1755,6 +1982,12 @@ impl LookupQuestion {
                 hasher.field(
                     "normalization_version",
                     &normalization_version.unwrap_or(0).to_be_bytes(),
+                );
+            }
+            Self::SelectedReceiverProof(question) => {
+                hasher.field(
+                    "selected_receiver_proof",
+                    question.canonical_digest().as_bytes(),
                 );
             }
             Self::StoredSemanticIrPublication(question) => {
@@ -2009,6 +2242,12 @@ impl ReadKey {
                 } => {
                     allocation(name.len())
                         + allocation(delegates.capacity() * size_of::<Language>())
+                }
+                LookupQuestion::SelectedReceiverProof(q) => {
+                    let source = q.source();
+                    allocation(source.rel_path.len())
+                        + allocation(source.storage_language.len())
+                        + allocation(source.producer_epoch.len())
                 }
                 LookupQuestion::StoredSemanticIrPublication(q) => {
                     allocation(q.rel_path.len()) + allocation(q.storage_language.len())

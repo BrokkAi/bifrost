@@ -93,16 +93,15 @@ fn nested_each_capture_bytes_are_bounded() {
     .unwrap();
     let result = execute(&analyzer, &query);
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted),
+        result.diagnostics.iter().any(
+            |diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        ),
         "{result:?}"
     );
     let roots = result
         .diagnostics
         .iter()
-        .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+        .flat_map(|diagnostic| &semantic_diagnostic(diagnostic).exhausted_roots)
         .collect::<Vec<_>>();
     assert!(!roots.is_empty(), "{result:?}");
     for root in roots {
@@ -153,7 +152,7 @@ fn identical_captures_pair_budget_has_one_diagnostic() {
         let budget = result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("comparison budget exhausted"))
+            .filter(|diagnostic| diagnostic.message().contains("comparison budget exhausted"))
             .count();
         assert_eq!(result.results.len(), usize::from(kept), "{result:?}");
         assert_eq!(budget, usize::from(!kept), "{result:?}");
@@ -188,7 +187,7 @@ fn identical_captures_drops_rows_without_a_pair_before_syntax() {
         result
             .diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.impact != CodeQueryDiagnosticImpact::Incomplete),
+            .all(|diagnostic| diagnostic.impact() != CodeQueryDiagnosticImpact::Incomplete),
         "{:?}",
         result.diagnostics
     );
@@ -225,17 +224,17 @@ fn identical_captures_open_pair_reasons_are_capped() {
     let diagnostic = result
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.message.contains("open pairs total"))
+        .find(|diagnostic| diagnostic.message().contains("open pairs total"))
         .unwrap_or_else(|| panic!("{result:?}"));
     // 5 x 4 pairs are all undecided; only the first 16 are listed.
     assert_eq!(
-        diagnostic.message.matches(" vs ").count(),
+        diagnostic.message().matches(" vs ").count(),
         16,
         "{diagnostic:?}"
     );
     assert!(
         diagnostic
-            .message
+            .message()
             .contains("20 open pairs total; 4 not listed"),
         "{diagnostic:?}"
     );
@@ -271,7 +270,7 @@ fn discarded_each_probe_bytes_do_not_block_a_retained_each() {
         !result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("each pattern is incomplete")),
+            .any(|diagnostic| diagnostic.message().contains("each pattern is incomplete")),
         "{result:?}"
     );
     assert!(
@@ -397,10 +396,9 @@ fn many_capture_predicates_over_a_large_node_stop_at_the_budget() {
         .load(std::sync::atomic::Ordering::Relaxed)
         - before;
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted),
+        result.diagnostics.iter().any(
+            |diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        ),
         "{result:?}"
     );
     // The budget admits at most one ~600 KiB binding per row; allow slack for
@@ -437,10 +435,9 @@ fn each_walk_stops_after_a_descendant_meets_the_capture_cap() {
         .load(std::sync::atomic::Ordering::Relaxed)
         - before;
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted),
+        result.diagnostics.iter().any(
+            |diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        ),
         "{result:?}"
     );
     // The walk stops at the first refused descendant; walking on built about
@@ -493,7 +490,7 @@ fn argument_mode_scan_work_is_charged_to_the_fact_budget() {
     assert!(result.truncated, "{result:?}");
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
         }),
         "{:?}",
         result.diagnostics
@@ -544,7 +541,7 @@ fn argument_mode_outside_calls_stops_at_the_role_owner() {
     assert!(result.results.is_empty(), "{result:?}");
     assert!(
         !result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
         }),
         "{:?}",
         result.diagnostics

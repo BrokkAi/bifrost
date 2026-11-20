@@ -2284,6 +2284,7 @@ impl BatchResolutionFragmentSource for PreloadedFragmentSource {
 pub(super) struct CompletedPath {
     pub(super) target: SemanticId,
     pub(super) admission: BindingCandidateAdmission,
+    pub(super) definitive_cutoff: bool,
     pub(super) path: PartialPath,
 }
 
@@ -2316,6 +2317,7 @@ pub(super) fn classify_completed_binding(
         }
     };
     CompletedBinding::Complete(CompletedPath {
+        definitive_cutoff: true,
         target,
         admission,
         path,
@@ -2554,23 +2556,27 @@ fn completed_path_dominance_with_poll(
             if selection_cancelled(work, cancellation) {
                 return None;
             }
-            if path_shadows_with_rules(
-                &completed[left].path,
-                &completed[right].path,
-                rules,
-                cancellation,
-                work,
-            )? {
+            if completed[left].definitive_cutoff
+                && path_shadows_with_rules(
+                    &completed[left].path,
+                    &completed[right].path,
+                    rules,
+                    cancellation,
+                    work,
+                )?
+            {
                 dominance[left].push(right);
                 indegree[right] += 1;
             }
-            if path_shadows_with_rules(
-                &completed[right].path,
-                &completed[left].path,
-                rules,
-                cancellation,
-                work,
-            )? {
+            if completed[right].definitive_cutoff
+                && path_shadows_with_rules(
+                    &completed[right].path,
+                    &completed[left].path,
+                    rules,
+                    cancellation,
+                    work,
+                )?
+            {
                 dominance[right].push(left);
                 indegree[left] += 1;
             }
@@ -2673,11 +2679,15 @@ fn augmented_path_relation_with_poll(
             if selection_cancelled(work, cancellation) {
                 return None;
             }
-            if path_shadows_with_rules(path(left), path(right), rules, cancellation, work)? {
+            if (left >= affirmative_count || completed[left].definitive_cutoff)
+                && path_shadows_with_rules(path(left), path(right), rules, cancellation, work)?
+            {
                 dominance[left].push(right);
                 indegree[right] += 1;
             }
-            if path_shadows_with_rules(path(right), path(left), rules, cancellation, work)? {
+            if (right >= affirmative_count || completed[right].definitive_cutoff)
+                && path_shadows_with_rules(path(right), path(left), rules, cancellation, work)?
+            {
                 dominance[right].push(left);
                 indegree[left] += 1;
             }
@@ -2718,11 +2728,15 @@ fn augmented_path_relation_reference_with_poll(
             if selection_cancelled(work, cancellation) {
                 return None;
             }
-            if path_shadows_with_poll(path(left), path(right), cancellation, work)? {
+            if (left >= affirmative_count || completed[left].definitive_cutoff)
+                && path_shadows_with_poll(path(left), path(right), cancellation, work)?
+            {
                 dominance[left].push(right);
                 indegree[right] += 1;
             }
-            if path_shadows_with_poll(path(right), path(left), cancellation, work)? {
+            if (right >= affirmative_count || completed[right].definitive_cutoff)
+                && path_shadows_with_poll(path(right), path(left), cancellation, work)?
+            {
                 dominance[right].push(left);
                 indegree[left] += 1;
             }
@@ -4477,13 +4491,8 @@ mod tests {
         assert!(cancelled.contains_reason(ResolutionIncompleteReason::Cancelled));
         assert!(!matches!(cancelled, ResolutionCompletion::Complete));
 
-        let zero_budget = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
-            None,
-        );
+        let zero_budget =
+            ResolutionSession::bounded_with_total_work(ReceiverAnalysisBudget::default(), 0, None);
         let budgeted = source
             .reference_inventory_completion(
                 zero,
@@ -4684,6 +4693,7 @@ mod tests {
         completion: ResolutionCompletion,
     ) -> CompletedPath {
         CompletedPath {
+            definitive_cutoff: true,
             admission: BindingCandidateAdmission::Target,
             target,
             path: path_with_completion(
@@ -5585,6 +5595,91 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_candidate_cannot_hide_a_base_but_known_cutoff_keeps_normal_precedence() {
+        let reference = semantic("private-cutoff-reference");
+        let choice = semantic("private-cutoff-choice");
+        let higher = semantic("private-cutoff-higher");
+        let lower = semantic("private-cutoff-lower");
+        let gap = semantic("private-cutoff-gap");
+        let cancellation = CancellationToken::new();
+        for uncertain_higher in [true, false] {
+            let mut candidates = vec![
+                selection_completed(
+                    "private-cutoff-high",
+                    higher,
+                    vec![precedence(choice, 0)],
+                    ResolutionCompletion::Complete,
+                ),
+                selection_completed(
+                    "private-cutoff-low",
+                    lower,
+                    vec![precedence(choice, 1)],
+                    ResolutionCompletion::Complete,
+                ),
+            ];
+            let uncertain = if uncertain_higher { 0 } else { 1 };
+            candidates[uncertain].definitive_cutoff = false;
+            candidates[uncertain].path = candidates[uncertain]
+                .path
+                .clone()
+                .with_additional_completion(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(gap),
+                ]));
+            let answer = select_paths(
+                reference,
+                candidates,
+                Vec::new(),
+                ResolutionCompletion::Complete,
+                &cancellation,
+            );
+            if uncertain_higher {
+                assert!(answer.targets().contains(&higher) && answer.targets().contains(&lower));
+                assert_ne!(answer.completion(), &ResolutionCompletion::Complete);
+            } else {
+                assert_eq!(answer.targets(), &[higher]);
+                assert_eq!(answer.completion(), &ResolutionCompletion::Complete);
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#7314: candidate cutoff indexed completed rows for terminal-only vertices")]
+    fn candidate_cutoff_preserves_terminal_only_selection_and_relation() {
+        let choice = semantic("private-terminal-only-choice");
+        let gap = semantic("private-terminal-only-gap");
+        let terminals = vec![
+            selection_terminal("private-terminal-first", vec![precedence(choice, 0)], gap),
+            selection_terminal("private-terminal-second", vec![precedence(choice, 1)], gap),
+        ];
+        let cancellation = CancellationToken::new();
+        let answer = select_paths(
+            semantic("private-terminal-reference"),
+            Vec::new(),
+            terminals.clone(),
+            ResolutionCompletion::Complete,
+            &cancellation,
+        );
+        assert!(answer.targets().is_empty());
+        assert_ne!(answer.completion(), &ResolutionCompletion::Complete);
+        let mut work = 0;
+        let actual = augmented_path_relation_with_poll(
+            &[],
+            &terminals,
+            &crate::analyzer::resolution::precedence::DefaultPrecedenceRules,
+            &cancellation,
+            &mut work,
+        )
+        .unwrap();
+        let mut work = 0;
+        let independent =
+            augmented_path_relation_reference_with_poll(&[], &terminals, &cancellation, &mut work)
+                .unwrap();
+        assert_eq!(actual.dominance, independent.dominance);
+        assert_eq!(actual.indegree, independent.indegree);
+        assert_eq!(actual.terminal_nodes, independent.terminal_nodes);
+    }
+
+    #[test]
     fn bidirectional_affirmative_terminal_cycle_remains_incomplete() {
         let reference = semantic("terminal-bidirectional-reference");
         let target = semantic("terminal-bidirectional-target");
@@ -5770,6 +5865,7 @@ mod tests {
         let target_node = node("large-selector-witness-target-node");
         let witness_node = node("large-selector-witness-node");
         let completed = vec![CompletedPath {
+            definitive_cutoff: true,
             admission: BindingCandidateAdmission::Target,
             target,
             path: PartialPath::new(

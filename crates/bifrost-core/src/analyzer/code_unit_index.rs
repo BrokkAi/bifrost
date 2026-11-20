@@ -277,6 +277,22 @@ pub trait CodeUnitIndex: Send + Sync {
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_>;
 
+    /// The declaration inventory restricted to exact indexed files. Implementations
+    /// must preserve the dependencies of those files and fail closed on unreadable
+    /// selected products. No current-source fallback is permitted.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> crate::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        // In-memory and compatibility indexes retain their typed inventory contract.
+        // Persisted analyzers override this with indexed file reads.
+        crate::analyzer::query_read_incomplete::LookupOutcome::Found(
+            self.all_declarations()
+                .filter(|unit| files.contains(unit.source()))
+                .collect(),
+        )
+    }
+
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
         self.all_declarations().collect()
     }

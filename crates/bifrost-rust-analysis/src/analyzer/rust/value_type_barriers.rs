@@ -143,11 +143,12 @@ pub(crate) fn open<'a>(
     }))
 }
 
-impl ValueTypeBarrierContext for RustBarrierContext<'_> {
-    fn observed_type(
+impl RustBarrierContext<'_> {
+    fn observed_type_impl(
         &self,
         observation: &BarrierObservation,
         request: &mut SemanticRequest<'_>,
+        guard_binding: bool,
     ) -> Result<ObservedValueType, SemanticProviderError> {
         let undecided = || ObservedValueType::Undecided(UnavailableObservation);
         if request.cancellation.is_cancelled() {
@@ -222,38 +223,58 @@ impl ValueTypeBarrierContext for RustBarrierContext<'_> {
                 });
             }
             let Some(name) = brokk_bifrost_rust::structural::expression_name_node(expression)
+                .or_else(|| {
+                    guard_binding
+                        .then(|| expression.child_by_field_name("pattern"))
+                        .flatten()
+                        .filter(|pattern| pattern.kind() == "identifier")
+                })
             else {
                 return Ok(undecided());
             };
+            let declaration = guard_binding
+                .then(|| super::std_types::binding_pattern_owner(name, name.byte_range()))
+                .flatten()
+                .filter(|owner| {
+                    owner.child_by_field_name("pattern").is_some_and(|pattern| {
+                        pattern.kind() == "identifier" && pattern.byte_range() == name.byte_range()
+                    })
+                });
             let Some(identifier) = source.get(name.start_byte()..name.end_byte()) else {
                 return Ok(undecided());
             };
-            let Some(binding) = resolve_lexical_binding(
-                Language::Rust,
-                prepared.tree().root_node(),
-                source,
-                name.start_byte(),
-                name.end_byte(),
-                identifier,
-            ) else {
-                return Ok(undecided());
+            // At its own declaration the name resolves outward past the `let`
+            // being declared, so an unannotated `let n = ...` must stay
+            // undecided rather than take a shadowed binding's type.
+            let declared = match declaration {
+                Some(owner) => owner.child_by_field_name("type"),
+                None => (|| {
+                    let binding = resolve_lexical_binding(
+                        Language::Rust,
+                        prepared.tree().root_node(),
+                        source,
+                        name.start_byte(),
+                        name.end_byte(),
+                        identifier,
+                    )?;
+                    let (LexicalBindingResolution::Parameter(definition)
+                    | LexicalBindingResolution::OtherLocal(definition)) = binding;
+                    prepared
+                        .tree()
+                        .root_node()
+                        .named_descendant_for_byte_range(
+                            definition.declaration_range.start_byte,
+                            definition.declaration_range.end_byte,
+                        )
+                        .and_then(|declaration| {
+                            super::std_types::binding_pattern_owner(
+                                declaration,
+                                definition.name_range.start_byte..definition.name_range.end_byte,
+                            )
+                        })
+                        .and_then(|owner| owner.child_by_field_name("type"))
+                })(),
             };
-            let (LexicalBindingResolution::Parameter(definition)
-            | LexicalBindingResolution::OtherLocal(definition)) = binding;
-            let declared = prepared
-                .tree()
-                .root_node()
-                .named_descendant_for_byte_range(
-                    definition.declaration_range.start_byte,
-                    definition.declaration_range.end_byte,
-                )
-                .and_then(|declaration| {
-                    super::std_types::binding_pattern_owner(
-                        declaration,
-                        definition.name_range.start_byte..definition.name_range.end_byte,
-                    )
-                })
-                .and_then(|owner| owner.child_by_field_name("type"));
             let Some(ty) = declared else {
                 return Ok(undecided());
             };
@@ -281,11 +302,16 @@ impl ValueTypeBarrierContext for RustBarrierContext<'_> {
             // The Rust resolver replaces primitive intrinsic seeds when lexical
             // declarations shadow their spelling. Only its selected intrinsic
             // identity can establish that this occurrence denotes a builtin.
+            let focus = if declaration.is_some() {
+                primitive
+            } else {
+                name
+            };
             let locator = SelectedSemanticLocator::for_reference_range(
                 "rust",
                 mapping.locator.path().as_str(),
-                name.start_byte(),
-                name.end_byte(),
+                focus.start_byte(),
+                focus.end_byte(),
             );
             let answer = operation
                 .resolve_rust_type_for_caller_bounded(
@@ -373,6 +399,62 @@ impl ValueTypeBarrierContext for RustBarrierContext<'_> {
                 }),
             )
         })
+    }
+}
+
+impl ValueTypeBarrierContext for RustBarrierContext<'_> {
+    fn guard_interior_mutability(
+        &self,
+        observation: &BarrierObservation,
+        request: &mut SemanticRequest<'_>,
+    ) -> crate::analyzer::semantic::partial_flow::guard_bindings::GuardInteriorMutability {
+        let observed = self.observed_type_impl(observation, request, true).ok();
+        super::std_types::guard_stability::for_observation(
+            self.analyzer,
+            observation,
+            observed.as_ref(),
+            request,
+        )
+    }
+
+    fn guard_storage_exclusivity(
+        &self,
+        observation: &BarrierObservation,
+        request: &mut SemanticRequest<'_>,
+    ) -> crate::analyzer::semantic::partial_flow::guard_bindings::GuardStorageExclusivity {
+        super::std_types::guard_stability::storage_exclusivity(self.analyzer, observation, request)
+    }
+
+    fn guard_comparison_semantics(
+        &self,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        guard: &crate::analyzer::semantic::GuardFact,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(), crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason>
+    {
+        super::std_types::guard_stability::comparison_semantics(
+            self.analyzer,
+            procedure,
+            guard,
+            request,
+        )
+    }
+
+    fn guard_argument_nonmutating(
+        &self,
+        formal: &BarrierObservation,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(), crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason>
+    {
+        super::std_types::guard_stability::argument_nonmutating(self.analyzer, formal, request)
+    }
+
+    fn observed_type(
+        &self,
+        observation: &BarrierObservation,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ObservedValueType, SemanticProviderError> {
+        self.observed_type_impl(observation, request, false)
     }
 
     fn classify(

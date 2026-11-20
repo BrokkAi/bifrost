@@ -1033,6 +1033,7 @@ pub struct SelectedCSharpCompilationConfiguration {
 impl AnalyzerStore {
     /// The current-format compilation set selected by this retained snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_selected_compilation_set(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1043,6 +1044,7 @@ impl AnalyzerStore {
 
     /// Read one owner's evaluator inputs without retaining a compilation index.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_owner_environment(
         &self,
         compilation_id: i64,
@@ -1082,6 +1084,7 @@ impl AnalyzerStore {
 
     /// Count missing decisions at a process's first read of this generation.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_missing_decision_count(
         &self,
         workspace: &WorkspaceId,
@@ -1097,6 +1100,7 @@ impl AnalyzerStore {
 
     /// Revisioned C# source refusals in the selected snapshot, keyed by path.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_selected_refusal_paths(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1126,6 +1130,7 @@ impl AnalyzerStore {
     /// The decision attached to this path in the specified retained revision.
     /// None means no selected source version; Some(None) means a corrupt C#
     /// source version without its required decision.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_selected_file_decision(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1147,6 +1152,7 @@ impl AnalyzerStore {
         .map_err(Into::into)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_file_version_decision(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1305,6 +1311,7 @@ fn read_unseen_branch_files(
 impl AnalyzerStore {
     /// Referenced symbols of the exact immutable variant, in symbol order.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_referenced_symbols(&self, key: &crate::gitblob::BlobKey) -> Result<Vec<String>> {
         let conn = self.read_conn()?;
         let mut statement = conn.prepare_cached(REFERENCED_SYMBOLS_SQL)?;
@@ -1365,6 +1372,7 @@ impl AnalyzerStore {
     /// The caller supplies a captured inventory path; this entry has no selected-source guard.
     /// None means the set is absent, obsolete or membership-capped.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn csharp_compilations_of_set(
         &self,
         set_id: i64,
@@ -1396,6 +1404,7 @@ impl AnalyzerStore {
     /// The compilation rules `snapshot` selects, or `None` when the revision
     /// has no selection that satisfies the validity rule.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_csharp_compilations(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1865,6 +1874,10 @@ impl<'a> CSharpCompilationView<'a> {
     /// Membership for a source authorized by this selected inventory, including
     /// a new transient source with no persisted file-version row.
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(super) fn selected_compilations_of(
         &self,
         selection: &super::resolution_selection::SelectedResolutionMountInventory<'_>,
@@ -2680,8 +2693,8 @@ mod tests {
                 "csharp_extent_stored_source_enumeration",
                 vec![vec!["USING PRIMARY KEY", "USING COVERING INDEX"]],
             ),
-            ("csharp_selected_global_using_coverage", vec![]),
-            ("csharp_selected_global_using_sites", vec![]),
+            ("csharp_selected_global_using_inventory", vec![]),
+            ("csharp_selected_compilation_labels", vec![]),
             (
                 "csharp_unseen_branch_files",
                 vec![
@@ -2739,6 +2752,9 @@ mod tests {
                                     "SCAN CONSTANT ROW",
                                     "SCAN j VIRTUAL TABLE",
                                     "SCAN m",
+                                    // One route's key-ordered children, each
+                                    // reached by its own primary-key SEARCH.
+                                    "SCAN (subquery-",
                                     "SCAN temp.selected_csharp_extent_state"
                                 ]
                                 .iter()
@@ -3054,6 +3070,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn decision_replacement_keeps_earlier_revisions_for_unchanged_content() {
         use super::super::{WorkspaceFileRow, WorkspaceId, WorkspaceSnapshots};
         let store = AnalyzerStore::open_ephemeral().unwrap();

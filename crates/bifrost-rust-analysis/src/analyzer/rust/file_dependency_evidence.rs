@@ -822,7 +822,8 @@ fn activation(package: &str, version: Option<Version>) -> SemanticModelActivatio
         toolchain: None,
         target: None,
         configuration: None,
-        artifact_sha256: None,
+        production_input_digest: None,
+        verified_raw_artifacts: Vec::new(),
     }
 }
 fn kind_label(kind: RustCargoDependencyKind) -> &'static str {

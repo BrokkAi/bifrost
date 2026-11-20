@@ -37,6 +37,47 @@ pub(super) fn decode(text: &str, offset: usize) -> Result<DecodedLiteral, &'stat
     if text.starts_with("\"\"\"") {
         return Err("java-text-block-not-supported");
     }
+    let translated = translate_unicode_escapes(text, offset)?;
+    if translated.first().map(|t| t.0) != Some(34) || translated.last().map(|t| t.0) != Some(34) {
+        return Err("java-invalid-string-delimiters");
+    }
+    let cooked = cook_escapes(&translated, 34)?;
+    let mut value = String::new();
+    let mut chars = Vec::new();
+    let mut i = 0;
+    while i < cooked.len() {
+        let (unit, source_start, mut source_end) = cooked[i];
+        i += 1;
+        let scalar = if (0xd800..=0xdbff).contains(&unit) {
+            let &(low, _, end) = cooked.get(i).ok_or("java-unpaired-surrogate")?;
+            if !(0xdc00..=0xdfff).contains(&low) {
+                return Err("java-unpaired-surrogate");
+            }
+            source_end = end;
+            i += 1;
+            0x10000 + ((u32::from(unit) - 0xd800) << 10) + u32::from(low) - 0xdc00
+        } else {
+            u32::from(unit)
+        };
+        value.push(char::from_u32(scalar).ok_or("java-unpaired-surrogate")?);
+        chars.push(MappedChar {
+            source_start,
+            source_end,
+        });
+    }
+    Ok(DecodedLiteral {
+        value,
+        chars,
+        source_start: offset,
+    })
+}
+
+/// JLS 3.3: translate `\uXXXX` escapes to UTF-16 units, keeping the original
+/// byte range of each unit.
+fn translate_unicode_escapes(
+    text: &str,
+    offset: usize,
+) -> Result<Vec<(u16, usize, usize)>, &'static str> {
     let raw: Vec<_> = text.char_indices().collect();
     let mut translated = Vec::<(u16, usize, usize)>::new();
     let mut i = 0;
@@ -77,11 +118,19 @@ pub(super) fn decode(text: &str, offset: usize) -> Result<DecodedLiteral, &'stat
             return Err("java-pattern-budget");
         }
     }
-    if translated.first().map(|t| t.0) != Some(34) || translated.last().map(|t| t.0) != Some(34) {
-        return Err("java-invalid-string-delimiters");
-    }
+    Ok(translated)
+}
+
+/// JLS 3.10.7: resolve the escapes between the delimiters of a translated
+/// literal. `quote` is the delimiter unit; it may appear only escaped, and a
+/// line terminator may not appear at all. Each returned unit is exact UTF-16,
+/// so a lone surrogate escape is returned as-is and left to the caller.
+fn cook_escapes(
+    translated: &[(u16, usize, usize)],
+    quote: u16,
+) -> Result<Vec<(u16, usize, usize)>, &'static str> {
     let mut cooked = Vec::new();
-    i = 1;
+    let mut i = 1;
     while i + 1 < translated.len() {
         let (mut unit, begin, mut end) = translated[i];
         i += 1;
@@ -117,39 +166,29 @@ pub(super) fn decode(text: &str, offset: usize) -> Result<DecodedLiteral, &'stat
             if i >= translated.len() {
                 return Err("java-escaped-closing-delimiter");
             }
-        } else if matches!(unit, 10 | 13 | 34) {
+        } else if unit == quote || matches!(unit, 10 | 13) {
             return Err("java-invalid-string-character");
         }
         cooked.push((unit, begin, end));
     }
-    let mut value = String::new();
-    let mut chars = Vec::new();
-    i = 0;
-    while i < cooked.len() {
-        let (unit, source_start, mut source_end) = cooked[i];
-        i += 1;
-        let scalar = if (0xd800..=0xdbff).contains(&unit) {
-            let &(low, _, end) = cooked.get(i).ok_or("java-unpaired-surrogate")?;
-            if !(0xdc00..=0xdfff).contains(&low) {
-                return Err("java-unpaired-surrogate");
-            }
-            source_end = end;
-            i += 1;
-            0x10000 + ((u32::from(unit) - 0xd800) << 10) + u32::from(low) - 0xdc00
-        } else {
-            u32::from(unit)
-        };
-        value.push(char::from_u32(scalar).ok_or("java-unpaired-surrogate")?);
-        chars.push(MappedChar {
-            source_start,
-            source_end,
-        });
+    Ok(cooked)
+}
+
+/// Decode an AST-selected Java `character_literal` to its one UTF-16 unit.
+/// A lone surrogate escape is a legal `char`, so it is exact here.
+pub fn decoded_char_literal_value(node: tree_sitter::Node<'_>, source: &str) -> Option<u16> {
+    if node.kind() != "character_literal" || node.has_error() {
+        return None;
     }
-    Ok(DecodedLiteral {
-        value,
-        chars,
-        source_start: offset,
-    })
+    let text = node.utf8_text(source.as_bytes()).ok()?;
+    let translated = translate_unicode_escapes(text, node.start_byte()).ok()?;
+    if translated.first().map(|t| t.0) != Some(39) || translated.last().map(|t| t.0) != Some(39) {
+        return None;
+    }
+    match cook_escapes(&translated, 39).ok()?.as_slice() {
+        [(unit, _, _)] => Some(*unit),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

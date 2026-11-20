@@ -34,7 +34,7 @@ use brokk_bifrost_core::analyzer::js_ts_facts::{
 };
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
+    CancellableNamedTreeWalk, walk_named_tree_preorder_cancellable,
 };
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
@@ -84,6 +84,9 @@ pub struct JsTsReceiverFactProvider<'tree, 'a> {
     jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
     /// Props owners by (enclosing scope, component name) in this file.
     jsx_component_owner_cache: RefCell<HashMap<(usize, String), Vec<CodeUnit>>>,
+    /// The request's cancellation. A cancelled walk stops early with a
+    /// non-precise answer and the receiver query reports the cancellation.
+    cancellation: Option<&'a CancellationToken>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,17 +99,6 @@ struct IndexedNodeRange {
 pub struct JsTsReceiverSyntaxIndex {
     function_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
     class_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
-}
-
-pub enum JsTsReceiverSyntaxIndexBuild {
-    Complete {
-        index: Arc<JsTsReceiverSyntaxIndex>,
-        visited: usize,
-    },
-    ExceededScope {
-        visited: usize,
-    },
-    Cancelled,
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
@@ -192,7 +184,18 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             member_target_cache: RefCell::new(HashMap::default()),
             jsx_props_owner_cache: RefCell::new(HashMap::default()),
             jsx_component_owner_cache: RefCell::new(HashMap::default()),
+            cancellation: None,
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: Option<&'a CancellationToken>) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     pub fn resolve_receiver_node(
@@ -408,11 +411,6 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 IdentifierBindingProofSearch::NotImmutable => {
                     return tracker.report(ReceiverAnalysisOutcome::Unknown);
                 }
-                IdentifierBindingProofSearch::ExceededBudget => {
-                    return tracker.report(ReceiverAnalysisOutcome::ExceededBudget {
-                        limit: "max_scope_nodes",
-                    });
-                }
             }
         }
         tracker.report(ReceiverAnalysisOutcome::Unknown)
@@ -428,8 +426,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let mut proof = IdentifierBindingProofSearch::NoBinding;
         let mut stack = vec![scope];
         while let Some(node) = stack.pop() {
-            if tracker.record_scope_node().is_err() {
-                return IdentifierBindingProofSearch::ExceededBudget;
+            tracker.record_scope_node();
+            if self.cancelled() {
+                return IdentifierBindingProofSearch::NotImmutable;
             }
             if node.id() != scope.id() && is_scope_boundary(node.kind()) {
                 continue;
@@ -582,12 +581,12 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     fn resolve_jsx_component_props_owners(&self, site: Node<'tree>, name: &str) -> Vec<CodeUnit> {
-        let bindings = visible_component_bindings(site, name, self.source);
+        let bindings = visible_component_bindings(site, name, self.source, self.cancellation);
         if bindings.len() > 1 {
             return Vec::new();
         }
         if let Some(binding) = bindings.first() {
-            return jsx_binding_props_source(*binding, self.source)
+            return jsx_binding_props_source(*binding, self.source, self.cancellation)
                 .map(|props| {
                     self.jsx_props_source_owners(
                         props,
@@ -1343,8 +1342,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .expect("receiver provider has lexical scopes");
         let function = enclosing_function_scope(receiver_node).map(|node| node.id());
         for byte in bindings.binding_write_sites_at(receiver, receiver_node.start_byte()) {
-            if let Err(limit) = tracker.record_scope_node() {
-                return limit.exceeded();
+            tracker.record_scope_node();
+            if self.cancelled() {
+                return ReceiverAnalysisOutcome::Unknown;
             }
             let write = self
                 .root
@@ -1434,8 +1434,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let mut latest = None;
         let mut stack = vec![scope];
         while let Some(node) = stack.pop() {
-            if let Err(limit) = tracker.record_scope_node() {
-                return Some(limit.exceeded());
+            tracker.record_scope_node();
+            if self.cancelled() {
+                return Some(ReceiverAnalysisOutcome::Unknown);
             }
             if node.start_byte() >= before_byte {
                 continue;
@@ -1507,8 +1508,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         // tree-sitter finds a parent by descending from the root (#7724).
         let mut stack = vec![(scope, false)];
         while let Some((node, same_scope)) = stack.pop() {
-            if let Err(limit) = tracker.record_scope_node() {
-                return Some(limit.exceeded());
+            tracker.record_scope_node();
+            if self.cancelled() {
+                return Some(ReceiverAnalysisOutcome::Unknown);
             }
             if node.start_byte() >= before_byte {
                 continue;
@@ -1553,7 +1555,13 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     .into_iter()
                     .take_while(|s| s.id() != scope.id())
                     .any(|block| {
-                        !component_bindings_in_scope(block, receiver, self.source).is_empty()
+                        !component_bindings_in_scope(
+                            block,
+                            receiver,
+                            self.source,
+                            self.cancellation,
+                        )
+                        .is_empty()
                     })
                 {
                     continue;
@@ -2100,10 +2108,11 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         else {
             return ReceiverAnalysisOutcome::Unknown;
         };
-        let exits = match function_body_exits(body, self.source, || tracker.record_scope_node()) {
-            Ok(Some(exits)) => exits,
-            Ok(None) => return ReceiverAnalysisOutcome::Unknown,
-            Err(limit) => return limit.exceeded(),
+        let Some(exits) = function_body_exits(body, self.source, || {
+            tracker.record_scope_node();
+            !self.cancelled()
+        }) else {
+            return ReceiverAnalysisOutcome::Unknown;
         };
         let mut outcomes = Vec::with_capacity(exits.returns.len() + 1);
         for value in exits.returns {
@@ -2419,6 +2428,7 @@ pub(crate) enum JsxPropsSource<'tree> {
 pub(crate) fn jsx_binding_props_source<'tree>(
     binding: Node<'tree>,
     source: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<JsxPropsSource<'tree>> {
     match binding.kind() {
         "function_declaration"
@@ -2433,7 +2443,7 @@ pub(crate) fn jsx_binding_props_source<'tree>(
             .child_by_field_name("type")
             .and_then(|annotation| component_type_props_source(annotation, source)),
         "shorthand_property_identifier_pattern" | "pair_pattern" => {
-            destructured_binding_props_source(binding, source)
+            destructured_binding_props_source(binding, source, cancellation)
         }
         _ => None,
     }
@@ -2523,6 +2533,7 @@ const MAX_JSX_DESTRUCTURING_DEPTH: usize = 4;
 fn destructured_binding_props_source<'tree>(
     binding: Node<'tree>,
     source: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<JsxPropsSource<'tree>> {
     let mut members = Vec::new();
     let mut current = binding;
@@ -2555,7 +2566,7 @@ fn destructured_binding_props_source<'tree>(
                 // `components`, which carries the type this reads through.
                 let value = owner.child_by_field_name("value")?;
                 let name = simple_identifier_text(value, source)?;
-                let bindings = visible_component_bindings(owner, name, source);
+                let bindings = visible_component_bindings(owner, name, source, cancellation);
                 let [next] = bindings.as_slice() else {
                     return None;
                 };
@@ -2709,11 +2720,12 @@ fn visible_component_bindings<'tree>(
     site: Node<'tree>,
     name: &str,
     source: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<Node<'tree>> {
     let mut scope = Some(site);
     while let Some(current) = scope {
         if is_scope_boundary(current.kind()) {
-            let bindings = component_bindings_in_scope(current, name, source);
+            let bindings = component_bindings_in_scope(current, name, source, cancellation);
             if !bindings.is_empty() {
                 return bindings;
             }
@@ -2723,14 +2735,20 @@ fn visible_component_bindings<'tree>(
     Vec::new()
 }
 
+/// The walk polls `cancellation` per node; a cancelled walk returns what it
+/// found and the receiver query reports the cancellation.
 fn component_bindings_in_scope<'tree>(
     scope: Node<'tree>,
     name: &str,
     source: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<Node<'tree>> {
     let mut bindings = Vec::new();
     let mut stack = vec![scope];
     while let Some(node) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
         if let Some(binding) = binding_node_for_name(node, name, source) {
             bindings.push(binding);
             continue;
@@ -3024,7 +3042,6 @@ enum IdentifierBindingProofSearch {
     NoBinding,
     Immutable(Range),
     NotImmutable,
-    ExceededBudget,
 }
 
 fn variable_declarator_is_const(declarator: Node<'_>) -> bool {
@@ -3164,62 +3181,46 @@ fn is_declaration_boundary(kind: &str) -> bool {
     )
 }
 
+/// Index the file's function and class declarations by name. `None` means the
+/// build was cancelled. Visiting syntax never refuses (#13216); the second
+/// element is the number of named nodes visited, reported as setup work.
 pub fn build_js_ts_receiver_syntax_index<'tree>(
     root: Node<'tree>,
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(Arc<JsTsReceiverSyntaxIndex>, usize)> {
-    match build_js_ts_receiver_syntax_index_bounded(root, source, cancellation, usize::MAX) {
-        JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => Some((index, visited)),
-        JsTsReceiverSyntaxIndexBuild::Cancelled => None,
-        JsTsReceiverSyntaxIndexBuild::ExceededScope { .. } => {
-            unreachable!("an in-memory syntax tree cannot exceed usize::MAX nodes")
-        }
-    }
-}
-
-pub fn build_js_ts_receiver_syntax_index_bounded<'tree>(
-    root: Node<'tree>,
-    source: &str,
-    cancellation: Option<&CancellationToken>,
-    max_scope_nodes: usize,
-) -> JsTsReceiverSyntaxIndexBuild {
     let mut functions: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
     let mut classes: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
-    let traversal =
-        walk_named_tree_preorder_bounded(root, true, max_scope_nodes, cancellation, |node| {
-            let range = IndexedNodeRange {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-            };
-            if node.kind() == "function_declaration"
-                && let Some(name_node) = node.child_by_field_name("name")
-                && let Some(name) = simple_identifier_text(name_node, source)
-            {
-                functions.entry(name.to_string()).or_default().push(range);
-            } else if matches!(
-                node.kind(),
-                "class_declaration" | "abstract_class_declaration"
-            ) && let Some(name_node) = node.child_by_field_name("name")
-                && let Some(name) = simple_identifier_text(name_node, source)
-            {
-                classes.entry(name.to_string()).or_default().push(range);
-            }
-        });
-    let visited = match traversal {
-        BoundedNamedTreeWalk::Complete { visited } => visited,
-        BoundedNamedTreeWalk::Exceeded { visited } => {
-            return JsTsReceiverSyntaxIndexBuild::ExceededScope { visited };
+    let traversal = walk_named_tree_preorder_cancellable(root, true, cancellation, |node| {
+        let range = IndexedNodeRange {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        };
+        if node.kind() == "function_declaration"
+            && let Some(name_node) = node.child_by_field_name("name")
+            && let Some(name) = simple_identifier_text(name_node, source)
+        {
+            functions.entry(name.to_string()).or_default().push(range);
+        } else if matches!(
+            node.kind(),
+            "class_declaration" | "abstract_class_declaration"
+        ) && let Some(name_node) = node.child_by_field_name("name")
+            && let Some(name) = simple_identifier_text(name_node, source)
+        {
+            classes.entry(name.to_string()).or_default().push(range);
         }
-        BoundedNamedTreeWalk::Cancelled => return JsTsReceiverSyntaxIndexBuild::Cancelled,
+    });
+    let visited = match traversal {
+        CancellableNamedTreeWalk::Complete { visited } => visited,
+        CancellableNamedTreeWalk::Cancelled => return None,
     };
-    JsTsReceiverSyntaxIndexBuild::Complete {
-        index: Arc::new(JsTsReceiverSyntaxIndex {
+    Some((
+        Arc::new(JsTsReceiverSyntaxIndex {
             function_declarations_by_name: functions,
             class_declarations_by_name: classes,
         }),
         visited,
-    }
+    ))
 }
 
 fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {

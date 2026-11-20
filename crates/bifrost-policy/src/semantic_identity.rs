@@ -1,6 +1,7 @@
 use crate::finding::PolicySourceLocation;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CallSiteHandle, ProcedureHandle, ProgramPointHandle, SemanticLocator,
+    CallSiteHandle, DeclarationSegmentKind, ProcedureHandle, ProgramPointHandle, SemanticLocator,
+    is_unmaterialized_external_artifact_locator,
 };
 use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::text_utils::{
@@ -44,6 +45,41 @@ pub(super) fn policy_location(
         end_line as u64,
         end_column as u64,
     )
+}
+
+/// Render a locator for user-facing diagnostic text: workspace-relative path,
+/// 1-based line:column of the anchor, and the declaration name path. The
+/// locator's mount digest depends on the workspace root, so it never appears.
+/// A synthetic unmaterialized-external locator has a sentinel provenance path
+/// and no real position, so it renders as its declaration name path alone.
+pub(super) fn locator_label(
+    workspace: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> Result<String, String> {
+    let names = locator
+        .declaration()
+        .segments()
+        .iter()
+        .filter(|segment| segment.kind() != DeclarationSegmentKind::File)
+        .map(|segment| match segment.name() {
+            Some(name) => name.to_owned(),
+            None => format!("<{}>", segment.kind().stable_label()),
+        })
+        .collect::<Vec<_>>()
+        .join("::");
+    if is_unmaterialized_external_artifact_locator(locator) {
+        return Ok(names);
+    }
+    let location = policy_location(workspace, locator)?;
+    let region = location
+        .region()
+        .expect("policy_location always produces a span location");
+    Ok(format!(
+        "{}:{}:{} {names}",
+        location.path(),
+        region.start_line(),
+        region.start_column()
+    ))
 }
 
 type FileCoordinates = (ProjectFile, (String, Vec<usize>));

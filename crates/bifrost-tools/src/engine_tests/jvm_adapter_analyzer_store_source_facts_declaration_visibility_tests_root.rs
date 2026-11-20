@@ -38,6 +38,10 @@ mod jvm_extraction_tests {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState;
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn java_visibility_publication_is_exact_across_reopen_reader_shapes_and_native_projection() {
         let (fixture, file, state) = java_fixture();
         assert_source_visibility_properties(&state);
@@ -111,6 +115,10 @@ mod jvm_extraction_tests {
         assert_eq!(visibility_snapshot(&conn, id), reopened_snapshot);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn empty_java_visibility_publication_is_present_and_distinct_from_legacy() {
         let fixture = InlineTestProject::with_language(Language::Java)
             .file("Empty.java", "")
@@ -182,6 +190,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn incomplete_java_visibility_bridges_fail_atomically_without_legacy_fallback() {
         for missing in ["metadata", "native"] {
             let (_fixture, _file, mut state) = java_fixture();
@@ -260,6 +272,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn legacy_visibility_rows_cannot_override_a_canonical_java_publication() {
         let (_fixture, _file, state) = java_fixture();
         let store = AnalyzerStore::open_ephemeral().expect("legacy projection store");
@@ -317,6 +333,10 @@ mod jvm_extraction_tests {
         assert_eq!(after.native_visibility, before.native_visibility);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn damaged_java_visibility_publication_is_unavailable_not_legacy() {
         use brokk_bifrost_core::analyzer::{
             DefinitionLanguageScope, RelationalDefinitionQuery, RelationalDefinitionRequest,

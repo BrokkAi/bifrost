@@ -8,7 +8,7 @@ use brokk_bifrost_core::analyzer::config::JvmExternalDependencies;
 
 use brokk_bifrost_core::analyzer::config::JvmMavenCoordinate;
 
-use brokk_bifrost_core::analyzer::project::Project;
+use brokk_bifrost_core::analyzer::project::{Project, SharedWorkspaceFileListing};
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
@@ -29,22 +29,149 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// The workspace inputs dependency discovery reads: the file listing and each manifest's bounded source.
-/// The live implementation reads the project exactly as before; the per-request fill (#9559) supplies a
-/// captured, validated set instead.
+/// The live implementation selects build inventory while retaining original-view bytes;
+/// the per-request fill (#9559) supplies a captured, validated set instead.
 pub(crate) trait DiscoveryInputs {
     fn files(&self) -> std::io::Result<Arc<BTreeSet<ProjectFile>>>;
+    fn files_with_omissions(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+        Ok((
+            self.files()?,
+            Arc::new(vec![
+                brokk_bifrost_core::analyzer::project::WorkspaceFileOmission {
+                    path: PathBuf::new(),
+                    reason:
+                        brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason::Unknown,
+                    bounded: None,
+                },
+            ]),
+        ))
+    }
     fn bounded_source(&self, file: &ProjectFile, max_bytes: usize) -> Option<String>;
 }
 
-pub(crate) struct LiveDiscoveryInputs<'a>(pub(crate) &'a dyn Project);
+/// One decision point for build inventory scope. Bytes stay on the original
+/// view, preserving overlays; the original stamp still brackets selection.
+pub(crate) fn manifest_scope<'a>(
+    project: &'a dyn Project,
+    config: &brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig,
+) -> LiveDiscoveryInputs<'a> {
+    use brokk_bifrost_core::analyzer::project::ProjectBuildAuthority;
+    let authority = project.build_authority();
+    let missing_revision = matches!(authority, ProjectBuildAuthority::MissingRevision);
+    let full = match authority {
+        ProjectBuildAuthority::Full { project, inventory } if !config.without_project_build => {
+            Some(ProjectBuildInputs { project, inventory })
+        }
+        _ => None,
+    };
+    LiveDiscoveryInputs {
+        project,
+        full,
+        missing_revision,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectBuildInputs<'a> {
+    project: &'a brokk_bifrost_core::analyzer::project::FilesystemProject,
+    inventory: Option<&'a BTreeSet<ProjectFile>>,
+}
+
+/// Query-borrowed scope; no inventory or manifest map survives the request.
+pub(crate) struct LiveDiscoveryInputs<'a> {
+    pub(crate) project: &'a dyn Project,
+    full: Option<ProjectBuildInputs<'a>>,
+    pub(crate) missing_revision: bool,
+}
+
+impl LiveDiscoveryInputs<'_> {
+    pub(crate) fn uses_project_build(&self) -> bool {
+        self.full.is_some()
+    }
+
+    /// Full-build reads belong to ExternalSelection, never to source facts.
+    pub(crate) fn capture_boundary<T>(&self, read: impl FnOnce() -> T) -> T {
+        if self.uses_project_build() {
+            brokk_bifrost_core::analyzer::project_reads::without_project_reads(read)
+        } else {
+            read()
+        }
+    }
+
+    pub(crate) fn authoritative_listing(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+        self.capture_boundary(|| {
+            if let Some(full) = self.full {
+                let listing =
+                    brokk_bifrost_core::analyzer::project::collect_workspace_files_with_omissions(
+                        full.project.root(),
+                    )?;
+                if full
+                    .inventory
+                    .is_some_and(|expected| expected != &listing.files)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "live workspace inventory changed since this diff image was selected",
+                    ));
+                }
+                Ok((
+                    self.include_overlay_files(Arc::new(listing.files)),
+                    Arc::new(listing.omissions),
+                ))
+            } else {
+                // Preserve subset omissions while checking its authoritative membership.
+                let files = self.project.authoritative_files()?;
+                Ok((Arc::new(files), self.project.all_files_with_omissions()?.1))
+            }
+        })
+    }
+
+    fn include_overlay_files(
+        &self,
+        mut files: Arc<BTreeSet<ProjectFile>>,
+    ) -> Arc<BTreeSet<ProjectFile>> {
+        if let Some(overlays) = self.project.overlay_content() {
+            for (file, _) in overlays.entries() {
+                if !files.contains(file) {
+                    Arc::make_mut(&mut files).insert(file.clone());
+                }
+            }
+        }
+        files
+    }
+
+    pub(crate) fn invalidate_listing(&self) {
+        if let Some(full) = self.full {
+            full.project.invalidate_cached_file_listing();
+        } else {
+            self.project.invalidate_cached_file_listing();
+        }
+    }
+}
 
 impl DiscoveryInputs for LiveDiscoveryInputs<'_> {
     fn files(&self) -> std::io::Result<Arc<BTreeSet<ProjectFile>>> {
-        self.0.all_files_shared()
+        self.files_with_omissions().map(|listing| listing.0)
+    }
+
+    fn files_with_omissions(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+        self.capture_boundary(|| match self.full {
+            Some(full) => {
+                let (files, omissions) = full.project.all_files_with_omissions()?;
+                Ok((self.include_overlay_files(files), omissions))
+            }
+            None => self.project.all_files_with_omissions(),
+        })
     }
 
     fn bounded_source(&self, file: &ProjectFile, max_bytes: usize) -> Option<String> {
-        brokk_bifrost_analysis::analyzer::common::read_bounded_source(self.0, file, max_bytes)
+        self.capture_boundary(|| {
+            brokk_bifrost_analysis::analyzer::common::read_bounded_source(
+                self.project,
+                file,
+                max_bytes,
+            )
+        })
     }
 }
 
@@ -200,17 +327,42 @@ pub(crate) fn discover_metadata(inputs: &dyn DiscoveryInputs) -> DiscoveredJvmDe
 /// in its own configuration or in an execution's. Gradle compile options are
 /// not read, and an argument built from a property that does not expand is not
 /// seen: the plan for modeling overrides in general is #10492.
-pub(crate) fn maven_platform_override_visible(inputs: &dyn DiscoveryInputs) -> bool {
-    let Ok(files) = inputs.files() else {
-        return false;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MavenPlatformOverride {
+    Visible,
+    #[default]
+    NotVisible,
+    Unknown,
+}
+
+impl MavenPlatformOverride {
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            Self::Visible => 0,
+            Self::NotVisible => 1,
+            Self::Unknown => 2,
+        }
+    }
+}
+
+pub(crate) fn maven_platform_override(inputs: &dyn DiscoveryInputs) -> MavenPlatformOverride {
+    let Ok((files, omissions)) = inputs.files_with_omissions() else {
+        return MavenPlatformOverride::Unknown;
     };
-    files.iter().filter(|file| is_maven_pom(file)).any(|file| {
+    let visible = files.iter().filter(|file| is_maven_pom(file)).any(|file| {
         inputs
             .bounded_source(file, MAX_BUILD_METADATA_BYTES)
             .and_then(|source| parse_xml(&source))
             .filter(|node| node.name == "project")
             .is_some_and(|project| pom_overrides_platform(&project))
-    })
+    });
+    if visible {
+        MavenPlatformOverride::Visible
+    } else if omissions.iter().any(omission_could_hide_manifest) {
+        MavenPlatformOverride::Unknown
+    } else {
+        MavenPlatformOverride::NotVisible
+    }
 }
 
 fn pom_overrides_platform(project: &XmlNode) -> bool {
@@ -416,6 +568,34 @@ fn discover_build_tools_with_executor(
     }
     deduplicate_discovered(&mut discovered);
     discovered
+}
+
+/// Whether a path the workspace listing omitted could hide a file that JVM
+/// dependency discovery reads (#9559). One symlink to a source file must not
+/// make every answer incomplete, so only an omission that can hold a manifest
+/// counts.
+///
+/// A file-like omission counts when its name is a dependency input by
+/// [`is_jvm_dependency_input_path`], the one predicate discovery, the
+/// authority and the analyzers share. A directory-like omission counts always:
+/// the files below a symlinked directory are not listed, and an unreadable or
+/// unknown kind may be a directory. A path that is not UTF-8 in a git listing
+/// has no name to check, so it counts conservatively.
+pub(crate) fn omission_could_hide_manifest(
+    omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+) -> bool {
+    use brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason as Reason;
+    match omission.reason {
+        Reason::SymlinkToDirectory
+        | Reason::WalkError
+        | Reason::UnreadableSymlink
+        | Reason::Unknown
+        | Reason::BoundedTree
+        | Reason::NonUtf8GitPath => true,
+        Reason::Symlink | Reason::NonRegular | Reason::NotSupplied | Reason::NonUtf8Name => {
+            is_jvm_dependency_input_path(&omission.path)
+        }
+    }
 }
 
 pub(crate) fn is_jvm_dependency_input(file: &ProjectFile) -> bool {
@@ -1003,7 +1183,7 @@ mod tests {
             </project>
         "#;
         let project = project(&[("pom.xml", pom), ("src/App.java", "class App {}")]);
-        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
+        let discovered = discover_metadata(&manifest_scope(&project, &Default::default()));
         assert_eq!(
             vec![JvmMavenCoordinate::new("org.example", "library", "2.3.4")],
             discovered.coordinates
@@ -1016,7 +1196,7 @@ mod tests {
             "pom.xml",
             "<project><dependencies><dependency><groupId>org.example</groupId><artifactId>local</artifactId><version>1</version><scope>system</scope><systemPath>/outside/workspace.jar</systemPath></dependency></dependencies></project>",
         )]);
-        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
+        let discovered = discover_metadata(&manifest_scope(&project, &Default::default()));
         assert!(discovered.coordinates.is_empty());
         assert!(discovered.artifact_paths.is_empty());
     }
@@ -1034,7 +1214,7 @@ mod tests {
             ),
             ("src/App.java", "class App {}"),
         ]);
-        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
+        let discovered = discover_metadata(&manifest_scope(&project, &Default::default()));
         assert_eq!(
             vec![
                 JvmMavenCoordinate::new("org.example", "alpha", "1.0"),
@@ -1077,7 +1257,7 @@ mod tests {
             ),
             ("src/App.java", "class App {}"),
         ]);
-        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
+        let discovered = discover_metadata(&manifest_scope(&project, &Default::default()));
 
         let declaration = |group: &str, name: &str, version: &str| {
             discovered
@@ -1219,8 +1399,29 @@ malformed
             ..JvmDependencyDiscoveryConfig::default()
         };
 
-        let discovered =
-            discover_build_tools_with_executor(&LiveDiscoveryInputs(&project), &config, &executor);
+        let (discovered, reads) =
+            brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads(
+                || {
+                    let discovered = discover_build_tools_with_executor(
+                        &manifest_scope(&project, &Default::default()),
+                        &config,
+                        &executor,
+                    );
+                    // A build tool's output is not replayable: later
+                    // completion cannot override the refusal.
+                    brokk_bifrost_analysis::analyzer::dependency_support::declare_external_discovery_reads_complete();
+                    discovered
+                },
+            );
+        assert!(!reads.complete);
+        assert!(
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryEvidence::from_outcome(
+                &brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome::complete(Vec::new())
+            )
+            .with_external_reads(reads.keys, reads.complete)
+            .carry_eligible_external_reads()
+            .is_none()
+        );
         assert_eq!(
             vec![
                 JvmMavenCoordinate::new("org.example", "gradle", "2.0"),

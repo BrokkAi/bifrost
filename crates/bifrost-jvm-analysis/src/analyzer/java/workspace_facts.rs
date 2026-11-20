@@ -176,6 +176,12 @@ pub(super) fn answer(
                 java.has_complete_symbol_lookup_index(),
             ))
         }
+        // A budget-limited answer recorded under the same root does not match
+        // the unlimited walk, so it fails verification and is rebuilt.
+        (WorkspaceFactFamily::JavaExternalRootDescendants, FactSubject::Named { name }) => Some(
+            java.external_root_descendants(analyzer, name, usize::MAX, None)
+                .digest(),
+        ),
         (WorkspaceFactFamily::JavaWorkspaceClasses, FactSubject::Named { name }) => {
             Some(classes_digest(
                 &java.workspace_classes(name),
@@ -199,6 +205,246 @@ mod tests {
             .file("app/Target.java", "package app; class Target {}\n")
             .file("lib/Base.java", "package lib; public class Base {}\n")
             .build()
+    }
+
+    #[test]
+    #[hardwon(
+        "#12834: an eager external fetch in the Java type ladder marked source-only resolutions incomplete and leaked build-input reads"
+    )]
+    fn source_settled_type_ladder_queries_do_not_acquire_external_inputs() {
+        use crate::analyzer::java::imports::JavaTypeResolution;
+        use crate::analyzer::java::unshadowed::UseSite;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, QueryReadIncomplete};
+        use brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive;
+        use brokk_bifrost_jvm::java::graph_support::JavaTypeName;
+
+        // Run the consuming cases first: the final source-only query must stay
+        // independent even after a sibling query has filled the external slot.
+        let cases = [
+            (
+                "imported/Use.java",
+                "package imported; import dependency.Helper; class Use { Helper value; }",
+                None,
+                true,
+            ),
+            // #14293: the unresolved supertype may declare a member type
+            // `Helper`; the import still binds and the read stays incomplete.
+            (
+                "inherited/Use.java",
+                "package inherited; import source.Helper; class Use extends dependency.Base { Helper value; }",
+                Some("source:source.Helper"),
+                true,
+            ),
+            (
+                "positive/Use.java",
+                "package positive; class Use extends dependency.Base { Helper value; }",
+                None,
+                true,
+            ),
+            (
+                "unresolved/Use.java",
+                "package unresolved; class Use extends NeverDeclared { Helper value; }",
+                None,
+                true,
+            ),
+            // #14293: likewise the enum's implicit `java.lang.Enum`, which
+            // nothing resolves without a JDK.
+            (
+                "implicit/Use.java",
+                "package implicit; import source.Helper; enum Use { VALUE; Helper value; }",
+                Some("source:source.Helper"),
+                true,
+            ),
+            (
+                "enum_member/Use.java",
+                "package enum_member; enum Use { VALUE; static class Helper {} Helper value; }",
+                Some("source:enum_member.Use.Helper"),
+                false,
+            ),
+            (
+                "enum_type_parameter/Use.java",
+                "package enum_type_parameter; enum Use { VALUE; <T> void run(T value) {} }",
+                None,
+                false,
+            ),
+            (
+                "record_header/Use.java",
+                "package record_header; import source.Helper; record Use(Helper value) {}",
+                Some("source:source.Helper"),
+                false,
+            ),
+            (
+                "source/Use.java",
+                "package source; class Use extends Parent { Helper value; } class Parent {}",
+                Some("source:source.Helper"),
+                false,
+            ),
+        ];
+        let mut builder = InlineTestProject::with_language(Language::Java)
+            .file("source/Helper.java", "package source; public class Helper {}")
+            .file("pom.xml", "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>test</groupId><artifactId>missing</artifactId><version>1</version></dependency></dependencies></project>");
+        for (path, source, _, _) in cases {
+            builder = builder.file(path, source);
+        }
+        let project = builder.build();
+        let mut config = AnalyzerConfig::default();
+        config.jvm.standard_library_discovery.discover_java_home = false;
+        config.jvm.external_dependencies.repository_roots = vec![project.root().join("empty")];
+        config.jvm.external_dependencies.gradle_cache_roots =
+            vec![project.root().join("no-gradle")];
+        let workspace = project.workspace_analyzer(config);
+        let java = resolve_analyzer::<JavaAnalyzer>(workspace.analyzer()).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        for (path, source, expected_target, external_gap) in cases {
+            let file = project.file(path);
+            let tree = parser.parse(source, None).unwrap();
+            let declaration =
+                first_named_descendant_of_kind_inclusive(tree.root_node(), "field_declaration")
+                    .or_else(|| {
+                        first_named_descendant_of_kind_inclusive(
+                            tree.root_node(),
+                            "formal_parameter",
+                        )
+                    })
+                    .expect("the fixture has a typed field or record component");
+            let node = declaration.child_by_field_name("type").unwrap();
+            assert_eq!(node.kind(), "type_identifier");
+            let name = JavaTypeName::from_components(vec![
+                node.utf8_text(source.as_bytes()).unwrap().to_owned(),
+            ])
+            .unwrap();
+            let ((target, reasons, completion), reads) = capture_query_reads(java, || {
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(java);
+                let site = UseSite {
+                    token: scope.token(),
+                    source,
+                    node,
+                };
+                let target = java
+                    .resolve_type_name_at(scope.token(), None, &file, &name, None, Some(&site))
+                    .map(|target| match target {
+                        JavaTypeResolution::Source(unit) => format!("source:{}", unit.fq_name()),
+                        JavaTypeResolution::External(hit) => format!("external:{}", hit.fqn()),
+                    });
+                (
+                    target,
+                    scope.captured_read_incompleteness(),
+                    scope.read_completion(),
+                )
+            });
+            assert_eq!(target.as_deref(), expected_target, "{path}: {reasons:?}");
+            let artifact_gap = reasons.iter().any(|reason| {
+                matches!(
+                    reason.base_cause(),
+                    QueryReadIncomplete::ArtifactUnavailable(_)
+                )
+            });
+            eprintln!(
+                "{path}: selected={target:?}, artifact_gap={artifact_gap}, completion={completion:?}"
+            );
+            assert_eq!(artifact_gap, external_gap, "{path}: {reasons:?}");
+            if path == "unresolved/Use.java" {
+                assert!(
+                    completion.is_err(),
+                    "unresolved hierarchy must stay incomplete: {reasons:?}"
+                );
+            }
+            if !external_gap {
+                assert!(completion.is_ok(), "{path}: {reasons:?}");
+                let keys = reads.keys();
+                assert!(
+                    !keys.iter().any(|key| matches!(key, ReadKey::Scope { .. })),
+                    "{path}: {keys:?}"
+                );
+                assert!(
+                    !keys.iter().any(|key| {
+                        let rel_path = match key {
+                            ReadKey::File { rel_path, .. }
+                            | ReadKey::PathAbsent { rel_path, .. } => rel_path,
+                            _ => return false,
+                        };
+                        crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(
+                            &ProjectFile::new(project.root().to_path_buf(), rel_path.as_ref()),
+                        )
+                    }),
+                    "{path}: {keys:?}"
+                );
+            }
+        }
+
+        // #13491: an unresolved supertype (`NeverDeclared`) must never let the
+        // import resolve as complete, even after acquisition. Since #14293 the
+        // import binds, and the read reports that the supertype may shadow it.
+        use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+        use brokk_bifrost_analysis::analyzer::JvmExternalArtifact;
+        let source = "import source.Helper; class Use extends NeverDeclared { Helper value; }";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Use.java", source)
+            .file(
+                "source/Helper.java",
+                "package source; public class Helper {}",
+            )
+            .build();
+        let jar = project.root().join("present.jar");
+        write_test_class_jar(
+            &jar,
+            &[TestClassFile {
+                internal_name: "unrelated/Present",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+        let mut config = AnalyzerConfig::default();
+        config.jvm.standard_library_discovery.discover_java_home = false;
+        config
+            .jvm
+            .external_dependencies
+            .artifact_paths
+            .push(JvmExternalArtifact {
+                artifact_path: jar,
+                source_artifact_path: None,
+                coordinate: None,
+                origin: brokk_bifrost_analysis::analyzer::JvmExternalArtifactOrigin::Explicit,
+            });
+        let workspace = project.workspace_analyzer(config);
+        let java = resolve_analyzer::<JavaAnalyzer>(workspace.analyzer()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let declaration =
+            first_named_descendant_of_kind_inclusive(tree.root_node(), "field_declaration")
+                .unwrap();
+        let node = declaration.child_by_field_name("type").unwrap();
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(java);
+        let site = UseSite {
+            token: scope.token(),
+            source,
+            node,
+        };
+        let name = JavaTypeName::from_components(vec!["Helper".to_owned()]).unwrap();
+        let target = java.resolve_type_name_at(
+            scope.token(),
+            None,
+            &project.file("Use.java"),
+            &name,
+            None,
+            Some(&site),
+        );
+        assert!(
+            matches!(&target, Some(JavaTypeResolution::Source(unit)) if unit.fq_name() == "source.Helper"),
+            "the import binds past an unresolved supertype: {target:?}"
+        );
+        let reasons = scope.captured_read_incompleteness();
+        eprintln!(
+            "unresolved-populated: target={target:?}, completion={:?}, reasons={reasons:?}",
+            scope.read_completion()
+        );
+        assert!(
+            scope.read_completion().is_err(),
+            "unresolved supertype must stay incomplete: {reasons:?}"
+        );
     }
 
     #[test]
@@ -551,14 +797,14 @@ mod tests {
         let _outer = AnalyzerQueryScope::new(&java);
         let outer_memo = java
             .inner
-            .active_query_request_memo::<AtomicUsize>()
+            .active_query_bookkeeping_slot::<AtomicUsize>()
             .unwrap();
         outer_memo.store(19, Ordering::Relaxed);
         let cell = QueryCacheCell::new();
         replayable_query_cache_cell(&java, &cell, || {
             let inner_memo = java
                 .inner
-                .active_query_request_memo::<AtomicUsize>()
+                .active_query_bookkeeping_slot::<AtomicUsize>()
                 .unwrap();
             assert_eq!(inner_memo.load(Ordering::Relaxed), 0);
             assert!(!Arc::ptr_eq(&outer_memo, &inner_memo));
@@ -571,7 +817,7 @@ mod tests {
                             let _nested = AnalyzerQueryScope::new(&java);
                             let transported = java
                                 .inner
-                                .active_query_request_memo::<AtomicUsize>()
+                                .active_query_bookkeeping_slot::<AtomicUsize>()
                                 .unwrap();
                             assert!(Arc::ptr_eq(&inner_memo, &transported));
                             assert_eq!(transported.load(Ordering::Relaxed), 7);
@@ -585,7 +831,7 @@ mod tests {
             &outer_memo,
             &java
                 .inner
-                .active_query_request_memo::<AtomicUsize>()
+                .active_query_bookkeeping_slot::<AtomicUsize>()
                 .unwrap()
         ));
         assert_eq!(outer_memo.load(Ordering::Relaxed), 19);

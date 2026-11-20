@@ -27,6 +27,9 @@ use brokk_bifrost_rql::structural::identifier_typos::IdentifierTypoTable;
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::packs_document::load_workspace_packs_config_at;
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    SemanticModelActivationInput, SemanticModelActivationRead, SemanticModelSetupFailure,
+};
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, Project, WorkspaceAnalyzer,
 };
@@ -35,7 +38,6 @@ use crate::budget::{PolicyBatchBudget, PolicyBudget};
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use crate::coordinator::{
     PolicyEvaluationInput, activate_owned_policy_workspace, policy_budget_for_workspace,
-    ready_policy_semantic_model_snapshot,
 };
 use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use crate::finding_identity::PolicyFindingId;
@@ -105,17 +107,115 @@ pub fn explain_policy_inputs(
     limits: &ExplanationLimits,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<PolicyExplanation, ExplainError> {
+    explain_policy_inputs_with_semantic_models(
+        root,
+        policy_inputs,
+        target,
+        generation,
+        workspace,
+        None,
+        flow_state,
+        cancellation,
+        limits,
+        retention_budget,
+    )
+}
+
+/// [`explain_policy_inputs`] for a caller that captured the semantic-model
+/// activation of its own `workspace` snapshot (the MCP session). `None` makes
+/// the host capture it: an owned analyzer is activated, a borrowed one is read.
+///
+/// # Errors
+///
+/// Exactly [`explain_policy_inputs`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn explain_policy_inputs_with_semantic_models(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
+    workspace: Option<&WorkspaceAnalyzer>,
+    semantic_models: Option<SemanticModelActivationRead>,
+    flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
+    cancellation: Option<&CancellationToken>,
+    limits: &ExplanationLimits,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+) -> Result<PolicyExplanation, ExplainError> {
     with_one_policy(
         root,
         policy_inputs,
         generation,
         workspace,
+        semantic_models,
         flow_state,
         cancellation,
-        |policy, context, budget| {
-            explain_loaded_policy(policy, context, target, generation, budget, limits)
+        |policy, context, budget, activation| {
+            explain_loaded_policy_under(
+                policy, context, target, generation, budget, limits, activation,
+            )
         },
         retention_budget,
+        None,
+    )
+}
+
+/// Explain through the same kernel with launch-owned approval, not repo options.
+#[allow(clippy::too_many_arguments)]
+pub fn explain_policy_inputs_with_host_activation_context(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
+    limits: &ExplanationLimits,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    host: &Arc<brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext>,
+) -> Result<PolicyExplanation, ExplainError> {
+    with_one_policy(
+        root,
+        policy_inputs,
+        generation,
+        None,
+        None,
+        None,
+        None,
+        |policy, context, budget, activation| {
+            explain_loaded_policy_under(
+                policy, context, target, generation, budget, limits, activation,
+            )
+        },
+        retention_budget,
+        Some(host),
+    )
+}
+
+/// Near-miss questions use the same passed approval as evaluation/explanation.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_policy_near_misses_with_host_activation_context(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    candidates: &NearMissCandidates,
+    generation: Option<ExplanationGeneration>,
+    limits: &ExplanationLimits,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    host: &Arc<brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext>,
+) -> Result<PolicyNearMissRanking, ExplainError> {
+    with_one_policy(
+        root,
+        policy_inputs,
+        generation,
+        None,
+        None,
+        None,
+        None,
+        |policy, context, budget, activation| {
+            let limits = limits.under_semantic_models(activation.status());
+            Ok(
+                rank_near_misses(policy, context, candidates, budget, &limits)?
+                    .answered_under(ExplanationGeneration::of(context.analyzer)),
+            )
+        },
+        retention_budget,
+        Some(host),
     )
 }
 
@@ -145,20 +245,57 @@ pub fn rank_policy_near_misses(
     limits: &ExplanationLimits,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<PolicyNearMissRanking, ExplainError> {
+    rank_policy_near_misses_with_semantic_models(
+        root,
+        policy_inputs,
+        candidates,
+        generation,
+        workspace,
+        None,
+        flow_state,
+        cancellation,
+        limits,
+        retention_budget,
+    )
+}
+
+/// [`rank_policy_near_misses`] for a caller that captured the semantic-model
+/// activation of its own `workspace` snapshot. See
+/// [`explain_policy_inputs_with_semantic_models`].
+///
+/// # Errors
+///
+/// Exactly [`rank_policy_near_misses`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_policy_near_misses_with_semantic_models(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    candidates: &NearMissCandidates,
+    generation: Option<ExplanationGeneration>,
+    workspace: Option<&WorkspaceAnalyzer>,
+    semantic_models: Option<SemanticModelActivationRead>,
+    flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
+    cancellation: Option<&CancellationToken>,
+    limits: &ExplanationLimits,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+) -> Result<PolicyNearMissRanking, ExplainError> {
     with_one_policy(
         root,
         policy_inputs,
         generation,
         workspace,
+        semantic_models,
         flow_state,
         cancellation,
-        |policy, context, budget| {
+        |policy, context, budget, activation| {
+            let limits = limits.under_semantic_models(activation.status());
             Ok(
-                rank_near_misses(policy, context, candidates, budget, limits)?
+                rank_near_misses(policy, context, candidates, budget, &limits)?
                     .answered_under(ExplanationGeneration::of(context.analyzer)),
             )
         },
         retention_budget,
+        None,
     )
 }
 
@@ -173,14 +310,17 @@ fn with_one_policy<T>(
     policy_inputs: &[PolicyEvaluationInput],
     generation: Option<ExplanationGeneration>,
     workspace: Option<&WorkspaceAnalyzer>,
+    semantic_models: Option<SemanticModelActivationRead>,
     flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
     answer: impl FnOnce(
         &LoadedPolicy,
         &PolicyEvaluationContext<'_>,
         &mut PolicyBudget,
+        &SemanticModelActivationRead,
     ) -> Result<T, ExplainError>,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    approval: Option<&Arc<brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext>>,
 ) -> Result<T, ExplainError> {
     let root = root.canonicalize().map_err(|error| {
         unavailable(format!(
@@ -223,6 +363,11 @@ fn with_one_policy<T>(
     let workspace = workspace
         .or(owned.as_ref())
         .expect("either the caller supplied a workspace or one was built");
+    if let Some(host) = approval {
+        workspace
+            .bind_host_activation_context(Arc::clone(host))
+            .map_err(unavailable)?;
+    }
     // This owner boundary covers explanations and near-miss questions. The
     // guard drops before `owned`, including on activation/selection errors.
     let _retention = brokk_bifrost_analysis::profiling::retention_scope(
@@ -237,40 +382,25 @@ fn with_one_policy<T>(
     ExplanationGeneration::require_current(generation, workspace.analyzer())?;
     let uncancelled = CancellationToken::default();
     let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
-    let workspace_activation = match owned.as_ref() {
-        Some(owned_workspace) => {
-            match load_workspace_packs_config_at(&root) {
-                // Ordinary evaluation diagnoses a malformed document and then
-                // evaluates without any semantic publication. An explanation
-                // must still be able to recover a finding retained by that
-                // unreliable run.
-                Err(_) => None,
-                Ok(config) => {
-                    // Activation-construction failures have the same normal-run
-                    // recovery: diagnose there, and explain here under a pinned
-                    // absence rather than changing which findings are reachable.
-                    activate_owned_policy_workspace(
-                        &root,
-                        owned_workspace,
-                        config.as_ref(),
-                        semantic_cancellation,
-                    )
-                    .unwrap_or_default()
-                }
-            }
+    assert!(
+        semantic_models.is_none() || owned.is_none(),
+        "a caller-supplied activation read describes a caller-supplied workspace"
+    );
+    // One capture serves both the pin and the status the answer states. A
+    // failed activation is reported, never turned into an absent snapshot.
+    let activation = match (semantic_models, owned.as_ref()) {
+        (Some(read), _) => read,
+        (None, Some(owned_workspace)) => {
+            owned_activation_read(&root, owned_workspace, semantic_cancellation)
         }
-        None => None,
+        (None, None) => SemanticModelActivationRead::capture(workspace.analyzer()),
     };
     check_explanation_cancellation(cancellation)?;
-    let active_semantic_model_snapshot = match owned.as_ref() {
-        Some(_) => ready_policy_semantic_model_snapshot(workspace_activation.as_ref()),
-        None => workspace.analyzer().active_semantic_model_snapshot(),
-    };
-    // Pin both a successful activation and a deliberate absence for the whole
-    // question. A host publication that races an explanation must not change
-    // the model set between its prefix executions or finding re-evaluation.
+    // Pin the captured publication for the whole question. A host publication
+    // that races an explanation must not change the model set between its
+    // prefix executions or finding re-evaluation.
     let _question_scope =
-        super::value_flow_question_scope(workspace.analyzer(), active_semantic_model_snapshot)?;
+        super::value_flow_question_scope(workspace.analyzer(), activation.snapshot().cloned())?;
     // Normal evaluation resolves qualified policy locators only after the
     // analyzer and semantic publication are ready. Explanation must cross the
     // same loaded-policy boundary or an otherwise runnable policy can fail here
@@ -318,7 +448,41 @@ fn with_one_policy<T>(
     let mut budget =
         policy_budget_for_workspace(*PolicyBatchBudget::default().per_policy(), Some(workspace));
     check_explanation_cancellation(cancellation)?;
-    answer(policy, &context, &mut budget)
+    answer(policy, &context, &mut budget, &activation)
+}
+
+/// Activate every semantic source of an analyzer this host owns and reduce the
+/// outcome, including setup failures, to one read.
+fn owned_activation_read(
+    root: &Path,
+    owned_workspace: &WorkspaceAnalyzer,
+    cancellation: &CancellationToken,
+) -> SemanticModelActivationRead {
+    let config = match load_workspace_packs_config_at(root) {
+        Ok(config) => config,
+        Err(error) => {
+            return SemanticModelActivationRead::reduce(SemanticModelActivationInput::SetupFailed(
+                SemanticModelSetupFailure::PacksDocument(&error),
+            ));
+        }
+    };
+    match activate_owned_policy_workspace(root, owned_workspace, config.as_ref(), cancellation) {
+        Err(error) => {
+            SemanticModelActivationRead::reduce(SemanticModelActivationInput::SetupFailed(
+                SemanticModelSetupFailure::Activation(&error),
+            ))
+        }
+        Ok(None) => SemanticModelActivationRead::reduce(SemanticModelActivationInput::Runtime {
+            ecosystems: &[],
+            runtime: None,
+        }),
+        Ok(Some(activation)) => {
+            SemanticModelActivationRead::reduce(SemanticModelActivationInput::Runtime {
+                ecosystems: &activation.outcome.ecosystems,
+                runtime: activation.outcome.runtime.as_ref(),
+            })
+        }
+    }
 }
 
 /// The catalog typo table an explanation reproduces. A policy that reads it,
@@ -393,9 +557,33 @@ pub fn explain_loaded_policy(
     budget: &mut PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    explain_loaded_policy_under(
+        policy,
+        context,
+        target,
+        generation,
+        budget,
+        limits,
+        &SemanticModelActivationRead::capture(context.analyzer),
+    )
+}
+
+/// [`explain_loaded_policy`] under one already captured activation, so the
+/// host entry point pins and states the same publication.
+fn explain_loaded_policy_under(
+    policy: &LoadedPolicy,
+    context: &PolicyEvaluationContext<'_>,
+    target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
+    budget: &mut PolicyBudget,
+    limits: &ExplanationLimits,
+    activation: &SemanticModelActivationRead,
+) -> Result<PolicyExplanation, ExplainError> {
     ExplanationGeneration::require_current(generation, context.analyzer)?;
     let answered_under = ExplanationGeneration::of(context.analyzer);
-    let active_semantic_model_snapshot = context.analyzer.active_semantic_model_snapshot();
+    let active_semantic_model_snapshot = activation.snapshot().cloned();
+    let limits = limits.under_semantic_models(activation.status());
+    let limits = &limits;
     // This public reuse boundary may be called without `with_one_policy`'s
     // host scope. Freeze one publication for every target so candidate prefix
     // executions and finding adapters cannot observe different model sets.
@@ -433,7 +621,21 @@ pub fn explain_loaded_policy(
                 .map_err(|error| {
                     unavailable(format!("the policy could not be evaluated: {error:?}"))
                 })?;
-            explain_finding(&run, finding_id, limits)
+            let status = activation.status();
+            explain_finding(&run, finding_id, status, limits).map_err(|error| {
+                match (error, status.cause()) {
+                    // Without models the finding may be absent only because
+                    // they did not activate; name that instead of a bare
+                    // not-found.
+                    (ExplainError::FindingNotFound { finding }, Some(cause)) => {
+                        unavailable(format!(
+                            "finding {finding} was not found, and semantic models were not \
+                             active, so it may exist only with them: {cause}"
+                        ))
+                    }
+                    (error, _) => error,
+                }
+            })
         }
         ExplanationTarget::Candidate(candidate) => {
             explain_candidate(policy, context, candidate, budget, limits)

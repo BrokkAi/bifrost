@@ -1306,6 +1306,8 @@ fn rust_source_membership_invalidates_the_stdlib_host_unit_census() {
         "test-only-census",
     );
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         bifrost_version: "0.0.0".parse().unwrap(),
         approximate_standard_libraries: Vec::new(),
         evidence: Vec::new(),
@@ -1342,7 +1344,7 @@ fn rust_source_membership_invalidates_the_stdlib_host_unit_census() {
             .standard_library_pack_expectations()
             .next()
             .unwrap()
-            .approximate;
+            .approximate();
         let mixed = discovery
             .diagnostics
             .iter()

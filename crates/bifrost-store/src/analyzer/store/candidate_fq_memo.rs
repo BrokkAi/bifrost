@@ -23,6 +23,7 @@
 //! outside the caller's outer query holds the memo.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -82,6 +83,7 @@ impl CandidateFqEntry {
 /// per outer query scope and passes it to each relational store read.
 pub struct CandidateFqMemo {
     entries: Mutex<ExactReadMemo<CandidateKey, CandidateFqEntry>>,
+    closed: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     hits: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -97,6 +99,23 @@ impl Default for CandidateFqMemo {
         Self::with_entries(ExactReadMemo::default())
     }
 }
+
+// Every hit is validated against the candidate row the batch selected: the
+// publication witness, lineage, generation and the whole FQ header (see the
+// module comment), so this memo is certifying by construction.
+impl brokk_bifrost_core::domain_memo::SelfCertifying for CandidateFqMemo {
+    fn retire(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let old = {
+            let mut entries = self.entries.lock().expect("candidate FQ memo poisoned");
+            let empty = entries.empty_with_same_caps();
+            std::mem::replace(&mut *entries, empty)
+        };
+        drop(old);
+    }
+}
+brokk_bifrost_core::self_certifying_domain_memo!(CandidateFqMemo);
 
 /// Test view of a memo's work.
 #[cfg(any(test, feature = "test-support"))]
@@ -126,6 +145,7 @@ impl CandidateFqMemo {
     fn with_entries(entries: ExactReadMemo<CandidateKey, CandidateFqEntry>) -> Self {
         Self {
             entries: Mutex::new(entries),
+            closed: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             hits: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -375,6 +395,10 @@ impl<'a> CandidateFqBatch<'a> {
     /// Admit the identities this batch read. Call only after the batch has
     /// completed without error or cancellation.
     pub(super) fn finish(self) {
+        // A retired memo admits nothing, even through a detached handle.
+        if self.memo.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut entries = self
             .memo
             .entries

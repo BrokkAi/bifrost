@@ -751,22 +751,107 @@ fn parse_rust_macro_source_tree(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_rust_embedded_item_sources<'source>(
+trait RustEmbeddedSourceConsumer<'source> {
+    fn declaration(
+        &mut self,
+        _tree_id: usize,
+        _declaration: SourceDeclarationId,
+        _node: Node<'_>,
+        _collector: &mut PrimarySourceFactCollector<'source>,
+        _maps: &mut [RustEmbeddedSourceMap],
+    ) {
+    }
+    fn enter(
+        &mut self,
+        _tree_id: usize,
+        _node: Node<'_>,
+        _source: &'source str,
+        _collector: &mut PrimarySourceFactCollector<'source>,
+        _maps: &mut [RustEmbeddedSourceMap],
+    ) {
+    }
+    fn exit(&mut self) {}
+    fn macro_source(
+        &mut self,
+        _invocation: SourceOccurrenceId,
+        _outcome: Result<Option<SourceOccurrenceId>, RustMacroParseFailure>,
+    ) {
+    }
+}
+
+impl<'source> RustEmbeddedSourceConsumer<'source> for () {}
+
+struct RustEmbeddedItemSources<'a, 'source> {
+    modules: &'a mut crate::facts::RustModuleSourceCollector<'source>,
+    items: &'a mut RustItemSourceCollector,
+    types: &'a mut RustTypeSourceCollector,
+}
+
+impl<'source> RustEmbeddedSourceConsumer<'source> for RustEmbeddedItemSources<'_, 'source> {
+    fn declaration(
+        &mut self,
+        tree_id: usize,
+        declaration: SourceDeclarationId,
+        node: Node<'_>,
+        collector: &mut PrimarySourceFactCollector<'source>,
+        maps: &mut [RustEmbeddedSourceMap],
+    ) {
+        if node.kind() == "mod_item" {
+            self.modules
+                .record_embedded_declaration(tree_id, declaration, node, collector, maps);
+        }
+    }
+    fn enter(
+        &mut self,
+        tree_id: usize,
+        node: Node<'_>,
+        source: &'source str,
+        collector: &mut PrimarySourceFactCollector<'source>,
+        maps: &mut [RustEmbeddedSourceMap],
+    ) {
+        self.items.enter(
+            node,
+            source,
+            &mut RustEmbeddedSourceOccurrenceSink {
+                collector,
+                source_maps: maps,
+                tree_id,
+            },
+            self.types,
+        );
+        if node.kind() == "macro_invocation" {
+            self.modules
+                .ensure_embedded_invocation(tree_id, node, collector, maps);
+        }
+    }
+    fn exit(&mut self) {
+        self.items.exit();
+    }
+    fn macro_source(
+        &mut self,
+        invocation: SourceOccurrenceId,
+        outcome: Result<Option<SourceOccurrenceId>, RustMacroParseFailure>,
+    ) {
+        self.items.record_macro(invocation, outcome);
+    }
+}
+
+/// Capture declaration/import identities once; optional consumers add their own
+/// item/module products without changing embedded traversal or import semantics.
+fn collect_rust_embedded_sources<'source>(
     invocation: SourceOccurrenceId,
     graph: &mut RustEmbeddedReplayGraph,
     source: &'source str,
     collector: &mut PrimarySourceFactCollector<'source>,
     properties: &mut RustDeclarationPropertyCollector<'source>,
-    module_sources: &mut crate::facts::RustModuleSourceCollector<'source>,
-    items: &mut RustItemSourceCollector,
-    types: &mut RustTypeSourceCollector,
     source_imports: &mut Vec<SourceImportFact>,
+    consumer: &mut impl RustEmbeddedSourceConsumer<'source>,
 ) {
     let root_tree = graph.root_id();
     let (trees, maps) = graph.split_mut();
     let root = trees[root_tree].root();
     let root_occurrence = maps[root_tree].intern_node(root, collector);
-    items.record_macro(invocation, Ok(Some(root_occurrence)));
+    consumer.macro_source(invocation, Ok(Some(root_occurrence)));
     enum Event<'tree> {
         Enter { tree_id: usize, node: Node<'tree> },
         Exit,
@@ -777,7 +862,7 @@ fn collect_rust_embedded_item_sources<'source>(
     }];
     while let Some(event) = pending.pop() {
         let Event::Enter { tree_id, node } = event else {
-            items.exit();
+            consumer.exit();
             continue;
         };
         if matches!(node.kind(), "use_declaration" | "extern_crate_declaration") {
@@ -787,29 +872,11 @@ fn collect_rust_embedded_item_sources<'source>(
         {
             let declaration =
                 ensure_embedded_source_declaration(tree_id, node, collector, properties, maps);
-            if node.kind() == "mod_item" {
-                module_sources.record_embedded_declaration(
-                    tree_id,
-                    declaration,
-                    node,
-                    collector,
-                    maps,
-                );
-            }
+            consumer.declaration(tree_id, declaration, node, collector, maps);
         }
-        items.enter(
-            node,
-            source,
-            &mut RustEmbeddedSourceOccurrenceSink {
-                collector,
-                source_maps: maps,
-                tree_id,
-            },
-            types,
-        );
+        consumer.enter(tree_id, node, source, collector, maps);
         pending.push(Event::Exit);
         if node.kind() == "macro_invocation" {
-            module_sources.ensure_embedded_invocation(tree_id, node, collector, maps);
             let invocation = maps[tree_id].intern_node(node, collector);
             let outcome = *trees[tree_id]
                 .child_macros
@@ -826,9 +893,7 @@ fn collect_rust_embedded_item_sources<'source>(
                     occurrence
                 })
             });
-            items.record_macro(invocation, expansion);
-            // The child graph owns interpretation of the token-tree interior.
-            // Never treat token-tree children as a second source-item parse.
+            consumer.macro_source(invocation, expansion);
             continue;
         }
         let children = node.named_children(&mut node.walk()).collect::<Vec<_>>();
@@ -1205,6 +1270,7 @@ struct RustPrimaryDeclarationContext {
     parent: Option<CodeUnit>,
     package_name: String,
     impl_import_binder: usize,
+    anonymous_impl_scope: usize,
     in_test_region: bool,
 }
 
@@ -1318,6 +1384,8 @@ struct RustPrimaryDeclarations<'source, 'parsed, 'tree> {
     source_declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
     context_stack: Vec<usize>,
     disabled_context: usize,
+    anonymous_impl_counts: Vec<usize>,
+    anonymous_impl_scopes: HashMap<FqName, usize>,
 }
 
 impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
@@ -1337,6 +1405,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             parent: None,
             package_name,
             impl_import_binder: 0,
+            anonymous_impl_scope: 0,
             in_test_region: false,
         };
         let disabled_context = RustPrimaryDeclarationContext {
@@ -1344,6 +1413,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             parent: None,
             package_name: String::new(),
             impl_import_binder: 0,
+            anonymous_impl_scope: 0,
             in_test_region: false,
         };
         Self {
@@ -1362,7 +1432,69 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             source_declaration_units: Vec::new(),
             context_stack: vec![0],
             disabled_context: 1,
+            anonymous_impl_counts: vec![0],
+            anonymous_impl_scopes: HashMap::default(),
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "replay shares the live source identities and macro admission"
+    )]
+    fn replay_macro(
+        &mut self,
+        node: Node<'_>,
+        request: RustEmbeddedReplayRequest,
+        macros: &RustPrimaryMacroState,
+        exported_macros: &crate::macro_matcher::ExportedMacroDefinitions<'_>,
+        graph: &mut RustEmbeddedReplayGraph,
+        source_collector: &mut PrimarySourceFactCollector<'source>,
+        declaration_properties: &mut RustDeclarationPropertyCollector<'source>,
+        module_sources: &mut crate::facts::RustModuleSourceCollector<'source>,
+    ) {
+        let root_tree_id = graph.root_id();
+        let (trees, source_maps) = graph.split_mut();
+        let mut embedded_source_bridge = RustEmbeddedDeclarationSourceBridge {
+            collector: source_collector,
+            properties: declaration_properties,
+            module_sources,
+            links: &mut self.source_declaration_units,
+            source_maps,
+            types: &mut self.type_sources,
+            tree_id: root_tree_id,
+        };
+        visit_rust_macro_invocation_definitions(
+            self.naming,
+            self.file,
+            self.source,
+            node,
+            request.parent.as_ref(),
+            &request.package_name,
+            macros.as_slice(),
+            exported_macros,
+            request.in_test_region,
+            request.scope,
+            self.parsed,
+            &mut embedded_source_bridge,
+            self.source_imports.as_slice(),
+            &mut self.embedded_import_ids,
+            trees,
+            root_tree_id,
+        );
+    }
+
+    fn macro_candidate(
+        &self,
+        node: Node<'tree>,
+        macros: &RustPrimaryMacroState,
+        properties: &RustDeclarationPropertyCollector<'_>,
+    ) -> Option<RustRulesItemMacroDefinition> {
+        let (start, end) = self.macro_definition_scope(node)?;
+        rust_macro_definition_name(node, self.source)?;
+        let property = properties
+            .for_primary_node(node)
+            .expect("eligible named macro has a canonical source property");
+        macros.candidate(node, start, end, self.source, property)
     }
 
     fn macro_definition_scope(&self, node: Node<'tree>) -> Option<(usize, usize)> {
@@ -1487,6 +1619,17 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                     self.context_stack.push(self.disabled_context);
                     return (declaration_descend, None, None);
                 };
+                // Cfg alternatives can declare the same module more than once.
+                // Its canonical identity owns one source-ordered rank sequence.
+                let counts = &mut self.anonymous_impl_counts;
+                child_context.anonymous_impl_scope = *self
+                    .anonymous_impl_scopes
+                    .entry(code_unit.fq().clone())
+                    .or_insert_with(|| {
+                        let scope = counts.len();
+                        counts.push(0);
+                        scope
+                    });
                 child_context.mode = RustPrimaryDeclarationMode::Module;
                 child_context.parent = Some(code_unit);
                 child_context.impl_import_binder = self.import_binders.len();
@@ -1610,15 +1753,43 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                 }
                 let owner = node.child_by_field_name("type").and_then(|type_node| {
                     let target = source_bridge.record_type(type_node, self.source);
-                    rust_impl_owner(
-                        self.naming,
-                        self.file,
-                        target,
-                        parent,
-                        package_name,
-                        &self.import_binders[current.impl_import_binder],
-                        self.parsed,
-                    )
+                    if rust_impl_self_is_path(type_node) {
+                        rust_impl_owner(
+                            self.naming,
+                            self.file,
+                            target,
+                            parent,
+                            package_name,
+                            &self.import_binders[current.impl_import_binder],
+                            self.parsed,
+                        )
+                    } else {
+                        // Only primary declarations allocate disambiguators in
+                        // the enclosing declaration scope. Nominal and replayed
+                        // impls cannot renumber them.
+                        let rank = &mut self.anonymous_impl_counts[current.anonymous_impl_scope];
+                        let name = format!("{{impl#{rank}}}");
+                        *rank += 1;
+                        let short_name = parent.map_or_else(
+                            || name.clone(),
+                            |parent| format!("{}.{name}", parent.short_name()),
+                        );
+                        let fq = child_fq_base(parent, || {
+                            rust_file_package_fq_with(self.naming, self.file)
+                        })
+                        .with_pushed(segment_interner().intern(&name, SegmentKind::Type));
+                        // A non-indexed seed owns real member declarations.
+                        Some(rust_inherit_package_anchor(
+                            CodeUnit::new_fq(
+                                self.file.clone(),
+                                CodeUnitType::Class,
+                                package_name,
+                                short_name,
+                                fq,
+                            ),
+                            parent,
+                        ))
+                    }
                 });
                 if let (Some(owner), Some(_body)) = (owner, node.child_by_field_name("body")) {
                     child_context.mode = RustPrimaryDeclarationMode::Impl;
@@ -1896,16 +2067,18 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                 match build_rust_embedded_replay_graph(node, self.declarations.source) {
                     Ok(Some(mut graph)) => {
                         let (collector, properties) = self.native.source_collectors_mut();
-                        collect_rust_embedded_item_sources(
+                        collect_rust_embedded_sources(
                             invocation,
                             &mut graph,
                             self.declarations.source,
                             collector,
                             properties,
-                            &mut self.module_sources,
-                            &mut self.item_sources,
-                            &mut self.declarations.type_sources,
                             &mut self.declarations.source_imports,
+                            &mut RustEmbeddedItemSources {
+                                modules: &mut self.module_sources,
+                                items: &mut self.item_sources,
+                                types: &mut self.declarations.type_sources,
+                            },
                         );
                         Some(graph)
                     }
@@ -1964,40 +2137,21 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         if let Some(request) = replay_request
             && let Some(graph) = replay_graph.as_mut()
         {
-            let (source_collector, declaration_properties) = self.native.source_collectors_mut();
-            let root_tree_id = graph.root_id();
-            let (trees, source_maps) = graph.split_mut();
-            let mut embedded_source_bridge = RustEmbeddedDeclarationSourceBridge {
-                collector: source_collector,
-                properties: declaration_properties,
-                module_sources: &mut self.module_sources,
-                links: &mut self.declarations.source_declaration_units,
-                source_maps,
-                types: &mut self.declarations.type_sources,
-                tree_id: root_tree_id,
-            };
-            visit_rust_macro_invocation_definitions(
-                self.declarations.naming,
-                self.declarations.file,
-                self.declarations.source,
+            let (collector, properties) = self.native.source_collectors_mut();
+            self.declarations.replay_macro(
                 node,
-                request.parent.as_ref(),
-                &request.package_name,
-                self.primary_macros.as_slice(),
+                request,
+                &self.primary_macros,
                 self.exported_macros.get_or_init(|| {
                     crate::macro_matcher::ExportedMacroDefinitions::from_root(
                         self.root,
                         self.declarations.source,
                     )
                 }),
-                request.in_test_region,
-                request.scope,
-                self.declarations.parsed,
-                &mut embedded_source_bridge,
-                self.declarations.source_imports.as_slice(),
-                &mut self.declarations.embedded_import_ids,
-                trees,
-                root_tree_id,
+                graph,
+                collector,
+                properties,
+                &mut self.module_sources,
             );
         }
         // Replay has now declared this invocation's items, so the native
@@ -2019,23 +2173,11 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             }
             graph.source_maps[root_tree_id] = returned;
         }
-        let macro_candidate =
+        let macro_candidate = {
+            let (_, properties) = self.native.source_collectors_mut();
             self.declarations
-                .macro_definition_scope(node)
-                .and_then(|(scope_start, scope_end)| {
-                    rust_macro_definition_name(node, self.declarations.source)?;
-                    let property = self
-                        .native
-                        .declaration_property_for_node(node)
-                        .expect("eligible named macro has a canonical source property");
-                    self.primary_macros.candidate(
-                        node,
-                        scope_start,
-                        scope_end,
-                        self.declarations.source,
-                        property,
-                    )
-                });
+                .macro_candidate(node, &self.primary_macros, properties)
+        };
         let projected_imports =
             self.declarations
                 .import_projections
@@ -2087,6 +2229,8 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         } else {
             None
         };
+        self.usage
+            .collect_include_event(node, self.native.source_collector_mut());
         let primary_module_property = primary_module_declaration.map(|_| {
             self.native
                 .declaration_property_for_node(node)
@@ -2319,6 +2463,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             })
             .collect();
         let mut rust_items = self.item_sources.into_facts();
+        rust_items.native_impl_scopes = native.impl_scopes;
         let native_frontiers = native.facts.gaps.iter().filter(|gap| {
             matches!(gap.kind,
                 brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedScopeOrBinder
@@ -2398,6 +2543,102 @@ pub fn parse_rust_file_with(
     )
 }
 
+/// Project source declarations without constructing native, structural, usage,
+/// or item-source products. The full producer shares the declaration contexts,
+/// import interpretation and embedded admission/replay below.
+pub fn parse_rust_declaration_projection_with(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+) -> brokk_bifrost_core::analyzer::parsed_file::DeclarationProjection {
+    let mut parsed = ParsedFile::new(rust_package_name_with(naming, file));
+    let root = tree.root_node();
+    let (imports, binder) = rust_primary_imports(root, source);
+    let mut collector = PrimarySourceFactCollector::new(source);
+    let root_occurrence = collector.intern_node(root);
+    let mut properties = RustDeclarationPropertyCollector::new(source);
+    // Embedded declaration replay records module identity at creation. This
+    // small bridge is never finalized into module routes or published facts.
+    let mut modules = crate::facts::RustModuleSourceCollector::new(source, root_occurrence);
+    let mut declarations =
+        RustPrimaryDeclarations::new(naming, file, source, binder, imports, &mut parsed, root);
+    let mut macros = RustPrimaryMacroState::default();
+    let exported = std::cell::OnceCell::new();
+    let mut primary_imports = Vec::new();
+    // Every primary node is visited for import ownership, independently of
+    // declaration descent. There is no native or structural consumer here.
+    walk_rust_primary_tree(
+        root,
+        &mut (
+            &mut declarations,
+            &mut collector,
+            &mut properties,
+            &mut modules,
+            &mut macros,
+            &mut primary_imports,
+        ),
+        |node, active, _, (declarations, collector, properties, modules, macros, imports)| {
+            let (descend, _, replay) = declarations.enter(node, active, collector, properties);
+            if let Some(request) = replay {
+                // A failed/unindexable interior contributes no declarations,
+                // exactly as in the full producer's embedded admission path.
+                if let Ok(Some(mut graph)) = build_rust_embedded_replay_graph(node, source) {
+                    let invocation = collector.intern_node(node);
+                    collect_rust_embedded_sources(
+                        invocation,
+                        &mut graph,
+                        source,
+                        collector,
+                        properties,
+                        &mut declarations.source_imports,
+                        &mut (),
+                    );
+                    declarations.replay_macro(
+                        node,
+                        request,
+                        macros,
+                        exported.get_or_init(|| {
+                            crate::macro_matcher::ExportedMacroDefinitions::from_root(root, source)
+                        }),
+                        &mut graph,
+                        collector,
+                        properties,
+                        modules,
+                    );
+                }
+            }
+            if declarations.macro_definition_scope(node).is_some() {
+                properties.ensure_primary(node, collector);
+            }
+            let candidate = declarations.macro_candidate(node, macros, properties);
+            if let Some((mut projected, nodes)) = declarations.import_projections.take(node) {
+                attach_import_source_occurrences(
+                    &mut projected,
+                    &nodes,
+                    *collector,
+                    &mut declarations.source_imports,
+                    &mut declarations.rust_import_contexts,
+                );
+                imports.extend(projected);
+            }
+            if let Some(candidate) = candidate {
+                macros.commit(candidate);
+            }
+            (descend, TreeWalkAction::Descend)
+        },
+        |_, (declarations, ..)| declarations.exit(),
+    );
+    let occurrences = collector.finish();
+    let import_ids = crate::facts::primary_module_import_ids(primary_imports, &occurrences);
+    declarations.parsed.imports = import_ids
+        .into_iter()
+        .chain(declarations.embedded_import_ids.iter().copied())
+        .map(|id| declarations.source_imports[id.index()].import_info(&occurrences))
+        .collect();
+    parsed.into_declaration_projection()
+}
+
 /// Collect declarations using the producer's admitted whole-file parse and warm cache.
 pub fn parse_rust_file_prepared_with(
     naming: &crate::crate_naming::RustCrateNamingCaches,
@@ -2416,21 +2657,13 @@ pub fn parse_rust_file_prepared_with(
     )
 }
 
-fn parse_rust_file_with_package(
-    naming: &crate::crate_naming::RustCrateNamingCaches,
-    file: &ProjectFile,
-    source: &str,
-    tree: &Tree,
-    package: String,
-    scope: Option<&crate::lexical_scope::RustPlainScope<'_>>,
-) -> ParsedFile {
-    let mut parsed = ParsedFile::new(package);
-    let root = tree.root_node();
-
-    // This binder stays top-level-only for its own reason: it resolves the
-    // owners of top-level `impl` blocks, and a name bound inside a nested
-    // module is not in scope for them. ParsedFile.imports itself is populated
-    // from the coordinated usage events in RustPrimaryParseState::finish.
+fn rust_primary_imports<'source, 'tree>(
+    root: Node<'tree>,
+    source: &'source str,
+) -> (
+    RustPrimaryImportProjectionCache<'source, 'tree>,
+    ImportBinder,
+) {
     let mut import_projections = RustPrimaryImportProjectionCache::new(source);
     let mut impl_import_binder = ImportBinder::empty();
     for index in 0..root.named_child_count() {
@@ -2451,6 +2684,25 @@ fn parse_rust_file_with_package(
             }
         }
     }
+    (import_projections, impl_import_binder)
+}
+
+fn parse_rust_file_with_package(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    package: String,
+    scope: Option<&crate::lexical_scope::RustPlainScope<'_>>,
+) -> ParsedFile {
+    let mut parsed = ParsedFile::new(package);
+    let root = tree.root_node();
+
+    // This binder stays top-level-only for its own reason: it resolves the
+    // owners of top-level `impl` blocks, and a name bound inside a nested
+    // module is not in scope for them. ParsedFile.imports itself is populated
+    // from the coordinated usage events in RustPrimaryParseState::finish.
+    let (import_projections, impl_import_binder) = rust_primary_imports(root, source);
 
     let spec = &crate::structural::RUST_STRUCTURAL_SPEC;
     let grammar = tree_sitter_rust::LANGUAGE.into();
@@ -3483,6 +3735,10 @@ impl<'graph, 'source, 'external, 'collector>
                     return;
                 };
                 let target = self.source_bridge.record_type(type_node, self.source);
+                // Preserve master's replay ownership, including peeled array
+                // and slice element owners. #13556 tracks anonymous replay
+                // owners with ranks independent of direct-parse/replay pass
+                // order. Until then, retain every previously registered member.
                 let Some(owner) = rust_impl_owner(
                     self.naming,
                     self.file,
@@ -4966,6 +5222,30 @@ fn rust_crate_root_package_for_parse(
     file: &ProjectFile,
 ) -> String {
     crate::imports::rust_crate_root_package_with(naming, file)
+}
+
+/// Classify the written Self rather than its peeled nominal projection.
+/// Arrays/slices own their own impls, while references and pointers to paths
+/// keep the existing nominal identity (including unsupported generic prefixes).
+fn rust_impl_self_is_path(mut node: Node<'_>) -> bool {
+    while matches!(node.kind(), "reference_type" | "pointer_type") {
+        let Some(inner) = node.child_by_field_name("type") else {
+            return false;
+        };
+        node = inner;
+    }
+    matches!(
+        node.kind(),
+        "generic_type"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "identifier"
+            | "type_identifier"
+            | "primitive_type"
+            | "self"
+            | "super"
+            | "crate"
+    )
 }
 
 fn rust_impl_owner(
@@ -7114,10 +7394,15 @@ wrap! { impl Item { fn embedded_b() {} } }
                 .keys()
                 .any(|unit| unit.identifier() == name)
         };
-        for name in ["plain", "external", "embedded_a", "embedded_b"] {
+        for name in [
+            "plain",
+            "external",
+            "unsupported",
+            "embedded_a",
+            "embedded_b",
+        ] {
             assert!(has_member(name), "supported owner retains member {name}");
         }
-        assert!(!has_member("unsupported"));
         assert!(
             !has_member("fabricated"),
             "a generic qualifier must not invent an Assoc owner"
@@ -11015,6 +11300,7 @@ mod inner {
             declaration_units: parsed.source_declaration_units.clone(),
             module_names: HashMap::default(),
             imports: facts.imports.clone(),
+            impl_spans: HashMap::default(),
         };
         let index = RustSourceContextIndex::new(&hierarchy, &|| true).unwrap();
         let module = hierarchy

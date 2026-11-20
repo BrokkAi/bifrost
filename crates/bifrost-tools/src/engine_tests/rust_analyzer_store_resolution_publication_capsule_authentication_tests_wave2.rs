@@ -13,6 +13,10 @@ mod rust_departing_wave2_capsule_authentication_tests_tests {
     #[hardwon(
         "3da13ca2218b: reordered or altered capsule presentation bypassed immutable publication identity"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn capsule_verification_authenticates_fresh_cached_and_reordered_artifacts() {
         use brokk_bifrost_analysis::analyzer::store::resolution_publication::CapsuleArtifactVerification::Cancelled as Cancelled;
 

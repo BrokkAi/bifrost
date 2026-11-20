@@ -52,7 +52,9 @@ mod forward_scan_probe {
     ) {
         SCANS.set(SCANS.get() + 1);
         if STOP_NEXT.replace(false) {
-            assert!(!session.scope_steps(usize::MAX));
+            session.mark_exceeded(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
+            );
         }
     }
 
@@ -95,7 +97,9 @@ mod family_positive_stop_probe {
     pub(super) fn after_positive(inverse: bool, session: &ResolutionSession) {
         if ARMED.get() == Some(inverse) {
             ARMED.set(None);
-            assert!(!session.scope_steps(usize::MAX));
+            session.mark_exceeded(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
+            );
             let BoundedResolution::Exceeded { limit, .. } = session.finish(()) else {
                 panic!("family positive probe did not latch a budget stop");
             };

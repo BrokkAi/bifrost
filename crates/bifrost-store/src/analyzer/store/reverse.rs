@@ -8,6 +8,7 @@ use super::*;
 
 use crate::analyzer::resolution::ResolutionIdentityDigestKey;
 use crate::analyzer::resolution::worker_transport::{WorkerAnswer, schedule_selected_queue};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
 
 pub(super) use super::reverse_candidates::*;
 
@@ -405,6 +406,33 @@ impl<T, L> ReverseBatch<T, L> {
     }
 }
 
+impl<T, L> ReverseBatch<T, L> {
+    /// Separate a ready value from every outcome that stopped the stage, so a
+    /// caller can keep the stop without a payload it does not have.
+    pub(crate) fn into_stop(
+        self,
+    ) -> std::result::Result<T, ReverseBatch<std::convert::Infallible, L>> {
+        match self {
+            Self::Ready(value) => Ok(value),
+            Self::Bounded(limit) => Err(ReverseBatch::Bounded(limit)),
+            Self::Stale(reason) => Err(ReverseBatch::Stale(reason)),
+            Self::Unavailable(reason) => Err(ReverseBatch::Unavailable(reason)),
+            Self::UnsupportedContext => Err(ReverseBatch::UnsupportedContext),
+            Self::TimeStopped => Err(ReverseBatch::TimeStopped),
+            Self::Cancelled { stage, completion } => {
+                Err(ReverseBatch::Cancelled { stage, completion })
+            }
+        }
+    }
+}
+
+impl<L> ReverseBatch<std::convert::Infallible, L> {
+    /// A stop carries no value, so it fits any batch type.
+    pub(crate) fn widen<T>(self) -> ReverseBatch<T, L> {
+        self.map(|never| match never {})
+    }
+}
+
 impl<T, L> From<SelectedResolutionOperationOutcome<T>> for ReverseBatch<T, L> {
     fn from(value: SelectedResolutionOperationOutcome<T>) -> Self {
         match value {
@@ -429,6 +457,13 @@ pub enum ReverseSessionReport<A> {
     Missing {
         locator: SelectedSemanticLocator,
     },
+    /// The session's receiver budget ran out before this locator finished.
+    /// Nothing was proved or refuted for it. Only a session that keeps its
+    /// finished locators across a budget stop produces this report.
+    Unattempted {
+        locator: SelectedSemanticLocator,
+        limit: ReceiverBudgetLimit,
+    },
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -437,7 +472,7 @@ impl<A> ReverseSessionReport<A> {
     pub fn answers_mut(&mut self) -> impl Iterator<Item = &mut A> {
         let meanings = match self {
             Self::Found { meanings, .. } => meanings.as_mut_slice(),
-            Self::Missing { .. } => &mut [],
+            Self::Missing { .. } | Self::Unattempted { .. } => &mut [],
         };
         meanings.iter_mut().flat_map(|(_, answers)| answers)
     }
@@ -445,7 +480,7 @@ impl<A> ReverseSessionReport<A> {
     pub fn into_answers(self) -> impl Iterator<Item = A> {
         let meanings = match self {
             Self::Found { meanings, .. } => meanings,
-            Self::Missing { .. } => Vec::new(),
+            Self::Missing { .. } | Self::Unattempted { .. } => Vec::new(),
         };
         meanings.into_iter().flat_map(|(_, answers)| answers)
     }
@@ -559,6 +594,11 @@ pub(crate) struct ReverseSemanticAnswer<A> {
 
 pub(crate) struct ReverseContextSite<A> {
     pub(crate) reports: Vec<(usize, Vec<ReverseSemanticAnswer<A>>)>,
+    /// Set when some context's session ran out of receiver budget before it
+    /// finished this site. The site's reports then cover only the contexts
+    /// that finished it, which proves nothing about the site: the consumer
+    /// reports it as unattempted instead of classifying it.
+    pub(crate) stopped: Option<ReceiverBudgetLimit>,
 }
 
 pub(crate) struct ReverseContextBatch<C, A> {
@@ -566,8 +606,11 @@ pub(crate) struct ReverseContextBatch<C, A> {
     pub(crate) sites: Vec<ReverseContextSite<A>>,
 }
 
-/// A stopped context discards all provisional reports for this blob. Missing
-/// reports are retained as missing; only the independent domain defines closure.
+/// A context stopped by anything but its receiver budget discards all
+/// provisional reports for this blob. A context whose receiver budget ran out
+/// part-way keeps the sites it finished and marks the rest of its sites
+/// stopped. Missing reports are retained as missing; only the independent
+/// domain defines closure.
 pub(crate) fn confirm_reverse_contexts<C, A, L>(
     domain: Vec<C>,
     locators: &[&SelectedSemanticLocator],
@@ -577,6 +620,7 @@ pub(crate) fn confirm_reverse_contexts<C, A, L>(
     let mut sites = (0..locators.len())
         .map(|_| ReverseContextSite {
             reports: Vec::with_capacity(domain.len()),
+            stopped: None,
         })
         .collect::<Vec<_>>();
     let positions = locators
@@ -613,6 +657,13 @@ pub(crate) fn confirm_reverse_contexts<C, A, L>(
                     }
                 }
                 ReverseSessionReport::Missing { .. } => {}
+                ReverseSessionReport::Unattempted { locator, limit } => {
+                    let position = *positions
+                        .get(&locator)
+                        .expect("a context reports only requested sites");
+                    assert!(seen.insert(position), "a context reports each site once");
+                    sites[position].stopped.get_or_insert(limit);
+                }
             }
         }
     }
@@ -629,6 +680,10 @@ pub(crate) fn project_reverse_context_site<A, V>(
     site: ReverseContextSite<A>,
     mut project: impl FnMut(A) -> V,
 ) -> ReverseSiteReduction<V, ()> {
+    assert!(
+        site.stopped.is_none(),
+        "a site stopped by its receiver budget is reported unattempted, never projected"
+    );
     let reports = site
         .reports
         .into_iter()
@@ -650,14 +705,34 @@ pub(crate) fn project_reverse_context_site<A, V>(
     reduce_reverse_site(required, reports)
 }
 
-/// One ordered session lifecycle, shared by mutable and immutable language drivers.
-pub(super) fn confirm_reverse_session<H: ReverseLifecycle>(
+/// How one ordered session lifecycle ended after its stages succeeded.
+pub(crate) enum ReverseSessionEnd<A, L> {
+    /// Every locator finished and the language's `finish` accepted the reports.
+    Finished(Vec<ReverseSessionReport<A>>),
+    /// Evaluation stopped part-way. `reports` holds, in locator order, exactly
+    /// the locators that finished before `stop`; the in-flight locator and all
+    /// later ones have no report, so `locators[reports.len()..]` is the
+    /// unattempted tail. `finish` has not run.
+    Stopped {
+        reports: Vec<ReverseSessionReport<A>>,
+        stop: ReverseBatch<std::convert::Infallible, L>,
+    },
+}
+
+pub(crate) type ReverseSessionPartialOutcome<A, L> =
+    Result<ReverseBatch<ReverseSessionEnd<A, L>, L>>;
+
+/// One ordered session lifecycle, shared by mutable and immutable language
+/// drivers. A stop before evaluation starts has no finished locator and is
+/// returned as the stage's own outcome. A stop during evaluation keeps the
+/// locators that already finished.
+pub(super) fn confirm_reverse_session_partial<H: ReverseLifecycle>(
     locators: &[&SelectedSemanticLocator],
     hooks: &mut H,
-) -> ReverseSessionOutcome<H::Answer, H::Limit> {
+) -> ReverseSessionPartialOutcome<H::Answer, H::Limit> {
     let prepared = reverse_ready!(hooks.prepare(locators));
     let context = reverse_ready!(hooks.validate(&prepared));
-    let reports = reverse_ready!(hooks.with_scope(&prepared, |scope| {
+    let evaluated = reverse_ready!(hooks.with_scope(&prepared, |scope| {
         let blueprint = reverse_ready!(scope.blueprint(context));
         reverse_ready!(scope.register(&blueprint));
         // Lookup precedes evaluator construction and preserves semantic order.
@@ -674,7 +749,12 @@ pub(super) fn confirm_reverse_session<H: ReverseLifecycle>(
                         assert!(!semantics.is_empty(), "found locator has semantic meanings");
                         let mut meanings = Vec::with_capacity(semantics.len());
                         for semantic in semantics {
-                            let answers = reverse_ready!(evaluator.evaluate(locator, semantic));
+                            let answers = match evaluator.evaluate(locator, semantic)?.into_stop() {
+                                Ok(answers) => answers,
+                                // A locator that stopped part-way through its
+                                // meanings is unattempted as a whole.
+                                Err(stop) => return Ok(ReverseBatch::Ready(Err((reports, stop)))),
+                            };
                             assert!(
                                 !answers.is_empty(),
                                 "successful semantic reports a binding or exclusion"
@@ -694,10 +774,29 @@ pub(super) fn confirm_reverse_session<H: ReverseLifecycle>(
                     }
                 }
             }
-            Ok(ReverseBatch::Ready(reports))
+            Ok(ReverseBatch::Ready(Ok(reports)))
         })
     }));
-    hooks.finish(reports)
+    match evaluated {
+        Ok(reports) => Ok(hooks.finish(reports)?.map(ReverseSessionEnd::Finished)),
+        Err((reports, stop)) => Ok(ReverseBatch::Ready(ReverseSessionEnd::Stopped {
+            reports,
+            stop,
+        })),
+    }
+}
+
+/// The whole-session form: any stop discards every report.
+pub(super) fn confirm_reverse_session<H: ReverseLifecycle>(
+    locators: &[&SelectedSemanticLocator],
+    hooks: &mut H,
+) -> ReverseSessionOutcome<H::Answer, H::Limit> {
+    Ok(
+        match confirm_reverse_session_partial(locators, hooks)?.into_stop() {
+            Ok(ReverseSessionEnd::Finished(reports)) => ReverseBatch::Ready(reports),
+            Ok(ReverseSessionEnd::Stopped { stop, .. }) | Err(stop) => stop.widen(),
+        },
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1042,6 +1141,9 @@ where
                 ReverseSessionReport::Missing { locator } => {
                     return Err(self.reducer.missing_locator(&locator));
                 }
+                ReverseSessionReport::Unattempted { .. } => {
+                    unreachable!("this file session does not keep finished locators past a stop")
+                }
             }
         }
         if !self.reducer.file(
@@ -1202,6 +1304,10 @@ pub(crate) fn classify_reverse_context_site<C, A, V, L: ReverseClosure>(
     site: ReverseContextSite<A>,
     mut classify: impl FnMut(A) -> Result<Option<ReverseClassifiedView<V, L>>>,
 ) -> Result<Option<ReverseSiteReduction<V, L>>> {
+    assert!(
+        site.stopped.is_none(),
+        "a site stopped by its receiver budget is reported unattempted, never classified"
+    );
     let target = proof.evidence.enumeration.target;
     let mut reports = Vec::with_capacity(site.reports.len());
     for (context, answers) in site.reports {
@@ -1899,6 +2005,10 @@ pub(crate) struct ReverseOwnerProjection {
 /// Project forward owners through the shared native declaration bridge, while
 /// retaining the consumer's historical projection-completion policy.
 #[cfg(any(test, feature = "test-support"))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 pub(crate) fn project_reverse_owners(
     operation: &SelectedResolutionOperation<'_, '_>,
     context: &ReverseContextWitness,
@@ -2423,6 +2533,50 @@ mod tests {
         assert!(reduced.closure.is_none());
         assert_eq!(reduced.binding.len(), 1);
         assert!(proof.evidence.enumeration.discharges.is_empty());
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[hardwon(
+        "#13145: a context whose receiver budget ran out discarded the sites it had finished"
+    )]
+    fn reverse_context_budget_stop_keeps_finished_sites_and_marks_the_rest() {
+        let (domain, finished, target) = two_root_file();
+        let unattempted = SelectedSemanticLocator::new(
+            "fixture",
+            "src/shared.rs",
+            ResolutionSiteId::new(2),
+            LoweredSemanticRole::Reference,
+        );
+        let limit = ReceiverBudgetLimit::ResolutionRounds;
+        let ReverseBatch::Ready(batch) = confirm_reverse_contexts(
+            domain,
+            &[&finished, &unattempted],
+            &CancellationToken::new(),
+            |context| {
+                let mut reports = test_context_reports(&finished, target);
+                if context.view == "src/lib.rs" {
+                    reports.push(ReverseSessionReport::Unattempted {
+                        locator: unattempted.clone(),
+                        limit,
+                    });
+                } else {
+                    reports.extend(test_context_reports(&unattempted, target));
+                }
+                Ok(ReverseBatch::<_, ()>::Ready(reports))
+            },
+        )
+        .unwrap() else {
+            panic!("a budget stop inside one context's session is not a batch stop");
+        };
+        assert_eq!(batch.sites.len(), 2);
+        assert_eq!(batch.sites[0].reports.len(), 2, "finished in both contexts");
+        assert!(batch.sites[0].stopped.is_none());
+        assert_eq!(
+            batch.sites[1].stopped,
+            Some(limit),
+            "stopped in one context, so unattempted"
+        );
     }
 
     #[cfg(test)]

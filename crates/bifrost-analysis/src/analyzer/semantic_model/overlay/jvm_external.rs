@@ -218,7 +218,11 @@ pub fn model_declared_external_owner(
     }) {
         super::ModelTypeOwnerAnswer::Unique { declaration, .. } => {
             Some(crate::analyzer::resolution::ExternalOwnerIdentity {
-                provider_id: declaration.provenance.pack_digest.as_str().into(),
+                provider_id:
+                    crate::analyzer::store::jvm_external_publication::jvm_external_provider_id(
+                        &declaration.provenance.pack_digest,
+                    )
+                    .into(),
                 owner_fqn: declaration.qualified_name.as_str().into(),
             })
         }

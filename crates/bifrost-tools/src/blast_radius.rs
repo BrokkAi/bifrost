@@ -55,7 +55,6 @@ mod coverage_tests;
 mod missing_tests;
 
 pub use crate::blast_radius::missing_tests::*;
-pub(crate) use missing_tests::test_file_context;
 
 pub const DEFAULT_MAX_SCOPES: usize = 100;
 pub const MAX_SCOPES: usize = 1_000;
@@ -264,12 +263,14 @@ struct TargetEvidence {
 
 enum TargetFileDependencyAnalyzer<'a> {
     Live(&'a dyn IAnalyzer),
+    // Boxed: the revision analyzer and its image are hundreds of bytes,
+    // while the live variant is one reference.
     Revision {
         // Boxed: the Windows build's RevisionAnalyzer makes this variant big
         // enough to trip clippy::large_enum_variant.
         analyzer: Box<RevisionAnalyzer>,
         // Keep the materialized tree alive until every analyzer query ends.
-        _image: RevisionImage,
+        _image: Box<RevisionImage>,
     },
 }
 
@@ -327,7 +328,7 @@ fn build_target_file_dependency_analyzer<'a>(
     )?;
     Ok(TargetFileDependencyAnalyzer::Revision {
         analyzer: Box::new(analyzer),
-        _image: image,
+        _image: Box::new(image),
     })
 }
 

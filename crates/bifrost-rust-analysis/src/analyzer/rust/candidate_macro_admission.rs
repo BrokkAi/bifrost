@@ -501,24 +501,31 @@ fn refuse_matches_call(
     }
 }
 
-pub(super) fn audited_item_free_stdlib_selected(analyzer: &dyn crate::analyzer::IAnalyzer) -> bool {
-    use brokk_bifrost_rust::macro_matcher::ITEM_FREE_MACRO_STDLIB_REVISION;
-    let Some(models) = analyzer.active_semantic_models() else {
-        return false;
-    };
-    let mut found = false;
+/// The revision of the selected `bifrost.rust-stdlib` pack, when every selected
+/// shard of it names the same one. Consulting the active models records
+/// `ReadKey::Models`, so a consumer of this revision replays when the model set
+/// changes (#13259).
+pub(super) fn selected_stdlib_revision(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+) -> Option<String> {
+    let models = analyzer.active_semantic_models()?;
+    let mut revision: Option<&str> = None;
     for shard in &models.shards {
         if shard.metadata.manifest.pack_id != "bifrost.rust-stdlib" {
             continue;
         }
-        found = true;
-        if shard.metadata.manifest.provenance.revision.as_deref()
-            != Some(ITEM_FREE_MACRO_STDLIB_REVISION)
-        {
-            return false;
+        let this = shard.metadata.manifest.provenance.revision.as_deref()?;
+        if revision.is_some_and(|seen| seen != this) {
+            return None;
         }
+        revision = Some(this);
     }
-    found
+    revision.map(str::to_owned)
+}
+
+pub(super) fn audited_item_free_stdlib_selected(analyzer: &dyn crate::analyzer::IAnalyzer) -> bool {
+    selected_stdlib_revision(analyzer).as_deref()
+        == Some(brokk_bifrost_rust::macro_matcher::ITEM_FREE_MACRO_STDLIB_REVISION)
 }
 
 /// This proof is captured in the enclosing candidate admission receipt. The

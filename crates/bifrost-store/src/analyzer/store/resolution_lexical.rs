@@ -1255,6 +1255,10 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     /// candidate reader. Test-only: this deliberately bypasses answer rebuilding.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn hydrated_file_paths_for_test(
         &self,
         language: &str,
@@ -1288,6 +1292,17 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
     ) -> StoreResult<Option<[u8; 32]>> {
+        self.canonical_digest_with_mount(key, |mount| Ok(mount.fragment_digest().as_bytes()))
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn canonical_digest_with_mount(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        mount_digest: impl Fn(
+            &super::resolution_selection::SelectedResolutionMountRecord,
+        ) -> StoreResult<[u8; 32]>,
+    ) -> StoreResult<Option<[u8; 32]>> {
         use crate::analyzer::resolution::{
             ResolutionIdentityDigestKey as Key, mounted_identity_digest,
         };
@@ -1301,11 +1316,9 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         let cancellation = &content_lookup;
         let (mount, kind, digest) = match key {
             Key::Fragment(fragment) => {
-                return Ok(Some(
-                    self.mount_record_of_fragment(fragment)?
-                        .fragment_digest()
-                        .as_bytes(),
-                ));
+                return Ok(Some(mount_digest(
+                    self.mount_record_of_fragment(fragment)?.as_ref(),
+                )?));
             }
             Key::Semantic(semantic) => {
                 if semantic.shared_name_id().is_some() {
@@ -1327,7 +1340,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                     {
                         return Ok(Some(mounted_identity_digest(
                             b"semantic",
-                            mount.fragment_digest().as_bytes(),
+                            mount_digest(&mount)?,
                             value.identity().fragment_local_digest(),
                         )));
                     }
@@ -1343,7 +1356,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                         );
                         return Ok(Some(mounted_identity_digest(
                             b"semantic",
-                            mount.fragment_digest().as_bytes(),
+                            mount_digest(&mount)?,
                             identity.fragment_local_digest(),
                         )));
                     }
@@ -1385,7 +1398,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                     let mount = self.mount_record(SelectedResolutionMountOrdinal::new(ordinal))?;
                     return Ok(Some(mounted_identity_digest(
                         b"node",
-                        mount.fragment_digest().as_bytes(),
+                        mount_digest(&mount)?,
                         value.identity().digest(),
                     )));
                 }
@@ -1440,7 +1453,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         };
         Ok(Some(mounted_identity_digest(
             kind,
-            mount.fragment_digest().as_bytes(),
+            mount_digest(&mount)?,
             digest,
         )))
     }
@@ -2585,6 +2598,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
     /// accepts a bounded batch instead of preparing one statement per
     /// reference. The semantic digest is the request key; the recipe relation
     /// is the only authority for its spelling and namespace.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn lookup_semantic_recipes(
         &self,
         requests: &[SelectedLookupRecipeRequest],
@@ -2721,6 +2735,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_statement<T>(
         &self,
         cancellation: &CancellationToken,
@@ -3356,6 +3371,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// lookups issue one index seek per requested identity, including lookup
     /// zero; an open-tail read uses the all-lookups statement. Identical reads
     /// are retained only in the owning semantic operation's exact-read memo.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn boundary_candidate_branches(
         &self,
         direction: CandidateDirection,
@@ -3554,6 +3570,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// bucket is keyed on a shared name.
     ///
     /// `Ok(None)` means the read was cancelled.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn endpoint_branch_completions(
         &self,
         direction: CandidateDirection,
@@ -3682,6 +3699,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// decoded evidence or resurrect closed reasons. Only certified exact gap
     /// exclusions apply; cached reason overlays never determine scoped answers.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn reverse_completion_with_exclusions(
         &self,
         requests: &[BatchCandidateRequest],
@@ -4252,6 +4270,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// that blob's index the request reads, exactly as `CandidateLeadCell` and
     /// `CandidateNodeIndex::extend_buckets_for` do in the heap.
     // None is cancellation, never an empty completed request inventory.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn candidate_request_keys(
         &self,
         requests: &[BatchCandidateRequest],
@@ -4361,6 +4380,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn visit_candidate_match_rows_page(
         &self,
         direction: CandidateDirection,
@@ -5137,6 +5157,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         brokk_bifrost_core::attribution::statement_started(sql, connection);
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn memo_connection_tag(&self) -> brokk_bifrost_core::attribution::ConnectionTag {
         brokk_bifrost_core::cache_db::sql_profile::connection_tag(self.selection.connection())
             .unwrap_or(brokk_bifrost_core::attribution::ConnectionTag::NONE)
@@ -5220,6 +5241,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         ))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_node_catalog(
         &self,
         record: &SelectedResolutionMountRecord,
@@ -5380,6 +5402,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// path of the requested shape, so a demand opens only the authority that can
     /// contribute a match. Coverage reasons are not read here: the unconditional
     /// box is tier-1 rows and the branch boxes name their own mounts.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn candidate_mount_positions(
         &self,
         direction: CandidateDirection,
@@ -5771,6 +5794,7 @@ impl SelectedResolutionLexicalSource<'_, '_> {
 
     /// The blob's universal-root-terminated paths that end in one shared name,
     /// in path-key order, which is the order the interior's own index holds.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn root_terminal_candidates(
         &self,
         mount: &SelectedResolutionMountRecord,
@@ -5809,6 +5833,7 @@ impl SelectedResolutionLexicalSource<'_, '_> {
 
     /// Blobs whose tier-1 terminal header names this shared identity as the
     /// last fixed symbol of a universal-root-terminated path.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn terminal_header_mount_positions(
         &self,
         name: SharedNameId,
@@ -6273,6 +6298,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         }))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -6383,6 +6409,41 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
             .insert(key, MemoizedRootPresence::Ready(ordinary || staged_present));
         Ok(present)
     }
+    fn proof_identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        if let Some(digest) = self
+            .selection
+            .authority_request_memo()
+            .borrow()
+            .proof_digests
+            .get(&key)
+            .copied()
+        {
+            return Ok(Some(digest));
+        }
+        // Retain already-returned cancellation evidence just like the mounted
+        // identity lookup. The enclosing proof reader owns cancellation.
+        let content_lookup = CancellationToken::new();
+        let digest = self.canonical_digest_with_mount(key, |mount| {
+            let source = self
+                .typed
+                .receiver_proof_source(mount, &content_lookup)?
+                .ok_or_else(|| invalid_fact("proof identity has no selected source publication"))?;
+            Ok(*source.canonical_digest().as_bytes())
+        })?;
+        if let Some(digest) = digest {
+            self.selection
+                .authority_request_memo()
+                .borrow_mut()
+                .proof_digests
+                .insert_bounded(key, digest);
+        }
+        Ok(digest)
+    }
+
     fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,

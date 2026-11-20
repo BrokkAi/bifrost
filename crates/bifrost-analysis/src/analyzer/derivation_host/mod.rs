@@ -425,15 +425,11 @@ impl AnalyzerDerivations {
         // it, or reading the binding, makes the demand unavailable.
         let _lease = match inventory.derivation_read() {
             Ok(lease) => lease,
-            Err(error) => {
-                return Demanded::Unavailable(UnavailableCause::Failed(error.to_string().into()));
-            }
+            Err(error) => return Demanded::Unavailable(read_frame::binding_unavailable(error)),
         };
         let binding = match inventory.derivation_reader_binding() {
             Ok(binding) => binding,
-            Err(error) => {
-                return Demanded::Unavailable(UnavailableCause::Failed(error.to_string().into()));
-            }
+            Err(error) => return Demanded::Unavailable(read_frame::binding_unavailable(error)),
         };
         let authority = AnalyzerAuthority::for_kind(&binding, D::ID);
         let _host = HostGuard::enter(analyzer, inventory, &binding);
@@ -482,17 +478,13 @@ impl AnalyzerDerivations {
         let _lease = match inventory.derivation_read() {
             Ok(lease) => lease,
             Err(error) => {
-                return ReplayedDemand::Unavailable(UnavailableCause::Failed(
-                    error.to_string().into(),
-                ));
+                return ReplayedDemand::Unavailable(read_frame::binding_unavailable(error));
             }
         };
         let binding = match inventory.derivation_reader_binding() {
             Ok(binding) => binding,
             Err(error) => {
-                return ReplayedDemand::Unavailable(UnavailableCause::Failed(
-                    error.to_string().into(),
-                ));
+                return ReplayedDemand::Unavailable(read_frame::binding_unavailable(error));
             }
         };
         let authority = AnalyzerAuthority::for_kind(&binding, kind);
@@ -509,15 +501,11 @@ impl AnalyzerDerivations {
         let inventory = &operation.ready.inventory;
         let _lease = match inventory.derivation_read() {
             Ok(lease) => lease,
-            Err(error) => {
-                return Demanded::Unavailable(UnavailableCause::Failed(error.to_string().into()));
-            }
+            Err(error) => return Demanded::Unavailable(read_frame::binding_unavailable(error)),
         };
         let binding = match inventory.derivation_reader_binding() {
             Ok(binding) => binding,
-            Err(error) => {
-                return Demanded::Unavailable(UnavailableCause::Failed(error.to_string().into()));
-            }
+            Err(error) => return Demanded::Unavailable(read_frame::binding_unavailable(error)),
         };
         let authority = AnalyzerAuthority::for_kind(&binding, D::ID);
         let _host = HostGuard::enter_operation(analyzer, operation, &binding);
@@ -662,6 +650,7 @@ pub fn selected_rust_snapshot(
         .ok_or_else(|| "no selected Rust snapshot".to_string())
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn read_unit_summary(key: &[u8; 32]) -> Result<UnitLive, String> {
     let _scope = attribution::enter_scope("unit_summary", CoverageClass::RecomputeOnCurrency);
     with_bound_inventory(|inventory| {
@@ -1033,6 +1022,53 @@ mod integration_tests {
         assert_eq!(state(&semantic_budget), before);
         assert!(host.verify_receipt_in_operation(&analyzer, &operation, &file_receipt));
         assert!(host.verify_receipt_in_operation(&model_analyzer, &operation, &models));
+    }
+
+    #[test]
+    #[hardwon(
+        "#12932: a derivation reader-binding SQLite failure was reported as provider incompleteness"
+    )]
+    fn reader_binding_failure_is_a_recorded_store_failure() {
+        let fixture = SelectionFixture::with_blob_writer(
+            AnalyzerStore::open_ephemeral().unwrap(),
+            0,
+            "rust",
+            Language::Rust,
+            false,
+            false,
+            |_, _, _, _, _| {},
+        );
+        let project = crate::inline_project::InlineTestProject::new()
+            .file("main.rs", "fn main() {}\n")
+            .build();
+        let languages = [fixture.language()];
+        let operation = crate::analyzer::store_support::test_support::operation_fixture_support::open_ready_operation(
+            &fixture.store,
+            SelectedResolutionOperationInput::new(project.project(), &fixture.workspace_id, &fixture.snapshots, &languages, &[]),
+            &crate::CancellationToken::default(),
+        );
+        let analyzer = MultiAnalyzer::default();
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
+        host.register(ModelsRead);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        brokk_bifrost_store::analyzer::store::resolution_selection::inject_derivation_binding_failure_for_test();
+        let answer = host.demand_in_operation::<ModelsRead>(&analyzer, &operation, &0);
+        assert!(
+            matches!(
+                answer,
+                Demanded::Unavailable(UnavailableCause::StoreFailure)
+            ),
+            "a binding SQLite failure is a store failure, not provider incompleteness"
+        );
+        let error = scope
+            .store_error()
+            .expect("the binding failure is recorded on the query scope");
+        assert!(
+            error
+                .to_string()
+                .contains("injected reader binding failure"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1841,6 +1877,10 @@ mod integration_tests {
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
             UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
             _: &mut DerivationFrame<'_, R, A>,
@@ -2250,6 +2290,10 @@ mod integration_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_stage_borrows_lease_read_and_ends_once() {
         let fixture = SelectionFixture::with_blob_writer(
             AnalyzerStore::open_ephemeral().unwrap(),

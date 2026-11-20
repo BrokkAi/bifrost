@@ -38,7 +38,7 @@ impl SelectedTypeHeadSource for RustTypeContext<'_, '_> {
             return Ok(Read::Unavailable(Stop::IdentityUnavailable));
         };
         Ok(match self.type_declaration(file, range)? {
-            SelectedTypeProofRead::Available(unit) => Read::Available(brokk_bifrost_analysis::analyzer::store::language_support::SelectedNominalHeadDeclaration { identity: unit.declaration_id(), declaration: unit }),
+            SelectedTypeProofRead::Available(unit) => Read::Available(brokk_bifrost_analysis::analyzer::store::language_support::SelectedNominalHeadDeclaration { rust_declaration_kind: None, identity: unit.declaration_id(), declaration: unit }),
             _ => Read::Unavailable(Stop::IdentityUnavailable),
         })
     }

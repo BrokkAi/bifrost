@@ -349,6 +349,7 @@ seam_methods! {
     RootReferenceToken => "root_reference_token", "BatchResolutionFragmentSource";
     JvmSelectedRootPresence => "jvm_selected_root_presence", "BatchResolutionFragmentSource";
     CandidateAdmissionSession => "candidate_admission_session", "BatchResolutionFragmentSource";
+    ProofIdentityContentDigest => "proof_identity_content_digest", "BatchResolutionFragmentSource";
     IdentityContentDigest => "identity_content_digest", "BatchResolutionFragmentSource";
     SelectionAuthority => "selection_authority", "BatchResolutionFragmentSource";
     AdmitsReverseReference => "admits_reverse_reference", "BatchResolutionFragmentSource";
@@ -365,11 +366,15 @@ seam_methods! {
     SelectedTypeHeads => "selected_type_heads", "SelectedTypedFactSource";
     SelectedBlobGapReasonProvenance => "selected_blob_gap_reason_provenance", "SelectedTypedFactSource";
     SelectedBlobForFragment => "selected_blob_for_fragment", "SelectedTypedFactSource";
+    SelectedAccessReference => "selected_access_reference", "SelectedTypedFactSource";
+    SelectedAccessDeclaration => "selected_access_declaration", "SelectedTypedFactSource";
     SelectedModelLanguage => "selected_model_language", "SelectedTypedFactSource";
     SelectedModelProjection => "selected_model_projection", "SelectedTypedFactSource";
     SupportsConditionalTypeSeeds => "supports_conditional_type_seeds", "SelectedTypedFactSource";
     ConditionalTypeSeeds => "conditional_type_seeds", "SelectedTypedFactSource";
     ConditionalTypeProductions => "conditional_type_productions", "SelectedTypedFactSource";
+    ClosureBinderContexts => "closure_binder_contexts", "SelectedTypedFactSource";
+    FormalFunctionShapes => "formal_function_shapes", "SelectedTypedFactSource";
     JvmIntrinsicOwnerIsUnshadowed => "jvm_intrinsic_owner_is_unshadowed", "SelectedTypedFactSource";
     SelectedJvmDeclarationOwner => "selected_jvm_declaration_owner", "SelectedTypedFactSource";
     GeneratedItemsCannotShadowBindings => "generated_items_cannot_shadow_bindings", "SelectedTypedFactSource";
@@ -430,6 +435,7 @@ seam_methods! {
     InvocationRolesForReferences => "invocation_roles_for_references", "SelectedTypedFactSource";
     LookupsOutsideImplicitRoot => "lookups_outside_implicit_root", "SelectedTypedFactSource";
     GenericParameterDeclarations => "generic_parameter_declarations", "SelectedTypedFactSource";
+    DeferredParticipationUsesReceiver => "deferred_participation_uses_receiver", "SelectedTypedFactSource";
     GoPackageMemberSources => "go_package_member_sources", "SelectedTypedFactSource";
     GoSourcePlacementProofs => "go_source_placement_proofs", "SelectedTypedFactSource";
     DeferredMemberParticipation => "deferred_member_participation", "SelectedTypedFactSource";
@@ -438,6 +444,13 @@ seam_methods! {
     GoModelOwnerDeclarations => "go_model_owner_declarations", "SelectedTypedFactSource";
     UnindexedModelCallableResult => "unindexed_model_callable_result", "SelectedTypedFactSource";
     ModelMemberCallableResult => "model_member_callable_result", "SelectedTypedFactSource";
+    DeclarationMethodAttributes => "declaration_method_attributes", "SelectedTypedFactSource";
+    DeclarationClassLikeMetadata => "declaration_class_like_metadata", "SelectedTypedFactSource";
+    SelectedImplicitRootInput => "selected_implicit_root_input", "SelectedTypedFactSource";
+    SupertypeKindEvidence => "supertype_kind_evidence", "SelectedTypedFactSource";
+    SelectedBaseReceiverContextQuestion => "selected_base_receiver_context_question", "SelectedTypedFactSource";
+    DeferredBaseReceiverIntent => "deferred_base_receiver_intent", "SelectedTypedFactSource";
+    NominalParentTargetKinds => "nominal_parent_target_kinds", "SelectedTypedFactSource";
     JavaInheritanceDeclarations => "java_inheritance_declarations", "SelectedTypedFactSource";
     RustSupertraitOwners => "rust_supertrait_owners", "SelectedTypedFactSource";
     RustExternalTypeIdentities => "rust_external_type_identities", "SelectedTypedFactSource";
@@ -498,6 +511,7 @@ seam_methods! {
     VisitCallApplicabilityPagesForCalleeReferences => "visit_call_applicability_pages_for_callee_references", "SelectedTypedFactSource";
     VisitCallApplicabilityPagesForGapReasons => "visit_call_applicability_pages_for_gap_reasons", "SelectedTypedFactSource";
     VisitCallableSignaturePagesForDefinitions => "visit_callable_signature_pages_for_definitions", "SelectedTypedFactSource";
+    VisitDeclarationModifierPagesForDefinitions => "visit_declaration_modifier_pages_for_definitions", "SelectedTypedFactSource";
     VisitGapReasonProvenancePagesForReasons => "visit_gap_reason_provenance_pages_for_reasons", "SelectedTypedFactSource";
     QualifiedMemberRegistrations => "qualified_member_registrations", "SelectedTypedFactSource";
 }
@@ -1494,6 +1508,22 @@ where
         self.inner.candidate_admission_session()
     }
 
+    fn proof_identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<[u8; 32]>> {
+        record_call(SeamMethod::ProofIdentityContentDigest, 1);
+        let outcome = self.inner.proof_identity_content_digest(key, cancellation);
+        if let Ok(digest) = &outcome {
+            record_rows(
+                SeamMethod::ProofIdentityContentDigest,
+                usize::from(digest.is_some()),
+            );
+        }
+        outcome
+    }
+
     fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
@@ -2099,6 +2129,32 @@ where
         result
     }
 
+    fn closure_binder_contexts(
+        &self,
+        binders: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<super::fact_source::ClosureBinderContext>> {
+        record_call(SeamMethod::ClosureBinderContexts, binders.len());
+        let result = self.inner.closure_binder_contexts(binders, cancellation);
+        if let Ok(rows) = &result {
+            record_rows(SeamMethod::ClosureBinderContexts, rows.len());
+        }
+        result
+    }
+
+    fn formal_function_shapes(
+        &self,
+        owners: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<super::fact_source::FormalFunctionShape>> {
+        record_call(SeamMethod::FormalFunctionShapes, owners.len());
+        let result = self.inner.formal_function_shapes(owners, cancellation);
+        if let Ok(rows) = &result {
+            record_rows(SeamMethod::FormalFunctionShapes, rows.len());
+        }
+        result
+    }
+
     fn supports_conditional_type_seeds(&self) -> bool {
         let supported = self.inner.supports_conditional_type_seeds();
         // Keep default-language lifecycle counters byte-identical.
@@ -2108,13 +2164,104 @@ where
         supported
     }
 
+    fn selected_access_reference(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::fact_source::SelectedAccessReference>> {
+        record_call(SeamMethod::SelectedAccessReference, 1);
+        let result = self
+            .inner
+            .selected_access_reference(reference, cancellation);
+        if matches!(&result, Ok(Some(_))) {
+            record_rows(SeamMethod::SelectedAccessReference, 1);
+        }
+        result
+    }
+    fn selected_access_declaration(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::fact_source::SelectedAccessDeclaration>> {
+        record_call(SeamMethod::SelectedAccessDeclaration, 1);
+        let result = self
+            .inner
+            .selected_access_declaration(definition, cancellation);
+        if matches!(&result, Ok(Some(_))) {
+            record_rows(SeamMethod::SelectedAccessDeclaration, 1);
+        }
+        result
+    }
+
+    fn records_class_like_staticness(&self, language: crate::analyzer::Language) -> bool {
+        self.inner.records_class_like_staticness(language)
+    }
+
+    fn receiver_proof_services(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::resolution_operation::SelectedAnalyzerServices> {
+        self.inner.receiver_proof_services()
+    }
+
+    fn selected_receiver_proof_question(
+        &self,
+        application: SemanticId,
+        transfer: Option<(SemanticId, SemanticId)>,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        self.inner
+            .selected_receiver_proof_question(application, transfer, cancellation)
+    }
+
+    fn selected_base_receiver_context_question(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        record_call(SeamMethod::SelectedBaseReceiverContextQuestion, 1);
+        let result = self
+            .inner
+            .selected_base_receiver_context_question(reference, cancellation);
+        if matches!(&result, Ok(Some(_))) {
+            record_rows(SeamMethod::SelectedBaseReceiverContextQuestion, 1);
+        }
+        result
+    }
+
+    fn deferred_base_receiver_intent(
+        &self,
+        slot: SemanticId,
+        reader: &dyn super::fact_source::DeferredBaseReceiverIntentReader,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::fact_source::DeferredBaseReceiverIntentRead> {
+        record_call(SeamMethod::DeferredBaseReceiverIntent, 1);
+        let result = self
+            .inner
+            .deferred_base_receiver_intent(slot, reader, cancellation);
+        if matches!(
+            &result,
+            Ok(
+                super::fact_source::DeferredBaseReceiverIntentRead::Intent { .. }
+                    | super::fact_source::DeferredBaseReceiverIntentRead::Open { .. }
+            )
+        ) {
+            record_rows(SeamMethod::DeferredBaseReceiverIntent, 1);
+        }
+        result
+    }
+
     fn conditional_type_seeds(
         &self,
         slots: &[SemanticId],
+        reader: &dyn crate::analyzer::resolution::fact_source::ConditionalOwnerApplicationReader,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Vec<super::ConditionalTypeSeed>> {
+    ) -> StoreResult<Vec<super::ConditionalTypeSeedRead>> {
         record_call(SeamMethod::ConditionalTypeSeeds, slots.len());
-        let result = self.inner.conditional_type_seeds(slots, cancellation);
+        let result = self
+            .inner
+            .conditional_type_seeds(slots, reader, cancellation);
         if let Ok(seeds) = &result {
             record_rows(SeamMethod::ConditionalTypeSeeds, seeds.len());
         }
@@ -2598,16 +2745,25 @@ where
         outcome
     }
 
+    fn deferred_participation_uses_receiver(&self, language: crate::analyzer::Language) -> bool {
+        let supported = self.inner.deferred_participation_uses_receiver(language);
+        if supported {
+            record_call(SeamMethod::DeferredParticipationUsesReceiver, 0);
+        }
+        supported
+    }
+
     fn deferred_member_participation(
         &self,
         definitions: &[SemanticId],
+        receivers: Option<&[super::fact_source::DeferredMemberReceiverType]>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<bool>>> {
         let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(definitions.len());
         record_call(SeamMethod::DeferredMemberParticipation, definitions.len());
-        let outcome = self
-            .inner
-            .deferred_member_participation(definitions, cancellation);
+        let outcome =
+            self.inner
+                .deferred_member_participation(definitions, receivers, cancellation);
         if let Ok(Some(rows)) = &outcome {
             record_rows(SeamMethod::DeferredMemberParticipation, rows.len());
         }
@@ -2731,6 +2887,97 @@ where
         let outcome = self.inner.hierarchy_terminal_nodes(gaps, cancellation);
         if let Ok(Some(rows)) = &outcome {
             record_rows(SeamMethod::HierarchyTerminalNodes, rows.len());
+        }
+        outcome
+    }
+
+    fn admitted_owner_language(&self, owner: SemanticId) -> Option<crate::analyzer::Language> {
+        self.inner.admitted_owner_language(owner)
+    }
+
+    fn implicit_root_rules_for_language(
+        &self,
+        language: crate::analyzer::Language,
+    ) -> Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers> {
+        self.inner.implicit_root_rules_for_language(language)
+    }
+
+    fn selected_implicit_root_input(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::SelectedImplicitRootInput>> {
+        record_call(SeamMethod::SelectedImplicitRootInput, 1);
+        let result = self.inner.selected_implicit_root_input(owner, cancellation);
+        if let Ok(Some(_)) = &result {
+            record_rows(SeamMethod::SelectedImplicitRootInput, 1);
+        }
+        result
+    }
+
+    fn supertype_kind_evidence(
+        &self,
+        language: crate::analyzer::Language,
+        stored: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind>,
+        targets: &[SemanticId],
+        completion: &super::ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::SupertypeKindEvidence>> {
+        record_call(SeamMethod::SupertypeKindEvidence, targets.len());
+        let result =
+            self.inner
+                .supertype_kind_evidence(language, stored, targets, completion, cancellation);
+        if matches!(&result, Ok(Some(_))) {
+            record_rows(SeamMethod::SupertypeKindEvidence, 1);
+        }
+        result
+    }
+
+    fn declaration_method_attributes(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, super::SelectedDeclarationMethodAttributes)>>> {
+        record_call(SeamMethod::DeclarationMethodAttributes, definitions.len());
+        let result = self
+            .inner
+            .declaration_method_attributes(definitions, cancellation);
+        if let Ok(Some(rows)) = &result {
+            record_rows(SeamMethod::DeclarationMethodAttributes, rows.len());
+        }
+        result
+    }
+
+    fn declaration_class_like_metadata(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::SelectedDeclarationClassLikeMetadata>>> {
+        record_call(SeamMethod::DeclarationClassLikeMetadata, definitions.len());
+        let result = self
+            .inner
+            .declaration_class_like_metadata(definitions, cancellation);
+        if let Ok(Some(rows)) = &result {
+            record_rows(SeamMethod::DeclarationClassLikeMetadata, rows.len());
+        }
+        result
+    }
+
+    fn requires_selected_nominal_parent_kind(&self, language: crate::analyzer::Language) -> bool {
+        self.inner.requires_selected_nominal_parent_kind(language)
+    }
+
+    fn nominal_parent_target_kinds(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, super::NominalParentTargetKind)>>> {
+        record_call(SeamMethod::NominalParentTargetKinds, definitions.len());
+        let outcome = self
+            .inner
+            .nominal_parent_target_kinds(definitions, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::NominalParentTargetKinds, rows.len());
         }
         outcome
     }
@@ -2990,6 +3237,12 @@ where
     );
 
     counted_typed_pages!(
+        visit_declaration_modifier_pages_for_definitions,
+        VisitDeclarationModifierPagesForDefinitions,
+        SemanticId,
+        SelectedTypedRow<super::fact_source::SelectedDeclarationModifier>
+    );
+    counted_typed_pages!(
         visit_declaration_type_pages_for_definitions,
         VisitDeclarationTypePagesForDefinitions,
         SemanticId,
@@ -3179,12 +3432,17 @@ mod tests {
         // #8834: jvm_selected_root_presence is forwarded and counted too.
         // #5671: the root-inventory admission session is forwarded and counted too.
         // #7708: supports_exact_type_argument_links is forwarded and counted too.
-        assert_eq!(batch.len(), 41, "BatchResolutionFragmentSource: {batch:?}");
+        // The merged reverse-inventory completion read is counted alongside
+        // H's selected JVM root-presence read.
+        assert_eq!(batch.len(), 42, "BatchResolutionFragmentSource: {batch:?}");
         // #7654, #5658, #9002, #11325 and #5658 2b.1 add readers; #12241 adds
         // the operator provider, selected type heads and binary-operation page
         // reader; #12159 adds the conditional nominal-constructor reader;
-        // #12070 adds the trailing implicit-base read.
-        assert_eq!(typed.len(), 115, "SelectedTypedFactSource: {typed:?}");
+        // #12070 adds the trailing implicit-base read; #12159 adds closure binder
+        // and function shape readers.
+        // H's selected receiver/source readers and #13081's
+        // receiver-participation capability are both counted.
+        assert_eq!(typed.len(), 134, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -3198,13 +3456,20 @@ mod tests {
                     .iter()
                     .map(|name| (name.as_str(), "SelectedTypedFactSource")),
             )
-            // These context hooks are reached only after registry opt-in or
-            // through a retained language route. Default-language requests do
-            // not call them; the no-call regression pins the universe guard.
+            // These context and capability hooks do not perform profiled source
+            // reads. Default-language requests do not call the selected-universe
+            // hooks; language routes use the remaining hooks as bounded lookups.
             .filter(|(name, _)| {
                 !matches!(
                     *name,
-                    "selected_universe_entry" | "intrinsic_member_inventory"
+                    "selected_universe_entry"
+                        | "intrinsic_member_inventory"
+                        | "admitted_owner_language"
+                        | "implicit_root_rules_for_language"
+                        | "receiver_proof_services"
+                        | "selected_receiver_proof_question"
+                        | "requires_selected_nominal_parent_kind"
+                        | "records_class_like_staticness"
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
@@ -3220,8 +3485,10 @@ mod tests {
         // hierarchy readers; #12241 profiles the operator provider, selected
         // type heads and binary-operation page reader; #12159 profiles the
         // conditional nominal-constructor reader; #12070 profiles the trailing
-        // implicit-base read.
-        assert_eq!(METHOD_COUNT, 154);
+        // implicit-base read; #12159 adds closure binder and function shape readers.
+        // H's selected receiver/source readers and #13081's
+        // receiver-participation capability are both counted.
+        assert_eq!(METHOD_COUNT, 168);
     }
 
     #[cfg(test)]

@@ -7,9 +7,6 @@ use crate::analyzer::java::semantic::numeric::JavaNumericLiteral;
 use crate::analyzer::java::semantic::numeric::integral_domain_contains;
 
 use crate::analyzer::java::semantic::numeric::java_numeric_literal;
-use crate::analyzer::java::semantic::numeric::{
-    java_integral_binary, java_integral_comparison, java_integral_negate,
-};
 
 use crate::analyzer::java::semantic::syntax::*;
 
@@ -163,6 +160,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         local_types: HashMap::default(),
         local_type_nodes: HashMap::default(),
         constant_locals: HashMap::default(),
+        constant_local_candidates: Vec::new(),
         array_values: HashSet::default(),
         non_null_values: HashSet::default(),
         written_bindings: HashSet::default(),
@@ -519,9 +517,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .filter_map(|declarator| {
                 let name = declarator.child_by_field_name("name")?;
                 let initializer = declarator.child_by_field_name("value")?;
-                (name.kind() == "identifier").then_some((declarator, name, initializer))
+                (name.kind() == "identifier").then_some((declarator, Some(name), initializer))
             })
             .collect::<Vec<_>>();
+        self.schedule_initializers(builder, &initializers, entry, next, scope, stack)
+    }
+
+    /// Evaluates each initializer in source order and, for one that declares
+    /// a local, assigns its value to that local before the next initializer
+    /// runs. Each entry is the declaring node, the declared name when there
+    /// is one, and the initializer. A local declaration declares a name for
+    /// every entry; a try-with-resources specification can also name an
+    /// existing variable as a resource, which only evaluates it.
+    fn schedule_initializers(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        initializers: &[(Node<'tree>, Option<Node<'tree>>, Node<'tree>)],
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
         if initializers.is_empty() {
             return self.edge(builder, entry, next);
         }
@@ -536,6 +552,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
         for (index, (declarator, name, initializer)) in initializers.iter().enumerate().rev() {
+            let following = expression_entries
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(next);
+            self.edge(builder, terminals[index], following)?;
+            stack.push(Work::Expression {
+                node: *initializer,
+                entry: expression_entries[index],
+                next: EdgeTarget::normal(terminals[index]),
+                scope,
+            });
+            let Some(name) = name else {
+                continue;
+            };
             let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
                 JavaLoweringError::Invalid("local declaration has invalid name range".into())
             })?;
@@ -573,18 +604,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     target,
                 },
             )?;
-            let following = expression_entries
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(next);
-            self.edge(builder, terminals[index], following)?;
-            stack.push(Work::Expression {
-                node: *initializer,
-                entry: expression_entries[index],
-                next: EdgeTarget::normal(terminals[index]),
-                scope,
-            });
         }
         Ok(())
     }
@@ -1541,6 +1560,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Ok((cursor, negated)) = peel_guard_condition(condition, syntax) else {
             return Ok(None);
         };
+        // A constant condition (a comparison of constants or an allowlisted
+        // String call on a constant) is decided like a literal;
+        // `condition` keeps only the arm it selects, and the published
+        // predicate says why the other arm is missing.
+        if let Some(value) = self.constant_truth(cursor) {
+            return Ok(Some(NormalizedConditionGuard::folded(
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                None,
+            )));
+        }
+
         // This rule is disjoint from local, literal and comparison rules by
         // the peeled terminal's node kind. A null boxed Boolean exits through
         // the existing exceptional path before either decision arm is taken.
@@ -1582,18 +1614,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "binary_expression" => {}
             _ => return Ok(None),
-        }
-
-        // A comparison over integral constants is decided like a literal;
-        // `condition` keeps only the arm it selects, and the published
-        // predicate says why the other arm is missing.
-        if let Some(value) = self.constant_truth(cursor) {
-            return Ok(Some(NormalizedConditionGuard::folded(
-                GuardPredicate::ConstantBoolean {
-                    value: value != negated,
-                },
-                None,
-            )));
         }
 
         let Some(operator) = cursor.child_by_field_name("operator") else {
@@ -1868,6 +1888,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 target_scalar.is_none()
                     && node_text(self.prepared.source(), target) != Some("var")
                     && (source.kind() == "this" && self.receiver.is_some()
+                        || self.call_result_reaches_reference_target(target, source)
                         || self
                             .lexical_reference_binding(source)
                             .is_some_and(|(value, _)| self.array_values.contains(&value))
@@ -1878,6 +1899,48 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         }))
             }
         }
+    }
+
+    /// A `new R(..)` result stored into a plain reference type is an identity
+    /// or widening reference conversion, which runs no code (#13668): its
+    /// static type is exactly `R`, because scoped, generic and anonymous
+    /// creations are refused before this point. A method call result is not
+    /// admitted: lowering never resolves the callee, so it cannot prove that
+    /// the declared return type needs no caller-side `checkcast`, which can
+    /// throw ClassCastException after a successful return (#14259). A
+    /// primitive, `var`, wrapper or wrapper supertype target can also hide a
+    /// box or unbox call. The assignment or return is the source's direct
+    /// parent, so a declarator with dimensions (`R r[] = new R()`) is an array
+    /// target and stays refused.
+    fn call_result_reaches_reference_target(
+        &self,
+        target: Node<'tree>,
+        source: Node<'tree>,
+    ) -> bool {
+        const BOXING_TARGETS: [&str; 14] = [
+            "Object",
+            "Number",
+            "Comparable",
+            "Serializable",
+            "Constable",
+            "ConstantDesc",
+            "Boolean",
+            "Byte",
+            "Character",
+            "Short",
+            "Integer",
+            "Long",
+            "Float",
+            "Double",
+        ];
+        source.kind() == "object_creation_expression"
+            && source.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "variable_declarator" | "return_statement")
+                    && parent.child_by_field_name("dimensions").is_none()
+            })
+            && target.kind() == "type_identifier"
+            && node_text(self.prepared.source(), target)
+                .is_some_and(|name| name != "var" && !BOXING_TARGETS.contains(&name))
     }
 
     fn assignment_literal_kind(
@@ -2251,6 +2314,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "if_statement" => {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
+                // The branch and its guard are rows. A condition whose value
+                // needs no boxing conversion has nothing else to account for.
+                if self.condition_is_claimable(condition) {
+                    self.session
+                        .footprint_register(node, BoundaryDisposition::Lowered);
+                    let mut claimed = condition;
+                    while claimed.kind() == "parenthesized_expression" {
+                        self.session
+                            .footprint_register(claimed, BoundaryDisposition::Lowered);
+                        claimed = first_named_child(claimed).expect("parenthesized value");
+                    }
+                    if claimed.kind() == "binary_expression" {
+                        self.session
+                            .footprint_register(claimed, BoundaryDisposition::Lowered);
+                    }
+                }
                 let alternative = node.child_by_field_name("alternative");
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 stack.push(Work::Statement {
@@ -2450,99 +2529,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
-    /// The value of a numerical comparison whose operands are integral
-    /// constants (see [`Self::integral_constant`]), or `None` when either
-    /// operand is not one. Evaluating such a condition has no side effects
-    /// and cannot throw, so dropping the arm it never selects is exact.
-    fn constant_truth(&self, node: Node<'tree>) -> Option<bool> {
-        if node.kind() != "binary_expression" {
-            return None;
-        }
-        let operator = node.child_by_field_name("operator")?.kind();
-        if !matches!(operator, "==" | "!=" | "<" | "<=" | ">" | ">=") {
-            return None;
-        }
-        let left = self.integral_constant(node.child_by_field_name("left")?)?;
-        let right = self.integral_constant(node.child_by_field_name("right")?)?;
-        java_integral_comparison(operator, left, right)
-    }
-
-    /// The `int` or `long` value of an expression built from integer
-    /// literals, effectively final constant locals (`constant_locals`),
-    /// parentheses, unary `+`/`-` and binary `+ - * / %`. Anything else,
-    /// including a division by zero, has no value. The walk is iterative
-    /// because generated conditions can nest deeply.
-    fn integral_constant(&self, root: Node<'tree>) -> Option<JavaNumericLiteral> {
-        enum Step<'tree> {
-            Visit(Node<'tree>),
-            Apply(Node<'tree>),
-        }
-        let source = self.prepared.source();
-        let mut work = vec![Step::Visit(root)];
-        let mut values = Vec::new();
-        while let Some(step) = work.pop() {
-            match step {
-                Step::Visit(node) => {
-                    if let Some(literal) = java_numeric_literal(source, node) {
-                        literal.integer()?;
-                        values.push(literal);
-                        continue;
-                    }
-                    match node.kind() {
-                        "parenthesized_expression" => {
-                            work.push(Step::Visit(first_named_child(node)?));
-                        }
-                        "identifier" => {
-                            let (binding, kind) = self.lexical_reference_binding(node)?;
-                            if kind != ValueFlowKind::Local {
-                                return None;
-                            }
-                            values.push(*self.constant_locals.get(&binding)?);
-                        }
-                        "unary_expression" => {
-                            let operator = node.child_by_field_name("operator")?.kind();
-                            if !matches!(operator, "+" | "-") {
-                                return None;
-                            }
-                            work.push(Step::Apply(node));
-                            work.push(Step::Visit(node.child_by_field_name("operand")?));
-                        }
-                        "binary_expression"
-                            if node
-                                .child_by_field_name("operator")
-                                .is_some_and(|operator| {
-                                    matches!(operator.kind(), "+" | "-" | "*" | "/" | "%")
-                                }) =>
-                        {
-                            work.push(Step::Apply(node));
-                            work.push(Step::Visit(node.child_by_field_name("right")?));
-                            work.push(Step::Visit(node.child_by_field_name("left")?));
-                        }
-                        _ => return None,
-                    }
-                }
-                Step::Apply(node) if node.kind() == "unary_expression" => {
-                    let operand = values.pop().expect("a visited unary operand has a value");
-                    let negate = node.child_by_field_name("operator")?.kind() == "-";
-                    values.push(if negate {
-                        java_integral_negate(operand)?
-                    } else {
-                        operand
-                    });
-                }
-                Step::Apply(node) => {
-                    let right = values.pop().expect("a visited right operand has a value");
-                    let left = values.pop().expect("a visited left operand has a value");
-                    let operator = node.child_by_field_name("operator")?.kind();
-                    values.push(java_integral_binary(operator, left, right)?);
-                }
-            }
-        }
-        let value = values.pop();
-        debug_assert!(values.is_empty(), "every operand was consumed: {values:?}");
-        value
-    }
-
     fn is_primitive_boolean_expression(&self, node: Node<'tree>) -> bool {
         match node.kind() {
             "true" | "false" | "instanceof_expression" => true,
@@ -2557,6 +2543,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .lexical_reference_binding(node)
                 .and_then(|(binding, _)| self.local_type_nodes.get(&binding))
                 .is_some_and(|ty| ty.kind() == "boolean_type"),
+            _ => false,
+        }
+    }
+
+    /// A condition the `if` claim covers: a primitive boolean literal or
+    /// local, or an `==`/`!=` comparison with `null`, which compares
+    /// references and never unboxes. A boxed `Boolean` condition stays
+    /// refused because its abort edge is not the `booleanValue()` call.
+    fn condition_is_claimable(&self, mut condition: Node<'tree>) -> bool {
+        while condition.kind() == "parenthesized_expression" {
+            condition = first_named_child(condition).expect("parenthesized value");
+        }
+        match condition.kind() {
+            "true" | "false" => true,
+            "identifier" => self.is_primitive_boolean_expression(condition),
+            "binary_expression" => java_null_comparison(condition),
             _ => false,
         }
     }
@@ -3617,6 +3619,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let dispatch = self.point(builder, node, Vec::new())?;
         let selector =
             self.expression_value(builder, condition, expression_value_kind(condition))?;
+        // A constant selector decides every constant label at lowering time.
+        let constant_selector = self.java_constant(condition);
         let switch_next = if expression_mode {
             let merge = self.point(builder, node, Vec::new())?;
             self.edge(builder, merge, next)?;
@@ -3854,6 +3858,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     continue;
                 }
                 let comparison = self.point(builder, *switch_label, Vec::new())?;
+                // Only a plain label of constants is decided: a pattern, a
+                // guard, an enum constant or any other non-constant label
+                // keeps both edges.
+                let verdict = constant_selector
+                    .as_ref()
+                    .filter(|_| {
+                        !switch_label_has_pattern(*switch_label)
+                            && switch_label_guard(*switch_label).is_none()
+                    })
+                    .and_then(|selector| self.switch_label_verdict(selector, *switch_label));
+                let (case_feasible, miss_feasible) = match verdict {
+                    Some(true) => (true, false),
+                    Some(false) => (false, true),
+                    None => (true, true),
+                };
                 if switch_label_has_pattern(*switch_label) {
                     self.add_gap(
                         builder,
@@ -3881,7 +3900,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // or not the label is guarded, so it is the one edge the
                 // default row can always name.
                 if default_point == Some(no_match.point) {
-                    default_edge_source = Some(comparison);
+                    default_edge_source = Some((comparison, miss_feasible));
                 }
                 let case_edge_source = if let Some(guard) = switch_label_guard(*switch_label) {
                     let guard_entry = self.point(builder, guard, Vec::new())?;
@@ -3921,14 +3940,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
                     guard_passed
                 } else {
-                    self.edge(
-                        builder,
-                        selected,
-                        EdgeTarget {
+                    if case_feasible {
+                        let case_target = EdgeTarget {
                             point: arm_entries[arm_index],
                             kind: ControlEdgeKind::SwitchCase,
-                        },
-                    )?;
+                        };
+                        self.edge(builder, selected, case_target)?;
+                        // A constant selector that matched this label drops
+                        // the default edge. The guard is the proof that the
+                        // omission is a decision and not a lost edge: switch
+                        // validation accepts a default without an edge only
+                        // beside it.
+                        if verdict == Some(true) {
+                            self.session.add_guard_fact(
+                                builder,
+                                selected,
+                                GuardPredicate::ConstantBoolean { value: true },
+                                None,
+                                Some(GuardArm {
+                                    target_point: case_target.point,
+                                    kind: case_target.kind,
+                                }),
+                                None,
+                            )?;
+                        }
+                    }
                     selected
                 };
                 if selected != comparison {
@@ -3947,9 +3983,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                     )?;
                 }
+                // A fact row names an edge that exists, so a label whose case
+                // edge was not built publishes no row.
                 for case_value in named_children(*switch_label)
                     .into_iter()
-                    .filter(|child| child.kind() != "guard")
+                    .filter(|child| child.kind() != "guard" && case_feasible)
                 {
                     cases.push(SwitchCaseFactParts {
                         value: self.expression_value(
@@ -3966,27 +4004,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                     });
                 }
-                self.edge(
-                    builder,
-                    comparison,
-                    EdgeTarget {
-                        point: no_match.point,
-                        kind: ControlEdgeKind::ConditionalFalse,
-                    },
-                )?;
+                if miss_feasible {
+                    self.edge(
+                        builder,
+                        comparison,
+                        EdgeTarget {
+                            point: no_match.point,
+                            kind: ControlEdgeKind::ConditionalFalse,
+                        },
+                    )?;
+                }
                 no_match = EdgeTarget::normal(comparison);
             }
         }
         self.edge(builder, dispatch, no_match)?;
-        let default_edge = default_point.map(|target_point| {
-            let (source_point, kind) = default_edge_source
-                .map_or((dispatch, ControlEdgeKind::SwitchCase), |source_point| {
-                    (source_point, ControlEdgeKind::ConditionalFalse)
-                });
-            SwitchEdgeParts {
+        // The default row names the edge that reaches the default arm. A
+        // constant selector that matched a label never takes that edge, so
+        // the edge is absent; the fact still records that the source has a
+        // default, so switch coverage stays exhaustive.
+        let default_edge = default_point.and_then(|target_point| {
+            let (source_point, kind) = match default_edge_source {
+                None => (dispatch, ControlEdgeKind::SwitchCase),
+                Some((_, false)) => return None,
+                Some((source_point, true)) => (source_point, ControlEdgeKind::ConditionalFalse),
+            };
+            Some(SwitchEdgeParts {
                 source_point,
                 arm: GuardArm { target_point, kind },
-            }
+            })
         });
         self.session.add_switch_fact(
             builder,
@@ -4172,69 +4217,97 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let (body_entry, body_scope, resource_normal_route) = if node.kind()
             == "try_with_resources_statement"
         {
-            let resource_region = CleanupRegionId::new(
-                u32::try_from(self.cleanups.len())
-                    .map_err(|_| JavaLoweringError::Invalid("too many cleanup regions".into()))?,
-            );
-            self.cleanups.push(CleanupRegion {
-                id: resource_region,
-                body: CleanupBody::OpaqueResource(node),
-                outer_scope: try_scope,
-            });
-            let body_scope = builder.push_scope(
-                Some(try_scope),
-                ScopeBinding::Cleanup {
-                    region: resource_region,
-                },
-            );
             let after_resource = self.point(builder, node, Vec::new())?;
             if let Some(route) = &normal_route {
                 self.route(builder, after_resource, route, stack)?;
             } else {
                 self.edge(builder, after_resource, next)?;
             }
-            let resource_normal_route =
-                builder.normal_cleanup_completion(resource_region, after_resource);
             let resource_boundary = self.point(builder, node, Vec::new())?;
-            let initializers = try_with_resources_values(node);
-            // A resource that another initializer follows can also be closed by
-            // that later initializer's failure: Java releases every resource
-            // that already initialized. That partial-initialization close chain
-            // is not lowered, so it opens exactly the values it can close and
-            // nothing else. The last resource has no later initializer, and a
-            // single-resource statement has no partial-initialization close at
-            // all, so those acquisitions stay exact.
-            for initializer in initializers
-                .iter()
-                .take(initializers.len().saturating_sub(1))
-            {
-                let value = self.expression_value(
-                    builder,
-                    *initializer,
-                    expression_value_kind(*initializer),
-                )?;
+            // A declared resource is a local that the try block reads, so its
+            // initializer is assigned to it like a local declaration's. A
+            // resource that names an existing variable is only evaluated. An
+            // error-recovery node among the resources has no declared name and
+            // likewise only evaluates its value.
+            let resources = try_with_resources_values(node)
+                .into_iter()
+                .map(|value| {
+                    let resource = value
+                        .parent()
+                        .filter(|resource| resource.kind() == "resource");
+                    let name = resource
+                        .and_then(|resource| resource.child_by_field_name("name"))
+                        .filter(|name| name.kind() == "identifier");
+                    (resource.unwrap_or(value), name, value)
+                })
+                .collect::<Vec<_>>();
+            if resources.is_empty() {
+                // Only an error-recovered resource specification has no
+                // resource value at all; the grammar requires at least one
+                // resource. Keep the body reachable and report the gap instead
+                // of inventing a close.
                 self.add_gap(
                     builder,
                     resource_boundary,
-                    SemanticGapSubject::Value(value),
+                    SemanticGapSubject::Point,
                     SemanticCapability::ResourceManagement,
                     SemanticGapKind::Unsupported,
-                    "a later resource initializer can fail and close this resource, and that partial-initialization close chain is not yet lowered",
+                    "a malformed resource specification declares no resource value, so its implicit close is not represented",
                 )?;
-            }
-            if initializers.is_empty() {
                 self.edge(builder, entry, EdgeTarget::normal(resource_boundary))?;
+                (resource_boundary, try_scope, None)
             } else {
-                self.schedule_expressions(
-                    builder,
-                    entry,
-                    &initializers,
-                    EdgeTarget::normal(resource_boundary),
+                // JLS 14.20.3.1 defines a statement with several resources as
+                // single-resource statements nested in declaration order. Each
+                // resource therefore owns a cleanup region that opens once its
+                // initializer has completed, and every later initializer runs
+                // inside the regions of the resources before it: when one
+                // throws, Java closes exactly the resources already
+                // initialized, in reverse order, and the body's exits close
+                // all of them.
+                let mut resource_scope = try_scope;
+                let mut initializer_entry = entry;
+                for (index, resource) in resources.iter().enumerate() {
+                    let initialized = if index + 1 == resources.len() {
+                        resource_boundary
+                    } else {
+                        self.point(builder, node, Vec::new())?
+                    };
+                    self.schedule_initializers(
+                        builder,
+                        std::slice::from_ref(resource),
+                        initializer_entry,
+                        EdgeTarget::normal(initialized),
+                        resource_scope,
+                        stack,
+                    )?;
+                    let region =
+                        CleanupRegionId::new(u32::try_from(self.cleanups.len()).map_err(|_| {
+                            JavaLoweringError::Invalid("too many cleanup regions".into())
+                        })?);
+                    self.cleanups.push(CleanupRegion {
+                        id: region,
+                        body: CleanupBody::OpaqueResource {
+                            statement: node,
+                            value: resource.2,
+                        },
+                        outer_scope: resource_scope,
+                    });
+                    resource_scope =
+                        builder.push_scope(Some(resource_scope), ScopeBinding::Cleanup { region });
+                    initializer_entry = initialized;
+                }
+                let resource_normal_route = builder.normal_cleanup_completion_until(
+                    resource_scope,
                     try_scope,
-                    stack,
-                )?;
+                    after_resource,
+                );
+                (
+                    resource_boundary,
+                    resource_scope,
+                    Some(resource_normal_route),
+                )
             }
-            (resource_boundary, body_scope, Some(resource_normal_route))
         } else {
             (entry, try_scope, None)
         };
@@ -4403,6 +4476,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .child_by_field_name("arguments")
             .map(named_children)
             .unwrap_or_default();
+        // The call target is always `Unknown` here, so the call carries the
+        // whole-program-dispatch gap pair emitted below; the claims that rely
+        // on it (a type-name receiver, `new`) are sound only with that gap.
+        assert!(matches!(resolution, CallableTargetResolution::Unknown));
         if node.kind() == "method_invocation" {
             // Claim only call syntax here. Receiver and arguments must earn
             // their own claims when their evaluation is actually lowered.
@@ -4412,6 +4489,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.session
                     .footprint_consume_subtree(name, BranchClass::Identifier);
             }
+            if let Some(receiver) = receiver_node
+                && receiver.kind() == "identifier"
+                && self.receiver_names_initialization_free_type(receiver)
+            {
+                self.session
+                    .footprint_consume_subtree(receiver, BranchClass::Identifier);
+            }
+            if let Some(arguments) = node.child_by_field_name("arguments") {
+                self.session
+                    .footprint_register(arguments, BoundaryDisposition::Lowered);
+            }
+        }
+        if node.kind() == "object_creation_expression"
+            && let Some(type_node) = node.child_by_field_name("type")
+            && type_node.kind() == "type_identifier"
+            && node.child_by_field_name("type_arguments").is_none()
+            && !has_child_kind(node, "class_body")
+            && enclosing_instance_node.is_none()
+            && node_text(self.prepared.source(), type_node)
+                .is_some_and(|name| self.type_name_initialization_is_covered(name, node))
+        {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            self.session
+                .footprint_consume_subtree(type_node, BranchClass::Type);
             if let Some(arguments) = node.child_by_field_name("arguments") {
                 self.session
                     .footprint_register(arguments, BoundaryDisposition::Lowered);
@@ -4712,7 +4814,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// A name before `::` is a type only after every file-local source of a
     /// variable binding has been ruled out. Inherited fields and static imports
     /// are deliberately treated as possible variables when they are unknown.
-    fn method_reference_name_is_type(&self, qualifier: Node<'tree>) -> bool {
+    pub(super) fn method_reference_name_is_type(&self, qualifier: Node<'tree>) -> bool {
         // A qualified name can end in a static field (System.out::println).
         if qualifier.kind() != "identifier" {
             return false;
@@ -5108,8 +5210,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope: step.region.outer_scope,
                     });
                 }
-                CleanupBody::OpaqueResource(node) => {
-                    self.lower_implicit_resource_closes(builder, node, step, stack)?;
+                CleanupBody::OpaqueResource { statement, value } => {
+                    self.lower_implicit_resource_close(builder, statement, value, step, stack)?;
                 }
                 CleanupBody::OpaqueMonitor(_) => {
                     self.add_gap(
@@ -5135,180 +5237,120 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, from, plan.target())
     }
 
-    /// Lower the implicit close of a try-with-resources statement.
+    /// Lower the implicit close of one try-with-resources resource.
     ///
-    /// Java releases every successfully initialized resource at the
-    /// construct's own exit, in reverse declaration order, on both the normal
-    /// and the exceptional continuation of the guarded body. Each release is a
-    /// real close operation on the resource value the construct acquired, so
-    /// the typestate engine binds it to the tracked subject identity instead
-    /// of to the spelled resource variable.
+    /// Each resource owns a cleanup region nested inside the regions of the
+    /// resources declared before it, so a route out of the guarded body runs
+    /// these closes in reverse declaration order, on both the normal and the
+    /// exceptional continuation, and a later initializer's failure runs only
+    /// the closes of the resources already initialized. The release is a real
+    /// close operation on the resource value the construct acquired, so the
+    /// typestate engine binds it to the tracked subject identity instead of to
+    /// the spelled resource variable.
     ///
-    /// Every cleanup point is anchored at the try statement, which is the
-    /// source fact the resource-lifecycle selector names for the construct,
-    /// while each specialized close call site receives its own occurrence-aware
-    /// exact mapping on the individual resource for dispatch and call-site
-    /// identity, and publishes the close operation's own normal and exceptional
+    /// The cleanup point is anchored at the try statement, which is the source
+    /// fact the resource-lifecycle selector names for the construct, while the
+    /// specialized close call site receives its own occurrence-aware exact
+    /// mapping on the individual resource for dispatch and call-site identity,
+    /// and publishes the close operation's own normal and exceptional
     /// continuations. A close that throws still released its resource, so its
-    /// exceptional continuation enters the *next* close in the chain, and only
-    /// the last release in the chain propagates from the enclosing scope: an
-    /// earlier failure cannot skip a later release, and this region never runs
-    /// twice.
-    fn lower_implicit_resource_closes(
+    /// exception propagates from the region's outer scope, which runs the
+    /// closes of the earlier resources: an earlier failure cannot skip a later
+    /// release, and this region never runs twice.
+    fn lower_implicit_resource_close(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
+        statement: Node<'tree>,
+        value_node: Node<'tree>,
         step: CleanupSpecialization<CleanupRegion<'tree>>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        let mut values = try_with_resources_values(node);
-        // Java closes in reverse declaration order, so the execution order runs
-        // from the last declared resource to the first.
-        values.reverse();
-        if values.is_empty() {
-            // Only an error-recovered resource specification has no resource
-            // value at all; the grammar requires at least one resource. Keep
-            // the construct reachable and report the gap instead of inventing a
-            // close.
-            self.add_gap(
-                builder,
-                step.entry,
-                SemanticGapSubject::Point,
-                SemanticCapability::ResourceManagement,
-                SemanticGapKind::Unsupported,
-                "a malformed resource specification declares no resource value, so its implicit close is not represented",
-            )?;
-            self.edge(builder, step.entry, step.next)?;
-            return Ok(());
-        }
-        // The cleanup entry is the first release Java performs, so reusing it
-        // keeps one point per release without adding a relay.
-        let mut invokes = Vec::with_capacity(values.len());
-        for index in 0..values.len() {
-            invokes.push(if index == 0 {
-                step.entry
-            } else {
-                self.point(builder, node, Vec::new())?
-            });
-        }
-        let last = values.len() - 1;
-        let mut continuations = Vec::with_capacity(values.len());
-        for (index, value_node) in values.into_iter().enumerate() {
-            let invoke = invokes[index];
-            // The cleanup point remains anchored to the try statement for
-            // ResourceRelease selectors. Dispatch needs the individual
-            // resource, and each route's specialization needs its own
-            // occurrence-aware call-site locator.
-            let resource = value_node
-                .parent()
-                .filter(|parent| {
-                    parent.kind() == "resource" && parent.child_by_field_name("type").is_some()
-                })
-                .unwrap_or(value_node);
-            assert!(
-                !matches!(
-                    resource.kind(),
-                    "method_invocation" | "object_creation_expression"
-                ),
-                "an implicit close anchor must not alias its initializer call"
-            );
-            let call_metadata = self.mapping(builder, resource)?;
-            let normal = self.point(builder, node, Vec::new())?;
-            let exceptional = self.point(builder, node, Vec::new())?;
-            let receiver =
-                self.expression_value(builder, value_node, expression_value_kind(value_node))?;
-            let callee = self.source_value(builder, value_node, SemanticValueKind::Callable)?;
-            let thrown = self.source_value(builder, value_node, SemanticValueKind::Exception)?;
-            let metadata = self.metadata(invoke)?;
-            self.append_effect(
-                builder,
-                invoke,
-                SemanticEffect::CallableReference {
-                    result: callee,
-                    callable: CallableValue {
-                        kind: CallableReferenceKind::BoundMethod,
-                        targets: CallableTargetResolution::Unknown,
-                        target_evidence: metadata.evidence,
-                        bound_receiver: Some(receiver),
-                        environment: None,
-                    },
+        let invoke = step.entry;
+        // The cleanup point remains anchored to the try statement for
+        // ResourceRelease selectors. Dispatch needs the individual resource,
+        // and each route's specialization needs its own occurrence-aware
+        // call-site locator.
+        let resource = value_node
+            .parent()
+            .filter(|parent| {
+                parent.kind() == "resource" && parent.child_by_field_name("type").is_some()
+            })
+            .unwrap_or(value_node);
+        assert!(
+            !matches!(
+                resource.kind(),
+                "method_invocation" | "object_creation_expression"
+            ),
+            "an implicit close anchor must not alias its initializer call"
+        );
+        let call_metadata = self.mapping(builder, resource)?;
+        let normal = self.point(builder, statement, Vec::new())?;
+        let exceptional = self.point(builder, statement, Vec::new())?;
+        let receiver =
+            self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+        let callee = self.source_value(builder, value_node, SemanticValueKind::Callable)?;
+        let thrown = self.source_value(builder, value_node, SemanticValueKind::Exception)?;
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: CallableReferenceKind::BoundMethod,
+                    targets: CallableTargetResolution::Unknown,
+                    target_evidence: metadata.evidence,
+                    bound_receiver: Some(receiver),
+                    environment: None,
                 },
-            )?;
-            let call_site = self.session.add_call_site_at_mapping(
-                builder,
-                CallSiteScaffold {
-                    point: invoke,
-                    callee,
-                    receiver: Some(receiver),
-                    member_selection: Some(Box::new(DeferredMemberSelection {
-                        member: "close".into(),
-                        receiver_place: None,
-                        receiver_pointer_depth: None,
-                    })),
-                    arguments: Box::new([]),
-                    normal_results: Box::new([]),
-                    result: None,
-                    thrown: Some(thrown),
-                    declared_targets: CallableTargetResolution::Unknown,
-                    normal_continuation: normal,
-                    exceptional_continuation: exceptional,
-                },
-                call_metadata,
-            )?;
-            self.resolution_gaps(
-                builder,
-                invoke,
+            },
+        )?;
+        let call_site = self.session.add_call_site_at_mapping(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
                 callee,
-                call_site,
-                &CallableTargetResolution::Unknown,
-            )?;
-            self.edge(builder, invoke, EdgeTarget::normal(normal))?;
-            self.edge(
-                builder,
-                invoke,
-                EdgeTarget {
-                    point: exceptional,
-                    kind: ControlEdgeKind::Exceptional,
-                },
-            )?;
-            continuations.push((normal, exceptional, index == last));
-        }
-        // A close that throws still released its resource, so its exceptional
-        // continuation continues with the releases that remain and then
-        // propagates from the enclosing scope.
-        for (index, (normal, exceptional, is_last)) in continuations.iter().copied().enumerate() {
-            let next = invokes
-                .get(index + 1)
-                .copied()
-                .map(EdgeTarget::normal)
-                .unwrap_or(step.next);
-            self.edge(builder, normal, next)?;
-            if is_last {
-                self.abrupt(
-                    builder,
-                    exceptional,
-                    step.region.outer_scope,
-                    CompletionKind::Throw,
-                    None,
-                    stack,
-                )?;
-            } else {
-                // The remaining releases run as part of the same unwinding, so
-                // the edge that resumes the chain stays exceptional. Publishing
-                // it as a normal edge would lose the in-flight completion here
-                // and let a later release's own exit class stand in for the
-                // class this hop arrived with.
-                self.edge(
-                    builder,
-                    exceptional,
-                    EdgeTarget {
-                        point: invokes[index + 1],
-                        kind: ControlEdgeKind::Exceptional,
-                    },
-                )?;
-            }
-        }
-        Ok(())
+                receiver: Some(receiver),
+                member_selection: Some(Box::new(DeferredMemberSelection {
+                    member: "close".into(),
+                    receiver_place: None,
+                    receiver_pointer_depth: None,
+                })),
+                arguments: Box::new([]),
+                normal_results: Box::new([]),
+                result: None,
+                thrown: Some(thrown),
+                declared_targets: CallableTargetResolution::Unknown,
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+            call_metadata,
+        )?;
+        self.resolution_gaps(
+            builder,
+            invoke,
+            callee,
+            call_site,
+            &CallableTargetResolution::Unknown,
+        )?;
+        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.edge(builder, normal, step.next)?;
+        self.abrupt(
+            builder,
+            exceptional,
+            step.region.outer_scope,
+            CompletionKind::Throw,
+            None,
+            stack,
+        )
     }
 
     fn edge(
@@ -5338,9 +5380,9 @@ fn literal_offset(constant: i64, subtract: bool) -> SignedIntegerMagnitude {
 ///
 /// A resource is a `variable_declarator` (or a bare access expression naming
 /// an existing resource), so its value is the declarator's `value` field, or,
-/// for the access form, its own expression. Java closes the resources in
-/// reverse declaration order, and both the acquisition lowering and the
-/// implicit-close lowering need the same list, so it is derived once here.
+/// for the access form, its own expression. The lowering opens one nested
+/// cleanup region per resource in this order, so the routes out of the
+/// statement close the resources in reverse declaration order.
 fn try_with_resources_values(node: Node<'_>) -> Vec<Node<'_>> {
     assert_eq!(
         node.kind(),
@@ -5465,14 +5507,33 @@ fn java_footprint_type(node: Node<'_>) -> bool {
     true
 }
 
+/// `a == null` or `a != null`: a reference comparison with no conversion.
+fn java_null_comparison(node: Node<'_>) -> bool {
+    node.child_by_field_name("operator")
+        .is_some_and(|operator| matches!(operator.kind(), "==" | "!="))
+        && ["left", "right"].into_iter().any(|field| {
+            node.child_by_field_name(field)
+                .is_some_and(|operand| operand.kind() == "null_literal")
+        })
+}
+
 fn java_call_control_branch(node: Node<'_>) -> (CallControlKind, CallControlDisposition) {
     use CallControlDisposition as D;
     use FootprintExclusion as E;
     use FootprintRefusal as R;
     match node.kind() {
+        // An anonymous class declares a class and captures its environment.
+        "object_creation_expression" if has_child_kind(node, "class_body") => (
+            CallControlKind::InitializationConversion,
+            D::Refused(R::UnclassifiedBranch),
+        ),
         "method_invocation" | "object_creation_expression" => {
             (CallControlKind::ExplicitCall, D::Represented)
         }
+        "binary_expression" if java_null_comparison(node) => (
+            CallControlKind::Syntax,
+            D::AffirmativelyExcluded(E::NoInstance),
+        ),
         "return_statement" | "if_statement" | "try_statement" | "catch_clause"
         | "finally_clause" => (CallControlKind::Control, D::Represented),
         "method_declaration" | "constructor_declaration" | "lambda_expression" => (
@@ -5484,7 +5545,7 @@ fn java_call_control_branch(node: Node<'_>) -> (CallControlKind, CallControlDisp
             CallControlKind::ImplicitAccess,
             D::Refused(R::UnclassifiedBranch),
         ),
-        "static_initializer" | "object_creation_expression_with_body" => (
+        "static_initializer" => (
             CallControlKind::InitializationConversion,
             D::Refused(R::UnclassifiedBranch),
         ),
@@ -5518,6 +5579,7 @@ fn java_call_control_branch(node: Node<'_>) -> (CallControlKind, CallControlDisp
         | "formal_parameters"
         | "void_type"
         | "block"
+        | "parenthesized_expression"
         | "expression_statement"
         | "decimal_integer_literal"
         | "string_literal" => (

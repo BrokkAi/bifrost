@@ -80,6 +80,7 @@ fn flow_counting_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
         op: IrRelationOp::Source {
             binding: binding("flow"),
             schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+            undecided_selections: Vec::new(),
         },
         schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
     };
@@ -107,6 +108,29 @@ fn column(qualifier: &str, name: &str) -> IrColumn {
     IrColumn::new(qualifier, name)
 }
 
+/// A placeholder site for a hand-built row: the policy projection never reads it.
+fn placeholder_site() -> brokk_bifrost_tools::site_context::SiteContextView {
+    use brokk_bifrost_tools::site_context::{
+        SiteContextView, SiteLocationView, SiteRoleView, SiteValueView, UnknownValueCauseView,
+    };
+    SiteContextView {
+        site: SiteLocationView::Source {
+            path: brokk_bifrost_core::admitted_text::AdmittedText::from_static("app.py"),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+            text: brokk_bifrost_core::admitted_text::AdmittedText::empty(),
+        },
+        role: SiteRoleView::Value,
+        value: SiteValueView::Unknown {
+            cause: UnknownValueCauseView::NotConstant,
+        },
+    }
+}
+
 /// One call-argument row. That domain is used throughout because it is the one
 /// registry domain carrying an identity, an integer, a nullable string and a
 /// boolean at once, which is exactly the typing surface under test.
@@ -128,6 +152,7 @@ fn argument(site: &str, id: &str, index: usize, name: Option<&str>, spread: bool
                 name: name.map(str::to_string),
                 literal_value: None,
                 spread,
+                site: placeholder_site(),
             }),
         },
         provenance: Vec::new(),
@@ -143,6 +168,7 @@ fn source(id: usize, name: &str) -> IrRelation {
         op: IrRelationOp::Source {
             binding: binding(name),
             schema: domain_schema(name, DOMAIN),
+            undecided_selections: Vec::new(),
         },
         schema: domain_schema(name, DOMAIN),
     }
@@ -1426,6 +1452,7 @@ fn flow_anti_join_plan() -> RelationalPlanIr {
         op: IrRelationOp::Source {
             binding: binding("sites"),
             schema: domain_schema("sites", DOMAIN),
+            undecided_selections: Vec::new(),
         },
         schema: domain_schema("sites", DOMAIN),
     };
@@ -1435,6 +1462,7 @@ fn flow_anti_join_plan() -> RelationalPlanIr {
         op: IrRelationOp::Source {
             binding: binding("flow"),
             schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
+            undecided_selections: Vec::new(),
         },
         schema: domain_schema("flow", DetailedCodeQueryDomain::FlowEndpoint),
     };
@@ -1831,6 +1859,7 @@ fn unavailable_conversion_inputs_survive_join_without_a_definite_assertion() {
             op: IrRelationOp::Source {
                 binding: binding(name),
                 schema: schema.clone(),
+                undecided_selections: Vec::new(),
             },
             schema,
         }

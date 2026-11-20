@@ -21,6 +21,8 @@ fn supplied_model_persistence_publishes_the_active_set_to_its_store() {
         .expect("semantic model catalog");
     let persistence_store = AnalyzerStore::open_ephemeral().expect("persistence store");
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: env!("CARGO_PKG_VERSION").parse().expect("package version"),
         evidence: Vec::new(),

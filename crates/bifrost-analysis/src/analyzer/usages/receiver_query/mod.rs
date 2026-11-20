@@ -32,8 +32,8 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverIdentityProof, ReceiverValue,
 };
 use crate::analyzer::usages::receiver_sites::{
-    ReceiverSiteIndex, ReceiverSiteIndexBuild, ReceiverSiteIndexLimit, ReceiverSiteInputMode,
-    ReceiverSiteKind, ReceiverSiteSelection, ReceiverSiteSelectionLimit, build_receiver_site_index,
+    ReceiverSiteIndex, ReceiverSiteIndexBuild, ReceiverSiteInputMode, ReceiverSiteKind,
+    ReceiverSiteSelection, build_receiver_site_index,
 };
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, node_range, smallest_named_node_covering,
@@ -294,7 +294,7 @@ pub struct ReceiverQueryService<'a> {
     /// Language-owned point state belongs to this service's one RQL/policy
     /// request and grows only for source files that request touches.
     receiver_request: RefCell<Option<Box<dyn crate::analyzer::languages::ReceiverRequest + 'a>>>,
-    reads: RefCell<Option<super::common::QueryMemoReads>>,
+    reads: RefCell<Option<super::common::RequestReadState>>,
 }
 
 struct PreparedReceiverFile {
@@ -516,36 +516,22 @@ impl ReceiverWorkLedger {
 
     #[doc(hidden)]
     pub fn remaining_budget(&self) -> ReceiverAnalysisBudget {
-        let mut remaining = self.budget.remaining_after(&self.work);
-        remaining.max_scope_nodes = remaining
-            .max_scope_nodes
-            .saturating_sub(self.work.setup_nodes);
-        remaining
+        self.budget.remaining_after(&self.work)
     }
 
     #[doc(hidden)]
-    pub fn charge_setup(&mut self, nodes: usize) -> Result<(), ReceiverBudgetLimit> {
-        let remaining = self.remaining_budget().max_scope_nodes;
-        self.work.setup_nodes = self.work.setup_nodes.saturating_add(nodes.min(remaining));
-        if !self.fits(nodes, remaining) {
-            Err(ReceiverBudgetLimit::ScopeNodes)
-        } else {
-            Ok(())
-        }
+    pub fn charge_setup(&mut self, nodes: usize) {
+        self.work.setup_nodes = self.work.setup_nodes.saturating_add(nodes);
     }
 
     fn charge_analysis(&mut self, work: ReceiverAnalysisWork) -> Result<(), ReceiverBudgetLimit> {
         debug_assert_eq!(work.setup_nodes, 0);
         let remaining = self.remaining_budget();
-        let scope_exceeded = !self.fits(work.scope_nodes, remaining.max_scope_nodes);
         let summaries_exceeded =
             !self.fits(work.summary_expansions, remaining.max_summary_expansions);
         let rounds_exceeded = !self.fits(work.resolution_rounds, remaining.max_resolution_rounds);
         let hierarchy_exceeded = work.hierarchy_order_steps > remaining.max_hierarchy_order_work;
-        self.work.scope_nodes = self
-            .work
-            .scope_nodes
-            .saturating_add(work.scope_nodes.min(remaining.max_scope_nodes));
+        self.work.scope_nodes = self.work.scope_nodes.saturating_add(work.scope_nodes);
         self.work.summary_expansions = self.work.summary_expansions.saturating_add(
             work.summary_expansions
                 .min(remaining.max_summary_expansions),
@@ -558,9 +544,7 @@ impl ReceiverWorkLedger {
             work.hierarchy_order_steps
                 .min(remaining.max_hierarchy_order_work),
         );
-        if scope_exceeded {
-            Err(ReceiverBudgetLimit::ScopeNodes)
-        } else if summaries_exceeded {
+        if summaries_exceeded {
             Err(ReceiverBudgetLimit::SummaryExpansions)
         } else if rounds_exceeded {
             Err(ReceiverBudgetLimit::ResolutionRounds)
@@ -614,11 +598,8 @@ pub fn charge_bounded_resolution<T>(
 }
 
 #[doc(hidden)]
-pub fn charge_scope_step(ledger: &mut ReceiverWorkLedger) -> Result<(), ReceiverBudgetLimit> {
-    ledger.charge_analysis(ReceiverAnalysisWork {
-        scope_nodes: 1,
-        ..ReceiverAnalysisWork::default()
-    })
+pub fn charge_scope_step(ledger: &mut ReceiverWorkLedger) {
+    ledger.work.scope_nodes = ledger.work.scope_nodes.saturating_add(1);
 }
 
 #[doc(hidden)]
@@ -638,13 +619,16 @@ fn charge_limited_projection<T>(
     let charged_rows = batch.inspected.max(batch.rows.len());
     for _ in 0..charged_rows {
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
     }
     if !batch.complete {
-        return Ok(CompatibilityOutcome::Exceeded(
-            ReceiverBudgetLimit::ScopeNodes,
+        // The lookahead is unlimited, so an incomplete batch is the provider's
+        // own incompleteness (omitted files, an unreadable blob), not a budget.
+        // Which files a provider omitted depends on the request, so the answer
+        // is execution dependent, as its session twin is.
+        ledger.join(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
+        return Ok(CompatibilityOutcome::Unavailable(
+            "provider_rows_incomplete",
         ));
     }
     Ok(CompatibilityOutcome::Complete(batch.rows))
@@ -910,7 +894,6 @@ impl<'a> ReceiverQueryService<'a> {
                 file,
                 language,
                 source: &source,
-                max_scope_nodes: ledger.remaining_budget().max_scope_nodes,
                 cancellation,
             }) {
                 ReceiverFileSetup::Ready {
@@ -918,9 +901,7 @@ impl<'a> ReceiverQueryService<'a> {
                     facts,
                     visited,
                 } => {
-                    ledger
-                        .charge_setup(visited)
-                        .expect("completed setup traversal fits its supplied receiver budget");
+                    ledger.charge_setup(visited);
                     self.prepared_files.borrow_mut().insert(
                         file.clone(),
                         PreparedReceiverFile {
@@ -938,17 +919,6 @@ impl<'a> ReceiverQueryService<'a> {
                         range,
                         "receiver_source_parse_failed",
                         Some(&source),
-                    ));
-                }
-                ReceiverFileSetup::ExceededScope { visited } => {
-                    let _ = ledger.charge_setup(visited);
-                    return Ok(setup_budget_report(
-                        operation,
-                        file,
-                        language,
-                        range,
-                        &source,
-                        ledger.work(),
                     ));
                 }
                 ReceiverFileSetup::Cancelled => {
@@ -987,6 +957,7 @@ impl<'a> ReceiverQueryService<'a> {
             source,
             root: tree.root_node(),
             facts: &prepared.facts,
+            cancellation,
         });
 
         let report = match operation {
@@ -1558,9 +1529,7 @@ impl<'a> ReceiverQueryService<'a> {
         else {
             return Ok(CompatibilityOutcome::Complete(None));
         };
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         let returned = overlay.symbols_with_id(id);
         if returned.disposition != SemanticModelOverlayDisposition::Unique {
             return Ok(CompatibilityOutcome::Complete(None));
@@ -1623,32 +1592,14 @@ impl<'a> ReceiverQueryService<'a> {
             .get(file)
             .is_some_and(|prepared| prepared.matches(facts));
         if !prepared_matches {
-            match build_receiver_site_index(
-                Arc::clone(facts),
-                ReceiverSiteIndexLimit {
-                    max_work_items: ledger.remaining_budget().max_scope_nodes,
-                },
-                cancellation,
-            ) {
+            match build_receiver_site_index(Arc::clone(facts), cancellation) {
                 ReceiverSiteIndexBuild::Complete {
                     index,
                     inspected_work,
                 } => {
-                    ledger
-                        .charge_setup(inspected_work)
-                        .expect("completed site indexing fits its supplied receiver budget");
+                    ledger.charge_setup(inspected_work);
                     check_cancelled(cancellation)?;
-                    let syntax_nodes = index.source().len().div_ceil(256).max(1);
-                    if ledger.charge_setup(syntax_nodes).is_err() {
-                        return Ok(setup_budget_report(
-                            operation,
-                            file,
-                            language,
-                            range,
-                            index.source(),
-                            ledger.work(),
-                        ));
-                    }
+                    ledger.charge_setup(index.source().len().div_ceil(256).max(1));
                     let Some(syntax) = prepared_structural_syntax_limited(
                         self.analyzer,
                         language,
@@ -1724,23 +1675,8 @@ impl<'a> ReceiverQueryService<'a> {
                         },
                     );
                 }
-                ReceiverSiteIndexBuild::Exceeded {
-                    inspected_work,
-                    refused,
-                } => {
-                    ledger.join(refused.reuse_verdict());
-                    let _ = ledger.charge_setup(inspected_work);
-                    return Ok(setup_budget_report(
-                        operation,
-                        file,
-                        language,
-                        range,
-                        facts.source(),
-                        ledger.work(),
-                    ));
-                }
                 ReceiverSiteIndexBuild::Cancelled { inspected_work } => {
-                    let _ = ledger.charge_setup(inspected_work);
+                    ledger.charge_setup(inspected_work);
                     return Err(ReceiverQueryError::Cancelled);
                 }
             }
@@ -1759,40 +1695,19 @@ impl<'a> ReceiverQueryService<'a> {
             (_, ReceiverQueryInput::ContainingSite) => ReceiverSiteInputMode::ContainingSite,
             (_, ReceiverQueryInput::Expression) => ReceiverSiteInputMode::Expression,
         };
-        let selected = match prepared.sites.select_bounded(
-            range,
-            selection_mode,
-            ReceiverSiteSelectionLimit {
-                max_inspected_sites: ledger.remaining_budget().max_scope_nodes,
-            },
-            cancellation,
-        ) {
+        let selected = match prepared
+            .sites
+            .select_cancellable(range, selection_mode, cancellation)
+        {
             ReceiverSiteSelection::Complete {
                 site,
                 inspected_sites,
             } => {
-                ledger
-                    .charge_setup(inspected_sites)
-                    .expect("completed site selection fits its supplied receiver budget");
+                ledger.charge_setup(inspected_sites);
                 site
             }
-            ReceiverSiteSelection::Exceeded {
-                inspected_sites,
-                refused,
-            } => {
-                ledger.join(refused.reuse_verdict());
-                let _ = ledger.charge_setup(inspected_sites);
-                return Ok(setup_budget_report(
-                    operation,
-                    file,
-                    language,
-                    range,
-                    source,
-                    ledger.work(),
-                ));
-            }
             ReceiverSiteSelection::Cancelled { inspected_sites } => {
-                let _ = ledger.charge_setup(inspected_sites);
+                ledger.charge_setup(inspected_sites);
                 return Err(ReceiverQueryError::Cancelled);
             }
         };
@@ -1848,9 +1763,7 @@ impl<'a> ReceiverQueryService<'a> {
         let fallback_cancellation = CancellationToken::default();
         let cancellation = cancellation.unwrap_or(&fallback_cancellation);
         check_cancelled(Some(cancellation))?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(budget_report(operation, report_site, ledger.work(), limit));
-        }
+        charge_scope_step(ledger);
 
         let reference_site = structural_reference_site(file, source, query_range);
         let resolution = self.structural_type_resolution(
@@ -2072,26 +1985,13 @@ impl<'a> ReceiverQueryService<'a> {
 
         let points_to = points_to
             .expect("non-static structural receiver analysis requires neutral points-to evidence");
-        let query_node = match java_smallest_named_node_covering(
+        let query_node = java_smallest_named_node_covering(
             prepared.syntax.tree().root_node(),
             query_range.start_byte,
             query_range.end_byte,
             Some(cancellation),
             ledger,
-        )? {
-            CompatibilityOutcome::Complete(node) => node,
-            CompatibilityOutcome::Exceeded(limit) => {
-                return Ok(budget_report(operation, report_site, ledger.work(), limit));
-            }
-            CompatibilityOutcome::Unavailable(reason) => {
-                return Ok(unavailable_report(
-                    operation,
-                    report_site,
-                    ledger.work(),
-                    reason,
-                ));
-            }
-        };
+        )?;
         let factories = if points_to_contains_call_result(&points_to, Some(cancellation))?
             && let Some(factory_node) =
                 query_node.and_then(|node| structural_factory_name_node(language, node))
@@ -2285,15 +2185,12 @@ pub fn structural_member_dispatch_supports_precise(
     if let Err(limit) = charge_summary_step(ledger) {
         return Ok(CompatibilityOutcome::Exceeded(limit));
     }
-    if let Err(limit) = charge_scope_step(ledger) {
-        return Ok(CompatibilityOutcome::Exceeded(limit));
-    }
-    let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
+    charge_scope_step(ledger);
     let metadata = language_support_for_hook(language, "signature_metadata_limited")
-        .and_then(|support| support.signature_metadata_limited(analyzer, target, provider_limit));
+        .and_then(|support| support.signature_metadata_limited(analyzer, target, usize::MAX));
     let Some(metadata) = metadata else {
-        return Ok(CompatibilityOutcome::Exceeded(
-            ReceiverBudgetLimit::ScopeNodes,
+        return Ok(CompatibilityOutcome::Unavailable(
+            "signature_metadata_unavailable",
         ));
     };
     let metadata = match charge_limited_projection(metadata, cancellation, ledger)? {
@@ -2764,69 +2661,31 @@ pub struct ReceiverSemanticBridge {
 
 impl ReceiverSemanticBridge {
     #[doc(hidden)]
-    pub const SCOPE_DIMENSIONS: usize = 11;
-    #[doc(hidden)]
     pub const SUMMARY_DIMENSIONS: usize = 3;
 
     #[doc(hidden)]
     pub fn new(receiver: ReceiverAnalysisBudget) -> Result<Self, ReceiverBudgetLimit> {
-        if receiver.max_scope_nodes < Self::SCOPE_DIMENSIONS {
-            return Err(ReceiverBudgetLimit::ScopeNodes);
-        }
         if receiver.max_summary_expansions < Self::SUMMARY_DIMENSIONS {
             return Err(ReceiverBudgetLimit::SummaryExpansions);
         }
 
-        let scope = receiver.max_scope_nodes;
         let summaries = receiver.max_summary_expansions;
         let targets = receiver.max_targets.max(1);
         // Oracle limits are positive by contract. Preserve the caller's zero
         // context request separately so any retained call-result candidate is
         // downgraded even though the representational minimum is one frame.
         let context = receiver.context_depth.max(1);
-        let text = scope.saturating_mul(1_024).max(1);
-        // Publishing each retained points-to candidate consumes one nested
-        // entry after graph traversal succeeds. Reserve that bounded tail so
-        // an otherwise complete receiver query cannot fail while serializing
-        // its final candidate set.
-        let publication_reserve = targets.min(scope - Self::SCOPE_DIMENSIONS);
-        let [
-            procedures,
-            blocks,
-            program_points,
-            values,
-            allocations,
-            source_mappings,
-            evidence,
-            gaps,
-            events,
-            control_edges,
-            mut nested_entries,
-        ] = partition_receiver_scope_limit(scope - publication_reserve);
-        nested_entries += publication_reserve;
-        // Each lane gets the full bound so an internal partition cannot starve
-        // one kind of summary; the shared ledger below still enforces the
-        // unchanged public aggregate summary-expansion cap.
-        let budget = SemanticBudget::new(SemanticWork {
-            source_bytes: text,
-            procedures,
-            blocks,
-            program_points,
-            values,
-            allocations,
-            call_sites: summaries,
-            memory_locations: summaries,
-            captures: summaries,
-            source_mappings,
-            evidence,
-            gaps,
-            events,
-            control_edges,
-            nested_entries,
-            owned_text_bytes: text,
-        })
-        .expect("receiver semantic budget is positive")
-        .with_shared_summary_expansion_limit(summaries);
+        // Rows and text the query keeps resident are admitted against the
+        // semantic budget's own resident limits. Visiting syntax is work and
+        // never refuses (#13216), so there is no scope partition. The shared
+        // ledger below still enforces the public aggregate summary-expansion cap.
+        let mut limits = SemanticBudget::default().limits();
+        limits.call_sites = summaries;
+        limits.memory_locations = summaries;
+        limits.captures = summaries;
+        let budget = SemanticBudget::new(limits)
+            .expect("receiver semantic budget is positive")
+            .with_shared_summary_expansion_limit(summaries);
 
         let defaults = OracleLimits::default().values();
         let oracle_limits = OracleLimits::new(OracleLimitValues {
@@ -2901,34 +2760,9 @@ impl ReceiverSemanticBridge {
             | SemanticBudgetDimension::Events
             | SemanticBudgetDimension::ControlEdges
             | SemanticBudgetDimension::NestedEntries
-            | SemanticBudgetDimension::OwnedTextBytes => ReceiverBudgetLimit::ScopeNodes,
+            | SemanticBudgetDimension::OwnedTextBytes => ReceiverBudgetLimit::ResidentRows,
         }
     }
-}
-
-fn partition_receiver_scope_limit(total: usize) -> [usize; 11] {
-    const DIMENSIONS: usize = ReceiverSemanticBridge::SCOPE_DIMENSIONS;
-    const NESTED_ENTRIES_INDEX: usize = DIMENSIONS - 1;
-    debug_assert!(total >= DIMENSIONS);
-
-    // Semantic materialization charges syntax traversal and nested collection
-    // publication to `nested_entries`, while the other dimensions mostly
-    // represent emitted rows. Give traversal one quarter of the aggregate
-    // scope budget and distribute the rest evenly across the ten row
-    // dimensions. Every dimension remains positive and the limits still sum
-    // exactly to the receiver's aggregate scope cap.
-    let mut limits = [1; DIMENSIONS];
-    let remaining = total - DIMENSIONS;
-    let nested_extra = remaining.div_ceil(4);
-    let row_capacity = remaining - nested_extra;
-    let row_dimensions = DIMENSIONS - 1;
-    let quotient = row_capacity / row_dimensions;
-    let remainder = row_capacity % row_dimensions;
-    for (index, limit) in limits[..row_dimensions].iter_mut().enumerate() {
-        *limit += quotient + usize::from(index < remainder);
-    }
-    limits[NESTED_ENTRIES_INDEX] += nested_extra;
-    limits
 }
 
 #[doc(hidden)]
@@ -2966,9 +2800,7 @@ fn project_static_receiver_values(
             break;
         }
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         values.push(ReceiverValue::ClassOrStaticObject(definition.clone()));
     }
     Ok(CompatibilityOutcome::Complete(ReceiverValueProjection {
@@ -2998,9 +2830,7 @@ pub fn project_receiver_values(
     let mut identities = Vec::new();
     for candidate in points_to.object_candidates() {
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         let identity = candidate.value().identity();
         // A field path augments the exact candidate with object-identity
         // evidence, but it does not establish a new receiver category or
@@ -3074,9 +2904,7 @@ pub fn project_receiver_values(
         let mut matched = None;
         for (factory, ranges) in &factory_ranges {
             check_cancelled(cancellation)?;
-            if let Err(limit) = charge_scope_step(ledger) {
-                return Ok(CompatibilityOutcome::Exceeded(limit));
-            }
+            charge_scope_step(ledger);
             if call_result_matches_factory(result, factory, ranges) {
                 matched = Some((*factory).clone());
                 break;
@@ -3120,9 +2948,7 @@ pub fn project_receiver_values(
             break;
         }
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         if static_reference {
             values.push(ReceiverValue::ClassOrStaticObject(definition.clone()));
             continue;
@@ -3135,9 +2961,7 @@ pub fn project_receiver_values(
                 break;
             }
             check_cancelled(cancellation)?;
-            if let Err(limit) = charge_scope_step(ledger) {
-                return Ok(CompatibilityOutcome::Exceeded(limit));
-            }
+            charge_scope_step(ledger);
             let row = allocation
                 .procedure()
                 .semantics()
@@ -3243,22 +3067,19 @@ pub fn code_unit_ranges_bounded(
             | Language::Scala
             | Language::TypeScript
     ) {
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
-        let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
+        charge_scope_step(ledger);
         let ranges = language_support_for_hook(language, "declaration_ranges_limited")
             .expect("language was checked above")
-            .declaration_ranges_limited(analyzer, unit, provider_limit);
+            .declaration_ranges_limited(analyzer, unit, usize::MAX);
         let Some(ranges) = ranges else {
-            return Ok(CompatibilityOutcome::Exceeded(
-                ReceiverBudgetLimit::ScopeNodes,
+            return Ok(CompatibilityOutcome::Unavailable(
+                "declaration_ranges_unavailable",
             ));
         };
         return charge_limited_projection(ranges, cancellation, ledger);
     }
-    Ok(CompatibilityOutcome::Exceeded(
-        ReceiverBudgetLimit::ScopeNodes,
+    Ok(CompatibilityOutcome::Unavailable(
+        "declaration_ranges_unsupported_language",
     ))
 }
 
@@ -3924,9 +3745,8 @@ pub fn java_smallest_named_node_covering<'tree>(
     end: usize,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
+) -> Result<Option<Node<'tree>>, ReceiverQueryError> {
     let mut cancellation_error = None;
-    let mut exceeded_limit = None;
     let selected = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
         node,
         start,
@@ -3936,22 +3756,14 @@ pub fn java_smallest_named_node_covering<'tree>(
                 cancellation_error = Some(error);
                 return false;
             }
-            match charge_scope_step(ledger) {
-                Ok(()) => true,
-                Err(limit) => {
-                    exceeded_limit = Some(limit);
-                    false
-                }
-            }
+            charge_scope_step(ledger);
+            true
         },
     );
     if let Some(error) = cancellation_error {
         return Err(error);
     }
-    if let Some(limit) = exceeded_limit {
-        return Ok(CompatibilityOutcome::Exceeded(limit));
-    }
-    Ok(CompatibilityOutcome::Complete(selected))
+    Ok(selected)
 }
 
 fn values_report(
@@ -4015,23 +3827,6 @@ pub fn unsupported_report(
         possible_candidates_suppressed: false,
         points_to: None,
     }
-}
-
-#[doc(hidden)]
-pub fn setup_budget_report(
-    operation: ReceiverQueryOperation,
-    file: &ProjectFile,
-    language: Language,
-    range: Range,
-    source: &str,
-    work: ReceiverAnalysisWork,
-) -> ReceiverQueryReport {
-    budget_report(
-        operation,
-        site(file, language, range, source, "setup", None),
-        work,
-        ReceiverBudgetLimit::ScopeNodes,
-    )
 }
 
 fn structural_reference_site(

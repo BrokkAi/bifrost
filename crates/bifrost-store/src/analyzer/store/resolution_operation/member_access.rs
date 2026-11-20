@@ -4,7 +4,7 @@
 use super::demand_closure::{CloserWork, Read, SelectedMemberRouteTarget, closer_step};
 use super::*;
 use crate::analyzer::resolution::{
-    DemandMemberSelection, DemandMemberSelectionRequest, DemandReferenceKey,
+    CompleteSelection, DemandMemberSelection, DemandMemberSelectionRequest, DemandReferenceKey,
     DemandRootUnavailableReason, FactResolutionAnswer, HierarchyOrderOutcomeId,
     HierarchyProvenanceView, HierarchyProviderKey, HierarchyProviderObservation,
     HierarchyProviderVisit, HierarchyRequestIdentity, ProviderObservationStore, ResolutionAnswer,
@@ -323,6 +323,7 @@ fn required_coverage(
 
 fn validate_access_provider_inputs(
     context: &MemberAccessContext<'_>,
+    complete: CompleteSelection,
     rows: &[ProjectedAccessRow],
     alternative: AccessAlternativeId,
     coverage: &[HierarchyProviderKey],
@@ -348,7 +349,7 @@ fn validate_access_provider_inputs(
     let mut observations = ProviderObservationStore::default();
     let mut kept = true;
     if !context.provenance.visit(
-        context.selection.provenance,
+        complete,
         &mut || {
             !closer_step(
                 context.session,
@@ -484,13 +485,10 @@ pub(super) fn validate_member_access_range_certificate(
     if row.facts.ordered_range != Some(certificate.range) {
         return Ok(refused());
     }
-    let status = context.provenance.order_status(certificate.range.order);
-    if !status.complete
-        || status.required_base.is_some()
-        || *status.completion != ResolutionCompletion::Complete
-    {
+    let Some(complete) = context.provenance.complete_selection(context.selection) else {
         return Ok(refused());
-    }
+    };
+    let status = context.provenance.order_status(certificate.range.order);
     let Some(scope) = status.cursor_scope else {
         return Ok(refused());
     };
@@ -534,6 +532,7 @@ pub(super) fn validate_member_access_range_certificate(
     }
     validate_access_provider_inputs(
         context,
+        complete,
         rows,
         row.facts.alternative,
         &certificate.coverage,
@@ -583,15 +582,12 @@ pub(super) fn validate_member_access_certificate(
     {
         return Ok(refused());
     }
-    let status = context.provenance.order_status(certificate.order);
-    if !status.complete
-        || status.required_base.is_some()
-        || *status.completion != ResolutionCompletion::Complete
-    {
+    let Some(complete) = context.provenance.complete_selection(context.selection) else {
         return Ok(refused());
-    }
+    };
     match validate_access_provider_inputs(
         context,
+        complete,
         rows,
         winner.facts.alternative,
         &certificate.coverage,
@@ -802,13 +798,8 @@ fn select_member_access(
     };
     let mut retained = vec![true; rows.len()];
     let mut certificates = Vec::new();
-    let mut open = !context.selection.own_dictionary
-        && context.selection.order.is_none_or(|order| {
-            let status = context.provenance.order_status(order);
-            !status.complete
-                || status.required_base.is_some()
-                || *status.completion != ResolutionCompletion::Complete
-        });
+    let complete_selection = context.provenance.complete_selection(context.selection);
+    let mut open = !context.selection.own_dictionary && complete_selection.is_none();
     let mut range_certificates = Vec::new();
     if observed_unconditional == ResolutionCompletion::Complete {
         for (slot, row) in rows.iter().enumerate() {
@@ -981,6 +972,7 @@ fn select_member_access(
         if completion == ResolutionCompletion::Complete
             && !open
             && let Some(order) = context.selection.order
+            && let Some(complete) = complete_selection
         {
             let mut entries = Vec::new();
             if !context.provenance.visit_order(
@@ -1054,6 +1046,7 @@ fn select_member_access(
                     };
                     match validate_access_provider_inputs(
                         context,
+                        complete,
                         rows,
                         row.facts.alternative,
                         &coverage,

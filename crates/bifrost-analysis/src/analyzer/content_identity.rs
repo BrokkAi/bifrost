@@ -43,6 +43,26 @@ const SCOPE_DOMAIN: &[u8] = b"bifrost-workspace-content:scope:v1";
 
 pub use crate::analyzer::semantic::content_identity::WorkspaceContentIdentity;
 
+/// A language wrapper's contribution to its language's workspace content
+/// identity, beyond the analyzed sources (C#: the compilation configuration).
+///
+/// `TreeSitterAnalyzer::workspace_content_identities` is the one producer of
+/// that identity, for the wrapper and for every read the inner analyzer
+/// records, so a recorded scope read and the verifier's recomputation cannot
+/// name different identities (#13307).
+pub trait WorkspaceIdentityExtension: Send + Sync {
+    /// The identity folding `sources` with this language's extra inputs, or
+    /// `None` when those inputs are unknown, which makes the whole identity
+    /// unknown. `analyzer` is the inner analyzer attributing the read and
+    /// `project` is its current project.
+    fn fold(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        project: &dyn brokk_bifrost_core::analyzer::project::Project,
+        sources: StableDigest,
+    ) -> Option<StableDigest>;
+}
+
 /// Every language scope one analyzer snapshot can answer for, in language
 /// order.
 ///
@@ -252,6 +272,7 @@ mod tests {
         let omission = |name: &[u8]| WorkspaceFileOmission {
             path: std::ffi::OsString::from_vec(name.to_vec()).into(),
             reason: WorkspaceFileOmissionReason::NonUtf8GitPath,
+            bounded: None,
         };
         let (first, second) = (omission(b"a\xffb"), omission(b"a\xfeb"));
         assert_eq!(

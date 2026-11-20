@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches, UndecidedSite};
-use super::semantic::{ArtifactUnavailable, SemanticQueryContext};
+use super::semantic::SemanticQueryContext;
 
 const QUERY: &str = "poem.web.query.Query";
 const PATH: &str = "poem.web.path.Path";
@@ -605,10 +605,10 @@ fn selected_binders(
         admit_wanted_patterns(workspace, snapshot, artifact, request, wanted_patterns)
     }) {
         Ok(binders) => binders,
-        Err(ArtifactUnavailable::BudgetExhausted) => Err(SelectedBinderError::Interrupted(
+        Err(refusal) if refusal.is_budget_exhausted() => Err(SelectedBinderError::Interrupted(
             "semantic budget exhausted",
         )),
-        Err(ArtifactUnavailable::Unavailable) => Err(SelectedBinderError::Unavailable(
+        Err(_) => Err(SelectedBinderError::Unavailable(
             "program semantics unavailable",
         )),
     }
@@ -1121,6 +1121,7 @@ mod tests {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("version"),
@@ -1132,7 +1133,8 @@ mod tests {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),

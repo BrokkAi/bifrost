@@ -254,7 +254,8 @@ pub fn intrinsic_language_evidence(
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         })
         .collect()
 }
@@ -304,7 +305,8 @@ pub fn python_process_input_evidence(
             toolchain: None,
             target: None,
             configuration: Some(REVIEWED_PYTHON_PROCESS_INPUT_PROFILE_DIGEST.to_owned()),
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         })
         .collect()
 }
@@ -378,7 +380,8 @@ pub fn node_runtime_evidence(
             toolchain: None,
             target: None,
             configuration: Some(REVIEWED_NODE_RUNTIME_PROFILE_DIGEST.to_owned()),
-            artifact_sha256: Some(REVIEWED_NODE_RUNTIME_ARTIFACT_DIGEST.to_owned()),
+            production_input_digest: None,
+verified_raw_artifacts: (Some(REVIEWED_NODE_RUNTIME_ARTIFACT_DIGEST.to_owned())).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
         })
         .collect()
 }
@@ -941,11 +944,12 @@ pub fn open_ambient_semantic_pack_catalog(
     let persistent_cache_requested = [SEMANTIC_PACK_CACHE_ROOT_ENV, CACHE_DIR_ENV, CACHE_ROOT_ENV]
         .into_iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
-    if workspace.persisted_store_path().is_none() && !persistent_cache_requested {
-        SemanticPackCatalog::open_ephemeral(options)
+    let catalog = if workspace.persisted_store_path().is_none() && !persistent_cache_requested {
+        SemanticPackCatalog::open_ephemeral(options)?
     } else {
-        open_default_semantic_pack_catalog(workspace_root, options)
-    }
+        open_default_semantic_pack_catalog(workspace_root, options)?
+    };
+    Ok(catalog)
 }
 
 // Workspace construction can deliberately disable dependency discovery for a
@@ -1034,6 +1038,32 @@ pub fn activate_selected_workspace_semantic_sources_in_catalog(
     cancellation: &crate::CancellationToken,
     selected_ecosystems: &[DependencyPackEcosystem],
 ) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
+    activate_selected_workspace_semantic_sources_in_catalog_with_handoff(
+        workspace,
+        analyzer_config,
+        catalog,
+        sources,
+        additional_evidence,
+        cancellation,
+        selected_ecosystems,
+        None,
+    )
+}
+
+/// Activate only the configured dependency ecosystems named by the host,
+/// optionally reusing verified discovery receipts handed over from the
+/// installed stage of the same warm.
+#[allow(clippy::too_many_arguments)]
+pub fn activate_selected_workspace_semantic_sources_in_catalog_with_handoff(
+    workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    catalog: &SemanticPackCatalog,
+    sources: WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+    cancellation: &crate::CancellationToken,
+    selected_ecosystems: &[DependencyPackEcosystem],
+    discovery_handoff: Option<super::workspace::StagedDependencyDiscoveryHandoff>,
+) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
     let before = catalog.cache_identity()?;
     let Some(prelude) = workspace_activation_prelude(
         workspace,
@@ -1056,7 +1086,7 @@ pub fn activate_selected_workspace_semantic_sources_in_catalog(
     } = prelude;
     let activation = merge_carried_activation_request(
         workspace,
-        semantic_model_activation_request(evidence, controls).into(),
+        semantic_model_activation_request(workspace, evidence, controls).into(),
         selected_ecosystems,
     );
     // An empty ecosystem list still resolves: the dependency loop simply has
@@ -1073,6 +1103,15 @@ pub fn activate_selected_workspace_semantic_sources_in_catalog(
             cancellation,
         },
         Some(&activation),
+        if DependencyPackEcosystem::ALL
+            .iter()
+            .all(|ecosystem| selected_ecosystems.contains(ecosystem))
+        {
+            super::workspace::DependencyPackPublicationKind::Full
+        } else {
+            super::workspace::DependencyPackPublicationKind::Subset
+        },
+        discovery_handoff,
     );
     let after = catalog.cache_identity()?;
     if before.sqlite_data_version != after.sqlite_data_version
@@ -1100,7 +1139,10 @@ fn merge_carried_activation_request(
     mut fresh: ActivationInputs,
     selected: &[DependencyPackEcosystem],
 ) -> ActivationInputs {
-    if selected.len() == DependencyPackEcosystem::ALL.len() {
+    if DependencyPackEcosystem::ALL
+        .iter()
+        .all(|ecosystem| selected.contains(ecosystem))
+    {
         return fresh;
     }
     if let Some(mut carried) = workspace.carried_activation_inputs() {
@@ -1136,6 +1178,7 @@ fn merge_carried_activation_request(
 pub struct InstalledWorkspacePacksActivation {
     pub activation: WorkspacePacksActivation,
     pub pending: Vec<PendingDependencyPackAcquisition>,
+    pub discovery_handoff: Option<super::workspace::StagedDependencyDiscoveryHandoff>,
 }
 
 /// The installed-pack stage of [`activate_workspace_semantic_sources_in_catalog`]
@@ -1195,7 +1238,7 @@ pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
     } = prelude;
     let activation = merge_carried_activation_request(
         workspace,
-        semantic_model_activation_request(evidence, controls).into(),
+        semantic_model_activation_request(workspace, evidence, controls).into(),
         selected_ecosystems,
     );
     let installed = workspace.activate_installed_dependency_packs_with_inputs(
@@ -1209,6 +1252,14 @@ pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
             cancellation,
         },
         Some(&activation),
+        if DependencyPackEcosystem::ALL
+            .iter()
+            .all(|ecosystem| selected_ecosystems.contains(ecosystem))
+        {
+            super::workspace::DependencyPackPublicationKind::Full
+        } else {
+            super::workspace::DependencyPackPublicationKind::Subset
+        },
     );
     catalog
         .release_leases(&leases)
@@ -1221,6 +1272,7 @@ pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
             outcome: installed.outcome,
         },
         pending: installed.pending,
+        discovery_handoff: installed.discovery_handoff,
     }))
 }
 
@@ -1238,10 +1290,17 @@ struct WorkspaceActivationPrelude {
 }
 
 fn semantic_model_activation_request(
+    workspace: &WorkspaceAnalyzer,
     evidence: Vec<SemanticModelActivationEvidence>,
     controls: Vec<SemanticModelActivationControl>,
 ) -> SemanticModelActivationRequest {
     SemanticModelActivationRequest {
+        host_activation: workspace
+            .analyzer()
+            .host_activation_context()
+            .unwrap_or_else(
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none,
+        ),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("package version must be semver"),
@@ -1564,8 +1623,9 @@ impl WorkspaceUpdateActivationContext<'_> {
             self.registration_evidence,
             self.sources.intrinsic_shipped_models,
         );
-        let mut activation =
-            ActivationInputs::from(semantic_model_activation_request(evidence, controls));
+        let mut activation = ActivationInputs::from(semantic_model_activation_request(
+            workspace, evidence, controls,
+        ));
         if let Some(verified) = workspace.carried_activation_inputs() {
             let ecosystems = workspace_pack_ecosystems(workspace, self.sources.config);
             activation.request.evidence.extend(
@@ -1780,7 +1840,9 @@ pub(crate) mod tests {
             _: &crate::ProjectFile,
             _: usize,
         ) -> Result<
-            Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+            crate::analyzer::semantic::SemanticArtifactSourceOutcome<
+                crate::analyzer::semantic::SemanticArtifactSourceSnapshot,
+            >,
             crate::analyzer::semantic::SemanticProviderError,
         > {
             unimplemented!()
@@ -1887,9 +1949,16 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let store =
+        let mut store =
             crate::analyzer::tree_sitter_analyzer::ephemeral_store_context(project.as_ref())
                 .unwrap();
+        // A built workspace always carries the membership its build observed.
+        store.membership = Some(
+            crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::capture(
+                project.as_ref(),
+                store.store.retention_budget(),
+            ),
+        );
         let context = std::sync::Arc::new(WorkspaceBuildContext::new(project, config, store, None));
         WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new_for_workspace(
             delegates, context,

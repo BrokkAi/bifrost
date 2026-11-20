@@ -63,7 +63,7 @@ workspace. It only reads them; it never writes to them.
 
 | Location | When |
 | --- | --- |
-| The JDK at `JAVA_HOME`, and JDKs named in `.bifrost/jvm-toolchains.json` | Java, Kotlin, and Scala workspaces, by default |
+| The JDK at `JAVA_HOME` (or, when `JAVA_HOME` is unset, the JDK of the first `java` on `PATH`), and JDKs named in `.bifrost/jvm-toolchains.json` | Java, Kotlin, and Scala workspaces, by default |
 | `~/.m2/repository` | JVM workspaces, for coordinates found in Maven or Gradle build files, by default |
 | `$GRADLE_USER_HOME/caches/modules-2/files-2.1`, or `~/.gradle/caches/modules-2/files-2.1` | JVM workspaces, for coordinates found in build files, by default |
 | `$NUGET_PACKAGES` and `~/.nuget/packages` | C# workspaces whose restore output names packages there |
@@ -114,9 +114,14 @@ or SMB, because their locking does not meet SQLite's WAL requirements.
 `BIFROST_ALLOW_UNSAFE_NETWORK_CACHE=1` overrides this check at your own risk.
 In a sandboxed shell, approve the local write the same way you approve a
 sandboxed `git commit` that writes `.git`. Use `BIFROST_CACHE_ROOT` to move the
-cache permanently. Set `BIFROST_CACHE_DIR` only when you need one exact
-directory; the database is then `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db`, and
-unrelated repositories that one process opens share that SQLite writer.
+cache permanently. Set `BIFROST_CACHE_DIR` only when you need one fixed
+location; Bifrost then creates the child directory `$BIFROST_CACHE_DIR/bifrost-store/`,
+writes a `.gitignore` containing `*` there, and keeps the database
+`bifrost_cache.v<N>.db` in it. Earlier versions wrote the database directly in
+`$BIFROST_CACHE_DIR`. Bifrost does not move or delete that old file: it rebuilds
+in the new location and prints a warning naming the old file on every run while
+it exists, so you can delete it. Unrelated repositories that one process opens
+share that SQLite writer.
 
 Only `.bifrost/cache/` and `.bifrost/suppressions.local.json` are local working
 state. The other files under `.bifrost/` are project inputs that you review and

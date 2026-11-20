@@ -56,6 +56,7 @@ pub(crate) fn dispatch(
         member_selection: _,
         cancellation,
         mut work,
+        special_dispatch_memos: _,
     } = request;
     let mut invocation = tree.root_node().named_descendant_for_byte_range(
         call_span.start_byte,
@@ -660,6 +661,7 @@ edition="2021"
                 start_line: invocation.start_position().row + 1,
                 end_line: invocation.end_position().row + 1,
             };
+            let mut special_dispatch_memos = brokk_bifrost_analysis::analyzer::usages::call_relations::SpecialDispatchMemos::default();
             let answer = dispatch(
                 CallDispatchLanguageRequest {
                     analyzer: &analyzer,
@@ -672,6 +674,7 @@ edition="2021"
                     member_selection: None,
                     cancellation: None,
                     work: Default::default(),
+                    special_dispatch_memos: &mut special_dispatch_memos,
                 },
                 None,
             )

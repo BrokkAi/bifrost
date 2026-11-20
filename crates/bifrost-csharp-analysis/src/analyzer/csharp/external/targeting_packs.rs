@@ -29,6 +29,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde_json::Value;
 
+use super::super::input_identity;
 use super::{CSharpAssetsResolution, DotNetAssetRole, ResolvedCSharpAssembly};
 use crate::analyzer::csharp::compilation::{attribute, element_attributes};
 
@@ -74,7 +75,7 @@ pub(super) fn approved_sdk_roots(workspace_root: &Path) -> Vec<PathBuf> {
     }
     let mut roots: Vec<_> = roots
         .into_iter()
-        .filter_map(|root| root.canonicalize().ok())
+        .filter_map(|root| input_identity::canonicalize(&root).ok())
         .collect();
     roots.sort();
     roots.dedup();
@@ -167,7 +168,7 @@ fn recorded_sdk(framework: &Value, sdk_roots: &[PathBuf]) -> Result<RecordedSdk,
             graph.display()
         ));
     }
-    let graph = graph.canonicalize().map_err(|error| {
+    let graph = input_identity::canonicalize(graph).map_err(|error| {
         format!(
             "the recorded SDK file {} is unavailable: {error}",
             graph.display()
@@ -185,6 +186,7 @@ fn recorded_sdk(framework: &Value, sdk_roots: &[PathBuf]) -> Result<RecordedSdk,
             root.display()
         ));
     }
+    input_identity::selected(directory);
     Ok(RecordedSdk {
         root: root.to_owned(),
         directory: directory.to_owned(),
@@ -320,6 +322,7 @@ fn select_targeting_pack(
             ));
         }
     };
+    input_identity::selected(&directory);
     Ok(SelectedPack {
         id: id.clone(),
         version,
@@ -417,6 +420,7 @@ fn for_each_element(
     if text.len() as u64 > MAX_XML_BYTES {
         return Err(format!("{} exceeds {MAX_XML_BYTES} bytes", path.display()));
     }
+    input_identity::content(path, text.as_bytes());
     let malformed = || format!("{} is not well-formed XML", path.display());
     let mut reader = Reader::from_str(&text);
     // Whether each open element is conditioned, itself or by an ancestor.
@@ -475,7 +479,7 @@ fn is_path_component(value: &str) -> bool {
 /// `root/relative` as a canonical directory that stays inside `root`.
 fn contained_directory(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     let candidate = root.join(relative);
-    match candidate.canonicalize() {
+    match input_identity::canonicalize(&candidate) {
         Ok(directory) if directory.starts_with(root) && directory.is_dir() => Ok(directory),
         Ok(directory) => Err(format!(
             "{} resolves to {}, outside {}",
@@ -497,8 +501,7 @@ fn contained_file(pack: &Path, relative: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    pack.join(relative)
-        .canonicalize()
+    input_identity::canonicalize(&pack.join(relative))
         .ok()
         .filter(|path| path.starts_with(pack) && path.is_file())
 }

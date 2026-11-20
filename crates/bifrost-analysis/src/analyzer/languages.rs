@@ -871,6 +871,26 @@ pub struct IntrinsicExternalSignature {
 }
 
 pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send + Sync {
+    /// Partition model declarations before application or overload filtering.
+    /// Most languages have one owner-declared overload family for each key.
+    fn model_callable_family_group(
+        &self,
+        _member: &crate::analyzer::semantic_model::MemberFact,
+    ) -> crate::analyzer::semantic_model::SemanticModelCallableGroup {
+        crate::analyzer::semantic_model::SemanticModelCallableGroup::Owner
+    }
+
+    /// Nominate a declaration group for a qualified callable locator. This
+    /// interprets a declaration name, independently of any call application.
+    /// A nomination must occur among the locator's matched records.
+    fn model_callable_locator_group(
+        &self,
+        _owner: &crate::analyzer::semantic_model::SemanticModelSymbol,
+        _matched: &[std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>],
+    ) -> Option<crate::analyzer::semantic_model::SemanticModelCallableGroup> {
+        None
+    }
+
     /// Select query-only payload relations using the active declaration provider.
     /// Blob lowering remains independent of the selected models.
     fn selected_payload_projection(
@@ -1140,15 +1160,14 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         Ok(SelectedCallResultOwnership::Unknown)
     }
 
-    /// Classify one ordinary formal's declared value type in its own selected
+    /// Classify one formal's declared value type in its own selected
     /// procedure. The result is a type fact, not evidence of a transfer at a
     /// caller's actual-to-formal boundary.
     fn ownership_class_of_formal(
         &self,
         _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
         _callee: &crate::analyzer::semantic::ProcedureHandle,
-        _ordinal: u32,
-        _actual: crate::analyzer::semantic::ValueId,
+        _formal: crate::analyzer::semantic::ProcedurePortKind,
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
         _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<SelectedCallResultOwnership, crate::analyzer::semantic::SemanticProviderError> {
@@ -1456,6 +1475,53 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// The language's canonical prepared source, including indexed declaration
+    /// authority. Shared request holders must not substitute an exact-only parse.
+    fn request_prepared_syntax(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        None
+    }
+
+    /// Native macro syntax supplied by the language for shared call consumers.
+    /// The returned lease keeps its exact trees and inventories owner-budgeted.
+    fn prepared_macro_source(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<
+        Option<
+            brokk_bifrost_core::retention_budget::BudgetedValue<
+                crate::analyzer::usages::prepared_macro_source::PreparedMacroSource,
+            >,
+        >,
+        crate::analyzer::usages::prepared_macro_source::SourceCancelled,
+    > {
+        Ok(None)
+    }
+
+    /// Exact caller-owned source when the indexed source capability is absent.
+    /// This backing stays current-only and cannot replace indexed authority.
+    fn exact_macro_source(
+        &self,
+        _source: &Arc<str>,
+        _tree: &tree_sitter::Tree,
+        _cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<
+        Option<
+            brokk_bifrost_core::retention_budget::BudgetedValue<
+                crate::analyzer::usages::prepared_macro_source::PreparedMacroSource,
+            >,
+        >,
+        crate::analyzer::usages::prepared_macro_source::SourceCancelled,
+    > {
+        Ok(None)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn prepared_syntax_for_test(
         &self,
@@ -1587,6 +1653,24 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    fn workspace_member_owner_selections(
+        &self,
+        workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
+        member: &CodeUnit,
+        receiver: brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape,
+        concrete_self: Option<&crate::analyzer::usages::member_family::ResolvedMemberSelf>,
+        call_site: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+    ) -> crate::analyzer::usages::member_family::MemberOwnerSelections {
+        workspace
+            .member_family_provider_for_code_unit(member)
+            .map(|provider| {
+                provider.member_owner_selections(member, receiver, concrete_self, call_site)
+            })
+            .unwrap_or_else(
+                crate::analyzer::usages::member_family::MemberOwnerSelections::unsupported,
+            )
+    }
+
     fn workspace_member_family_capability(
         &self,
         workspace: &crate::analyzer::multi_analyzer::MultiAnalyzer,
@@ -1706,7 +1790,13 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
     /// Provider identities for external declaration inventories owned by this
     /// language's analyzer. Shared resolution gathers these through the
     /// registered language hooks instead of reaching into a language module.
-    fn external_inventory_providers(&self, _analyzer: &dyn IAnalyzer) -> Vec<String> {
+    /// `models` is the operation's model authority; a hook gates against it
+    /// and never reads the analyzer's own model snapshot (#14384).
+    fn external_inventory_providers(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _models: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    ) -> Vec<String> {
         Vec::new()
     }
 
@@ -1874,8 +1964,11 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         &self,
         _workspace: &crate::analyzer::WorkspaceAnalyzer,
         _changed: Option<&std::collections::BTreeSet<crate::analyzer::ProjectFile>>,
-    ) -> Result<(), crate::analyzer::store::StoreError> {
-        Ok(())
+    ) -> Result<crate::analyzer::read_verification::UpdateEffects, crate::analyzer::store::StoreError>
+    {
+        Ok(crate::analyzer::read_verification::UpdateEffects::Paths(
+            Default::default(),
+        ))
     }
 
     /// Republish tool-derived context after a live workspace snapshot update.
@@ -1914,12 +2007,17 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
             Ok(project) => project,
             Err(_) => return crate::analyzer::semantic_model::DependencyDiscoveryOutcome::generation_listing_unavailable(cancellation),
         };
+        let verifications = workspace.store().map_or_else(
+            || std::sync::Arc::new(brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications::default()),
+            |store| store.toolchain_verifications(),
+        );
         self.dependency_pack_resolver()
             .expect("dependency ecosystem resolver")
             .resolve(
                 config,
                 project.as_ref(),
                 &digests,
+                &verifications,
                 limits,
                 Some(cancellation),
             )
@@ -2853,6 +2951,43 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         false
     }
 
+    /// Whether [`Self::infeasible_control_edges`] can name an edge of
+    /// `semantics`.
+    ///
+    /// The shared entry opens the procedure's syntax only when this answers
+    /// `true`, so a language without a proof, or a procedure without a
+    /// candidate edge, costs one scan of the artifact's rows at most. The
+    /// answer reads the artifact alone.
+    fn has_infeasible_control_edge_candidate(
+        &self,
+        _semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    ) -> bool {
+        false
+    }
+
+    /// The control edges of `semantics` that no execution takes, in ascending
+    /// order.
+    ///
+    /// `syntax` is the procedure's exact prepared tree in `file`. Lowering
+    /// reads one file, so it keeps an edge wherever that file alone cannot
+    /// rule it out; this hook names the edges that the language's own rules
+    /// rule out once other workspace declarations are read. An implementation
+    /// must name an edge only from those rules, never from spelling, and must
+    /// leave an edge it cannot decide.
+    ///
+    /// The answer depends on the workspace, not on the procedure's content
+    /// alone. The ICFG provider asks it for a query, which records what the
+    /// implementation read; a product keyed by content must not consume it.
+    fn infeasible_control_edges(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _syntax: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+        _semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    ) -> Vec<crate::analyzer::semantic::ControlEdgeId> {
+        Vec::new()
+    }
+
     /// Prove the selected value gaps of one procedure using recorded resolution.
     /// The shared sweep memoizes the result for that procedure. Languages
     /// without a proof keep all Values gaps open by default.
@@ -3295,6 +3430,16 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// Structured formal declarations for a grammar that flattens parameters.
+    /// None delegates to the shared grammar traversal; Some(None) is invalid syntax.
+    fn formal_parameter_syntax<'tree>(
+        &self,
+        _list: tree_sitter::Node<'tree>,
+        _step: &mut dyn FnMut() -> bool,
+    ) -> Option<Option<Vec<crate::analyzer::lexical_definitions::ParameterSyntax<'tree>>>> {
+        None
+    }
+
     /// The syntax declaration supplying a callable's parameters. Most
     /// callables write their own list; compact forms may inherit an owner's.
     fn formal_parameter_source_owner<'tree>(
@@ -3486,12 +3631,15 @@ pub trait LanguageEdgePass: Send + Sync {
     /// available: files that source admission refused, each with the recorded
     /// reason object as JSON text. A consumer names each one as partial
     /// coverage and never treats the missing references as proof of absence.
+    ///
+    /// There is no default. Source admission is shared by every tree-sitter
+    /// language, so an empty default let a language silently report a refused
+    /// caller as absent (#13870). Production passes answer through
+    /// `TreeSitterAnalyzer::selected_graph_source_exclusions`.
     fn excluded_sources(
         &self,
-        _analyzer: &dyn IAnalyzer,
-    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>> {
-        Ok(Vec::new())
-    }
+        analyzer: &dyn IAnalyzer,
+    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>>;
 
     /// Whether an FQN-only edge can be a proven relation to a logical callable
     /// family even when no single physical overload is selected. Consumers
@@ -3639,12 +3787,15 @@ pub trait NativeWorkspaceGraphProvider: Send + Sync {
     /// available: files that source admission refused, each with the recorded
     /// reason object as JSON text. A consumer names each one as partial
     /// coverage and never treats the missing references as proof of absence.
+    ///
+    /// There is no default. Source admission is shared by every tree-sitter
+    /// language, so an empty default let a language silently report a refused
+    /// caller as absent (#13870). Production passes answer through
+    /// `TreeSitterAnalyzer::selected_graph_source_exclusions`.
     fn excluded_sources(
         &self,
-        _analyzer: &dyn IAnalyzer,
-    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>> {
-        Ok(Vec::new())
-    }
+        analyzer: &dyn IAnalyzer,
+    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>>;
 
     /// The `callers` whose references this provider could resolve to a
     /// declaration in one of `targets`, in `callers` order.
@@ -4238,6 +4389,9 @@ pub struct ReceiverFactContext<'a, 'tree> {
     pub root: tree_sitter::Node<'tree>,
     #[doc(hidden)]
     pub facts: &'a ReceiverFileFacts,
+    /// The request's cancellation, polled by long provider walks.
+    #[doc(hidden)]
+    pub cancellation: Option<&'a brokk_bifrost_core::cancellation::CancellationToken>,
 }
 
 /// A language's own receiver analysis, resolving against a syntax index it builds rather
@@ -4601,11 +4755,14 @@ const ANALYZABLE_LANGUAGES: &[Language] = &[
     Language::Kotlin,
 ];
 
-pub(crate) fn selected_external_inventory_providers(analyzer: &dyn IAnalyzer) -> Vec<String> {
+pub(crate) fn selected_external_inventory_providers(
+    analyzer: &dyn IAnalyzer,
+    models: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+) -> Vec<String> {
     let mut providers = ANALYZABLE_LANGUAGES
         .iter()
         .filter_map(|&language| language_support(language))
-        .flat_map(|support| support.external_inventory_providers(analyzer))
+        .flat_map(|support| support.external_inventory_providers(analyzer, models))
         .collect::<Vec<_>>();
     providers.sort_unstable();
     providers.dedup();

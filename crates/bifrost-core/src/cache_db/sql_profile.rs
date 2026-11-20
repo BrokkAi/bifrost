@@ -247,6 +247,12 @@ struct RequestAggregate {
     tool: String,
     started: Instant,
     overlapped: bool,
+    /// The process-wide counters at scope start; `None` when counters are off.
+    counters_before: Option<HashMap<&'static str, u64>>,
+    /// The counters when the request closed, taken under the request lock so the
+    /// next request's start snapshot cannot precede it; `None` while open or
+    /// when counters are off.
+    counters_after: Option<HashMap<&'static str, u64>>,
     statements: HashMap<u64, RequestStatement>,
     seen_bindings: HashSet<(u64, u64)>,
     internal_rows: [u64; ConnectionRole::ALL.len()],
@@ -258,6 +264,8 @@ impl RequestAggregate {
             tool: tool.to_string(),
             started: Instant::now(),
             overlapped: false,
+            counters_before: crate::profiling::counters_snapshot(),
+            counters_after: None,
             statements: HashMap::new(),
             seen_bindings: HashSet::new(),
             internal_rows: [0; ConnectionRole::ALL.len()],
@@ -370,7 +378,7 @@ impl RequestAggregate {
                 .cmp(&right["role"].as_str())
                 .then_with(|| left["sql"].as_str().cmp(&right["sql"].as_str()))
         });
-        serde_json::json!({
+        let mut record = serde_json::json!({
             "kind": "request",
             "tool": self.tool,
             "wall_ms": self.started.elapsed().as_secs_f64() * 1000.0,
@@ -379,8 +387,11 @@ impl RequestAggregate {
             "distinct_expanded_bindings": self.seen_bindings.len(),
             "statements": statements,
             "sqlite_internal_rows": internal_row_records(&self.internal_rows),
-        })
-        .to_string()
+        });
+        if let (Some(before), Some(after)) = (&self.counters_before, &self.counters_after) {
+            record["counters"] = serde_json::json!(crate::profiling::counters_delta(before, after));
+        }
+        record.to_string()
     }
 }
 
@@ -577,6 +588,10 @@ impl Profile {
     }
 
     fn finish_request(&self, request: RequestAggregate) {
+        #[cfg(test)]
+        if let Some(hook) = TEST_FINISH_HOOK.get() {
+            hook(&request.tool);
+        }
         let line = request.render();
         let mut output = self
             .request_output
@@ -599,6 +614,14 @@ static PROFILE: OnceLock<Option<Profile>> = OnceLock::new();
 /// the instrument on.
 #[cfg(test)]
 static TEST_PROFILE: OnceLock<Profile> = OnceLock::new();
+
+/// Runs with the request's tool name after its lock is released and before it
+/// renders, so a test can hold one request in that window.
+#[cfg(test)]
+static TEST_FINISH_HOOK: OnceLock<TestFinishHook> = OnceLock::new();
+
+#[cfg(test)]
+type TestFinishHook = Box<dyn Fn(&str) + Send + Sync>;
 
 /// The process's profile, or `None` when [`PROFILE_PATH_ENV`] is unset. The
 /// environment is read exactly once, on the first store connection.
@@ -647,12 +670,19 @@ impl Drop for RequestScope {
         let Some(profile) = self.profile else {
             return;
         };
-        let request = profile
-            .active_request
-            .lock()
-            .expect("SQL request profile poisoned")
-            .take()
-            .expect("counted SQL request scope owns an open request");
+        let request = {
+            let mut active = profile
+                .active_request
+                .lock()
+                .expect("SQL request profile poisoned");
+            let mut request = active
+                .take()
+                .expect("counted SQL request scope owns an open request");
+            // Still under the lock: a request opened after this guard drops
+            // snapshots its start later, so no event is in two records.
+            request.counters_after = crate::profiling::counters_snapshot();
+            request
+        };
         profile.finish_request(request);
     }
 }
@@ -1572,6 +1602,126 @@ mod tests {
         }
         conn.close().unwrap();
         assert!(!tags().lock().unwrap().contains_key(&address));
+    }
+
+    #[test]
+    fn request_record_carries_counter_deltas_only_when_counters_are_on() {
+        // The profile and the counter switch are process-global; run in a child.
+        const CHILD: &str = "BIFROST_SQL_COUNTERS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cache_db::sql_profile::tests::request_record_carries_counter_deltas_only_when_counters_are_on"])
+                .env(CHILD, "1")
+                .env_remove(PROFILE_PATH_ENV)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "fixture failed: {output:?}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dump_path = dir.path().join("sql.jsonl");
+        assert!(TEST_PROFILE.set(Profile::new(dump_path.clone())).is_ok());
+        let count = |n: u64| crate::profile_count!("test.counter", n);
+        // Off: counted events are dropped and the field is omitted.
+        drop({
+            let scope = request_scope("off");
+            count(5);
+            scope
+        });
+        crate::profiling::FORCE_COUNTERS.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Events before the scope opens are not part of its delta.
+        count(7);
+        drop({
+            let scope = request_scope("on");
+            count(2);
+            count(1);
+            scope
+        });
+        drop(request_scope("quiet"));
+        let requests: Vec<serde_json::Value> =
+            std::fs::read_to_string(dump_path.with_extension("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].get("counters").is_none(), "{}", requests[1]);
+        assert_eq!(
+            requests[2]["counters"],
+            serde_json::json!({"test.counter": 3})
+        );
+        assert_eq!(requests[3]["counters"], serde_json::json!({}));
+    }
+
+    #[test]
+    #[hardwon(
+        "#13223: a request's end counter snapshot was taken after its lock was released, so events in the gap appeared in two records"
+    )]
+    fn request_counter_deltas_exclude_events_after_the_request_closed() {
+        const CHILD: &str = "BIFROST_SQL_COUNTERS_GAP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cache_db::sql_profile::tests::request_counter_deltas_exclude_events_after_the_request_closed"])
+                .env(CHILD, "1")
+                .env_remove(PROFILE_PATH_ENV)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "fixture failed: {output:?}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dump_path = dir.path().join("sql.jsonl");
+        assert!(TEST_PROFILE.set(Profile::new(dump_path.clone())).is_ok());
+        crate::profiling::FORCE_COUNTERS.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Hold request "first" after its lock is released and before it renders.
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new((paused_tx, resume_rx));
+        assert!(
+            TEST_FINISH_HOOK
+                .set(Box::new(move |tool| {
+                    if tool == "first" {
+                        let gate = gate.lock().unwrap();
+                        gate.0.send(()).unwrap();
+                        gate.1.recv().unwrap();
+                    }
+                }))
+                .is_ok()
+        );
+        let first = std::thread::spawn(|| {
+            let request = request_scope("first");
+            crate::profile_count!("test.gap", 1);
+            drop(request);
+        });
+        paused_rx.recv().unwrap();
+        let second = request_scope("second");
+        assert!(second.counted, "second must own its request");
+        crate::profile_count!("test.gap", 2);
+        drop(second);
+        resume_tx.send(()).unwrap();
+        first.join().unwrap();
+        let requests: Vec<serde_json::Value> =
+            std::fs::read_to_string(dump_path.with_extension("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let find = |tool: &str| {
+            requests
+                .iter()
+                .find(|row| row["tool"] == tool)
+                .unwrap_or_else(|| panic!("no record for {tool}: {requests:?}"))
+        };
+        assert_eq!(
+            find("first")["counters"],
+            serde_json::json!({"test.gap": 1})
+        );
+        assert_eq!(
+            find("second")["counters"],
+            serde_json::json!({"test.gap": 2})
+        );
+        assert_eq!(find("first")["overlapped"], false);
+        assert_eq!(find("second")["overlapped"], false);
     }
 
     #[test]

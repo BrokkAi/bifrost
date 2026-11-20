@@ -82,8 +82,880 @@ mod tests {
     use brokk_bifrost_rust::test_helpers::write_fixture_file as write;
     use std::path::PathBuf;
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: a claimed file's path-derived package answered complete and empty"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: regression inspects selected package naming authority"
+    )]
+    fn claimed_files_keep_path_derived_packages_incomplete() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[workspace]\nmembers=['a','b','c','good']\nresolver='2'\n")
+            .file("a/Cargo.toml", "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='../shared.rs'\n")
+            .file("shared.rs", "mod child; pub fn shared() {}\n")
+            .file("child.rs", "pub fn child() {}\n")
+            .file("a/unowned.rs", "pub fn unowned() {}\n")
+            .file("b/Cargo.toml", "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='../libs/shared.rs'\n")
+            .file("libs/shared.rs", "pub fn shared() {}\n")
+            .file("c/Cargo.toml", "[package]\nname='c'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='../src/lib.rs'\n")
+            .file("src/lib.rs", "pub fn root() {}\n")
+            .file("good/Cargo.toml", "[package]\nname='good'\nversion='0.1.0'\nedition='2021'\n")
+            .file("good/src/lib.rs", "pub fn healthy() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        let snapshots = analyzer.inner.selected_workspace_snapshots();
+        let conn = analyzer
+            .analyzer_store()
+            .read_conn_for_workspace(&snapshots)
+            .unwrap();
+        let naming = conn.prepare_cached("SELECT DISTINCT f.rel_path,n.package_name
+            FROM selected_workspace_file_versions f JOIN workspace_file_package_rows n USING(file_version_id)
+            WHERE f.lang='rust' AND f.rel_path IN ('shared.rs','src/lib.rs','libs/shared.rs','child.rs','a/unowned.rs')
+            ORDER BY f.rel_path,n.package_name").unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        drop(conn);
+        assert!(
+            naming
+                .iter()
+                .any(|(path, package)| path == "src/lib.rs" && package.is_empty()),
+            "{naming:?}"
+        );
+        assert!(
+            naming
+                .iter()
+                .any(|(path, package)| path == "libs/shared.rs" && !package.is_empty()),
+            "{naming:?}"
+        );
+        assert!(
+            !analyzer
+                .package_view()
+                .contains(&fixture.file("shared.rs"), None)
+                .unwrap()
+                .complete
+        );
+        for path in [
+            "shared.rs",
+            "src/lib.rs",
+            "libs/shared.rs",
+            "child.rs",
+            "a/unowned.rs",
+        ] {
+            let packages: Vec<_> = naming
+                .iter()
+                .filter(|(file, _)| file == path)
+                .map(|(_, package)| package.clone())
+                .collect();
+            assert!(!packages.is_empty(), "{path}: {naming:?}");
+            for package in packages {
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+                let answer = analyzer
+                    .package_view()
+                    .files_in_package(&package, None)
+                    .unwrap();
+                assert!(
+                    answer.value.is_empty(),
+                    "unavailable owners have no summary listing"
+                );
+                assert!(
+                    !answer.complete,
+                    "claimed package {package:?} must not certify absence; selected packages: {naming:?}"
+                );
+                let reasons = scope.captured_read_incompleteness();
+                assert!(reasons.iter().any(|reason| matches!(reason,
+                    QueryReadIncomplete::SemanticEvidenceGap(text) if text.contains("target_root_unavailable")
+                )), "{package:?}: {reasons:?}");
+                drop(scope);
+                assert!(
+                    analyzer
+                        .package_view()
+                        .certified_files_in_package(&package, None)
+                        .is_err(),
+                    "an unavailable owner cannot certify package {package:?}"
+                );
+                assert!(
+                    !analyzer
+                        .package_view()
+                        .crate_packages(&package, None)
+                        .unwrap()
+                        .complete
+                );
+                if !package.is_empty() {
+                    assert!(
+                        !analyzer
+                            .package_view()
+                            .files_in_package(&format!("{package}.inner"), None)
+                            .unwrap()
+                            .complete
+                    );
+                }
+            }
+        }
+        for package in ["good", "missing", "sharedness"] {
+            assert!(
+                analyzer
+                    .package_view()
+                    .files_in_package(package, None)
+                    .unwrap()
+                    .complete,
+                "{package}"
+            );
+        }
+    }
+
     struct OuterRouteWithUnpersistedChild {
         inner: brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations,
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: a binary dropped its implicit dependency on an unavailable same-package library and reported complete"
+    )]
+    fn binary_retains_unavailable_same_package_library() {
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            ResolutionCompletion, ResolutionIncompleteReason,
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[workspace]\nmembers=[\"app\"]\nresolver=\"2\"\n")
+            .file("app/Cargo.toml", "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"../shared.rs\"\n[[bin]]\nname=\"runner\"\npath=\"src/main.rs\"\n")
+            .file("shared.rs", "pub fn run() {}\n")
+            .file("app/src/main.rs", "fn main() { app::run(); }\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let operation = match analyzer
+            .open_selected_rust_operation(&cancellation)
+            .outcome
+            .unwrap()
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("opening binary context: {other:?}"),
+        };
+        let context = match operation.rust_context_for_file(std::path::Path::new("app/src/main.rs"), &cancellation).unwrap() {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustFileContextOutcome::Ready {context,..} => context,
+            _ => panic!("binary context unexpectedly cancelled"),
+        };
+        let completion = context.inventory_completion();
+        let identities = &operation.ready().context_identities;
+        let ResolutionCompletion::Incomplete(reasons) = completion else {
+            panic!("a binary cannot be complete without its enabled library");
+        };
+        assert!(
+            reasons.iter().any(|reason| match reason {
+                ResolutionIncompleteReason::UnsupportedSemantic(reason) => identities
+                    .named_reason(*reason)
+                    .is_some_and(|(kind, text)| kind == "RustTargetRootUnavailable"
+                        && text.starts_with("target_root_unavailable:")),
+                _ => false,
+            }),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: escaping target roots became complete Detached owners and hid their package gap"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn unavailable_target_roots_keep_local_ownership_incomplete() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
+            RustUnitAvailability, rust_file_unit_availability,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause;
+        // Detached is native ownership, not a Cargo target root. Check its
+        // selected owner and summary kind rather than target_roots(), which
+        // deliberately excludes Detached from the Cargo-route surface.
+        let detached_owners = |analyzer: &RustAnalyzer, file: &ProjectFile| {
+            let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+            let operation = match analyzer
+                .open_selected_rust_operation(&cancellation)
+                .outcome
+                .unwrap()
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+                other => panic!("opening Detached context: {other:?}"),
+            };
+            let keys = operation
+                .rust_crate_keys_for_file(file.rel_path(), &cancellation)
+                .unwrap();
+            assert!(
+                !keys.is_empty(),
+                "a genuinely unowned file has a native Detached owner"
+            );
+            match operation.rust_context_for_file(file.rel_path(), &cancellation).unwrap() {
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustFileContextOutcome::Ready {context,..} => assert!(matches!(context.inventory_completion(),brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete)),
+                _ => panic!("Detached context unexpectedly cancelled"),
+            }
+            drop(operation);
+            let kinds = analyzer.with_selected_route_demands(None, |inventory| {
+                let snapshot = brokk_bifrost_analysis::analyzer::derivation_host::selected_rust_snapshot(inventory).map_err(|e|UnavailableCause::Failed(e.into()))?;
+                let mut kinds = Vec::new();
+                for key in &keys {
+                    let rows = brokk_bifrost_analysis::analyzer::store::AnalyzerStore::rust_summary_cargo_route_rows_for_unit(inventory.connection(), &snapshot, key).map_err(|e|UnavailableCause::Failed(e.to_string().into()))?;
+                    kinds.extend(rows.into_iter().map(|row|row.target_kind));
+                }
+                Ok::<_,UnavailableCause>(kinds)
+            }).expect("Detached summary rows");
+            assert!(
+                !kinds.is_empty() && kinds.iter().all(|kind| kind == "detached"),
+                "{kinds:?}"
+            );
+            keys
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[workspace]\nmembers = [\"a\",\"b\",\"outside\",\"good\",\"consumer\"]\nresolver = \"2\"\n")
+            .file("a/Cargo.toml", "[package]\nname=\"a\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"../shared.rs\"\n[features]\nextra=[]\n")
+            .file("a/src/main.rs", "fn main() {}\n")
+            .file("b/Cargo.toml", "[package]\nname=\"b\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"../shared.rs\"\n")
+            .file("outside/Cargo.toml", "[package]\nname=\"outside\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"../../../unavailable.rs\"\n")
+            .file("outside/src/main.rs", "fn main() {}\n")
+            .file("outside/unowned.rs", "pub fn unowned() {}\n")
+            .file("shared.rs", "mod child;\n#[cfg(feature=\"extra\")] pub fn extra() {}\npub fn shared() {}\n")
+            .file("child.rs", "pub fn child() {}\n")
+            .file("good/Cargo.toml", "[package]\nname=\"good\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+            .file("good/src/lib.rs", "pub fn healthy() {}\n")
+            .file("good/orphan.rs", "pub fn detached() {}\n")
+            .file("consumer/Cargo.toml", "[package]\nname=\"consumer\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nalias_a={package=\"a\",path=\"../a\"}\n")
+            .file("consumer/src/lib.rs", "pub fn consumer() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        let normal_states: Vec<(String,bool,bool)> = analyzer.analyzer_store().read_conn().unwrap().prepare("SELECT crate_name,broad_complete,inventory_complete FROM rust_crate_topologies ORDER BY crate_name").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        let listing_failures: Vec<(String, String)> = analyzer
+            .analyzer_store()
+            .read_conn()
+            .unwrap()
+            .prepare(
+                "SELECT rel_path,reason FROM rust_source_listing_failures ORDER BY rel_path,reason",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let persisted_gaps: Vec<(String,String)> = analyzer.analyzer_store().read_conn().unwrap().prepare("SELECT package.manifest_path,target.reason FROM rust_package_route_versions package JOIN rust_package_unavailable_targets target USING(route_set_id) WHERE package.valid_until IS NULL ORDER BY package.manifest_path,target.unit_key").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        let selected_manifests: Vec<String> = analyzer.analyzer_store().read_conn().unwrap().prepare("SELECT rel_path FROM workspace_file_versions WHERE input_kind='configuration' AND valid_until IS NULL ORDER BY rel_path").unwrap().query_map([],|row|row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            persisted_gaps,
+            vec![
+                ("a/Cargo.toml".into(), "outside_package_unsupported".into()),
+                ("b/Cargo.toml".into(), "outside_package_unsupported".into()),
+                ("outside/Cargo.toml".into(), "outside_workspace".into())
+            ],
+            "selected configuration: {selected_manifests:?}"
+        );
+        for path in ["shared.rs", "child.rs", "outside/unowned.rs"] {
+            let file = fixture.file(path);
+            let routes = <RustAnalyzer as RustSource>::file_routes(&analyzer, &file, None)
+                .expect("partial file routes");
+            assert!(!routes.is_complete(), "{path} must retain its target gap");
+            assert!(
+                routes.target_roots(&file).is_empty(),
+                "{path} must not become Detached"
+            );
+            assert!(
+                !analyzer
+                    .package_view()
+                    .contains(&file, None)
+                    .unwrap()
+                    .complete
+            );
+
+            let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+            let operation = match analyzer
+                .open_selected_rust_operation(&cancellation)
+                .outcome
+                .expect("selected operation")
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+                other => panic!("opening local context: {other:?}"),
+            };
+            assert!(
+                !operation
+                    .rust_file_configuration_targets(file.rel_path(), &cancellation)
+                    .unwrap()
+                    .membership_complete
+            );
+            match operation.rust_context_for_file(file.rel_path(),&cancellation).unwrap() {
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustFileContextOutcome::Ready {context,crate_keys}=> {
+                    assert!(crate_keys.is_empty(),"{path} cannot acquire a fabricated summary owner: {crate_keys:02x?}; gaps={persisted_gaps:?}; selected={selected_manifests:?}");
+                    assert!(matches!(context.inventory_completion(),brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(_)));
+                },
+                _=>panic!("local context unexpectedly cancelled"),
+            }
+            drop(operation);
+            let states = analyzer
+                .with_selected_route_demands(None, |inventory| {
+                    let snapshot =
+                        brokk_bifrost_analysis::analyzer::derivation_host::selected_rust_snapshot(
+                            inventory,
+                        )
+                        .map_err(|e| UnavailableCause::Failed(e.into()))?;
+                    rust_file_unit_availability(inventory.connection(), &snapshot, path)
+                        .map_err(|e| UnavailableCause::Failed(e.to_string().into()))
+                })
+                .expect("selected target availability");
+            assert!(states.iter().all(|(_, state)| matches!(
+                state,
+                RustUnitAvailability::IntentionallyUnavailable { .. }
+            )));
+            let expected = if path.starts_with("outside/") {
+                "outside_workspace"
+            } else {
+                "outside_package_unsupported"
+            };
+            assert!(states.iter().any(|(_,state)|matches!(state,RustUnitAvailability::IntentionallyUnavailable {cause,..} if cause.reason.label()==expected)), "{states:?}");
+        }
+        assert!(
+            !analyzer
+                .package_view()
+                .files_in_package("a", None)
+                .unwrap()
+                .complete
+        );
+        for path in ["good/src/lib.rs", "outside/src/main.rs", "a/src/main.rs"] {
+            let file = fixture.file(path);
+            assert_eq!(
+                <RustAnalyzer as RustSource>::file_routes(&analyzer, &file, None)
+                    .unwrap()
+                    .is_complete(),
+                path == "good/src/lib.rs",
+                "{path}: normal units={normal_states:?}; listing={listing_failures:?}"
+            );
+            let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+            let operation = match analyzer
+                .open_selected_rust_operation(&cancellation)
+                .outcome
+                .expect("healthy selected operation")
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+                other => panic!("opening healthy context: {other:?}"),
+            };
+            assert_eq!(
+                operation
+                    .rust_file_configuration_targets(file.rel_path(), &cancellation)
+                    .unwrap()
+                    .membership_complete,
+                path == "good/src/lib.rs",
+                "{path}"
+            );
+            match operation.rust_context_for_file(file.rel_path(),&cancellation).unwrap() {
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustFileContextOutcome::Ready {context,..}=>assert_eq!(matches!(context.inventory_completion(),brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete), path == "good/src/lib.rs", "{path}"),
+                _=>panic!("healthy context unexpectedly cancelled"),
+            }
+        }
+        assert!(
+            !analyzer
+                .unscoped_libraries_of("alias_a", None)
+                .unwrap()
+                .complete,
+            "an alias to an unavailable library cannot prove complete absence"
+        );
+        let healthy = fixture.file("good/src/lib.rs");
+        assert!(
+            <RustAnalyzer as RustSource>::file_routes(&analyzer, &healthy, None)
+                .unwrap()
+                .is_complete()
+        );
+        let orphan = fixture.file("good/orphan.rs");
+        let routes = <RustAnalyzer as RustSource>::file_routes(&analyzer, &orphan, None).unwrap();
+        assert!(routes.is_complete());
+        assert!(routes.target_roots(&orphan).is_empty());
+        detached_owners(&analyzer, &orphan);
+
+        // Removing the mounting edge releases a formerly claimed external
+        // module. Incremental reconciliation must reconsider it for Detached.
+        write(fixture.root(), "shared.rs", "pub fn shared() {}\n");
+        let analyzer = analyzer.update(&std::collections::BTreeSet::from([
+            fixture.file("shared.rs")
+        ]));
+        let child = fixture.file("child.rs");
+        let routes = <RustAnalyzer as RustSource>::file_routes(&analyzer, &child, None).unwrap();
+        assert!(routes.is_complete());
+        assert!(routes.target_roots(&child).is_empty());
+        let incremental_child_owners = detached_owners(&analyzer, &child);
+        let fresh = RustAnalyzer::new(fixture.certified_project_dyn());
+        let fresh_routes = <RustAnalyzer as RustSource>::file_routes(&fresh, &child, None).unwrap();
+        assert_eq!(routes.is_complete(), fresh_routes.is_complete());
+        assert_eq!(
+            routes.target_roots(&child),
+            fresh_routes.target_roots(&child)
+        );
+        assert_eq!(incremental_child_owners, detached_owners(&fresh, &child));
+        drop(fresh);
+        // Repairing a package root closes its unavailable admission interval.
+        write(
+            fixture.root(),
+            "outside/Cargo.toml",
+            "[package]\nname=\"outside\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        );
+        write(
+            fixture.root(),
+            "outside/src/lib.rs",
+            "pub fn repaired() {}\n",
+        );
+        let analyzer = analyzer.update(&std::collections::BTreeSet::from([
+            fixture.file("outside/Cargo.toml"),
+            fixture.file("outside/src/lib.rs"),
+        ]));
+        let released = fixture.file("outside/unowned.rs");
+        let routes = <RustAnalyzer as RustSource>::file_routes(&analyzer, &released, None).unwrap();
+        assert!(routes.is_complete());
+        assert!(routes.target_roots(&released).is_empty());
+        detached_owners(&analyzer, &released);
+
+        // Retain a normal topology/version but remove its summary publication.
+        // Intentional gaps elsewhere must not mask this real store failure.
+        analyzer
+            .analyzer_store()
+            .execute_selection_publication(|conn| {
+                conn.execute(
+                    "DELETE FROM resolution_unit_summary_versions WHERE lang='rust' AND unit_key IN (SELECT crate_key FROM rust_crate_topologies WHERE crate_name='good' AND target_kind='lib')",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            analyzer.check_route_membership_completeness(&|| true),
+            Err(RustCargoRouteError::Unavailable)
+        ));
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let operation = match analyzer
+            .open_selected_rust_operation(&cancellation)
+            .outcome
+            .unwrap()
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("opening mixed-publication context: {other:?}"),
+        };
+        assert!(
+            operation
+                .rust_file_configuration_targets(
+                    std::path::Path::new("good/src/lib.rs"),
+                    &cancellation
+                )
+                .is_err()
+        );
+        assert!(
+            operation
+                .rust_context_for_file(std::path::Path::new("good/src/lib.rs"), &cancellation)
+                .is_err()
+        );
+        // An unpublished selected unit is partial for a cause other than an
+        // unavailable target, so it keeps every file's membership incomplete.
+        assert!(
+            !operation
+                .rust_file_configuration_targets(
+                    std::path::Path::new("outside/src/main.rs"),
+                    &cancellation
+                )
+                .unwrap()
+                .membership_complete
+        );
+        match operation.rust_context_for_file(std::path::Path::new("outside/src/main.rs"), &cancellation).unwrap() {
+            // The package repair above made this binary and its library healthy.
+            // An unrelated missing summary affects membership, not this context.
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustFileContextOutcome::Ready {context,..} => assert!(matches!(context.inventory_completion(),brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete)),
+            _ => panic!("unrelated broken unit stopped a healthy local context"),
+        }
+        assert!(
+            !operation
+                .rust_file_configuration_targets(std::path::Path::new("shared.rs"), &cancellation)
+                .unwrap()
+                .membership_complete
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: per-file availability replaced the workspace-wide gate on units that are partial for a cause other than an unavailable target"
+    )]
+    fn non_target_partial_unit_keeps_workspace_membership_incomplete() {
+        // x and y depend on each other, so the scheduler forces them: both are
+        // broad-incomplete for a cause that is not an unavailable target. Neither
+        // lists z/src/lib.rs, yet an incomplete unit could own it. The unavailable
+        // `esc` target is still attributed to its own files.
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[workspace]\nmembers = [\"x\",\"y\",\"z\",\"esc\"]\nresolver = \"2\"\n")
+            .file("x/Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\ny={path=\"../y\"}\n")
+            .file("x/src/lib.rs", "pub fn x() {}\n")
+            .file("y/Cargo.toml", "[package]\nname=\"y\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nx={path=\"../x\"}\n")
+            .file("y/src/lib.rs", "pub fn y() {}\n")
+            .file("z/Cargo.toml", "[package]\nname=\"z\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+            .file("z/src/lib.rs", "pub fn z() {}\n")
+            .file("esc/Cargo.toml", "[package]\nname=\"esc\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\npath=\"../../../unavailable.rs\"\n")
+            .file("esc/src/main.rs", "fn main() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let operation = match analyzer
+            .open_selected_rust_operation(&cancellation)
+            .outcome
+            .expect("selected operation")
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("opening context: {other:?}"),
+        };
+        for path in ["z/src/lib.rs", "x/src/lib.rs", "esc/src/main.rs"] {
+            assert!(
+                !operation
+                    .rust_file_configuration_targets(std::path::Path::new(path), &cancellation)
+                    .unwrap()
+                    .membership_complete,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: scoped repair and removal lost package-admitted files that had no target claim"
+    )]
+    fn unavailable_package_admission_refresh_matches_fresh_unit_keys() {
+        use brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput;
+        use brokk_bifrost_analysis::analyzer::store::rust_crates::CrateReconcileScope;
+        let base = "[package]
+name='pkg'
+version='0.1.0'
+edition='2021'
+autobins=false
+[lib]
+path='src/healthy.rs'
+";
+        let old_manifest = format!(
+            "{base}[[bin]]
+name='unavailable'
+path='../../../missing.rs'
+"
+        );
+        for repair in [true, false] {
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[workspace]
+members=['pkg','pkg/nested/member','other']
+resolver='2'
+",
+                )
+                .file("pkg/Cargo.toml", &old_manifest)
+                .file(
+                    "pkg/src/healthy.rs",
+                    "pub fn healthy() {}
+",
+                )
+                .file(
+                    "pkg/src/repaired.rs",
+                    "fn main() {}
+",
+                )
+                .file(
+                    "pkg/unowned.rs",
+                    "pub fn unowned() {}
+",
+                )
+                .file(
+                    "pkg/nested/free.rs",
+                    "pub fn nested() {}
+",
+                )
+                .file(
+                    "pkg/nested/member/Cargo.toml",
+                    "[package]
+name='member'
+version='0.1.0'
+edition='2021'
+",
+                )
+                .file(
+                    "pkg/nested/member/src/lib.rs",
+                    "pub fn member() {}
+",
+                )
+                .file(
+                    "pkg/nested/member/orphan.rs",
+                    "pub fn other_detached() {}
+",
+                )
+                .file(
+                    "other/Cargo.toml",
+                    "[package]
+name='other'
+version='0.1.0'
+edition='2021'
+",
+                )
+                .file(
+                    "other/src/lib.rs",
+                    "pub fn other() {}
+",
+                )
+                .build();
+            let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+            let previous_snapshots = analyzer.inner.selected_workspace_snapshots();
+            let previous = previous_snapshots["rust"].clone();
+            let manifest = if repair {
+                format!(
+                    "{base}[[bin]]
+name='unavailable'
+path='src/repaired.rs'
+"
+                )
+            } else {
+                base.to_owned()
+            };
+            write(fixture.root(), "pkg/Cargo.toml", &manifest);
+            let fresh = RustAnalyzer::new(fixture.certified_project_dyn());
+            let cargo_keys = fresh.analyzer_store().execute_selection_publication(|conn| {
+                conn.prepare("SELECT version.crate_key FROM rust_crate_versions version JOIN rust_crate_topologies topology USING(topology_id) JOIN workspace_file_versions manifest ON manifest.file_version_id=version.manifest_file_version_id WHERE version.valid_until IS NULL AND topology.target_kind<>'detached' AND manifest.rel_path='pkg/Cargo.toml'").unwrap().query_map([],|row|row.get::<_,[u8;32]>(0)).unwrap().collect::<rusqlite::Result<std::collections::HashSet<_>>>().unwrap()
+            });
+            assert!(!cargo_keys.is_empty());
+            let generations = std::iter::once(("rust".to_owned(), previous.generation)).collect();
+            let (snapshots, _) = analyzer.analyzer_store().replace_configuration_input(
+                &previous.workspace_id,
+                &previous_snapshots,
+                &["rust".into()],
+                &generations,
+                WorkspaceConfigurationInput::new("pkg/Cargo.toml".into(),manifest.as_bytes().into()),
+                Some(&brokk_bifrost_analysis::analyzer::store::RustListingInput::new(
+                    brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
+                    Vec::new(),
+                )),
+            ).unwrap();
+            let current = snapshots["rust"].clone();
+            assert!(
+                matches!(
+                    analyzer
+                        .analyzer_store()
+                        .rust_crate_reconcile_scope(
+                            &current,
+                            previous.revision,
+                            &["pkg/Cargo.toml".into()]
+                        )
+                        .unwrap(),
+                    CrateReconcileScope::Everything
+                ),
+                "production manifest routing stays a full pass"
+            );
+            analyzer
+                .analyzer_store()
+                .reconcile_rust_crates_scoped_for_test(
+                    &current,
+                    CrateReconcileScope::Reached {
+                        crates: cargo_keys.into_iter().collect(),
+                        from_revision: previous.revision,
+                        created: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let keys = |analyzer: &RustAnalyzer| {
+                analyzer.analyzer_store().execute_selection_publication(|conn| {
+                    conn.prepare("SELECT crate_key FROM rust_crate_versions WHERE valid_until IS NULL ORDER BY crate_key").unwrap().query_map([],|row|row.get::<_,[u8;32]>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+                })
+            };
+            assert_eq!(
+                keys(&analyzer),
+                keys(&fresh),
+                "scoped {} must preserve every native unit key",
+                if repair { "repair" } else { "removal" }
+            );
+            let detached = analyzer.analyzer_store().execute_selection_publication(|conn| {
+                conn.prepare("SELECT topology.crate_name FROM rust_crate_versions version JOIN rust_crate_topologies topology USING(topology_id) WHERE version.valid_until IS NULL AND topology.target_kind='detached' ORDER BY topology.crate_name").unwrap().query_map([],|row|row.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            });
+            assert!(detached.iter().any(|name| name == "pkg/unowned.rs"));
+            assert!(detached.iter().any(|name| name == "pkg/nested/free.rs"));
+            if !repair {
+                assert!(detached.iter().any(|name| name == "pkg/src/repaired.rs"));
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: a meaning-preserving manifest edit relinked crate intervals in place and made units stale"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: regression inspects persisted publication intervals"
+    )]
+    fn meaning_preserving_manifest_edit_preserves_selected_bindings() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
+            RustUnitAvailability, rust_file_unit_availability,
+        };
+        let good = "[package]\nname='good'\nversion='0.1.0'\nedition='2021'\n";
+        let bad =
+            "[package]\nname='bad'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='../shared.rs'\n";
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[workspace]\nmembers=['good','bad']\nresolver='2'\n",
+            )
+            .file("good/Cargo.toml", good)
+            .file("good/src/lib.rs", "pub fn good() {}\n")
+            .file("bad/Cargo.toml", bad)
+            .file("shared.rs", "pub fn shared() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        let previous = analyzer.inner.selected_workspace_snapshots();
+        let healthy = fixture.file("good/src/lib.rs");
+        assert!(
+            <RustAnalyzer as RustSource>::file_routes(&analyzer, &healthy, None)
+                .unwrap()
+                .is_complete()
+        );
+        write(
+            fixture.root(),
+            "good/Cargo.toml",
+            &format!("{good}# comment only\n"),
+        );
+        write(
+            fixture.root(),
+            "bad/Cargo.toml",
+            &format!("{bad}# comment only\n"),
+        );
+        let updated = analyzer.update(&std::collections::BTreeSet::from([
+            fixture.file("good/Cargo.toml"),
+            fixture.file("bad/Cargo.toml"),
+        ]));
+        let current = updated.inner.selected_workspace_snapshots();
+        assert!(current["rust"].revision > previous["rust"].revision);
+        let mut publications = Vec::new();
+        for snapshots in [&previous, &current] {
+            // Select an earlier revision after the edit has committed; no held
+            // SQLite read transaction can hide an in-place history rewrite.
+            let conn = updated
+                .analyzer_store()
+                .read_conn_for_workspace(snapshots)
+                .unwrap();
+            let snapshot = &snapshots["rust"];
+            let states = rust_file_unit_availability(&conn, snapshot, "good/src/lib.rs").unwrap();
+            assert!(!states.is_empty());
+            assert!(
+                states.iter().all(|(_, state)| matches!(
+                    state,
+                    RustUnitAvailability::Published { complete: true, .. }
+                )),
+                "{snapshot:?}: {states:?}"
+            );
+            let states = rust_file_unit_availability(&conn, snapshot, "shared.rs").unwrap();
+            assert!(!states.is_empty());
+            assert!(
+                states.iter().all(|(_, state)| matches!(
+                    state,
+                    RustUnitAvailability::IntentionallyUnavailable { .. }
+                )),
+                "{snapshot:?}: {states:?}"
+            );
+            for table in ["rust_crate_versions", "rust_package_route_versions"] {
+                let stale: i64 = conn.query_row(&format!("SELECT count(*) FROM {table} v JOIN workspace_file_versions f ON f.file_version_id=v.manifest_file_version_id WHERE v.workspace_id=?1 AND v.generation=?2 AND v.valid_from<=?3 AND (v.valid_until IS NULL OR ?3<v.valid_until) AND NOT (f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until))"), rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision], |row|row.get(0)).unwrap();
+                assert_eq!(stale, 0, "{table} at {snapshot:?}");
+            }
+            let summary: i64 = conn.query_row("SELECT v.summary_id FROM resolution_unit_summary_versions v JOIN resolution_unit_summary_members m USING(summary_id) WHERE m.rel_path='good/src/lib.rs' AND v.workspace_id=?1 AND v.generation=?2 AND v.valid_from<=?3 AND (v.valid_until IS NULL OR ?3<v.valid_until)", rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision], |row|row.get(0)).unwrap();
+            publications.push(summary);
+        }
+        // Summary inputs deliberately include raw own/workspace manifest OIDs
+        // (declare_configuration_inputs). A comment edit reuses the topology,
+        // but publishes a new summary bound to the new configuration bytes.
+        assert_ne!(
+            publications[0], publications[1],
+            "changed manifest bytes must have distinct summary inputs"
+        );
+        assert!(
+            <RustAnalyzer as RustSource>::file_routes(&updated, &healthy, None)
+                .unwrap()
+                .is_complete()
+        );
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let operation = match updated
+            .open_selected_rust_operation(&cancellation)
+            .outcome
+            .unwrap()
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("opening healthy context: {other:?}"),
+        };
+        match operation.rust_context_for_file(std::path::Path::new("good/src/lib.rs"), &cancellation).unwrap() {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustFileContextOutcome::Ready { context, .. } => assert!(matches!(context.inventory_completion(), brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete)),
+            _ => panic!("healthy context unexpectedly cancelled"),
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13400: an unrelated package file rewrote every Rust package route set"
+    )]
+    fn unrelated_file_addition_writes_no_other_package_routes() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[workspace]
+members=['a','b']
+resolver='2'
+",
+            )
+            .file(
+                "a/Cargo.toml",
+                "[package]
+name='a'
+version='0.1.0'
+edition='2021'
+",
+            )
+            .file(
+                "a/src/lib.rs",
+                "pub fn a() {}
+",
+            )
+            .file(
+                "b/Cargo.toml",
+                "[package]
+name='b'
+version='0.1.0'
+edition='2021'
+",
+            )
+            .file(
+                "b/src/lib.rs",
+                "pub fn b() {}
+",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        analyzer.analyzer_store().execute_selection_publication(|conn| {
+            conn.execute_batch("CREATE TEMP TABLE package_route_writes(operation TEXT NOT NULL);
+                CREATE TEMP TRIGGER observe_route_insert AFTER INSERT ON main.rust_package_route_versions WHEN NEW.manifest_path='a/Cargo.toml' BEGIN INSERT INTO package_route_writes VALUES('insert'); END;
+                CREATE TEMP TRIGGER observe_route_update AFTER UPDATE ON main.rust_package_route_versions WHEN OLD.manifest_path='a/Cargo.toml' BEGIN INSERT INTO package_route_writes VALUES('update'); END;
+                CREATE TEMP TRIGGER observe_route_delete AFTER DELETE ON main.rust_package_route_versions WHEN OLD.manifest_path='a/Cargo.toml' BEGIN INSERT INTO package_route_writes VALUES('delete'); END;")
+        }).unwrap();
+        let new_file = fixture.file("b/added.rs");
+        write(
+            fixture.root(),
+            "b/added.rs",
+            "pub fn added() {}
+",
+        );
+        let updated = analyzer.update(&std::collections::BTreeSet::from([new_file]));
+        let writes: i64 = updated
+            .analyzer_store()
+            .execute_selection_publication(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM temp.package_route_writes",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        println!("route-set row writes for a after an unrelated b file: {writes}");
+        assert_eq!(
+            writes, 0,
+            "adding a file in b must write no route-set rows for a"
+        );
     }
 
     impl brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKind
@@ -515,6 +1387,10 @@ mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#9737: incomplete exports incorrectly blocked complete Rust route inventories"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn incomplete_exports_and_partial_membership_keep_file_routes_available() {
         let unresolved = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -595,6 +1471,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn partial_file_routes_do_not_certify_negative_membership() {
         fn fixture(complete: bool) -> BuiltInlineTestProject {
             let project = InlineTestProject::with_language(Language::Rust)
@@ -716,8 +1596,8 @@ mod tests {
             assert_eq!(
                 keys(&memo),
                 (
-                    "KeyedPoolSafeMemo { keys: 0, .. }".into(),
-                    "KeyedPoolSafeMemo { keys: 0, .. }".into()
+                    "ReplayingStore(KeyedPoolSafeMemo { keys: 0, .. })".into(),
+                    "ReplayingStore(KeyedPoolSafeMemo { keys: 0, .. })".into()
                 )
             );
             let read = |capture: &AnalyzerQueryScope<'_>| {
@@ -747,8 +1627,8 @@ mod tests {
             assert_eq!(
                 keys(&memo),
                 (
-                    "KeyedPoolSafeMemo { keys: 1, .. }".into(),
-                    "KeyedPoolSafeMemo { keys: 1, .. }".into()
+                    "ReplayingStore(KeyedPoolSafeMemo { keys: 1, .. })".into(),
+                    "ReplayingStore(KeyedPoolSafeMemo { keys: 1, .. })".into()
                 )
             );
             // A hit replays the receipt: the consumer's scope sees the same
@@ -784,8 +1664,8 @@ mod tests {
         assert_eq!(
             keys(&second_memo),
             (
-                "KeyedPoolSafeMemo { keys: 0, .. }".into(),
-                "KeyedPoolSafeMemo { keys: 0, .. }".into()
+                "ReplayingStore(KeyedPoolSafeMemo { keys: 0, .. })".into(),
+                "ReplayingStore(KeyedPoolSafeMemo { keys: 0, .. })".into()
             ),
             "no answer crosses the request boundary"
         );
@@ -859,11 +1739,6 @@ mod tests {
             2,
             "the fill compares Main and overlay blobs"
         );
-        let memo = analyzer
-            .inner
-            .active_query_request_memo::<super::super::RustRouteRequestMemo>()
-            .expect("request route memo");
-        assert_eq!(memo.route_topology_kept.lock().unwrap().len(), 1);
         let second = analyzer
             .file_routes(&file, None)
             .expect("second overlay routes");
@@ -888,6 +1763,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn overlay_route_inventory_carries_mask_and_overlay_authority() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventoryOutcome;
         use brokk_bifrost_core::analyzer::project::OverlayProject;
@@ -1030,21 +1909,20 @@ mod tests {
         {
             let _reads = AnalyzerQueryScope::with_read_ledger(analyzer, ledger.clone());
             let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
-            // Use the existing production conversion, not a constructed StoreError:
-            // the route inventory fails at the same real active-operation guard.
+            // Exercise the production refusal at the active-operation guard.
             let result = analyzer.memoized_route_index(&memo, &|| true, || {
                 analyzer.with_selected_route_demands(None, |_| Ok(()))
             });
             assert!(matches!(result, Err(RustCargoRouteError::Unavailable)));
+            assert!(scope.store_error().is_none());
             let reasons = scope.captured_read_incompleteness();
             assert!(
                 reasons.iter().any(|reason| matches!(
                     reason,
-                    QueryReadIncomplete::StoreFailure(error)
-                        if error.to_string().contains("MissingOperationReadFrame")
-                        && reason.execution_cause() == Some(DerivationExecutionCause::Provider)
-                        && reason.label() == "store_failure"
-                    && reason.stable_replay_reason().is_none()
+                    QueryReadIncomplete::ProofStopped {
+                        reason: "RustRouteUnavailable",
+                        cause: Some(DerivationExecutionCause::Provider),
+                    }
                 )),
                 "{reasons:?}"
             );
@@ -1424,6 +2302,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12928: incomplete route readiness is a scoped provider stop, not a store failure"
+    )]
     fn incomplete_live_blob_is_not_filtered_out_of_route_readiness() {
         let fixture = readiness_fixture();
         let analyzer = RustAnalyzer::new(fixture.project_dyn());
@@ -1443,7 +2324,8 @@ mod tests {
                 analyzer.file_routes(&fixture.file("src/lib.rs"), Some(&|| true)),
                 Err(RustCargoRouteError::Unavailable)
             ));
-            assert!(scope.store_error().is_some());
+            assert!(scope.store_error().is_none());
+            assert!(scope.read_completion().is_err());
         }
         analyzer.warm_usage_facts();
         assert!(analyzer.rust_usage_facts_ready());
@@ -1591,11 +2473,13 @@ mod tests {
                 .expect("published Cargo routes");
             cold.store(false, std::sync::atomic::Ordering::Relaxed);
             let completion = fill.read_completion();
+            // The build records the unparseable member (StructureUnavailable,
+            // not replayable) and the route evidence gap it causes (a stable
+            // reason). Completion presents the canonical order, which puts the
+            // gap first; only the gap survives the memo hit, so it must be the
+            // representative of every pass.
             assert!(
-                matches!(
-                    completion,
-                    Err(QueryReadIncomplete::StructureUnavailable(_))
-                ),
+                matches!(completion, Err(QueryReadIncomplete::SemanticEvidenceGap(_))),
                 "pass {pass}: {completion:?}"
             );
         }
@@ -2054,6 +2938,9 @@ inline_only! { mod escaped_inline; }
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12928: incomplete route readiness is a scoped provider stop, not a store failure"
+    )]
     fn missing_canonical_routes_are_unavailable_and_retry_after_preparation() {
         let fixture = readiness_fixture();
         let analyzer = RustAnalyzer::new(fixture.project_dyn());
@@ -2069,7 +2956,8 @@ inline_only! { mod escaped_inline; }
                 analyzer.file_routes(&fixture.file("src/lib.rs"), None),
                 Err(RustCargoRouteError::Unavailable)
             ));
-            assert!(scope.store_error().is_some());
+            assert!(scope.store_error().is_none());
+            assert!(scope.read_completion().is_err());
         }
         assert_eq!(analyzer.module_route_fact_fallback_count_for_test(), 0);
         assert!(!analyzer.rust_usage_facts_ready());
@@ -2098,7 +2986,10 @@ inline_only! { mod escaped_inline; }
         let error = scope
             .store_error()
             .expect("route SQL error must reach the query boundary");
-        assert!(error.to_string().contains("Rust"), "{error}");
+        assert!(
+            error.to_string().contains("rust_published_fact_blobs"),
+            "{error}"
+        );
         assert_eq!(analyzer.module_route_fact_fallback_count_for_test(), 0);
     }
 

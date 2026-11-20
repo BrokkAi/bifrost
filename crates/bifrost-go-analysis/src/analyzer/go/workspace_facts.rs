@@ -50,7 +50,8 @@ pub(super) fn stable_completion(
                 QueryReadIncomplete::SemanticModelsPending
                 | QueryReadIncomplete::Cancelled
                 | QueryReadIncomplete::SemanticEvidenceUnavailable(_)
-                | QueryReadIncomplete::StoreFailure(_) => None,
+                | QueryReadIncomplete::StoreFailure(_)
+                | QueryReadIncomplete::InternalInvariant(_) => None,
                 QueryReadIncomplete::Attributed(_) => {
                     unreachable!("base cause cannot be attributed")
                 }
@@ -109,6 +110,18 @@ impl Default for GoMembershipMemo {
         }
     }
 }
+
+// Every read goes through the authority wrapper, which records the
+// certificate on hits and fills, so the memo is certifying by construction.
+impl brokk_bifrost_core::domain_memo::SelfCertifying for GoMembershipMemo {
+    fn retire(&self) {
+        self.answers.retire_with(|answers| {
+            let taken = std::mem::take(&mut *answers.lock().expect("Go membership memo poisoned"));
+            drop(taken);
+        });
+    }
+}
+brokk_bifrost_core::self_certifying_domain_memo!(GoMembershipMemo);
 
 /// What recording one domain's membership needs: the membership answer, and the
 /// environment part of that answer, if the domain has one.

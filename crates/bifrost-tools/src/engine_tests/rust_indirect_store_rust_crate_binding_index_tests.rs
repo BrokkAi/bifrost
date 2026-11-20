@@ -71,6 +71,10 @@ mod shared { use crate::private_first::*; use crate::a::*; pub fn probe(_: T) { 
         ),
     ];
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn snapshot(files: &[(&str, &str)], with_index: bool) -> Vec<String> {
         use crate::inline_project::InlineTestProject;
         let mut project = InlineTestProject::new();

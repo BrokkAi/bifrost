@@ -868,6 +868,10 @@ mod jvm_extraction_tests {
     /// check is not seen by the stage's later reads of the mount, but the graph
     /// build's `finish_native` still ends the request `Stale`.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_republication_during_a_crate_stage_still_ends_stale() {
         use brokk_bifrost_analysis::analyzer::store::resolution_authority::SelectedResolutionAuthority;
         let fixture = ResolutionOperationFixture::new();
@@ -916,6 +920,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_operation_memoizes_published_authority_identities_and_site_rows() {
         use brokk_bifrost_analysis::analyzer::store::resolution_authority::SelectedResolutionAuthority;
 
@@ -1041,6 +1049,10 @@ mod jvm_extraction_tests {
     /// stage's snapshot is renewed, and the reader leaves the stage outside any
     /// transaction.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_crate_stage_reads_one_snapshot_and_renews_it_around_a_publication() {
         let fixture = ResolutionOperationFixture::new();
         let cancellation = CancellationToken::default();
@@ -1509,6 +1521,10 @@ mod jvm_extraction_tests {
     use std::collections::HashSet;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn reverse_candidate_static_extension_preserves_groups_and_cleans_request_keys() {
         use brokk_bifrost_analysis::analyzer::resolution::{SharedNameId, SharedNameInterner};
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse_candidates::{

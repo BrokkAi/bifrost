@@ -320,6 +320,7 @@ pub enum GoDotImportContext {
 impl SelectedResolutionOperation<'_, '_> {
     /// Failure metadata is independent of whether package membership admits a file.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_domain_discovery_failure(
         &self,
         context_id: i64,
@@ -344,6 +345,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// These are discovery failures, even though Go returned partial JSON and
     /// the graph can still retain the callers' proven same-package edges.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_import_discovery_failures(
         &self,
         context_id: i64,
@@ -502,6 +504,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// The context helper fixes the same generation and revision used by the
     /// selected source-file view; this adds no second context inventory read.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_hierarchy_selection_coverage(
         &self,
         context_id: i64,
@@ -523,6 +526,7 @@ impl SelectedResolutionOperation<'_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_go_context_selection(
         &self,
         context_id: i64,
@@ -567,6 +571,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn go_dot_import_context_for_selection(
         &self,
         context_id: i64,
@@ -751,6 +756,7 @@ impl SelectedResolutionOperation<'_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_root_import_terminal_targets(
         &self,
         blob_id: i64,
@@ -777,6 +783,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Read the exact selected package, including a ForTest instance whose
     /// ordinary Go files also occur in the normal package. Source role alone
     /// cannot choose the inventory of an imported package.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn go_package_inventory_for_selected_package(
         &self,
         context_id: i64,
@@ -1029,6 +1036,7 @@ impl super::super::resolution_typed::GoDefinitionContextBinder
 
     // The caller has already selected this request's base profile. Candidate
     // declarations can belong to other domains under that same profile.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn bind_context(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
@@ -1223,6 +1231,7 @@ impl<'store, 'input> RootImportRules for GoDotImportRules<'_, 'store, 'input> {
         }))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn targets(&self, prepared: &Self::Prepared) -> Result<impl Iterator<Item = Self::Target>> {
         let connection = self.operation.ready.inventory.connection();
         let mut statement = connection.prepare_cached(&DOT_IMPORT_TARGET_MOUNTS)?;

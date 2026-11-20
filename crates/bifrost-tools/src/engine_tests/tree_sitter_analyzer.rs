@@ -1152,6 +1152,12 @@ mod tests {
             self.delegate.root()
         }
 
+        // A hand-written project names its effective ignore rules; this one
+        // has none of its own, so it states the delegate's.
+        fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+            self.delegate.ignore_rules_digest()
+        }
+
         fn analyzer_languages(&self) -> BTreeSet<Language> {
             self.delegate.analyzer_languages()
         }
@@ -1261,6 +1267,12 @@ mod tests {
     impl Project for ConfigurationCaptureFailureProject {
         fn root(&self) -> &Path {
             self.delegate.root()
+        }
+
+        // A hand-written project names its effective ignore rules; this one
+        // has none of its own, so it states the delegate's.
+        fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+            self.delegate.ignore_rules_digest()
         }
 
         fn analyzer_languages(&self) -> BTreeSet<Language> {
@@ -3039,6 +3051,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn prepared_source_above_batch_targets_publishes_queryable_facts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -5928,6 +5944,9 @@ mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "e087290f89ff: concurrent C++ inverse batches contended by deep-copying file-state snapshots"
     )]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10979: an empty Rust analyzer lacked the IR epoch for its first overlay publication"
+    )]
     #[test]
     fn bulk_file_state_snapshot_reuses_and_resets_across_query_scopes() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -5951,9 +5970,12 @@ mod tests {
             .expect("overlay OID");
         let key = TreeSitterAnalyzer::<RustAdapter>::transient_cache_key(oid, &file);
         let snapshot_guard = analyzer.query_file_state_snapshot.load();
-        let snapshot = snapshot_guard
-            .as_ref()
-            .expect("bulk hydration should publish a file-state snapshot");
+        let snapshot = snapshot_guard.as_ref().unwrap_or_else(|| {
+            panic!(
+                "bulk hydration should publish a file-state snapshot: {:?}",
+                first.read_completion()
+            )
+        });
         let query_budget = {
             let cache = analyzer.query_read_cache_lock();
             cache
@@ -8619,5 +8641,291 @@ mod tests {
             parse_threads <= width,
             "{parse_threads} parse threads for a pool of {width}"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn filtered_inventory_requires_both_header_readings() {
+        use brokk_bifrost_analysis::analyzer::store::BlobKey;
+        use brokk_bifrost_core::gitblob::ParseVariant;
+        let source = "struct Outer { struct Inner { int value; } member; };\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file("common.h", source)
+            .file("one.c", "#include \"common.h\"\n")
+            .file("two.cpp", "#include \"common.h\"\n")
+            .build();
+        let file = fixture.file("common.h");
+        let cpp =
+            brokk_bifrost_cpp_analysis::analyzer::cpp::CppAnalyzer::new(fixture.project_dyn());
+        let analyzer = cpp.inner();
+        let snapshots = analyzer.relational_workspace_snapshots.load_full();
+        let conn = analyzer
+            .store_context
+            .store
+            .read_conn_for_workspace(&snapshots)
+            .unwrap();
+        let selected: usize = conn
+            .query_row(
+                "SELECT count(*) FROM workspace_files WHERE lang='cpp:c' AND rel_path='common.h'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selected, 1, "fixture must select the alternate reading");
+        drop(conn);
+        let key = BlobKey {
+            oid: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap(),
+            lang: "cpp:c".into(),
+            variant: ParseVariant::Empty,
+        };
+        assert!(
+            analyzer
+                .store_context
+                .store
+                .contains_parsed_blob(&key)
+                .unwrap(),
+            "fixture must publish the differing C reading"
+        );
+        assert!(
+            analyzer
+                .declarations_for_files_answer(std::slice::from_ref(&file))
+                .into_inventory_result()
+                .is_ok()
+        );
+        // A cached primary FileState must never shadow the mounted C reading.
+        assert!(!analyzer.get_declarations(&file).is_empty());
+        let expected = analyzer
+            .all_declarations()
+            .filter(|unit| unit.source() == &file)
+            .collect::<Vec<_>>();
+        let actual = analyzer
+            .declarations_for_files_answer(std::slice::from_ref(&file))
+            .into_inventory_result()
+            .unwrap();
+        assert_eq!(expected, actual);
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(&key);
+        assert!(
+            analyzer
+                .declarations_for_files_answer(&[file])
+                .into_inventory_result()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn filtered_inventory_requires_a_selected_publication() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("Model.java", "class Model { void work() {} }\n")
+            .build();
+        let file = fixture.file("Model.java");
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+        assert!(
+            !analyzer
+                .declarations_for_files_answer(std::slice::from_ref(&file))
+                .into_inventory_result()
+                .unwrap()
+                .is_empty()
+        );
+        // The content-addressed blob stays complete, but this reader no longer
+        // has a selected workspace publication mounting it.
+        analyzer
+            .relational_workspace_snapshots
+            .store(Arc::new(Default::default()));
+        assert!(
+            analyzer
+                .declarations_for_files_answer(&[file])
+                .into_inventory_result()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn requested_declaration_work_is_independent_of_workspace_size() {
+        for unrequested in [1, 64] {
+            let mut builder =
+                crate::inline_project::InlineTestProject::with_language(Language::Java)
+                    .file("Model.java", "class Model { void work() {} }\n");
+            for n in 0..unrequested {
+                builder = builder.file(
+                    format!("Other{n}.java"),
+                    format!("class Other{n} {{ void unrelated() {{}} }}\n"),
+                );
+            }
+            let fixture = builder.build();
+            let file = fixture.file("Model.java");
+            let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+            assert_eq!(
+                analyzer
+                    .indexed_live_snapshot
+                    .identity_render_count_for_test(),
+                0,
+                "healthy snapshot construction must not render identity keys"
+            );
+            analyzer.reset_full_declaration_scan_count_for_test();
+            analyzer.reset_full_hydration_count_for_test();
+            analyzer
+                .store_context
+                .store
+                .take_parsed_blob_membership_keys_for_test();
+            analyzer
+                .indexed_live_snapshot
+                .take_path_inspections_for_test();
+            let actual = analyzer
+                .declarations_for_files_answer(&[file])
+                .into_inventory_result()
+                .unwrap();
+            assert_eq!(
+                analyzer
+                    .indexed_live_snapshot
+                    .take_path_inspections_for_test(),
+                1
+            );
+            assert_eq!(
+                analyzer
+                    .indexed_live_snapshot
+                    .identity_render_count_for_test(),
+                0,
+                "healthy selected reads must not render unrelated identity keys"
+            );
+            assert_eq!(actual.len(), 2);
+            assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+            assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+            assert_eq!(
+                analyzer
+                    .store_context
+                    .store
+                    .take_parsed_blob_membership_keys_for_test(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn requested_declaration_work_for_path_modules_is_independent_of_copies() {
+        use brokk_bifrost_js_ts_analysis::analyzer::typescript::TypescriptAdapter;
+        let source =
+            "import { value } from './provider'; export function run() { return value; }\n";
+        for copies in [1, 64] {
+            let mut builder =
+                crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
+                    .file("target.ts", source);
+            for n in 0..copies {
+                builder = builder.file(format!("copy{n}.ts"), source);
+            }
+            let fixture = builder.build();
+            let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), TypescriptAdapter);
+            analyzer.reset_full_declaration_scan_count_for_test();
+            analyzer.reset_workspace_path_scan_count_for_test();
+            analyzer
+                .store_context
+                .store
+                .take_selected_path_symbol_rows_read_for_test();
+            let units = analyzer
+                .declarations_for_files_answer(&[fixture.file("target.ts")])
+                .into_inventory_result()
+                .unwrap();
+            assert!(units.iter().any(|unit| unit.is_module()));
+            assert_eq!(
+                analyzer
+                    .store_context
+                    .store
+                    .take_selected_path_symbol_rows_read_for_test(),
+                1
+            );
+            assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+            assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
+        }
+    }
+
+    #[test]
+    fn filtered_inventory_failure_is_scoped_to_requested_publications() {
+        use brokk_bifrost_analysis::analyzer::store::BlobKey;
+        use brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome;
+        use brokk_bifrost_core::gitblob::ParseVariant;
+        let source = "class Model { void work() {} }\n";
+        let unrelated = "class Other { void ignored() {} }\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("Model.java", source)
+            .file("Other.java", unrelated)
+            .build();
+        let file = fixture.file("Model.java");
+        let other = fixture.file("Other.java");
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+        let key = BlobKey {
+            oid: git2::Oid::hash_object(git2::ObjectType::Blob, unrelated.as_bytes()).unwrap(),
+            lang: "java".into(),
+            variant: ParseVariant::Empty,
+        };
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(&key);
+        assert!(matches!(
+            analyzer.declarations_for_files_answer(std::slice::from_ref(&file)),
+            LookupOutcome::Found(_)
+        ));
+        assert!(matches!(
+            analyzer.declarations_for_files_answer(&[other]),
+            LookupOutcome::Incomplete(_)
+        ));
+        assert!(matches!(
+            analyzer.declarations_for_files_answer(&[file, fixture.file("Other.java")]),
+            LookupOutcome::Incomplete(_)
+        ));
+    }
+
+    #[test]
+    fn requested_path_modules_apply_the_full_inventory_stale_file_gate() {
+        use brokk_bifrost_analysis::analyzer::store::liveness::{LivePathEntry, LivePathMap};
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "target.ts",
+                "import { value } from './provider'; export function run() { return value; }\n",
+            )
+            .file("provider.ts", "export const value = 1;\n")
+            .build();
+        let file = fixture.file("target.ts");
+        let mut analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), TypescriptAdapter);
+        // Stat-validated identities, so an out-of-band edit stales the indexed module.
+        let indexed = analyzer.live_snapshot();
+        let map = LivePathMap::default();
+        map.replace_all(indexed.all_paths().map(|path| {
+            LivePathEntry::filesystem(path.clone(), indexed.oid_for_path(path).unwrap())
+        }));
+        analyzer.store_context.live_paths = Arc::new(map);
+        let module_of_file = |units: &[CodeUnit]| {
+            units
+                .iter()
+                .any(|unit| unit.is_module() && unit.source() == &file)
+        };
+        let requested = || {
+            let mut units = analyzer
+                .declarations_for_files_answer(std::slice::from_ref(&file))
+                .into_inventory_result()
+                .unwrap();
+            units.sort();
+            units
+        };
+        assert!(
+            module_of_file(&requested()),
+            "fixture must publish a path module"
+        );
+        file.write("export function changed() {}\n").unwrap();
+        let mut full = analyzer
+            .all_declarations()
+            .filter(|unit| unit.source() == &file)
+            .collect::<Vec<_>>();
+        full.sort();
+        assert!(
+            !module_of_file(&full),
+            "the full inventory gates the stale module"
+        );
+        assert_eq!(full, requested());
     }
 }

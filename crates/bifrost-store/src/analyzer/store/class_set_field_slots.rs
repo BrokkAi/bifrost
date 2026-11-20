@@ -726,6 +726,7 @@ impl AnalyzerStore {
         Ok(())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_field_slot_index(
         &self,
         key: &ClassSetFieldSlotIndexKey,
@@ -1638,6 +1639,10 @@ mod tests {
         reconstruct(value).unwrap()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn table_counts(store: &AnalyzerStore) -> [i64; 5] {
         let conn = store.read_conn().unwrap();
         [

@@ -178,9 +178,11 @@ fn raw_open(root: &Path, flags: OpenFlags) -> Result<Connection, CatalogError> {
     // through the canonical root (macOS temp roots sit under /var ->
     // /private/var). The database file itself still must not be a link.
     let root = storage::open_read_only_root(root)?;
-    let connection =
-        Connection::open_with_flags(root.join(DB), flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-            .map_err(|e| CatalogError::sqlite("open catalog upgrade snapshot", e))?;
+    let connection = brokk_bifrost_core::cache_db::open_owned_sqlite(
+        &root.join(DB),
+        flags | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|e| CatalogError::sqlite("open catalog upgrade snapshot", e))?;
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(|e| CatalogError::sqlite("configure catalog upgrade timeout", e))?;
@@ -598,8 +600,9 @@ fn snapshot_once(source: &Path, target: &Path) -> Result<SnapshotAttempt, Snapsh
     let _: i64 = transaction
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| predecessor_failure(CatalogError::sqlite("read predecessor version", e)))?;
-    let mut destination = Connection::open(target.join(DB))
-        .map_err(|e| CatalogError::sqlite("create catalog snapshot", e))?;
+    let mut destination =
+        brokk_bifrost_core::cache_db::open_owned_sqlite(&target.join(DB), OpenFlags::default())
+            .map_err(|e| CatalogError::sqlite("create catalog snapshot", e))?;
     {
         let backup = rusqlite::backup::Backup::new(&transaction, &mut destination)
             .map_err(|e| predecessor_failure(CatalogError::sqlite("start catalog snapshot", e)))?;
@@ -938,7 +941,7 @@ mod tests {
         // The v30 change only adds validation census columns. Recreate the
         // actual v29 shape, so ordered migration 30 must run on the copy.
         let db = Connection::open(root.join(DB)).unwrap();
-        db.execute_batch("DROP TABLE catalog_shard_validations; CREATE TABLE catalog_shard_validations(manifest_digest TEXT NOT NULL, shard_id TEXT NOT NULL, validation_version INTEGER NOT NULL, limits_sha256 TEXT NOT NULL, PRIMARY KEY(manifest_digest,shard_id,validation_version,limits_sha256)) WITHOUT ROWID; PRAGMA user_version=29;").unwrap();
+        db.execute_batch("DROP TABLE catalog_production_inputs; DROP INDEX catalog_selectors_production_input; ALTER TABLE catalog_selectors DROP COLUMN production_input_digest; DROP TABLE catalog_shard_validations; CREATE TABLE catalog_shard_validations(manifest_digest TEXT NOT NULL, shard_id TEXT NOT NULL, validation_version INTEGER NOT NULL, limits_sha256 TEXT NOT NULL, PRIMARY KEY(manifest_digest,shard_id,validation_version,limits_sha256)) WITHOUT ROWID; PRAGMA user_version=29;").unwrap();
         drop(db);
         root
     }
@@ -1618,7 +1621,7 @@ mod tests {
     }
     #[test]
     #[hardwon("#12422: migration removed generated sources for pinned or active packs")]
-    fn protected_generated_packs_keep_selectable_sources_and_cache_bindings() {
+    fn protected_historical_generated_packs_keep_sources_but_require_regeneration() {
         for protection in ["pin", "activation"] {
             let parent = tempfile::tempdir().unwrap();
             let source = seed(parent.path());
@@ -1670,32 +1673,38 @@ mod tests {
             let target = parent.path().join("semantic-pack-catalog.v30");
             let catalog = open(&target, 30, CatalogOptions::default()).unwrap();
             let candidates = catalog
-                .candidates(&SemanticPackSelectorQuery {
-                    language: "java".into(),
-                    ecosystem: "maven".into(),
-                    package: Some(CatalogCoordinate {
-                        name: "com.acme:widget".into(),
-                        version: Some("1.2.0".parse().unwrap()),
-                    }),
-                    module: None,
-                    toolchain: Some(CatalogCoordinate {
-                        name: "jdk".into(),
-                        version: Some("17.0.0".parse().unwrap()),
-                    }),
-                    target: Some("jvm".into()),
-                    configuration: Some("release".into()),
-                    artifact_sha256: None,
-                    bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
-                })
+                .activation_candidates_bounded(
+                    &SemanticPackSelectorQuery {
+                        verified_raw_artifacts: Vec::new(),
+                        production_input_digest: None,
+                        language: "java".into(),
+                        ecosystem: "maven".into(),
+                        package: Some(CatalogCoordinate {
+                            name: "com.acme:widget".into(),
+                            version: Some("1.2.0".parse().unwrap()),
+                        }),
+                        module: None,
+                        toolchain: Some(CatalogCoordinate {
+                            name: "jdk".into(),
+                            version: Some("17.0.0".parse().unwrap()),
+                        }),
+                        target: Some("jvm".into()),
+                        configuration: Some("release".into()),
+                        artifact_sha256: None,
+                        bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                    },
+                    usize::MAX,
+                )
                 .unwrap();
-            assert_eq!(
-                candidates.len(),
-                1,
-                "{protection}: protected generated source remains selectable"
+            assert!(
+                candidates.1.iter().any(|(_, reason)| matches!(
+                    reason,
+                    CatalogError::StaleGeneratedSelector { .. }
+                )),
+                "historical selectors are refused until regeneration"
             );
-            catalog.load_decoded_for_test(&candidates[0]).unwrap();
             assert_installed(&catalog);
-            assert!(catalog.generated_production(&key).unwrap().is_some());
+            assert!(catalog.generated_production(&key).unwrap().is_none());
             let db = catalog.connection.lock().unwrap();
             for table in [
                 "catalog_generated_productions",

@@ -31,43 +31,7 @@ pub(crate) fn publish_implicit_supertype(
             "invalid implicit superclass route for {language:?}: {route:?}"
         );
     }
-    assert_eq!(
-        facts.sites[reference.index()].kind,
-        ResolutionSiteKind::SyntheticReference
-    );
-    facts.identifiers.push(PositionedIdentifierFact {
-        site: reference,
-        name,
-        role: ResolutionIdentifierRole::Reference,
-        namespace: ResolutionNamespace::Type,
-        qualifier: None,
-    });
-    facts.reference_owners.push(ResolutionReferenceOwnerFact {
-        reference,
-        owner: Some(subtype),
-    });
-    let slot = facts.allocate_type_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
-    facts.binding_projections.push(BindingProjectionFact {
-        reference,
-        output: slot,
-        kind: BindingProjectionKind::TargetTypeIdentity,
-    });
-    facts.root_references.push(ResolutionRootReferenceFact {
-        reference,
-        root_scope: facts.scopes[0].id,
-        anchor: ResolutionRootImportAnchor::Absolute,
-        prefix_reference: None,
-        owner_continued: false,
-    });
-    facts
-        .root_reference_segments
-        .extend(prefix.iter().enumerate().map(|(position, &name)| {
-            ResolutionRootReferenceSegmentFact {
-                reference,
-                position: u32::try_from(position).expect("implicit superclass route fits u32"),
-                name,
-            }
-        }));
+    let slot = publish_absolute_synthetic_type_reference(facts, subtype, reference, name, prefix);
     for parent in facts
         .supertypes
         .iter_mut()

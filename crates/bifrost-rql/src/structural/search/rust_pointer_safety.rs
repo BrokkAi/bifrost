@@ -471,10 +471,12 @@ fn modeled_vec_pointer_facts(
     facts
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn analyze(
     workspace: &WorkspaceAnalyzer,
     root: &crate::analyzer::semantic::ProcedureHandle,
     active_models: Option<std::sync::Arc<ActiveSemanticModelSnapshot>>,
+    _guards: Option<&brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::CompiledGuardBindings>,
     semantic_budget: &mut SemanticBudget,
     solver_work: brokk_bifrost_flow::dataflow::SolverWork,
     max_source_bytes: usize,

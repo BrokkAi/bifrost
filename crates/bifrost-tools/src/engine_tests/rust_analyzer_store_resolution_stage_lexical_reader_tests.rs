@@ -31,6 +31,10 @@ mod rust_departing_root_tests {
 
     use rusqlite::params;
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn prefix_spellings_use_the_path_producer_recipe_and_both_selected_hosts() {
         use brokk_bifrost_analysis::analyzer::resolution::local_identity::ResolutionLookupSemanticRecipe;
 

@@ -834,7 +834,7 @@ mod tests {
     fn an_unresolved_definition_keeps_its_status_and_diagnostics() {
         for (status, kind) in [
             (
-                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ResolutionRounds),
                 "exceeded_budget",
             ),
             (DefinitionLookupStatus::Cancelled, "cancelled"),

@@ -357,6 +357,10 @@ use std::path::Path;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn persisted_rust_authority_batch_order_is_request_order_independent() {
         use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
 
@@ -428,6 +432,10 @@ use std::path::Path;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn persisted_node_authority_follows_semantic_site_bridge_and_property() {
         let fixture = RustRootResolutionOperationFixture::new();
         let cancellation = CancellationToken::default();
@@ -713,6 +721,10 @@ use std::path::Path;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn persisted_contract_reference_keeps_exact_trait_member_association() {
         use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
         use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;

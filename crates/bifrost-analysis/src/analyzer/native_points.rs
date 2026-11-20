@@ -444,6 +444,15 @@ impl NativePointValue {
     }
 }
 
+/// Preserve typed resolution invalidation at every native error boundary.
+pub(crate) fn native_store_error_kind(error: &crate::analyzer::store::StoreError) -> &'static str {
+    if error.is_stale_resolution() {
+        "native_stale"
+    } else {
+        "native_store_error"
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn operational_point_failure(kind: &str) -> bool {
     matches!(
@@ -652,6 +661,56 @@ pub fn selected_analyzer_services_for_test(
     crate::analyzer::selected_services::AnalyzerSelectedServices(analyzer)
 }
 
+/// Refuse the next selected receiver-proof capture through the analyzer's
+/// real scoped read ledger while running the supplied operation.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_selected_receiver_proof_capture_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    crate::analyzer::selected_services::with_unpublishable_selected_receiver_proof_capture_for_test(
+        run,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_selected_receiver_proof_capture_after_for_test<T>(
+    successful_captures: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    crate::analyzer::selected_services::with_unpublishable_selected_receiver_proof_capture_after_for_test(
+        successful_captures,
+        run,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_current_instance_receiver_proof_capture_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    crate::analyzer::selected_services::with_unpublishable_current_instance_receiver_proof_capture_for_test(run)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_owner_application_proof_replay_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    crate::analyzer::selected_services::with_unpublishable_owner_application_proof_replay_for_test(
+        run,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_current_instance_receiver_proof_replay_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    crate::analyzer::selected_services::with_unpublishable_current_instance_receiver_proof_replay_for_test(run)
+}
+
 /// Borrow the same engine service dispatch used by native point queries.
 #[doc(hidden)]
 pub fn selected_analyzer_services(
@@ -794,12 +853,7 @@ pub fn native_point_operation_inputs<A: LanguageAdapter>(
     ) {
         let storage_languages = ["java", "kotlin", "scala"].map(str::to_owned);
         let snapshots = std::sync::Arc::new(
-            inner
-                .analyzer_store()
-                .workspace_snapshots_for_current_languages(
-                    inner.workspace_id(),
-                    &storage_languages,
-                )?,
+            inner.selected_workspace_snapshots_for_current_languages(&storage_languages)?,
         );
         let languages = [
             ("java", Language::Java),
@@ -1408,7 +1462,7 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
     };
     match attempt() {
         Ok(result) => result,
-        Err(error) => unavailable("native_store_error", error.to_string()),
+        Err(error) => unavailable(native_store_error_kind(&error), error.to_string()),
     }
 }
 
@@ -3131,53 +3185,12 @@ fn render_projected_type_shape(
 #[doc(hidden)]
 pub fn render_type_shape_with(
     shape: &FactProjectedTypeShape,
-    mut render: impl FnMut(
+    render: impl FnMut(
         &crate::analyzer::resolution::FactProjectedTypeNode,
         &std::collections::HashMap<crate::analyzer::resolution::SemanticId, String>,
     ) -> Option<String>,
 ) -> Option<String> {
-    use crate::analyzer::resolution::SemanticId;
-    let nodes = shape
-        .nodes()
-        .iter()
-        .map(|node| (node.slot(), node))
-        .collect::<std::collections::HashMap<SemanticId, _>>();
-    let mut rendered = std::collections::HashMap::<SemanticId, String>::new();
-    let mut active = std::collections::HashSet::new();
-    let mut pending = vec![(shape.root_slot(), false)];
-    while let Some((slot, finish)) = pending.pop() {
-        let node = nodes.get(&slot)?;
-        if !finish {
-            if rendered.contains_key(&slot) {
-                continue;
-            }
-            if !active.insert(slot) {
-                return None;
-            }
-            pending.push((slot, true));
-            match node.form() {
-                FactProjectedTypeNodeForm::Alias(child)
-                | FactProjectedTypeNodeForm::Slice(child)
-                | FactProjectedTypeNodeForm::Array(child) => pending.push((*child, false)),
-                FactProjectedTypeNodeForm::Map { key, value } => {
-                    pending.push((*value, false));
-                    pending.push((*key, false));
-                }
-                FactProjectedTypeNodeForm::Applied(arguments) => {
-                    pending.extend(arguments.iter().rev().map(|argument| (*argument, false)));
-                }
-                FactProjectedTypeNodeForm::Leaf
-                | FactProjectedTypeNodeForm::Channel { .. }
-                | FactProjectedTypeNodeForm::Unsupported => {}
-            }
-            continue;
-        }
-
-        let spelling = render(node, &rendered)?;
-        rendered.insert(slot, spelling);
-        active.remove(&slot);
-    }
-    rendered.remove(&shape.root_slot())
+    crate::analyzer::resolution::fact_resolution::fold_projected_type_shape_with(shape, render)
 }
 
 /// Caller-visible native type evidence for the private differential harness.

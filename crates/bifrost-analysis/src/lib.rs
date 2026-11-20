@@ -352,6 +352,10 @@ pub mod native_resolution_test_support {
 
     /// [`with_python_native_operation`] for an action that returns its reuse
     /// verdict, which joins the operation's capture.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn with_python_native_operation_judged<T>(
         publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
         project: &dyn crate::analyzer::Project,

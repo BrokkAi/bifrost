@@ -5,13 +5,12 @@ mod common;
 
 use brokk_bifrost_analysis::Language;
 use brokk_bifrost_analysis::path_normalization::NormalizePath;
-use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-};
+use brokk_bifrost_mcp::benchmark_api::MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use brokk_bifrost_test_macros::hardwon;
 use common::InlineTestProject;
-use common::mcp_wire::{DrainedStderr, read_line, round_trip_json_line as round_trip, write_line};
+use common::mcp_server::FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS;
+use common::mcp_wire::{DrainedStderr, read_line, round_trip_when_ready as round_trip, write_line};
 use git2::{IndexAddOption, Repository, Signature};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -147,10 +146,13 @@ fn run_pack_activation_policy(
     project: &common::BuiltInlineTestProject,
     java_home: &std::path::Path,
 ) -> (Value, Value, Value) {
-    let mut child = mcp_server_command(project.root(), "searchtools", &[])
-        .env("JAVA_HOME", java_home)
-        .spawn()
-        .expect("spawn pack activation MCP server");
+    let mut command = mcp_server_command(project.root(), "searchtools", &[]);
+    command.env("JAVA_HOME", java_home);
+    run_pack_activation_policy_with(command)
+}
+
+fn run_pack_activation_policy_with(mut command: Command) -> (Value, Value, Value) {
+    let mut child = command.spawn().expect("spawn pack activation MCP server");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
@@ -236,6 +238,76 @@ fn pack_activation_project(ecosystems: &str, install_pack: bool) -> common::Buil
         install_pack_activation_fixture(project.root());
     }
     project
+}
+
+/// A server whose only way to a JDK is a `java` launcher on its PATH. The fake
+/// home is `jdk_home`; `java_home` is what the server sees in JAVA_HOME
+/// (`None` removes it).
+fn server_with_java_on_path(
+    root: &std::path::Path,
+    jdk_home: &std::path::Path,
+    java_home: Option<&str>,
+) -> Command {
+    let launcher_dir = jdk_home.join("bin");
+    fs::create_dir_all(&launcher_dir).expect("fake JDK bin directory");
+    let launcher = launcher_dir.join(if cfg!(windows) { "java.exe" } else { "java" });
+    fs::write(&launcher, b"launcher").expect("fake java launcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+            .expect("make the fake launcher executable");
+    }
+    let path = std::env::join_paths(std::iter::once(launcher_dir).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH with the fake launcher first");
+    let mut command = mcp_server_command(root, "searchtools", &[]);
+    command.env("PATH", path);
+    match java_home {
+        Some(value) => command.env("JAVA_HOME", value),
+        None => command.env_remove("JAVA_HOME"),
+    };
+    command
+}
+
+#[test]
+#[hardwon("#13266: a JDK reachable only as java on PATH left the JVM packs unavailable")]
+fn mcp_bound_policy_finds_the_jdk_from_java_on_path_only_when_java_home_is_unset() {
+    let homes = TempDir::new().expect("fake JDK home root");
+    let jdk21 = fake_jdk_home(homes.path(), "21.0.2");
+
+    let unset = pack_activation_project(r#"["jvm"]"#, true);
+    let command = server_with_java_on_path(unset.root(), &jdk21, None);
+    let (_, _, unset_run) = run_pack_activation_policy_with(command);
+    assert_eq!(unset_run["exit_status"], 0, "{unset_run:#}");
+    assert_eq!(
+        unset_run["report"]["runs"][0]["completion"]["type"], "complete",
+        "{unset_run:#}"
+    );
+    assert_eq!(
+        unset_run["report"]["packs"]["complete"], true,
+        "{unset_run:#}"
+    );
+
+    // A set but empty JAVA_HOME is the opt-out: PATH is not consulted.
+    let empty = pack_activation_project(r#"["jvm"]"#, true);
+    let command = server_with_java_on_path(empty.root(), &jdk21, Some(""));
+    let (_, _, empty_run) = run_pack_activation_policy_with(command);
+    // The missing JDK is Bifrost's own inconclusive verdict, advisory (#8111).
+    assert_eq!(empty_run["exit_status"], 0, "{empty_run:#}");
+    assert_eq!(
+        empty_run["report"]["runs"][0]["completion"]["type"], "inconclusive",
+        "{empty_run:#}"
+    );
+    assert!(
+        empty_run["report"]["packs"]["decisions"]
+            .as_array()
+            .expect("empty JAVA_HOME decisions")
+            .iter()
+            .any(|decision| decision["pack"] == "jdk.home.unavailable"),
+        "{empty_run:#}"
+    );
 }
 
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
@@ -561,12 +633,12 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "blast_radius",
             "cyclomatic_complexity",
             "missing_tests",
-            "relation_brief",
             "score_diff",
             "query_code",
             "list_policies",
             "run_policy",
             "explain_policy",
+            "flow_query",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "most_relevant_files",
@@ -1376,6 +1448,175 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[test]
+#[hardwon("#13216: long MCP flow runs reported no progress")]
+fn run_policy_progress_names_flow_phases() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "App.java",
+            include_str!("fixtures/policy-flow-progress/App.java"),
+        )
+        .file(
+            "policy.rqlp",
+            include_str!("fixtures/policy-flow-progress/policy.rqlp"),
+        )
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    // A cold server answers a workspace-dependent call at once with
+    // `workspace_not_ready` (#13391). `round_trip` retries readiness probes
+    // until the analyzer is ready or its build failed, so wait for it first.
+    let probe = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_active_workspace", "arguments": {}}}),
+    );
+    assert_eq!(
+        probe["result"]["structuredContent"]["analyzer_ready"], true,
+        "{probe}"
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {"policy_files": ["policy.rqlp"], "evaluation_date": "2026-11-15"},
+                "_meta": {"progressToken": "flow-progress"}
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_progress_is_monotonic(&progress);
+    assert!(
+        progress
+            .iter()
+            .all(|p| p["progressToken"] == "flow-progress"),
+        "{progress:?}"
+    );
+    let phases = progress
+        .iter()
+        .filter_map(|p| p["message"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases
+            .iter()
+            .filter(|phase| **phase == "discovering value flow for test.flow-progress")
+            .count(),
+        1,
+        "one discovery phase covers every root: {progress:?}"
+    );
+    let mut next = 0;
+    for expected in [
+        "preparing 1 flow policies",
+        "compiling flow policy test.flow-progress",
+        "binding observation endpoints of test.flow-progress",
+        "binding origin endpoints of test.flow-progress",
+        "discovering value flow for test.flow-progress",
+        "planning flow batches",
+        "seeding flow store channels",
+        "solving flow batch 1 of 1 (1 policies)",
+        "projecting flow witnesses and findings",
+        "assembling the policy report",
+    ] {
+        let offset = phases[next..]
+            .iter()
+            .position(|phase| *phase == expected)
+            .unwrap_or_else(|| panic!("missing ordered phase {expected:?}: {progress:?}"));
+        next += offset + 1;
+    }
+    child.kill().expect("stop server");
+    child.wait().expect("reap server");
+}
+
+#[test]
+#[hardwon("#13215: inconclusive flow runs were labeled clean and unresolved empty roles passed")]
+fn bifrost_mcp_run_policy_distinguishes_inconclusive_and_unresolved_roles() {
+    // Keep this test self-contained: the public MCP test cannot embed the
+    // private flow-evidence fixtures. These mirror the unresolved- and
+    // absent-origin golden policies so the three verdicts stay covered here.
+    const GAP: &str = r#"(policy :schema-version 1 :id "test.zero-partial" :name "Zero partial" :message "flow" :severity warning
+ :analysis (analysis :type flow :mode may :call-modeling (call-modeling :unmodeled paranoid)
+ :origins (endpoint-set :entries [(origin :id input :display-name "unresolved missing" :selector (rql :schema-version 1 (language java (call-bindings (call-shape (call :callee (name "missing")))))) :bind return-value)])
+ :observations (endpoint-set :entries [(observation :id output :display-name "sink" :selector (rql :schema-version 1 (language java (call :callee (name "sink")))) :observed-operand (argument :index 0))])))
+"#;
+    const CONTROL: &str = r#"(policy :schema-version 1 :id "test.zero-partial" :name "Zero partial" :message "flow" :severity warning
+ :analysis (analysis :type flow :mode may :call-modeling (call-modeling :unmodeled paranoid)
+ :origins (endpoint-set :entries [(origin :id input :display-name "unresolved missing" :selector (rql :schema-version 1 (language java (call-bindings (call-shape (call :callee (name "absent")))))) :bind return-value)])
+ :observations (endpoint-set :entries [(observation :id output :display-name "sink" :selector (rql :schema-version 1 (language java (call :callee (name "sink")))) :observed-operand (argument :index 0))])))
+"#;
+    let mixed = GAP.replace(
+        "(call-bindings (call-shape (call :callee (name \"missing\"))))",
+        "(union (call :callee (name \"source\")) (call-bindings (call-shape (call :callee (name \"missing\")))))",
+    );
+    assert_ne!(mixed, GAP);
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", "class App { static Object source() { return null; } static void sink(Object x) {} void run(Unknown receiver) { source(); sink(receiver.missing()); } }")
+        .file("gap.rqlp", GAP)
+        .file("control.rqlp", CONTROL)
+        .file("mixed.rqlp", &mixed)
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    for (index, (policy, status, exit, completion, sources)) in [
+        ("gap.rqlp", "unreliable", 2, "failed", 0),
+        ("control.rqlp", "clean", 0, "complete", 0),
+        ("mixed.rqlp", "inconclusive", 0, "inconclusive", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({
+                "jsonrpc": "2.0", "id": index + 1, "method": "tools/call",
+                "params": { "name": "run_policy", "arguments": {
+                    "policy_files": [policy], "evaluation_date": "2026-11-15"
+                }}
+            }),
+        );
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result = &response["result"]["structuredContent"];
+        assert_eq!(result["status"], status, "{result}");
+        assert_eq!(result["exit_status"], exit, "{result}");
+        let run = &result["report"]["runs"][0];
+        assert_eq!(run["completion"]["type"], completion, "{run}");
+        if completion == "failed" {
+            assert_eq!(
+                run["completion"]["reasons"],
+                json!(["endpoint_role_unresolved"])
+            );
+        }
+        let metrics = run["work"]["metrics"].as_array().expect("metrics");
+        for (name, count) in [
+            ("taint.compiled_source_endpoints", sources),
+            ("taint.compiled_sink_endpoints", 1),
+        ] {
+            assert_eq!(
+                metrics
+                    .iter()
+                    .find(|m| m["name"] == name)
+                    .expect("endpoint metric")["value"],
+                count,
+                "{run}"
+            );
+        }
+    }
+    child.kill().expect("stop server");
+    child.wait().expect("reap server");
+}
+
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
@@ -1669,6 +1910,10 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     );
     let suppressed = &suppressed["result"]["structuredContent"];
     assert_eq!(suppressed["status"], "clean");
+    assert_eq!(
+        suppressed["report"]["runs"][0]["completion"]["type"],
+        "complete"
+    );
     assert_eq!(suppressed["exit_status"], 0);
     assert_eq!(
         suppressed["report"]["runs"][0]["findings"][0]["id"],
@@ -3364,6 +3609,82 @@ fn call_tool(
 #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 #[hardwon(
+    "#13391: an outstanding roots reply held server locks and blocked another readiness probe"
+)]
+fn readiness_probe_negotiates_while_another_roots_reply_is_outstanding() {
+    let plugin = TempDir::new().unwrap();
+    let workspace = InlineTestProject::new()
+        .file("Bound.java", "class Bound {}\n")
+        .build();
+    let mut child = spawn_rootless_server(plugin.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().unwrap());
+    let initialized = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{"protocolVersion":"2025-11-25", "capabilities":{"roots":{"listChanged":true}}, "clientInfo":{"name":"probe-roots", "version":"1"}}}),
+    );
+    assert!(initialized.get("error").is_none(), "{initialized}");
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+    );
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"search_symbols", "arguments":{"patterns":["Bound"]}}}),
+    );
+    let first_roots = read_line(&mut reader, &mut stderr);
+    assert_eq!(first_roots["method"], "roots/list", "{first_roots}");
+    // Leave that reply outstanding. The probe must be able to ask its own
+    // roots question, rather than find any server guard held by the first call.
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"get_active_workspace", "arguments":{}}}),
+    );
+    let probe_roots = read_line(&mut reader, &mut stderr);
+    assert_eq!(probe_roots["method"], "roots/list", "{probe_roots}");
+    let uri = url::Url::from_directory_path(workspace.root()).unwrap();
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "id":probe_roots["id"], "result":{"roots":[{"uri":uri.as_str(), "name":"approved"}]}}),
+    );
+    let probe = read_line(&mut reader, &mut stderr);
+    assert_eq!(probe["id"], 2, "{probe}");
+    assert_eq!(probe["result"]["isError"], false, "{probe}");
+    let bound = probe["result"]["structuredContent"]["workspace_path"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        PathBuf::from(bound).canonicalize().unwrap(),
+        workspace.root().canonicalize().unwrap()
+    );
+    // The older answer cannot replace the binding established in the gap.
+    let stale_uri = url::Url::from_directory_path(plugin.path()).unwrap();
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "id":first_roots["id"], "result":{"roots":[{"uri":stale_uri.as_str(), "name":"older"}]}}),
+    );
+    let first = read_line(&mut reader, &mut stderr);
+    assert_eq!(first["id"], 1, "{first}");
+    assert!(first.get("error").is_none(), "{first}");
+    let current = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"get_active_workspace", "arguments":{}}}),
+    );
+    assert_eq!(
+        current["result"]["structuredContent"]["workspace_path"],
+        bound
+    );
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+#[hardwon(
     "#1035: the plugin workspace root negotiation selected process cwd instead of the client root"
 )]
 fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
@@ -4236,7 +4557,7 @@ fn call_tool_answering_roots(
     request: Value,
     roots_result: Value,
 ) -> Value {
-    write_line(stdin, request);
+    write_line(stdin, request.clone());
     let message = read_line(reader, stderr);
     if message["method"] != "roots/list" {
         return message;
@@ -4245,7 +4566,14 @@ fn call_tool_answering_roots(
         stdin,
         json!({ "jsonrpc": "2.0", "id": message["id"], "result": roots_result }),
     );
-    read_line(reader, stderr)
+    let response = read_line(reader, stderr);
+    if response["result"]["_meta"]["io.bifrost/incomplete"]["completion"]["reasons"]
+        == json!(["workspace_not_ready"])
+    {
+        round_trip(stdin, reader, stderr, request)
+    } else {
+        response
+    }
 }
 
 /// A Codex tool call sent before `initialize` must not bind a workspace.
@@ -4511,12 +4839,11 @@ fn legacy_clients_never_see_a_result_type() {
 
 /// The tools whose `structuredContent` shapes are published as contracts.
 /// published tool answers with a shape that is not yet a declared contract.
-const OUTPUT_SCHEMA_TOOLS: [&str; 15] = [
+const OUTPUT_SCHEMA_TOOLS: [&str; 14] = [
     "analyze_diff",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "score_diff",
-    "relation_brief",
     "list_function_sources",
     "blast_radius",
     "cyclomatic_complexity",
@@ -4708,6 +5035,16 @@ fn output_schema_describes_real_workspace_and_policy_results() {
             .expect("workspace_path"),
         workspace.root(),
     );
+    let readiness = &workspace_result["result"]["structuredContent"];
+    assert_eq!(readiness["analyzer_ready"], true, "{workspace_result}");
+    assert_eq!(
+        readiness["workspace_build"]["status"], "completed",
+        "{workspace_result}"
+    );
+    assert!(
+        readiness["workspace_build"]["generation"].is_u64(),
+        "{workspace_result}"
+    );
     assert_structured_content_matches_advertised_schema(
         &tools,
         "get_active_workspace",
@@ -4778,41 +5115,6 @@ fn output_schema_describes_real_workspace_and_policy_results() {
         "{missing_tests}"
     );
     assert_structured_content_matches_advertised_schema(&tools, "missing_tests", &missing_tests);
-
-    let relation_brief = call_tool(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        7,
-        "relation_brief",
-        json!({}),
-    );
-    assert_eq!(
-        relation_brief["result"]["structuredContent"]["sections"][2]["state"], "not_computed",
-        "{relation_brief}"
-    );
-    assert_eq!(
-        relation_brief["result"]["structuredContent"]["sections"][0]["notes_summarized"],
-        false
-    );
-    assert_eq!(
-        relation_brief["result"]["structuredContent"]["deleted_subjects"],
-        json!([])
-    );
-    assert_structured_content_matches_advertised_schema(&tools, "relation_brief", &relation_brief);
-    // The cause vocabulary stays open for future typed scan causes. Validate
-    // the degraded shape against the same advertised contract.
-    let mut degraded = relation_brief.clone();
-    degraded["result"]["structuredContent"]["subjects"][0]["first_hop"] = json!({
-        "complete": false, "causes": ["time_budget", "future_scan_cause"]
-    });
-    degraded["result"]["structuredContent"]["sections"][0]["complete"] = json!(false);
-    degraded["result"]["structuredContent"]["sections"][0]["notes_summarized"] = json!(true);
-    degraded["result"]["structuredContent"]["deleted_subjects"] = json!([{
-        "fqn": "Described.retired", "path": "Described.java", "line": 1,
-        "completeness": {"complete": false, "causes": ["deleted_symbol_not_scanned"]}
-    }]);
-    assert_structured_content_matches_advertised_schema(&tools, "relation_brief", &degraded);
 
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
@@ -4960,7 +5262,9 @@ fn a_cold_index_build_reports_and_clears_the_build_lock_holder() {
         .build();
     let cache_dir = workspace.root().join(".bifrost").join("cache");
     fs::create_dir_all(&cache_dir).expect("create workspace cache");
-    let db_path = cache_dir.join(brokk_bifrost_core::cache_db::cache_db_file_name());
+    let store_dir = cache_dir.join(brokk_bifrost_core::gitblob::CACHE_DIR_STORE_SUBDIR);
+    fs::create_dir_all(&store_dir).expect("create the BIFROST_CACHE_DIR store child");
+    let db_path = store_dir.join(brokk_bifrost_core::cache_db::cache_db_file_name());
     let purpose = "building the analyzer for another worktree";
     let held = brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(&db_path, purpose)
         .expect("hold the cold build lock");
@@ -4980,85 +5284,88 @@ fn a_cold_index_build_reports_and_clears_the_build_lock_holder() {
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {
-                "name": "get_summaries", "arguments": {"targets": ["Described.java"]},
-                "_meta": {"progressToken": "cold-lock-wait"}
-            }
-        }),
-    );
-    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 1);
     let wait_text = "waiting for the analyzer cache build lock";
     let holder = format!("pid {} on ", std::process::id());
-    let notification = progress
-        .iter()
-        .find(|notification| {
-            notification["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(wait_text))
-        })
-        .unwrap_or_else(|| panic!("cold build never reported its wait: {progress:?}"));
-    let message = notification["message"].as_str().unwrap();
-    assert!(
-        message.contains(&holder) && message.contains(purpose),
-        "{notification}"
-    );
-    let snapshot = &notification["_meta"]["io.bifrost/workspace-build"];
-    assert!(
-        snapshot["phase"]
+    let watchdog = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = common::mcp_wire::round_trip_json_line(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"get_active_workspace", "arguments":{}}}),
+        );
+        let probe = &response["result"]["structuredContent"];
+        assert_eq!(probe["analyzer_ready"], false, "{response}");
+        assert_eq!(probe["workspace_build"]["status"], "running", "{response}");
+        if probe["workspace_build"]["phase"]
             .as_str()
-            .is_some_and(|phase| phase.contains(wait_text)),
-        "{notification}"
-    );
-    let error = response.to_string();
-    assert!(
-        error.contains(wait_text) && error.contains(&holder) && error.contains(purpose),
-        "{response}"
-    );
-    assert!(
-        response["error"].is_object() || response["result"]["isError"] == true,
-        "{response}"
-    );
-
-    drop(held);
-    write_line(
+            .is_some_and(|phase| phase.contains(wait_text))
+        {
+            let phase = probe["workspace_build"]["phase"].as_str().unwrap();
+            assert!(
+                phase.contains(&holder) && phase.contains(purpose),
+                "{response}"
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < watchdog, "{response}");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let response = common::mcp_wire::round_trip_json_line(
         &mut stdin,
-        json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {
-                "name": "get_active_workspace", "arguments": {},
-                "_meta": {"progressToken": "cold-lock-released"}
-            }
-        }),
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"get_summaries", "arguments":{"targets":["Described.java"]}}}),
     );
-    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
-    assert_eq!(response["result"]["isError"], false, "{response}");
-    let completed = progress
-        .iter()
-        .find(|notification| {
-            notification["_meta"]["io.bifrost/workspace-build"]["status"] == "completed"
-        })
-        .unwrap_or_else(|| panic!("no completed build snapshot: {progress:?}"));
+    let encoded = response.to_string();
     assert!(
-        !completed.to_string().contains(wait_text),
-        "the acquired lock must clear the wait: {completed}"
+        encoded.contains(wait_text) && encoded.contains(&holder) && encoded.contains(purpose),
+        "{response}"
     );
-    assert!(
-        completed["_meta"]["io.bifrost/workspace-build"]["phase"].is_null(),
-        "{completed}"
+    assert_eq!(
+        response["result"]["_meta"]["io.bifrost/incomplete"]["completion"]["reasons"],
+        json!(["workspace_not_ready"])
     );
-    let response = call_tool(
+    drop(held);
+    call_tool(
         &mut stdin,
         &mut reader,
         &mut stderr,
         3,
+        "get_active_workspace",
+        json!({}),
+    );
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{
+        "name":"get_active_workspace", "arguments":{}, "_meta":{"progressToken":"cold-lock-released"}}}),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 4);
+    assert_eq!(
+        response["result"]["structuredContent"]["analyzer_ready"],
+        true
+    );
+    let completed = progress
+        .iter()
+        .find(|n| n["_meta"]["io.bifrost/workspace-build"]["status"] == "completed")
+        .unwrap_or_else(|| panic!("no completed snapshot: {progress:?}"));
+    assert!(!completed.to_string().contains(wait_text), "{completed}");
+    assert!(completed["_meta"]["io.bifrost/workspace-build"]["phase"].is_null());
+    let response = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        5,
         "get_summaries",
-        json!({"targets": ["Described.java"]}),
+        json!({"targets":["Described.java"]}),
     );
     assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["summaries"][0]["path"], "Described.java",
+        "{response}"
+    );
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
 }
@@ -5583,6 +5890,14 @@ fn run_policy_streams_each_finished_run_before_the_result() {
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+    call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        -1,
+        "get_active_workspace",
+        json!({}),
+    );
 
     let call = |id: i64, stream_runs: bool| {
         json!({
@@ -5672,6 +5987,14 @@ fn progress_token_yields_phase_progress_and_silence_without_it() {
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+    call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        -1,
+        "get_active_workspace",
+        json!({}),
+    );
 
     // A string token, echoed as a string.
     write_line(
@@ -5705,11 +6028,7 @@ fn progress_token_yields_phase_progress_and_silence_without_it() {
         .collect::<Vec<_>>();
     assert_eq!(
         messages,
-        vec![
-            "waiting for workspace readiness",
-            "waiting for analyzer admission",
-            "executing search_symbols"
-        ],
+        vec!["waiting for analyzer admission", "executing search_symbols"],
         "{progress:?}"
     );
     assert_progress_is_monotonic(&progress);
@@ -5779,6 +6098,14 @@ fn concurrent_progress_tokens_never_cross_route() {
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+    call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        -1,
+        "get_active_workspace",
+        json!({}),
+    );
 
     // Both calls are on the wire before either response, so their phase
     // notifications can interleave freely; routing is what must not.
@@ -5877,6 +6204,14 @@ fn cancellation_with_progress_in_flight_leaves_the_session_healthy() {
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+    call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        -1,
+        "get_active_workspace",
+        json!({}),
+    );
 
     // Cancel immediately after sending, so the cancellation lands during
     // readiness, admission, or execution -- whichever phase the call is in.
@@ -6595,7 +6930,7 @@ fn codex_sandbox_metadata(root: &std::path::Path, thread_id: &str) -> Value {
 }
 
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
-    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    let request_budget = FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS.to_string();
     common::mcp_server::spawn_mcp_server(
         common::mcp_server::mcp_server_binary(),
         root,
@@ -6604,58 +6939,6 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         &[(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, &request_budget)],
     )
     .expect("spawn bifrost")
-}
-
-/// Cold-start latency guard (1 of 2; the other is
-/// `mcp_repository_corpus::cold_first_call_stays_within_the_production_budget`).
-///
-/// Every other server in this file runs with the 60-second test budget from
-/// `apply_test_request_budget`, so none of them can still prove that a cold
-/// workspace answers its first request inside the budget a real client gets.
-/// This test makes that claim on purpose and is the only place in this file
-/// that does: it spawns cold at the production default and requires the first
-/// analyzer-backed call to succeed within `COLD_WORKSPACE_REQUEST_BUDGET`
-/// (4.5s, `crates/bifrost-mcp/src/mcp_common.rs`). The server enforces the
-/// bound itself -- past it the call returns a "not ready within the
-/// request-wide time budget" error instead of a result -- so asserting success
-/// is asserting the latency.
-///
-/// `get_symbol_sources` is the request under test because the fallback budget
-/// ladder exempts `search_symbols` from the cold fail-fast (discovery waits
-/// out initialization within the default interactive budget instead), which
-/// would make the assertion vacuous.
-///
-/// `.config/nextest.toml` reserves the machine for this test: a wall-clock
-/// bound measured on a saturated box measures the box.
-#[test]
-fn cold_first_call_stays_within_the_production_cold_workspace_budget() {
-    let workspace = InlineTestProject::new()
-        .file(
-            "Cold.java",
-            "public class Cold {\n  public void run() {}\n}\n",
-        )
-        .build();
-
-    let (first, status) = common::mcp_server::run_cold_first_tool_call(
-        common::mcp_server::mcp_server_binary(),
-        workspace.root(),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "get_symbol_sources",
-                "arguments": { "symbols": ["Cold.java"] }
-            }
-        }),
-    );
-    assert_eq!(
-        first["result"]["isError"], false,
-        "a cold workspace must answer its first request inside the production \
-         cold-workspace budget: {first}"
-    );
-
-    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
 const PROFILED_STDERR_TAIL_BYTES: usize = 64 * 1024;
@@ -6804,7 +7087,7 @@ impl Read for ProfiledStderrDrain {
 }
 
 fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
-    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    let request_budget = FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS.to_string();
     common::mcp_server::mcp_server_command(
         common::mcp_server::mcp_server_binary(),
         root,
@@ -6814,25 +7097,12 @@ fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -
     )
 }
 
-/// Give a spawned server a budget that absorbs box load.
-///
-/// A functional wire test must not incidentally assert the cold-start budget.
-/// Left at the production default, a first call made while the workspace is
-/// still building is held to `COLD_WORKSPACE_REQUEST_BUDGET` (4.5s), so
-/// whole-suite CPU saturation converts a protocol assertion into a latency
-/// failure: on 2026-08-29 five tests in this file failed 3/3 in one
-/// 13,692-test run, and a disjoint six in `mcp_repository_corpus` failed 3/3
-/// in the next, out of a pool of 156 server-spawning tests. Sixty seconds
-/// never trips on load and still catches a genuine hang.
-///
-/// The cold-start claim is proven deliberately instead, by
-/// `cold_first_call_stays_within_the_production_cold_workspace_budget` here
-/// and its repository-corpus twin. Those two keep the production default and
-/// are reserved a quiet machine in `.config/nextest.toml`.
+/// Bound execution in functional tests independently of preparation, which
+/// the transport helper retries. The held-lock golden pins cold responses.
 fn apply_test_request_budget(command: &mut Command) {
     command.env(
         MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-        BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+        FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS.to_string(),
     );
 }
 
@@ -6932,9 +7202,7 @@ fn light_lookup_overtakes_long_usage_scan() {
     let workspace = project.build();
     // This test asserts request ordering, not cold-start latency. Spawn at the
     // production budget ladder instead of this file's 60-second benchmark
-    // budget: `get_active_workspace` below is a serial tool with no fallback
-    // timer, so it waits out the 301-file cold build however long a loaded
-    // merge host takes. The measured calls keep their production interactive
+    // budget: the measured calls below keep their production interactive
     // budgets. Under concurrent suites the benchmark budget expired during
     // the warm-up (#10711).
     let mut child = common::mcp_server::spawn_mcp_server_at_production_budget(
@@ -6948,14 +7216,17 @@ fn light_lookup_overtakes_long_usage_scan() {
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
-    // Wait for the cold build through a tool outside the fallback budget
-    // ladder. `get_active_workspace` is serial, so the host gives it no
-    // deadline and its handler joins the deferred workspace build. The warm
-    // lookup itself is a bounded read: on a loaded host its cold fallback (or
-    // the benchmark budget this file normally passes) expires before the
-    // build finishes and answers with the retryable not-ready error instead
-    // of a result.
-    let ready = round_trip(
+    // `get_active_workspace` observes the deferred build without waiting
+    // (#13618), so poll it until the build installs the session. This setup
+    // gets its own budget rather than the shared 120 s hang detector: the
+    // 301 loose .rs files become 301 detached crate roots, which the analyzer
+    // derives one at a time; `.cargo/config.toml` also pins analyzer
+    // parallelism to one. The build measured 42.2 s and 101.9 s on the
+    // release-gate legs and 267.1 s under heavy host load (#10711), so a
+    // 120 s cap measured the host rather than the ordering (#13982). The
+    // profile's 600 s terminate-after remains the hang detector.
+    const COLD_WORKSPACE_READINESS_BUDGET: Duration = Duration::from_secs(480);
+    let ready = common::mcp_wire::round_trip_when_ready_with_watchdog(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -6968,6 +7239,7 @@ fn light_lookup_overtakes_long_usage_scan() {
                 "arguments": {}
             }
         }),
+        COLD_WORKSPACE_READINESS_BUDGET,
     );
     assert_eq!(ready["result"]["isError"], false, "{ready}");
 
@@ -7236,7 +7508,8 @@ fn semantic_model_configuration_rejects_empty_values_and_accepts_multiple_record
     });
     for (setting, evidence, expected_state) in [
         (Some(""), None, "unavailable"),
-        (Some("off"), None, "no_models"),
+        // The declared fake JDK has no compatible installed pack and no runtime.
+        (Some("off"), None, "unavailable"),
         (None, Some("[]".to_owned()), "unavailable"),
         (None, Some(json!([record.clone()]).to_string()), "ready"),
         (

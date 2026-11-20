@@ -618,7 +618,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         self.workspace
             .analyzer()
             .record_read(crate::analyzer::ReadKey::Models(
-                crate::analyzer::i_analyzer::current_model_set_digest(
+                self.workspace.analyzer().model_set_digest(
                     self.active_semantic_model_snapshot
                         .as_ref()
                         .map(|snapshot| snapshot.active_models().active_model_set_hash()),

@@ -22,6 +22,10 @@ mod source_import_path_tests {
     use brokk_bifrost_core::analyzer::structural::facts::Span;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_import_path_presence_round_trips_through_typed_and_generic_reads() {
         let source = "fn main() {}\n";
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();

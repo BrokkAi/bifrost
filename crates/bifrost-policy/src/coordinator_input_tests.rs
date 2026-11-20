@@ -190,6 +190,7 @@ fn built_in_scope_uses_manifest_category() {
         root.path(),
         &inputs,
         &options,
+        &Default::default(),
         &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
@@ -1235,6 +1236,7 @@ fn control_character_policy_filename_is_rejected() {
         root.path(),
         &[input],
         &crate::test_support::evaluation_options("2026-07-27"),
+        &Default::default(),
         &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
@@ -1488,6 +1490,10 @@ mod export_determined_base_reuse {
     #[brokk_bifrost_test_macros::hardwon(
         "#11607: a tree holding an initialized submodule was admitted as an export although its listing depends on the checkout"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn an_initialized_submodule_replays_only_against_the_base_tree() {
         let root = csharp_fixture();
         let capture = || {
@@ -1702,7 +1708,7 @@ mod export_determined_base_reuse {
         // SAFETY: the lock above serializes every test that reads these.
         unsafe {
             std::env::set_var("HOME", home.path());
-            std::env::remove_var("JAVA_HOME");
+            std::env::set_var("JAVA_HOME", "");
         }
         let root = commit_repo(&[
             ("policy.rqlp", JAVA_POLICY),

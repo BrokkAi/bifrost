@@ -2,6 +2,7 @@
 use super::reverse::*;
 use super::*;
 use crate::analyzer::resolution::SelectedTypedFactSource;
+use crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord;
 use brokk_bifrost_core::analyzer::source_facts::{DeclarationAccessBoundary, PackageAccessRegion};
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
@@ -18,9 +19,27 @@ pub struct NominalReverseTarget<'a> {
 
 pub enum PeerNaming {
     Closed,
-    WithinPackage(PackageAccessRegion),
+    WithinRegion(MountRegion),
     Open,
     OpenIncomplete(ResolutionIncompleteReason),
+}
+
+/// Mounts that may spell a reference to a target. A region is judged from the
+/// facts a candidate mount records; a family whose visibility is not a package
+/// region adds its own variant with the facts it needs.
+pub enum MountRegion {
+    /// JVM lexical package visibility, judged from the mount's content package.
+    Package(PackageAccessRegion),
+}
+
+impl MountRegion {
+    /// Whether a mount with this recorded content package may spell the target.
+    /// A mount with no recorded package is never excluded.
+    pub(super) fn admits(&self, content_package: Option<&str>) -> bool {
+        match self {
+            Self::Package(region) => content_package.is_none_or(|package| region.contains(package)),
+        }
+    }
 }
 
 pub struct HierarchyRoute {
@@ -80,6 +99,28 @@ pub(crate) trait NominalReverseTargetRules: Sync {
         known_sites: &HashSet<brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId>,
         cancellation: &CancellationToken,
     ) -> Result<Option<ResolutionCompletion>>;
+    /// Every placement of the target file: one mount for single-placement
+    /// families; a family compiled into several units returns each of them.
+    /// The first placement is the primary one. An empty result means the
+    /// target is outside the selected source mounts.
+    fn target_placements(
+        &self,
+        operation: &SelectedResolutionOperation<'_, '_>,
+        storage_language: &str,
+        relative_path: &str,
+    ) -> Result<Vec<std::sync::Arc<SelectedResolutionMountRecord>>> {
+        Ok(operation
+            .ready
+            .inventory
+            .mount_record_for_path(storage_language, relative_path)?
+            .into_iter()
+            .collect())
+    }
+    /// Storage languages whose sources, besides the target's own, may name the
+    /// target. Empty for a single-language family.
+    fn peer_storage_languages(&self, _target_storage_language: &str) -> Vec<&'static str> {
+        Vec::new()
+    }
     fn file_evaluator(&self) -> &'static dyn ReverseFileEvaluator<Answer = FactResolutionAnswer>;
     fn target_families(
         &self,
@@ -148,4 +189,17 @@ pub struct NominalReverseConfirmed {
     pub(super) evidence: Box<ReverseEvidence>,
     pub(super) selected_target: ReverseTarget,
     pub(super) nominations: Vec<ReverseNomination>,
+}
+
+/// Reverse target policy of a nominal language; algorithms stay shared. A
+/// language that is not registered here fails loudly at its admission site.
+pub(crate) fn nominal_reverse_rules(
+    language: Language,
+) -> Option<&'static dyn NominalReverseTargetRules> {
+    match language {
+        Language::Java => Some(&super::jvm_reverse_rows::JavaReverseTargetRules),
+        Language::Kotlin => Some(&super::jvm_reverse_rows::KotlinReverseTargetRules),
+        Language::Scala => Some(&super::jvm_reverse_rows::ScalaReverseTargetRules),
+        _ => None,
+    }
 }

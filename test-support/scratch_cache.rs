@@ -95,6 +95,7 @@ impl ScratchCacheDir {
     /// its workspace root exactly as an in-process build does, so every
     /// spawned process pointed at a path inside the checkout needs one of
     /// these (issue #1588).
+    /// Tests must not depend on host JDK discovery (#14290).
     pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
         let mut command = Command::new(program);
         self.bind(&mut command);
@@ -102,8 +103,10 @@ impl ScratchCacheDir {
     }
 
     /// Point an already-built `Command` at this directory.
+    /// Tests must not depend on host JDK discovery (#14290).
     pub fn bind(&self, command: &mut Command) {
         assert_cache_is_scratch(self.temp.path());
+        command.env("JAVA_HOME", "");
         command.env(CACHE_DIR_ENV, self.temp.path());
     }
 }

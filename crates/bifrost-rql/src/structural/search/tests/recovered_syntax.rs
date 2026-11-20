@@ -163,9 +163,9 @@ fn a_recovered_gap_names_its_file_until_a_later_operator_crosses_files() {
             .diagnostics
             .iter()
             .filter(|diagnostic| {
-                diagnostic.code == CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete
+                diagnostic.code() == CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete
             })
-            .map(|diagnostic| diagnostic.withheld_rows_path.clone())
+            .map(|diagnostic| diagnostic.withheld_rows_path().map(str::to_owned))
             .collect::<Vec<_>>()
     };
     assert_eq!(withheld(seed.clone()), [Some("Sample.kt".to_owned())]);

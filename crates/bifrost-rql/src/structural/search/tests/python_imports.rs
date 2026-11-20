@@ -441,8 +441,8 @@ fn python_import_cycles_select_only_persisted_cycle_sites_and_keep_absence_incom
         ]
     );
     assert!(result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.message.contains("#3673")
-            && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+        diagnostic.message().contains("#3673")
+            && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete
     }));
     assert!(matches!(
         result.completion(),
@@ -538,9 +538,9 @@ fn python_import_cycles_keep_budget_limited_absence_incomplete() {
         Some("incomplete")
     );
     assert!(bounded.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::ImportGraphBudgetExhausted
-            && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
-            && diagnostic
+        diagnostic.code() == CodeQueryDiagnosticCode::ImportGraphBudgetExhausted
+            && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete
+            && semantic_diagnostic(diagnostic)
                 .exhausted_roots
                 .iter()
                 .any(|root| root.lane == "query/scanned_files")
@@ -652,13 +652,13 @@ fn python_unsafe_cyclic_import_proves_order_and_keeps_near_misses_open() {
         field_result
             .diagnostics
             .iter()
-            .any(|diagnostic| { diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete })
+            .any(|diagnostic| { diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete })
     );
     assert!(
         field_result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("#3673"))
+            .any(|diagnostic| diagnostic.message().contains("#3673"))
     );
 
     let import_result = run("import");

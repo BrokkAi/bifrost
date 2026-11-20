@@ -498,6 +498,8 @@ implicit-initializer context, and nested short-loop context.
 | `program_point_of` | `program-point-of`, `program_point_of` | `structural_match` -> `program_point` | none | The unique point whose source mapping retains the exact structural match identity. For `await`, this is its `AsyncSuspend`. Missing or ambiguous points, incomplete producer capability coverage, exhausted traversal budgets and cancellation report incomplete. |
 | `program_point_by_id` | `program-point-by-id`, `program_point_by_id` | `procedure` -> `program_point` | required `id` | Look up an observed content-scoped public point ID in the supplied current procedure. This selects a physical point and does not claim exhaustive AST/read discovery. Missing, stale, wrong-procedure, ambiguous or incomplete selection reports incomplete. IDs do not certify semantic-overlay freshness; downstream proofs acquire current evidence. |
 | `selected_property_relations_of` | `selected-property-relations-of`, `selected_property_relations_of` | `program_point` -> `flow_relation` | none | Reaching relations for the unique property read at that exact point. Completeness covers only the selected durable receiver/member and its dependencies and endpoints; unknown values stay unknown. Missing or ambiguous reads and open alias, runtime, control, budget or cancellation evidence report incomplete. |
+| `field_writes_of` | `field-writes-of`, `field_writes_of` | `declaration` -> `field_write` | none | Each write to a field declaration that the semantic IR models as a field store: an assignment, a compound assignment, a struct-literal initializer or its shorthand. A write is located by a proven usage of the field in the access, so an equally named field of another struct is never returned. Complete only when the usage scan is complete and proven, every procedure around a usage lowered with field-memory support, and no relevant gap, address-of, unsupported pointer or macro fact, or unresolved store through a pointer could hide a write; otherwise the answer is incomplete. A declaration that is not a field returns no rows and an advisory `no_enclosing_procedure` diagnostic. |
+| `field_reads_of` | `field-reads-of`, `field_reads_of` | `declaration` -> `field_read` | none | Each read of a field declaration that the semantic IR models as a field load, located and completed as `field_writes_of` is, with read-side gaps and unresolved loads through a pointer. |
 | `cfg_entry` | `cfg-entry`, `cfg_entry` | `procedure` -> `program_point` | none | The entry point of the procedure's control-flow graph. |
 | `cfg_exits` | `cfg-exits`, `cfg_exits` | `procedure` -> `program_point` | none | The normal and exceptional exit points of the procedure. |
 | `cfg_successor_edges` | `cfg-successor-edges`, `cfg_successor_edges` | `program_point` -> `control_edge` | none | Outgoing control edges, one hop. |
@@ -1079,6 +1081,8 @@ in the last column is left out of the JSON when it has no value. With
 | `reference_edge` | `edge_provenance`, `end_byte`, `generation`, `id`, `language`, `owner_relation`, `path`, `proof`, `range`, `reference_facets`, `site_class`, `start_byte`, `target`, `usage_kind` | `ast_id`, `enclosing_declaration` |
 | `state_event` | `completeness`, `end_byte`, `event_class`, `generation`, `id`, `language`, `path`, `procedure_id`, `program_point`, `program_point_id`, `range`, `start_byte`, `subject`, `subject_value`, `value` | `ast_id`, `member`, `uncovered_axes` |
 | `binding_initializer_call` | `end_byte`, `establishment_event_id`, `id`, `initializer_role`, `language`, `path`, `range`, `site_ast_id`, `start_byte` | none |
+| `field_write` | `completeness`, `enclosing`, `field_id`, `id`, `language`, `member_fq_name`, `path`, `procedure_id`, `program_point_id`, `proof`, `range`, `site`, `strong_update` | `value_site` |
+| `field_read` | `completeness`, `enclosing`, `field_id`, `id`, `language`, `member_fq_name`, `path`, `procedure_id`, `program_point_id`, `proof`, `range`, `site` | none |
 | `flow_relation` | `certainty`, `completeness`, `generation`, `id`, `language`, `path`, `procedure_id`, `range`, `relation`, `source`, `target` | `uncovered_axes` |
 | `control_relation` | `certainty`, `completeness`, `exit_partition`, `generation`, `id`, `language`, `path`, `procedure_id`, `range`, `relation`, `source`, `target` | `controlling_edge_id`, `uncovered_relations` |
 | `branch_relation` | `earlier_ordinal`, `earlier_range`, `id`, `language`, `later_ordinal`, `later_range`, `owner_id`, `owner_range`, `path`, `range`, `relation`, `verdict` | `orientation`, `reason` |
@@ -1282,6 +1286,8 @@ The impact column gives the impact that `query_code` uses for each code.
 | `call_relation_candidate_limit` | `incomplete` | Call traversal reached its candidate limit. |
 | `call_relation_analysis_failed` | `incomplete` | Call analysis failed. |
 | `rendered_captures_truncated` | `incomplete` | Rendered captures exceeded the response byte budget; rows are retained. |
+| `presentation_rows_refused` | `incomplete` | Existing retained-memory capacity refused site presentation. Optional source text is withheld as `unrendered`; if required fields cannot fit, the current row and remaining rows are withheld. The operational budget root names lane `render/site_output/retained_bytes` and stage `result_presentation`. |
+| `presentation_owner_unavailable` | `incomplete` | The analyzer has no retention owner for required site presentation. This is a provider refusal, not evidence of absent rows. |
 | `reference_source_bytes_truncated` | `incomplete` | Reference search reached its source-byte limit. |
 | `reference_candidate_files_truncated` | `incomplete` | Reference search reached its candidate-file limit. |
 | `reference_candidates_omitted` | `incomplete` | Reference candidates were left out. |
@@ -1339,6 +1345,7 @@ The impact column gives the impact that `query_code` uses for each code.
 | `call_shape_coverage_incomplete` | `incomplete` | A call shape is incomplete, so its argument, group, and binding rows were not produced. |
 | `jsx_projection_incomplete` | `incomplete` | A JSX attribute value could not be fully projected. |
 | `result_limit_reached` | `incomplete` | The result `limit` was reached; more results exist. |
+| `step_produced_no_rows` | `advisory` | A step turned non-empty input rows into no rows. `no_rows_reason` says why. It never changes completeness. |
 | `broad_query` | `advisory` | The query scanned the workspace without a name, path, or language anchor. |
 
 ## Limits

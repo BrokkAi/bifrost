@@ -440,6 +440,7 @@ pub enum NativeConfigurationOverlayAuthority {
 
 impl super::AnalyzerStore {
     /// The canonical OwnModule identity already published with this file version.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_module_name(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -478,6 +479,7 @@ impl super::AnalyzerStore {
     }
 
     /// Preload target layout before a query holds a store reader.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_rust_target_roots(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -505,6 +507,7 @@ impl super::AnalyzerStore {
     }
 
     /// Capture naming authority at publication, before any query holds a reader.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_cargo_manifests(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -571,6 +574,7 @@ impl super::AnalyzerStore {
 
     /// Exact configuration bytes, including absence, selected by this revision.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_configuration_source(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -605,6 +609,7 @@ impl super::AnalyzerStore {
     /// context selected by this exact workspace revision. Bytes live in SQL;
     /// this check retains only one input for the duration of the request.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn native_configuration_overlay_mismatch(
         &self,
         project: &dyn crate::analyzer::Project,
@@ -1065,6 +1070,27 @@ pub(super) fn publish_workspace_input_changes(
     refusals: &WorkspaceRefusalChanges<'_>,
     acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
 ) -> Result<PublishedWorkspaceInputChanges> {
+    // A complete predecessor plus the explicitly published replacement decisions
+    // proves completeness inductively. Unknown predecessors require one census;
+    // no application counter or per-edit walk of an unchanged selected set.
+    let predecessor_complete = head
+        .map(|revision| {
+            selected_set_complete(
+                tx,
+                &WorkspaceSnapshotId {
+                    workspace_id: workspace_id.clone(),
+                    lang: lang.to_owned(),
+                    generation,
+                    revision,
+                },
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let replacements_complete = lang != "csharp"
+        || replacements.iter().all(|(kind, row)| {
+            *kind != WorkspaceInputKind::Source || row.csharp_decision.is_some()
+        });
     // A source-only publication carries the prior snapshot's explicitly
     // recorded config input, validated again against the new local references.
     // This is an exact revision lookup inside admission, never a head guess.
@@ -1078,6 +1104,7 @@ pub(super) fn publish_workspace_input_changes(
                     generation,
                     revision,
                 },
+                &super::dependency_file_evidence::NonQueryEvidenceReadRecorder,
             )
         })
         .transpose()?
@@ -1099,6 +1126,7 @@ pub(super) fn publish_workspace_input_changes(
                     generation,
                     revision,
                 },
+                &super::dependency_file_evidence::NonQueryEvidenceReadRecorder,
             )
         })
         .transpose()?
@@ -1107,10 +1135,27 @@ pub(super) fn publish_workspace_input_changes(
     } else {
         None
     };
+    // Non-Rust and test-only snapshots may have no Cargo acquisition. They
+    // publish an explicit unknown view, never an evidence set without a view.
+    let unknown =
+        brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView::default();
+    let effective_acquired = acquired.unwrap_or(&unknown);
     let mut inserted = HashMap::default();
     let revision = match head {
         Some(revision)
-            if closed_ids.is_empty() && replacements.is_empty() && refusals.is_empty() =>
+            if closed_ids.is_empty()
+                && replacements.is_empty()
+                && refusals.is_empty()
+                && super::dependency_file_evidence::disk_evidence_identity_matches(
+                    tx,
+                    &WorkspaceSnapshotId {
+                        workspace_id: workspace_id.clone(),
+                        lang: lang.to_owned(),
+                        generation,
+                        revision,
+                    },
+                    effective_acquired,
+                )? =>
         {
             revision
         }
@@ -1208,19 +1253,15 @@ pub(super) fn publish_workspace_input_changes(
         generation,
         revision,
     };
-    // Non-Rust and test-only snapshots may have no Cargo acquisition. They
-    // publish an explicit unknown view, never an evidence set without a view.
-    let unknown =
-        brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView::default();
-    super::dependency_file_evidence::publish_with_acquired(
-        tx,
-        &snapshot,
-        acquired.unwrap_or(&unknown),
-    )?;
+    super::dependency_file_evidence::publish_with_acquired(tx, &snapshot, effective_acquired)?;
     if lang == "rust"
         && previous_acquired_effect
-            != super::rust_acquired_cargo_config::selected(tx, &snapshot)?
-                .map(|view| view.effective_digest())
+            != super::rust_acquired_cargo_config::selected(
+                tx,
+                &snapshot,
+                &super::dependency_file_evidence::NonQueryEvidenceReadRecorder,
+            )?
+            .map(|view| view.effective_digest())
     {
         // An edit that changes what the acquisition means, external or local,
         // withdraws the certificate and all FK-cascaded feature projections
@@ -1240,7 +1281,46 @@ pub(super) fn publish_workspace_input_changes(
             .collect::<Vec<_>>();
         super::csharp_compilation::extent::publish(tx, &snapshot, head, &changed, budget)?;
     }
+    if predecessor_complete && replacements_complete || selected_decisions_complete(tx, &snapshot)?
+    {
+        tx.execute("INSERT OR IGNORE INTO workspace_selected_set_completeness(workspace_id,lang,generation,revision) VALUES(?1,?2,?3,?4)",
+            params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision])?;
+    }
     Ok((snapshot, inserted))
+}
+
+/// The owner-issued selected-set certificate. Absence is Unknown, never an
+/// optimistic empty set. Caller holds the publication or verification transaction.
+pub(crate) fn selected_set_complete(
+    conn: &rusqlite::Connection,
+    snapshot: &WorkspaceSnapshotId,
+) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_selected_set_completeness WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4)",
+        params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision], |row|row.get(0))?)
+}
+
+/// A metadata-only revision preserves the selected source set. This owner
+/// checks/republishes the same completeness fact before committing that revision.
+pub(super) fn certify_unchanged_selected_set(
+    tx: &Transaction<'_>,
+    snapshot: &WorkspaceSnapshotId,
+    previous: &WorkspaceSnapshotId,
+) -> Result<()> {
+    if selected_set_complete(tx, previous)? || selected_decisions_complete(tx, snapshot)? {
+        tx.execute("INSERT OR IGNORE INTO workspace_selected_set_completeness(workspace_id,lang,generation,revision) VALUES(?1,?2,?3,?4)",params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision])?;
+    }
+    Ok(())
+}
+
+fn selected_decisions_complete(
+    conn: &rusqlite::Connection,
+    snapshot: &WorkspaceSnapshotId,
+) -> Result<bool> {
+    if snapshot.lang != "csharp" {
+        return Ok(true);
+    }
+    Ok(!conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_file_versions AS files LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id=files.file_version_id WHERE files.workspace_id=?1 AND files.lang=?2 AND files.generation=?3 AND files.input_kind='source' AND files.valid_from<=?4 AND (files.valid_until IS NULL OR ?4<files.valid_until) AND decisions.file_version_id IS NULL)",
+        params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision], |row|row.get::<_,bool>(0))?)
 }
 
 /// Acquisition is part of selection identity, including external-only edits.
@@ -1387,7 +1467,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
-                    Some((
+                    Some(super::super::RustListingInput::new(
                         super::super::rust_source_listing_derivation_identity(),
                         if complete {
                             vec![]
@@ -1459,7 +1539,10 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                Some((version, vec![("x.rs".to_string(), "test".to_string())])),
+                Some(super::super::RustListingInput::new(
+                    version,
+                    vec![("x.rs".to_string(), "test".to_string())],
+                )),
             )
             .unwrap();
         let failures = vec![("x.rs".to_string(), "test".to_string())];
@@ -1467,8 +1550,7 @@ mod tests {
             store
                 .publish_rust_source_listing(
                     &snapshot,
-                    version,
-                    failures.clone(),
+                    super::super::RustListingInput::new(version, failures.clone()),
                     Default::default()
                 )
                 .unwrap(),
@@ -1476,7 +1558,11 @@ mod tests {
             "an identical certificate stays at its revision"
         );
         let moved = store
-            .publish_rust_source_listing(&snapshot, version, Vec::new(), Default::default())
+            .publish_rust_source_listing(
+                &snapshot,
+                super::super::RustListingInput::new(version, Vec::new()),
+                Default::default(),
+            )
             .unwrap();
         assert_eq!(moved.revision, snapshot.revision + 1);
         assert_eq!(
@@ -1490,6 +1576,191 @@ mod tests {
             store.rust_source_listing_failures(&moved, version).unwrap(),
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn a_bounded_tree_record_round_trips_and_certifies_by_tree_and_digest() {
+        use super::super::{BoundedTreeRecord, RustListingInput};
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("rust", "bounded-listing-test")
+            .unwrap();
+        let version = super::super::rust_source_listing_derivation_identity();
+        let summary = vec![(String::new(), "omission: BoundedTree".to_string())];
+        let overlaid = |tree: u8, paths: &[&str], present: &[&str], absent: &[&str]| {
+            let own = |paths: &[&str]| {
+                paths
+                    .iter()
+                    .map(|path| path.to_string())
+                    .collect::<Vec<_>>()
+            };
+            let (materialized, present, absent) = (own(paths), own(present), own(absent));
+            BoundedTreeRecord {
+                tree: vec![tree; 20],
+                digest: brokk_bifrost_core::analyzer::project::BoundedTreeOmission::digest_of(
+                    &materialized,
+                    &present,
+                    &absent,
+                ),
+                materialized,
+                overlay_present: present,
+                overlay_absent: absent,
+            }
+        };
+        let record = |tree: u8, paths: &[&str]| overlaid(tree, paths, &[], &[]);
+        let input = |record: BoundedTreeRecord| RustListingInput {
+            identity: version,
+            failures: summary.clone(),
+            bounded: Some(record),
+        };
+        let first = record(1, &["Cargo.toml", "src/lib.rs"]);
+        let snapshot = store
+            .sync_workspace_inputs_with_rust_listing(
+                &WorkspaceId("b".repeat(64)),
+                "rust",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(input(first.clone())),
+            )
+            .unwrap();
+        // The certificate is not complete, keeps its summary row, and returns
+        // the record, with the paths, as written.
+        assert!(
+            !store
+                .rust_source_listing_complete(&snapshot, version)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .rust_source_listing_failures(&snapshot, version)
+                .unwrap(),
+            Some(summary.clone())
+        );
+        assert_eq!(
+            store
+                .rust_source_listing_bounded_record(&snapshot, version)
+                .unwrap(),
+            Some(first.clone())
+        );
+        // An exact-rows certificate has no record, and neither does a stale one.
+        assert_eq!(
+            store
+                .rust_source_listing_bounded_record(
+                    &snapshot,
+                    brokk_bifrost_rust::cargo_routes::rust_source_listing_derivation_identity_before_last_token()
+                )
+                .unwrap(),
+            None
+        );
+        // The same tree and digest stay at their revision; a different digest
+        // or a different tree opens a new one and the old record stays readable.
+        let same = store
+            .publish_rust_source_listing(&snapshot, input(first.clone()), Default::default())
+            .unwrap();
+        assert_eq!(same, snapshot);
+        let other_digest = record(1, &["Cargo.toml", "src/lib.rs", "src/ops.rs"]);
+        let moved = store
+            .publish_rust_source_listing(&snapshot, input(other_digest.clone()), Default::default())
+            .unwrap();
+        assert_eq!(moved.revision, snapshot.revision + 1);
+        assert_eq!(
+            store
+                .rust_source_listing_bounded_record(&moved, version)
+                .unwrap(),
+            Some(other_digest)
+        );
+        assert_eq!(
+            store
+                .rust_source_listing_bounded_record(&snapshot, version)
+                .unwrap(),
+            Some(first.clone())
+        );
+        let other_tree = record(2, &["Cargo.toml", "src/lib.rs"]);
+        let retreed = store
+            .publish_rust_source_listing(&moved, input(other_tree), Default::default())
+            .unwrap();
+        assert_eq!(retreed.revision, moved.revision + 1);
+        assert!(
+            store
+                .rust_listing_certificates_differ(&snapshot, &retreed)
+                .unwrap()
+        );
+        // A working-tree record keeps its overlay roles apart from the
+        // materialized paths.
+        let worktree = overlaid(
+            2,
+            &["Cargo.toml", "src/new.rs"],
+            &["src/new.rs"],
+            &["src/old.rs"],
+        );
+        let with_overlay = store
+            .publish_rust_source_listing(&retreed, input(worktree.clone()), Default::default())
+            .unwrap();
+        assert_eq!(
+            store
+                .rust_source_listing_bounded_record(&with_overlay, version)
+                .unwrap(),
+            Some(worktree)
+        );
+    }
+
+    #[test]
+    fn a_bounded_listing_registration_ends_with_its_guard() {
+        use brokk_bifrost_core::analyzer::project::{BoundedListingResolver, ListingUnknown};
+        struct Fixed;
+        impl BoundedListingResolver for Fixed {
+            fn omitted_files(
+                &self,
+                _: &[&str],
+            ) -> std::result::Result<Vec<String>, ListingUnknown> {
+                Ok(vec!["fixed".to_string()])
+            }
+            fn dirs_with_omissions(
+                &self,
+                _: &[&str],
+            ) -> std::result::Result<Vec<String>, ListingUnknown> {
+                Ok(Vec::new())
+            }
+            fn changed_paths(
+                &self,
+                _: &dyn BoundedListingResolver,
+            ) -> std::result::Result<Vec<String>, ListingUnknown> {
+                Ok(Vec::new())
+            }
+        }
+        let snapshot = |revision| WorkspaceSnapshotId {
+            workspace_id: WorkspaceId("c".repeat(64)),
+            lang: "rust".to_string(),
+            generation: GenerationId(1),
+            revision,
+        };
+        assert!(super::super::bounded_listing_resolver(&snapshot(7)).is_none());
+        let first = super::super::register_bounded_listing_resolver(
+            snapshot(7),
+            std::sync::Arc::new(Fixed),
+        );
+        let found = super::super::bounded_listing_resolver(&snapshot(7)).expect("registered");
+        assert_eq!(found.omitted_files(&[]).unwrap(), ["fixed"]);
+        assert!(super::super::bounded_listing_resolver(&snapshot(8)).is_none());
+        // A later registration replaces the entry, and the replaced guard
+        // dropping must not remove the newer one.
+        let second = super::super::register_bounded_listing_resolver(
+            snapshot(7),
+            std::sync::Arc::new(Fixed),
+        );
+        drop(first);
+        assert!(super::super::bounded_listing_resolver(&snapshot(7)).is_some());
+        drop(second);
+        assert!(super::super::bounded_listing_resolver(&snapshot(7)).is_none());
     }
 
     #[hardwon(
@@ -1527,7 +1798,11 @@ mod tests {
             None
         );
         let certified = store
-            .publish_rust_source_listing(&observable, version, Vec::new(), Default::default())
+            .publish_rust_source_listing(
+                &observable,
+                super::super::RustListingInput::new(version, Vec::new()),
+                Default::default(),
+            )
             .unwrap();
         assert_eq!(certified.revision, observable.revision + 1);
         assert_eq!(
@@ -1573,7 +1848,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                Some((version, Vec::new())),
+                Some(super::super::RustListingInput::new(version, Vec::new())),
             )
             .unwrap();
         store
@@ -1582,8 +1857,10 @@ mod tests {
                 super::super::write_rust_listing_certificate(
                     &tx,
                     &snapshot,
-                    version,
-                    &[("x.rs".to_string(), "test".to_string())],
+                    &super::super::RustListingInput::new(
+                        version,
+                        vec![("x.rs".to_string(), "test".to_string())],
+                    ),
                 )
             })
             .unwrap();
@@ -1716,6 +1993,103 @@ mod tests {
                     || line.contains("TEMP B-TREE")),
                 "{state:?}: {plan:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod selected_set_certificate_tests {
+    use super::super::{AnalyzerStore, WorkspaceFileRow};
+    use super::*;
+
+    #[test]
+    fn randomized_publication_retraction_and_selection_equal_fresh() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceId::for_root(temp.path());
+        let mut authored = std::collections::BTreeMap::new();
+        let mut random = 0x13066_u64;
+        for step in 0..160 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let path = format!("Source{}.cs", (random >> 32) % 7);
+            if random & 3 == 0 {
+                authored.remove(&path);
+            } else {
+                authored.insert(path, ((random >> 8) % 251 + 1) as u8);
+            }
+            let files = authored
+                .iter()
+                .map(|(path, byte)| WorkspaceFileRow {
+                    rel_path: path.clone(),
+                    blob_oid: Oid::hash_object(git2::ObjectType::Blob, &[*byte]).unwrap(),
+                    decision: Some(super::super::csharp_compilation::FileVersionDecision {
+                        decision_digest: [*byte; 32],
+                        assignment_digest: [byte.wrapping_add(1); 32],
+                    }),
+                })
+                .collect::<Vec<_>>();
+            let publish = |store: &AnalyzerStore| {
+                store
+                    .sync_workspace_inputs_for_workspace(
+                        &workspace,
+                        "csharp",
+                        GenerationId::BOOTSTRAP,
+                        &files,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                    )
+                    .unwrap()
+            };
+            let snapshot = publish(&store);
+            let fresh = AnalyzerStore::open_ephemeral().unwrap();
+            let fresh_snapshot = publish(&fresh);
+            let paths = authored.keys().cloned().collect::<Vec<_>>();
+            let read = store.begin_update_projection_read().unwrap();
+            assert!(
+                read.selected_set_complete(&snapshot).unwrap(),
+                "step {step}"
+            );
+            let projected = read.selected_variants(&snapshot, &paths).unwrap();
+            assert_eq!(
+                projected,
+                store
+                    .selected_parse_variants_for_paths(&snapshot, &paths)
+                    .unwrap()
+            );
+            assert_eq!(
+                projected,
+                fresh
+                    .selected_parse_variants_for_paths(&fresh_snapshot, &paths)
+                    .unwrap(),
+                "warm/fresh at step {step}"
+            );
+            drop(read);
+            if step % 5 == 0 && !files.is_empty() {
+                let selected = snapshot.clone();
+                store.execute_selection_publication(move |conn| {
+                    conn.execute("DELETE FROM csharp_file_version_decisions WHERE file_version_id=(SELECT file_version_id FROM workspace_file_versions WHERE workspace_id=?1 AND lang='csharp' AND generation=0 AND valid_until IS NULL LIMIT 1)",[selected.workspace_id.as_str()]).unwrap();
+                });
+                let read = store.begin_update_projection_read().unwrap();
+                assert!(
+                    !read.selected_set_complete(&snapshot).unwrap(),
+                    "retraction is Unknown"
+                );
+                drop(read);
+                let repaired = publish(&store);
+                assert!(
+                    store
+                        .begin_update_projection_read()
+                        .unwrap()
+                        .selected_set_complete(&repaired)
+                        .unwrap()
+                );
+            }
         }
     }
 }

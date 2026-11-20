@@ -261,7 +261,7 @@ mod tests {
                     kind: LookupKind::Derivation(kind),
                     question: LookupQuestion::Derivation(question),
                     ..
-                } if kind.0 == "derivation:rust_unit_inputs:v2" => question.subject,
+                } if kind.0 == "derivation:rust_unit_inputs:v3" => question.subject,
                 _ => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
@@ -2564,6 +2564,10 @@ impl SearchToolsService {
     #[hardwon(
         "#11546: removing an included file unplaced its whole host container, including unrelated sibling modules"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_rust_removed_included_file_unplaces_only_itself() {
         use brokk_bifrost_analysis::CancellationToken;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
@@ -3562,7 +3566,7 @@ impl SearchToolsService {
         // The kinds a route question can demand, by their registered ids.
         const KINDS: [&str; 5] = [
             "derivation:rust_unit_routes:v1",
-            "derivation:rust_unit_inputs:v2",
+            "derivation:rust_unit_inputs:v3",
             "derivation:rust_unit_naming:v1",
             "derivation:rust_unit_package_rows:v1",
             "derivation:rust_broad_file_units:v1",
@@ -3971,7 +3975,6 @@ impl SearchToolsService {
             budget:
                 brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
                     max_summary_expansions: baseline_work.summary_expansions,
-                    max_scope_nodes: baseline_work.scope_nodes,
                     ..Default::default()
                 },
             ..baseline_query
@@ -3988,7 +3991,7 @@ impl SearchToolsService {
             budget:
                 brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
                     max_summary_expansions: baseline_work.summary_expansions,
-                    max_scope_nodes: baseline_work.scope_nodes - 1,
+                    max_resolution_rounds: baseline_work.resolution_rounds - 1,
                     ..Default::default()
                 },
             ..baseline_query
@@ -3996,7 +3999,7 @@ impl SearchToolsService {
         assert!(matches!(
             selected_rust_definition_shadow_result(&analyzer, under_query),
             RustDefinitionShadowResult::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::ResolutionRounds,
                 ..
             }
         ));
@@ -4005,7 +4008,7 @@ impl SearchToolsService {
         let exhausted = BoundedReceiverQuery {
             budget:
                 brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                    max_scope_nodes: 0,
+                    max_resolution_rounds: 0,
                     ..Default::default()
                 },
             ..baseline_query
@@ -4014,7 +4017,7 @@ impl SearchToolsService {
         assert!(matches!(
             native,
             RustDefinitionShadowResult::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::ResolutionRounds,
                 ..
             }
         ));
@@ -4571,6 +4574,10 @@ impl SearchToolsService {
 
     /// The files whose persisted placements the selection unplaces when the
     /// overlay removes `removed` from `fixture`, read from the fill's own relation.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn unplaced_files_after_removing(
         fixture: &crate::inline_project::BuiltInlineTestProject,
         removed: &str,
@@ -5007,4 +5014,137 @@ impl SearchToolsService {
             );
         }
     }
+}
+
+use brokk_bifrost_test_macros::hardwon;
+
+#[test]
+#[hardwon(
+    "#14384: JVM provider hooks read the analyzer's model snapshot under an explicit operation authority"
+)]
+fn selected_operation_jvm_hooks_preserve_explicit_model_authority() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::{
+        AnalyzerQueryScope, capture_query_reads, current_model_set_digest,
+    };
+    use brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test;
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ResolvedActiveSemanticModels, SemanticModelOverlay,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+        SelectedResolutionStageOutcome, take_macro_frontier_cache_counts_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerConfig, Language, ReadKey, ReadLedger, WorkspaceAnalyzer,
+    };
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use std::{path::Path, sync::Arc};
+
+    // No JVM source is needed: selected provider discovery visits every linked hook.
+    for language in [Language::Java, Language::Kotlin, Language::Scala] {
+        assert!(brokk_bifrost_analysis::analyzer::languages::language_support(language).is_some());
+    }
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname = \"model_authority\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+        .file("src/lib.rs", "macro_rules! identity { ($value:expr) => { $value }; } pub struct Item; pub fn run() { let _ = identity!(Item); }")
+        .build();
+    let project = fixture.project_dyn();
+    let context = ephemeral_store_context(project.as_ref()).unwrap();
+    let workspace_id = context.workspace_id.clone();
+    let store = Arc::clone(&context.store);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+        context,
+    )
+    .unwrap();
+    let analyzer = workspace.analyzer();
+    assert!(analyzer.active_semantic_models().is_none());
+    let cancellation = CancellationToken::new();
+    let mut models = ResolvedActiveSemanticModels::default();
+    models.active_model_set_hash = "test-operation-authority-14384".to_owned();
+    let models = Arc::new(models);
+    let authority = Arc::new(
+        SemanticModelOverlay::build(
+            analyzer,
+            &models,
+            &cancellation,
+            u64::MAX,
+            store.retention_budget(),
+        )
+        .unwrap(),
+    );
+    let snapshots = store
+        .workspace_snapshots_for_current_languages(&workspace_id, &["rust".to_owned()])
+        .unwrap();
+    let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+    let services = selected_analyzer_services_for_test(analyzer);
+    let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+        analyzer,
+        Arc::new(ReadLedger::new()),
+        "policy=test.jvm-model-authority".to_owned(),
+    );
+    let _ = take_macro_frontier_cache_counts_for_test();
+    for _ in 0..2 {
+        let (_, reads) = capture_query_reads(analyzer, || {
+            let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+                .open_selected_resolution_operation(
+                    SelectedResolutionOperationInput::new(
+                        project.as_ref(),
+                        &workspace_id,
+                        &snapshots,
+                        &languages,
+                        &[],
+                    )
+                    .with_analyzer(&services)
+                    .with_model_authority(Some(authority.clone())),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("selected Rust operation must open");
+            };
+            let operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+            assert!(
+                operation
+                    .ensure_selected_rust_inputs(&cancellation)
+                    .unwrap()
+            );
+            assert!(matches!(
+                operation
+                    .prepare_selected_macro_frontiers_for_files(
+                        &[Path::new("src/lib.rs")],
+                        &cancellation,
+                    )
+                    .unwrap(),
+                SelectedResolutionStageOutcome::Ready
+            ));
+            operation.observe_macro_retention_result(true);
+        });
+        let digests = reads
+            .keys()
+            .into_iter()
+            .filter_map(|key| match key {
+                ReadKey::Models(digest) => Some(digest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            digests,
+            vec![current_model_set_digest(Some(
+                models.active_model_set_hash()
+            ))],
+            "JVM hooks must use the operation authority; reads: {:?}",
+            reads.keys()
+        );
+        assert!(reads.is_bounded(), "{:?}", reads.channels());
+    }
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test(),
+        (1, 1),
+        "the second operation must reuse the retained frontier"
+    );
 }

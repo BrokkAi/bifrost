@@ -159,6 +159,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         if prepared.dialect().language() != self.flavor.language() {
             return Err(SemanticProviderError::invalid_identity(format!(

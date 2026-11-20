@@ -31,6 +31,14 @@ struct ParameterBinding<'tree> {
     kind: DeclarationKind,
 }
 
+/// Grammar-owned syntax supplied to the shared formal traversal.
+#[doc(hidden)]
+pub struct ParameterSyntax<'tree> {
+    pub anchor: Node<'tree>,
+    pub name: Node<'tree>,
+    pub variadic: bool,
+}
+
 struct ParameterDeclaration<'tree> {
     declaration: Node<'tree>,
     names: Vec<Node<'tree>>,
@@ -1267,6 +1275,26 @@ fn parameter_declarations_with_step<'tree>(
             return None;
         }
         if node != root && is_parameter_owner(language, node.kind()) {
+            continue;
+        }
+
+        if is_parameter_container(language, node.kind())
+            && let Some(syntax) = language_support_for_hook(language, "formal_parameter_syntax")
+                .and_then(|support| support.formal_parameter_syntax(node, scope_step))
+        {
+            for formal in syntax? {
+                declarations.push(ParameterDeclaration {
+                    declaration: formal.anchor,
+                    names: vec![formal.name],
+                    kind: forced_kind.unwrap_or(if lambda {
+                        DeclarationKind::LambdaParameter
+                    } else {
+                        DeclarationKind::Parameter
+                    }),
+                    positions: 1,
+                    variadic: formal.variadic.then_some(FormalVariadicKind::Positional),
+                });
+            }
             continue;
         }
 
@@ -2834,7 +2862,7 @@ fn is_parameter_container(language: Language, kind: &str) -> bool {
         Language::Rust => matches!(kind, "parameters" | "closure_parameters"),
         Language::Php => kind == "formal_parameters",
         Language::Scala => matches!(kind, "parameters" | "class_parameters" | "bindings"),
-        Language::CSharp => kind == "parameter_list",
+        Language::CSharp => matches!(kind, "parameter_list" | "bracketed_parameter_list"),
         Language::Ruby => matches!(
             kind,
             "method_parameters" | "lambda_parameters" | "block_parameters"

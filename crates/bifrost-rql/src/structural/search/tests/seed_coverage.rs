@@ -22,7 +22,7 @@ fn empty_union_branches_preserve_unsupported_relation_coverage() {
             result
                 .diagnostics
                 .iter()
-                .any(|d| d.language == "java" && d.message.contains("unsupported_relation")),
+                .any(|d| d.language() == "java" && d.message().contains("unsupported_relation")),
             "{query}: {result:#?}"
         );
     }
@@ -112,7 +112,7 @@ fn path_language_scope_excludes_unselected_adapter_diagnostics() {
         !result
             .diagnostics
             .iter()
-            .any(|d| d.language == "python" && d.message.contains("unsupported_relation")),
+            .any(|d| d.language() == "python" && d.message().contains("unsupported_relation")),
         "{result:#?}"
     );
 }

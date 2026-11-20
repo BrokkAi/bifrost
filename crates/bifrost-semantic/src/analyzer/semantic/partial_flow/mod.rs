@@ -7,6 +7,10 @@
 //! only what one file proves.
 
 pub mod fixpoint;
+pub use fixpoint::{
+    GuardProjectionMode, compute_partial_flows_in_mode, partial_flows_from_projection_in_mode,
+};
+pub mod guard_bindings;
 pub mod ports;
 pub mod rules;
 

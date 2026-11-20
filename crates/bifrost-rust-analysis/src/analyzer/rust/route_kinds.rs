@@ -5,9 +5,10 @@ use brokk_bifrost_analysis::analyzer::derivation_host::{self, AnalyzerDerivation
 use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity;
 use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
-    RustSelectedUnitsPublication, rust_broad_file_units, rust_broad_placement_rows,
-    rust_crate_name_units, rust_file_units, rust_package_units, rust_selected_units_known,
-    rust_unit_dependents, rust_unit_file_activity, rust_unit_inputs, rust_unit_package_rows,
+    RustSelectedUnitsPublication, RustUnitAvailability, rust_broad_file_units,
+    rust_broad_placement_rows, rust_crate_name_units, rust_file_unit_availability, rust_file_units,
+    rust_package_units, rust_selected_units_known, rust_unit_availability, rust_unit_dependents,
+    rust_unit_file_activity, rust_unit_inputs, rust_unit_package_rows,
     rust_unit_placement_activity,
 };
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, QueryReadIncomplete};
@@ -32,64 +33,32 @@ use brokk_bifrost_rust::crate_naming::RustSelectedCargoNaming;
 use brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded;
 use brokk_bifrost_semantic::analyzer::semantic::derivation::{
     Computed, DerivationAuthority, DerivationFrame, DerivationKind, DerivationKindId,
-    DerivationQuestion, DerivationRevision, ReuseValidity, UnavailableCause, Verification,
+    DerivationQuestion, DerivationRevision, IncompleteReason, ReuseValidity, UnavailableCause,
+    Verification,
 };
 use git2::Oid;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// One unit of the selection, as a units kind listed it. Only the kinds that
-/// list units (`RustBroadFileUnits`, `RustFileUnits`, `RustPackageUnits`,
-/// `RustCrateNameUnits` and `RustUnitDependents`, each with
-/// `RustSelectedUnitsKnown` as a child) can make one, because the constructor is
-/// private to this module. `RustUnitRoutes`, `RustUnitPackageRows` and
-/// `RustTargetReachability` take no other key, so a route or package answer is
-/// always asked about a unit that a certified-or-flagged listing named.
-///
-/// `complete` is the completeness of the listing answer that named the unit,
-/// which re-reads the listing certificate at every binding. A composition ANDs
-/// it with the completeness of the answer it asks about, through
-/// [`Self::and_complete`]. The flag is not part of the unit's identity: two
-/// listings that name one unit name one key.
+/// A selected unit identity. Coverage belongs to the question that selected
+/// it; each consumer re-reads this unit's availability at its own binding.
 #[derive(Debug, Clone)]
 pub struct SelectedRustUnit {
     key: [u8; 32],
-    complete: bool,
 }
-
 impl SelectedRustUnit {
-    fn mint(key: [u8; 32], complete: bool) -> Self {
-        Self { key, complete }
+    fn mint(key: [u8; 32]) -> Self {
+        Self { key }
     }
-
-    /// A unit built to replay a recorded question. A replay re-demands the kind
-    /// to compare its projection, and never composes the answer, so the
-    /// listing's completeness is unknown and reads as incomplete.
     fn replayed(key: [u8; 32]) -> Self {
-        Self::mint(key, false)
+        Self::mint(key)
     }
-
-    /// Test fixtures name units from raw store rows, which no listing kind
-    /// produced. Production code cannot reach this: the feature is a
-    /// dev-dependency feature of the test crates.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn minted_by_test_fixture(key: [u8; 32], complete: bool) -> Self {
-        Self::mint(key, complete)
+    pub fn minted_by_test_fixture(key: [u8; 32]) -> Self {
+        Self::mint(key)
     }
-
     pub fn key(&self) -> &[u8; 32] {
         &self.key
-    }
-
-    /// Whether the listing that named this unit was complete.
-    pub fn complete(&self) -> bool {
-        self.complete
-    }
-
-    /// The completeness of an answer about this unit: the answer's own, and
-    /// the listing's that named the unit.
-    pub fn and_complete(&self, answer_complete: bool) -> bool {
-        self.complete && answer_complete
     }
 }
 
@@ -117,7 +86,7 @@ impl RetainedBytes for SelectedRustUnit {
 /// selected units once the question's completeness is known.
 trait UnitRows {
     type Selected: HashAnswer;
-    fn select(self, complete: bool) -> Self::Selected;
+    fn select(self) -> Self::Selected;
 }
 
 trait HashAnswer {
@@ -126,36 +95,34 @@ trait HashAnswer {
 
 impl UnitRows for Vec<[u8; 32]> {
     type Selected = Vec<SelectedRustUnit>;
-    fn select(self, complete: bool) -> Self::Selected {
-        self.into_iter()
-            .map(|key| SelectedRustUnit::mint(key, complete))
-            .collect()
+    fn select(self) -> Self::Selected {
+        self.into_iter().map(SelectedRustUnit::mint).collect()
     }
 }
 
 impl UnitRows for Vec<([u8; 32], String)> {
     type Selected = Vec<(SelectedRustUnit, String)>;
-    fn select(self, complete: bool) -> Self::Selected {
+    fn select(self) -> Self::Selected {
         self.into_iter()
-            .map(|(key, kind)| (SelectedRustUnit::mint(key, complete), kind))
+            .map(|(key, kind)| (SelectedRustUnit::mint(key), kind))
             .collect()
     }
 }
 
 impl UnitRows for Vec<([u8; 32], u32)> {
     type Selected = Vec<(SelectedRustUnit, u32)>;
-    fn select(self, complete: bool) -> Self::Selected {
+    fn select(self) -> Self::Selected {
         self.into_iter()
-            .map(|(key, ordinal)| (SelectedRustUnit::mint(key, complete), ordinal))
+            .map(|(key, ordinal)| (SelectedRustUnit::mint(key), ordinal))
             .collect()
     }
 }
 
 impl UnitRows for Vec<([u8; 32], String, String)> {
     type Selected = Vec<(SelectedRustUnit, String, String)>;
-    fn select(self, complete: bool) -> Self::Selected {
+    fn select(self) -> Self::Selected {
         self.into_iter()
-            .map(|(key, kind, root)| (SelectedRustUnit::mint(key, complete), kind, root))
+            .map(|(key, kind, root)| (SelectedRustUnit::mint(key), kind, root))
             .collect()
     }
 }
@@ -241,11 +208,10 @@ pub fn record_inactive_placement_gap(analyzer: &dyn IAnalyzer, file: &ProjectFil
     ));
 }
 
-/// The route evidence gaps among `reasons`, as the text each recorded. A usage
-/// entry point that captured the read incompleteness of its walk turns a
-/// non-empty list into a diagnostic.
+/// The route evidence gap multiset in canonical presentation order. Keep every
+/// recorded string and its multiplicity; capture order is not answer identity.
 pub fn route_evidence_gaps(reasons: &[QueryReadIncomplete]) -> Vec<String> {
-    reasons
+    let mut gaps = reasons
         .iter()
         .filter_map(|reason| match reason {
             QueryReadIncomplete::SemanticEvidenceGap(text)
@@ -256,7 +222,29 @@ pub fn route_evidence_gaps(reasons: &[QueryReadIncomplete]) -> Vec<String> {
             }
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    gaps.sort_by_cached_key(|text| {
+        QueryReadIncomplete::SemanticEvidenceGap(text.clone().into()).answer_order_key()
+    });
+    gaps
+}
+
+/// Render the complete gap multiset through the same canonical boundary on
+/// cold computation and warm replay. Never format raw capture order.
+pub(super) fn render_route_evidence_gaps(reasons: &[QueryReadIncomplete]) -> Option<String> {
+    let gaps = route_evidence_gaps(reasons);
+    (!gaps.is_empty()).then(|| format!("{gaps:?}"))
+}
+
+fn record_route_store_error(
+    error: impl Into<brokk_bifrost_analysis::analyzer::store::StoreError>,
+) -> String {
+    let error = error.into();
+    let message = error.to_string();
+    if !error.is_cancelled() {
+        derivation_host::with_current_analyzer(|analyzer| analyzer.record_query_failure(error));
+    }
+    message
 }
 
 /// The answer to a units question, naming every unit in it as selected.
@@ -271,7 +259,7 @@ fn read<T: UnitRows>(
         f(i, &s)
     }) {
         Ok(rows) => Computed::Available {
-            value: rows.select(complete),
+            value: rows.select(),
             complete,
             validity: ReuseValidity::Reusable,
             reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
@@ -279,8 +267,189 @@ fn read<T: UnitRows>(
         Err(e) => Computed::Unavailable(UnavailableCause::Failed(e.into())),
     }
 }
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+fn unit_intentionally_unavailable(unit: &[u8; 32]) -> Result<bool, String> {
+    let state = derivation_host::with_bound_inventory(|i| {
+        let snapshot = derivation_host::selected_rust_snapshot(i)?;
+        rust_unit_availability(i.connection(), &snapshot, unit).map_err(record_route_store_error)
+    })?;
+    match state {
+        Some(RustUnitAvailability::IntentionallyUnavailable { cause, .. }) => {
+            derivation_host::with_current_analyzer(|a| {
+                a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(format!("Rust route evidence incomplete: unit {unit:02x?}: target_root_unavailable {cause:?}").into()))
+            });
+            Ok(true)
+        }
+        // A stale unit can be an unavailable target whose state this head has
+        // not decided. Answering it as an ordinary unit could report a complete
+        // absence, so the derivation fails closed.
+        Some(RustUnitAvailability::Stale) => Err(format!(
+            "stale selected Rust unit {unit:02x?}: derivation or reconcile pending"
+        )),
+        Some(state) => {
+            state
+                .require_published_or_stale(unit)
+                .map_err(record_route_store_error)?;
+            Ok(false)
+        }
+        None => Ok(false),
+    }
+}
+
+fn availability_projection(
+    states: Vec<([u8; 32], RustUnitAvailability)>,
+) -> Result<([u8; 32], bool), String> {
+    let mut complete = true;
+    let mut digest = CanonicalHasher::new(b"rust-unit-availability:v1");
+    for (unit, state) in states {
+        state
+            .require_published_or_stale(&unit)
+            .map_err(record_route_store_error)?;
+        digest.value(&unit);
+        match state {
+            RustUnitAvailability::Published {
+                input,
+                complete: own,
+            } => {
+                digest.value(&[0]);
+                digest.value(&input);
+                digest.value(&[u8::from(own)]);
+                complete &= own;
+            }
+            RustUnitAvailability::IntentionallyUnavailable { cause, evidence } => {
+                digest.value(&[1]);
+                digest.value(&evidence);
+                complete = false;
+                derivation_host::with_current_analyzer(|a| {
+                    a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(format!("Rust route evidence incomplete: unit {unit:02x?}: target_root_unavailable {cause:?}").into()))
+                });
+            }
+            RustUnitAvailability::Unpublished => {
+                unreachable!("rejected by require_published_or_stale")
+            }
+            // Stale between an upgrade and reconcile: unknown, so incomplete, and
+            // the tag keeps the projection distinct from every current state.
+            RustUnitAvailability::Stale => {
+                digest.value(&[3]);
+                complete = false;
+            }
+        }
+    }
+    Ok::<_, String>((digest.finish(), complete))
+}
+
+/// Local coverage has its own projection so a changed gap or claim invalidates
+/// replay even when the selected healthy unit keys are unchanged.
+pub struct RustFileAvailability;
+impl DerivationKind for RustFileAvailability {
+    type Key = String;
+    type Output = [u8; 32];
+    const ID: DerivationKindId = DerivationKindId("derivation:rust_file_availability:v1");
+    const QUESTION_SHAPE:
+        brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily =
+        brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(
+            Self::ID,
+            true,
+            false,
+            true,
+            false,
+        );
+    const STRATUM: u16 = 0;
+    const VERIFY: Verification = Verification::Recompute;
+    const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
+    fn question(path: &String) -> DerivationQuestion {
+        question(None, Some(path.clone().into_boxed_str()), None)
+    }
+    fn key_from_question(q: &DerivationQuestion) -> Option<String> {
+        (q.language == Some(Language::Rust) && q.subject.is_none() && q.name.is_none())
+            .then(|| q.rel_path.as_deref().map(str::to_owned))
+            .flatten()
+    }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn compute<R: DerivationRevision, A: DerivationAuthority>(
+        &self,
+        _: &mut DerivationFrame<'_, R, A>,
+        path: &String,
+    ) -> Computed<[u8; 32]> {
+        let _scope =
+            attribution::enter_scope("rust_file_availability", CoverageClass::RecomputeOnCurrency);
+        let result = derivation_host::with_bound_inventory(|i| {
+            let s = derivation_host::selected_rust_snapshot(i)?;
+            let states = rust_file_unit_availability(i.connection(), &s, path)
+                .map_err(record_route_store_error)?;
+            availability_projection(states)
+        });
+        match result {
+            Ok((value, complete)) => Computed::Available {
+                value,
+                complete,
+                validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+            },
+            Err(error) => Computed::Unavailable(UnavailableCause::Failed(error.into())),
+        }
+    }
+    fn output_projection(value: &[u8; 32], hash: &mut CanonicalHasher) {
+        hash.value(value);
+    }
+}
+
+pub struct RustNameAvailability;
+impl DerivationKind for RustNameAvailability {
+    type Key = String;
+    type Output = [u8; 32];
+    const ID: DerivationKindId = DerivationKindId("derivation:rust_name_availability:v1");
+    const QUESTION_SHAPE:
+        brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily =
+        brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(
+            Self::ID,
+            true,
+            false,
+            false,
+            true,
+        );
+    const STRATUM: u16 = 0;
+    const VERIFY: Verification = Verification::Recompute;
+    const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
+    fn question(name: &Self::Key) -> DerivationQuestion {
+        question(None, None, Some(name.clone().into_boxed_str()))
+    }
+    fn key_from_question(q: &DerivationQuestion) -> Option<Self::Key> {
+        (q.language == Some(Language::Rust) && q.subject.is_none() && q.rel_path.is_none())
+            .then(|| q.name.as_deref().map(str::to_owned))
+            .flatten()
+    }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn compute<R: DerivationRevision, A: DerivationAuthority>(
+        &self,
+        _: &mut DerivationFrame<'_, R, A>,
+        name: &Self::Key,
+    ) -> Computed<Self::Output> {
+        let _scope =
+            attribution::enter_scope("rust_name_availability", CoverageClass::RecomputeOnCurrency);
+        let result = derivation_host::with_bound_inventory(|i| {
+            let s = derivation_host::selected_rust_snapshot(i)?;
+            let states=brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_name_unit_availability(i.connection(),&s,name).map_err(record_route_store_error)?;
+            availability_projection(states)
+        });
+        match result {
+            Ok((value, complete)) => Computed::Available {
+                value,
+                complete,
+                validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+            },
+            Err(error) => Computed::Unavailable(UnavailableCause::Failed(error.into())),
+        }
+    }
+    fn output_projection(value: &Self::Output, hash: &mut CanonicalHasher) {
+        hash.value(value);
+    }
+}
+
 fn project_answer<T: HashAnswer>(family: &'static str, value: &T, h: &mut CanonicalHasher) {
-    let mut answer = CanonicalHasher::new(family.as_bytes());
+    let mut answer = CanonicalHasher::new(b"rust-route-listing-answer:v2");
+    answer.value(family.as_bytes());
     value.append(&mut answer);
     h.value(&answer.finish());
 }
@@ -380,6 +549,7 @@ impl DerivationKind for RustSelectedUnitsKnown {
             && q.name.is_none())
         .then_some(0)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         _: &mut DerivationFrame<'_, R, A>,
@@ -391,7 +561,8 @@ impl DerivationKind for RustSelectedUnitsKnown {
         );
         let known = derivation_host::with_bound_inventory(|i| -> Result<_, String> {
             let s = derivation_host::selected_rust_snapshot(i)?;
-            let units = rust_selected_units_known(i.connection(), &s).map_err(|e| e.to_string())?;
+            let units =
+                rust_selected_units_known(i.connection(), &s).map_err(record_route_store_error)?;
             // An uncertified listing may have hidden any manifest or source
             // file, so even an empty or fully published unit set is not known
             // to be every unit.
@@ -400,7 +571,7 @@ impl DerivationKind for RustSelectedUnitsKnown {
                 &s,
                 brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(record_route_store_error)?;
             Ok((units, listing))
         });
         match known {
@@ -434,7 +605,7 @@ impl DerivationKind for RustSelectedUnitsKnown {
             }
             Ok((RustSelectedUnitsPublication::Unpublished(units), _)) => {
                 Computed::Unavailable(UnavailableCause::Failed(
-                    format!("unpublished selected Rust units: {units:02x?}").into(),
+                    format!("unpublished or stale selected Rust units: {units:02x?}").into(),
                 ))
             }
             Err(error) => Computed::Unavailable(UnavailableCause::Failed(error.into())),
@@ -464,22 +635,23 @@ type UnitMembers = (
 /// mounts at its path: an overlay's content for an edited file, `None` for a
 /// masked or removed one (never the revision's blob). Membership is the
 /// persisted unit's; a path the unit does not know does not join it.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn unit_members(unit: &[u8; 32]) -> Result<UnitMembers, String> {
     let root = derivation_host::with_current_analyzer(|a| a.project().root().to_path_buf());
     derivation_host::with_bound_inventory(|i| {
         let snapshot = derivation_host::selected_rust_snapshot(i)?;
         let package =
             AnalyzerStore::rust_selected_package_rows_for_unit(i.connection(), &snapshot, unit)
-                .map_err(|e| e.to_string())?;
+                .map_err(record_route_store_error)?;
         let placements = rust_broad_placement_rows(i.connection(), &snapshot, unit)
-            .map_err(|e| e.to_string())?;
+            .map_err(record_route_store_error)?;
         // Files no selected build is proved to compile, split by what the
         // activation proves. The activity is the store's one definition
         // (`rust_file_activity.sql`); a file without a stored placement is not
         // listed and keeps its existing treatment.
         let mut not_active = RustInactivePlacements::default();
-        for (path, activity) in
-            rust_unit_file_activity(i.connection(), &snapshot, unit).map_err(|e| e.to_string())?
+        for (path, activity) in rust_unit_file_activity(i.connection(), &snapshot, unit)
+            .map_err(record_route_store_error)?
         {
             match activity {
                 RustBlobActivity::Active => {}
@@ -497,7 +669,7 @@ fn unit_members(unit: &[u8; 32]) -> Result<UnitMembers, String> {
         }
         for (path, module_path, activity) in
             rust_unit_placement_activity(i.connection(), &snapshot, unit)
-                .map_err(|e| e.to_string())?
+                .map_err(record_route_store_error)?
         {
             not_active
                 .placements
@@ -521,7 +693,7 @@ fn unit_members(unit: &[u8; 32]) -> Result<UnitMembers, String> {
                         .as_deref()
                         .map(Oid::from_str)
                         .transpose()
-                        .map_err(|e| e.to_string())?,
+                        .map_err(record_route_store_error)?,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -530,7 +702,7 @@ fn unit_members(unit: &[u8; 32]) -> Result<UnitMembers, String> {
                 ProjectFile::new(root.clone(), path),
                 oid.map(|oid| Oid::from_str(&oid))
                     .transpose()
-                    .map_err(|e| e.to_string())?,
+                    .map_err(record_route_store_error)?,
             ));
         }
         members.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -562,6 +734,7 @@ impl DerivationKind for RustUnitNaming {
     fn key_from_question(q: &DerivationQuestion) -> Option<Self::Key> {
         RustUnitInputs::key_from_question(q)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         _: &mut DerivationFrame<'_, R, A>,
@@ -569,6 +742,18 @@ impl DerivationKind for RustUnitNaming {
     ) -> Computed<Self::Output> {
         let _scope =
             attribution::enter_scope("rust_unit_naming", CoverageClass::RecomputeOnCurrency);
+        match unit_intentionally_unavailable(unit) {
+            Ok(true) => {
+                return Computed::Available {
+                    value: Vec::new(),
+                    complete: false,
+                    validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                };
+            }
+            Ok(false) => {}
+            Err(error) => return Computed::Unavailable(UnavailableCause::Failed(error.into())),
+        }
         let result = (|| {
             let (_, members, _) = unit_members(unit)?;
             let mut paths = members
@@ -594,7 +779,7 @@ impl DerivationKind for RustUnitNaming {
                     &snapshot,
                     &paths,
                 )
-                .map_err(|e| e.to_string())
+                .map_err(record_route_store_error)
             })?;
             let mut records = mounts
                 .into_iter()
@@ -674,6 +859,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
     fn key_from_question(q: &DerivationQuestion) -> Option<Self::Key> {
         RustUnitInputs::key_from_question(q)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         _: &mut DerivationFrame<'_, R, A>,
@@ -691,7 +877,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
                     &snapshot,
                     unit,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(record_route_store_error)?;
                 let paths = rows
                     .into_iter()
                     .filter_map(|row| row.manifest_rel_path)
@@ -724,7 +910,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
                     &snapshot,
                     &paths,
                 )
-                .map_err(|e| e.to_string())
+                .map_err(record_route_store_error)
             })?;
             // Every configuration level from the owning manifest's directory up,
             // which includes the workspace root's levels.
@@ -747,7 +933,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
                     &snapshot,
                     &configuration_paths,
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(record_route_store_error)?
                 .map_err(|errors| format!("Unreadable selected Cargo configuration: {errors:?}"))
             })?;
             let documents = mounts
@@ -880,7 +1066,7 @@ pub struct RustUnitInputs;
 impl DerivationKind for RustUnitInputs {
     type Key = [u8; 32];
     type Output = [u8; 32];
-    const ID: DerivationKindId = DerivationKindId("derivation:rust_unit_inputs:v2");
+    const ID: DerivationKindId = DerivationKindId("derivation:rust_unit_inputs:v3");
     const QUESTION_SHAPE:
         brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily =
         brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(
@@ -901,6 +1087,7 @@ impl DerivationKind for RustUnitInputs {
             .then_some(q.subject)
             .flatten()
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         _: &mut DerivationFrame<'_, R, A>,
@@ -908,9 +1095,12 @@ impl DerivationKind for RustUnitInputs {
     ) -> Computed<Self::Output> {
         let _scope =
             attribution::enter_scope("rust_unit_inputs", CoverageClass::RecomputeOnCurrency);
+        if let Err(error) = unit_intentionally_unavailable(k) {
+            return Computed::Unavailable(UnavailableCause::Failed(error.into()));
+        }
         let result = derivation_host::with_bound_inventory(|i| {
             let s = derivation_host::selected_rust_snapshot(i)?;
-            rust_unit_inputs(i.connection(), &s, k).map_err(|e| e.to_string())
+            rust_unit_inputs(i.connection(), &s, k).map_err(record_route_store_error)
         });
         match result {
             Ok(Some((value, complete))) => {
@@ -929,7 +1119,7 @@ impl DerivationKind for RustUnitInputs {
                 }
             }
             Ok(None) => {
-                let mut h = CanonicalHasher::new(b"derivation:rust_unit_inputs:absent:v2");
+                let mut h = CanonicalHasher::new(b"derivation:rust_unit_inputs:absent:v3");
                 h.value(k);
                 Computed::Available {
                     value: h.finish(),
@@ -969,6 +1159,7 @@ impl DerivationKind for RustUnitDependents {
             .then_some(q.subject)
             .flatten()
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         frame: &mut DerivationFrame<'_, R, A>,
@@ -979,7 +1170,7 @@ impl DerivationKind for RustUnitDependents {
             Err(cause) => return Computed::Unavailable(cause),
         };
         read("rust_unit_dependents", complete, |i, s| {
-            rust_unit_dependents(i.connection(), s, k).map_err(|e| e.to_string())
+            rust_unit_dependents(i.connection(), s, k).map_err(record_route_store_error)
         })
     }
     fn output_projection(v: &Self::Output, h: &mut CanonicalHasher) {
@@ -992,13 +1183,16 @@ macro_rules! path_kind {
  impl DerivationKind for $t {
   type Key=String; type Output=$output;
   const ID:DerivationKindId=DerivationKindId($id);
-  const QUESTION_SHAPE: brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily = brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(Self::ID, true, false, path_kind!(@is_path $field), path_kind!(@is_name $field)); const STRATUM:u16=1; const VERIFY:Verification=Verification::Recompute; const CHILDREN:&'static [(DerivationKindId,u16)]=&[(RustSelectedUnitsKnown::ID,0)];
+  const QUESTION_SHAPE: brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily = brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(Self::ID, true, false, path_kind!(@is_path $field), path_kind!(@is_name $field)); const STRATUM:u16=1; const VERIFY:Verification=Verification::Recompute; const CHILDREN:&'static [(DerivationKindId,u16)]=&[(RustSelectedUnitsKnown::ID,0),(RustFileAvailability::ID,0),(RustNameAvailability::ID,0)];
   fn question(k:&Self::Key)->DerivationQuestion { question(None, path_kind!(@path $field,k),path_kind!(@name $field,k)) }
   fn key_from_question(q:&DerivationQuestion)->Option<Self::Key> { if q.language==Some(Language::Rust)&&q.subject.is_none()&&path_kind!(@other_empty $field,q) { q.$field.as_deref().map(str::to_owned) } else { None } }
-  fn compute<R:DerivationRevision,A:DerivationAuthority>(&self,frame:&mut DerivationFrame<'_,R,A>,k:&Self::Key)->Computed<Self::Output> { let complete=match selected_units_known(frame) { Ok(complete)=>complete, Err(cause)=>return Computed::Unavailable(cause) }; read($family,complete,|i,s|$read(i.connection(),s,k).map_err(|e|e.to_string())) }
+  #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+  fn compute<R:DerivationRevision,A:DerivationAuthority>(&self,frame:&mut DerivationFrame<'_,R,A>,k:&Self::Key)->Computed<Self::Output> { let complete=match selected_units_known(frame) { Ok(complete)=>complete, Err(cause)=>return Computed::Unavailable(cause) }; let complete = path_kind!(@local $field, frame, k, complete); read($family,complete,|i,s|$read(i.connection(),s,k).map_err(record_route_store_error)) }
   fn output_projection(v:&Self::Output,h:&mut CanonicalHasher) { project_answer($family,v,h); }
  }
  };
+ (@local rel_path,$frame:ident,$k:ident,$complete:ident)=>{match $frame.demand::<RustFileAvailability>($k) { Demanded::Available { complete: local,.. }=>$complete && local, Demanded::Unavailable(cause)=>return Computed::Unavailable(cause) }};
+ (@local name,$frame:ident,$k:ident,$complete:ident)=>{match $frame.demand::<RustNameAvailability>($k) { Demanded::Available {complete:local,..}=>$complete&&local,Demanded::Unavailable(cause)=>return Computed::Unavailable(cause) }};
  (@is_path rel_path)=>{true}; (@is_path name)=>{false};
  (@is_name name)=>{true}; (@is_name rel_path)=>{false};
  (@path rel_path,$k:ident)=>{Some($k.clone().into_boxed_str())}; (@path name,$k:ident)=>{None};
@@ -1042,7 +1236,10 @@ impl DerivationKind for RustCrateNameUnits {
         );
     const STRATUM: u16 = 1;
     const VERIFY: Verification = Verification::Recompute;
-    const CHILDREN: &'static [(DerivationKindId, u16)] = &[(RustSelectedUnitsKnown::ID, 0)];
+    const CHILDREN: &'static [(DerivationKindId, u16)] = &[
+        (RustSelectedUnitsKnown::ID, 0),
+        (RustNameAvailability::ID, 0),
+    ];
     fn question(k: &Self::Key) -> DerivationQuestion {
         question(None, None, Some(normalize_crate_name(k).into_boxed_str()))
     }
@@ -1051,6 +1248,7 @@ impl DerivationKind for RustCrateNameUnits {
             .then(|| q.name.as_deref().map(normalize_crate_name))
             .flatten()
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         frame: &mut DerivationFrame<'_, R, A>,
@@ -1061,8 +1259,14 @@ impl DerivationKind for RustCrateNameUnits {
             Err(cause) => return Computed::Unavailable(cause),
         };
         let normalized = normalize_crate_name(name);
+        let complete = match frame.demand::<RustNameAvailability>(&normalized) {
+            Demanded::Available {
+                complete: local, ..
+            } => complete && local,
+            Demanded::Unavailable(cause) => return Computed::Unavailable(cause),
+        };
         read("rust_crate_name_units", complete, |i, s| {
-            rust_crate_name_units(i.connection(), s, &normalized).map_err(|e| e.to_string())
+            rust_crate_name_units(i.connection(), s, &normalized).map_err(record_route_store_error)
         })
     }
     fn output_projection(v: &Self::Output, h: &mut CanonicalHasher) {
@@ -1354,6 +1558,7 @@ impl DerivationKind for RustUnitRoutes {
     fn key_from_question(q: &DerivationQuestion) -> Option<Self::Key> {
         RustUnitInputs::key_from_question(q).map(SelectedRustUnit::replayed)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         frame: &mut DerivationFrame<'_, R, A>,
@@ -1370,7 +1575,7 @@ impl DerivationKind for RustUnitRoutes {
             let connection = inventory.connection();
             let routes =
                 AnalyzerStore::rust_summary_cargo_route_rows_for_unit(connection, &snapshot, unit)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(record_route_store_error)?;
             Ok::<_, String>((snapshot, routes))
         });
         let (snapshot, routes) = match read {
@@ -1439,7 +1644,7 @@ impl DerivationKind for RustUnitRoutes {
                 &oids,
                 &progress,
             )
-            .map_err(|error| error.to_string())
+            .map_err(record_route_store_error)
         });
         let stored = match stored {
             Ok(Some(stored)) => stored,
@@ -1849,6 +2054,7 @@ impl DerivationKind for RustUnitPackageRows {
     fn key_from_question(q: &DerivationQuestion) -> Option<Self::Key> {
         RustUnitInputs::key_from_question(q).map(SelectedRustUnit::replayed)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         _: &mut DerivationFrame<'_, R, A>,
@@ -1857,10 +2063,22 @@ impl DerivationKind for RustUnitPackageRows {
         let unit = unit.key();
         let _scope =
             attribution::enter_scope("rust_unit_package_rows", CoverageClass::RecomputeOnCurrency);
+        match unit_intentionally_unavailable(unit) {
+            Ok(true) => {
+                return Computed::Available {
+                    value: Vec::new(),
+                    complete: false,
+                    validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                };
+            }
+            Ok(false) => {}
+            Err(error) => return Computed::Unavailable(UnavailableCause::Failed(error.into())),
+        }
         let read = derivation_host::with_bound_inventory(|inventory| {
             let snapshot = derivation_host::selected_rust_snapshot(inventory)?;
             rust_unit_package_rows(inventory.connection(), &snapshot, unit)
-                .map_err(|error| error.to_string())
+                .map_err(record_route_store_error)
         });
         let (rows, mut complete) = match read {
             Ok(Some((rows, complete))) => {
@@ -1929,6 +2147,8 @@ impl DerivationKind for RustUnitPackageRows {
 
 pub fn register(d: &AnalyzerDerivations) {
     d.register(RustSelectedUnitsKnown);
+    d.register(RustFileAvailability);
+    d.register(RustNameAvailability);
     d.register(RustUnitInputs);
     d.register(RustUnitConfiguration);
     d.register(RustUnitNaming);
@@ -2044,6 +2264,7 @@ impl DerivationKind for RustLocalGlobNameAbsence {
         }
         Some((q.rel_path.as_deref()?.into(), q.name.as_deref()?.into()))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         frame: &mut DerivationFrame<'_, R, A>,
@@ -2055,7 +2276,7 @@ impl DerivationKind for RustLocalGlobNameAbsence {
         );
         let result = (|| -> Result<_, String> {
             let (start, segments, namespace, name): (usize, Vec<String>, String, String) =
-                serde_json::from_str(&key.1).map_err(|e| e.to_string())?;
+                serde_json::from_str(&key.1).map_err(|error| error.to_string())?;
             let namespace = match namespace.as_str() {
                 "type" => brokk_bifrost_rust::graph_support::RustGlobNamespace::Type,
                 "macro" => brokk_bifrost_rust::graph_support::RustGlobNamespace::Macro,
@@ -2065,9 +2286,9 @@ impl DerivationKind for RustLocalGlobNameAbsence {
                 // The bridge admits only a selection whose changes cannot reach
                 // this glob's closure; a bound inventory that still overlays a
                 // file the closure lists answers from rows that file made stale.
-                let overlaid = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_selection_overlay_paths(inventory.connection()).map_err(|e| e.to_string())?;
+                let overlaid = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_selection_overlay_paths(inventory.connection()).map_err(record_route_store_error)?;
                 if !overlaid.is_empty()
-                    && brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_local_glob_closure_reads_paths(inventory.connection(), &key.0, &overlaid).map_err(|e| e.to_string())?
+                    && brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_local_glob_closure_reads_paths(inventory.connection(), &key.0, &overlaid).map_err(record_route_store_error)?
                 {
                     return Ok(brokk_bifrost_rust::graph_support::RustGlobNameAbsence::Incomplete);
                 }
@@ -2079,7 +2300,7 @@ impl DerivationKind for RustLocalGlobNameAbsence {
                     namespace,
                     &name,
                 )
-                .map_err(|e| e.to_string())
+                .map_err(record_route_store_error)
             })
         })();
         let answer = match result {
@@ -2105,7 +2326,9 @@ impl DerivationKind for RustLocalGlobNameAbsence {
                 ..
             } => value,
             Demanded::Available { .. } => {
-                return Computed::Unavailable(UnavailableCause::ValidationFailed);
+                return Computed::Unavailable(UnavailableCause::Incomplete(
+                    IncompleteReason::Answer,
+                ));
             }
             Demanded::Unavailable(cause) => return Computed::Unavailable(cause),
         };
@@ -2123,9 +2346,8 @@ impl DerivationKind for RustLocalGlobNameAbsence {
             let dependencies = match dependencies {
                 Ok(value) => value,
                 Err(error) => {
-                    return Computed::Unavailable(UnavailableCause::Failed(
-                        error.to_string().into(),
-                    ));
+                    record_route_store_error(error);
+                    return Computed::Unavailable(UnavailableCause::StoreFailure);
                 }
             };
             for dependency in dependencies {
@@ -2134,7 +2356,9 @@ impl DerivationKind for RustLocalGlobNameAbsence {
                 match frame.demand::<RustUnitInputs>(&dependency) {
                     Demanded::Available { complete: true, .. } => (),
                     Demanded::Available { .. } => {
-                        return Computed::Unavailable(UnavailableCause::ValidationFailed);
+                        return Computed::Unavailable(UnavailableCause::Incomplete(
+                            IncompleteReason::Answer,
+                        ));
                     }
                     Demanded::Unavailable(cause) => return Computed::Unavailable(cause),
                 }
@@ -2161,6 +2385,117 @@ mod tests {
     use brokk_bifrost_core::retention_budget::RetentionBudget;
     use brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#13337: route input receipts omitted gap-derived file and placement activity")]
+    fn activity_changes_invalidate_route_inputs_while_inventory_stays_open() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"activity\"\nversion = \"0.1.0\"\n",
+            )
+            .file("src/lib.rs", "pub struct Item;\n")
+            .build();
+        let workspace = project.certified_workspace_analyzer(Default::default());
+        let analyzer = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+            super::super::RustAnalyzer,
+        >(workspace.analyzer())
+        .unwrap();
+        let store = workspace.store().unwrap();
+        // Keep the same summary, broad bit and source bytes. Only the decoded
+        // activity answer changes, so a Boolean-only receipt cannot detect it.
+        let summary = store.execute_selection_publication(move |conn| {
+            let _fixture = brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(conn);
+            let summary: i64 = conn.query_row(
+                "SELECT summary_id FROM rust_resolution_unit_summary_contexts WHERE crate_name='activity'",
+                [], |row| row.get(0),
+            ).unwrap();
+            conn.execute(
+                "UPDATE rust_resolution_unit_summary_contexts SET broad_complete=0 WHERE summary_id=?1",
+                [summary],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO rust_resolution_unit_summary_gaps(summary_id,gap_kind,subject,detail) VALUES(?1,'unknown_activation','crate::ghost',jsonb(?2))",
+                rusqlite::params![summary, r#"{"path":"src/ghost_a.rs"}"#],
+            ).unwrap();
+            summary
+        });
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(10_000_000));
+        let read_answer = |host: &AnalyzerDerivations| {
+            let read = analyzer
+                .open_selected_rust_inventory(
+                    &brokk_bifrost_core::cancellation::CancellationToken::default(),
+                )
+                .unwrap();
+            let brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventoryOutcome::Ready(read) = read else { panic!("selected inventory unavailable") };
+            let unit = match host.demand::<RustFileUnits>(analyzer, &read, &"src/lib.rs".to_owned())
+            {
+                Demanded::Available { value, .. } => value[0].clone(),
+                Demanded::Unavailable(cause) => panic!("membership: {cause:?}"),
+            };
+            let input = match host.demand::<RustUnitInputs>(analyzer, &read, unit.key()) {
+                Demanded::Available {
+                    value, complete, ..
+                } => {
+                    assert!(!complete, "the broad inventory stays open");
+                    *value
+                }
+                Demanded::Unavailable(cause) => panic!("inputs: {cause:?}"),
+            };
+            let routes = match host.demand::<RustUnitRoutes>(analyzer, &read, &unit) {
+                Demanded::Available {
+                    identity, complete, ..
+                } => {
+                    assert!(!complete);
+                    identity
+                }
+                Demanded::Unavailable(cause) => panic!("routes: {cause:?}"),
+            };
+            (input, routes)
+        };
+        let initial = read_answer(&host);
+        store.execute_selection_publication(move |conn| {
+            let _fixture = brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(conn);
+            conn.execute(
+                "UPDATE rust_resolution_unit_summary_gaps SET detail=jsonb(?2) WHERE summary_id=?1 AND gap_kind='unknown_activation' AND subject='crate::ghost'",
+                rusqlite::params![summary, r#"{"path":"src/ghost_b.rs"}"#],
+            ).unwrap();
+        });
+        let file_changed = read_answer(&host);
+        let scratch = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(10_000_000));
+        assert_eq!(
+            file_changed,
+            read_answer(&scratch),
+            "warm routes must equal fresh routes after a gap path edit"
+        );
+        assert_ne!(initial.0, file_changed.0, "file activity must be recorded");
+        assert_ne!(
+            initial.1, file_changed.1,
+            "BaseInputs must recompute routes"
+        );
+        store.execute_selection_publication(move |conn| {
+            let _fixture = brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(conn);
+            conn.execute(
+                "UPDATE rust_resolution_unit_summary_gaps SET subject='crate' WHERE summary_id=?1 AND gap_kind='unknown_activation' AND subject='crate::ghost'",
+                [summary],
+            ).unwrap();
+        });
+        let placement_changed = read_answer(&host);
+        assert_ne!(
+            file_changed.0, placement_changed.0,
+            "placement activity must be recorded"
+        );
+        assert_ne!(
+            file_changed.1, placement_changed.1,
+            "routes must see the new placement activity"
+        );
+        let scratch = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(10_000_000));
+        assert_eq!(
+            placement_changed,
+            read_answer(&scratch),
+            "warm routes must equal fresh routes after a placement edit"
+        );
+    }
 
     #[test]
     #[hardwon("#9737: an empty selected Rust unit set was complete without a listing certificate")]
@@ -2193,8 +2528,10 @@ mod tests {
             .store
             .publish_rust_source_listing(
                 &uncertified,
-                brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
-                vec![("x.rs".to_string(), "unreadable".to_string())],
+                brokk_bifrost_analysis::analyzer::store::RustListingInput::new(
+                    brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
+                    vec![("x.rs".to_string(), "unreadable".to_string())],
+                ),
                 Default::default(),
             )
             .unwrap();
@@ -2209,8 +2546,10 @@ mod tests {
             .store
             .publish_rust_source_listing(
                 &failed,
-                brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
-                Vec::new(),
+                brokk_bifrost_analysis::analyzer::store::RustListingInput::new(
+                    brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
+                    Vec::new(),
+                ),
                 Default::default(),
             )
             .unwrap();
@@ -2307,7 +2646,7 @@ mod tests {
         };
         // An absent unit token is valid stratum-zero evidence, but it cannot
         // certify an empty route fragment or composed reachability answer.
-        let absent = SelectedRustUnit::minted_by_test_fixture([0; 32], true);
+        let absent = SelectedRustUnit::minted_by_test_fixture([0; 32]);
         assert!(!matches!(
             host.demand::<RustUnitRoutes>(analyzer, &read, &absent),
             Demanded::Available { complete: true, .. }

@@ -658,6 +658,7 @@ fn prepare_resolution_bundle_rows(
     if !prepare_lexical_rows(lowered, &keys, &mut rows, cancellation) {
         return ResolutionInteriorPreparation::Cancelled;
     }
+    let mut prepare_gap_work = crate::analyzer::span_index::SpanScanWork::default();
     if !prepare_common_rows(
         lowered,
         &keys,
@@ -665,6 +666,7 @@ fn prepare_resolution_bundle_rows(
         source,
         source_text,
         &mut rows,
+        &mut prepare_gap_work,
         cancellation,
     ) || !prepare_typed_rows(lowered, &keys, &mut rows, cancellation)
         || !prepare_typed_fact_lookups(lowered, &mut rows, cancellation)
@@ -672,6 +674,16 @@ fn prepare_resolution_bundle_rows(
     {
         return ResolutionInteriorPreparation::Cancelled;
     }
+    crate::profiling::note_with(|| {
+        format!(
+            "resolution_prepare.rust_gap_scan_work fragment={:?} lowering={:?} (total={}) prepare={:?} (total={})",
+            lexical.fragment(),
+            lowered.rust_gap_scan_work,
+            lowered.rust_gap_scan_work.total(),
+            prepare_gap_work,
+            prepare_gap_work.total(),
+        )
+    });
     // Header rows are derived once per path and once per gap, so the same
     // distinct discovery shape is produced many times. The relation is the
     // distinct set.
@@ -731,6 +743,7 @@ fn prepare_resolution_bundle_rows(
     ResolutionInteriorPreparation::Prepared(Box::new(bundle))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_common_rows(
     lowered: &LoweredResolutionFactsWithIdentityCatalog,
     keys: &ResolutionLocalKeys,
@@ -738,6 +751,7 @@ fn prepare_common_rows(
     source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
     source_text: Option<&str>,
     rows: &mut PreparedResolutionBundleRows,
+    gap_scan_work: &mut crate::analyzer::span_index::SpanScanWork,
     cancellation: &CancellationToken,
 ) -> bool {
     let common = lowered.common();
@@ -749,6 +763,23 @@ fn prepare_common_rows(
             return false;
         }
         rows.extern_aliases.push(row![*site, *scope, name.clone()]);
+    }
+    for fact in &common.shared_language.implicit_root_candidates {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.implicit_root_candidates.push(row![
+            fact.definition.get(),
+            fact.reference.get(),
+            keys.semantic(fact.frontier)
+        ]);
+    }
+    for fact in &common.shared_language.declaration_modifiers {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.declaration_modifiers
+            .push(row![fact.definition.get(), i64::from(fact.partial)]);
     }
     for fact in &common.shared_language.csharp_friend_attributes {
         if cancellation.is_cancelled() {
@@ -1259,6 +1290,9 @@ fn prepare_common_rows(
             }
         }
     }
+    if let Some(index) = &structural_index {
+        *gap_scan_work = index.work();
+    }
     true
 }
 
@@ -1557,6 +1591,7 @@ struct RustGapSpanIndexes {
     names: crate::analyzer::span_index::SpanIndex<(usize, usize)>,
     unknown: crate::analyzer::span_index::SpanIndex<()>,
     globs: crate::analyzer::span_index::SpanIndex<()>,
+    source_scan_steps: usize,
 }
 
 impl RustGapSpanIndexes {
@@ -1564,10 +1599,13 @@ impl RustGapSpanIndexes {
         let mut names = Vec::new();
         let mut unknown = Vec::new();
         let mut globs = Vec::new();
+        let mut source_scan_steps = 0;
         for region in source.structural.recovered_regions() {
+            source_scan_steps += 1;
             unknown.push((region.start_byte, region.end_byte, ()));
         }
         for import in &source.imports {
+            source_scan_steps += 1;
             let range = source.occurrences.occurrence(import.declaration).range;
             if import.is_wildcard {
                 globs.push((range.start_byte, range.end_byte, ()));
@@ -1577,6 +1615,7 @@ impl RustGapSpanIndexes {
             }
         }
         for node in source.structural.nodes() {
+            source_scan_steps += 1;
             if let Some(name) = node.name {
                 let range = source.occurrences.occurrence(name).range;
                 names.push((
@@ -1593,7 +1632,19 @@ impl RustGapSpanIndexes {
             names: crate::analyzer::span_index::SpanIndex::new(names),
             unknown: crate::analyzer::span_index::SpanIndex::new(unknown),
             globs: crate::analyzer::span_index::SpanIndex::new(globs),
+            source_scan_steps,
         }
+    }
+
+    fn work(&self) -> crate::analyzer::span_index::SpanScanWork {
+        let mut work = crate::analyzer::span_index::SpanScanWork {
+            indexed_entries: self.source_scan_steps,
+            query_steps: 0,
+        };
+        work.record_index(&self.names);
+        work.record_index(&self.unknown);
+        work.record_index(&self.globs);
+        work
     }
 
     fn glob_import_site(
@@ -2248,6 +2299,29 @@ fn prepare_typed_rows(
                     && target_role == Some(ResolutionTypeSlotRole::CallResult),
                 "unwrap transfer has inconsistent roles or transform: {rule:?}"
             ),
+            ResolutionTypeTransferKind::BindingMode
+            | ResolutionTypeTransferKind::BindingModeScrutinee => assert!(
+                (
+                    rule.indirection_delta(),
+                    rule.reference_indirection_delta(),
+                    rule.value_transform()
+                ) == if transfer.kind() == ResolutionTypeTransferKind::BindingMode {
+                    (
+                        1,
+                        1,
+                        TypeTransferValueTransform::ToRuntime { addressable: false },
+                    )
+                } else {
+                    (0, 0, TypeTransferValueTransform::ToNoValue)
+                } && matches!(
+                    source_role,
+                    Some(
+                        ResolutionTypeSlotRole::CallResult
+                            | ResolutionTypeSlotRole::ExpressionValue
+                    )
+                ) && target_role == Some(ResolutionTypeSlotRole::ExpressionValue),
+                "binding-mode transfer has an unapproved tuple or inconsistent roles: {rule:?}"
+            ),
             ResolutionTypeTransferKind::ComponentElement
             | ResolutionTypeTransferKind::ComponentKey
             | ResolutionTypeTransferKind::ComponentValue
@@ -2319,7 +2393,7 @@ fn prepare_typed_rows(
                     ResolutionTypeSlotRole::CallResult,
                 BindingProjectionKind::TargetDeclaredValueType
                 | BindingProjectionKind::TargetTypeOrDeclaredValueType
-                | BindingProjectionKind::NonInvokingMemberReference
+                | BindingProjectionKind::BindingOnlyMemberReference
                 | BindingProjectionKind::BareTermBinding
                 | BindingProjectionKind::BareTermBindingNoExpectedType => {
                     ResolutionTypeSlotRole::ExpressionValue
@@ -3659,32 +3733,12 @@ mod tests {
 mod span_index_regressions {
     use super::*;
     use crate::analyzer::resolution::{BindingFragmentId, test_shared_names};
+    use crate::analyzer::span_index::SpanScanWork;
     use brokk_bifrost_test_macros::hardwon;
 
-    fn thread_ticks() -> u64 {
-        // Linux operator measurements report these at `getconf CLK_TCK` ticks/s.
-        // Other platforms still run the regression using elapsed durations.
-        std::fs::read_to_string("/proc/thread-self/stat")
-            .ok()
-            .and_then(|stat| stat.rsplit_once(')').map(|(_, fields)| fields.to_owned()))
-            .map(|fields| {
-                fields
-                    .split_whitespace()
-                    .skip(11)
-                    .take(2)
-                    .filter_map(|field| field.parse::<u64>().ok())
-                    .sum()
-            })
-            .unwrap_or(0)
-    }
-
-    fn measure(
-        source: &str,
-    ) -> (
-        PreparedResolutionBundleRows,
-        std::time::Duration,
-        std::time::Duration,
-    ) {
+    /// Returns the prepared rows and the deterministic span-scan work counts
+    /// for lowering and common preparation (#12997, #14537).
+    fn measure(source: &str) -> (PreparedResolutionBundleRows, SpanScanWork, SpanScanWork) {
         let _support =
             crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
                 Language::Rust,
@@ -3704,16 +3758,13 @@ mod span_index_regressions {
             source,
             &tree,
         );
-        let cpu_start = thread_ticks();
-        let start = std::time::Instant::now();
         let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
             BindingFragmentId::for_test(b"12997"),
             test_shared_names(),
             Language::Rust,
             &parsed.resolution_facts,
         );
-        let lowering = start.elapsed();
-        let lowering_cpu = thread_ticks() - cpu_start;
+        let lowering_work = lowered.rust_gap_scan_work;
         let cancellation = CancellationToken::new();
         let keys = ResolutionLocalKeys::new(&lowered, &cancellation).unwrap();
         let unit_keys = lowered
@@ -3724,8 +3775,7 @@ mod span_index_regressions {
             .map(|(index, fact)| (fact.unit.clone(), i64::try_from(index).unwrap()))
             .collect();
         let mut rows = PreparedResolutionBundleRows::default();
-        let cpu_start = thread_ticks();
-        let start = std::time::Instant::now();
+        let mut prepare_work = SpanScanWork::default();
         assert!(prepare_common_rows(
             &lowered,
             &keys,
@@ -3733,13 +3783,11 @@ mod span_index_regressions {
             parsed.source_facts.as_ref(),
             Some(source),
             &mut rows,
+            &mut prepare_work,
             &cancellation
         ));
-        let prepare = start.elapsed();
-        let prepare_cpu = thread_ticks() - cpu_start;
-        eprintln!("lowering_cpu_ticks={lowering_cpu} common_prepare_cpu_ticks={prepare_cpu}");
         eprintln!(
-            "bytes={} gaps={} routes={} segments={} structural_nodes={} candidates={} lowering={lowering:?} common_prepare={prepare:?}",
+            "bytes={} gaps={} routes={} segments={} structural_nodes={} candidates={} lowering_work={lowering_work:?} prepare_work={prepare_work:?}",
             source.len(),
             parsed.resolution_facts.gaps.len(),
             parsed.resolution_facts.root_references.len(),
@@ -3753,7 +3801,7 @@ mod span_index_regressions {
                 .len(),
             rows.rust_reverse_gap_candidates.len()
         );
-        (rows, lowering, prepare)
+        (rows, lowering_work, prepare_work)
     }
 
     #[test]
@@ -3770,31 +3818,59 @@ mod span_index_regressions {
     }
 
     #[test]
-    #[hardwon("#12997: per-gap route and structural scans made one large Rust blob quadratic")]
+    #[hardwon(
+        "#12997: per-gap route and structural scans made one large Rust blob quadratic; #14537: counted, not timed"
+    )]
     fn span_index_file_scaling() {
-        let mut previous = None;
-        for count in [256, 512, 1024] {
+        let sizes = [256usize, 512, 1024];
+        let mut lowering_by_size = Vec::with_capacity(sizes.len());
+        let mut prepare_by_size = Vec::with_capacity(sizes.len());
+        for count in sizes {
             let source = (0..count)
                 .map(|i| {
-                    format!("fn f{i}() {{ callbacks[0]().inspect(); module::Thing::call(); }}\n")
+                    format!("use m{i}::{{}};\nuse g{i}::*;\nfn r{i}() {{ let x = ; }}\nfn f{i}() {{ callbacks[0]().inspect(); module::Thing::call(); }}\n")
                 })
                 .collect::<String>();
-            // The minimum rejects scheduler pauses and cold-start noise. Keep
-            // every input uncapped so quadratic work still fails this guard.
-            let cost = (0..5)
-                .map(|_| {
-                    let (_, lowering, prepare) = measure(&source);
-                    lowering + prepare
-                })
-                .min()
-                .unwrap();
-            if let Some(previous) = previous {
-                assert!(
-                    cost < previous * 3,
-                    "doubling source should stay near linear: {previous:?} -> {cost:?}"
-                );
-            }
-            previous = Some(cost);
+            let (_, lowering_work, prepare_work) = measure(&source);
+            assert!(
+                lowering_work.query_steps > 0 && prepare_work.query_steps > 0,
+                "scaling guard must observe non-zero span query work at size {count}: \
+                 lowering={lowering_work:?} prepare={prepare_work:?}"
+            );
+            lowering_by_size.push((count, lowering_work));
+            prepare_by_size.push((count, prepare_work));
+        }
+        // Each doubling of file size grows O(n log n) span-index work by at
+        // most ~2.25x (2.5x bound), whereas a quadratic per-gap scan grows ~4x.
+        // Checking lowering and preparation separately prevents a quadratic
+        // regression in one pass from hiding behind linear work in the other.
+        for pair in lowering_by_size.windows(2) {
+            let (prev_size, prev) = pair[0];
+            let (next_size, next) = pair[1];
+            assert!(
+                next.query_steps * 2 <= prev.query_steps * 5,
+                "lowering gap query steps must stay near linear: {prev_size} -> {next_size}; \
+                 lowering_by_size={lowering_by_size:?}"
+            );
+            assert!(
+                next.total() * 2 <= prev.total() * 5,
+                "lowering total gap scan work must stay near linear: {prev_size} -> {next_size}; \
+                 lowering_by_size={lowering_by_size:?}"
+            );
+        }
+        for pair in prepare_by_size.windows(2) {
+            let (prev_size, prev) = pair[0];
+            let (next_size, next) = pair[1];
+            assert!(
+                next.query_steps * 2 <= prev.query_steps * 5,
+                "prepare gap query steps must stay near linear: {prev_size} -> {next_size}; \
+                 prepare_by_size={prepare_by_size:?}"
+            );
+            assert!(
+                next.total() * 2 <= prev.total() * 5,
+                "prepare total gap scan work must stay near linear: {prev_size} -> {next_size}; \
+                 prepare_by_size={prepare_by_size:?}"
+            );
         }
     }
 }

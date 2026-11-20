@@ -1144,7 +1144,10 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallableApplicability
         | QueryStep::OverloadSelection
         | QueryStep::CppExpressions => {}
-        QueryStep::BindingInitializerCallsOf | QueryStep::SelectedPropertyRelationsOf => {}
+        QueryStep::BindingInitializerCallsOf
+        | QueryStep::SelectedPropertyRelationsOf
+        | QueryStep::FieldWritesOf
+        | QueryStep::FieldReadsOf => {}
         // The default tier is omitted so a query written before the filter
         // existed keeps its canonical form and semantic hash.
         QueryStep::AbsentMember(proof) => {

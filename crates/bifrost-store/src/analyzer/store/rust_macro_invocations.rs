@@ -120,6 +120,7 @@ pub(super) fn read(
 }
 
 impl AnalyzerStore {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_macro_invocations_answer(
         &self,
         snapshots: &WorkspaceSnapshots,

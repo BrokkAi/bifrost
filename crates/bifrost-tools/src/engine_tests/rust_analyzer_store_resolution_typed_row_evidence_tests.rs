@@ -20,6 +20,10 @@ mod rust_departing_row_evidence_tests_tests {
     #[hardwon(
         "#5658: generic parameter classification scanned fragment interiors before its request table"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn typed_request_plans_drive_from_requested_keys() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned;
 
@@ -166,6 +170,10 @@ mod rust_departing_row_evidence_tests_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_reason_owner_memo_rebases_shared_blob_and_preserves_terminals() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
         let fixture = SelectionFixture::shared_rust_source(
@@ -282,6 +290,10 @@ mod rust_departing_row_evidence_tests_tests {
     #[test]
     #[hardwon(
         "#5658: Django call-result refinement sent a shared semantic reason to ordinary gap provenance"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn gap_reason_provenance_preserves_mixed_completion_reason_identities() {
         use brokk_bifrost_analysis::analyzer::resolution::SharedNameInterner;

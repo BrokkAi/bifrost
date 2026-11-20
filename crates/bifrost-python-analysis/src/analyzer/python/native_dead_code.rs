@@ -49,6 +49,7 @@ pub(super) fn usage_result(result: FuzzyResult) -> FuzzyResult {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn coverage(
     analyzer: &dyn IAnalyzer,
     candidates: &[CodeUnit],

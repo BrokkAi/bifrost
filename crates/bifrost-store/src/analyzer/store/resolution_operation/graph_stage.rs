@@ -456,6 +456,10 @@ impl<'operation, 'store> GraphStageReadMemoGuard<'operation, 'store> {
 }
 
 impl Drop for GraphStageReadMemoGuard<'_, '_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn drop(&mut self) {
         self.candidate_cache.take();
         self.inventory.authority_validations().take();

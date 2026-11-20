@@ -1821,8 +1821,15 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
         if let BoundedResolution::Complete { value, .. } = &stored {
             eprintln!("nested {method} stored argument: {:?}", value.value_types);
         }
-        let actual = java_native_argument_type(&analyzer, query, scope.token(), expression, None)
-            .expect("conversion fixture finishes");
+        let actual = java_native_argument_type(
+            &analyzer,
+            query,
+            scope.token(),
+            expression,
+            &mut ReceiverAnalysisWork::default(),
+            None,
+        )
+        .expect("conversion fixture finishes");
         let value_site = java_native_receiver_type_site_node(expression).expect("value site");
         let direct = java_native_expression_value_type_at_node(query, value_site)
             .expect("the expression query completes");
@@ -2529,6 +2536,8 @@ fn model_declared_class_inventory(
             .unwrap();
     }
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: vec![SemanticModelActivationEvidence {
@@ -2542,7 +2551,8 @@ fn model_declared_class_inventory(
             }),
             target: Some("jvm".into()),
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }],
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),
@@ -2575,7 +2585,7 @@ fn static_type_qualifier_boundary_requires_its_active_model_owner_identity() {
     let owners: Vec<_> = records
         .iter()
         .map(|record| ExternalOwnerIdentity {
-            provider_id: Arc::from(record.shard.manifest.semantic_sha256.as_str()),
+            provider_id: Arc::from(brokk_bifrost_analysis::analyzer::store::jvm_external_publication::jvm_external_provider_id(&record.shard.manifest.semantic_sha256)),
             owner_fqn: Arc::from("java.lang.Class"),
         })
         .collect();
@@ -2583,6 +2593,7 @@ fn static_type_qualifier_boundary_requires_its_active_model_owner_identity() {
     let boundary = SemanticId::local(0, 1);
     let digest = [42; 32];
     let binding = NativeExternalArgumentBinding {
+        inherited_external_member: None,
         implicit_receiver: false,
         completion: ResolutionCompletion::incomplete([ResolutionIncompleteReason::OpenBoundary {
             semantic: boundary,
@@ -2595,6 +2606,7 @@ fn static_type_qualifier_boundary_requires_its_active_model_owner_identity() {
         call_binding_reason_digests: Vec::new(),
         constructor_hierarchy_reason_digests: Vec::new(),
         static_type_qualifier_reason_digests: vec![(owners[0].clone(), digest)],
+        obscuring_name_reason_digests: Vec::new(),
     };
     let proofs: Vec<_> = owners
         .into_iter()
@@ -2626,7 +2638,8 @@ fn model_declared_value_receiver_keeps_its_owner_boundary() {
     let project = InlineTestProject::with_language(Language::Java)
         .file("App.java", source)
         .build();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let workspace =
+        project.workspace_analyzer(brokk_bifrost_analysis::test_support::no_host_jdk_config());
     let (catalog, request) = model_declared_class_inventory(&["value-receiver"]);
     let activation = acquire_active_semantic_models(
         workspace.analyzer(),
@@ -2640,6 +2653,10 @@ fn model_declared_value_receiver_keeps_its_owner_boundary() {
         "{activation:?}"
     );
     let java = resolve_analyzer::<JavaAnalyzer>(workspace.analyzer()).unwrap();
+    let _scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_outer_request(
+        workspace.analyzer(),
+        brokk_bifrost_analysis::analyzer::OuterRequest::new(),
+    );
     let file = project.file("App.java");
     let tree = brokk_bifrost_jvm::java::declarations::parse_tree(source).unwrap();
     let site = |name: &str| {
@@ -2724,6 +2741,7 @@ fn model_declared_value_receiver_keeps_its_owner_boundary() {
         "{outcome:?}"
     );
     let binding = NativeExternalArgumentBinding {
+        inherited_external_member: None,
         implicit_receiver: false,
         completion: ResolutionCompletion::incomplete([owner_reason]),
         members: Vec::new(),
@@ -2731,6 +2749,7 @@ fn model_declared_value_receiver_keeps_its_owner_boundary() {
         call_binding_reason_digests: Vec::new(),
         constructor_hierarchy_reason_digests: Vec::new(),
         static_type_qualifier_reason_digests: qualifiers,
+        obscuring_name_reason_digests: Vec::new(),
     };
     let value_site = site("getResource");
     let mut discharged = Vec::new();
@@ -2744,7 +2763,10 @@ fn model_declared_value_receiver_keeps_its_owner_boundary() {
         &[],
         Some(&binding),
         &mut discharged,
+        &mut ReceiverAnalysisWork::default(),
         None,
+        0,
+        false,
     )
     .expect("call evidence must complete");
     assert_eq!(
@@ -2970,6 +2992,126 @@ fn java_native_batch_reuses_nested_points_and_keeps_sibling_contexts_separate() 
 
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
+    "#13260: nested native resolutions got the full budget and their completed work was not counted"
+)]
+fn java_native_nested_argument_uses_remaining_budget() {
+    // The nested argument is a nominal reference type. #12370 resolves an
+    // intrinsic primitive leaf without the exact-type-links walk, which would
+    // make the argument point cheaper than the outer binding root.
+    let source = "class A { static class B {} void run() { B x0 = new B(); B x1 = x0; B x2 = x1; B x3 = x2; sink(x3); } }";
+    let path = "A.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let _inventory = analyzer.external_declaration_index();
+    let file = fixture.file(path);
+    let tree = brokk_bifrost_jvm::java::declarations::parse_tree(source).unwrap();
+    let start = source.find("sink(").unwrap();
+    let site = ResolvedReferenceSite {
+        path: path.into(),
+        text: "sink".into(),
+        range: Range {
+            start_byte: start,
+            end_byte: start + 4,
+            start_line: 1,
+            end_line: 1,
+        },
+        focus_start_byte: start,
+        focus_end_byte: start + 4,
+    };
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: None,
+    };
+    let outer = resolve_native_definition_bounded(
+        &analyzer.inner,
+        query,
+        None,
+        |operation, path, cancellation| {
+            prepare_context(&analyzer, &analyzer, operation, path, cancellation)
+        },
+        || {},
+    );
+    let BoundedResolution::Complete {
+        work: outer_work, ..
+    } = outer
+    else {
+        panic!("outer resolution must complete: {outer:?}");
+    };
+    let nested = brokk_bifrost_analysis::analyzer::native_points::resolve_native_call_argument_type_bounded_in_batch(
+        &analyzer.inner, query, 0, None,
+        |operation, path, cancellation| prepare_context(&analyzer, &analyzer, operation, path, cancellation),
+        || {},
+    );
+    let BoundedResolution::Complete {
+        work: nested_work, ..
+    } = nested
+    else {
+        panic!("nested resolution must complete");
+    };
+    // Scope work never refuses (#13216), so the allowance is on rounds.
+    let allowance = outer_work
+        .resolution_rounds
+        .max(nested_work.resolution_rounds);
+    assert!(
+        outer_work.resolution_rounds + nested_work.resolution_rounds > allowance,
+        "both phases must contribute round work: {outer_work:?}, {nested_work:?}"
+    );
+    let constrained = BoundedReceiverQuery {
+        budget: ReceiverAnalysisBudget {
+            max_resolution_rounds: allowance,
+            ..Default::default()
+        },
+        ..query
+    };
+    // Each resolution alone fits this allowance; together they must stop.
+    assert!(matches!(
+        resolve_native_definition_bounded(
+            &analyzer.inner,
+            constrained,
+            None,
+            |operation, path, cancellation| prepare_context(
+                &analyzer,
+                &analyzer,
+                operation,
+                path,
+                cancellation
+            ),
+            || {},
+        ),
+        BoundedResolution::Complete { .. }
+    ));
+    assert!(matches!(brokk_bifrost_analysis::analyzer::native_points::resolve_native_call_argument_type_bounded_in_batch(
+        &analyzer.inner, constrained, 0, None,
+        |operation, path, cancellation| prepare_context(&analyzer, &analyzer, operation, path, cancellation),
+        || {},
+    ), BoundedResolution::Complete { .. }));
+    let stopped = resolve_java_definition_with_evidence_bounded(constrained, || {});
+    assert!(
+        matches!(stopped, BoundedResolution::Exceeded { .. }),
+        "{stopped:?}"
+    );
+    let full = resolve_java_definition_with_evidence_bounded(query, || {});
+    let BoundedResolution::Complete {
+        work: full_work, ..
+    } = full
+    else {
+        panic!("unconstrained evidence must complete: {full:?}");
+    };
+    assert!(
+        full_work.scope_nodes >= outer_work.scope_nodes + nested_work.scope_nodes,
+        "completed nested work must be reported: {full_work:?}, {outer_work:?}, {nested_work:?}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
     "#7886: a nested argument budget stop was hidden by the completed outer definition"
 )]
 fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
@@ -3028,7 +3170,7 @@ fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
     // the narrow budget from the latter rather than pinning solver internals.
     let constrained = BoundedReceiverQuery {
         budget: ReceiverAnalysisBudget {
-            max_scope_nodes: work.scope_nodes + 1,
+            max_resolution_rounds: work.resolution_rounds + 1,
             ..Default::default()
         },
         ..query
@@ -3070,7 +3212,7 @@ fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
         assert!(matches!(
             outcome,
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::ResolutionRounds,
                 ..
             }
         ));
@@ -3234,13 +3376,26 @@ fn native_batch_hit_replays_fill_query_obligations() {
     // acquire scala. Its independent library obligation must survive the hit.
     let source = "class ScalaProbe extends Enumeration { def inherited() = getClass() }";
     let path = "Probe.scala";
-    let fixture = InlineTestProject::with_language(Language::Scala)
-        .file(path, source)
-        .file(
-            ".bifrost/packs.json",
-            r#"{"schema_version":1,"ecosystems":[],"enable":[]}"#,
-        )
-        .build();
+    use brokk_bifrost_core::analyzer::project::{
+        FilesystemProject, Project, WorkspaceFileListingCache,
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    std::fs::write(root.join(path), source).unwrap();
+    std::fs::create_dir(root.join(".bifrost")).unwrap();
+    std::fs::write(
+        root.join(".bifrost/packs.json"),
+        r#"{"schema_version":1,"ecosystems":[],"enable":[]}"#,
+    )
+    .unwrap();
+    // A cached filesystem listing supplies the view stamp required by INV-C.
+    // With discovery disabled, dependency and JDK absence are certified.
+    let listing = std::sync::Arc::new(WorkspaceFileListingCache::new(root.clone()));
+    let project =
+        std::sync::Arc::new(FilesystemProject::with_cached_listing(root, listing).unwrap());
+    let file = project
+        .file_by_rel_path(std::path::Path::new(path))
+        .unwrap();
     let empty_repository = tempfile::tempdir().unwrap();
     let mut config = brokk_bifrost_analysis::test_support::hermetic_jvm_config();
     config.jvm.external_dependencies.repository_roots = vec![empty_repository.path().to_path_buf()];
@@ -3248,7 +3403,11 @@ fn native_batch_hit_replays_fill_query_obligations() {
         vec![empty_repository.path().to_path_buf()];
     // Direct construction has no host pack activation; the fixture also
     // explicitly disables workspace dependency-pack activation.
-    let analyzer = crate::analyzer::ScalaAnalyzer::new_with_config(fixture.project_dyn(), config);
+    let analyzer = crate::analyzer::ScalaAnalyzer::new_with_config(project, config);
+    let _scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_outer_request(
+        &analyzer,
+        brokk_bifrost_analysis::analyzer::OuterRequest::new(),
+    );
     assert!(
         brokk_bifrost_analysis::analyzer::IAnalyzer::semantic_model_overlay(&analyzer).is_none()
     );
@@ -3256,7 +3415,6 @@ fn native_batch_hit_replays_fill_query_obligations() {
         crate::native_resolution_test_support::scala_library_scope_fixture(&analyzer);
     let _inventory = analyzer.external_declaration_index();
     let inner = analyzer.tree_sitter_analyzer();
-    let file = fixture.file(path);
     let tree = brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
         &file,
         Language::Scala,
@@ -3499,7 +3657,7 @@ fn java_import_context_snapshot_certificate() {
             resolve(offset)
         })
         .collect();
-    let _scope = AnalyzerQueryScope::new(&analyzer);
+    let scope = AnalyzerQueryScope::new(&analyzer);
     let memo = analyzer
         .inner
         .active_query_request_memo::<JavaImportContextSnapshots>()
@@ -3522,13 +3680,75 @@ fn java_import_context_snapshot_certificate() {
             cold[index].1.execution_dependences(),
             "point {index}"
         );
-        memo.entries.run_pending_tasks();
-        assert_eq!(memo.entries.entry_count(), 1);
+        assert_eq!(memo.entries.stats().entries, 1);
         assert_eq!(
             memo.restores.load(std::sync::atomic::Ordering::Relaxed),
             index
         );
     }
+    // The region pays to the analyzer's own owner while the request lives and
+    // is retired with it, even though this test still holds the memo handle.
+    let owner = analyzer.inner.analyzer_store().retention_budget().clone();
+    assert_eq!(memo.entries.stats().entries, 1);
+    let charged = owner.accounted_bytes();
+    drop(scope);
+    assert!(memo.entries.is_closed());
+    assert_eq!(memo.entries.stats().entries, 0);
+    assert!(
+        owner.accounted_bytes() < charged,
+        "retirement refunds what the region's own references paid"
+    );
+}
+
+#[test]
+fn domain_registries_use_each_analyzers_own_owner_and_spare_cross_request_regions() {
+    let build = |name: &str| {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                format!("src/main/java/{name}/A.java"),
+                format!("package {name}; class A {{}}"),
+            )
+            .build();
+        JavaAnalyzer::new(project.project_dyn())
+    };
+    let (first, second) = (build("one"), build("two"));
+    let owner_of =
+        |analyzer: &JavaAnalyzer| analyzer.inner.analyzer_store().retention_budget().clone();
+    let (first_owner, second_owner) = (owner_of(&first), owner_of(&second));
+    assert!(
+        !first_owner.ptr_eq(&second_owner),
+        "two analyzers keep distinct retention owners"
+    );
+    let assessments = |owner: &brokk_bifrost_core::retention_budget::RetentionBudget| {
+        owner
+            .snapshot()
+            .regions
+            .into_iter()
+            .find(|region| region.name == "analysis.statement_assessments_by_procedure")
+            .map(|region| (region.namespace, region.stats.entries))
+            .expect("the cross-request statement region exists under the store owner")
+    };
+    let before = assessments(&first_owner);
+    let fill = AnalyzerQueryScope::for_retained_fill(&first);
+    let first_registry = first
+        .inner
+        .active_query_request_registry()
+        .expect("active fill");
+    // One fill spans both analyzers, yet each analyzer's registry keeps its own owner.
+    let second_registry = second
+        .inner
+        .active_query_request_registry()
+        .expect("the fill's domain reaches the second analyzer");
+    assert!(first_registry.owner().ptr_eq(&first_owner));
+    assert!(!first_registry.owner().ptr_eq(&second_owner));
+    assert!(second_registry.owner().ptr_eq(&second_owner));
+    drop(fill);
+    assert!(first_registry.is_retired() && second_registry.is_retired());
+    assert_eq!(
+        assessments(&first_owner),
+        before,
+        "retiring a domain leaves the cross-request statement-assessment region alone"
+    );
 }
 
 #[test]
@@ -3617,8 +3837,7 @@ fn java_import_context_snapshot_keeps_traced_and_untraced_contexts_apart() {
         matches!(untraced, BoundedResolution::Complete { .. }),
         "{untraced:?}"
     );
-    memo.entries.run_pending_tasks();
-    assert_eq!(memo.entries.entry_count(), 1);
+    assert_eq!(memo.entries.stats().entries, 1);
     assert_eq!(memo.restores.load(std::sync::atomic::Ordering::Relaxed), 0);
     let warm = traced(&points);
     for (index, ((outcome, trace), (cold_outcome, cold_trace))) in

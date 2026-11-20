@@ -65,6 +65,14 @@ pub enum SelectedDependency {
         snapshot: WorkspaceSnapshotId,
         base_profile: [u8; 32],
     },
+    /// A workspace fact whose digest the store already computed over the exact
+    /// rows the query read. The recorded key is `Lookup WorkspaceFact` with
+    /// that digest; verification asks the owning analyzer for the head digest,
+    /// computed by the same store function (#13276).
+    WorkspaceFactDigest {
+        question: Box<LookupQuestion>,
+        digest: brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest,
+    },
 }
 
 /// The analysis layer retains the complete ledger, including refusal channels.
@@ -206,6 +214,21 @@ macro_rules! selected_queries {
 
 pub mod queries;
 
+/// What a `SelectedRead` reads through: one immutable selected inventory.
+pub trait SelectedInventory {
+    fn selected_inventory(&self) -> &SelectedResolutionMountInventory<'_>;
+}
+impl SelectedInventory for SelectedResolutionMountInventory<'_> {
+    fn selected_inventory(&self) -> &SelectedResolutionMountInventory<'_> {
+        self
+    }
+}
+impl SelectedInventory for ReadySelectedResolution<'_, '_> {
+    fn selected_inventory(&self) -> &SelectedResolutionMountInventory<'_> {
+        &self.inventory
+    }
+}
+
 pub struct SelectedRead<'a> {
     connection: &'a Connection,
     inventory: &'a SelectedResolutionMountInventory<'a>,
@@ -229,11 +252,15 @@ impl<A: Clone> Clone for MemoValue<A> {
     }
 }
 impl<'a> SelectedRead<'a> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: SelectedRead owns selected SQL execution"
+    )]
     pub fn new(
-        selection: &'a ReadySelectedResolution<'_, '_>,
+        selection: &'a impl SelectedInventory,
         services: &'a dyn SelectedAnalyzerServices,
     ) -> Self {
-        let inventory = &*selection.inventory;
+        let inventory = selection.selected_inventory();
         Self {
             connection: inventory.connection(),
             inventory,
@@ -464,6 +491,10 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_queries_read_only_relations_their_class_allows() {
         let store = super::super::AnalyzerStore::open_ephemeral().unwrap();
         let connection = store.read_conn().unwrap();
@@ -472,6 +503,9 @@ mod tests {
             .execute_batch(
                 super::super::resolution_selection::selected_resolution_temp_schema_sql(),
             )
+            .unwrap();
+        connection
+            .execute_batch(super::super::csharp_compilation::extent::OVERLAY_SCHEMA)
             .unwrap();
         connection.execute_batch("CREATE TEMP VIEW selected_read_authorizer_view AS SELECT blob_id FROM temp.selected_resolution_mounts").unwrap();
         let mut catalog = BTreeSet::new();

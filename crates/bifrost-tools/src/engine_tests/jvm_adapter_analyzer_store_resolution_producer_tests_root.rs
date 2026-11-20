@@ -650,7 +650,13 @@ mod jvm_extraction_tests {
         let mut failed_replacement =
             prepare_legacy_java(published_oid, Arc::clone(&rich_state), &generations, &[]);
         failed_replacement.inject_invalid_range_for_test();
-        let (outcomes, stats) = store.persist_prepared_blobs(vec![failed_replacement], targets);
+        let (outcomes, stats) =
+            brokk_bifrost_analysis::analyzer::store::test_support::repair_prepared_blobs(
+                &store,
+                vec![failed_replacement],
+                &CancellationToken::default(),
+                targets,
+            );
         assert!(outcomes[0].error.is_some());
         assert_eq!(stats.failed_blobs, 1);
         assert_eq!(
@@ -665,11 +671,13 @@ mod jvm_extraction_tests {
         let cancellation = CancellationToken::cancel_after_checks_for_test(4);
         let cancelled_replacement =
             prepare_legacy_java(published_oid, rich_state, &generations, &[]);
-        let (outcomes, stats) = store.persist_prepared_blobs_with_cancellation(
-            vec![cancelled_replacement],
-            &cancellation,
-            targets,
-        );
+        let (outcomes, stats) =
+            brokk_bifrost_analysis::analyzer::store::test_support::repair_prepared_blobs(
+                &store,
+                vec![cancelled_replacement],
+                &cancellation,
+                targets,
+            );
         assert!(outcomes[0].error.is_some());
         assert!(cancellation.is_cancelled());
         assert_eq!(stats.failed_blobs, 1);

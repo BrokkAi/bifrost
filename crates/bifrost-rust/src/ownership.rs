@@ -920,6 +920,18 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         }
     }
 
+    /// The start byte of the one struct, enum or union declaration in this
+    /// file that the written type path `type_node` names from its own module,
+    /// after imports and module nesting. `None` when the path names no
+    /// declaration of this file, several of them, or sits in macro syntax.
+    pub fn resolved_local_nominal_start(&self, type_node: Node<'tree>) -> Option<usize> {
+        if has_macro_ancestor(type_node) {
+            return None;
+        }
+        let index = self.unique_nominal_candidate_index(type_node).ok()?;
+        Some(self.declarations[index].identity.source_start)
+    }
+
     /// Resolve a local nominal type's exact, nongeneric `Drop::drop` body.
     ///
     /// This returns a method only when the impl's trait path resolved to the
@@ -2203,6 +2215,11 @@ fn is_copy_primitive(node: Node<'_>, source: &str) -> bool {
         || is_named_primitive(node, source, "char")
 }
 
+/// Whether `node` is a written primitive integer type such as `usize`.
+pub fn rust_is_integer_primitive_type(node: Node<'_>, source: &str) -> bool {
+    is_integer_primitive(node, source)
+}
+
 fn is_integer_primitive(node: Node<'_>, source: &str) -> bool {
     node.kind() == "primitive_type"
         && matches!(
@@ -2285,7 +2302,10 @@ pub(crate) fn has_macro_ancestor(node: Node<'_>) -> bool {
         .expect("infallible legacy macro ancestry")
 }
 
-fn has_macro_ancestor_bounded<F, E>(mut node: Node<'_>, charge: &mut F) -> Result<bool, E>
+pub(crate) fn has_macro_ancestor_bounded<F, E>(
+    mut node: Node<'_>,
+    charge: &mut F,
+) -> Result<bool, E>
 where
     F: FnMut(usize) -> Result<(), E>,
 {

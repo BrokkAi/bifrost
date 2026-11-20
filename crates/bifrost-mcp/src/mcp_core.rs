@@ -347,12 +347,12 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
     vec![
         mutating_tool_descriptor(
             "refresh",
-            "Force a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so use this only when you want to blow away cached analyzer state and rescan the entire workspace.",
+            "Force a full rebuild of the code index. During initial preparation, returns workspace_not_ready without executing; retry it. Once ready, completes the rebuild and publication before reporting success. Normal tool calls already apply watcher-detected file changes automatically, so use this only when you want to blow away cached analyzer state and rescan the entire workspace.",
             json_schema_object(&[]),
         ),
         mutating_tool_descriptor(
             "activate_workspace",
-            "Switch the active workspace root for later tools; a workspace is already active at startup, so use this only to move to a different repo, checkout, or worktree.",
+            "Bind the active workspace root and start preparation without waiting; success may report analyzer_ready false. Each service retains the installed workspace plus one replacement in flight; if retiring work fills both slots, returns workspace_not_ready at workspace_activation without changing the binding. Retry after retirement drains. Re-activating a workspace whose preparation failed starts preparation again; building or ready workspaces are not restarted. Switch the active workspace root for later tools; a workspace is already active at startup, so use this only to move to a different repo, checkout, or worktree.",
             json!({
                 "type": "object",
                 "properties": {
@@ -366,7 +366,7 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_active_workspace",
-            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect. Also reports usage_index_ready: other tools block until any background usage-analysis catch-up finishes, so call this first if you would rather do something else than wait. semantic_packs_ready reports whether pack warm-up has settled; semantic_model_overlay reports whether models are active (ready, partially usable with reasons, unavailable with a reason, no_models when nothing is selected, or pending).",
+            "Observe initial preparation without waiting; a contended session or lifecycle lock returns busy at workspace_activation, so retry. retiring_workspaces lists every retained root, generation and teardown phase. analyzer_ready reports installation, and workspace_build reports status, generation, optional phase and failure error. Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect. Also reports usage_index_ready: other tools block until any background usage-analysis catch-up finishes, so call this first if you would rather do something else than wait. semantic_packs_ready reports whether pack warm-up has settled; semantic_model_overlay reports whether models are active (ready, partially usable with reasons, unavailable with a reason, no_models when nothing is selected, or pending).",
             json_schema_object(&[]),
         ),
     ]

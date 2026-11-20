@@ -106,13 +106,27 @@ pub struct EmbeddedSyntaxForest {
     by_anchor: crate::hash::HashMap<usize, Vec<usize>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum EmbeddedSyntaxStop {
     Exceeded,
     Cancelled,
 }
 
 impl EmbeddedSyntaxForest {
+    /// Owned Rust buffers only; the caller counts each native tree backing.
+    pub fn retained_structure_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.trees.capacity() * std::mem::size_of::<EmbeddedSyntaxTree>()
+            + self.parents.capacity() * std::mem::size_of::<EmbeddedSyntaxParent>()
+            + self.by_root.capacity() * (std::mem::size_of::<(usize, usize)>() + 1)
+            + self.by_anchor.capacity() * (std::mem::size_of::<(usize, Vec<usize>)>() + 1)
+            + self
+                .by_anchor
+                .values()
+                .map(|indices| indices.capacity() * std::mem::size_of::<usize>())
+                .sum::<usize>()
+    }
+
     /// One bounded file/query parse. Trees are dropped with this forest, never
     /// retained in a workspace index or an unbounded cache.
     pub fn parse(
@@ -230,8 +244,43 @@ impl EmbeddedSyntaxForest {
         primary: &'a tree_sitter::Tree,
         node: Node<'a>,
     ) -> Option<Node<'a>> {
+        self.logical_parent_in_context(primary, node, (), |_| ())
+            .map(|(_, node)| node)
+    }
+
+    /// Preserve the actual physical Tree through ordinary and recorded host hops.
+    /// Recorded anchor coordinates select a node only after its host is known;
+    /// they never select or infer the owning Tree.
+    pub fn logical_parent_with_owner<'a>(
+        &'a self,
+        primary: &'a tree_sitter::Tree,
+        owner: &'a tree_sitter::Tree,
+        node: Node<'a>,
+    ) -> Option<(&'a tree_sitter::Tree, Node<'a>)> {
+        assert_eq!(
+            node.into_raw().tree,
+            owner.root_node().into_raw().tree,
+            "logical parent input retains its physical Tree"
+        );
+        if let Some(index) = self.by_root.get(&node.id()) {
+            assert_eq!(
+                owner.root_node().into_raw().tree,
+                self.trees[*index].tree.root_node().into_raw().tree,
+                "admitted root uses its recorded physical Tree"
+            );
+        }
+        self.logical_parent_in_context(primary, node, owner, |host| host)
+    }
+
+    fn logical_parent_in_context<'a, C>(
+        &'a self,
+        primary: &'a tree_sitter::Tree,
+        node: Node<'a>,
+        context: C,
+        host_context: impl FnOnce(&'a tree_sitter::Tree) -> C,
+    ) -> Option<(C, Node<'a>)> {
         let Some(index) = self.by_root.get(&node.id()) else {
-            return node.parent();
+            return node.parent().map(|parent| (context, parent));
         };
         let parent = &self.parents[*index];
         let host = parent.host.map_or(primary, |index| &self.trees[index].tree);
@@ -248,7 +297,7 @@ impl EmbeddedSyntaxForest {
             anchor.byte_range(),
             parent.range.start_byte..parent.range.end_byte
         );
-        Some(anchor)
+        Some((host_context(host), anchor))
     }
 
     /// The source root reached without visiting synthetic fragment wrappers.
@@ -277,6 +326,16 @@ impl EmbeddedSyntaxForest {
             .filter(|tree| tree.range.start_byte <= start && end <= tree.range.end_byte)
             .min_by_key(|tree| tree.range.end_byte - tree.range.start_byte)
             .map_or(primary, |tree| &tree.tree)
+    }
+
+    /// Physical owners for admitted children of this exact parser anchor.
+    pub fn trees_at_anchor(
+        &self,
+        anchor: usize,
+    ) -> Option<impl DoubleEndedIterator<Item = &EmbeddedSyntaxTree>> {
+        self.by_anchor
+            .get(&anchor)
+            .map(|indices| indices.iter().map(|index| &self.trees[*index]))
     }
 
     pub fn children(&self, anchor: usize) -> Option<impl DoubleEndedIterator<Item = Node<'_>>> {

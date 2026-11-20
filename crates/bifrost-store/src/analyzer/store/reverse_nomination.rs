@@ -61,6 +61,12 @@ pub struct ReverseCandidateSet {
     pub(super) locators: Vec<SelectedSemanticLocator>,
     pub(super) names: Vec<(i64, String, String)>,
     pub(super) completion: ResolutionCompletion,
+    /// Relative paths of files whose reference inventory is open in a way
+    /// that may name the target, such as an unparsed macro input that spells
+    /// it. They nominate no site, but they are candidate files: an answer
+    /// admitted to the candidate files must examine their gaps, or it would
+    /// certify absence over a region it never read.
+    pub(super) open_frontier_paths: Vec<String>,
 }
 impl ReverseCandidateSet {
     /// Request-local evidence about routes the selected placements cannot prove.
@@ -79,18 +85,25 @@ impl ReverseCandidateSet {
         self.locators
     }
 
-    /// The defining file is admitted even if discovery found no references.
+    /// The defining file is admitted even if discovery found no references,
+    /// and so is every file with an open frontier that may name the target.
     #[doc(hidden)]
     pub fn files<'a>(
         &'a self,
         root: &'a Path,
         target: &'a CodeUnit,
     ) -> impl Iterator<Item = ProjectFile> + 'a {
-        std::iter::once(target.source().clone()).chain(
-            self.locators
-                .iter()
-                .map(move |locator| ProjectFile::new(root, locator.relative_path())),
-        )
+        std::iter::once(target.source().clone())
+            .chain(
+                self.locators
+                    .iter()
+                    .map(move |locator| ProjectFile::new(root, locator.relative_path())),
+            )
+            .chain(
+                self.open_frontier_paths
+                    .iter()
+                    .map(move |path| ProjectFile::new(root, path)),
+            )
     }
 }
 
@@ -243,6 +256,7 @@ pub(super) fn nominate_reverse_target(
     )
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn nominate_reverse_target_with_reason(
     operation: &SelectedResolutionOperation<'_, '_>,
     hooks: &impl ReverseNominationHooks,
@@ -298,6 +312,7 @@ pub(super) fn nominate_reverse_target_with_reason(
             locators: overlay_locators,
             names: Vec::new(),
             completion,
+            open_frontier_paths: Vec::new(),
         }));
     };
     let seeds = hooks.exposure_seeds(target, blob, site)?;
@@ -433,5 +448,6 @@ pub(super) fn nominate_reverse_target_with_reason(
         locators,
         names: inventory_names,
         completion,
+        open_frontier_paths: Vec::new(),
     }))
 }

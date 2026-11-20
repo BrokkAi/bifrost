@@ -209,11 +209,8 @@ fn foreign_parse_recovery_stays_incomplete_for_every_owned_visit() {
     for owned in [None, Some("check(1)"), Some("check(2)")] {
         let result = query_with_fixture_call_ownership(&workspace, &file, &query, owned, None);
         assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code
-                    == CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete),
+            result.diagnostics.iter().any(|diagnostic| diagnostic.code()
+                == CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete),
             "{owned:?}: {result:#?}"
         );
         assert_ne!(result.completion(), CodeQueryCompletion::Complete);

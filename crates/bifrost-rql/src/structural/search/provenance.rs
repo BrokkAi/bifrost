@@ -85,6 +85,10 @@ fn provenance_expansions_with_model_key(
             message: "C/C++ provenance requires a semantic workspace".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
         return Vec::new();
     };
@@ -104,6 +108,10 @@ fn provenance_expansions_with_model_key(
             message: "C/C++ provenance requires procedure semantics".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
         return Vec::new();
     };
@@ -135,6 +143,10 @@ fn provenance_expansions_with_model_key(
                         message: "C/C++ provenance selection was cancelled".to_string(),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+                        step_index: None,
+                        step_op: None,
+                        no_rows_reason: None,
+                        cause_codes: Vec::new(),
                     }),
                     Some(DerivationExecutionCause::Cancelled),
                 ));
@@ -208,6 +220,10 @@ fn report_incomplete(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }),
         CodeQueryDiagnosticCode::from_execution_reason(
             CodeQueryDiagnosticCode::EffectDerivationIncomplete,

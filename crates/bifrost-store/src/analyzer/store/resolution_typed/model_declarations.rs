@@ -164,6 +164,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
     /// The language-fixed identity of a model class the fixed table also names,
     /// so a base reached through a fixed class and the same base reached
     /// through source name one owner.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn fixed_class_token(&self, qualified_name: &str) -> Option<SemanticId> {
         let short = qualified_name.strip_prefix("builtins.")?;
         let entry = crate::analyzer::resolution::universe::lookup(
@@ -183,6 +184,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn model_type_value(
         &self,
         ty: &TypeRef,
@@ -218,6 +220,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
     }
     /// As `model_type_value`, for a base in a hierarchy: a class two providers
     /// declare identically is one owner (see `agreed_class_owner`).
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn model_hierarchy_type_value(
         &self,
         ty: &TypeRef,
@@ -495,6 +498,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             },
         }))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn visit_model_supertypes(
         &self,
         definitions: &[SemanticId],
@@ -571,6 +575,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 hash.field("ordinal", &(ordinal as u64).to_be_bytes());
                 let reference = SemanticId::shared_name(names.intern(hash.finish()));
                 let row = LoweredSupertypeProperty::resolved(
+                    Language::from_config_label(&owner.declaration.language)
+                        .expect("selected model provider has a supported language"),
                     token,
                     reference,
                     reference,

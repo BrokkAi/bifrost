@@ -151,11 +151,18 @@ pub struct FieldSlotIndex {
     transient_resolver_budget: bool,
     persistent_artifacts: Vec<ClassSetFieldSlotArtifactRow>,
     mounted_artifacts: Vec<MountedArtifactReplay>,
-    persistable: bool,
-    /// The keyed inputs fully determine this value, including dynamic writes
-    /// and open bounds, without budget-dependent gaps and within the cache cap.
-    memory_shareable: bool,
+    /// Content eligibility restricted by this construction's owned completion.
+    admission: FieldSlotAdmission,
     source_refusals: Vec<crate::analyzer::semantic::SemanticProviderError>,
+}
+
+/// A positive construction observation is required for either reuse lifetime.
+/// Failure provenance remains in request completion, never in the shared index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldSlotAdmission {
+    RequestOnly,
+    MemoryOnly,
+    Durable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +375,9 @@ impl FieldSlotIndex {
     // #8385: semantic read digests omit source positions; old stored checksums miss.
     // #10539: the dynamic-store survey's value-flow solve joins one event's
     // alternatives instead of killing them.
-    const ALGORITHM_VERSION: u32 = 32;
+    // #14085: retire durable indexes published from failed hierarchy reads.
+    // #14120: retire indexes without owned construction-health authority.
+    const ALGORITHM_VERSION: u32 = 34;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -394,6 +403,7 @@ impl FieldSlotIndex {
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<FieldSlotIndexAcquisition, TypeFlowPlanError> {
+        let completion = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
         // Bind every adapter lookup in this acquisition to the exact immutable
         // model publication named by the persistence key.
         let _snapshot_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
@@ -409,13 +419,14 @@ impl FieldSlotIndex {
             active_semantic_model_snapshot.as_deref(),
         ) else {
             return Ok(FieldSlotIndexAcquisition {
-                index: Self::build_checked(
+                index: Arc::new(Self::build_checked(
                     workspace,
+                    &completion,
                     adapter,
                     value_flow_cache,
                     semantic_budget,
                     cancellation,
-                )?,
+                )?),
                 kind: FieldSlotIndexAcquisitionKind::Built,
                 miss_reason: Some(FieldSlotIndexMissReason::NoSemanticKey),
                 published: false,
@@ -446,13 +457,14 @@ impl FieldSlotIndex {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
                 Ok(FieldSlotIndexAcquisition {
-                    index: Self::build_checked(
+                    index: Arc::new(Self::build_checked(
                         workspace,
+                        &completion,
                         adapter,
                         value_flow_cache,
                         semantic_budget,
                         cancellation,
-                    )?,
+                    )?),
                     kind: FieldSlotIndexAcquisitionKind::Built,
                     miss_reason: Some(FieldSlotIndexMissReason::MemoryReplayBudget),
                     published: false,
@@ -460,13 +472,14 @@ impl FieldSlotIndex {
             }
             CompleteValueAcquisition::Cancelled => Err(TypeFlowPlanError::Cancelled),
             CompleteValueAcquisition::Rejected => Ok(FieldSlotIndexAcquisition {
-                index: Self::build_checked(
+                index: Arc::new(Self::build_checked(
                     workspace,
+                    &completion,
                     adapter,
                     value_flow_cache,
                     semantic_budget,
                     cancellation,
-                )?,
+                )?),
                 kind: FieldSlotIndexAcquisitionKind::Built,
                 miss_reason: Some(FieldSlotIndexMissReason::StoreFailure),
                 published: false,
@@ -479,13 +492,13 @@ impl FieldSlotIndex {
                 } else {
                     FieldSlotIndexMissReason::NoPersistentStore
                 };
-                let mut shared_publish_eligible = true;
                 if persistent && let Some(store) = workspace.store() {
                     match store.class_set_field_slot_index(&semantic_key, cancellation) {
                         Ok(Some(row)) => {
                             let mut staged_budget = semantic_budget.clone();
                             match Self::from_persisted(
                                 workspace,
+                                &completion,
                                 row,
                                 &mut staged_budget,
                                 cancellation,
@@ -496,7 +509,7 @@ impl FieldSlotIndex {
                                     }
                                     let index = Arc::new(index);
                                     *semantic_budget = staged_budget;
-                                    if !Self::store_failed_under_acquisition(workspace) {
+                                    if index.is_shareable() {
                                         permit.publish_complete(Arc::clone(&index));
                                     }
                                     return Ok(FieldSlotIndexAcquisition {
@@ -522,23 +535,23 @@ impl FieldSlotIndex {
                             if cancellation.is_cancelled() {
                                 return Err(TypeFlowPlanError::Cancelled);
                             }
-                            workspace
-                                .analyzer()
-                                .record_query_failure(StoreError::new(format!(
-                                    "loading persisted class-set field slots: {error}"
-                                )));
                             if error.is_corrupt() || error.is_resource_bound() {
+                                // A rejected derived row is a cache miss. Only an
+                                // operational read failure stops the request.
                                 miss_reason = FieldSlotIndexMissReason::PersistenceValidation;
                             } else {
+                                workspace.analyzer().record_query_failure(
+                                    error.context("loading persisted class-set field slots"),
+                                );
                                 miss_reason = FieldSlotIndexMissReason::StoreFailure;
-                                shared_publish_eligible = false;
                             }
                         }
                     }
                 }
 
-                let index = Self::build_checked(
+                let mut index = Self::build_checked(
                     workspace,
+                    &completion,
                     adapter,
                     value_flow_cache,
                     semantic_budget,
@@ -548,11 +561,12 @@ impl FieldSlotIndex {
                 // performed and remains charged. Its paid-artifact set turns
                 // winner hydration into repeat charges instead of charging
                 // each retained census a second time.
-                if !index.persistable
+                if !index.is_persistable()
                     && initial_key_miss
                     && let Some(store) = workspace.store()
                     && let Some((winner, winner_budget)) = Self::recover_persisted_winner(
                         workspace,
+                        &completion,
                         store,
                         &semantic_key,
                         semantic_budget.clone(),
@@ -563,7 +577,8 @@ impl FieldSlotIndex {
                         return Err(TypeFlowPlanError::Cancelled);
                     }
                     *semantic_budget = winner_budget;
-                    if !Self::store_failed_under_acquisition(workspace) {
+                    let winner = Arc::new(winner);
+                    if winner.is_shareable() {
                         permit.publish_complete(Arc::clone(&winner));
                     }
                     return Ok(FieldSlotIndexAcquisition {
@@ -576,8 +591,9 @@ impl FieldSlotIndex {
                         published: false,
                     });
                 }
+                index.restrict_admission(workspace, &completion);
                 let mut published = false;
-                if index.persistable && !cancellation.is_cancelled() {
+                if index.is_persistable() && !cancellation.is_cancelled() {
                     if persistent && let Some(store) = workspace.store() {
                         match index.to_persisted(semantic_key) {
                             Ok(Some(row)) => {
@@ -592,12 +608,12 @@ impl FieldSlotIndex {
                                                 "publishing persisted class-set field slots: {error}"
                                             )),
                                         );
-                                        shared_publish_eligible = false;
+                                        index.admission = FieldSlotAdmission::RequestOnly;
                                     }
                                 }
                             }
                             Ok(None) => {
-                                shared_publish_eligible = false;
+                                index.admission = FieldSlotAdmission::RequestOnly;
                             }
                             Err(error) => {
                                 workspace.analyzer().record_query_failure(StoreError::new(
@@ -605,7 +621,7 @@ impl FieldSlotIndex {
                                         "encoding complete class-set field slots for persistence: {error}"
                                     ),
                                 ));
-                                shared_publish_eligible = false;
+                                index.admission = FieldSlotAdmission::RequestOnly;
                             }
                         }
                     }
@@ -613,11 +629,9 @@ impl FieldSlotIndex {
                         return Err(TypeFlowPlanError::Cancelled);
                     }
                 }
-                if index.memory_shareable
-                    && shared_publish_eligible
-                    && !Self::store_failed_under_acquisition(workspace)
-                    && !cancellation.is_cancelled()
-                {
+                index.restrict_admission(workspace, &completion);
+                let index = Arc::new(index);
+                if index.is_shareable() && !cancellation.is_cancelled() {
                     permit.publish_complete(Arc::clone(&index));
                 }
                 Ok(FieldSlotIndexAcquisition {
@@ -630,26 +644,39 @@ impl FieldSlotIndex {
         }
     }
 
-    /// Whether a store read failed under the capture this acquisition runs in.
-    /// The explicit checks above cover the reads this function makes itself;
-    /// the index build and hydration read the store through the analyzer, which
-    /// records its failure on the ledger. A failed leader publishes nothing, so
-    /// its followers (other policies of the same request) read for themselves
-    /// and own their own failure (#11534).
-    fn store_failed_under_acquisition(workspace: &WorkspaceAnalyzer) -> bool {
-        workspace
-            .analyzer()
-            .current_thread_read_ledger()
-            .is_some_and(|ledger| ledger.store_failed())
+    /// Restrict this owned value after construction or a later acquisition read.
+    /// An absent caller ledger is neither a failure nor a health certificate.
+    fn restrict_admission(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        completion: &AnalyzerQueryScope<'_>,
+    ) {
+        if completion.request_store_error().is_some()
+            || completion
+                .captured_read_incompleteness()
+                .iter()
+                .any(|reason| reason.is_execution_dependent())
+            || workspace
+                .analyzer()
+                .current_thread_read_ledger()
+                .is_some_and(|ledger| ledger.store_failed())
+        {
+            self.admission = FieldSlotAdmission::RequestOnly;
+        }
+    }
+
+    fn is_persistable(&self) -> bool {
+        self.admission == FieldSlotAdmission::Durable
     }
 
     fn recover_persisted_winner(
         workspace: &WorkspaceAnalyzer,
+        completion: &AnalyzerQueryScope<'_>,
         store: &crate::analyzer::store::AnalyzerStore,
         semantic_key: &ClassSetFieldSlotIndexKey,
         mut budget_after_build: SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
-    ) -> Result<Option<(Arc<Self>, SemanticBudget)>, TypeFlowPlanError> {
+    ) -> Result<Option<(Self, SemanticBudget)>, TypeFlowPlanError> {
         let row = match store.class_set_field_slot_index(semantic_key, cancellation) {
             Ok(row) => row,
             Err(error) => {
@@ -667,12 +694,18 @@ impl FieldSlotIndex {
         let Some(row) = row else {
             return Ok(None);
         };
-        match Self::from_persisted(workspace, row, &mut budget_after_build, cancellation) {
+        match Self::from_persisted(
+            workspace,
+            completion,
+            row,
+            &mut budget_after_build,
+            cancellation,
+        ) {
             Ok(index) => {
                 if cancellation.is_cancelled() {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
-                Ok(Some((Arc::new(index), budget_after_build)))
+                Ok(Some((index, budget_after_build)))
             }
             Err(PersistedHydrationRejection::Cancelled) => Err(TypeFlowPlanError::Cancelled),
             Err(
@@ -687,8 +720,10 @@ impl FieldSlotIndex {
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
+        let completion = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
         Self::build_with_value_flow_cache(
             workspace,
+            &completion,
             adapter,
             ValueFlowCache::default(),
             semantic_budget,
@@ -698,6 +733,7 @@ impl FieldSlotIndex {
 
     fn build_with_value_flow_cache(
         workspace: &WorkspaceAnalyzer,
+        completion: &AnalyzerQueryScope<'_>,
         adapter: &dyn TypeFlowAdapter,
         value_flow_cache: ValueFlowCache,
         semantic_budget: &mut SemanticBudget,
@@ -770,8 +806,13 @@ impl FieldSlotIndex {
         }
         if !collected.dynamic_writes.is_empty() {
             let mut solver_budget = crate::dataflow::SolverBudget::default();
-            let mut provisional =
-                Self::finish(workspace, adapter, collected.clone(), cancellation)?;
+            let mut provisional = Self::finish(
+                workspace,
+                completion,
+                adapter,
+                collected.clone(),
+                cancellation,
+            )?;
             loop {
                 // Start with the syntactic slot values, then monotonically
                 // add effects until receiver scopes stop changing. Guards
@@ -835,25 +876,33 @@ impl FieldSlotIndex {
                 if exhausted {
                     break;
                 }
-                let next = Self::finish(workspace, adapter, collected.clone(), cancellation)?;
+                let next = Self::finish(
+                    workspace,
+                    completion,
+                    adapter,
+                    collected.clone(),
+                    cancellation,
+                )?;
                 if next.slots == provisional.slots {
                     break;
                 }
                 provisional = next;
             }
         }
-        Self::finish(workspace, adapter, collected, cancellation)
+        Self::finish(workspace, completion, adapter, collected, cancellation)
     }
 
     fn build_checked(
         workspace: &WorkspaceAnalyzer,
+        completion: &AnalyzerQueryScope<'_>,
         adapter: &dyn TypeFlowAdapter,
         value_flow_cache: ValueFlowCache,
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
-    ) -> Result<Arc<Self>, TypeFlowPlanError> {
+    ) -> Result<Self, TypeFlowPlanError> {
         let index = Self::build_with_value_flow_cache(
             workspace,
+            completion,
             adapter,
             value_flow_cache,
             semantic_budget,
@@ -862,11 +911,12 @@ impl FieldSlotIndex {
         if cancellation.is_cancelled() {
             return Err(TypeFlowPlanError::Cancelled);
         }
-        Ok(Arc::new(index))
+        Ok(index)
     }
 
     fn finish(
         workspace: &WorkspaceAnalyzer,
+        completion: &AnalyzerQueryScope<'_>,
         adapter: &dyn TypeFlowAdapter,
         mut collected: CollectedSlots,
         cancellation: &crate::analyzer::semantic::CancellationToken,
@@ -910,8 +960,6 @@ impl FieldSlotIndex {
                     )
                 )
             });
-        let persistable =
-            memory_shareable && collected.dynamic_writes.is_empty() && !collected.has_open_bound;
         let mut artifacts = collected
             .persistent_artifacts
             .into_iter()
@@ -1066,6 +1114,15 @@ impl FieldSlotIndex {
                 atoms: field_atoms,
             });
         }
+        // Hierarchy reads above can fail after source collection completed.
+        // Keep their incomplete atoms for this caller, but do not make that
+        // unavailable hierarchy a durable answer for a healthy later request.
+        let persistable = memory_shareable
+            && collected.dynamic_writes.is_empty()
+            && !collected.has_open_bound
+            && hierarchy_cache
+                .values()
+                .all(|hierarchy| hierarchy.descendants.is_complete());
         let digest = digest_index(
             &slots,
             &open_bound_class_sources,
@@ -1089,14 +1146,19 @@ impl FieldSlotIndex {
             transient_resolver_budget: collected.transient_resolver_budget,
             persistent_artifacts,
             mounted_artifacts,
-            persistable,
-            memory_shareable,
+            admission: if persistable {
+                FieldSlotAdmission::Durable
+            } else if memory_shareable {
+                FieldSlotAdmission::MemoryOnly
+            } else {
+                FieldSlotAdmission::RequestOnly
+            },
             source_refusals: collected.source_refusals,
         };
-        let within_cache_cap = index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize;
-        index.persistable &= within_cache_cap;
-        index.memory_shareable &= within_cache_cap;
-        assert!(!index.persistable || index.memory_shareable);
+        if index.retained_bytes() > FIELD_SLOT_CACHE_BYTES as usize {
+            index.admission = FieldSlotAdmission::RequestOnly;
+        }
+        index.restrict_admission(workspace, completion);
         Ok(index)
     }
 
@@ -1104,6 +1166,9 @@ impl FieldSlotIndex {
         &self,
         key: ClassSetFieldSlotIndexKey,
     ) -> Result<Option<ClassSetFieldSlotIndexRow>, StoreError> {
+        if !self.is_persistable() {
+            return Ok(None);
+        }
         assert!(
             self.open_bound_class_sources.is_empty(),
             "open-bound field slots are not persisted"
@@ -1158,6 +1223,7 @@ impl FieldSlotIndex {
 
     fn from_persisted(
         workspace: &WorkspaceAnalyzer,
+        completion: &AnalyzerQueryScope<'_>,
         row: ClassSetFieldSlotIndexRow,
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
@@ -1306,7 +1372,7 @@ impl FieldSlotIndex {
                 return Err(PersistedHydrationRejection::Hydration);
             }
         }
-        let index = Self {
+        let mut index = Self {
             slots,
             lookup,
             open_bound_class_sources,
@@ -1316,13 +1382,14 @@ impl FieldSlotIndex {
             transient_resolver_budget: false,
             persistent_artifacts,
             mounted_artifacts: replay.mounted,
-            persistable: true,
-            memory_shareable: true,
+            admission: FieldSlotAdmission::Durable,
             source_refusals: Vec::new(),
         };
-        (index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize)
-            .then_some(index)
-            .ok_or(PersistedHydrationRejection::Hydration)
+        if index.retained_bytes() > FIELD_SLOT_CACHE_BYTES as usize {
+            return Err(PersistedHydrationRejection::Hydration);
+        }
+        index.restrict_admission(workspace, completion);
+        Ok(index)
     }
 
     /// An exact receiver class can inherit stores from ancestors, never from
@@ -1574,7 +1641,10 @@ impl FieldSlotIndex {
     /// Whether this complete snapshot can answer reads outside its build.
     /// Budget-dependent gaps and source refusals must never verify a unit.
     pub const fn is_shareable(&self) -> bool {
-        self.memory_shareable
+        matches!(
+            self.admission,
+            FieldSlotAdmission::MemoryOnly | FieldSlotAdmission::Durable
+        )
     }
 
     pub const fn digest(&self) -> StableDigest {
@@ -1807,8 +1877,15 @@ fn replay_artifact_charges(
             .program_semantics_provider_for_file(&file)
             .ok_or(PersistedHydrationRejection::Hydration)?;
         let snapshot = match provider.current_artifact_source(&file, maximum_source_bytes) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return Err(PersistedHydrationRejection::ReplayBudget),
+            Ok(crate::analyzer::semantic::SemanticArtifactSourceOutcome::Held(snapshot)) => {
+                snapshot
+            }
+            Ok(crate::analyzer::semantic::SemanticArtifactSourceOutcome::Refused(_)) => {
+                return Err(PersistedHydrationRejection::ReplayBudget);
+            }
+            Ok(crate::analyzer::semantic::SemanticArtifactSourceOutcome::Unavailable) => {
+                return Err(PersistedHydrationRejection::Hydration);
+            }
             Err(error) => {
                 workspace
                     .analyzer()
@@ -3211,9 +3288,14 @@ mod tests {
                 .unwrap();
             }
             assert_eq!(collected.dynamic_writes.len(), 1);
-            let mut slots =
-                FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation)
-                    .unwrap();
+            let mut slots = FieldSlotIndex::finish(
+                &workspace,
+                &AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer()),
+                &adapter,
+                collected.clone(),
+                &cancellation,
+            )
+            .unwrap();
             slots.store_survey.dynamic_effects = collected
                 .dynamic_writes
                 .iter()
@@ -3369,7 +3451,7 @@ mod tests {
             incomplete.member_store_evidence(&workspace, adapter, &child, "missing"),
             MemberStoreEvidence::Unknown
         );
-        assert!(!incomplete.persistable);
+        assert!(!incomplete.is_persistable());
     }
 
     #[test]
@@ -3522,8 +3604,8 @@ mod tests {
         )
         .expect("dynamic field slots build");
         assert_eq!(first.kind, FieldSlotIndexAcquisitionKind::Built);
-        assert!(!first.index.persistable);
-        assert!(first.index.memory_shareable);
+        assert!(!first.index.is_persistable());
+        assert!(first.index.is_shareable());
         let second = acquire(
             &workspace,
             adapter,
@@ -3732,7 +3814,7 @@ mod tests {
             &cancellation,
         )
         .expect("nonblocking incomplete oracle builds");
-        assert!(!local_oracle_index.persistable);
+        assert!(!local_oracle_index.is_persistable());
 
         let blocking = BlockingTypeFlowAdapter::python()
             .with_constructed_seed(ClassSeed::Unknown(UnknownReason::SemanticBudget));
@@ -3770,7 +3852,7 @@ mod tests {
             );
             assert!(!recovered.published);
             assert_eq!(recovered.index.slots(), winner.slots());
-            assert!(recovered.index.persistable);
+            assert!(recovered.index.is_persistable());
             assert_eq!(
                 recovered_budget
                     .used()
@@ -3897,7 +3979,7 @@ mod tests {
             let mut budget = SemanticBudget::default();
             let index = FieldSlotIndex::build(workspace, adapter, &mut budget, &cancellation)
                 .expect("complete field slots build");
-            assert!(index.persistable);
+            assert!(index.is_persistable());
             index
                 .to_persisted(key)
                 .expect("field-slot DTO encoding succeeds")
@@ -4112,6 +4194,809 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14085: failed updates persisted incomplete field slots for healthy same-key reopen"
+    )]
+    fn failed_opaque_noop_update_does_not_publish_field_slots() {
+        use crate::analyzer::read_ledger::ReadLedger;
+        use crate::analyzer::{AnalyzerQueryScope, ProjectFile};
+        use brokk_bifrost_core::analyzer::project::Project;
+        use brokk_bifrost_core::analyzer::project_reads::{ProjectReadSlot, ReadCapability};
+        use std::collections::BTreeSet;
+        use std::{io, path::Path};
+
+        struct OpaqueProject(Arc<dyn Project>);
+        impl Project for OpaqueProject {
+            fn root(&self) -> &Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files(language)
+            }
+            fn analyzable_files_from(
+                &self,
+                files: &BTreeSet<ProjectFile>,
+                language: Language,
+            ) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files_from(files, language)
+            }
+            fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+            fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+                self.0.project_read_slot()
+            }
+            fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+                self.0.install_read_recorder(capability)
+            }
+            // Keep the real default unsupported digest. #14093 separates
+            // successful selection from unavailable proof, making this
+            // unchanged-file update healthy without fabricating reuse evidence.
+        }
+        fn opaque(project: &BuiltInlineTestProject) -> Arc<dyn Project> {
+            Arc::new(OpaqueProject(project.project_dyn()))
+        }
+        fn unknowns(index: &FieldSlotIndex) -> usize {
+            index
+                .slots()
+                .iter()
+                .flat_map(|slot| &slot.atoms)
+                .filter(|(atom, _)| matches!(atom, ClassAtom::Unknown(_)))
+                .count()
+        }
+        fn assert_no_reusable_field_slots(
+            workspace: &WorkspaceAnalyzer,
+            key: &ClassSetFieldSlotIndexKey,
+            cancellation: &crate::analyzer::semantic::CancellationToken,
+        ) {
+            // Only this complete key can answer acquisition. Unrelated or
+            // orphan rows do not make a reusable entry for these inputs.
+            assert!(
+                workspace
+                    .store()
+                    .unwrap()
+                    .class_set_field_slot_index(key, cancellation)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        fn assert_retained_source_facts(workspace: &WorkspaceAnalyzer) {
+            for name in ["app.Box", "app.Stored"] {
+                assert!(
+                    !workspace.analyzer().get_definitions(name).is_empty(),
+                    "fixture source facts must remain available: {name}"
+                );
+            }
+        }
+        fn configuration(workspace: &WorkspaceAnalyzer) -> String {
+            let selected = workspace
+                .analyzer()
+                .workspace_fact_indexes()
+                .iter()
+                .map(|index| {
+                    (
+                        index.fact_index_language(),
+                        index.selected_configuration_input_blobs(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "config={:?}; selected={selected:?}; lowering={:?}",
+                workspace.config(),
+                workspace.policy_lowering_identity(None)
+            )
+        }
+        let adapter = type_flow_adapter(Language::Python).unwrap();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        // Independent healthy opaque control: neither store may contain a
+        // reusable row for the tested full key. Keep source facts intact.
+        let control_project = field_slot_project();
+        let control =
+            WorkspaceAnalyzer::build_persisted(opaque(&control_project), AnalyzerConfig::default())
+                .unwrap();
+        let control_key = field_slot_persistence_key(
+            &control,
+            adapter,
+            WorkspaceIcfgProvider::new(&control).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        assert_no_reusable_field_slots(&control, &control_key, &cancellation);
+        let control_content = control.analyzer().workspace_content_identity().unwrap();
+        let control_configuration = configuration(&control);
+        let healthy_cache = FieldSlotIndexCache::default();
+        let healthy = {
+            let ledger = Arc::new(ReadLedger::new());
+            let scope = AnalyzerQueryScope::with_read_ledger(control.analyzer(), ledger.clone());
+            assert!(scope.store_error().is_none());
+            let value = acquire(
+                &control,
+                adapter,
+                &healthy_cache,
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            assert!(!ledger.store_failed());
+            value
+        };
+        assert!(
+            healthy.published,
+            "healthy opaque control must really publish a cold SQL row"
+        );
+        let healthy_unknowns = unknowns(&healthy.index);
+        assert_eq!(
+            healthy_unknowns, 0,
+            "fixture must begin with definite healthy slots"
+        );
+        assert!(!healthy.index.slots().is_empty());
+        let warm_control = acquire(
+            &control,
+            adapter,
+            &healthy_cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(warm_control.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
+        assert!(Arc::ptr_eq(&healthy.index, &warm_control.index));
+        assert_retained_source_facts(&control);
+
+        let project = field_slot_project();
+        let owner = opaque(&project);
+        assert!(owner.ignore_rules_digest().is_err());
+        let base =
+            WorkspaceAnalyzer::build_persisted(owner.clone(), AnalyzerConfig::default()).unwrap();
+        assert_ne!(base.persisted_store_path(), control.persisted_store_path());
+        let base_content = base.analyzer().workspace_content_identity().unwrap();
+        let base_configuration = configuration(&base);
+        let base_key = field_slot_persistence_key(
+            &base,
+            adapter,
+            WorkspaceIcfgProvider::new(&base).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(base_content, control_content);
+        assert_eq!(base_configuration, control_configuration);
+        assert_eq!(base_key, control_key);
+        assert_no_reusable_field_slots(&base, &base_key, &cancellation);
+        let source = project.file("app.py");
+        let before_bytes = std::fs::read(source.abs_path()).unwrap();
+        // Real reported no-op update. Do not write bytes, inject a failure,
+        // delete SQL, or alter the original unsupported Project operation.
+        let updated = base.update(&BTreeSet::from([source.clone()]));
+        assert_eq!(std::fs::read(source.abs_path()).unwrap(), before_bytes);
+        let updated_content = updated.analyzer().workspace_content_identity().unwrap();
+        let updated_configuration = configuration(&updated);
+        let updated_key = field_slot_persistence_key(
+            &updated,
+            adapter,
+            WorkspaceIcfgProvider::new(&updated).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(updated_content, base_content);
+        assert_eq!(updated_configuration, base_configuration);
+        assert_eq!(updated_key, base_key);
+        assert_no_reusable_field_slots(&updated, &updated_key, &cancellation);
+        let ledger = Arc::new(ReadLedger::new());
+        let updated_cache = FieldSlotIndexCache::default();
+        let built = {
+            let scope = AnalyzerQueryScope::with_read_ledger(updated.analyzer(), ledger.clone());
+            assert!(scope.store_error().is_none());
+            assert!(!ledger.store_failed());
+            let built = acquire(
+                &updated,
+                adapter,
+                &updated_cache,
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .expect("healthy opaque no-op update builds complete field slots");
+            assert_eq!(built.kind, FieldSlotIndexAcquisitionKind::Built);
+            assert!(built.published, "healthy update must publish reusable SQL");
+            assert!(built.index.is_persistable());
+            assert!(!built.index.slots().is_empty());
+            assert_eq!(unknowns(&built.index), 0);
+            assert!(
+                built
+                    .index
+                    .to_persisted(updated_key.clone())
+                    .unwrap()
+                    .is_some()
+            );
+            let repeat = acquire(
+                &updated,
+                adapter,
+                &updated_cache,
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .expect("healthy update reuses its complete field slots");
+            assert_eq!(repeat.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
+            assert!(Arc::ptr_eq(&built.index, &repeat.index));
+            assert!(scope.store_error().is_none());
+            assert!(!ledger.store_failed());
+            built
+        };
+        assert!(
+            updated
+                .store()
+                .unwrap()
+                .class_set_field_slot_index(&updated_key, &cancellation)
+                .unwrap()
+                .is_some(),
+            "healthy update must leave its durable index"
+        );
+        // Read the already-built healthy base only after the measured
+        // acquisitions, so this source-fact witness cannot prewarm their reads.
+        assert_retained_source_facts(&base);
+        drop(built);
+        drop(updated);
+        drop(base);
+        drop(owner);
+        let reopened =
+            WorkspaceAnalyzer::build_persisted(opaque(&project), AnalyzerConfig::default())
+                .unwrap();
+        let reopen_key = field_slot_persistence_key(
+            &reopened,
+            adapter,
+            WorkspaceIcfgProvider::new(&reopened).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        let reopen_content = reopened.analyzer().workspace_content_identity().unwrap();
+        let reopen_configuration = configuration(&reopened);
+        assert_eq!(reopen_key, updated_key);
+        assert_eq!(reopen_content, base_content);
+        assert_eq!(reopen_configuration, base_configuration);
+        let replayed = {
+            let ledger = Arc::new(ReadLedger::new());
+            let scope = AnalyzerQueryScope::with_read_ledger(reopened.analyzer(), ledger.clone());
+            assert!(scope.store_error().is_none());
+            assert!(!ledger.store_failed());
+            let replayed = acquire(
+                &reopened,
+                adapter,
+                &FieldSlotIndexCache::default(),
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            assert!(scope.store_error().is_none());
+            assert!(!ledger.store_failed());
+            replayed
+        };
+        let reopened_unknowns = unknowns(&replayed.index);
+        assert_eq!(
+            reopened_unknowns, healthy_unknowns,
+            "healthy same-key SQL reopen must retain the healthy control's definite slots"
+        );
+        assert_eq!(reopened_unknowns, 0);
+        assert_eq!(replayed.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
+        assert!(
+            !replayed.published,
+            "reopen must read the existing healthy row"
+        );
+        let healthy_hit = acquire(
+            &reopened,
+            adapter,
+            &FieldSlotIndexCache::default(),
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(
+            healthy_hit.kind,
+            FieldSlotIndexAcquisitionKind::PersistentHit
+        );
+        assert_eq!(unknowns(&healthy_hit.index), 0);
+    }
+
+    fn field_slot_incomplete_count(index: &FieldSlotIndex) -> usize {
+        index
+            .slots()
+            .iter()
+            .flat_map(|slot| &slot.atoms)
+            .filter(|(atom, _)| {
+                matches!(atom, ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete))
+            })
+            .count()
+    }
+
+    #[test]
+    #[hardwon(
+        "#14120: ledger-free construction reported reusable admission despite owned store failure"
+    )]
+    fn ledger_free_failed_construction_does_not_advertise_shared_admission() {
+        let project = field_slot_project();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let adapter = type_flow_adapter(Language::Python).unwrap();
+        let config = AnalyzerConfig::default();
+        let control_workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), config.clone()).unwrap();
+        let key = field_slot_persistence_key(
+            &control_workspace,
+            adapter,
+            WorkspaceIcfgProvider::new(&control_workspace).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        let control = FieldSlotIndex::build(
+            &control_workspace,
+            adapter,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(field_slot_incomplete_count(&control), 0);
+        assert!(!control.slots().is_empty());
+        drop(control_workspace);
+
+        let failed_workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), config.clone()).unwrap();
+        assert!(
+            failed_workspace
+                .analyzer()
+                .current_thread_read_ledger()
+                .is_none()
+        );
+        let cache = FieldSlotIndexCache::default();
+        let store = failed_workspace.store().unwrap();
+        assert!(
+            store
+                .class_set_field_slot_index(&key, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        let failed = {
+            let scope =
+                AnalyzerQueryScope::capturing_read_incompleteness(failed_workspace.analyzer());
+            assert!(
+                failed_workspace
+                    .analyzer()
+                    .current_thread_read_ledger()
+                    .is_none()
+            );
+            // Reuse the existing operational store seam with the registered
+            // Python adapter. The SQL loader can also fail: this pins owned
+            // index admission independently of that loader's publication guard.
+            store.set_class_set_field_slot_operational_failure_for_test(true);
+            let failed = acquire(
+                &failed_workspace,
+                adapter,
+                &cache,
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            eprintln!(
+                "failed acquisition: kind={:?} miss={:?} shareable={} persistable={} published={} slots={:#?} reasons={:#?} store_error={:#?}",
+                failed.kind,
+                failed.miss_reason,
+                failed.index.is_shareable(),
+                failed.index.is_persistable(),
+                failed.published,
+                failed.index.slots(),
+                scope.captured_read_incompleteness(),
+                scope.store_error(),
+            );
+            assert!(scope.store_error().is_some());
+            assert!(
+                failed_workspace
+                    .analyzer()
+                    .current_thread_read_ledger()
+                    .is_none()
+            );
+            assert_eq!(failed.kind, FieldSlotIndexAcquisitionKind::Built);
+            assert_eq!(
+                failed.miss_reason,
+                Some(FieldSlotIndexMissReason::StoreFailure)
+            );
+            assert!(!failed.published);
+            failed
+        };
+        store.set_class_set_field_slot_operational_failure_for_test(false);
+        assert!(
+            store
+                .class_set_field_slot_index(&key, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        drop(failed_workspace);
+
+        let healthy_workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), config).unwrap();
+        assert_eq!(
+            field_slot_persistence_key(
+                &healthy_workspace,
+                adapter,
+                WorkspaceIcfgProvider::new(&healthy_workspace).behavior_identity(),
+                None,
+            )
+            .unwrap(),
+            key
+        );
+        // A separate memory cache first proves that the same SQL/source inputs
+        // remain healthy before examining the original failed cache.
+        let healthy = acquire(
+            &healthy_workspace,
+            adapter,
+            &FieldSlotIndexCache::default(),
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert!(healthy.published);
+        assert_eq!(healthy.index.slots(), control.slots());
+        assert_eq!(field_slot_incomplete_count(&healthy.index), 0);
+        let same_cache = acquire(
+            &healthy_workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        eprintln!(
+            "healthy acquisitions: independent kind={:?} shareable={} persistable={} slots={:#?}; same-cache kind={:?} miss={:?} shareable={} persistable={} slots={:#?}",
+            healthy.kind,
+            healthy.index.is_shareable(),
+            healthy.index.is_persistable(),
+            healthy.index.slots(),
+            same_cache.kind,
+            same_cache.miss_reason,
+            same_cache.index.is_shareable(),
+            same_cache.index.is_persistable(),
+            same_cache.index.slots(),
+        );
+        assert_eq!(
+            field_slot_incomplete_count(&same_cache.index),
+            field_slot_incomplete_count(&healthy.index),
+            "healthy same-cache consumer: {:?}, failed shareable: {}",
+            same_cache.kind,
+            failed.index.is_shareable(),
+        );
+        assert_eq!(same_cache.index.slots(), control.slots());
+        assert!(
+            healthy_workspace
+                .analyzer()
+                .current_thread_read_ledger()
+                .is_none()
+        );
+        assert!(same_cache.index.is_shareable());
+        let memory = acquire(
+            &healthy_workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(memory.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
+        assert!(Arc::ptr_eq(&memory.index, &same_cache.index));
+        assert_eq!(memory.index.slots(), control.slots());
+        // The loader's explicit publication guard can protect this cache even
+        // while the returned index wrongly advertises reusable admission.
+        // This assertion checks that independent owned-authority boundary.
+        assert!(failed.index.to_persisted(key.clone()).unwrap().is_none());
+        assert!(
+            !failed.index.is_shareable(),
+            "failed owned construction remained shareable after its scope closed"
+        );
+    }
+
+    #[test]
+    #[hardwon("#14120: a first content reason hid later operational field-slot admission failure")]
+    fn ledger_free_content_then_operational_completion_restricts_only_owned_indexes() {
+        use crate::analyzer::QueryReadIncomplete;
+        use crate::analyzer::read_ledger::DerivationExecutionCause;
+
+        let project = field_slot_project();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .unwrap();
+        let adapter = type_flow_adapter(Language::Python).unwrap();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+        assert!(workspace.analyzer().current_thread_read_ledger().is_none());
+        let mut owned = FieldSlotIndex::build_with_value_flow_cache(
+            &workspace,
+            &scope,
+            adapter,
+            ValueFlowCache::default(),
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        let key = field_slot_persistence_key(
+            &workspace,
+            adapter,
+            WorkspaceIcfgProvider::new(&workspace).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(owned.admission, FieldSlotAdmission::Durable);
+        assert!(owned.to_persisted(key.clone()).unwrap().is_some());
+        let healthy_shared = Arc::new(owned.clone());
+        let content =
+            QueryReadIncomplete::SemanticEvidenceGap("field-slot content boundary witness".into());
+        workspace
+            .analyzer()
+            .record_query_incomplete(content.clone());
+        assert_eq!(scope.read_completion(), Err(content.clone()));
+        owned.restrict_admission(&workspace, &scope);
+        assert_eq!(owned.admission, FieldSlotAdmission::Durable);
+        let operational = QueryReadIncomplete::ProofStopped {
+            reason: "field_slot_owned_completion_test",
+            cause: Some(DerivationExecutionCause::Provider),
+        };
+        workspace
+            .analyzer()
+            .record_query_incomplete(operational.clone());
+        assert_eq!(scope.read_completion(), Err(operational.clone()));
+        assert!(scope.request_store_error().is_none());
+        assert_eq!(
+            scope.captured_read_incompleteness(),
+            vec![operational, content]
+        );
+        owned.restrict_admission(&workspace, &scope);
+        assert_eq!(owned.admission, FieldSlotAdmission::RequestOnly);
+        assert!(owned.to_persisted(key).unwrap().is_none());
+        assert_eq!(owned.slots(), healthy_shared.slots());
+        assert!(healthy_shared.is_shareable());
+        assert_eq!(field_slot_incomplete_count(&owned), 0);
+    }
+
+    #[test]
+    #[hardwon("#14085: a failed capture published an otherwise persistable field-slot index")]
+    fn store_failed_ledger_does_not_publish_an_otherwise_persistable_field_slot_index() {
+        use crate::analyzer::AnalyzerQueryScope;
+        use crate::analyzer::read_ledger::ReadLedger;
+
+        let project = field_slot_project();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .unwrap();
+        let adapter = type_flow_adapter(Language::Python).unwrap();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let key = field_slot_persistence_key(
+            &workspace,
+            adapter,
+            WorkspaceIcfgProvider::new(&workspace).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        let cache = FieldSlotIndexCache::default();
+        let store = workspace.store().unwrap();
+        assert!(
+            store
+                .class_set_field_slot_index(&key, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        {
+            let ledger = Arc::new(ReadLedger::new());
+            let scope = AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), ledger.clone());
+            // Transition only capture admission state. Do not install a
+            // StoreError: the data shape remains healthy, but admission must
+            // record the legacy channel's negative authority.
+            ledger.record_store_failure();
+            assert!(ledger.store_failed());
+            assert!(scope.store_error().is_none());
+            let failed = acquire(
+                &workspace,
+                adapter,
+                &cache,
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            assert_eq!(failed.kind, FieldSlotIndexAcquisitionKind::Built);
+            assert!(ledger.store_failed());
+            assert!(scope.store_error().is_none());
+            assert!(!cancellation.is_cancelled());
+            assert_eq!(failed.index.admission, FieldSlotAdmission::RequestOnly);
+            assert!(!failed.index.is_persistable());
+            assert!(!failed.index.is_shareable());
+            assert!(!failed.index.slots().is_empty());
+            assert_eq!(field_slot_incomplete_count(&failed.index), 0);
+            assert!(
+                failed
+                    .index
+                    .slots()
+                    .iter()
+                    .flat_map(|slot| &slot.atoms)
+                    .all(|(atom, _)| !matches!(atom, ClassAtom::Unknown(_)))
+            );
+            assert!(failed.index.to_persisted(key.clone()).unwrap().is_none());
+            assert!(!failed.published, "failed capture published reusable SQL");
+            assert!(
+                store
+                    .class_set_field_slot_index(&key, &cancellation)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let failed_slots = {
+            // A direct healthy build proves the shape, independently of the
+            // denied capture and without a publication permit.
+            let control = FieldSlotIndex::build(
+                &workspace,
+                adapter,
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            assert!(control.to_persisted(key.clone()).unwrap().is_some());
+            control.slots().to_vec()
+        };
+        let healthy = acquire(
+            &workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(healthy.kind, FieldSlotIndexAcquisitionKind::Built);
+        assert!(healthy.published);
+        assert_eq!(healthy.index.slots(), failed_slots);
+        assert_eq!(field_slot_incomplete_count(&healthy.index), 0);
+        drop(healthy);
+        drop(workspace);
+        let reopened =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .unwrap();
+        let reopened_key = field_slot_persistence_key(
+            &reopened,
+            adapter,
+            WorkspaceIcfgProvider::new(&reopened).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened_key, key);
+        let replayed = acquire(
+            &reopened,
+            adapter,
+            &FieldSlotIndexCache::default(),
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(replayed.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
+        assert_eq!(field_slot_incomplete_count(&replayed.index), 0);
+    }
+
+    #[test]
+    #[hardwon("#14085: failure-incomplete field slots passed reusable serialization admission")]
+    fn operationally_incomplete_field_slots_cannot_be_serialized_for_reuse() {
+        use crate::analyzer::AnalyzerQueryScope;
+        use crate::analyzer::read_ledger::ReadLedger;
+
+        let project = field_slot_project();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .unwrap();
+        let adapter = type_flow_adapter(Language::Python).unwrap();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let key = field_slot_persistence_key(
+            &workspace,
+            adapter,
+            WorkspaceIcfgProvider::new(&workspace).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        let store = workspace.store().unwrap();
+        assert!(
+            store
+                .class_set_field_slot_index(&key, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        let failed = {
+            let ledger = Arc::new(ReadLedger::new());
+            let scope = AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), ledger.clone());
+            store.set_class_set_field_slot_operational_failure_for_test(true);
+            let failed = acquire(
+                &workspace,
+                adapter,
+                &FieldSlotIndexCache::default(),
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            assert!(scope.store_error().is_some());
+            assert!(ledger.store_failed());
+            assert_eq!(failed.kind, FieldSlotIndexAcquisitionKind::Built);
+            assert_eq!(
+                failed.miss_reason,
+                Some(FieldSlotIndexMissReason::StoreFailure)
+            );
+            assert!(!failed.published);
+            assert!(field_slot_incomplete_count(&failed.index) > 0);
+            assert!(!failed.index.is_persistable());
+            // Owned failure now restricts both reuse lifetimes. Preserve the
+            // independent source/DTO-shape witnesses below.
+            assert_eq!(failed.index.admission, FieldSlotAdmission::RequestOnly);
+            assert!(!failed.index.is_shareable());
+            assert!(failed.index.open_bound_class_sources.is_empty());
+            assert!(failed.index.store_survey.to_persisted().is_some());
+            for slot in failed.index.slots() {
+                assert!(persist_class(&slot.class).is_some());
+                for (atom, source) in &slot.atoms {
+                    assert!(persist_source(source).is_some());
+                    match atom {
+                        ClassAtom::Class(class) => assert!(persist_class(class).is_some()),
+                        ClassAtom::Unknown(reason) => {
+                            assert!(
+                                CLASS_SET_FIELD_SLOT_UNKNOWN_REASONS
+                                    .contains(&reason.to_string().as_str())
+                            );
+                        }
+                    }
+                }
+            }
+            store.set_class_set_field_slot_operational_failure_for_test(false);
+            failed
+        };
+        // The capture has ended and the store seam is disabled. Admission of
+        // this same returned value must reject it without a current failure.
+        assert!(failed.index.to_persisted(key.clone()).unwrap().is_none());
+        assert!(
+            store
+                .class_set_field_slot_index(&key, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        drop(failed);
+        drop(workspace);
+        let reopened =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .unwrap();
+        let reopened_key = field_slot_persistence_key(
+            &reopened,
+            adapter,
+            WorkspaceIcfgProvider::new(&reopened).behavior_identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened_key, key);
+        let healthy = {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(reopened.analyzer());
+            assert!(scope.store_error().is_none());
+            acquire(
+                &reopened,
+                adapter,
+                &FieldSlotIndexCache::default(),
+                &mut SemanticBudget::default(),
+                &cancellation,
+            )
+            .unwrap()
+        };
+        assert_eq!(healthy.kind, FieldSlotIndexAcquisitionKind::Built);
+        assert!(healthy.published);
+        assert_eq!(field_slot_incomplete_count(&healthy.index), 0);
+        let replayed = acquire(
+            &reopened,
+            adapter,
+            &FieldSlotIndexCache::default(),
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(replayed.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
+        assert_eq!(field_slot_incomplete_count(&replayed.index), 0);
+    }
+
+    #[test]
     fn operational_store_failure_is_typed_and_does_not_fill_the_ready_cache() {
         let project = field_slot_project();
         let adapter = type_flow_adapter(Language::Python).expect("Python type-flow adapter");
@@ -4225,8 +5110,14 @@ mod tests {
             .unwrap();
         }
         assert_eq!(collected.dynamic_writes.len(), 1);
-        let mut slots =
-            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        let mut slots = FieldSlotIndex::finish(
+            &workspace,
+            &AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer()),
+            &adapter,
+            collected.clone(),
+            &cancellation,
+        )
+        .unwrap();
         slots.store_survey.dynamic_effects = collected
             .dynamic_writes
             .iter()
@@ -4386,8 +5277,14 @@ mod tests {
             .unwrap();
         }
         assert_eq!(collected.dynamic_writes.len(), 2);
-        let slots =
-            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        let slots = FieldSlotIndex::finish(
+            &workspace,
+            &AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer()),
+            &adapter,
+            collected.clone(),
+            &cancellation,
+        )
+        .unwrap();
         let root = |name| {
             procedures
                 .iter()
@@ -4476,7 +5373,7 @@ mod tests {
                 .expect("resolver-budget classification returns an honest incomplete index");
             assert_eq!(acquired.kind, FieldSlotIndexAcquisitionKind::Built);
             assert!(!acquired.published);
-            assert!(!acquired.index.persistable);
+            assert!(!acquired.index.is_persistable());
             assert!(acquired.index.semantic_budget_exhausted());
             assert_eq!(acquired.index.semantic_budget_exhaustion(), None);
             assert!(acquired.index.slots().iter().any(|slot| {
@@ -4601,6 +5498,12 @@ mod tests {
         let cold_workspace =
             WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
                 .expect("cold persisted workspace builds");
+        assert!(
+            cold_workspace
+                .analyzer()
+                .current_thread_read_ledger()
+                .is_none()
+        );
         solve_type_flow_workspace(
             &cold_workspace,
             ClosureLimits { max_procedures: 64 },
@@ -4628,5 +5531,12 @@ mod tests {
         )
         .expect("the public workspace solve published its field-slot index");
         assert_eq!(warm.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
+        assert!(warm.index.is_shareable());
+        assert!(
+            warm_workspace
+                .analyzer()
+                .current_thread_read_ledger()
+                .is_none()
+        );
     }
 }

@@ -5,6 +5,10 @@ use super::placement_access::{
 use super::unit_access::{UnitAccess, UnitAccessMemo, UnitAccessRules, read_unit_access};
 use super::*;
 use crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory;
+use crate::analyzer::store::selected_read::SelectedRead;
+use crate::analyzer::store::selected_read::queries::csharp::{
+    CSharpGlobalUsingInventory, GlobalUsingParams, compilation_label,
+};
 use crate::analyzer::store::{
     WorkspaceSnapshotId,
     csharp_compilation::{CSharpCompilationView, CertifiedCSharpHandle, SelectedCSharpMembership},
@@ -39,16 +43,20 @@ pub struct CSharpUnitReader<'a, 'selection> {
     identities: &'a SelectedContextIdentities,
     placements: PlacementMemo<CSharpUnitPlacement>,
     access: UnitAccessMemo,
+    selected: SelectedRead<'a>,
 }
 
 impl<'a, 'selection> CSharpUnitReader<'a, 'selection> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn new(
         selection: &'a SelectedResolutionMountInventory<'selection>,
         snapshot: &'a WorkspaceSnapshotId,
         certified: &CertifiedCSharpHandle<'_>,
         identities: &'a SelectedContextIdentities,
+        services: &'a dyn SelectedAnalyzerServices,
     ) -> Result<Self> {
         Ok(Self {
+            selected: SelectedRead::new(selection, services),
             selection,
             compilations: Some(CSharpCompilationView::certified(
                 selection.connection(),
@@ -78,6 +86,11 @@ impl<'a, 'selection> CSharpUnitReader<'a, 'selection> {
         &self,
         rel_path: &str,
     ) -> Result<SelectedCSharpMembership> {
+        // Membership of one path is a function of the compilation configuration
+        // (recorded by certification) and this path's own selected version.
+        // Recording the version keeps a new or edited path's answer fresh
+        // without reading every other C# file's content.
+        self.selected.mount_by_path(Language::CSharp, rel_path)?;
         match &self.compilations {
             Some(view) => view.selected_compilations_of(self.selection, rel_path),
             None => Ok(SelectedCSharpMembership::NotSelected),
@@ -326,22 +339,6 @@ impl UnitAccessRules for CSharpAccessRules<'_> {
 
 // A coverage row counts only for a compilation of a set at the current
 // derivation version: a row left by an older derivation proves nothing.
-pub const SELECTED_GLOBAL_USING_COVERAGE: &str =
-    "SELECT v.membership_complete,v.publications_expected,
- v.publications_installed,json(v.reasons)
- FROM temp.selected_csharp_compilation_using_coverage v
- JOIN main.csharp_compilations c ON c.compilation_id=v.compilation_id
- JOIN main.csharp_compilation_sets s ON s.set_id=c.set_id AND s.derivation_identity=?2
- WHERE v.compilation_id=?1";
-// The extent holds only installed publications of selected members; the reader
-// checks each row's blob against the selected mount, and coverage proves the
-// publication counts. Joining the member view would build an automatic index.
-pub const SELECTED_GLOBAL_USING_SITES: &str =
-    "SELECT e.rel_path,e.blob_id,e.import_site,s.local_name
- FROM temp.selected_csharp_global_using_extent e
- LEFT JOIN main.resolution_import_selectors s ON s.blob_id=e.blob_id AND s.site=e.import_site
- WHERE e.compilation_id=?1";
-
 pub(super) struct CSharpGlobalUsingRoute {
     pub fragment: BindingFragmentId,
     pub alias: Option<String>,
@@ -387,96 +384,65 @@ impl CSharpUnitReader<'_, '_> {
         session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
     ) -> Result<Option<CSharpGlobalUsings>> {
         use crate::analyzer::resolution::{ResolutionCompletion, ResolutionIncompleteReason};
-        let conn = self.selection.connection();
         let mut missing = Vec::new();
-        let coverage = conn
-            .prepare_cached(SELECTED_GLOBAL_USING_COVERAGE)?
-            .query_row(
-                rusqlite::params![
-                    placement.compilation_id,
-                    super::super::csharp_compilation::derivation_identity()
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, bool>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let inventory =
+            self.selected
+                .selection::<CSharpGlobalUsingInventory>(&GlobalUsingParams {
+                    compilation_id: placement.compilation_id,
+                    label: compilation_label(
+                        placement.project_path.as_deref(),
+                        placement.target_framework.as_deref(),
+                    )
+                    .into(),
+                })?;
         // Completeness comes from the coverage row alone, never from the absence
         // of extent rows. Its `metadata` reason is native demand's obligation.
-        match coverage {
-            Some((membership, expected, installed, reasons)) => {
-                if !membership {
+        match &inventory.coverage {
+            Some(coverage) => {
+                if !coverage.membership_complete {
                     let gaps = self.inventory_gaps(placement)?;
                     missing.push(format!("compilation inventory is open: {gaps:?}"));
                 }
-                if expected != installed {
+                if coverage.publications_expected != coverage.publications_installed {
                     missing.push(format!(
-                        "source publications: expected/installed {expected}/{installed}"
+                        "source publications: expected/installed {}/{}",
+                        coverage.publications_expected, coverage.publications_installed
                     ));
                 }
-                let reasons: Vec<serde_json::Value> =
-                    serde_json::from_str(&reasons).map_err(|error| {
-                        StoreError::corrupt(format!(
-                            "invalid global-using coverage reasons: {error}"
-                        ))
-                    })?;
-                for reason in &reasons {
-                    if reason["kind"] != "source_enumeration" {
-                        continue;
-                    }
-                    let paths = reason["paths"].as_array().ok_or_else(|| {
-                        StoreError::corrupt("source enumeration reason lacks its paths")
-                    })?;
-                    for path in paths {
-                        missing.push(format!(
-                            "source marker enumeration incomplete: {}",
-                            path.as_str().ok_or_else(|| {
-                                StoreError::corrupt("source enumeration path is not text")
-                            })?
-                        ));
-                    }
+                for path in &coverage.enumeration_gaps {
+                    missing.push(format!("source marker enumeration incomplete: {path}"));
                 }
             }
             None => missing.push("selected compilation coverage row missing".into()),
         }
         let mut routes = Vec::new();
-        let mut sites = conn
-            .prepare_cached(SELECTED_GLOBAL_USING_SITES)?
-            .query_map([placement.compilation_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, u32>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        sites.sort_unstable();
-        for (path, blob, site, alias) in sites {
+        let mut sites: Vec<_> = inventory.sites.iter().collect();
+        sites.sort_unstable_by(|a, b| {
+            (&a.path, a.blob, a.site, &a.alias).cmp(&(&b.path, b.blob, b.site, &b.alias))
+        });
+        for site in sites {
             if cancellation.is_cancelled() || !session.scope_step() {
                 return Ok(None);
             }
-            let Some(mount) = self.selection.mount_record_for_path("csharp", &path)? else {
+            let path = &site.path;
+            let Some(mount) = self.selection.mount_record_for_path("csharp", path)? else {
                 missing.push(format!("selected source mount unavailable: {path}"));
                 continue;
             };
-            if mount.blob_id() != blob {
+            if mount.blob_id() != site.blob {
                 missing.push(format!("selected source publication differs: {path}"));
                 continue;
             }
-            let route = super::imports::route_at_site(conn, blob, site)?
+            let route = site
+                .route
+                .clone()
                 .ok_or_else(|| StoreError::corrupt("global using extent lacks its root import"))?;
-            if route.kind == "named" && alias.is_none() {
+            if route.kind == "named" && site.alias.is_none() {
                 return Err(StoreError::corrupt("global alias lacks its named selector"));
             }
             routes.push(CSharpGlobalUsingRoute {
                 fragment: mount.fragment_id(),
-                alias,
+                alias: site.alias.clone(),
                 route,
             });
         }
@@ -503,4 +469,28 @@ impl CSharpUnitReader<'_, '_> {
         };
         Ok(Some(CSharpGlobalUsings { routes, completion }))
     }
+}
+
+/// The head's digest of one compilation's global-using fact, by label. It runs
+/// the recording query and the digest function the recording site uses, so the
+/// two cannot disagree. None names no unique compilation of the selected set.
+pub fn compilation_global_using_digest(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    label: &str,
+) -> Result<Option<crate::analyzer::semantic::ids::StableDigest>> {
+    use crate::analyzer::store::selected_read::queries::csharp::{
+        CSharpCompilationLabels, global_using_inventory_digest,
+    };
+    let ready = &operation.ready;
+    let selected = SelectedRead::new(ready, ready.csharp_services()?);
+    let labels = selected.selection::<CSharpCompilationLabels>(&())?;
+    let mut matching = labels.iter().filter(|candidate| &*candidate.label == label);
+    let (Some(compilation), None) = (matching.next(), matching.next()) else {
+        return Ok(None);
+    };
+    let inventory = selected.selection::<CSharpGlobalUsingInventory>(&GlobalUsingParams {
+        compilation_id: compilation.compilation_id,
+        label: label.into(),
+    })?;
+    Ok(Some(global_using_inventory_digest(&inventory)))
 }

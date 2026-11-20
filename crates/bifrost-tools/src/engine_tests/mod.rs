@@ -1,6 +1,45 @@
 // Keep the moved Go regression's original ancestor-relative fixture path.
 use brokk_bifrost_go_analysis::persist_live_go_sources_for_test;
 
+// Re-execute discovery-sensitive goldens without changing this process's environment.
+fn run_with_empty_java_home(test: &str) -> bool {
+    if std::env::var_os("JAVA_HOME").is_some_and(|home| home.is_empty()) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", test, "--nocapture"])
+        .env("JAVA_HOME", "")
+        .output()
+        .expect("run no-JDK golden in a child process");
+    assert!(
+        output.status.success(),
+        "{test}: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}
+
+/// Request canonical replacement rather than adoption of a healthy source.
+fn repair_parsed_source<
+    A: brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter,
+>(
+    store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
+    key: &brokk_bifrost_core::gitblob::BlobKey,
+    adapter: &A,
+    state: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
+) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+    use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
+    let prepared = brokk_bifrost_analysis::analyzer::store::AnalyzerStore::prepare_parsed_blob(
+        key,
+        store.current_generation(&key.lang)?,
+        adapter,
+        std::sync::Arc::new(state.clone()),
+    )?;
+    store.ensure_prepared_resolution_epochs(std::slice::from_ref(&prepared))?;
+    store.repair_prepared_blob(prepared)
+}
+
 mod analyzer_build_state;
 mod analyzer_dirty_declarations;
 mod analyzer_file_states;
@@ -14,8 +53,10 @@ mod derivation_identity_upgrade;
 mod go_native_graph;
 mod go_retained_receiver_oracle;
 mod hit_path_read_parity;
+mod ignore_membership;
 mod overlay_bounded_declarations;
 mod point_latency;
+mod program_point_selection;
 mod retained_source_queries;
 mod rust_crate_context;
 mod rust_crates;
@@ -24,6 +65,7 @@ mod rust_manifest_update;
 mod rust_native_graph;
 mod rust_selected_shadow;
 mod rust_unit_summaries;
+mod site_context;
 mod tree_sitter_analyzer;
 mod workspace_analyzer_lifecycle;
 mod workspace_evidence_boundaries;
@@ -67,6 +109,7 @@ mod go_module_overlay;
 mod csharp_demand;
 mod csharp_imports;
 mod csharp_namespaces;
+mod csharp_parts;
 mod csharp_receiver_query;
 mod csharp_store;
 
@@ -169,6 +212,7 @@ mod rust_analyzer_store_resolution_operation_rust_reverse_rows_tests;
 mod rust_analyzer_store_resolution_operation_unit_summary_tests;
 
 mod rust_analyzer_store_resolution_producer_tests;
+mod rust_import_provenance_tests;
 
 mod rust_analyzer_store_resolution_publication_tests;
 
@@ -411,3 +455,5 @@ mod resolution_rows_dump;
 mod structural_rows_dump;
 
 mod usage_answer_coverage;
+
+mod workspace_selection;

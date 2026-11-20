@@ -1,6 +1,7 @@
 //! Deterministic public results for in-memory summary tabulation.
 
 use super::summary::MemberReadReceipt;
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::analyzer::store::cache_budget::RetainedHeap;
 use crate::hash::{HashMap, HashSet};
 use std::{
@@ -849,6 +850,15 @@ pub struct SummaryDataflowResult<Fact> {
     metrics: SummaryMetrics,
     witness_store: WitnessStore,
     witness_retention_truncated: bool,
+    // Execution dependence of the solve's own witness limits. The
+    // termination's budget refusal joins it in `reuse_verdict`.
+    reuse: ReuseVerdict,
+}
+
+impl<Fact> CarriesReuseVerdict for SummaryDataflowResult<Fact> {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse.join(self.termination.budget_verdict())
+    }
 }
 
 impl<Fact> SummaryDataflowResult<Fact> {
@@ -867,6 +877,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
         metrics: SummaryMetrics,
         witness_store: WitnessStore,
         witness_retention_truncated: bool,
+        reuse: ReuseVerdict,
     ) -> Self {
         reached.sort_by(compare_reached_facts);
         reached.dedup();
@@ -892,6 +903,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
             metrics,
             witness_store,
             witness_retention_truncated,
+            reuse,
         }
     }
 
@@ -913,6 +925,32 @@ impl<Fact> SummaryDataflowResult<Fact> {
             witness_store: super::WitnessArena::new(super::WitnessRetentionLimits::disabled())
                 .into_store(),
             witness_retention_truncated: false,
+            reuse: self.reuse,
+        }
+    }
+
+    /// Keep the verdict of a solve whose findings are already projected: its
+    /// facts, coverage, termination and work. The solved rows and the proof
+    /// graph are retired, because witnesses were reconstructed into the
+    /// findings and no reader of a projected report walks the rows again.
+    pub(crate) fn into_verdict(self) -> Self {
+        Self {
+            caller_conversions: HashSet::default(),
+            member_receipts: None,
+            facts: self.facts,
+            reached: Box::default(),
+            end_summaries: Box::default(),
+            entry_transfers: Box::default(),
+            incoming_calls: Box::default(),
+            coverage: self.coverage,
+            termination: self.termination,
+            work: self.work,
+            semantic_work: self.semantic_work,
+            metrics: self.metrics,
+            witness_store: super::WitnessArena::new(super::WitnessRetentionLimits::disabled())
+                .into_store(),
+            witness_retention_truncated: self.witness_retention_truncated,
+            reuse: self.reuse,
         }
     }
 
@@ -1302,7 +1340,9 @@ impl<Fact> SummaryDataflowResult<Fact> {
         };
         let Some(evidence) = evidence_for(quality) else {
             return if self.witness_retention_truncated {
-                Ok(SummaryWitness::retention_truncated_marker(quality))
+                Ok(SummaryWitness::retention_truncated_marker(
+                    quality, self.reuse,
+                ))
             } else {
                 Err(SummaryWitnessError::RetentionDisabled)
             };

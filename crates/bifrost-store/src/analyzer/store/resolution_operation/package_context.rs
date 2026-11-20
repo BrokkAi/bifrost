@@ -323,6 +323,7 @@ impl PackageMemberCoordinates {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn has_package_reference(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -379,6 +380,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
 impl ReadySelectedResolution<'_, '_> {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_package_references(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -461,6 +463,7 @@ impl ReadySelectedResolution<'_, '_> {
 
     // Both readers preserve staged replacement by reference/namespace while
     // seeking only the source identity already established by the demand.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn selected_package_reference_rows(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -519,6 +522,7 @@ impl ReadySelectedResolution<'_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_package_members_for_lookup(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -609,6 +613,7 @@ impl ReadySelectedResolution<'_, '_> {
     /// Read one mount's package members in two bounded passes, applying staged
     /// overlay authority by definition and namespace before grouping by lookup.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_package_members_by_lookup(
         &self,
         mount: SelectedResolutionMountOrdinal,

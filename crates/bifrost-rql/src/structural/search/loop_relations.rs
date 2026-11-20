@@ -140,6 +140,7 @@ pub(super) fn loop_relation_expansions<'a>(
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled => Some(DerivationExecutionCause::Cancelled),
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticModelsPending
                 | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(_)
+                | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::InternalInvariant(_)
                 | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(_) => Some(DerivationExecutionCause::Provider),
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(_)
                 | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ArtifactUnavailable(_)
@@ -164,7 +165,7 @@ pub(super) fn loop_relation_expansions<'a>(
     if candidates.rows.is_empty() {
         return Vec::new();
     }
-    let Some(outcome) = semantic.materialized_outcome(procedure.file()) else {
+    let Ok(outcome) = semantic.materialized_outcome(procedure.file()) else {
         report_open(
             workspace.analyzer(),
             procedure,
@@ -306,7 +307,8 @@ pub(super) fn loop_relation_expansions<'a>(
                     let cause = reasons.iter().find_map(|reason| match reason {
                         LoopRepeatIncompleteReason::Flow(reason) => match reason {
                             brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::Cancelled => Some(DerivationExecutionCause::Cancelled),
-                            brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::BudgetExhausted { .. } => Some(DerivationExecutionCause::Budget),
+                            brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::BudgetExhausted { .. }
+                            | brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. } => Some(DerivationExecutionCause::Budget),
                             _ => None,
                         },
                         _ => None,

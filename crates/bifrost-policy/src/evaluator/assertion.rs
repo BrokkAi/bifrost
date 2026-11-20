@@ -5,7 +5,9 @@ use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
 use brokk_bifrost_analysis::path_utils::workspace_relative_slash_path;
 use brokk_bifrost_rql::structural::CodeQueryRowScalarRef;
 use brokk_bifrost_rql::structural::edges::EdgeProvenance;
-use brokk_bifrost_rql::structural::search::{DetailedCodeQueryResult, MergedUnitRows};
+#[cfg(test)]
+use brokk_bifrost_rql::structural::search::DetailedCodeQueryResult;
+use brokk_bifrost_rql::structural::search::MergedUnitRows;
 use brokk_bifrost_rql::{BindingFilter, BindingSeed};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use std::sync::Arc;
 mod occurrence_parity;
 mod subject_batch;
 pub(crate) use subject_batch::SubjectQueryBatch;
+pub(super) use subject_batch::match_guard_batch_identity;
 
 use crate::definition::PolicyAssertId;
 use crate::relational::{
@@ -110,9 +113,31 @@ pub(super) struct ExecutedQueryRows {
 }
 
 impl ExecutedQueryRows {
+    fn of_semantic(mut unit: brokk_bifrost_rql::structural::search::UnitExecutionResult) -> Self {
+        CodeQueryDiagnostic::strip_step_attribution(&mut unit.diagnostics);
+        let (items, evidence) = unit
+            .rows
+            .into_iter()
+            .map(|row| (row.item, row.evidence))
+            .unzip();
+        Self {
+            items,
+            evidence,
+            completion: unit.completion,
+            depth_bound_status: unit.depth_bound_status,
+            truncated: unit.truncated,
+            diagnostics: unit.diagnostics,
+            work: unit.work,
+            reuse: unit.reuse,
+            candidate_sites: unit.budgeted_work.candidate_sites,
+        }
+    }
+
+    #[cfg(test)]
     /// One whole execution's rendered rows, projected into exactly the product
     /// a unit publishes, so no consumer can tell which path produced them.
-    fn of_detailed(detailed: DetailedCodeQueryResult) -> Self {
+    fn of_detailed(mut detailed: DetailedCodeQueryResult) -> Self {
+        detailed.strip_step_attribution();
         Self {
             items: detailed
                 .result
@@ -128,7 +153,7 @@ impl ExecutedQueryRows {
             completion: detailed.result.completion(),
             depth_bound_status: detailed.result.depth_bound_status,
             truncated: detailed.result.truncated,
-            diagnostics: detailed.result.diagnostics,
+            diagnostics: detailed.result.diagnostics.into_semantic(),
             work: detailed.work,
             reuse: detailed.reuse,
             candidate_sites: detailed.budgeted_work.candidate_sites,
@@ -696,6 +721,7 @@ fn sliced_assertion_run(
         depth_opt_in: false,
         workspace_files: &workspace_files,
         subject_batch: None,
+        guard_identity: None,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
     let subject_units = {
@@ -852,28 +878,33 @@ fn whole_assertion_run(
         });
         match subject_batch {
             Some(batch) => batch.execute(subject_query, context, budget, false),
-            None => Arc::new(ExecutedQueryRows::of_detailed(match context.workspace {
-                Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
-                    workspace,
-                    context.flow_resources(),
-                    subject_query,
-                    budget.query_limits(),
-                    context.cancellation,
-                    execution_scope
-                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
-                        .with_depth_bound_status(false),
-                ),
-                None => execute_code_query_detailed_eager_index_in_scope(
-                    context.analyzer,
-                    context.flow_resources(),
-                    subject_query,
-                    budget.query_limits(),
-                    context.cancellation,
-                    execution_scope
-                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
-                        .with_depth_bound_status(false),
-                ),
-            })),
+            None => Arc::new(ExecutedQueryRows::of_semantic(
+                (match context.workspace {
+                    Some(workspace) => execute_code_query_semantic_unit_in_scope(
+                        workspace.analyzer(),
+                        context.flow_resources(),
+                        Some(workspace),
+                        subject_query,
+                        budget.query_limits(),
+                        context.cancellation,
+                        execution_scope
+                            .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                            .with_depth_bound_status(false),
+                    ),
+                    None => execute_code_query_semantic_unit_in_scope(
+                        context.analyzer,
+                        context.flow_resources(),
+                        None,
+                        subject_query,
+                        budget.query_limits(),
+                        context.cancellation,
+                        execution_scope
+                            .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                            .with_depth_bound_status(false),
+                    ),
+                })
+                .unit,
+            )),
         }
     };
     let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
@@ -1490,18 +1521,20 @@ fn evaluate_assert_file(
             assertion_iteration_binding_query(&file_paths, budget),
         ] {
             let query = query.map_err(|message| Box::new(AssertFileFailure::QueryPlan(message)))?;
-            let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
-                context.analyzer,
-                context.flow_resources(),
-                &query,
-                budget.query_limits(),
-                context.cancellation,
-                &mut row_family_session,
-                execution_scope.clone(),
-            );
+            let mut outcome =
+                execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
+                    context.analyzer,
+                    context.flow_resources(),
+                    &query,
+                    budget.query_limits(),
+                    context.cancellation,
+                    &mut row_family_session,
+                    execution_scope.clone(),
+                );
+            outcome.strip_step_attribution();
             file_incomplete.extend(incomplete_reasons(&outcome.result.completion()));
             file_failures.extend(failure_reasons(&outcome.result.completion()));
-            file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+            file_diagnostics.extend(outcome.result.diagnostics.semantic().iter().cloned());
             file_work = file_work.saturating_add(outcome.work);
             row_completions.push(outcome.result.completion());
             establishment_outcomes.push(outcome);
@@ -1624,7 +1657,7 @@ fn evaluate_assert_file(
 
     let mut executed = Vec::new();
     for query in &queries {
-        let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
+        let mut outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
             context.analyzer,
             context.flow_resources(),
             query,
@@ -1633,9 +1666,10 @@ fn evaluate_assert_file(
             &mut row_family_session,
             execution_scope.clone(),
         );
+        outcome.strip_step_attribution();
         file_incomplete.extend(incomplete_reasons(&outcome.result.completion()));
         file_failures.extend(failure_reasons(&outcome.result.completion()));
-        file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+        file_diagnostics.extend(outcome.result.diagnostics.semantic().iter().cloned());
         file_work = file_work.saturating_add(outcome.work);
         row_completions.push(outcome.result.completion());
         executed.push(outcome);
@@ -1656,17 +1690,22 @@ fn evaluate_assert_file(
             context.cancellation,
             CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
         );
+        outcome.strip_step_attribution();
         // A dynamic generation site reports the generated-set axis
         // incomplete at query level, but here that honesty is handled per
         // row: a dynamic site makes exactly the asserts over it
         // inconclusive (or, under :forbid-dynamic, the finding), never the
         // whole file.
-        outcome.result.diagnostics.retain(|diagnostic| {
-            diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
-        });
+        outcome
+            .result
+            .diagnostics
+            .semantic_mut()
+            .retain(|diagnostic| {
+                diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
+            });
         file_incomplete.extend(incomplete_reasons(&outcome.result.completion()));
         file_failures.extend(failure_reasons(&outcome.result.completion()));
-        file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+        file_diagnostics.extend(outcome.result.diagnostics.semantic().iter().cloned());
         file_work = file_work.saturating_add(outcome.work);
         row_completions.push(outcome.result.completion());
         executed.push(outcome);
@@ -1827,10 +1866,10 @@ fn evaluate_assert_file(
     // surfaced.
     let mut capability_diagnostics = subject_diagnostics.to_vec();
     for query in &executed {
-        capability_diagnostics.extend(query.result.diagnostics.iter().cloned());
+        capability_diagnostics.extend(query.result.diagnostics.semantic().iter().cloned());
     }
     for outcome in &establishment_outcomes {
-        capability_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+        capability_diagnostics.extend(outcome.result.diagnostics.semantic().iter().cloned());
     }
     let capability = assertion_capabilities(&capability_diagnostics);
 
@@ -2475,30 +2514,35 @@ fn whole_relational_bindings(
     queries
         .iter()
         .map(|query| {
-            ExecutedQueryRows::of_detailed(match context.workspace {
-                Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
-                    workspace,
-                    context.flow_resources(),
-                    query,
-                    budget.query_limits(),
-                    context.cancellation,
-                    execution_scope
-                        .clone()
-                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
-                        .with_depth_bound_status(false),
-                ),
-                None => execute_code_query_detailed_eager_index_in_scope(
-                    context.analyzer,
-                    context.flow_resources(),
-                    query,
-                    budget.query_limits(),
-                    context.cancellation,
-                    execution_scope
-                        .clone()
-                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
-                        .with_depth_bound_status(false),
-                ),
-            })
+            ExecutedQueryRows::of_semantic(
+                (match context.workspace {
+                    Some(workspace) => execute_code_query_semantic_unit_in_scope(
+                        workspace.analyzer(),
+                        context.flow_resources(),
+                        Some(workspace),
+                        query,
+                        budget.query_limits(),
+                        context.cancellation,
+                        execution_scope
+                            .clone()
+                            .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                            .with_depth_bound_status(false),
+                    ),
+                    None => execute_code_query_semantic_unit_in_scope(
+                        context.analyzer,
+                        context.flow_resources(),
+                        None,
+                        query,
+                        budget.query_limits(),
+                        context.cancellation,
+                        execution_scope
+                            .clone()
+                            .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                            .with_depth_bound_status(false),
+                    ),
+                })
+                .unit,
+            )
         })
         .collect()
 }
@@ -2544,6 +2588,7 @@ fn sliced_relational_bindings(
         workspace_files: &workspace_files,
         // Binding queries are not counted as batch consumers.
         subject_batch: None,
+        guard_identity: None,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
     let mut executed = Vec::with_capacity(queries.len());
@@ -6903,7 +6948,9 @@ mod budget_telemetry_tests {
             has_non_utf8_refusal: false,
             refusal_sites: Default::default(),
             uses_omissions: Vec::new(),
-            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Budget,
+            ),
             code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -6921,6 +6968,10 @@ mod budget_telemetry_tests {
                 feedback_iteration: None,
             }],
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
             call_relation_facts: None,
         });
         let totals = AssertionRunTotals {
@@ -6998,6 +7049,10 @@ mod cause_tests {
             related: Vec::new(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
             call_relation_facts: None,
             uses_omissions: Vec::new(),
         });
@@ -7202,6 +7257,10 @@ mod cause_tests {
                         uses_omissions: Vec::new(),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+                        step_index: None,
+                        step_op: None,
+                        no_rows_reason: None,
+                        cause_codes: Vec::new(),
                         call_relation_facts: None,
                     })
                 })

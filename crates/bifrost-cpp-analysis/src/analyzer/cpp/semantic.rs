@@ -301,6 +301,7 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (inventory, initial_work) =
             match enumerate_procedures(self.analyzer, file, prepared, budget, cancellation)?
@@ -2456,6 +2457,8 @@ type CppLoweringError = ProcedureLoweringError;
 type EdgeTarget = ControlTarget;
 
 type Work<'tree> = ProcedureWork<'tree>;
+type WorkStack<'stack, 'tree> = dyn brokk_bifrost_analysis::analyzer::semantic::lowering::WorkSink<Work<'tree>, Context = ()>
+    + 'stack;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GapFact {
@@ -2578,7 +2581,7 @@ impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'ta
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         self.session.record_statement_entry(builder, node, entry)?;
         self.statement(builder, node, entry, next, scope, stack)
@@ -2591,7 +2594,7 @@ impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'ta
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         self.expression(builder, node, entry, next, scope, stack)
     }
@@ -2603,7 +2606,7 @@ impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'ta
         entry: ProgramPointId,
         targets: ConditionTargets,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         self.condition(
             builder,
@@ -3805,7 +3808,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let (operand, target, flow_kind) = self
             .integral_update_target(node)
@@ -3875,7 +3878,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let (operand, target, flow_kind) = self
             .fundamental_update_target(node)
@@ -5698,7 +5701,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         when_true: EdgeTarget,
         when_false: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         if self.condition_uses_object_like_macro(node) {
             self.add_gap(
@@ -5962,7 +5965,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         match node.kind() {
             "function_definition" => {
@@ -6456,7 +6459,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
         let completion = if !self.is_c_source
@@ -6550,7 +6553,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
@@ -6607,7 +6610,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let body = required_field(node, "body")?;
         let condition = required_field(node, "condition")?;
@@ -6658,7 +6661,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let body = required_field(node, "body")?;
         let initializer = node.child_by_field_name("initializer");
@@ -6773,7 +6776,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let range = required_field(node, "right")?;
         let body = required_field(node, "body")?;
@@ -6906,7 +6909,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
@@ -7007,7 +7010,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let body = required_field(node, "body")?;
         let catches = named_children(node)
@@ -7101,7 +7104,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         for (capability, detail) in [
             (
@@ -7317,7 +7320,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         for (capability, detail) in [
             (
@@ -7379,7 +7382,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let result =
             self.expression_value(builder, node, cpp_expression_value_kind(self.source, node))?;
@@ -8203,7 +8206,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let invoke = self.session.add_node_point(builder, node, Vec::new())?;
         let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
@@ -8495,7 +8498,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         let captures = lambda_capture_initializers(node);
         let creation = if captures.is_empty() {
@@ -8712,7 +8715,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         if children.is_empty() {
             return self.session.add_target_edge(builder, entry, next);
@@ -8750,7 +8753,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         values: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         self.add_gap(
             builder,
@@ -8800,7 +8803,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), CppLoweringError> {
         if children.is_empty() {
             return self.session.add_target_edge(builder, entry, next);
@@ -10517,6 +10520,7 @@ mod tests {
                 &prepared,
                 &SemanticBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
             )
             .expect("C++ lowering succeeds")
         else {

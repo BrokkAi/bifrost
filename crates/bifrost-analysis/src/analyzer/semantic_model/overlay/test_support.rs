@@ -52,6 +52,7 @@ pub fn overlay(
         charge: Default::default(),
         extraction_gaps: Vec::new(),
         extraction_gap_by_declaration: HashMap::default(),
+        packs_naming_every_loss: Default::default(),
         declaration_surface_languages: Vec::new(),
         complete_declaration_surface_languages: Vec::new(),
         generated_function_languages: symbols
@@ -61,7 +62,6 @@ pub fn overlay(
             .collect(),
         symbols: symbols.into_iter().map(std::sync::Arc::new).collect(),
         relations: relations.into_iter().map(std::sync::Arc::new).collect(),
-        java_hierarchy: HashMap::default(),
         symbols_by_id: HashMap::default(),
         symbols_by_name: HashMap::default(),
         symbols_by_uri: HashMap::default(),
@@ -98,6 +98,7 @@ pub fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProve
         origin: SemanticModelOriginKind::DependencySource,
         activation: SemanticModelActivationProvenance {
             approximate: false,
+            approximation: None,
             status: "active".to_string(),
             reason: "test".to_string(),
             source_kind: "test".to_string(),
@@ -125,6 +126,8 @@ pub fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProve
 #[doc(hidden)]
 pub fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
     SemanticModelSymbol {
+        callable_group: Default::default(),
+        callable_family_target_independent: false,
         pre_composition_qualified_name: None,
         semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
@@ -145,6 +148,7 @@ pub fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         is_static: false,
         declaration_is_abstract: false,
         declaration_is_sealed: false,
+        declaration_is_final: None,
         callable_surface_complete: false,
         source_completeness:
             brokk_bifrost_semantic::analyzer::semantic_model::model::Completeness::Complete,
@@ -195,6 +199,8 @@ pub fn method(
     signature: Option<Signature>,
 ) -> SemanticModelSymbol {
     let mut symbol = SemanticModelSymbol {
+        callable_group: Default::default(),
+        callable_family_target_independent: false,
         pre_composition_qualified_name: None,
         semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
@@ -211,6 +217,7 @@ pub fn method(
         is_static: false,
         declaration_is_abstract: false,
         declaration_is_sealed: false,
+        declaration_is_final: None,
         callable_surface_complete: false,
         source_completeness:
             brokk_bifrost_semantic::analyzer::semantic_model::model::Completeness::Complete,
@@ -334,4 +341,203 @@ pub(super) fn selected_fixture_groups(
             })
         })
         .collect())
+}
+
+/// Compare the complete question family with the uncached row path after a fill.
+/// Callers may attach SQL row listeners to the counter to verify warm reads.
+pub fn assert_indexed_binding_questions(
+    published: &SemanticModelOverlay,
+    realm: Option<&str>,
+    rows: Option<&std::sync::atomic::AtomicUsize>,
+) -> (
+    crate::analyzer::store::semantic_composition::SearchCandidateKey,
+    [u8; 32],
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let unused_counter = AtomicUsize::new(0);
+    let rows = rows.unwrap_or(&unused_counter);
+    let token = crate::CancellationToken::new();
+    let overlay = published.row_source.as_ref().expect("row-backed fixture");
+    let mut ordinary = overlay.as_ref().clone();
+    ordinary.cache = None;
+    let patterns =
+        crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+    let (symbols, complete) =
+        ordinary.with_search_symbols(&patterns, Some(&token), realm, |records, complete| {
+            (
+                records
+                    .into_iter()
+                    .map(|symbol| symbol.to_shared())
+                    .collect::<Vec<_>>(),
+                complete,
+            )
+        });
+    assert!(complete);
+    assert!(!symbols.is_empty());
+    use crate::analyzer::store::cache_budget::RetainedBytes;
+    use crate::analyzer::store::semantic_composition::SearchCandidateKey;
+    let owner = overlay
+        .active
+        .request_source()
+        .unwrap()
+        .jvm_reader(&overlay.active)
+        .unwrap();
+    let key = SearchCandidateKey {
+        realm: realm.map(str::to_owned),
+        build: overlay.build_identity,
+        jvm_binding: Some(owner.binding),
+    };
+    let mut names = vec!["missing.spelling".to_owned()];
+    let mut ids = vec!["missing.id".to_owned()];
+    for symbol in &symbols {
+        names.extend([symbol.name.clone(), symbol.qualified_name.clone()]);
+        names.extend(symbol.aliases.clone());
+        ids.push(symbol.id.clone());
+        ids.extend(
+            symbol
+                .semantic_contributors
+                .iter()
+                .map(|contributor| contributor.record_id.clone()),
+        );
+        if let Some(owner) = &symbol.owner_id {
+            names.push(format!("{owner}.{}", symbol.name));
+            for alias in &symbol.aliases {
+                names.push(format!("{owner}.{alias}"));
+            }
+        }
+    }
+    for warm in [false, true] {
+        if warm {
+            overlay.with_search_symbols(&patterns, Some(&token), realm, |_, complete| {
+                assert!(complete)
+            });
+            let entry = overlay
+                .cache
+                .as_ref()
+                .expect("budgeted row overlay")
+                .composed_search_inputs
+                .get_ready(&overlay.effective_search_inputs(&key).digest(), &token)
+                .expect("complete exact-key entry");
+            // Exercise the resident augmentation on both the project and JDK
+            // carriers that use this shared boundary oracle.
+            let language = realm.map(|_| "java");
+            for limit in [0, 1, 3, usize::MAX] {
+                let expected = match language {
+                    Some(language) => published.search_with_limit_filter_in_family(
+                        &patterns,
+                        limit,
+                        None,
+                        language,
+                        |s| s.owner_id.is_none(),
+                    ),
+                    None => published
+                        .search_with_limit_filter(&patterns, limit, None, |s| s.owner_id.is_none()),
+                };
+                let accepted = std::cell::Cell::new(0usize);
+                let actual = published.augmentation_symbols(&patterns, limit, language, |s| {
+                    let matches = s.owner_id.is_none();
+                    if matches {
+                        accepted.set(accepted.get() + 1);
+                    }
+                    matches
+                });
+                assert_eq!((expected.0, expected.2), actual);
+                assert_eq!(
+                    accepted.get(),
+                    actual.0.len(),
+                    "stop after the last accepted slot"
+                );
+            }
+            assert_eq!(entry.records.capacity(), entry.records.len());
+            assert_eq!(entry.groups.capacity(), entry.groups.len());
+            for group in &entry.groups {
+                assert_eq!(group.capacity(), group.len());
+            }
+            eprintln!(
+                "SemanticModelSymbol size={}",
+                std::mem::size_of::<crate::analyzer::semantic_model::SemanticModelSymbol>()
+            );
+            eprintln!(
+                "realm={realm:?} base_bytes={} index_bytes={}",
+                entry.retained_bytes() - entry.index.retained_bytes(),
+                entry.index.retained_bytes()
+            );
+        }
+        for name in &names {
+            let expected = ordinary.symbols_named_scoped(name, realm);
+            assert!(expected.1.is_none());
+            rows.store(0, Ordering::Relaxed);
+            assert_eq!(
+                overlay.symbols_named_scoped(name, realm),
+                expected,
+                "name={name}"
+            );
+            if warm {
+                assert_eq!(rows.load(Ordering::Relaxed), 0);
+            }
+        }
+        for id in &ids {
+            let expected = ordinary.symbols_with_id_scoped(id, realm);
+            assert!(expected.1.is_none());
+            rows.store(0, Ordering::Relaxed);
+            assert_eq!(overlay.symbols_with_id_scoped(id, realm), expected);
+            if warm {
+                assert_eq!(rows.load(Ordering::Relaxed), 0);
+            }
+            let expected = ordinary.members_of_scoped(id, realm);
+            assert!(expected.1.is_none());
+            rows.store(0, Ordering::Relaxed);
+            assert_eq!(overlay.members_of_scoped(id, realm), expected);
+            if warm {
+                assert_eq!(rows.load(Ordering::Relaxed), 0);
+            }
+            // Relations are not in the fill: they read their owners' rows.
+            let expected = ordinary.relations_from_scoped(id, realm);
+            assert!(expected.1.is_none());
+            assert_eq!(overlay.relations_from_scoped(id, realm), expected);
+            let expected = ordinary.relations_to_scoped(id, realm);
+            assert!(expected.1.is_none());
+            assert_eq!(overlay.relations_to_scoped(id, realm), expected);
+        }
+    }
+    let digest = overlay.effective_search_inputs(&key).digest();
+    (key, digest)
+}
+
+/// Verify that reactivation selects a new certificate, even if the old entry
+/// remains in the shared budget. Compare cold and warm questions with row reads.
+pub fn assert_reactivated_binding_questions(
+    published: &SemanticModelOverlay,
+    realm: Option<&str>,
+    previous: &(
+        crate::analyzer::store::semantic_composition::SearchCandidateKey,
+        [u8; 32],
+    ),
+) {
+    let overlay = published.row_source.as_ref().expect("row-backed fixture");
+    let owner = overlay
+        .active
+        .request_source()
+        .unwrap()
+        .jvm_reader(&overlay.active)
+        .unwrap();
+    assert_ne!(previous.0.jvm_binding.as_ref(), Some(&owner.binding));
+    let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+        realm: realm.map(str::to_owned),
+        build: overlay.build_identity,
+        jvm_binding: Some(owner.binding),
+    };
+    assert_ne!(&key, &previous.0);
+    let cache = &overlay.cache.as_ref().unwrap().composed_search_inputs;
+    let token = crate::CancellationToken::new();
+    eprintln!(
+        "reactivation realm={realm:?} old_entry_resident={}",
+        cache.get_ready(&previous.1, &token).is_some()
+    );
+    // Another realm may already have filled the replacement's equal inputs.
+    assert_ne!(overlay.effective_search_inputs(&key).digest(), previous.1);
+    assert_eq!(
+        assert_indexed_binding_questions(published, realm, None),
+        (key.clone(), overlay.effective_search_inputs(&key).digest())
+    );
 }

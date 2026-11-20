@@ -189,13 +189,14 @@ def drive(car: Car):
     /// outcome that names the axis, not a silent "no type".
     #[test]
     fn budget_exhaustion_on_either_python_shape_names_the_axis() {
-        for outcome in [
-            member_expression(ReceiverAnalysisBudget::tiny()),
-            imported_annotation(ReceiverAnalysisBudget::tiny()),
-        ] {
+        let no_rounds = ReceiverAnalysisBudget {
+            max_resolution_rounds: 0,
+            ..ReceiverAnalysisBudget::default()
+        };
+        for outcome in [member_expression(no_rounds), imported_annotation(no_rounds)] {
             assert_eq!(
                 outcome.status,
-                TypeLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                TypeLookupStatus::ExceededBudget(ReceiverBudgetLimit::ResolutionRounds),
                 "{outcome:#?}"
             );
             assert!(outcome.types.is_empty(), "{outcome:#?}");
@@ -231,20 +232,6 @@ def drive(car: Car):
         assert_eq!(result.status, TypeLookupStatus::Resolved, "{result:#?}");
         assert_eq!(result.types.len(), 1, "{result:#?}");
         assert_eq!(result.types[0].fqn, "widget.Widget", "{result:#?}");
-
-        let limited = resolve(
-            &files,
-            "consumer.py",
-            start,
-            "value".len(),
-            ReceiverAnalysisBudget::tiny(),
-        );
-        assert_eq!(
-            limited.status,
-            TypeLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
-            "{limited:#?}",
-        );
-        assert!(limited.types.is_empty(), "{limited:#?}");
     }
 
     #[test]

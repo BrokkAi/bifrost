@@ -8,7 +8,7 @@ use crate::CancellationToken;
 use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
 use brokk_bifrost_core::analyzer::rust_facts::{
     MacroFragmentKind, MacroIdentRole, RustImplCensusBoundaryKind, RustItemMacroExpansion,
-    RustItemMacroSourcePosition, RustItemSourceFacts, RustMacroDelimiter,
+    RustItemMacroSourcePosition, RustItemSourceFacts, RustMacroArgumentKey, RustMacroDelimiter,
     RustMacroPatternSourceKind, RustMacroRepetitionOperator, RustSourceContextKind,
     RustTypeCompoundSourceKind, RustTypeSourceFact, RustTypeSourceShape, RustTypeWrapperSourceKind,
 };
@@ -147,6 +147,20 @@ pub fn rust_item_source_cost(
         .saturating_add(items.import_contexts.len())
         .saturating_add(types.len());
     let mut payload = 0usize;
+    for attribute in &items.macro_arguments {
+        rows = rows
+            .saturating_add(1)
+            .saturating_add(attribute.path.len())
+            .saturating_add(attribute.keys.len());
+        for segment in &attribute.path {
+            payload = payload.saturating_add(segment.len());
+        }
+        for key in &attribute.keys {
+            if let RustMacroArgumentKey::Ident(name) = key {
+                payload = payload.saturating_add(name.len());
+            }
+        }
+    }
     for input in &items.macro_inputs {
         rows = rows
             .saturating_add(1)
@@ -401,25 +415,92 @@ pub fn insert_rust_item_source_facts_tx(
             RustImplCensusBoundaryKind::InternalAttribute => 3,
             RustImplCensusBoundaryKind::SyntaxError => 4,
         };
+        let is_macro = boundary.kind == RustImplCensusBoundaryKind::Macro;
+        assert!(
+            is_macro || (boundary.macro_path.is_empty() && !boundary.macro_absolute),
+            "only a macro census boundary carries a macro path: {boundary:?}"
+        );
         boundaries.push((
             blob_id,
             usize_to_i64(ordinal)?,
             kind,
             usize_to_i64(boundary.start_byte)?,
+            is_macro.then(|| i64::from(boundary.macro_absolute)),
+            is_macro.then(|| i64::from(boundary.macro_shadow_possible)),
+            is_macro.then(|| {
+                serde_json::to_string(&boundary.macro_path)
+                    .expect("a string vector serializes as JSON")
+            }),
         ));
     }
     tx.execute(
-        "INSERT INTO source_rust_impl_census_files(blob_id, census_version, impl_count, boundary_count)
-         VALUES(?1, 1, ?2, ?3)",
+        "INSERT INTO source_rust_impl_census_files(blob_id, census_version, impl_count, boundary_count, arguments_version)
+         VALUES(?1, 1, ?2, ?3, 1)",
         params![blob_id, written_impls, usize_to_i64(boundaries.len())?],
     )?;
     super::insert_rows(
         tx,
-        "INSERT INTO source_rust_impl_census_boundaries(blob_id, ordinal, kind, start_byte) VALUES",
-        "(?, ?, ?, ?)",
+        "INSERT INTO source_rust_impl_census_boundaries(
+           blob_id, ordinal, kind, start_byte, macro_absolute, macro_shadow_possible, macro_path
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, jsonb(?))",
         &boundaries,
         cancellation,
     )?;
+
+    if !item_facts.macro_arguments.is_empty() {
+        let first_id: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM source_rust_macro_attributes",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut attributes = Vec::new();
+        let mut paths = Vec::new();
+        let mut keys = Vec::new();
+        for (ordinal, attribute) in item_facts.macro_arguments.iter().enumerate() {
+            check_cancelled(cancellation)?;
+            assert!(attribute.boundary_ordinal < item_facts.impl_census_boundaries.len());
+            let id = first_id + usize_to_i64(ordinal)?;
+            attributes.push((
+                id,
+                blob_id,
+                usize_to_i64(attribute.boundary_ordinal)?,
+                usize_to_i64(ordinal)?,
+                attribute.from_cfg_attr,
+            ));
+            for (ordinal, segment) in attribute.path.iter().enumerate() {
+                paths.push((id, usize_to_i64(ordinal)?, segment.as_str()));
+            }
+            for (ordinal, key) in attribute.keys.iter().enumerate() {
+                let (kind, name) = match key {
+                    RustMacroArgumentKey::Ident(name) => (0, Some(name.as_str())),
+                    RustMacroArgumentKey::Unparsed => (1, None),
+                };
+                keys.push((id, usize_to_i64(ordinal)?, kind, name));
+            }
+        }
+        super::insert_rows(
+            tx,
+            "INSERT INTO source_rust_macro_attributes(id, blob_id, boundary_ordinal, ordinal, from_cfg_attr) VALUES",
+            "(?, ?, ?, ?, ?)",
+            &attributes,
+            cancellation,
+        )?;
+        super::insert_rows(
+            tx,
+            "INSERT INTO source_rust_macro_attribute_paths(attribute_id, ordinal, segment) VALUES",
+            "(?, ?, ?)",
+            &paths,
+            cancellation,
+        )?;
+        super::insert_rows(
+            tx,
+            "INSERT INTO source_rust_macro_argument_keys(attribute_id, ordinal, kind, name) VALUES",
+            "(?, ?, ?, ?)",
+            &keys,
+            cancellation,
+        )?;
+    }
 
     let mut traits = Vec::new();
     for row in &item_facts.traits {
@@ -1119,4 +1200,62 @@ pub fn insert_rust_item_source_facts_tx(
         cancellation,
     )?;
     Ok(())
+}
+
+/// Decode an inclusive range of census sites within an already witnessed blob
+/// transaction. Used by whole-file hydration and the single-site reader.
+#[doc(hidden)]
+pub fn read_rust_macro_argument_attributes(
+    conn: &rusqlite::Connection,
+    blob_id: i64,
+    boundaries: std::ops::RangeInclusive<i64>,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<Option<Vec<brokk_bifrost_core::analyzer::rust_facts::RustMacroAttributeSourceFact>>> {
+    use super::super::StoreError;
+    use brokk_bifrost_core::analyzer::rust_facts::RustMacroAttributeSourceFact;
+    let (first, last) = boundaries.into_inner();
+    let mut attributes = Vec::new();
+    let mut by_id = std::collections::BTreeMap::new();
+    let mut statement = conn.prepare_cached("SELECT id, from_cfg_attr, boundary_ordinal FROM source_rust_macro_attributes WHERE blob_id=?1 AND boundary_ordinal BETWEEN ?2 AND ?3 ORDER BY ordinal")?;
+    let mut rows = statement.query(params![blob_id, first, last])?;
+    while let Some(row) = rows.next()? {
+        if !keep_going() {
+            return Ok(None);
+        }
+        by_id.insert(row.get::<_, i64>(0)?, attributes.len());
+        attributes.push(RustMacroAttributeSourceFact {
+            boundary_ordinal: usize::try_from(row.get::<_, i64>(2)?)
+                .expect("schema enforces nonnegative boundary ordinal"),
+            path: Vec::new(),
+            from_cfg_attr: row.get(1)?,
+            keys: Vec::new(),
+        });
+    }
+    let mut statement = conn.prepare_cached("SELECT a.id, p.segment FROM source_rust_macro_attributes a JOIN source_rust_macro_attribute_paths p ON p.attribute_id=a.id WHERE a.blob_id=?1 AND a.boundary_ordinal BETWEEN ?2 AND ?3 ORDER BY a.ordinal, p.ordinal")?;
+    let mut rows = statement.query(params![blob_id, first, last])?;
+    while let Some(row) = rows.next()? {
+        if !keep_going() {
+            return Ok(None);
+        }
+        attributes[by_id[&row.get::<_, i64>(0)?]]
+            .path
+            .push(row.get(1)?);
+    }
+    let mut statement = conn.prepare_cached("SELECT a.id, k.kind, k.name FROM source_rust_macro_attributes a JOIN source_rust_macro_argument_keys k ON k.attribute_id=a.id WHERE a.blob_id=?1 AND a.boundary_ordinal BETWEEN ?2 AND ?3 ORDER BY a.ordinal, k.ordinal")?;
+    let mut rows = statement.query(params![blob_id, first, last])?;
+    while let Some(row) = rows.next()? {
+        if !keep_going() {
+            return Ok(None);
+        }
+        let key = match row.get::<_, i64>(1)? {
+            0 => RustMacroArgumentKey::Ident(row.get(2)?),
+            1 => RustMacroArgumentKey::Unparsed,
+            kind => return Err(StoreError::new(format!("invalid macro key kind {kind}"))),
+        };
+        attributes[by_id[&row.get::<_, i64>(0)?]].keys.push(key);
+    }
+    if !keep_going() {
+        return Ok(None);
+    }
+    Ok(Some(attributes))
 }

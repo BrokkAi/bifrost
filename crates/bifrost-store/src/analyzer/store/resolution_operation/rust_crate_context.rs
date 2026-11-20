@@ -1521,6 +1521,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// the item's module inventory is closed and an empty answer would read as
     /// an absence.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn append_macro_item_bridges(
         &self,
         reader: &SelectedResolutionLexicalSource<'_, '_>,
@@ -1681,15 +1682,19 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(false);
         };
         for (request, recipe) in requests.iter().zip(rows) {
-            if let Some(recipe) = recipe {
-                recipes.insert((request.fragment, request.semantic), recipe);
-            }
+            let Some(recipe) = recipe else {
+                return Err(StoreError::corrupt(format!(
+                    "required Rust root lookup recipe is missing: {request:?}"
+                )));
+            };
+            recipes.insert((request.fragment, request.semantic), recipe);
         }
         Ok(true)
     }
 
     /// Selected membership uses exactly the same FILE_CRATES filter as resolution.
     /// Build scripts are source membership: their generated cfg is not in Cargo configuration.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_file_configuration_targets(
         &self,
         caller: &Path,
@@ -1705,7 +1710,27 @@ impl SelectedResolutionOperation<'_, '_> {
             .map(|language| language.snapshot_id());
         let mut membership_complete = !cancellation.is_cancelled();
         if let Some(snapshot) = snapshot {
+            // Workspace-wide: a selected unit that is partial for any cause (inventory
+            // error, forced, depth cap, unpublished facts) can own a file it does not
+            // list. Intentionally unavailable targets are not published units, so they
+            // never appear here; the per-file availability below attributes them.
             membership_complete &= matches!(super::super::rust_unit_summaries::rust_selected_units_known(self.ready.inventory.connection(), &snapshot)?, super::super::rust_unit_summaries::RustSelectedUnitsPublication::Published { partial } if partial.is_empty());
+            for (unit, state) in super::super::rust_unit_summaries::rust_file_unit_availability(
+                self.ready.inventory.connection(),
+                &snapshot,
+                &selected_path_key(caller),
+            )? {
+                state.require_published_or_stale(&unit)?;
+                // Anything but a complete published unit (including a stale
+                // summary in the upgrade window) leaves membership partial.
+                membership_complete &= matches!(
+                    state,
+                    super::super::rust_unit_summaries::RustUnitAvailability::Published {
+                        complete: true,
+                        ..
+                    }
+                );
+            }
             membership_complete &= AnalyzerStore::rust_source_listing_complete_on_connection(
                 self.ready.inventory.connection(),
                 &snapshot,
@@ -1741,6 +1766,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// that wants the mount does not pay a second read for it.
     // Keep the joined crate keys and optional selected mount in one query result.
     #[allow(clippy::type_complexity)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn rust_file_crates_and_mount(
         &self,
         caller: &Path,
@@ -1931,6 +1957,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// detached crate, so both are kept; a target no selected crate compiles
     /// bounds nothing, so it keeps every caller.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_callers_reaching(
         &self,
         callers: &[ProjectFile],
@@ -2022,6 +2049,10 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Every selected crate key, in crate-key order.
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_selected_crate_keys(&self, cancellation: &CancellationToken) -> Result<Vec<[u8; 32]>> {
         if cancellation.is_cancelled() {
             return Ok(Vec::new());
@@ -2043,6 +2074,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// its crates, which is what lets a graph build resolve it once per crate
     /// and let the edge rows deduplicate by endpoint.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_crate_member_paths(
         &self,
         crate_key: [u8; 32],
@@ -2088,6 +2120,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// `sources` names the files this context answers references for. Their
     /// root halves are the only ones that can compile a bridge out, so they
     /// are the only import and reference halves read.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn rust_context_for_crate_keys(
         &self,
         keys: Vec<[u8; 32]>,
@@ -2103,6 +2136,46 @@ impl SelectedResolutionOperation<'_, '_> {
         // request owns it, which is also what makes a reason minted while a
         // crate's rows are read agree with the context built from them.
         let identities = self.ready.context_identities.clone();
+        if let Some(snapshot) = self
+            .ready
+            .inventory
+            .languages()?
+            .iter()
+            .find(|language| language.snapshot_id().lang == "rust")
+            .map(|language| language.snapshot_id())
+        {
+            for source in sources {
+                for (unit, state) in super::super::rust_unit_summaries::rust_file_unit_availability(
+                    self.ready.inventory.connection(),
+                    &snapshot,
+                    &source.persisted_relative_path,
+                )? {
+                    state.require_published_or_stale(&unit)?;
+                    match state {
+                        super::super::rust_unit_summaries::RustUnitAvailability::IntentionallyUnavailable { cause, evidence } => {
+                            let text = format!("target_root_unavailable: unit {unit:02x?}: {cause:?}");
+                            let mut identity=CanonicalHasher::new(b"rust-target-root-unavailable:v1");
+                            identity.value(&unit);
+                            identity.value(&evidence);
+                            let reason = identities.named_semantic(identity.finish(),"RustTargetRootUnavailable",crate::analyzer::resolution::ReasonDeterminism::Unaudited,&text);
+                            completion = completion.combine(&ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(reason)]));
+                        }
+                        // A stale unit (derivation or reconcile pending) can be an
+                        // unavailable target whose state this head has not decided,
+                        // so the context cannot be complete.
+                        super::super::rust_unit_summaries::RustUnitAvailability::Stale => {
+                            let text = format!("rust_unit_stale: unit {unit:02x?}");
+                            let mut identity = CanonicalHasher::new(b"rust-unit-stale:v1");
+                            identity.value(&unit);
+                            let reason = identities.named_semantic(identity.finish(), "RustUnitStale", crate::analyzer::resolution::ReasonDeterminism::Unaudited, &text);
+                            completion = completion.combine(&ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(reason)]));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         for key in &keys {
             let SelectedRustContextOutcome::Ready(context) =
                 self.rust_crate_context(identities.clone(), *key, sources, cancellation)?
@@ -2164,6 +2237,7 @@ impl SelectedResolutionOperation<'_, '_> {
         ))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn rust_crate_context(
         &self,
         identities: SelectedContextIdentities,
@@ -3455,6 +3529,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(SelectedRustContextOutcome::Ready(context))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn overlay_base_blobs(&self) -> Result<Vec<(BindingFragmentId, i64)>> {
         let mut base_blobs = Vec::new();
         let mounts = self.mount_table();
@@ -3973,6 +4048,7 @@ const BLOCK_LOCAL_TYPE_GAP_FOR_TARGET: &str = "SELECT EXISTS(SELECT 1
 /// whose members come from the parameter's bounds, which the typed member
 /// route reads; it is never a module the crate route continues through. No
 /// targets is not a parameter.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn prefix_names_type_parameters(
     ready: &ReadySelectedResolution<'_, '_>,
     targets: &[SemanticId],
@@ -3995,6 +4071,7 @@ pub(super) fn prefix_names_type_parameters(
     Ok(true)
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn prefix_names_nominal_types(
     ready: &ReadySelectedResolution<'_, '_>,
     targets: &[SemanticId],
@@ -4020,6 +4097,7 @@ fn prefix_names_nominal_types(
 /// Whether this incomplete prefix answer contains only known gaps on the exact
 /// block-local type declarations it selected. Scope/binder and visibility
 /// gaps do not undo the declaration's name or Type namespace.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn block_local_type_prefix_binding_is_decided(
     ready: &ReadySelectedResolution<'_, '_>,
     targets: &[SemanticId],
@@ -4175,6 +4253,7 @@ fn prefix_targets_are_universe_entries(
 /// `rel_path` is the reference's file, whose open inventories
 /// (`GAP_DETAILS`) name the reasons an open glob target gives.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn classify_route_prefix(
     ready: &ReadySelectedResolution<'_, '_>,
     rel_path: Option<&str>,
@@ -4347,6 +4426,7 @@ const ANCHORED_IMPORT_BINDS: &str = "SELECT EXISTS(SELECT 1
 /// workspace. It is not answered as a proved absence: measured on the census,
 /// such walks still miss real declarations (items a macro declares in another
 /// crate, re-export chains across crates), so the answer is the dead end.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn prefix_bound_in_the_crate(
     ready: &ReadySelectedResolution<'_, '_>,
     prefix: SemanticId,
@@ -4976,6 +5056,7 @@ pub(super) struct RustFileNaming {
 }
 
 impl RustFileNaming {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn read(
         ready: &ReadySelectedResolution<'_, '_>,
         file: &ProjectFile,
@@ -5056,6 +5137,7 @@ impl<'a, 'store> super::RustForwardBuildView<'a, 'store> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn narrow_forward_scope_to_crates(
         &self,
         crate_keys: &[[u8; 32]],

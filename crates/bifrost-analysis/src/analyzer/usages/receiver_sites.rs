@@ -38,43 +38,16 @@ pub(crate) struct ReceiverSite {
     pub(crate) member_range: Option<Range>,
 }
 
-/// Maximum canonical fact nodes and role edges inspected while building one receiver-site index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReceiverSiteIndexLimit {
-    pub(crate) max_work_items: usize,
-}
-
-/// Maximum indexed receiver sites inspected while selecting one query input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReceiverSiteSelectionLimit {
-    pub(crate) max_inspected_sites: usize,
-}
-
-/// Outcome of a bounded receiver-site index build.
+/// Outcome of a receiver-site index build. Only cancellation stops it.
 #[derive(Debug)]
 pub(crate) enum ReceiverSiteIndexBuild {
     Complete {
         index: ReceiverSiteIndex,
         inspected_work: usize,
     },
-    Exceeded {
-        inspected_work: usize,
-        refused: brokk_bifrost_core::analyzer::work_budget::LimitRefused,
-    },
     Cancelled {
         inspected_work: usize,
     },
-}
-
-impl ReceiverSiteIndexBuild {
-    #[cfg(test)]
-    pub(crate) fn inspected_work(&self) -> usize {
-        match self {
-            Self::Complete { inspected_work, .. }
-            | Self::Exceeded { inspected_work, .. }
-            | Self::Cancelled { inspected_work } => *inspected_work,
-        }
-    }
 }
 
 /// Outcome of selecting a receiver site without hiding cached-index work.
@@ -84,28 +57,9 @@ pub(crate) enum ReceiverSiteSelection {
         site: Option<ReceiverSite>,
         inspected_sites: usize,
     },
-    Exceeded {
-        inspected_sites: usize,
-        refused: brokk_bifrost_core::analyzer::work_budget::LimitRefused,
-    },
     Cancelled {
         inspected_sites: usize,
     },
-}
-
-impl ReceiverSiteSelection {
-    #[cfg(test)]
-    pub(crate) fn inspected_sites(&self) -> usize {
-        match self {
-            Self::Complete {
-                inspected_sites, ..
-            }
-            | Self::Exceeded {
-                inspected_sites, ..
-            }
-            | Self::Cancelled { inspected_sites } => *inspected_sites,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,16 +100,15 @@ impl ReceiverSiteIndex {
         self.sites.is_empty()
     }
 
-    /// Select the structurally closest receiver site for `input` within `limit`.
+    /// Select the structurally closest receiver site for `input`.
     ///
     /// Exact matches beat containment. Calls beat their nested field-access facts so
     /// `service.Run()` is treated as an invocation rather than a property read. Remaining
     /// ties are resolved by the smallest containing site and canonical fact source order.
-    pub(crate) fn select_bounded(
+    pub(crate) fn select_cancellable(
         &self,
         input: Range,
         mode: ReceiverSiteInputMode,
-        limit: ReceiverSiteSelectionLimit,
         cancellation: Option<&CancellationToken>,
     ) -> ReceiverSiteSelection {
         if input.start_byte >= input.end_byte {
@@ -170,18 +123,6 @@ impl ReceiverSiteIndex {
         for indexed in &self.sites {
             if is_cancelled(cancellation) {
                 return ReceiverSiteSelection::Cancelled { inspected_sites };
-            }
-            if let Err(refused) =
-                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                    inspected_sites,
-                    limit.max_inspected_sites,
-                )
-                .try_allow(1)
-            {
-                return ReceiverSiteSelection::Exceeded {
-                    inspected_sites,
-                    refused,
-                };
             }
             inspected_sites += 1;
 
@@ -250,26 +191,18 @@ impl ReceiverSiteIndex {
 
     #[cfg(test)]
     pub(crate) fn select(&self, input: Range, mode: ReceiverSiteInputMode) -> Option<ReceiverSite> {
-        match self.select_bounded(
-            input,
-            mode,
-            ReceiverSiteSelectionLimit {
-                max_inspected_sites: usize::MAX,
-            },
-            None,
-        ) {
+        match self.select_cancellable(input, mode, None) {
             ReceiverSiteSelection::Complete { site, .. } => site,
-            ReceiverSiteSelection::Exceeded { .. } | ReceiverSiteSelection::Cancelled { .. } => {
-                unreachable!("unbounded uncancelled test selection")
+            ReceiverSiteSelection::Cancelled { .. } => {
+                unreachable!("uncancelled test selection")
             }
         }
     }
 }
 
-/// Build a bounded receiver-site index from one canonical structural snapshot.
+/// Build a receiver-site index from one canonical structural snapshot.
 pub(crate) fn build_receiver_site_index(
     facts: Arc<FileFacts>,
-    limit: ReceiverSiteIndexLimit,
     cancellation: Option<&CancellationToken>,
 ) -> ReceiverSiteIndexBuild {
     let mut inspected_work = 0;
@@ -282,17 +215,6 @@ pub(crate) fn build_receiver_site_index(
     for (source_order, node) in facts.nodes().iter().enumerate() {
         if is_cancelled(cancellation) {
             return ReceiverSiteIndexBuild::Cancelled { inspected_work };
-        }
-        if let Err(refused) = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-            inspected_work,
-            limit.max_work_items,
-        )
-        .try_allow(1)
-        {
-            return ReceiverSiteIndexBuild::Exceeded {
-                inspected_work,
-                refused,
-            };
         }
         inspected_work += 1;
 
@@ -319,18 +241,6 @@ pub(crate) fn build_receiver_site_index(
         for target in facts.roles(fact_id) {
             if is_cancelled(cancellation) {
                 return ReceiverSiteIndexBuild::Cancelled { inspected_work };
-            }
-            if let Err(refused) =
-                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                    inspected_work,
-                    limit.max_work_items,
-                )
-                .try_allow(1)
-            {
-                return ReceiverSiteIndexBuild::Exceeded {
-                    inspected_work,
-                    refused,
-                };
             }
             inspected_work += 1;
 
@@ -402,13 +312,7 @@ mod tests {
     fn complete_index(source: &str) -> ReceiverSiteIndex {
         let facts = facts(source);
         let work_item_count = facts.work_item_count();
-        match build_receiver_site_index(
-            facts,
-            ReceiverSiteIndexLimit {
-                max_work_items: work_item_count,
-            },
-            None,
-        ) {
+        match build_receiver_site_index(facts, None) {
             ReceiverSiteIndexBuild::Complete {
                 index,
                 inspected_work,
@@ -526,86 +430,15 @@ mod tests {
     }
 
     #[test]
-    fn tiny_build_limit_reports_only_inspected_work() {
-        let facts = facts(
-            "class Service { public void Run() {} }\n\
-             class Caller { void Go(Service service) { service.Run(); } }\n",
-        );
-        let outcome =
-            build_receiver_site_index(facts, ReceiverSiteIndexLimit { max_work_items: 1 }, None);
-
-        assert!(matches!(
-            &outcome,
-            ReceiverSiteIndexBuild::Exceeded {
-                inspected_work: 1,
-                ..
-            }
-        ));
-        assert_eq!(outcome.inspected_work(), 1);
-    }
-
-    #[test]
-    fn node_only_budget_does_not_hide_role_edge_work() {
-        let facts = facts(
-            "class Service { public void Run() {} }\n\
-             class Caller { void Go(Service service) { service.Run(); } }\n",
-        );
-        let node_count = facts.nodes().len();
-        let outcome = build_receiver_site_index(
-            facts,
-            ReceiverSiteIndexLimit {
-                max_work_items: node_count,
-            },
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            ReceiverSiteIndexBuild::Exceeded {
-                inspected_work,
-                ..
-            } if inspected_work == node_count
-        ));
-    }
-
-    #[test]
-    fn cached_selection_reports_its_own_bounded_work() {
-        let index = complete_index(
-            "class Service { public void Run() {} }\n\
-             class Caller { void Go(Service first, Service second) { first.Run(); second.Run(); } }\n",
-        );
-        let outcome = index.select_bounded(
-            range_of(&index, "second"),
-            ReceiverSiteInputMode::Expression,
-            ReceiverSiteSelectionLimit {
-                max_inspected_sites: 1,
-            },
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            ReceiverSiteSelection::Exceeded {
-                inspected_sites: 1,
-                ..
-            }
-        ));
-        assert_eq!(outcome.inspected_sites(), 1);
-    }
-
-    #[test]
     fn cached_selection_polls_cancellation_between_sites() {
         let index = complete_index(
             "class Service { public void Run() {} }\n\
              class Caller { void Go(Service first, Service second) { first.Run(); second.Run(); } }\n",
         );
         let cancellation = CancellationToken::cancel_after_checks_for_test(2);
-        let outcome = index.select_bounded(
+        let outcome = index.select_cancellable(
             range_of(&index, "second"),
             ReceiverSiteInputMode::Expression,
-            ReceiverSiteSelectionLimit {
-                max_inspected_sites: usize::MAX,
-            },
             Some(&cancellation),
         );
 
@@ -617,20 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn mid_build_cancellation_retains_bounded_work_count() {
+    fn mid_build_cancellation_retains_its_work_count() {
         let facts = facts(
             "class Service { public void Run() {} }\n\
              class Caller { void Go(Service service) { service.Run(); service.Run(); } }\n",
         );
         let work_item_count = facts.work_item_count();
         let cancellation = CancellationToken::cancel_after_checks_for_test(4);
-        let outcome = build_receiver_site_index(
-            facts,
-            ReceiverSiteIndexLimit {
-                max_work_items: usize::MAX,
-            },
-            Some(&cancellation),
-        );
+        let outcome = build_receiver_site_index(facts, Some(&cancellation));
 
         let ReceiverSiteIndexBuild::Cancelled { inspected_work } = outcome else {
             panic!("expected mid-build cancellation, got {outcome:?}");

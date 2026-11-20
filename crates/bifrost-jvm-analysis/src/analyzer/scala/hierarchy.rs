@@ -802,7 +802,9 @@ impl ScalaAnalyzer {
                         // bindings, the template may sit below the root and
                         // the family is refused; otherwise an unindexed
                         // namespace could still bind the name, so the family
-                        // stays open.
+                        // stays open. The landing is unproven, so the outcome
+                        // depends on the whole classpath: record every gap.
+                        external.record_all_gaps(&recorder);
                         if supertype.wildcard_names_root(external_root_fqn) {
                             return ExternalMemberFamilyAnswer::incomplete(
                                 ExternalMemberFamilyIncompleteReason::ExternalRootUnresolved,
@@ -1322,13 +1324,13 @@ impl ScalaAnalyzer {
         owner: &CodeUnit,
         parents: &mut Vec<crate::analyzer::jvm::native_hierarchy::MappedParent>,
     ) {
-        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind;
+        use brokk_bifrost_analysis::analyzer::resolution::ClassifiedSupertypeKind;
         let no_written_parent = parents
             .iter()
-            .all(|parent| parent.kind == Some(ResolutionSupertypeKind::ImplicitSuperclass));
+            .all(|parent| parent.kind == Some(ClassifiedSupertypeKind::ImplicitSuperclass));
         let first = parents
             .iter_mut()
-            .filter(|parent| parent.kind == Some(ResolutionSupertypeKind::Superclass))
+            .filter(|parent| parent.kind == Some(ClassifiedSupertypeKind::Superclass))
             .min_by_key(|parent| parent.ordinal);
         let trait_first = if !self.is_scala_trait_declaration(owner)
             && let Some(first) = first
@@ -1344,10 +1346,10 @@ impl ScalaAnalyzer {
         if trait_first {
             parents
                 .iter_mut()
-                .filter(|parent| parent.kind == Some(ResolutionSupertypeKind::Superclass))
+                .filter(|parent| parent.kind == Some(ClassifiedSupertypeKind::Superclass))
                 .min_by_key(|parent| parent.ordinal)
                 .expect("trait first parent exists")
-                .kind = Some(ResolutionSupertypeKind::Interface);
+                .kind = Some(ClassifiedSupertypeKind::Interface);
         }
         if (trait_first || no_written_parent)
             && !parents.iter().any(|parent| {
@@ -1358,7 +1360,7 @@ impl ScalaAnalyzer {
             })
         {
             parents.push(crate::analyzer::jvm::native_hierarchy::MappedParent {
-                kind: Some(ResolutionSupertypeKind::ImplicitSuperclass),
+                kind: Some(ClassifiedSupertypeKind::ImplicitSuperclass),
                 ordinal: 0,
                 targets: Vec::new(),
                 // Like the native Java implicit Object root, this intrinsic
@@ -1367,7 +1369,7 @@ impl ScalaAnalyzer {
                 intrinsic_root: Some(
                     brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::jvm_intrinsic_parent(
                         brokk_bifrost_core::analyzer::model::Language::Scala,
-                        Some(ResolutionSupertypeKind::ImplicitSuperclass),
+                        Some(brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind::ImplicitSuperclass),
                     ).expect("Scala's language-defined implicit superclass is intrinsic"),
                 ),
                 alternatives: 1,

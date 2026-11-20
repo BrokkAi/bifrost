@@ -3,7 +3,7 @@ mod jvm_extraction_tests {
 
     use std::sync::Arc;
 
-    use brokk_bifrost_analysis::analyzer::usages::receiver_query::test_support::assert_factory_ranges_limited_and_cancellable;
+    use brokk_bifrost_analysis::analyzer::usages::receiver_query::test_support::assert_factory_ranges_cancellable;
 
     use brokk_bifrost_jvm_analysis::analyzer::JavaAnalyzer;
 
@@ -49,7 +49,7 @@ static Service makeService() { return new Service(); }
             .expect("workspace Java analyzer");
         java.inner().reset_full_hydration_count_for_test();
 
-        assert_factory_ranges_limited_and_cancellable(workspace.analyzer(), &factory);
+        assert_factory_ranges_cancellable(workspace.analyzer(), &factory);
         assert_eq!(
             java.inner().full_hydration_count_for_test(),
             0,

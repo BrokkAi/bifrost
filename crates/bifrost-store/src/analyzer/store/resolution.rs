@@ -331,6 +331,7 @@ macro_rules! resolution_bundle_families {
             root_import_segments => ("root_import_segments", "resolution_root_import_segments", "expected_root_import_segment_count", "import_site, position, segment", 3, 2),
             root_import_demands => ("root_import_demands", "resolution_root_import_demands", "expected_root_import_demand_count", "import_site, namespace, name, target_kind, target_reference, target_name", 6, 3),
             rust_reference_contexts => ("rust_reference_contexts", "resolution_rust_reference_contexts", "expected_rust_reference_context_count", "semantic_key, source_site, source_occurrence, module_context, module_declaration, cfg_condition", 6, 1),
+            rust_impl_declarations => ("rust_impl_declarations", "resolution_rust_impl_declarations", "expected_rust_impl_declaration_count", "declaration, enclosing_scope", 2, 1),
             rust_declaration_authorities => ("rust_declaration_authorities", "resolution_rust_declaration_authorities", "expected_rust_declaration_authority_count", "semantic_key, source_site, declaration, visibility, module_context, module_declaration, cfg_condition, activation_reason", 8, 1),
             semantic_catalog => ("semantic_catalog", "resolution_semantic_catalog", "expected_semantic_catalog_count", "local_key, identity_digest, shared_identity, import_source_site, import_start_byte, import_end_byte, import_route_kind", 7, 1),
             node_catalog => ("node_catalog", "resolution_node_catalog", "expected_node_catalog_count", "local_key, identity_digest, source_scope, kind, semantic_local_key, semantic_shared_identity, target_local_key, target_boundary_key", 8, 1),
@@ -374,6 +375,8 @@ macro_rules! resolution_bundle_families {
             reference_package_contexts => ("reference_package_contexts", "resolution_reference_package_contexts", "expected_reference_package_context_count", "reference_site, prefixes", 2, 1),
             member_type_coverage => ("member_type_coverage", "resolution_member_type_coverage", "expected_member_type_coverage_count", "definition_semantic_key, scope_head_node_key, coverage, open_reason", 4, 1),
             reference_execution_contexts => ("reference_execution_contexts", "resolution_reference_execution_contexts", "expected_reference_execution_context_count", "site, disposition, procedure_kind, initializer_is_static, callable_site", 5, 1),
+            implicit_root_candidates => ("implicit_root_candidates", "resolution_implicit_root_candidates", "expected_implicit_root_candidate_count", "definition, reference, frontier", 3, 1),
+            declaration_modifiers => ("declaration_modifiers", "resolution_declaration_modifiers", "expected_declaration_modifier_count", "definition, partial", 2, 1),
         }
     };
 }
@@ -415,18 +418,15 @@ macro_rules! define_manifest_counts {
     ($($field:ident => ($name:literal, $table:literal, $count_column:literal, $columns:literal, $arity:literal, $key_arity:literal),)*) => {
         #[doc(hidden)]
         pub const RESOLUTION_MANIFEST_COUNT_COLUMNS: &[&str] = &{
-            let header_count = ResolutionManifestFamilyIndex::FamilyCount as usize - 1;
+            let header_count = ResolutionManifestFamilyIndex::reference_execution_contexts as usize;
             let mut columns = [""; ResolutionManifestFamilyIndex::FamilyCount as usize
                 + resolution_manifest::BODY_MANIFEST_COLUMNS.len()];
-            $(if (ResolutionManifestFamilyIndex::$field as usize) < header_count {
-                columns[ResolutionManifestFamilyIndex::$field as usize] = $count_column;
-            })*
+            $(columns[family_count_position(ResolutionManifestFamilyIndex::$field as usize)] = $count_column;)*
             let mut index = 0;
             while index < resolution_manifest::BODY_MANIFEST_COLUMNS.len() {
                 columns[header_count + index] = resolution_manifest::BODY_MANIFEST_COLUMNS[index];
                 index += 1;
             }
-            columns[columns.len() - 1] = "expected_reference_execution_context_count";
             columns
         };
 
@@ -471,7 +471,9 @@ resolution_bundle_families!(define_manifest_counts);
 pub(crate) fn resolution_family_applies(language: Language, family: &str) -> bool {
     match family {
         "reference_package_contexts" => language == Language::Scala,
-        "binary_operations" | "structural_trait_impls" => language == Language::Rust,
+        "binary_operations" | "structural_trait_impls" | "rust_impl_declarations" => {
+            language == Language::Rust
+        }
         "csharp_friend_attributes" => language == Language::CSharp,
         // #9546: only the JVM producers claim member-type coverage, so other
         // languages keep their earlier bundle and count encodings.
@@ -484,20 +486,62 @@ pub(crate) fn resolution_family_applies(language: Language, family: &str) -> boo
     }
 }
 
+fn sparse_extension_family(name: &str) -> bool {
+    matches!(name, "implicit_root_candidates" | "declaration_modifiers")
+}
+
+pub(crate) fn sparse_extension_count(index: usize) -> bool {
+    index == family_count_position(ResolutionManifestFamilyIndex::implicit_root_candidates as usize)
+        || index
+            == family_count_position(ResolutionManifestFamilyIndex::declaration_modifiers as usize)
+}
+
+pub(crate) fn resolution_count_is_encoded(language: Language, index: usize, count: u64) -> bool {
+    resolution_count_applies(language, index) && (!sparse_extension_count(index) || count != 0)
+}
+
+pub(crate) fn hash_manifest_count(
+    hash: &mut brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher,
+    label: &str,
+    language: Language,
+    index: usize,
+    count: u64,
+) {
+    if resolution_count_is_encoded(language, index, count) {
+        if sparse_extension_count(index) {
+            hash.field("count_family", &(index as u64).to_be_bytes());
+        }
+        hash.field(label, &count.to_be_bytes());
+    } else {
+        assert_eq!(count, 0, "inapplicable resolution count");
+    }
+}
+
+const fn family_count_position(index: usize) -> usize {
+    let body_start = ResolutionManifestFamilyIndex::reference_execution_contexts as usize;
+    if index < body_start {
+        index
+    } else {
+        index + resolution_manifest::BODY_MANIFEST_COLUMNS.len()
+    }
+}
+
 pub(crate) fn resolution_count_applies(language: Language, index: usize) -> bool {
-    // Another language must rotate its own bundle token before admitting
-    // binary operations; omit its empty column from existing count identities.
     if RESOLUTION_MANIFEST_COUNT_COLUMNS[index] == "expected_binary_operation_count" {
         return resolution_family_applies(language, "binary_operations");
     }
-    if index == RESOLUTION_MANIFEST_COUNT_COLUMNS.len() - 1 {
-        return language == Language::Java;
-    }
-    if index >= ResolutionManifestFamilyIndex::FamilyCount as usize - 1 {
+    let body_start = ResolutionManifestFamilyIndex::reference_execution_contexts as usize;
+    let body_end = body_start + resolution_manifest::BODY_MANIFEST_COLUMNS.len();
+    if (body_start..body_end).contains(&index) {
         return true;
     }
+    let family_index = if index < body_start {
+        index
+    } else {
+        index - resolution_manifest::BODY_MANIFEST_COLUMNS.len()
+    };
     PreparedResolutionBundleRows::family_specs()
-        .get(index)
+        .get(family_index)
         .is_none_or(|family| resolution_family_applies(language, family.name))
 }
 
@@ -508,7 +552,7 @@ macro_rules! manifest_count_accessors {
         impl ResolutionManifestCounts {
             $(#[doc(hidden)]
             pub const fn $field(&self) -> u64 {
-                self.get(ResolutionManifestFamilyIndex::$field as usize)
+                self.get(family_count_position(ResolutionManifestFamilyIndex::$field as usize))
             })*
         }
     };
@@ -557,11 +601,7 @@ impl PreparedResolutionBundleRows {
     fn counts(&self) -> [usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()] {
         let mut counts = [0; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()];
         for (index, rows) in self.families().into_iter().enumerate() {
-            let position = if index == Self::family_specs().len() - 1 {
-                counts.len() - 1
-            } else {
-                index
-            };
+            let position = family_count_position(index);
             counts[position] = rows.len();
         }
         counts
@@ -583,6 +623,9 @@ impl PreparedResolutionBundleRows {
             .zip(self.families())
             .enumerate()
         {
+            if sparse_extension_family(spec.name) && rows.is_empty() {
+                continue;
+            }
             if !resolution_family_applies(semantic_language, spec.name) {
                 assert!(rows.is_empty(), "inapplicable resolution family has rows");
                 continue;
@@ -590,11 +633,7 @@ impl PreparedResolutionBundleRows {
             if cancellation.is_cancelled() {
                 return None;
             }
-            let row_count = family_counts[if index == Self::family_specs().len() - 1 {
-                family_counts.len() - 1
-            } else {
-                index
-            }];
+            let row_count = family_counts[family_count_position(index)];
             debug_assert_eq!(row_count, rows.len());
             put_bytes(hasher.buffer(), spec.name.as_bytes());
             put_len(hasher.buffer(), row_count);
@@ -791,11 +830,14 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_root_imports",
     "resolution_extern_aliases",
     "resolution_csharp_friend_attributes",
+    "resolution_implicit_root_candidates",
+    "resolution_declaration_modifiers",
     "resolution_compilation_imports",
     "resolution_root_import_segments",
     "resolution_root_import_demands",
     "resolution_rust_reverse_gap_candidates",
     "resolution_rust_declaration_authorities",
+    "resolution_rust_impl_declarations",
     "resolution_rust_reference_contexts",
     "resolution_semantic_catalog",
     "resolution_semantic_sites",
@@ -815,6 +857,10 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_macro_type_candidates",
     "resolution_macro_type_elements",
     "resolution_macro_type_segments",
+    "resolution_function_shapes",
+    "resolution_function_shape_parameters",
+    "resolution_closure_literals",
+    "resolution_closure_members",
     "resolution_type_frontiers",
     "resolution_type_transfers",
     "resolution_declared_type_arguments",
@@ -911,6 +957,14 @@ pub const MEMBER_TYPE_COVERAGE_HISTORY: &[MemberTypeCoverageHistoryEntry] = &[
         census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
         golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
     },
+    // #13460 moves Scala calls on Java source interfaces; member-type
+    // coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Scala,
+        bundle_epoch: "resolution-bundle-scala-v106-java-interface-redeclared-object-member-13460-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10",
+        census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
+        golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
+    },
     // #12120 changes annotated-type lowering only; member-type coverage is unchanged.
     MemberTypeCoverageHistoryEntry {
         language: Language::Java,
@@ -931,6 +985,108 @@ pub const MEMBER_TYPE_COVERAGE_HISTORY: &[MemberTypeCoverageHistoryEntry] = &[
     MemberTypeCoverageHistoryEntry {
         language: Language::Java,
         bundle_epoch: "resolution-bundle-java-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #7892 retires provisional qualified-type gaps for closed package absences
+    // and #13044 publishes the qualified-this receiver identity; member-type
+    // coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #13044 publishes a qualified-super qualifier projection; member-type
+    // coverage is unchanged. See .agents/docs/cache-identity-levers.md.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #11379 changes inherited external call proofs; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v78-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #13460 suppresses implicit Object interface members when the interface
+    // explicitly declares the same signature. This merged v79 also keeps
+    // #11379's inherited external call proofs; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v79-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #13468 drops a static-on-demand Type demand shadowed by a single-type
+    // import. This merged v80 also keeps #13460's interface redeclaration and
+    // #11379's inherited external call proofs; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v80-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #13587 adds protected external member candidates at v81, merged with
+    // #13468, #13460 and #11379; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v81-protected-external-members-13587-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #13587 changes protected external member resolution only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Kotlin,
+        bundle_epoch: "resolution-bundle-kotlin-v74-protected-external-members-13587-v73-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-v68-lexical-head-blockers-9002-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10",
+        census_digest: "5ab89965b3b3ca528f0f9a568bceb8d863386ff9cbda3eb1ed8450391e7709e0",
+        golden_digest: "75b9d0721528c4fcaf343e7ec48411a8c40d2d007fa61446f0aaa8924f09e66e",
+    },
+    // #13587 changes protected external member resolution only; this merged
+    // v107 also keeps #13460's Java-interface redeclaration; coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Scala,
+        bundle_epoch: "resolution-bundle-scala-v107-protected-external-members-13587-java-interface-redeclared-object-member-13460-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10",
+        census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
+        golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
+    },
+    // #10572 closes dispatch for final external receivers at v82, merged with
+    // #13587, #13468, #13460 and #11379; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v82-java-final-external-dispatch-10572-protected-external-members-13587-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #13632 keeps an ambiguous name open while a static import of an
+    // unenumerated owner may supply an obscuring field; member-type coverage
+    // is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v83-static-import-field-obscures-ambiguous-name-13632-java-final-external-dispatch-10572-protected-external-members-13587-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #4375 resolves Java array receivers to Object's public members (JLS 10.7);
+    // member-type coverage is unchanged.
+    // #8440 (v85): native call actuals typed through a class-file generic
+    // owner substitute its type arguments; member-type coverage is unchanged.
+    // v86 combines #4375 and #8440 with master's #13632 static-import gap;
+    // member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v86-array-receiver-object-members-4375-generic-return-substitution-8440-v83-static-import-field-obscures-ambiguous-name-13632-java-final-external-dispatch-10572-protected-external-members-13587-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #14133: query-time member-type absence proofs over a partial JDK pack;
+    // the member-type coverage the producer publishes is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v87-jdk-member-type-absence-14133-v86-array-receiver-object-members-4375-generic-return-substitution-8440-v83-static-import-field-obscures-ambiguous-name-13632-java-final-external-dispatch-10572-protected-external-members-13587-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
         census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
         golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
     },
@@ -964,8 +1120,49 @@ pub fn csharp_trial_bundle_epoch() -> &'static str {
     &TRIAL
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static RUST_BUNDLE_EPOCH_OVERRIDE: std::sync::Mutex<Option<&'static str>> =
+    std::sync::Mutex::new(None);
+
+/// Resets the isolated test's Rust producer epoch even when it unwinds.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct RustBundleEpochOverride;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for RustBundleEpochOverride {
+    fn drop(&mut self) {
+        *RUST_BUNDLE_EPOCH_OVERRIDE
+            .lock()
+            .expect("bundle epoch override lock") = None;
+    }
+}
+
+/// Override the shared Rust producer owner in a subprocess-isolated test.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn override_rust_bundle_epoch(epoch: &'static str) -> RustBundleEpochOverride {
+    let mut value = RUST_BUNDLE_EPOCH_OVERRIDE
+        .lock()
+        .expect("bundle epoch override lock");
+    assert!(
+        value.is_none(),
+        "Rust bundle epoch override already installed"
+    );
+    *value = Some(epoch);
+    RustBundleEpochOverride
+}
+
 #[doc(hidden)]
 pub fn resolution_bundle_epoch(language: Language) -> &'static str {
+    #[cfg(any(test, feature = "test-support"))]
+    if language == Language::Rust
+        && let Some(epoch) = *RUST_BUNDLE_EPOCH_OVERRIDE
+            .lock()
+            .expect("bundle epoch override lock")
+    {
+        return epoch;
+    }
     use brokk_bifrost_core::lever_label;
     match language {
         // #9628: every language moved one version together. Bundle and
@@ -1003,8 +1200,25 @@ pub fn resolution_bundle_epoch(language: Language) -> &'static str {
         // older interiors point at a second, nameless declaration.
         // v72 (#7746): Java pattern binders publish disjoint activation regions.
         // v73: master's #12948 v71 and the batch's v72 merged; keep both tokens.
+        // v76: #7892 retires provisional qualified-type gaps for closed package
+        // absences and #13044 publishes the qualified-this receiver identity.
+        // v77 (#13044): qualified super publishes a selected qualifier projection.
+        // v78 (#11379): source receivers publish selected inherited external call proofs.
+        // v82 combines #10572's final external dispatch with v81's protected
+        // external members (#13587), single-type-import shadow (#13468),
+        // interface redeclaration (#13460), and inherited proofs (#11379).
+        // v83 (#13632): a static import of an unenumerated owner publishes a
+        // never-discharged gap on the Value demand, so an ambiguous name stays
+        // open while an imported field could obscure its type.
+        // v85 (#4375): array receivers resolve to Object's public members
+        // (JLS 10.7), combined with master's v83 change.
+        // v85 (#8440): class-file owners bind receiver type arguments into
+        // generic returns. v86 combines both with master's v83 change.
+        // v87 (#14133): a partial JDK pack proves member-type absence for a
+        // type no extraction gap names, so names inside classes whose closure
+        // reaches the JDK resolve instead of stopping as inherited_unresolved.
         Language::Java => {
-            "resolution-bundle-java-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v87-jdk-member-type-absence-14133-v86-array-receiver-object-members-4375-generic-return-substitution-8440-v83-static-import-field-obscures-ambiguous-name-13632-java-final-external-dispatch-10572-protected-external-members-13587-single-type-import-shadows-static-on-demand-13468-interface-redeclared-object-member-13460-inherited-external-call-proof-11379-v77-qualified-super-13044-v76-proven-empty-qualified-type-7892-qualified-receiver-identity-13044-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
         Language::Go => lever_label!("resolution-bundle-go", "resolution-bundle-go.tokens"),
         Language::Cpp => lever_label!("resolution-bundle-cpp", "resolution-bundle-cpp.tokens"),
@@ -1063,8 +1277,11 @@ pub fn resolution_bundle_epoch(language: Language) -> &'static str {
         // #10445 v105: a Scala value parameter activates after its own clause,
         // so binder activation rows and resolution answers change for unchanged
         // source; older bundles must be relowered.
+        // v107 combines #13587's protected external member candidates with
+        // v106's Java-interface redeclaration (#13460); Scala keeps target and
+        // gap likewise.
         Language::Scala => {
-            "resolution-bundle-scala-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
+            "resolution-bundle-scala-v107-protected-external-members-13587-java-interface-redeclared-object-member-13460-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
         }
         Language::CSharp => csharp_bundle_epoch(),
         Language::Ruby => lever_label!("resolution-bundle-ruby", "resolution-bundle-ruby.tokens"),
@@ -1075,8 +1292,10 @@ pub fn resolution_bundle_epoch(language: Language) -> &'static str {
         // #9002: publish ordered JVM lexical choice records in path bodies.
         // #9002: continuation prefixes are now published on site rows.
         // v72: master's #9546 v71 and #9002's v70 merged; the literal keeps both tokens.
+        // v74 (#13587): protected external members are hierarchy candidates;
+        // Kotlin keeps target and gap until a declaring origin is recorded.
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v73-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-v68-lexical-head-blockers-9002-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
+            "resolution-bundle-kotlin-v74-protected-external-members-13587-v73-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-v68-lexical-head-blockers-9002-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
@@ -1116,7 +1335,9 @@ impl PreparedResolutionBundle {
     ) {
         // The capsule counts close the body columns; the Java-only reference
         // execution context count follows them and stays untouched.
-        let body_end = self.family_counts.len() - 1;
+        let body_end = family_count_position(
+            ResolutionManifestFamilyIndex::reference_execution_contexts as usize,
+        );
         debug_assert_eq!(
             RESOLUTION_MANIFEST_COUNT_COLUMNS[body_end - 3..body_end],
             [
@@ -1222,14 +1443,14 @@ impl PreparedResolutionBundle {
             cancellation,
         )?;
         drop(_body_timing);
-        let last_count = family_counts.len() - 1;
-        family_counts[ResolutionManifestFamilyIndex::FamilyCount as usize - 1..last_count]
-            .copy_from_slice(&resolution_manifest::body_counts(
-                &path_rows,
-                &site_rows,
-                &typed_fact_rows,
-                &gap_rows,
-            ));
+        let body_start = ResolutionManifestFamilyIndex::reference_execution_contexts as usize;
+        let body_end = family_count_position(body_start);
+        family_counts[body_start..body_end].copy_from_slice(&resolution_manifest::body_counts(
+            &path_rows,
+            &site_rows,
+            &typed_fact_rows,
+            &gap_rows,
+        ));
         let logical_rows = family_counts
             .into_iter()
             .fold(1usize, usize::saturating_add);
@@ -1386,6 +1607,13 @@ impl AnalyzerStore {
                 tx.commit()?;
                 return Ok(false);
             }
+            // Install the new epoch before retiring its obsolete products.
+            tx.execute(
+                "INSERT INTO resolution_producer_epochs(lang, producer_epoch)
+                 VALUES(?1, ?2)
+                 ON CONFLICT(lang) DO UPDATE SET producer_epoch = excluded.producer_epoch",
+                params![storage_language, producer_epoch],
+            )?;
             tx.execute(
                 "DELETE FROM surface_sets WHERE blob_id IN (SELECT id FROM blobs WHERE lang=?1)",
                 [&storage_language],
@@ -1403,12 +1631,6 @@ impl AnalyzerStore {
             }
             #[cfg(any(test, debug_assertions, feature = "test-support"))]
             drop(_cascade);
-            tx.execute(
-                "INSERT INTO resolution_producer_epochs(lang, producer_epoch)
-                 VALUES(?1, ?2)
-                 ON CONFLICT(lang) DO UPDATE SET producer_epoch = excluded.producer_epoch",
-                params![storage_language, producer_epoch],
-            )?;
             tx.commit()?;
             Ok(true)
         })
@@ -3240,6 +3462,54 @@ mod tests {
     }
 
     #[test]
+    fn sparse_generic_families_have_tagged_count_identities() {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        let empty = bundle(Language::Rust, PreparedResolutionBundleRows::default());
+        let mut roots = PreparedResolutionBundleRows::default();
+        roots
+            .implicit_root_candidates
+            .push(PreparedResolutionRow::new(vec![
+                0_u32.into(),
+                1_u32.into(),
+                2_u32.into(),
+            ]));
+        let roots = bundle(Language::Rust, roots);
+        let mut modifiers = PreparedResolutionBundleRows::default();
+        modifiers
+            .declaration_modifiers
+            .push(PreparedResolutionRow::new(vec![0_u32.into(), 0_i64.into()]));
+        let modifiers = bundle(Language::Rust, modifiers);
+        assert_ne!(roots.interior_digest(), modifiers.interior_digest());
+        assert_ne!(roots.interior_digest(), empty.interior_digest());
+        for label in ["count", "manifest_count"] {
+            let encode = |bundle: &PreparedResolutionBundle| {
+                let mut hash = CanonicalHasher::new(b"sparse-family-codec-boundary");
+                for (index, count) in bundle.family_counts().iter().enumerate() {
+                    hash_manifest_count(&mut hash, label, Language::Rust, index, *count as u64);
+                }
+                hash.finish()
+            };
+            assert_ne!(
+                encode(&roots),
+                encode(&modifiers),
+                "equal counts in distinct families must differ"
+            );
+            let mut old = CanonicalHasher::new(b"sparse-family-codec-boundary");
+            for (index, count) in empty.family_counts().iter().enumerate() {
+                if !sparse_extension_count(index) && resolution_count_applies(Language::Rust, index)
+                {
+                    old.field(label, &(*count as u64).to_be_bytes());
+                }
+            }
+            assert_eq!(
+                encode(&empty),
+                old.finish(),
+                "empty extension preserves prior bytes"
+            );
+        }
+    }
+
+    #[test]
     fn bundle_and_mount_count_encodings_omit_inapplicable_families() {
         // A family that does not apply to a language leaves that language's
         // bundle digest and count codecs byte-identical (#9195, #8870, #9546).
@@ -3267,11 +3537,21 @@ mod tests {
             ]));
         let with_context = bundle(Language::Java, rows);
         assert_ne!(empty.interior_digest(), with_context.interior_digest());
-        assert_eq!(with_context.family_counts().last().copied(), Some(1));
-        assert_eq!(empty.family_counts().last().copied(), Some(0));
+        let legacy_tail = family_count_position(
+            ResolutionManifestFamilyIndex::reference_execution_contexts as usize,
+        );
+        assert_eq!(with_context.family_counts()[legacy_tail], 1);
+        assert_eq!(empty.family_counts()[legacy_tail], 0);
         assert_eq!(
-            RESOLUTION_MANIFEST_COUNT_COLUMNS.last().copied(),
-            Some("expected_reference_execution_context_count")
+            RESOLUTION_MANIFEST_COUNT_COLUMNS[legacy_tail],
+            "expected_reference_execution_context_count"
+        );
+        assert_eq!(
+            &RESOLUTION_MANIFEST_COUNT_COLUMNS[legacy_tail + 1..],
+            [
+                "expected_implicit_root_candidate_count",
+                "expected_declaration_modifier_count"
+            ]
         );
     }
 
@@ -3303,6 +3583,7 @@ mod tests {
             .enumerate()
             .filter_map(|(index, count)| {
                 (index != ResolutionManifestFamilyIndex::csharp_friend_attributes as usize
+                    && !sparse_extension_count(index)
                     && resolution_count_applies(language, index))
                 .then_some(*count)
             })
@@ -3310,7 +3591,9 @@ mod tests {
         let inapplicable = RESOLUTION_MANIFEST_COUNT_COLUMNS
             .iter()
             .enumerate()
-            .filter(|(index, _)| !resolution_count_applies(language, *index))
+            .filter(|(index, _)| {
+                !resolution_count_applies(language, *index) || sparse_extension_count(*index)
+            })
             .count();
         assert_eq!(old_counts.len() + inapplicable, counts.len());
 
@@ -3324,6 +3607,7 @@ mod tests {
         {
             // Reconstruct the pre-IVT framing independently of applicability.
             if spec.name == "csharp_friend_attributes"
+                || sparse_extension_family(spec.name)
                 || !resolution_family_applies(language, spec.name)
             {
                 continue;
@@ -3356,7 +3640,7 @@ mod tests {
             }
             let mut current = CanonicalHasher::new(b"9195-old-selected-counts");
             for (index, count) in counts.iter().enumerate() {
-                if resolution_count_applies(language, index) {
+                if resolution_count_is_encoded(language, index, *count as u64) {
                     current.field(label, &(*count as u64).to_be_bytes());
                 }
             }
@@ -3442,7 +3726,7 @@ mod tests {
             let language = match spec.name {
                 "reference_package_contexts" => Language::Scala,
                 "csharp_friend_attributes" => Language::CSharp,
-                "structural_trait_impls" => Language::Rust,
+                "structural_trait_impls" | "rust_impl_declarations" => Language::Rust,
                 _ => Language::Java,
             };
             let changed_family = bundle(language, rows);
@@ -3552,16 +3836,29 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#7314: root candidate frontier persisted a source slot ordinal instead of its semantic key"
+    )]
     fn rich_lowered_java_bundle_prepares_populated_typed_and_common_families() {
         let _neutral_rules =
             crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
                 crate::analyzer::Language::Java,
             ]);
+        let mut source_facts = rich_java_resolution_facts_for_test();
+        let root = source_facts.supertypes.iter().find(|edge|
+            edge.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind::ImplicitSuperclass).copied().unwrap();
+        source_facts.implicit_root_candidates.push(
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionImplicitRootCandidateFact {
+                definition: root.subtype,
+                reference: root.supertype_reference,
+                frontier: root.supertype_slot,
+            },
+        );
         let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
             BindingFragmentId::for_test(b"digest-7"),
             crate::analyzer::resolution::test_shared_names(),
             Language::Java,
-            &rich_java_resolution_facts_for_test(),
+            &source_facts,
         );
         let ResolutionInteriorPreparation::Prepared(bundle) =
             super::super::resolution_prepare::prepare_resolution_bundle_with_unit_keys(
@@ -3573,6 +3870,22 @@ mod tests {
             panic!("uncancelled rich Java preparation must finish")
         };
         assert_eq!(bundle.semantic_language(), Language::Java);
+        let row = &bundle.rows.implicit_root_candidates[0];
+        let projection = bundle
+            .typed_fact_rows
+            .binding_projections
+            .iter()
+            .find(|projection| projection.reference == i64::from(root.supertype_reference.get()))
+            .unwrap();
+        assert_eq!(
+            row.values[2],
+            PreparedResolutionValue::Integer(projection.output_slot)
+        );
+        assert_ne!(
+            projection.output_slot,
+            i64::from(root.supertype_slot.get()),
+            "fixture must distinguish source slot ordinal from persisted semantic key"
+        );
         for family in [
             "expected_semantic_site_count",
             "expected_member_scope_property_count",

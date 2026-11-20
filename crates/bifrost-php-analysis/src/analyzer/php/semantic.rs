@@ -104,6 +104,7 @@ impl ProgramSemanticsLowerer for PhpSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (specs, initial_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)?.into_lowering_input()
@@ -6732,6 +6733,7 @@ mod tests {
                 &prepared,
                 &SemanticBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
             )
             .expect("PHP lowering must not fail");
         let SemanticOutcome::Complete { value, .. } = outcome else {

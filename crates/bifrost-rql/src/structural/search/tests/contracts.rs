@@ -23,6 +23,10 @@ fn diagnostic(
         message: "prose deliberately carries no classification words".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     })
 }
 
@@ -297,6 +301,10 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         message: "broad query".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     });
     assert_eq!(
         diagnostic.presentation_label(),
@@ -308,7 +316,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         session_subset: None,
         results: vec![item],
         truncated: false,
-        diagnostics: vec![diagnostic],
+        diagnostics: vec![diagnostic].into(),
     }
     .render_text();
     assert!(rendered.contains("  provenance: 3 paths (truncated); branches 1.0, 0\n"));
@@ -423,7 +431,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             },
         ],
         truncated: false,
-        diagnostics: Vec::new(),
+        diagnostics: Vec::new().into(),
     };
 
     let serialized = serde_json::to_value(&result).expect("semantic results serialize");
@@ -627,7 +635,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
             session_subset: None,
             results: Vec::new(),
             truncated: false,
-            diagnostics: vec![diagnostic(code, impact)],
+            diagnostics: vec![diagnostic(code, impact)].into(),
         };
         let serialized = serde_json::to_value(&result).expect("serialize query result");
         assert_eq!(serialized["diagnostics"][0]["code"], code.as_str());
@@ -1037,7 +1045,7 @@ fn outbound_uses_omission_codes_preserve_evidence_and_skip_certified_nonreferenc
             session_subset: None,
             results: Vec::new(),
             truncated: false,
-            diagnostics,
+            diagnostics: diagnostics.into(),
         }
         .completion(),
         CodeQueryCompletion::Incomplete { codes }
@@ -1333,6 +1341,7 @@ fn formal_call_site_value(binding: CallBindingStatus) -> CallSiteValue {
                 range,
                 name: None,
                 position: Some(0),
+                written_position: Some(0),
                 formal_index: (binding == CallBindingStatus::Complete).then_some(0),
                 formal_name: (binding == CallBindingStatus::Complete)
                     .then(|| "payload".to_string()),
@@ -1560,7 +1569,7 @@ fn enclosing_declaration_index_retains_exact_owner_and_reports_missing_real_rang
             session_subset: None,
             results: Vec::new(),
             truncated: index.projection_omitted,
-            diagnostics,
+            diagnostics: diagnostics.into(),
         }
         .completion(),
         CodeQueryCompletion::Incomplete { .. }
@@ -1923,5 +1932,68 @@ proptest::proptest! {
         if wanted.iter().any(|kind| *kind != 0) { wanted.remove(&0); }
         let expected = wanted.into_iter().map(|kind| causes[kind]).collect::<Vec<_>>();
         proptest::prop_assert_eq!(actual.iter().map(|row| row.incompleteness).collect::<Vec<_>>(), expected);
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12410: native call-relation budget refusals were published as Provider"
+)]
+fn native_call_relation_budget_causes_survive_diagnostic_mapping() {
+    use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+        CallRelationDiagnostic, CallRelationDiagnosticCode as Code,
+        CallRelationDiagnosticPayload as Payload, CallRelationScanLimit,
+    };
+    let file = ProjectFile::new(std::env::temp_dir(), "frontier.go");
+    let range = Range {
+        start_byte: 0,
+        end_byte: 1,
+        start_line: 1,
+        end_line: 1,
+    };
+    for (code, payload, cause) in [
+        (
+            Code::BudgetExhausted,
+            Payload::BudgetOmitted {
+                subject: "frontier".into(),
+            },
+            DiagnosticExecutionCause::Budget,
+        ),
+        (
+            Code::CandidateLimit,
+            Payload::RetainedCandidates {
+                target: "frontier".into(),
+                limit: 1,
+            },
+            DiagnosticExecutionCause::Budget,
+        ),
+        (
+            Code::ScanGrantRefused(CallRelationScanLimit::Files),
+            Payload::IncomingScanGrantRefused {
+                target: "frontier".into(),
+                path: "frontier.go".into(),
+                limit: CallRelationScanLimit::Files,
+            },
+            DiagnosticExecutionCause::Budget,
+        ),
+        (
+            Code::CandidatesOmitted,
+            Payload::GoExternalReceiver {
+                target: "net/http.Client.Do".into(),
+            },
+            DiagnosticExecutionCause::Provider,
+        ),
+    ] {
+        let diagnostic = CallRelationDiagnostic::new(
+            code,
+            payload.at(&file, Some(range)),
+            "typed frontier stop".into(),
+        );
+        let mapped = super::super::relations::map_call_relation_diagnostic("go", diagnostic);
+        assert_eq!(
+            mapped.incompleteness.execution_cause(),
+            Some(cause),
+            "{code:?}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Inert request-local verification of external dependency selection.
+//! Request verification of external dependency selection.
 use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::config::{JvmAnalyzerConfig, JvmDependencyDiscoveryMode};
@@ -9,10 +9,13 @@ use brokk_bifrost_core::analyzer::external_selection::{
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::content_digest::ContentDigestCache;
 
-use super::external::{ExternalProbeOperation, JvmExternalDeclarationIndex};
-use super::selected_inputs::capture;
+use super::dependency_discovery::DiscoveryInputs;
+use super::external::{
+    ExternalProbeOperation, ExternalSelectionFailure, JvmExternalDeclarationIndex,
+};
+use super::selected_inputs::capture_listing;
 
-#[allow(dead_code)] // No product caller until P2.
+#[cfg(test)]
 pub(crate) fn verify_selection(
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
@@ -21,38 +24,101 @@ pub(crate) fn verify_selection(
     retry: &SelectionRetry,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<VerifiedSelection, SelectionRefused> {
+    verify_selection_with(
+        config,
+        project,
+        digests,
+        &Default::default(),
+        question,
+        retry,
+        cancellation,
+    )
+}
+
+pub(crate) fn verify_selection_with(
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+    digests: &ContentDigestCache,
+    verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
+    question: &ExternalSelectionQuestion,
+    retry: &SelectionRetry,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<VerifiedSelection, SelectionRefused> {
     match question.kind {
         ExternalSelectionQuestionKind::RustToolchain => Err(SelectionRefused::Stale),
         ExternalSelectionQuestionKind::Dependencies => {
-            verify_dependencies_with(config, project, question, retry, || {})
+            verify_dependencies_with_evidence(config, project, question, retry, || {})
         }
-        ExternalSelectionQuestionKind::Jdk => {
-            verify_jdk(config, project, digests, question, retry, cancellation)
-        }
+        ExternalSelectionQuestionKind::Jdk => verify_jdk(
+            config,
+            project,
+            digests,
+            verifications,
+            question,
+            retry,
+            cancellation,
+        ),
     }
 }
 
-/// The JDK question reads only JDK discovery, never workspace manifests,
-/// dependency artifacts or build tools, so it needs no capture. Its artifacts
-/// are pinned to content digests streamed from the files (#9559), which no
-/// view stamp covers, so a complete selection whose every artifact is pinned is
-/// certified: bytes replaced under the same metadata change a pin. A selection
-/// with no artifact (no `jmods` directory, no `src.zip`, each probe recorded)
-/// is a certified negative answer; an unpinned artifact or an unreadable
-/// member leaves the answer uncertified or incomplete.
+/// Content is verified at activation, refresh or a detected change. A record
+/// may skip hashing only when its identities match and were non-racy at its
+/// recorded observation time. Same-tick rewrites cannot age into trust at a
+/// later lookup. Missing or racy metadata requires content verification.
 fn verify_jdk(
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
     digests: &ContentDigestCache,
+    verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
     question: &ExternalSelectionQuestion,
     retry: &SelectionRetry,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<VerifiedSelection, SelectionRefused> {
     loop {
         let stamp = project.view_stamp();
-        let jdk =
-            JvmExternalDeclarationIndex::select_jdk(config, project, digests, Some(cancellation))
+        use super::external::{VerifiedJdkRecord, observe_jdk, verify_jdk_record};
+        let observed = observe_jdk(config, project.root());
+        let cached = verifications.get::<VerifiedJdkRecord>(&question.digest);
+        let same_metadata = cached
+            .as_ref()
+            .is_some_and(|record| observed.as_ref() == Some(&record.observation));
+        let matches = |record: &VerifiedJdkRecord| record.matches(&observed);
+        let jdk = if let Some(record) = cached.filter(|record| matches(record)) {
+            record.selected.clone()
+        } else {
+            // A matching racy record needs a content read on this request.
+            // Background refresh would publish another racy record and keep
+            // refusing answers, indefinitely for future-dated files.
+            if !same_metadata && verifications.signal_stale() {
+                return Err(SelectionRefused::Stale);
+            }
+            let _guard = verifications.lock_verification();
+            let current = observe_jdk(config, project.root());
+            let record = verifications.get::<VerifiedJdkRecord>(&question.digest);
+            if let Some(record) = record.filter(|record| record.matches(&current)) {
+                record.selected.clone()
+            } else {
+                let verification = verify_jdk_record(
+                    config,
+                    project,
+                    digests,
+                    verifications,
+                    &Default::default(),
+                    Some(cancellation),
+                )
                 .map_err(|_| SelectionRefused::Cancelled)?;
+                // An incomplete selection is not recorded, so the pinned
+                // selection itself is the answer, if the files held still.
+                let after = observe_jdk(config, project.root());
+                if verification
+                    .observation
+                    .is_none_or(|observation| after.as_ref() != Some(&observation))
+                {
+                    return Err(SelectionRefused::Stale);
+                }
+                verification.selected
+            }
+        };
         if project.view_stamp() != stamp {
             if retry.retry() {
                 continue;
@@ -60,14 +126,18 @@ fn verify_jdk(
             return Err(SelectionRefused::Stale);
         }
         let complete = jdk.inputs.complete;
-        let certified = complete && stamp.is_some() && jdk.every_artifact_pinned();
+        let verified = stamp.is_some() && jdk.every_artifact_pinned();
+        let certified = complete && verified;
         return Ok(VerifiedSelection {
             question_digest: question.digest,
             answer_digest: jdk.answer_digest(complete, certified),
+            verified,
             certified,
             view_stamp: stamp,
             complete,
-            records: Arc::new(jdk),
+            // An incomplete JDK names no failure that is fixed for unchanged inputs.
+            only_replayable_gaps: false,
+            records: jdk,
         });
     }
 }
@@ -83,7 +153,7 @@ fn dependencies_certifiable(
     !question.uncertified
         && config.dependency_discovery.mode != JvmDependencyDiscoveryMode::OfflineBuildTools
         // Dependency resolution lists directories only in the Gradle cache, and
-        // that listing makes the selection uncertified. Every listing counts:
+        // a found listing makes the selection uncertified. Absent probes are replayable:
         // the probes sit under the canonical cache root, which need not share a
         // prefix with the configured root.
         && selection.is_some_and(|selection| {
@@ -91,13 +161,12 @@ fn dependencies_certifiable(
                 .inputs
                 .resolution_steps
                 .iter()
-                .any(|probe| matches!(probe.operation, ExternalProbeOperation::List))
+                .any(|probe| matches!(probe.operation, ExternalProbeOperation::List) && !probe.is_absent())
         })
 }
 
 /// The answer digest of the dependency question when its tree part is `basis`
-/// and the environment is this one, or `None` unless that answer is complete
-/// and certifiable (#11607). Reads no manifest: replay resolves the recorded
+/// and the environment is this one, or `None` unless that answer is replayable (#11607). Reads no manifest: replay resolves the recorded
 /// coordinates under `project_root` and compares the digest with the recorded
 /// one.
 pub(crate) fn dependencies_answer_under_basis(
@@ -115,9 +184,12 @@ pub(crate) fn dependencies_answer_under_basis(
     .expect("infallible artifact visitor");
     let complete = selection.completeness.is_complete();
     let certified = complete && dependencies_certifiable(config, question, Some(&selection));
-    (complete && certified).then(|| selection.answer_digest(complete, certified))
+    (dependencies_certifiable(config, question, Some(&selection))
+        && (complete || selection.completeness.only_replayable_gaps()))
+    .then(|| selection.answer_digest(complete, certified))
 }
 
+#[cfg(test)]
 fn verify_dependencies_with(
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
@@ -125,22 +197,62 @@ fn verify_dependencies_with(
     retry: &SelectionRetry,
     before_validation: impl Fn(),
 ) -> Result<VerifiedSelection, SelectionRefused> {
+    verify_dependencies_with_evidence(config, project, question, retry, before_validation)
+}
+
+fn verify_dependencies_with_evidence(
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+    question: &ExternalSelectionQuestion,
+    retry: &SelectionRetry,
+    before_validation: impl Fn(),
+) -> Result<VerifiedSelection, SelectionRefused> {
+    let inputs = super::dependency_discovery::manifest_scope(project, config);
     loop {
-        // Filling a cold listing advances its epoch, so the listing is filled
-        // before the stamp is sampled; otherwise every cold or refreshed
-        // listing would spend the retry. The capture then reads that same
-        // listing unless an event invalidates it, which moves the stamp.
-        let listed = project.all_files_shared();
+        // Capture the listing before sampling its owner revision. Observer
+        // invalidations move that revision; authoritative scope validation
+        // below also detects disk drift without an observer notification.
+        let listed = inputs.files_with_omissions();
+        // Only an omission that could hide a manifest makes the selection
+        // incomplete; a symlink to a source file changes no dependency.
+        let omitted: Vec<_> = listed
+            .as_ref()
+            .map(|(_, omissions)| {
+                omissions
+                    .iter()
+                    .filter(|omission| {
+                        super::dependency_discovery::omission_could_hide_manifest(omission)
+                    })
+                    .map(|omission| omission.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let inventory_complete = listed.is_ok() && omitted.is_empty();
         let stamp = project.view_stamp();
-        let captured = listed.and_then(|_| capture(project));
+        let captured = listed.map(|listing| capture_listing(&inputs, listing));
         let (selection, valid) = match captured {
             Ok(captured) => {
-                let selection = JvmExternalDeclarationIndex::select_external_inventory::<
-                    std::convert::Infallible,
-                >(config, project, &captured, |_| Ok(()))
-                .expect("infallible artifact visitor");
+                let mut selection = inputs
+                    .capture_boundary(|| {
+                        JvmExternalDeclarationIndex::select_external_inventory::<
+                            std::convert::Infallible,
+                        >(config, project, &captured, |_| Ok(()))
+                    })
+                    .expect("infallible artifact visitor");
+                // A listing that omitted files may have hidden a manifest, so
+                // the selection is incomplete for that named reason.
+                if !inventory_complete {
+                    selection
+                        .completeness
+                        .record(ExternalSelectionFailure::ListingOmitted { paths: omitted });
+                }
+                if inputs.missing_revision {
+                    selection.completeness.record(ExternalSelectionFailure::DependencyGaps(vec![
+                        brokk_bifrost_semantic::analyzer::semantic_model::dependency::JvmDependencyGap::missing_revision_build_authority(),
+                    ]));
+                }
                 before_validation();
-                let validation = captured.validate(project);
+                let validation = captured.validate_scope(&inputs);
                 // A file set or an absence that the authoritative walk
                 // contradicts came from a cached listing that missed a file
                 // change, and the retry would capture the same stale set. So
@@ -152,7 +264,7 @@ fn verify_dependencies_with(
                     Err(super::selected_inputs::CaptureDrift::FileSet(_)
                         | super::selected_inputs::CaptureDrift::Absence(_))
                 ) {
-                    project.invalidate_cached_file_listing();
+                    inputs.invalidate_listing();
                 }
                 (Some(selection), validation.is_ok())
             }
@@ -166,12 +278,24 @@ fn verify_dependencies_with(
             }
             return Err(SelectionRefused::Stale);
         }
-        let complete = selection
+        let complete = inventory_complete
+            && selection
+                .as_ref()
+                .is_some_and(|selection| selection.completeness.is_complete());
+        // `verified` is provenance: a later run can ask this authority again
+        // and compare. It does not depend on `complete`; `certified` adds that.
+        // Whether an incomplete selection may be reused is `replayable()`: the
+        // failures that are a pack's fixed content (folded in later, at the
+        // reader bind) or a declared coordinate with no local artifact are fixed
+        // for unchanged inputs, while a read, a limit, an unreadable probe or an
+        // omitted listing may succeed next time.
+        let verified =
+            stamp.is_some() && dependencies_certifiable(config, question, selection.as_ref());
+        let certified = complete && verified;
+        // An omitted listing is itself a failure, so it is never replayable.
+        let only_replayable_gaps = selection
             .as_ref()
-            .is_some_and(|selection| selection.completeness.is_complete());
-        let certified = complete
-            && stamp.is_some()
-            && dependencies_certifiable(config, question, selection.as_ref());
+            .is_some_and(|selection| selection.completeness.only_replayable_gaps());
         return Ok(VerifiedSelection {
             question_digest: question.digest,
             answer_digest: match &selection {
@@ -187,8 +311,10 @@ fn verify_dependencies_with(
                 }
             },
             view_stamp: stamp,
+            verified,
             certified,
             complete,
+            only_replayable_gaps,
             records: Arc::new(selection),
         });
     }
@@ -200,6 +326,422 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Matching metadata identities reuse a JDK digest on every filesystem, so
+    // none of these requests hashes after the first. /var/tmp additionally
+    // exercises the FUSE filesystem the content-digest allowlist rejects in the
+    // disposable executor.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11968: a source subset omitted its project build and could not replay dependency selections"
+    )]
+    fn live_subset_build_receipts_track_manifests_overlays_and_scope() {
+        use super::super::catalog_reader::JvmSelectionAuthority;
+        use brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority;
+        use brokk_bifrost_core::analyzer::outer_request::OuterRequest;
+        use brokk_bifrost_core::analyzer::project::{FileSetProject, OverlayProject};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let pom = |version| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>{version}</version></dependency></dependencies></project>"
+            )
+        };
+        std::fs::write(root.join("pom.xml"), pom("1")).unwrap();
+        std::fs::write(root.join("App.java"), "class App {}").unwrap();
+        let repository = root.join("repo");
+        for version in ["1", "2"] {
+            let jar = repository.join(format!("com/example/lib/{version}/lib-{version}.jar"));
+            std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+            std::fs::write(jar, version).unwrap();
+        }
+        let delegate = Arc::new(FilesystemProject::new(&root).unwrap());
+        let subset = Arc::new(
+            FileSetProject::new(&root, [std::path::PathBuf::from("App.java")])
+                .with_project_build(delegate.clone()),
+        );
+        let config = JvmAnalyzerConfig {
+            external_dependencies: brokk_bifrost_core::analyzer::config::JvmExternalDependencies {
+                repository_roots: vec![repository],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let authority =
+            |config: JvmAnalyzerConfig, project: Arc<dyn Project>| JvmSelectionAuthority {
+                config,
+                project,
+                verifications: Arc::default(),
+                digests: super::super::external::test_digests(),
+            };
+        let live = authority(config.clone(), subset.clone());
+        let question = live.questions().remove(0);
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let ask = |authority: &JvmSelectionAuthority, request: &OuterRequest| {
+            authority
+                .answer(
+                    request,
+                    &authority.questions().remove(0),
+                    &SelectionRetry::default(),
+                    &cancellation,
+                )
+                .unwrap()
+        };
+        let request = OuterRequest::new();
+        let original = ask(&live, &request);
+        assert!(original.complete && original.replayable(), "{original:?}");
+        assert_eq!(original.view_stamp, subset.view_stamp());
+        assert_eq!(
+            super::super::external::jvm_dependency_basis(&config, subset.as_ref())
+                .unwrap()
+                .entries[0]
+                .version,
+            "1"
+        );
+        assert!(
+            live.basis(&question, original.answer_digest).is_none(),
+            "a live external build cannot be frozen as an export basis"
+        );
+        assert!(Arc::ptr_eq(&original, &ask(&live, &request)));
+        // Source bytes are outside this selection's inputs. Within the same
+        // outer request their edit must not cause a second selection fill.
+        std::fs::write(root.join("App.java"), "class App { int changed; }").unwrap();
+        assert!(Arc::ptr_eq(&original, &ask(&live, &request)));
+        // Receipt replay re-asks the authority in a fresh request. The pom is
+        // outside the source subset and an unsignalled edit still invalidates it.
+        std::fs::write(root.join("pom.xml"), pom("2")).unwrap();
+        let changed = ask(&live, &OuterRequest::new());
+        assert!(changed.replayable());
+        assert_ne!(original.answer_digest, changed.answer_digest);
+        let replayed = ask(&live, &OuterRequest::new());
+        assert_eq!(changed.answer_digest, replayed.answer_digest);
+        let overlay = Arc::new(OverlayProject::new(subset.clone()));
+        assert!(overlay.set(root.join("pom.xml"), pom("1")));
+        let buffered = ask(&authority(config.clone(), overlay), &OuterRequest::new());
+        assert_eq!(original.answer_digest, buffered.answer_digest);
+        let mut opted_config = config.clone();
+        opted_config.without_project_build = true;
+        let opted = authority(opted_config, subset);
+        assert_ne!(question.digest, opted.questions()[0].digest);
+        let incomplete = ask(&opted, &request);
+        assert!(
+            !incomplete.complete && !incomplete.replayable(),
+            "{incomplete:?}"
+        );
+        assert!(!Arc::ptr_eq(&original, &incomplete));
+        // The opt-out's explicit membership stays fixed when the surrounding
+        // workspace grows or shrinks. It remains incomplete, not stale.
+        let frozen = authority(
+            config.clone(),
+            Arc::new(
+                FileSetProject::new(&root, [std::path::PathBuf::from("App.java")])
+                    .with_live_delegate(delegate.clone(), delegate.all_files_shared().unwrap()),
+            ),
+        );
+        let unrelated = root.join("Unrelated.java");
+        std::fs::write(&unrelated, "class Unrelated {}").unwrap();
+        assert!(!ask(&opted, &OuterRequest::new()).replayable());
+        assert!(matches!(
+            frozen.answer(
+                &OuterRequest::new(),
+                &frozen.questions().remove(0),
+                &SelectionRetry::default(),
+                &cancellation
+            ),
+            Err(SelectionRefused::Stale)
+        ));
+        std::fs::remove_file(unrelated).unwrap();
+        assert!(!ask(&opted, &OuterRequest::new()).replayable());
+        let revision = Arc::new(
+            FileSetProject::new(&root, [std::path::PathBuf::from("App.java")])
+                .with_missing_revision_build_authority(),
+        );
+        let historical = ask(&authority(config, revision), &OuterRequest::new());
+        assert!(!historical.replayable());
+        let records = historical
+            .records
+            .downcast_ref::<Option<super::super::external::ExternalInventorySelection>>()
+            .unwrap();
+        assert!(records.as_ref().unwrap().completeness.only_gaps().unwrap().iter().any(|gap|
+            matches!(gap.cause, brokk_bifrost_semantic::analyzer::semantic_model::dependency::JvmDependencyGapCause::MissingRevisionBuildAuthority)));
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(root.join("hidden")).unwrap();
+            std::os::unix::fs::symlink(root.join("hidden"), root.join("linked-build")).unwrap();
+            let omitted = ask(&live, &OuterRequest::new());
+            assert!(
+                !omitted.replayable(),
+                "fresh omissions must not be dropped by an inventory-only check"
+            );
+        }
+    }
+
+    fn age_jdk_record(
+        holder: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
+        question: &ExternalSelectionQuestion,
+    ) {
+        use super::super::external::VerifiedJdkRecord;
+        let record = holder.get::<VerifiedJdkRecord>(&question.digest).unwrap();
+        holder.replace(
+            question.digest,
+            Arc::new(VerifiedJdkRecord {
+                selected: record.selected.clone(),
+                observation: record.observation.clone(),
+                observed_at: std::time::SystemTime::now() + std::time::Duration::from_secs(172800),
+            }),
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12097: unchanged JDK selections rehashed on non-allowlisted filesystems"
+    )]
+    fn unchanged_jdk_requests_hash_nothing_and_activation_replaces_record() {
+        use super::super::external::{JDK_DIGEST_COMPUTATIONS, verify_jdk_record};
+        use brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications;
+        let locations = vec![std::env::temp_dir()];
+        #[cfg(target_os = "linux")]
+        let locations = {
+            let mut locations = locations;
+            locations.push(std::path::PathBuf::from("/var/tmp"));
+            locations
+        };
+        for location in locations {
+            let temp = tempfile::tempdir_in(location).unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let workspace = root.join("workspace");
+            let home = root.join("jdk");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(home.join("jmods")).unwrap();
+            std::fs::create_dir_all(home.join("lib")).unwrap();
+            std::fs::write(home.join("release"), "JAVA_VERSION=\"21\"\n").unwrap();
+            std::fs::write(home.join("jmods/java.base.jmod"), b"jmod bytes").unwrap();
+            std::fs::write(home.join("lib/src.zip"), b"source bytes").unwrap();
+            // Keep activation reads deterministically racy; only the explicit
+            // aged verification record below is allowed to skip those reads.
+            for path in [home.join("jmods/java.base.jmod"), home.join("lib/src.zip")] {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(86400),
+                    )
+                    .unwrap();
+            }
+            let listing = Arc::new(WorkspaceFileListingCache::new(workspace.clone()));
+            let project = FilesystemProject::with_cached_listing(workspace, listing).unwrap();
+            let mut config = JvmAnalyzerConfig::default();
+            config.standard_library_discovery.discover_java_home = false;
+            config.standard_library_discovery.jdk_homes = vec![home];
+            let question = ExternalSelectionQuestion::for_jvm(&config).remove(1);
+            let holder = ToolchainVerifications::default();
+            let digests = test_digests();
+            let answer = || {
+                verify_selection_with(
+                    &config,
+                    &project,
+                    &digests,
+                    &holder,
+                    &question,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .unwrap()
+            };
+            let first = answer();
+            age_jdk_record(&holder, &question);
+            let before = JDK_DIGEST_COMPUTATIONS.get();
+            assert_eq!(first.answer_digest, answer().answer_digest);
+            assert_eq!(before, JDK_DIGEST_COMPUTATIONS.get());
+            // Even unchanged metadata must replace the record on activation.
+            verify_jdk_record(
+                &config,
+                &project,
+                &digests,
+                &holder,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(JDK_DIGEST_COMPUTATIONS.get(), before + 2);
+            age_jdk_record(&holder, &question);
+            let refreshed = answer();
+            assert!(!Arc::ptr_eq(&first.records, &refreshed.records));
+            assert_eq!(first.answer_digest, refreshed.answer_digest);
+            verify_jdk_record(
+                &config,
+                &project,
+                &digests,
+                &holder,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+            age_jdk_record(&holder, &question);
+            let before = JDK_DIGEST_COMPUTATIONS.get();
+            assert_eq!(first.answer_digest, answer().answer_digest);
+            assert_eq!(before, JDK_DIGEST_COMPUTATIONS.get());
+            verify_jdk_record(
+                &config,
+                &project,
+                &digests,
+                &holder,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(JDK_DIGEST_COMPUTATIONS.get(), before + 2);
+        }
+    }
+
+    #[test]
+    fn jdk_record_reuses_selection_and_coalesces_touch_refresh() {
+        use super::super::external::verify_jdk_record;
+        use brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let home = root.join("jdk");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("jmods")).unwrap();
+        std::fs::write(home.join("release"), "JAVA_VERSION=\"21\"\n").unwrap();
+        let jmod = home.join("jmods/java.base.jmod");
+        std::fs::write(&jmod, b"jmod bytes").unwrap();
+        let listing = Arc::new(WorkspaceFileListingCache::new(workspace.clone()));
+        let project = FilesystemProject::with_cached_listing(workspace, listing).unwrap();
+        let mut config = JvmAnalyzerConfig::default();
+        config.standard_library_discovery.discover_java_home = false;
+        config.standard_library_discovery.jdk_homes = vec![home];
+        let question = ExternalSelectionQuestion::for_jvm(&config).remove(1);
+        let holder = ToolchainVerifications::default();
+        let digests = test_digests();
+        let cancellation = Default::default();
+        let answer = || {
+            verify_selection_with(
+                &config,
+                &project,
+                &digests,
+                &holder,
+                &question,
+                &Default::default(),
+                &cancellation,
+            )
+        };
+        let first = answer().unwrap();
+        age_jdk_record(&holder, &question);
+        let second = answer().unwrap();
+        assert!(Arc::ptr_eq(&first.records, &second.records));
+        assert_eq!(first.answer_digest, second.answer_digest);
+        let signals = Arc::new(AtomicUsize::new(0));
+        let counter = signals.clone();
+        holder.set_refresh_callback(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        std::fs::File::options()
+            .write(true)
+            .open(&jmod)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123))
+            .unwrap();
+        assert!(matches!(answer(), Err(SelectionRefused::Stale)));
+        assert!(matches!(answer(), Err(SelectionRefused::Stale)));
+        assert_eq!(signals.load(Ordering::SeqCst), 1);
+        verify_jdk_record(
+            &config,
+            &project,
+            &digests,
+            &holder,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        age_jdk_record(&holder, &question);
+        let refreshed = answer().unwrap();
+        assert_eq!(first.answer_digest, refreshed.answer_digest);
+        assert!(!Arc::ptr_eq(&first.records, &refreshed.records));
+        let fallback = ToolchainVerifications::default();
+        verify_jdk_record(
+            &config,
+            &project,
+            &digests,
+            &fallback,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&jmod)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(456))
+            .unwrap();
+        assert_eq!(
+            first.answer_digest,
+            verify_selection_with(
+                &config,
+                &project,
+                &digests,
+                &fallback,
+                &question,
+                &Default::default(),
+                &cancellation
+            )
+            .unwrap()
+            .answer_digest
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: a transient JDK pin failure was recorded, so every later request reused the incomplete selection"
+    )]
+    fn a_transient_jdk_pin_failure_is_not_retained() {
+        use super::super::external::FAIL_NEXT_JDK_PIN;
+        use brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let home = root.join("jdk");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("jmods")).unwrap();
+        std::fs::write(home.join("release"), "JAVA_VERSION=\"21\"\n").unwrap();
+        std::fs::write(home.join("jmods/java.base.jmod"), b"jmod bytes").unwrap();
+        let listing = Arc::new(WorkspaceFileListingCache::new(workspace.clone()));
+        let project = FilesystemProject::with_cached_listing(workspace, listing).unwrap();
+        let mut config = JvmAnalyzerConfig::default();
+        config.standard_library_discovery.discover_java_home = false;
+        config.standard_library_discovery.jdk_homes = vec![home];
+        let question = ExternalSelectionQuestion::for_jvm(&config).remove(1);
+        let holder = ToolchainVerifications::default();
+        let digests = test_digests();
+        let answer = || {
+            verify_selection_with(
+                &config,
+                &project,
+                &digests,
+                &holder,
+                &question,
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        // One member read fails once, then the file reads cleanly. The files
+        // never change, so a recorded selection would keep matching.
+        FAIL_NEXT_JDK_PIN.set(true);
+        let transient = answer();
+        assert!(!FAIL_NEXT_JDK_PIN.get(), "the injected failure was used");
+        assert!(!transient.complete && !transient.certified, "{transient:?}");
+        let retried = answer();
+        assert!(retried.complete && retried.certified, "{retried:?}");
+        assert_ne!(transient.answer_digest, retried.answer_digest);
+        // A complete, non-racy observation is served without pinning.
+        age_jdk_record(&holder, &question);
+        let again = answer();
+        assert!(Arc::ptr_eq(&retried.records, &again.records));
+        assert_eq!(retried.answer_digest, again.answer_digest);
+    }
 
     #[test]
     fn manifest_drift_uses_one_retry_then_returns_stale() {
@@ -233,6 +775,54 @@ mod tests {
         });
         assert!(matches!(answer, Err(SelectionRefused::Stale)));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11607: under-basis replay must not certify an original selection with an omitted listing"
+    )]
+    fn an_omitted_original_listing_refuses_a_dependency_basis() {
+        use brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("module")).unwrap();
+        let listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project =
+            Arc::new(FilesystemProject::with_cached_listing(root.clone(), listing).unwrap());
+        let config = JvmAnalyzerConfig::default();
+        let question = ExternalSelectionQuestion::for_jvm(&config).remove(0);
+        let live = verify_dependencies_with(
+            &config,
+            project.as_ref(),
+            &question,
+            &SelectionRetry::default(),
+            || {},
+        )
+        .unwrap();
+        assert!(!live.certified && !live.replayable(), "{live:?}");
+        assert!(
+            live.records
+                .downcast_ref::<Option<super::super::external::ExternalInventorySelection>>()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .completeness
+                .failures()
+                .iter()
+                .any(|failure| failure.name() == "listing_omitted")
+        );
+        // An omitted directory also leaves platform-override visibility unknown.
+        // Refuse the basis before coordinate replay can discard that evidence.
+        assert!(super::super::external::jvm_dependency_basis(&config, project.as_ref()).is_none());
+        let authority = super::super::catalog_reader::JvmSelectionAuthority {
+            config,
+            project,
+            digests: test_digests(),
+            verifications: Arc::new(Default::default()),
+        };
+        assert!(authority.basis(&question, live.answer_digest).is_none());
     }
 
     /// The dependency answer is reproduced from the coordinates alone, and
@@ -280,11 +870,7 @@ mod tests {
         std::fs::write(&jar, b"other bytes").unwrap();
         assert_ne!(under(), Some(live.answer_digest));
         std::fs::remove_file(&jar).unwrap();
-        assert_eq!(
-            under(),
-            None,
-            "an unresolved coordinate is not a complete answer"
-        );
+        assert!(under().is_some(), "an unresolved coordinate is replayable");
     }
 
     #[test]
@@ -405,12 +991,18 @@ mod tests {
             JvmMavenCoordinate::new("org.example", "lib", "1.0"),
             gradle.clone(),
         );
-        assert!(found.complete && found.certified, "{found:?}");
+        assert!(
+            found.complete && found.certified && found.replayable(),
+            "{found:?}"
+        );
         let listed = verify(
             JvmMavenCoordinate::new("org.example", "other", "1.0"),
             gradle.clone(),
         );
-        assert!(listed.complete && !listed.certified, "{listed:?}");
+        assert!(
+            listed.complete && !listed.certified && !listed.replayable(),
+            "{listed:?}"
+        );
         // The listing is found under the canonical cache root even when the
         // configured root is a different spelling of it.
         #[cfg(unix)]
@@ -421,12 +1013,18 @@ mod tests {
                 JvmMavenCoordinate::new("org.example", "other", "1.0"),
                 alias,
             );
-            assert!(listed.complete && !listed.certified, "{listed:?}");
+            assert!(
+                listed.complete && !listed.certified && !listed.replayable(),
+                "{listed:?}"
+            );
         }
     }
 
     #[test]
-    fn an_inventory_past_the_artifact_cap_is_incomplete() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13851: a selection past 128 jars left packs activation activated unselected, so the reader refused every JVM lookup"
+    )]
+    fn an_inventory_past_128_artifacts_is_complete() {
         use brokk_bifrost_core::analyzer::config::JvmMavenCoordinate;
 
         let temp = tempfile::tempdir().unwrap();
@@ -434,7 +1032,8 @@ mod tests {
         let workspace = root.join("workspace");
         let maven = root.join("maven");
         std::fs::create_dir_all(&workspace).unwrap();
-        let coordinates: Vec<_> = (0..=super::super::external::MAX_INDEX_ARTIFACTS)
+        // BenchmarkJava resolves 132 dependency jars.
+        let coordinates: Vec<_> = (0..132)
             .map(|index| {
                 let name = format!("lib{index}");
                 let jar = maven.join(format!("org/example/{name}/1.0/{name}-1.0.jar"));
@@ -449,25 +1048,21 @@ mod tests {
         config.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
         config.external_dependencies.repository_roots = vec![maven];
         config.external_dependencies.gradle_cache_roots = vec![root.join("gradle")];
-        let verify = |config: &JvmAnalyzerConfig| {
-            let question = ExternalSelectionQuestion::for_jvm(config).remove(0);
-            verify_selection(
-                config,
-                &project,
-                &test_digests(),
-                &question,
-                &SelectionRetry::default(),
-                &brokk_bifrost_core::cancellation::CancellationToken::default(),
-            )
-            .unwrap()
-        };
-        config.external_dependencies.coordinates =
-            coordinates[..super::super::external::MAX_INDEX_ARTIFACTS].to_vec();
-        let at_cap = verify(&config);
-        assert!(at_cap.complete && at_cap.certified, "{at_cap:?}");
         config.external_dependencies.coordinates = coordinates;
-        let past_cap = verify(&config);
-        assert!(!past_cap.complete && !past_cap.certified, "{past_cap:?}");
+        let question = ExternalSelectionQuestion::for_jvm(&config).remove(0);
+        let selection = verify_selection(
+            &config,
+            &project,
+            &test_digests(),
+            &question,
+            &SelectionRetry::default(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            selection.complete && selection.certified && selection.replayable(),
+            "{selection:?}"
+        );
     }
 
     #[test]
@@ -502,7 +1097,7 @@ mod tests {
         ] {
             let answer = verify(partial, 0);
             assert!(
-                !answer.complete && !answer.certified,
+                !answer.complete && !answer.certified && !answer.replayable(),
                 "{partial}: {answer:?}"
             );
             // The JDK question is answered from JDK discovery alone; with no
@@ -624,7 +1219,7 @@ mod tests {
             panic!("one dependency and one JDK answer: {unreadable:?}");
         };
         assert!(
-            !dependencies.complete && !dependencies.certified,
+            !dependencies.complete && !dependencies.certified && !dependencies.replayable(),
             "{dependencies:?}"
         );
         assert_eq!(jdk.complete, cfg!(windows), "{jdk:?}");
@@ -777,6 +1372,296 @@ mod tests {
                 question.kind
             );
         }
+    }
+
+    /// One real selection per way a dependency question can end: what it
+    /// proves (`certified`), whether a later run can reuse it (`replayable`),
+    /// and the failures it names. An incomplete selection always names one.
+    #[test]
+    fn unresolved_coordinates_are_replayable_and_other_incompleteness_is_not() {
+        use super::super::external::ExternalInventorySelection;
+        use brokk_bifrost_core::analyzer::config::JvmMavenCoordinate;
+        use brokk_bifrost_core::analyzer::project::TestProject;
+        use brokk_bifrost_semantic::analyzer::semantic_model::dependency::{
+            JvmDependencyGapCause, JvmProbeOperation,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let maven = root.join("maven");
+        let gradle = root.join("gradle");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&maven).unwrap();
+        std::fs::create_dir_all(&gradle).unwrap();
+        let jar = maven.join("org/example/lib/1.0/lib-1.0.jar");
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::write(&jar, b"maven bytes").unwrap();
+        let cached = gradle.join("org.example/cached/1.0/abc123/cached-1.0.jar");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"gradle bytes").unwrap();
+        // Found, but with no jar below it: the listing was observed.
+        std::fs::create_dir_all(gradle.join("org.example/hollow/1.0")).unwrap();
+        let listing = Arc::new(WorkspaceFileListingCache::new(workspace.clone()));
+        let project = FilesystemProject::with_cached_listing(workspace.clone(), listing).unwrap();
+        let select = |project: &dyn Project,
+                      names: &[&str],
+                      repositories: Vec<std::path::PathBuf>,
+                      uncertified: bool| {
+            let mut config = JvmAnalyzerConfig::default();
+            config.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
+            config.external_dependencies.coordinates = names
+                .iter()
+                .map(|name| JvmMavenCoordinate::new("org.example", *name, "1.0"))
+                .collect();
+            config.external_dependencies.repository_roots = repositories;
+            config.external_dependencies.gradle_cache_roots = vec![gradle.clone()];
+            let mut question = ExternalSelectionQuestion::for_jvm(&config).remove(0);
+            question.uncertified = uncertified;
+            verify_selection(
+                &config,
+                project,
+                &test_digests(),
+                &question,
+                &SelectionRetry::default(),
+                &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            )
+            .unwrap()
+        };
+        let failures = |answer: &VerifiedSelection| -> Vec<&'static str> {
+            answer
+                .records
+                .downcast_ref::<Option<ExternalInventorySelection>>()
+                .unwrap()
+                .as_ref()
+                .map(|selection| {
+                    selection
+                        .completeness
+                        .failures()
+                        .iter()
+                        .map(|failure| failure.name())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let blocked = root.join("blocked\0repository");
+        // (case, answer, complete, certified, replayable, failures)
+        let mut cases = vec![
+            (
+                "resolved",
+                select(&project, &["lib"], vec![maven.clone()], false),
+                true,
+                true,
+                true,
+                vec![],
+            ),
+            (
+                "unresolved in the Maven repository and absent from the Gradle cache",
+                select(&project, &["nope"], vec![maven.clone()], false),
+                false,
+                false,
+                true,
+                vec!["dependency_gaps"],
+            ),
+            (
+                "a resolved and an unresolved coordinate",
+                select(&project, &["lib", "nope"], vec![maven.clone()], false),
+                false,
+                false,
+                true,
+                vec!["dependency_gaps"],
+            ),
+            (
+                "resolved from a Gradle listing",
+                select(&project, &["cached"], vec![maven.clone()], false),
+                true,
+                false,
+                false,
+                vec![],
+            ),
+            (
+                "unresolved behind a Gradle listing that found a directory",
+                select(&project, &["hollow"], vec![maven.clone()], false),
+                false,
+                false,
+                false,
+                vec!["dependency_gaps"],
+            ),
+            // An unreadable repository leaves the coordinate unavailable, not
+            // certified absent (2f9505db5d): it is Provider incompleteness of
+            // discovery, with no replayable Unresolved gap.
+            (
+                "unresolved with an unreadable repository",
+                select(
+                    &project,
+                    &["nope"],
+                    vec![blocked.clone(), maven.clone()],
+                    false,
+                ),
+                false,
+                false,
+                false,
+                vec!["discovery", "unreadable_probe"],
+            ),
+            (
+                "resolved with an unreadable repository",
+                select(
+                    &project,
+                    &["lib"],
+                    vec![blocked.clone(), maven.clone()],
+                    false,
+                ),
+                false,
+                false,
+                false,
+                vec!["unreadable_probe"],
+            ),
+            (
+                "unresolved under a question that cannot be certified",
+                select(&project, &["nope"], vec![maven.clone()], true),
+                false,
+                false,
+                false,
+                vec!["dependency_gaps"],
+            ),
+        ];
+        // A view that cannot stamp verifies nothing.
+        let unstamped = TestProject::new(
+            &workspace,
+            brokk_bifrost_core::analyzer::model::Language::Java,
+        );
+        assert!(unstamped.view_stamp().is_none());
+        cases.push((
+            "unresolved in an unstamped view",
+            select(&unstamped, &["nope"], vec![maven.clone()], false),
+            false,
+            false,
+            false,
+            vec!["dependency_gaps"],
+        ));
+        // A symbolic link to a source file hides no manifest, so the omission
+        // changes nothing (#9559, 75135e29d1). A symlinked manifest, or a
+        // symlinked directory, may hide one, so the selection is incomplete
+        // for that named reason even when every coordinate resolves.
+        #[cfg(unix)]
+        {
+            let linked_project = |name: &str, links: &[(&str, &str)]| {
+                let linked = root.join(name);
+                std::fs::create_dir_all(linked.join("sub")).unwrap();
+                std::fs::write(linked.join("target.txt"), b"t").unwrap();
+                for (link, target) in links {
+                    std::os::unix::fs::symlink(linked.join(target), linked.join(link)).unwrap();
+                }
+                let listing = Arc::new(WorkspaceFileListingCache::new(linked.clone()));
+                FilesystemProject::with_cached_listing(linked, listing).unwrap()
+            };
+            let irrelevant = linked_project("irrelevant-links", &[("link.txt", "target.txt")]);
+            let manifest = linked_project("manifest-link", &[("pom.xml", "target.txt")]);
+            let directory = linked_project("directory-link", &[("module", "sub")]);
+            cases.push((
+                "resolved with an omitted symlink to a non-manifest file",
+                select(&irrelevant, &["lib"], vec![maven.clone()], false),
+                true,
+                true,
+                true,
+                vec![],
+            ));
+            cases.push((
+                "unresolved with an omitted symlink to a non-manifest file",
+                select(&irrelevant, &["nope"], vec![maven.clone()], false),
+                false,
+                false,
+                true,
+                vec!["dependency_gaps"],
+            ));
+            cases.push((
+                "resolved with a symlinked manifest",
+                select(&manifest, &["lib"], vec![maven.clone()], false),
+                false,
+                false,
+                false,
+                vec!["listing_omitted"],
+            ));
+            cases.push((
+                "unresolved with a symlinked manifest",
+                select(&manifest, &["nope"], vec![maven.clone()], false),
+                false,
+                false,
+                false,
+                vec!["dependency_gaps", "listing_omitted"],
+            ));
+            cases.push((
+                "resolved with a symlinked directory",
+                select(&directory, &["lib"], vec![maven.clone()], false),
+                false,
+                false,
+                false,
+                vec!["listing_omitted"],
+            ));
+        }
+        for (case, answer, complete, certified, replayable, names) in &cases {
+            assert_eq!(answer.complete, *complete, "{case}: {answer:?}");
+            assert_eq!(answer.certified, *certified, "{case}: {answer:?}");
+            assert_eq!(answer.replayable(), *replayable, "{case}: {answer:?}");
+            assert_eq!(&failures(answer), names, "{case}");
+            // `certified` is `complete && verified`, and only the incomplete
+            // selections name failures.
+            assert_eq!(
+                answer.certified,
+                answer.complete && answer.verified,
+                "{case}"
+            );
+            assert_eq!(answer.complete, names.is_empty(), "{case}");
+        }
+        // The unresolved gap carries what selection observed: the absent
+        // binary and sources artifact paths and the absent Gradle directory,
+        // by operation.
+        let answer = &cases[1].1;
+        let selection = answer
+            .records
+            .downcast_ref::<Option<ExternalInventorySelection>>()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        let gaps = selection.completeness.only_gaps().unwrap();
+        let [gap] = &gaps[..] else {
+            panic!("one unresolved coordinate: {gaps:?}");
+        };
+        assert_eq!(gap.dependency_id, "org.example:nope:1.0");
+        assert_eq!(gap.cause_label(), "unresolved");
+        assert_eq!(
+            gap.message(),
+            "exact local artifact was not found for org.example:nope:1.0"
+        );
+        let JvmDependencyGapCause::Unresolved(probes) = &gap.cause else {
+            panic!("unresolved gap: {gap:?}");
+        };
+        let observed: Vec<_> = probes
+            .iter()
+            .map(|probe| {
+                (
+                    probe.path.strip_prefix(&root).unwrap().to_path_buf(),
+                    probe.operation,
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                (
+                    std::path::PathBuf::from("maven/org/example/nope/1.0/nope-1.0.jar"),
+                    JvmProbeOperation::Canonicalize
+                ),
+                (
+                    std::path::PathBuf::from("maven/org/example/nope/1.0/nope-1.0-sources.jar"),
+                    JvmProbeOperation::Canonicalize
+                ),
+                (
+                    std::path::PathBuf::from("gradle/org.example/nope/1.0"),
+                    JvmProbeOperation::List
+                ),
+            ]
+        );
     }
 
     #[test]

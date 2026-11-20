@@ -295,7 +295,7 @@ fn procedure_source_owner_budget_refusal_is_reported_by_the_query() {
             .result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic
+            .any(|diagnostic| semantic_diagnostic(diagnostic)
                 .exhausted_roots
                 .iter()
                 .any(|root| root.stage.as_deref() == Some("procedure_source_owner"))),

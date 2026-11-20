@@ -577,6 +577,8 @@ impl Default for CSharpAnalyzerConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JvmAnalyzerConfig {
+    /// Limit manifest discovery to the selected sources instead of their build.
+    pub without_project_build: bool,
     pub external_dependencies: JvmExternalDependencies,
     pub dependency_discovery: JvmDependencyDiscoveryConfig,
     pub standard_library_discovery: JvmStandardLibraryDiscoveryConfig,
@@ -592,7 +594,9 @@ pub struct JvmStandardLibraryDiscoveryConfig {
     /// mixed-toolchain workspace; the unscoped `jdk_homes` list only discovers
     /// candidates and does not select one for a source file.
     pub source_toolchains: Vec<JvmSourceToolchainBinding>,
-    /// Inspect the process `JAVA_HOME` after configured homes.
+    /// Inspect the process `JAVA_HOME` after configured homes. While `JAVA_HOME`
+    /// is unset (not merely empty), use the JDK home of the first `java` on
+    /// `PATH`. A set but empty `JAVA_HOME` disables both.
     pub discover_java_home: bool,
 }
 

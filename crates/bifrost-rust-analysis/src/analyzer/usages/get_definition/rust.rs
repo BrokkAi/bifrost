@@ -832,6 +832,7 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
         self.resolve_unprepared(query)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn resolve_unprepared(
         &mut self,
         query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,

@@ -128,6 +128,10 @@ class Container {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn failed_and_cancelled_java_publications_leave_no_partial_rows_and_retry() {
         let source = "class C { void run() { int value = 1; value++; } }\n";
         let fixture = InlineTestProject::with_language(Language::Java)

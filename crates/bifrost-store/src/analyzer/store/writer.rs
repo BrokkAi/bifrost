@@ -11,8 +11,8 @@ use std::thread::JoinHandle;
 use rusqlite::Connection;
 
 use super::{
-    BlobKey, GenerationId, PersistBatchTargets, PreparedParsedBlob, PreparedPersistenceWriter,
-    PreparedWriteCounters, StoreError, reader_source_path,
+    BlobKey, GenerationId, PersistBatchTargets, PreparedParsedBlob, PreparedWriteCounters,
+    StoreError, reader_source_path,
 };
 
 const WRITER_QUEUE_CAPACITY: usize = 64;
@@ -673,12 +673,13 @@ impl RepairBatch {
         if prepared.is_empty() {
             return 0;
         }
-        let (outcomes, stats) = PreparedPersistenceWriter::new(
+        let (outcomes, stats) = super::source_publication::repair_prepared_blobs_on_connection(
             conn,
+            prepared,
             self.counters,
             crate::CancellationToken::default(),
-        )
-        .persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+            PersistBatchTargets::PRODUCTION,
+        );
         assert_eq!(
             outcomes.len(),
             grouped_replies.len(),
@@ -708,9 +709,13 @@ fn persist_one_repair(
     prepared: PreparedParsedBlob,
     counters: PreparedWriteCounters,
 ) -> Result<(), StoreError> {
-    let (mut outcomes, _) =
-        PreparedPersistenceWriter::new(conn, counters, crate::CancellationToken::default())
-            .persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
+    let (mut outcomes, _) = super::source_publication::repair_prepared_blobs_on_connection(
+        conn,
+        vec![prepared],
+        counters,
+        crate::CancellationToken::default(),
+        PersistBatchTargets::PRODUCTION,
+    );
     outcomes
         .pop()
         .expect("one prepared repair has one outcome")

@@ -890,6 +890,7 @@ fn build_pack(
 /// The activation selector every shard of one realm's pack carries.
 fn realm_activation(realm: GoldenRealm) -> Vec<ActivationSelector> {
     vec![ActivationSelector {
+        production_input_digest: None,
         package: None,
         module: None,
         toolchain: realm.toolchain.map(|pin| NameSelector {

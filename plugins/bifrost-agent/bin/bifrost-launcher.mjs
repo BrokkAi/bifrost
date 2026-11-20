@@ -44,7 +44,23 @@ export class LauncherError extends Error {
   }
 }
 
+// Pack approval is host-owned: the launcher never forwards a caller- or
+// agent-controlled approval argument. Any argument starting with `--pack`
+// (every spelling: `=` form, separate value, abbreviations of the flag names)
+// is refused before a binary is resolved or spawned.
+export function assertNoPackApprovalFlags(args) {
+  for (const arg of args) {
+    if (typeof arg === "string" && arg.toLowerCase().startsWith("--pack")) {
+      throw new LauncherError(
+        "approval_flags_reserved",
+        `Refusing argument ${JSON.stringify(arg)}: --pack-approval-* options are reserved for the host and cannot be passed through the launcher.`
+      );
+    }
+  }
+}
+
 export function parseLauncherArgs(args) {
+  assertNoPackApprovalFlags(args);
   const command = args[0];
   if (command === "doctor" || command === "prepare" || command === "prepare-preferred") {
     let json = false;
@@ -999,11 +1015,13 @@ function archiveRootName(archiveName) {
 }
 
 export function buildBifrostArgs(root, toolset, passThrough = []) {
+  assertNoPackApprovalFlags(passThrough);
   const rootArgs = root ? ["--root", root] : [];
   return [...rootArgs, "--mcp", toolset || DEFAULT_TOOLSET, ...passThrough];
 }
 
 export async function resolveBifrostLaunch(options = {}) {
+  assertNoPackApprovalFlags(options.passThrough ?? []);
   const env = options.env ?? process.env;
   const root = await resolveWorkspaceRoot({
     env: {},

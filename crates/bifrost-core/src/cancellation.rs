@@ -34,6 +34,11 @@ pub struct CancellationToken {
     /// What the work under this token is doing right now. See
     /// [`CancellationToken::enter_phase`].
     phase: Arc<Mutex<Option<String>>>,
+    /// The phase that was current when this token's deadline was first
+    /// observed. Work that stops on its deadline unwinds its phase guards
+    /// before the host reads the phase, so the host needs the phase the
+    /// deadline interrupted, not the one restored afterwards (#13577).
+    timeout_phase: Arc<Mutex<Option<String>>>,
     /// Where each phase change is published as it happens, for a host that
     /// reports the request's progress while it runs. See
     /// [`CancellationToken::with_phase_sink`].
@@ -144,6 +149,7 @@ impl CancellationToken {
         Self {
             parent: Some(Arc::new(self.clone())),
             phase: Arc::clone(&self.phase),
+            timeout_phase: Arc::clone(&self.timeout_phase),
             phase_sink: self.phase_sink.clone(),
             result_sink: self.result_sink.clone(),
             ..Self::default()
@@ -257,6 +263,47 @@ impl CancellationToken {
             .lock()
             .expect("cancellation phase lock poisoned")
             .clone()
+    }
+
+    /// The phase the work was in when this request's deadline stopped it.
+    ///
+    /// Once some part of the work has observed the deadline, this is the phase
+    /// that was current at that moment, even after the work's phase guards
+    /// have restored an outer phase. Before that, it is the current phase:
+    /// a host whose own timer fired first reads the phase the work is still in.
+    pub fn deadline_phase(&self) -> Option<String> {
+        self.recorded_timeout_phase().or_else(|| self.phase())
+    }
+
+    fn recorded_timeout_phase(&self) -> Option<String> {
+        self.timeout_phase
+            .lock()
+            .expect("cancellation timeout phase lock poisoned")
+            .clone()
+            .or_else(|| {
+                self.parent
+                    .as_ref()
+                    .and_then(|parent| parent.recorded_timeout_phase())
+            })
+            .or_else(|| {
+                self.additional_parent
+                    .as_ref()
+                    .and_then(|parent| parent.recorded_timeout_phase())
+            })
+    }
+
+    /// Mark this token as stopped by its deadline. The first observer also
+    /// records the current phase, under the phase lock, so no phase guard can
+    /// restore an outer phase between the deadline and the record.
+    fn record_timeout(&self) {
+        if self.timed_out.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let phase = self.phase.lock().expect("cancellation phase lock poisoned");
+        self.timeout_phase
+            .lock()
+            .expect("cancellation timeout phase lock poisoned")
+            .clone_from(&phase);
     }
 
     /// Return a child token that cancels itself after `duration` while still
@@ -384,7 +431,7 @@ impl CancellationToken {
                 })
                 .unwrap_or(0);
             if previous <= 1 {
-                self.timed_out.store(true, Ordering::Release);
+                self.record_timeout();
                 self.cancel();
             }
         }
@@ -410,7 +457,7 @@ impl CancellationToken {
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            self.timed_out.store(true, Ordering::Release);
+            self.record_timeout();
             self.cancelled.store(true, Ordering::Release);
             return true;
         }
@@ -497,6 +544,31 @@ mod tests {
 
         assert!(clone.is_cancelled());
         assert!(token.is_timed_out());
+    }
+
+    #[test]
+    #[hardwon(
+        "#13577: a worker that stopped on its deadline reported the outer phase, not the one that was running"
+    )]
+    fn deadline_phase_names_the_phase_the_deadline_interrupted() {
+        let token = CancellationToken::new().with_deadline(Instant::now());
+        let outer = token.enter_phase("executing tool");
+        let inner = token.enter_phase("waiting for the lock");
+        // The worker observes the deadline through a child, as analyzer work
+        // does, while it is inside the inner phase.
+        assert!(token.child().is_cancelled());
+        assert!(token.is_timed_out());
+        drop(inner);
+        assert_eq!(token.phase().as_deref(), Some("executing tool"));
+        assert_eq!(
+            token.deadline_phase().as_deref(),
+            Some("waiting for the lock")
+        );
+        drop(outer);
+        assert_eq!(
+            token.deadline_phase().as_deref(),
+            Some("waiting for the lock")
+        );
     }
 
     #[test]

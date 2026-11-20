@@ -48,6 +48,10 @@ mod forwarded_surface_tests {
         fixture
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn topology_surface(workspace: &WorkspaceAnalyzer, unit: &str) -> Vec<u8> {
         workspace
             .store()

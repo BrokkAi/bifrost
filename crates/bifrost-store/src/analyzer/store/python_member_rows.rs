@@ -739,6 +739,7 @@ pub(crate) struct PythonImportReference<'a> {
 /// Callers supply matching binding rows and keep the mutation memo query-local.
 /// This admits identity only; each consumer owns its intrinsic/semantic table.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn admitted_python_import_member(
     selection: &SelectedResolutionMountInventory<'_>,
     environment: i64,
@@ -851,6 +852,7 @@ pub(crate) fn admitted_python_import_member(
 /// No source spelling alone proves standard-library authority.
 /// Resolve a structurally selected name, attribute or call to its admitted import identity.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn expression_import_identity(
     selection: &SelectedResolutionMountInventory<'_>,
     environment: i64,
@@ -945,6 +947,7 @@ fn expression_import_identity(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn class_decorator_completion(
     selection: &SelectedResolutionMountInventory<'_>,
     identities: &crate::analyzer::resolution::SelectedContextIdentities,
@@ -1015,6 +1018,7 @@ fn class_decorator_completion(
 /// This is one selected owner seek, including a real empty operand inventory.
 /// The environment is an already selected publication, never the newest row.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn implicit_inputs(
     selection: &SelectedResolutionMountInventory<'_>,
     identities: &crate::analyzer::resolution::SelectedContextIdentities,
@@ -1145,19 +1149,21 @@ pub fn implicit_inputs(
 /// positional parameter. Decorator spellings remain observations, never proof.
 /// Implicit static/class hooks stay open until their special binding is modeled.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn receiver_seed(
     selection: &SelectedResolutionMountInventory<'_>,
     slot: SemanticId,
+    context: &crate::analyzer::resolution::ConditionalTypeSeedContext<'_>,
     cancellation: &CancellationToken,
-) -> Result<Option<crate::analyzer::resolution::ConditionalTypeSeed>> {
+) -> Result<crate::analyzer::resolution::ConditionalTypeSeedRead> {
     use crate::analyzer::resolution::{
-        ConditionalTypeSeed, ResolutionSlotValue, ResolutionTypeRef,
+        ConditionalTypeSeed, ConditionalTypeSeedRead, ResolutionSlotValue, ResolutionTypeRef,
     };
     if cancellation.is_cancelled() {
-        return Ok(None);
+        return Ok(context.cancelled(slot));
     }
     let (Some(ordinal), Some(key)) = (slot.ordinal(), slot.local_key()) else {
-        return Ok(None);
+        return Ok(ConditionalTypeSeedRead::NotProvided);
     };
     let mount = selection.mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
     let conn = selection.connection();
@@ -1200,7 +1206,17 @@ pub fn receiver_seed(
         rows
     };
     let [(owner, member)] = rows.as_slice() else {
-        return Ok(None);
+        return Ok(if rows.is_empty() {
+            // This hook covers ordinary instance/class methods only. Other
+            // slots and the excluded special class receivers have no seed.
+            ConditionalTypeSeedRead::NotProvided
+        } else {
+            context.open(
+                slot,
+                "python_receiver_owner_ambiguous",
+                "The selected receiver has multiple exact owner rows",
+            )
+        });
     };
     let decorators = conn
         .prepare_cached(
@@ -1214,7 +1230,7 @@ pub fn receiver_seed(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if cancellation.is_cancelled() {
-        return Ok(None);
+        return Ok(context.cancelled(slot));
     }
     let ty = ResolutionTypeRef::new(SemanticId::local(ordinal, *owner), 0);
     // An unchanged first parameter of an unreplaced method denotes its owner.
@@ -1269,7 +1285,11 @@ pub fn receiver_seed(
                 ResolutionNamespace::TypeOrValue,
                 "classmethod",
             ) else {
-                return Ok(None);
+                return Ok(context.open(
+                    slot,
+                    "python_classmethod_identity_unavailable",
+                    "The selected classmethod builtin identity is unavailable",
+                ));
             };
             let identity = SemanticId::shared_name(selection.shared_names().intern(
                 crate::analyzer::resolution::universe::identity_digest(entry),
@@ -1311,9 +1331,15 @@ pub fn receiver_seed(
                 discharged_gap_reasons,
             )
         }
-        _ => return Ok(None),
+        _ => {
+            return Ok(context.open(
+                slot,
+                "python_receiver_decorator_open",
+                "The selected method has an unsupported or unresolved decorator transformation",
+            ));
+        }
     };
-    Ok(Some(ConditionalTypeSeed {
+    Ok(ConditionalTypeSeedRead::Ready(ConditionalTypeSeed {
         slot,
         value,
         prerequisites,
@@ -1331,6 +1357,7 @@ pub(crate) enum DataclassKeywordInitializer {
 
 /// Only literal init options close synthesis. The selected call and argument
 /// rows supply syntax; the structural publication supplies the decoded boolean.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn dataclass_init_option(
     selection: &SelectedResolutionMountInventory<'_>,
     blob: i64,
@@ -1372,6 +1399,7 @@ fn dataclass_init_option(
     Ok(Some(enabled))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn dataclass_keyword_initializer(
     selection: &SelectedResolutionMountInventory<'_>,
     environment: i64,
@@ -1414,6 +1442,7 @@ pub(crate) fn dataclass_keyword_initializer(
     )
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn admitted_dataclass_expression(
     selection: &SelectedResolutionMountInventory<'_>,
     environment: i64,
@@ -1465,6 +1494,7 @@ pub(crate) enum DataclassAnnotationIdentity {
 /// A selected C3 declaration must have a retained annotation. Generic heads
 /// use their structured identity reference; an unreadable head remains open.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn dataclass_keyword_field(
     selection: &SelectedResolutionMountInventory<'_>,
     environment: i64,

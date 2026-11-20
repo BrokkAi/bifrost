@@ -881,9 +881,10 @@ mod tests {
         let reader = replay(&acquired);
         assert_eq!(
             reader.source_effect(Path::new("")),
-            RustCargoConfigSourceEffect::Changes
+            RustCargoConfigSourceEffect::Unknown
         );
-        assert!(reader.cfg_atoms(Path::new("")).contains("included_flag"));
+        // --extern can bind a crate to another artifact, so cfg stays uncertain.
+        assert!(!reader.acquisition_is_complete(Path::new("")));
         assert!(reader.has_extern_flags(Path::new("")));
         assert!(
             acquired
@@ -1021,6 +1022,10 @@ mod tests {
         assert_eq!(Failure::TotalBytesLimit.label(), "max_total_artifact_bytes");
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn same_revision_home_edit_refreshes_store_reader_and_withdraws_feature_projections() {
         use brokk_bifrost_analysis::analyzer::store::{
             AnalyzerStore, WorkspaceConfigurationInput, WorkspaceId,
@@ -1072,7 +1077,7 @@ mod tests {
         let before = sync(capture(&project, &home));
         assert_eq!(
             store
-                .selected_rust_cargo_configuration(&before)
+                .selected_rust_cargo_configuration(&before, &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .stdlib_build_mode(Path::new("")),
             RustStdlibBuildMode::Prebuilt
@@ -1087,12 +1092,13 @@ mod tests {
         put(&home, "config.toml", "[unstable]\nbuild-std=['std']\n");
         let after = sync(capture(&project, &home));
         assert_eq!(
-            before.revision, after.revision,
-            "repository inputs did not change"
+            after.revision,
+            before.revision + 1,
+            "evidence change allocates a new revision"
         );
         assert_eq!(
             store
-                .selected_rust_cargo_configuration(&after)
+                .selected_rust_cargo_configuration(&after, &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .stdlib_build_mode(Path::new("")),
             RustStdlibBuildMode::BuildStd
@@ -1208,6 +1214,10 @@ mod tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn overlay_build_std_uses_its_own_record_and_reclaims_it_with_the_lease() {
         use brokk_bifrost_analysis::analyzer::store::{
             AnalyzerStore, WorkspaceConfigurationInput, WorkspaceId, WorkspaceSnapshots,
@@ -1268,7 +1278,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let mode = publication
-            .acquired_rust_configuration()
+            .acquired_rust_configuration(
+                &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder,
+            )
             .unwrap()
             .unwrap()
             .stdlib_build_mode(Path::new(""));
@@ -1279,7 +1291,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .selected_rust_cargo_configuration(&snapshot)
+                .selected_rust_cargo_configuration(&snapshot, &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .stdlib_build_mode(Path::new("")),
             RustStdlibBuildMode::Prebuilt,
@@ -1309,6 +1321,10 @@ mod tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#12922: native Windows separators hid the selected Cargo layer from the point reader"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn pure_point_reader_keeps_absent_legacy_absent_and_reads_the_modern_patch() {
         use brokk_bifrost_analysis::analyzer::store::{
@@ -1513,7 +1529,7 @@ mod tests {
             analyzer
                 .inner
                 .analyzer_store()
-                .selected_rust_cargo_configuration(&snapshots["rust"])
+                .selected_rust_cargo_configuration(&snapshots["rust"], &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .configured_build_targets(Path::new(""))
                 .0
@@ -1605,7 +1621,7 @@ mod tests {
             analyzer
                 .inner
                 .analyzer_store()
-                .selected_rust_cargo_configuration(&snapshots["rust"])
+                .selected_rust_cargo_configuration(&snapshots["rust"], &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .configured_build_targets(Path::new(""))
                 .0
@@ -1654,7 +1670,7 @@ mod tests {
             analyzer
                 .inner
                 .analyzer_store()
-                .selected_rust_cargo_configuration(&snapshots["rust"])
+                .selected_rust_cargo_configuration(&snapshots["rust"], &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .configured_build_targets(Path::new(""))
                 .0
@@ -1689,7 +1705,7 @@ mod tests {
             let targets = analyzer
                 .inner
                 .analyzer_store()
-                .selected_rust_cargo_configuration(&snapshot)
+                .selected_rust_cargo_configuration(&snapshot, &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap()
                 .configured_build_targets(Path::new(""))
                 .0;
@@ -1706,8 +1722,9 @@ mod tests {
         let after = before.update_with_listing(&BTreeSet::new(), Some(&listing));
         let (new_snapshot, new_targets) = read(&after);
         assert_eq!(
-            old_snapshot.revision, new_snapshot.revision,
-            "an external-only edit keeps the repository revision"
+            new_snapshot.revision,
+            old_snapshot.revision + 1,
+            "an external-only edit allocates a new revision"
         );
         assert_eq!(new_targets, vec!["aarch64-unknown-linux-gnu"]);
         let fresh = super::super::RustAnalyzer::new(Arc::new(project));
@@ -1741,7 +1758,7 @@ mod tests {
             let configuration = analyzer
                 .inner
                 .analyzer_store()
-                .selected_rust_cargo_configuration(&snapshots["rust"])
+                .selected_rust_cargo_configuration(&snapshots["rust"], &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap();
             let directory = Path::new("");
             (
@@ -1812,7 +1829,7 @@ mod tests {
             let configuration = analyzer
                 .inner
                 .analyzer_store()
-                .selected_rust_cargo_configuration(&snapshots["rust"])
+                .selected_rust_cargo_configuration(&snapshots["rust"], &brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder)
                 .unwrap();
             (
                 configuration.acquisition_is_complete(Path::new("")),
@@ -1831,5 +1848,71 @@ mod tests {
         let fresh = super::super::RustAnalyzer::new(Arc::new(project.clone()));
         assert_eq!(read(&warm), read(&fresh));
         assert!(read(&warm).0);
+    }
+
+    #[test]
+    #[hardwon(
+        "#13340: an external Cargo config edit replaced evidence under an unchanged snapshot id"
+    )]
+    fn external_cargo_config_edit_allocates_new_revision_and_preserves_old_reader() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use std::sync::Arc;
+        let (temp, project, _home) = fixture();
+        put(project.root(), "src/lib.rs", "pub fn example() {}\n");
+        put(
+            project.root(),
+            "Cargo.toml",
+            "[package]\nname='example'\nversion='0.1.0'\n[dependencies]\ndep='1.0.0'\n",
+        );
+        put(
+            project.root(),
+            "Cargo.lock",
+            &format!(
+                "version=3\n[[package]]\nname='example'\nversion='0.1.0'\ndependencies=['dep']\n[[package]]\nname='dep'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n",
+                "a".repeat(64)
+            ),
+        );
+        put(temp.path(), ".cargo/config.toml", "[http]\ntimeout=30\n");
+
+        // Dependency evidence is a query-path read: it answers from the
+        // selection its request pinned (#13346).
+        let read_evidence = |analyzer: &super::super::RustAnalyzer| {
+            let _request =
+                brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(analyzer);
+            analyzer.dependency_file_evidence().unwrap()
+        };
+        let before = super::super::RustAnalyzer::new(Arc::new(project.clone()));
+        let snapshot_before = before.inner.selected_workspace_snapshots()["rust"].clone();
+        let evidence_before = read_evidence(&before);
+
+        let listing = project.all_files_with_omissions().unwrap();
+        let same = before.update_with_listing(&BTreeSet::new(), Some(&listing));
+        assert_eq!(
+            same.inner.selected_workspace_snapshots()["rust"],
+            snapshot_before
+        );
+
+        put(
+            temp.path(),
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with='mirror'\n[source.mirror]\nregistry='https://example.invalid/index'\n",
+        );
+        let after = before.update_with_listing(&BTreeSet::new(), Some(&listing));
+        let snapshot_after = after.inner.selected_workspace_snapshots()["rust"].clone();
+        assert_ne!(snapshot_before, snapshot_after);
+        assert_eq!(snapshot_after.revision, snapshot_before.revision + 1);
+
+        let evidence_after = read_evidence(&after);
+        assert_ne!(evidence_before, evidence_after);
+        assert_eq!(read_evidence(&before), evidence_before);
+
+        let fresh = super::super::RustAnalyzer::new(Arc::new(project));
+        assert_eq!(evidence_after, read_evidence(&fresh));
+
+        let after_equal = after.update_with_listing(&BTreeSet::new(), Some(&listing));
+        assert_eq!(
+            after_equal.inner.selected_workspace_snapshots()["rust"],
+            snapshot_after
+        );
     }
 }

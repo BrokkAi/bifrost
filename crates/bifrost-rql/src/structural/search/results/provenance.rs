@@ -188,6 +188,20 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
     },
+    FieldWrite {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        program_point_id: String,
+    },
+    FieldRead {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        program_point_id: String,
+    },
     FieldWriteValue {
         id: String,
         assignment_ast_id: String,
@@ -793,6 +807,8 @@ impl CodeQueryResultRef {
             Self::ReceiverEvidence { .. } => QueryKind::ReceiverEvidence,
             Self::PointsToCandidate { .. } => QueryKind::PointsToCandidate,
             Self::FieldWriteValue { .. } => QueryKind::FieldWriteValue,
+            Self::FieldWrite { .. } => QueryKind::FieldWrite,
+            Self::FieldRead { .. } => QueryKind::FieldRead,
             Self::RuntimeKeyedReadValue { .. } => QueryKind::KeyedReadValue,
             Self::DispatchOutcome { .. } => QueryKind::DispatchOutcome,
             Self::DispatchTarget { .. } => QueryKind::DispatchTarget,
@@ -928,6 +944,8 @@ impl CodeQueryResultRef {
             | Self::ReferenceEdge { path, .. }
             | Self::StateEvent { path, .. }
             | Self::BindingInitializerCall { path, .. }
+            | Self::FieldWrite { path, .. }
+            | Self::FieldRead { path, .. }
             | Self::FlowRelation { path, .. }
             | Self::ControlRelation { path, .. }
             | Self::BranchRelation { path, .. }

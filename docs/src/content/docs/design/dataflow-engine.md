@@ -86,6 +86,22 @@ value or program-point ID from being paired with rows from another partial
 materialization. Dense IDs are compact implementation coordinates; artifact
 keys provide the public cross-run identity.
 
+### Rust closure creation in macro operands
+
+Capture slots belong to a closure body; their bindings belong to a particular
+parent realization and creating value. An opaque macro can leave the base
+without creation bindings that an admitted alternate supplies.
+`CreatingRealizationBindsCaptures` records only this missing association. The
+gap stays in the artifact because another query can still use the base.
+
+A consumer holding an exact creation can discharge that obligation after
+checking complete, unique bindings for every slot and the correct lexical
+parent. This proof does not establish that an uncertain capture prepass found
+every slot. Consumers without the creating realization keep the gap open.
+Exact creation bindings also do not prove the later state of a callable passed
+through `&mut`; the local-callable oracle keeps its independent address-taken
+provenance refusal.
+
 ### Rust tuple binding initialization
 
 The Rust hook admits flat, by-value identifier bindings from captured tuple
@@ -258,6 +274,17 @@ intercepts it first. An exception raised two calls down therefore keeps its
 carrier through an intermediate procedure that does not catch it. A call whose
 exceptional continuation receives no value leaves its bindings open.
 
+Lowering reads one file, so a procedure CFG keeps a local edge wherever that
+file alone cannot rule it out. The provider asks the language which of those
+edges no execution takes once workspace declarations are read, and summary
+tabulation and snapshot construction propagate along none of them. Java names
+the edge on which an exception leaves a `try` statement without entering a
+handler when one catch clause resolves to `java.lang.Throwable`. The name
+`Throwable` is not enough: a class of that name in the same package, a member
+type, or a single-type import shadows it, so the type goes through the
+definition resolver, and a type it cannot prove keeps the edge. The answer
+depends on the workspace, so a product kept by content does not consume it.
+
 Every edge carries its own proof and evidence completeness. Boundaries are
 first-class graph rows. A solver may report positive reachability from a partial
 graph alongside the boundaries that prevent a complete-model claim.
@@ -366,6 +393,25 @@ A typestate root reports a clean result only when the completeness of the summar
 A solved typestate root is stored as a root product and replayed on a later evaluation when none of its recorded reads changed. ICFG and composition roots follow the same rules, and each engine publishes under its own root-key domain. The two engines therefore never replay each other's roots, even in one store or under the test-only engine override. A root is published only when its result does not depend on how this execution ran. One shared boundary, used by both engines, records the cancellation state, execution-budget exhaustion, semantic and solver read refusals, and the analyzer generation before the root, and compares them after it. A root is also execution dependent when the search reports cancelled or budget incompleteness, when a nested summary is incomplete for an execution reason, or when it used a recursive pending summary. Composition answers several questions through query-local memos: summaries, pending summaries, local partial flows, dispatches, openness, sweeps, and the ordered parts, bypasses and inert drops. Each memo entry keeps the read receipts behind it and replays them on a hit, so a replayed root records the same reads as a fresh one. The receipt bytes are charged to a query-local budget. An entry the budget cannot admit is returned without being retained, and never hides a refusal. A replayed root checks the shared limits and work admission again and keeps its completion and reasons. A root that no longer fits is recomputed.
 
 Canonical typestate binding plans and policy unit keys hash each artifact's `public_fingerprint`. It retains content, adapter, IR, configuration, dependencies, and the workspace-relative path while excluding the absolute mount and overlay snapshot token. A comment-only diff base can run from another mount, so mount-sensitive hashes would prevent valid unit reuse even when answers agree. Call-site locators and occurrences still distinguish separate bindings.
+
+A typestate transfer accounts for each event bound on an edge exactly once, in the order the stages execute. A binding the edge applies is applied, or has its own uncertainty resolved. A call-stage binding that a dispatch boundary withholds may or may not have fired, so the boundary's uncertainty resolves it where it stands, and a later event on the same call sees both outcomes. Under `:unmodeled paranoid` that uncertainty is conservative: it keeps the current state and adds the state the one withheld event reaches. No uncertainty repeats an event. One call fires an authored event at most once, so a repeat would report a transition, such as a second `close`, that no execution of the call performs.
+
+An event acts on a subject when the value it observes denotes the subject's object. The heap oracle's evidence for a named object describes where the object came from, and the result of a call whose dispatch stays open, such as a call through an interface, never closes that evidence. It does not describe which value the event site observed. When the observed value is an immutable snapshot of the value the object's identity names (the value itself, or single-assignment copies of it in a language with definite assignment), the event denotes that object on every path, so only the event selector's own evidence qualifies the binding. This holds only where the written operand is the object the callee acts on. A language that requires a selected receiver witness (Rust, Go) can adjust the operand before the call, so there the named object's evidence stands. The subject's seed keeps the origin evidence: the run stays inconclusive and its findings stay possible until the dispatch family closes.
+
+### Analyzed dispatch families (#11296)
+
+A Java call through an interface or abstract method can still give a complete typestate answer. This requires a sealed dispatch family and an analysis of every arm. The membership is sealed only on the owned source and session dispatch path. Its witness carries the exact call, the canonical member set, and a replayable read receipt, so an override added in another file invalidates a warm family. `DispatchResult::analyzed_family` and `CallTransferSet::family_closure` certify a call when four conditions hold:
+
+- every executable arm is projected;
+- each arm's own body evidence is proven and complete;
+- each arm's formals accept the call's actuals;
+- every dispatch boundary is selection-only, meaning the bodiless family declaration or the open remainder that membership proved absent.
+
+Each arm stays an Unproven may-target. The certificate removes only the incompleteness that runtime selection causes. Declaration, binding, conversion, initialization, budget, and cancellation evidence still combine normally. Concrete expansion turned off (#2277) and a native, unresolved, or external arm keep the call open.
+
+Only a consumer that analyzes every arm for one subject may use the certificate. The typestate problem opts in through `closes_analyzed_dispatch_families`. Its summary solve replaces the call's transfers with `analyzed_arms()`, so an arm's selection-only unproof neither adds `IncompleteAnalysis` nor counts as a coverage gap. The policy's close discharge treats the call as a release at the call site only when every arm hands the object to a formal whose close contract is discharged. One leaking arm leaves the others' releases standing as possible outcomes, so the mixed family keeps its possible leak. Bounded snapshot mode does not use the certificate yet and stays incomplete (#11297).
+
+A dispatched Java arm takes the argument conversions of the unique statically selected declaration. Java converts each argument to the compile-time declaration's formal type, and an override receives that value unchanged. The arm's binding therefore preserves reference identity whenever the static selection does.
 
 Class-set dispatch feedback can close a resolved receiver call's dynamic-dispatch
 remainder when the complete receiver set names exactly the declarations already

@@ -113,6 +113,9 @@ pub enum SelectedNominalHead<'a> {
 
 /// A selected declaration head, without any instantiation or type proof.
 pub struct SelectedNominalHeadDeclaration {
+    /// Request-local selected producer kind. Missing evidence never implies a struct.
+    pub rust_declaration_kind:
+        Option<brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind>,
     pub identity: brokk_bifrost_core::analyzer::model::DeclarationId,
     pub declaration: brokk_bifrost_core::analyzer::model::CodeUnit,
 }
@@ -437,6 +440,19 @@ pub trait StoreLanguageSupport: Send + Sync {
         false
     }
 
+    /// False means the existing producer's concrete stored parent roles are
+    /// authoritative. Deferred authored parents always require selected kinds.
+    fn requires_selected_nominal_parent_kind(&self) -> bool {
+        false
+    }
+
+    /// Rules for declaration-owned, selected implicit root candidates.
+    fn selected_implicit_root_rules(
+        &self,
+    ) -> Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers> {
+        None
+    }
+
     /// Whether the shared native type projector should publish direct
     /// constructor shapes for this language's selected type components.
     fn supports_direct_type_shapes(&self) -> bool {
@@ -482,6 +498,20 @@ pub trait StoreLanguageSupport: Send + Sync {
         _source: &mut dyn SelectedReceiverStepSource,
     ) -> crate::analyzer::store::Result<SelectedReceiverStepRead> {
         Ok(SelectedReceiverStepRead::ReadyNone)
+    }
+
+    /// Whether the unindexed external type boundaries of one written trait
+    /// head are the standard `Fn`, `FnMut` or `FnOnce` trait, decided from
+    /// the selected identity evidence and never from the written spelling.
+    /// A qualified head may also carry the boundaries of its path prefixes.
+    /// The outer `None` reports cancellation. Default languages certify
+    /// nothing, so no closure takes a contextual signature from them.
+    fn standard_function_trait(
+        &self,
+        _boundaries: &[crate::analyzer::resolution::SemanticId],
+        _source: &mut dyn SelectedTypeHeadSource,
+    ) -> crate::analyzer::store::Result<Option<bool>> {
+        Ok(Some(false))
     }
 
     /// Callable result formals can be substituted inside constructed types.
@@ -554,10 +584,23 @@ pub trait StoreLanguageSupport: Send + Sync {
             '_,
         >,
         _slot: crate::analyzer::resolution::SemanticId,
+        _context: &crate::analyzer::resolution::ConditionalTypeSeedContext<'_>,
         _cancellation: &crate::CancellationToken,
-    ) -> crate::analyzer::store::Result<Option<crate::analyzer::resolution::ConditionalTypeSeed>>
-    {
-        Ok(None)
+    ) -> crate::analyzer::store::Result<crate::analyzer::resolution::ConditionalTypeSeedRead> {
+        Ok(crate::analyzer::resolution::ConditionalTypeSeedRead::NotProvided)
+    }
+
+    /// Structural locator for a deferred `base`-style receiver. Intent only;
+    /// the default performs no reads.
+    fn selected_deferred_base_receiver_intent(
+        &self,
+        _slot: crate::analyzer::resolution::SemanticId,
+        _reader: &dyn crate::analyzer::resolution::fact_source::DeferredBaseReceiverIntentReader,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        crate::analyzer::resolution::fact_source::DeferredBaseReceiverIntentRead,
+    > {
+        Ok(crate::analyzer::resolution::fact_source::DeferredBaseReceiverIntentRead::NotProvided)
     }
 
     /// Static member capabilities; the selected source exposes this same table.
@@ -568,8 +611,29 @@ pub trait StoreLanguageSupport: Send + Sync {
         &[]
     }
 
-    /// Retain language-owned native rows in the selected blob transaction.
-    fn publish_native_source_rows(
+    /// Whether retained language-owned resolution products use the current
+    /// format. A stale product is republished with the resolution interior.
+    fn native_resolution_rows_current(
+        &self,
+        _conn: &rusqlite::Connection,
+        _blob: i64,
+    ) -> crate::analyzer::store::Result<bool> {
+        Ok(true)
+    }
+
+    /// Retire language-owned resolution products that do not cascade from the
+    /// resolution header. Called before that header is replaced; canonical
+    /// source facts remain sealed and unchanged.
+    fn retire_native_resolution_rows(
+        &self,
+        _tx: &rusqlite::Transaction<'_>,
+        _blob: i64,
+    ) -> crate::analyzer::store::Result<()> {
+        Ok(())
+    }
+
+    /// Publish language-owned resolution products in the same blob transaction.
+    fn publish_native_resolution_rows(
         &self,
         _tx: &rusqlite::Transaction<'_>,
         _blob: i64,

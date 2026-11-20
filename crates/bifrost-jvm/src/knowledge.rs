@@ -15,6 +15,10 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct JavaKnowledge;
 
 impl LanguageKnowledge for JavaKnowledge {
+    fn models_compose_from_catalog_rows(&self) -> bool {
+        true
+    }
+
     fn unmarked_member_stores(
         &self,
     ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
@@ -23,6 +27,17 @@ impl LanguageKnowledge for JavaKnowledge {
 
     fn semantic_string_constant_value(&self, payload: &str) -> Option<String> {
         Some(payload.to_owned())
+    }
+
+    fn update_operand<'t>(&self, node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+        // The grammar gives `update_expression` one unlabeled operand child;
+        // any other named child is a comment.
+        if node.kind() != "update_expression" {
+            return None;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| !child.is_extra())
     }
 
     fn declared_type_is_referent_immutable(&self, canonical_type: &str) -> bool {
@@ -74,6 +89,37 @@ impl LanguageKnowledge for JavaKnowledge {
             node.child_by_field_name("name")?,
             node.child_by_field_name("value")?,
         ))
+    }
+
+    fn unmodeled_field_access_macros<'t>(
+        &self,
+        root: tree_sitter::Node<'t>,
+        owner: Option<tree_sitter::Node<'t>>,
+        field: Option<tree_sitter::Node<'t>>,
+        source: &str,
+    ) -> Vec<String> {
+        const OWNERS: &[&str] = &[
+            "class_declaration",
+            "record_declaration",
+            "enum_declaration",
+        ];
+        let mut owner = owner.or(field);
+        while let Some(node) = owner
+            && !OWNERS.contains(&node.kind())
+        {
+            owner = node.parent();
+        }
+        let mut field = field;
+        while let Some(node) = field
+            && node.kind() != "field_declaration"
+        {
+            field = node.parent();
+        }
+        let mut macros = Vec::new();
+        for declaration in owner.into_iter().chain(field) {
+            lombok_annotations(root, declaration, source, &mut macros);
+        }
+        macros
     }
 
     fn factory_name_node<'t>(&self, call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
@@ -154,6 +200,10 @@ impl LanguageKnowledge for JavaKnowledge {
 pub struct KotlinKnowledge;
 
 impl LanguageKnowledge for KotlinKnowledge {
+    fn models_compose_from_catalog_rows(&self) -> bool {
+        true
+    }
+
     fn unmarked_member_stores(
         &self,
     ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
@@ -397,6 +447,10 @@ impl LanguageKnowledge for KotlinKnowledge {
 pub struct ScalaKnowledge;
 
 impl LanguageKnowledge for ScalaKnowledge {
+    fn models_compose_from_catalog_rows(&self) -> bool {
+        true
+    }
+
     fn unmarked_member_stores(
         &self,
     ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
@@ -512,5 +566,116 @@ impl LanguageKnowledge for ScalaKnowledge {
 
     fn highlight_query(&self) -> Option<&'static str> {
         Some(crate::queries::SCALA_HIGHLIGHTS_QUERY)
+    }
+}
+
+/// Lombok annotations whose generated code reads or writes fields.
+const LOMBOK_FIELD_ACCESS_ANNOTATIONS: &[&str] = &[
+    "Data",
+    "Value",
+    "Getter",
+    "Setter",
+    "Builder",
+    "SuperBuilder",
+    "With",
+    "AllArgsConstructor",
+    "RequiredArgsConstructor",
+    "NoArgsConstructor",
+    "ToString",
+    "EqualsAndHashCode",
+];
+
+/// Segments of a Java `identifier` or `scoped_identifier` read from its AST
+/// `scope` and `name` fields rather than by splitting source text.
+fn java_qualified_segments<'a>(
+    node: tree_sitter::Node<'_>,
+    source: &'a str,
+) -> Option<Vec<&'a str>> {
+    let mut segments = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => {
+                segments.push(source[current.byte_range()].trim());
+                segments.reverse();
+                return Some(segments);
+            }
+            "scoped_identifier" => {
+                let name = current.child_by_field_name("name")?;
+                segments.push(source[name.byte_range()].trim());
+                current = current.child_by_field_name("scope")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Push the Lombok field-access annotations on `declaration`. An annotation is
+/// Lombok's when it is qualified `lombok.X` or `lombok.experimental.X`, or is
+/// bare and the file imports it from one of those packages by name or by
+/// wildcard.
+fn lombok_annotations(
+    root: tree_sitter::Node<'_>,
+    declaration: tree_sitter::Node<'_>,
+    source: &str,
+    macros: &mut Vec<String>,
+) {
+    let mut cursor = declaration.walk();
+    let Some(modifiers) = declaration
+        .children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+    else {
+        return;
+    };
+    let mut imports: Vec<(Vec<&str>, bool)> = Vec::new();
+    let mut root_cursor = root.walk();
+    for import in root
+        .children(&mut root_cursor)
+        .filter(|child| child.kind() == "import_declaration")
+    {
+        let mut import_cursor = import.walk();
+        let children: Vec<_> = import.named_children(&mut import_cursor).collect();
+        let wildcard = children.iter().any(|child| child.kind() == "asterisk");
+        if let Some(path) = children
+            .iter()
+            .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
+            && let Some(segments) = java_qualified_segments(*path, source)
+        {
+            imports.push((segments, wildcard));
+        }
+    }
+    let imported = |name: &str| {
+        imports.iter().any(|(segments, wildcard)| {
+            if *wildcard {
+                matches!(segments.as_slice(), ["lombok"] | ["lombok", "experimental"])
+            } else {
+                matches!(
+                    segments.as_slice(),
+                    ["lombok", leaf] | ["lombok", "experimental", leaf] if *leaf == name
+                )
+            }
+        })
+    };
+    let mut modifier_cursor = modifiers.walk();
+    for annotation in modifiers
+        .children(&mut modifier_cursor)
+        .filter(|child| matches!(child.kind(), "marker_annotation" | "annotation"))
+    {
+        let Some(name) = annotation.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(segments) = java_qualified_segments(name, source) else {
+            continue;
+        };
+        let lombok = match segments.as_slice() {
+            ["lombok", simple] | ["lombok", "experimental", simple] => {
+                LOMBOK_FIELD_ACCESS_ANNOTATIONS.contains(simple)
+            }
+            [simple] => LOMBOK_FIELD_ACCESS_ANNOTATIONS.contains(simple) && imported(simple),
+            _ => false,
+        };
+        if lombok {
+            macros.push(segments.join("."));
+        }
     }
 }

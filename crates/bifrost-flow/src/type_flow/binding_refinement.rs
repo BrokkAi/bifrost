@@ -449,6 +449,8 @@ fn guard_predicate_subject(guard: &GuardFact) -> Option<ValueId> {
         | GuardPredicate::OrderedIntegerComparison { .. }
         | GuardPredicate::OrderedFloatComparison { .. }
         | GuardPredicate::NanComparison { .. }
+        | GuardPredicate::ValueEquality { .. }
+        | GuardPredicate::ValueOrdering { .. }
         | GuardPredicate::Opaque { .. } => None,
     }
 }

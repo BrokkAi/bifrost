@@ -1461,6 +1461,7 @@ impl ActivationInput {
             .map(|control| control.into_control(format))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version,
             evidence,
@@ -1475,6 +1476,15 @@ impl ActivationEvidenceInput {
         self,
         format: OutputFormat,
     ) -> Result<SemanticModelActivationEvidence, CommandFailure> {
+        if self.artifact_sha256.as_deref().is_some_and(|digest| {
+            !brokk_bifrost_analysis::analyzer::canonical_hash::is_lower_sha256(digest)
+        }) {
+            return Err(failure(
+                2,
+                "activation evidence artifact digest must be lowercase SHA-256",
+                format,
+            ));
+        }
         Ok(SemanticModelActivationEvidence {
             language: self.language,
             ecosystem: self.ecosystem,
@@ -1492,7 +1502,8 @@ impl ActivationEvidenceInput {
                 .transpose()?,
             target: self.target,
             configuration: self.configuration,
-            artifact_sha256: self.artifact_sha256,
+            production_input_digest: None,
+verified_raw_artifacts: (self.artifact_sha256).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
         })
     }
 }

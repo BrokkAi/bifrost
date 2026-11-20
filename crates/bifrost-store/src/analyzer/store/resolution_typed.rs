@@ -7,12 +7,16 @@
 //! selected-first and keyset-paged, and parent rows are emitted only after all
 //! ordered children and completion reasons have been decoded.
 
+mod conditional_seeds;
+pub(super) use conditional_seeds::ResolvedReceiverProofQuestion;
 pub(super) mod external_owners;
 pub(super) mod go_members;
 mod go_model;
 pub(super) mod java_access;
 pub(super) mod java_inheritance;
 mod model_declarations;
+pub(super) mod rust_members;
+mod source_access;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -27,6 +31,7 @@ use rusqlite::Row;
 use rusqlite::params_from_iter;
 
 use crate::CancellationToken;
+use crate::analyzer::resolution::fact_source::TypedFactInventoryEvidence;
 
 use crate::analyzer::Language;
 
@@ -319,6 +324,7 @@ pub trait SelectedImplicitInputProvider {
 #[doc(hidden)]
 pub struct SelectedResolutionTypedSource<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
+    source_project_root: Option<&'selection std::path::Path>,
     binding_cache: Option<&'selection super::cache_budget::StoreCacheBudget>,
     base_guard_bindings: std::cell::RefCell<
         HashMap<
@@ -345,12 +351,18 @@ pub struct SelectedResolutionTypedSource<'selection, 'store> {
     authority: Rc<SelectedResolutionAuthority<'selection>>,
     context_identities: crate::analyzer::resolution::SelectedContextIdentities,
     external_providers: Vec<String>,
+    external_inventory_generation: Option<super::jvm_external_publication::PublicationClock>,
+    external_signature_memo_proof:
+        std::cell::Cell<Option<super::jvm_external_publication::JvmInventoryMemoProof>>,
     external_provider_families: HashMap<String, ExternalProviderFamily>,
     model_authority: Option<
         std::sync::Arc<dyn super::resolution_operation::SelectedModelAuthority + Send + Sync>,
     >,
     external_models:
         Option<std::sync::Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>>,
+    receiver_proof_services:
+        Option<&'selection dyn super::resolution_operation::SelectedAnalyzerServices>,
+    nominal_kind_provider: Option<&'selection dyn SelectedNominalKindProvider>,
     go_context_binder: Option<&'selection dyn GoDefinitionContextBinder>,
     type_heads: Option<&'selection dyn super::language_support::SelectedTypeHeadSource>,
     binary_operation_type_provider:
@@ -416,6 +428,10 @@ mod implicit_inputs_memo_tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#9575: implicit input memo hits bypassed selected mutation authority"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn implicit_input_hits_validate_the_selected_provider() {
         use crate::analyzer::store::AnalyzerStore;
@@ -644,6 +660,68 @@ pub struct GoLookupReadKey {
     pub selection_fingerprint: [u8; 32],
 }
 
+pub(super) trait SelectedNominalKindProvider {
+    fn refuse_reuse(&self) {}
+    fn records_class_like_staticness(&self, _language: Language) -> bool {
+        false
+    }
+    fn class_like_metadata(
+        &self,
+        _definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<Vec<crate::analyzer::resolution::fact_source::SelectedDeclarationClassLikeMetadata>>,
+    > {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+    fn method_attributes(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<
+            Vec<(
+                SemanticId,
+                crate::analyzer::resolution::SelectedDeclarationMethodAttributes,
+            )>,
+        >,
+    > {
+        Ok((!cancellation.is_cancelled()).then(|| {
+            definitions
+                .iter()
+                .copied()
+                .map(|definition| {
+                    (
+                        definition,
+                        crate::analyzer::resolution::SelectedDeclarationMethodAttributes::default(),
+                    )
+                })
+                .collect()
+        }))
+    }
+    fn target_kinds(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<
+            Vec<(
+                SemanticId,
+                crate::analyzer::resolution::NominalParentTargetKind,
+            )>,
+        >,
+    >;
+}
+
+/// Sparse declaration-owned source evidence in one exact selected context.
+/// Missing modifier evidence is distinct from a proven non-partial declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedDeclarationSourceFacts {
+    pub definition: SemanticId,
+    pub partial: Option<bool>,
+    pub root_candidate: Option<(SemanticId, SemanticId)>,
+}
+
 impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     #[doc(hidden)]
     pub fn new_on_demand(selection: &'selection SelectedResolutionMountInventory<'store>) -> Self {
@@ -659,6 +737,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     ) -> Self {
         Self {
             selection,
+            source_project_root: None,
             binding_cache: None,
             base_guard_bindings: Default::default(),
             base_guard_mutations: Default::default(),
@@ -669,12 +748,16 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             authority,
             context_identities: crate::analyzer::resolution::SelectedContextIdentities::new(),
             external_providers: Vec::new(),
+            external_inventory_generation: Default::default(),
+            external_signature_memo_proof: Default::default(),
             external_provider_families: HashMap::from([(
                 "jvm-intrinsic".to_owned(),
                 ExternalProviderFamily::Jvm,
             )]),
             model_authority: None,
             external_models: None,
+            receiver_proof_services: None,
+            nominal_kind_provider: None,
             go_context_binder: None,
             type_heads: None,
             binary_operation_type_provider: None,
@@ -743,6 +826,27 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         crate::analyzer::resolution::universe::entry_for_digest(digest)
     }
 
+    pub(super) fn with_source_project_root(mut self, root: &'selection std::path::Path) -> Self {
+        self.source_project_root = Some(root);
+        self
+    }
+
+    pub(super) fn with_receiver_proof_services(
+        mut self,
+        services: Option<&'selection dyn super::resolution_operation::SelectedAnalyzerServices>,
+    ) -> Self {
+        self.receiver_proof_services = services;
+        self
+    }
+
+    pub(super) fn with_nominal_kind_provider(
+        mut self,
+        provider: &'selection dyn SelectedNominalKindProvider,
+    ) -> Self {
+        self.nominal_kind_provider = Some(provider);
+        self
+    }
+
     pub(super) fn with_external_models(
         mut self,
         models: Option<
@@ -801,6 +905,25 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             self.external_provider_families
                 .insert(provider.clone(), ExternalProviderFamily::Jvm);
         }
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_external_inventory_generation(
+        self,
+        store: &super::AnalyzerStore,
+        generation: Option<i64>,
+    ) -> Self {
+        self.with_external_inventory_clock(
+            generation.map(|generation| store.jvm_inventory_publication_clock(generation)),
+        )
+    }
+
+    pub(super) fn with_external_inventory_clock(
+        mut self,
+        clock: Option<super::jvm_external_publication::PublicationClock>,
+    ) -> Self {
+        self.external_inventory_generation = clock;
         self
     }
 
@@ -1089,6 +1212,36 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         })
     }
 
+    /// Read only an exact selected declaration's sparse source families.
+    /// None is cancellation/unavailable selection, never a proved empty inventory.
+    pub fn declaration_source_facts(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SelectedDeclarationSourceFacts>> {
+        if cancellation.is_cancelled() || !self.validate_selected_interiors(cancellation)? {
+            return Ok(None);
+        }
+        let (Some(ordinal), Some(key)) = (definition.ordinal(), definition.local_key()) else {
+            return Ok(None);
+        };
+        if ordinal as usize >= self.selection.persisted_mount_count() {
+            return Ok(None);
+        }
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        self.read_statement(cancellation, |connection| {
+            let partial = connection.query_row(
+                "SELECT partial FROM resolution_declaration_modifiers WHERE blob_id=?1 AND definition=?2",
+                rusqlite::params![mount.blob_id(), key], |row| row.get::<_, bool>(0),
+            ).optional()?;
+            let root_candidate = connection.query_row(
+                "SELECT reference,frontier FROM resolution_implicit_root_candidates WHERE blob_id=?1 AND definition=?2",
+                rusqlite::params![mount.blob_id(), key], |row| Ok((row.get::<_, u32>(0)?,row.get::<_, u32>(1)?)),
+            ).optional()?.map(|(reference,frontier)| (SemanticId::local(ordinal,reference),SemanticId::local(ordinal,frontier)));
+            Ok(Some(SelectedDeclarationSourceFacts { definition, partial, root_candidate }))
+        })
+    }
+
     /// Read metadata for the requested persisted mount.
     fn mount(
         &self,
@@ -1140,11 +1293,13 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     pub fn jvm_candidate_hierarchy_rows(
         &self,
         mounts: &[SelectedResolutionMountOrdinal],
-        storage_language: &str,
+        producer_language: Language,
         names: &[String],
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> StoreResult<Option<JvmHierarchyCandidateRows>> {
+        let storage_language = producer_language.config_label();
+        assert_ne!(producer_language, Language::None);
         if mounts.is_empty() {
             return Ok(Some(JvmHierarchyCandidateRows {
                 parents: Vec::new(),
@@ -1245,16 +1400,15 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                     aliases.push((semantic(1)?, semantic(2)?));
                     continue;
                 }
-                parents.push(
+                parents.push(LoweredSupertypeProperty::from_source(
                     typed_rows::decode_supertype_fields(
                         semantic(1)?,
                         semantic(2)?,
                         semantic(3)?,
                         row.get(4)?,
                         row.get(5)?,
-                    )
-                    .into(),
-                );
+                    ), producer_language,
+                ));
             }
             Ok(Some(JvmHierarchyCandidateRows { parents, aliases }))
         })
@@ -1356,6 +1510,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_statement<T>(
         &self,
         cancellation: &CancellationToken,
@@ -1373,7 +1528,9 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         Ok(if cancellation.is_cancelled() {
             TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
         } else {
-            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete).with_inventory_evidence(
+                TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete),
+            )
         })
     }
 
@@ -1458,6 +1615,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         self.semantic_coordinates_in_session(identities, relation, cancellation, None)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn semantic_coordinates_in_session(
         &self,
         identities: &[SemanticId],
@@ -1948,6 +2106,7 @@ const PYTHON_GUARD_DYNAMIC_WRITES_SQL: &str = "WITH candidates AS (
  LEFT JOIN resolution_semantic_sites receiver ON receiver.blob_id=op.blob_id AND receiver.source_site=op.receiver_reference AND receiver.semantic_role='reference' ";
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn base_guard_mutation_receivers(
         &self,
         members: &[&str],
@@ -2031,6 +2190,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
 }
 
 impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn base_preservation_reference_complete(
         &self,
         reference: SemanticId,
@@ -2150,6 +2310,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             .query_row(rusqlite::params![mount.blob_id(),start,end], |row| row.get(0))?;
         Ok(!blocked && !cancellation.is_cancelled())
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn base_preservation_members(
         &self,
         owner: SemanticId,
@@ -2244,6 +2405,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                         && model.declaration.qualified_name == terminal
                 }))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn base_preservation_terminal_reference(
         &self,
         reference: SemanticId,
@@ -2289,6 +2451,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         Ok(rows.builtin_type_unshadowed && !cancellation.is_cancelled())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn class_alias_source(
         &self,
         definition: SemanticId,
@@ -2438,6 +2601,49 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         self.project_model_value(token, kind, receivers, cancellation)
     }
 
+    fn selected_access_reference(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::resolution::fact_source::SelectedAccessReference>>
+    {
+        self.read_access_reference(reference, cancellation)
+    }
+
+    fn selected_access_declaration(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::resolution::fact_source::SelectedAccessDeclaration>>
+    {
+        self.read_access_declaration(definition, cancellation)
+    }
+
+    fn receiver_proof_services(
+        &self,
+    ) -> Option<&dyn super::resolution_operation::SelectedAnalyzerServices> {
+        self.receiver_proof_services
+    }
+
+    fn selected_receiver_proof_question(
+        &self,
+        application: SemanticId,
+        transfer: Option<(SemanticId, SemanticId)>,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        self.receiver_proof_question(application, transfer, cancellation)
+    }
+
+    fn selected_base_receiver_context_question(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        self.base_receiver_context_question(reference, cancellation)
+    }
+
     fn conditional_type_productions(
         &self,
         slots: &[SemanticId],
@@ -2454,6 +2660,36 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn closure_binder_contexts(
+        &self,
+        binders: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<crate::analyzer::resolution::fact_source::ClosureBinderContext>> {
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(Vec::new());
+        }
+        super::resolution_operation::rust_closure_literals::binder_contexts(
+            self.selection,
+            binders,
+            cancellation,
+        )
+    }
+
+    fn formal_function_shapes(
+        &self,
+        owners: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<crate::analyzer::resolution::fact_source::FormalFunctionShape>> {
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(Vec::new());
+        }
+        super::resolution_operation::rust_function_shapes::shapes(
+            self.selection,
+            owners,
+            cancellation,
+        )
+    }
+
     fn supports_conditional_type_seeds(&self) -> bool {
         self.selection.has_conditional_type_seeds()
     }
@@ -2461,8 +2697,9 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
     fn conditional_type_seeds(
         &self,
         slots: &[SemanticId],
+        reader: &dyn crate::analyzer::resolution::fact_source::ConditionalOwnerApplicationReader,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Vec<crate::analyzer::resolution::ConditionalTypeSeed>> {
+    ) -> StoreResult<Vec<crate::analyzer::resolution::ConditionalTypeSeedRead>> {
         if !self.selection.has_conditional_type_seeds() {
             return Ok(Vec::new());
         }
@@ -2480,17 +2717,54 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             if ordinal as usize >= self.selection.persisted_mount_count() {
                 continue;
             }
-            let language = self
-                .mount(SelectedResolutionMountOrdinal::new(ordinal))?
-                .semantic_language();
-            if let Some(support) = super::store_language_support(language)
-                && let Some(seed) =
-                    support.selected_conditional_type_seed(self.selection, slot, cancellation)?
-            {
-                seeds.push(seed);
+            let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+            let language = mount.semantic_language();
+            if let Some(support) = super::store_language_support(language) {
+                let context = crate::analyzer::resolution::ConditionalTypeSeedContext::new(
+                    &self.context_identities,
+                )
+                .with_reader(reader);
+                let outcome = support.selected_conditional_type_seed(
+                    self.selection,
+                    slot,
+                    &context,
+                    cancellation,
+                )?;
+                #[cfg(any(test, feature = "test-support"))]
+                crate::analyzer::resolution::fact_resolution::receiver_proof_tests::with_receiver_proof_test_decorator(|decorator| {
+                    decorator.conditional_seed_evaluated(mount.persisted_relative_path(), &outcome);
+                });
+                if !matches!(
+                    outcome,
+                    crate::analyzer::resolution::ConditionalTypeSeedRead::NotProvided
+                ) {
+                    seeds.push(outcome);
+                }
             }
         }
         Ok(seeds)
+    }
+
+    fn deferred_base_receiver_intent(
+        &self,
+        slot: SemanticId,
+        reader: &dyn crate::analyzer::resolution::fact_source::DeferredBaseReceiverIntentReader,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::analyzer::resolution::fact_source::DeferredBaseReceiverIntentRead> {
+        use crate::analyzer::resolution::fact_source::DeferredBaseReceiverIntentRead;
+        let Some(ordinal) = slot.ordinal() else {
+            return Ok(DeferredBaseReceiverIntentRead::NotProvided);
+        };
+        if ordinal as usize >= self.selection.persisted_mount_count() {
+            return Ok(DeferredBaseReceiverIntentRead::NotProvided);
+        }
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        match super::store_language_support(mount.semantic_language()) {
+            Some(support) => {
+                support.selected_deferred_base_receiver_intent(slot, reader, cancellation)
+            }
+            None => Ok(DeferredBaseReceiverIntentRead::NotProvided),
+        }
     }
 
     fn qualified_member_registrations(
@@ -2649,6 +2923,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                 self.model_authority.as_deref(),
                 &self.external_providers,
                 owner_fqn,
+                self.external_inventory_generation()?,
             )?
             .is_none();
             let unindexed =
@@ -2680,6 +2955,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     self.model_authority.as_deref(),
                     &self.external_providers,
                     owner_fqn,
+                    self.external_inventory_generation()?,
                 )
                 .map(Some)
             })?
@@ -2721,6 +2997,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         self.read_callable_parameter_for_label(callable, label, cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn lookup_namespace(
         &self,
         lookup: SemanticId,
@@ -2899,6 +3176,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
     /// Only an ordinary selected declaration can name persisted impl rows.
     /// Resolved trait endpoints name workspace declarations, so they cannot
     /// establish the standard-library Deref identity and are excluded here.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn rust_receiver_impl_targets(
         &self,
         owner: SemanticId,
@@ -3105,6 +3383,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         java_access::read_jvm(self, semantics, cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_callable_lookups(
         &self,
         lookups: &[(BindingFragmentId, SemanticId)],
@@ -3344,19 +3623,31 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         Ok((!cancellation.is_cancelled()).then_some(found))
     }
 
+    fn deferred_participation_uses_receiver(&self, language: Language) -> bool {
+        language == Language::Rust
+    }
+
     fn deferred_member_participation(
         &self,
         definitions: &[SemanticId],
+        receivers: Option<&[crate::analyzer::resolution::fact_source::DeferredMemberReceiverType]>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<bool>>> {
-        Ok(
-            go_members::source_participation(self, definitions, cancellation)?.map(|roles| {
-                roles
-                    .into_iter()
-                    .map(|role| role.as_deref() != Some("ignored"))
-                    .collect()
-            }),
-        )
+        let Some(roles) = go_members::source_participation(self, definitions, cancellation)? else {
+            return Ok(None);
+        };
+        let Some(rust) = rust_members::participation(self, definitions, receivers, cancellation)?
+        else {
+            return Ok(None);
+        };
+        assert_eq!(roles.len(), rust.len());
+        Ok(Some(
+            roles
+                .into_iter()
+                .zip(rust)
+                .map(|(role, rust)| role.as_deref() != Some("ignored") && rust)
+                .collect(),
+        ))
     }
 
     fn go_package_member_sources(
@@ -3461,6 +3752,193 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             }
         }
         Ok((!cancellation.is_cancelled()).then_some(rows))
+    }
+
+    fn admitted_owner_language(&self, owner: SemanticId) -> Option<Language> {
+        owner.ordinal().and_then(|ordinal| {
+            self.selection
+                .requested_mount_rows()
+                .known_record(SelectedResolutionMountOrdinal::new(ordinal))
+                .map(|record| record.semantic_language())
+        })
+    }
+
+    fn implicit_root_rules_for_language(
+        &self,
+        language: Language,
+    ) -> Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers> {
+        super::store_language_support(language)
+            .and_then(|support| support.selected_implicit_root_rules())
+    }
+
+    fn selected_implicit_root_input(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::resolution::SelectedImplicitRootInput>> {
+        use crate::analyzer::resolution::{
+            NominalParentTargetKind as Kind, SelectedImplicitRootInput as Input,
+            SelectedSourceImplicitRoot,
+        };
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(language) = self.admitted_owner_language(owner) else {
+            return Ok(Some(Input::NotProvided));
+        };
+        if self.implicit_root_rules_for_language(language).is_none() {
+            return Ok(Some(Input::NotProvided));
+        }
+        let open = || {
+            if let Some(provider) = self.nominal_kind_provider {
+                provider.refuse_reuse();
+            }
+            Input::Open(ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(owner),
+            ]))
+        };
+        // External/staged owners have no source candidate invariant.
+        let Some(ordinal) = owner.ordinal() else {
+            return Ok(Some(open()));
+        };
+        if ordinal as usize >= self.selection.persisted_mount_count() {
+            return Ok(Some(open()));
+        }
+        let Some(kinds) = self.nominal_parent_target_kinds(&[owner], cancellation)? else {
+            return Ok(None);
+        };
+        let kind = kinds
+            .iter()
+            .find(|(definition, _)| *definition == owner)
+            .map_or(Kind::Missing, |(_, kind)| *kind);
+        match kind {
+            Kind::Class | Kind::Interface | Kind::Struct | Kind::Enum => {}
+            Kind::NonBase | Kind::Missing | Kind::Ambiguous | Kind::Incomplete => {
+                return Ok(Some(open()));
+            }
+        }
+        let Some(facts) = self.declaration_source_facts(owner, cancellation)? else {
+            return Ok((!cancellation.is_cancelled()).then(open));
+        };
+        let Some((reference, frontier)) = facts.root_candidate else {
+            debug_assert!(
+                false,
+                "supported selected source owner lacks its implicit root candidate: {owner:?} {kind:?}"
+            );
+            return Ok(Some(open()));
+        };
+        // Kind/identity above is unique. A declaration-owned partial flag
+        // leaves unseen written parents open, independently of the root binding.
+        let context_completion = match facts.partial {
+            Some(false) => ResolutionCompletion::Complete,
+            None => return Ok(Some(open())),
+            Some(true) => {
+                let record = self
+                    .selection
+                    .requested_mount_rows()
+                    .known_record(SelectedResolutionMountOrdinal::new(ordinal))
+                    .expect("admitted source owner retains its selected header");
+                let local = owner
+                    .local_key()
+                    .expect("selected source owner has a local identity");
+                let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                    b"bifrost-partial-owner-written-parents:v1",
+                );
+                hash.field("source", &record.interior_digest);
+                hash.field("definition", &local.to_le_bytes());
+                let reason = self.context_identities.named_semantic(
+                    hash.finish(),
+                    "partial_type_written_parents_open",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+                    &format!(
+                        "{}: declaration {} is partial; other parts may supply written parents",
+                        record.persisted_relative_path, local
+                    ),
+                );
+                ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                    reason,
+                )])
+            }
+        };
+        Ok(Some(Input::Source(SelectedSourceImplicitRoot {
+            context_completion,
+            language,
+            owner_kind: kind,
+            reference,
+            frontier,
+        })))
+    }
+
+    fn declaration_class_like_metadata(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<Vec<crate::analyzer::resolution::fact_source::SelectedDeclarationClassLikeMetadata>>,
+    > {
+        match self.nominal_kind_provider {
+            Some(provider) => provider.class_like_metadata(definitions, cancellation),
+            None => Ok((!cancellation.is_cancelled()).then(Vec::new)),
+        }
+    }
+
+    fn records_class_like_staticness(&self, language: Language) -> bool {
+        self.nominal_kind_provider
+            .is_some_and(|provider| provider.records_class_like_staticness(language))
+    }
+
+    fn declaration_method_attributes(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<
+            Vec<(
+                SemanticId,
+                crate::analyzer::resolution::SelectedDeclarationMethodAttributes,
+            )>,
+        >,
+    > {
+        match self.nominal_kind_provider {
+            Some(provider) => provider.method_attributes(definitions, cancellation),
+            None => Ok((!cancellation.is_cancelled()).then(|| definitions.iter().copied()
+                .map(|definition| (definition, crate::analyzer::resolution::SelectedDeclarationMethodAttributes::default()))
+                .collect())),
+        }
+    }
+
+    fn requires_selected_nominal_parent_kind(&self, language: Language) -> bool {
+        super::store_language_support(language)
+            .is_some_and(|support| support.requires_selected_nominal_parent_kind())
+    }
+
+    fn nominal_parent_target_kinds(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<
+            Vec<(
+                SemanticId,
+                crate::analyzer::resolution::NominalParentTargetKind,
+            )>,
+        >,
+    > {
+        match self.nominal_kind_provider {
+            Some(provider) => provider.target_kinds(definitions, cancellation),
+            None => Ok((!cancellation.is_cancelled()).then(|| {
+                definitions
+                    .iter()
+                    .copied()
+                    .map(|definition| {
+                        (
+                            definition,
+                            crate::analyzer::resolution::NominalParentTargetKind::Missing,
+                        )
+                    })
+                    .collect()
+            })),
+        }
     }
 
     fn java_inheritance_declarations(
@@ -4563,6 +5041,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
     /// under the requested lookup and a qualifier slot cannot add a blob that
     /// relation omits; inside a blob, only a pair whose qualifier slot is that
     /// blob's own can match, which is what grouping the slot coordinates does.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn visit_qualified_route_pages_for_slot_lookups(
         &self,
         requests: TypedFactRequest<'_, QualifiedRouteSlotLookup>,
@@ -4657,6 +5136,9 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     TypedFactReadOutcome::cancelled(evidence.finish_semantic().0)
                 } else {
                     TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+                        .with_inventory_evidence(TypedFactInventoryEvidence::Established(
+                            ResolutionCompletion::Complete,
+                        ))
                 })
             },
             |visitor| {
@@ -4801,6 +5283,18 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn visit_declaration_modifier_pages_for_definitions(
+        &self,
+        definitions: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<
+            '_,
+            SelectedTypedRow<crate::analyzer::resolution::fact_source::SelectedDeclarationModifier>,
+        >,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        self.visit_declaration_modifiers(definitions, cancellation, visitor)
+    }
+
     fn visit_declaration_type_pages_for_definitions(
         &self,
         definitions: TypedFactRequest<'_, SemanticId>,
@@ -4831,7 +5325,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         if !source.is_exhausted() {
             return Ok(source);
         }
-        self.visit_external_declaration_types(definitions.as_slice(), cancellation, visitor)
+        Ok(source.followed_by(self.visit_external_declaration_types(
+            definitions.as_slice(),
+            cancellation,
+            visitor,
+        )?))
     }
 
     fn visit_declaration_type_pages_for_slots(
@@ -4864,7 +5362,13 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         if !source.is_exhausted() {
             return Ok(source);
         }
-        self.visit_external_declaration_types_for_slots(slots.as_slice(), cancellation, visitor)
+        Ok(
+            source.followed_by(self.visit_external_declaration_types_for_slots(
+                slots.as_slice(),
+                cancellation,
+                visitor,
+            )?),
+        )
     }
 
     /// Question 45 keeps the view it already has over the source declaration
@@ -4891,32 +5395,12 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     return cancelled();
                 };
                 self.visit_typed_rows(
-                &mounts,
-                typed_rows::DECLARATION_VISIBILITIES_BY_DEFINITION_SQL,
-                cancellation,
-                visitor,
-                |context, row| {
-                    let label: String = row.get(1)?;
-                    use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
-                    let boundary = match row.get::<_, Option<i64>>(2)? {
-                        None => None,
-                        Some(0) => Some(DeclarationAccessBoundary::Package(row.get(3)?)),
-                        Some(1) => Some(DeclarationAccessBoundary::Template(context.semantic(row.get(4)?))),
-                        kind => return Err(invalid_fact(format!("stored access boundary kind {kind:?} is outside its vocabulary"))),
-                    };
-                    Ok(SelectedTypedRow::new(
-                        context.fragment,
-                        LoweredDeclarationVisibilityProperty::new(
-                            context.semantic(row.get(0)?),
-                            DeclaredVisibility::from_label(&label).ok_or_else(|| {
-                                invalid_fact(format!(
-                                    "stored declaration visibility {label:?} is outside its vocabulary"
-                                ))
-                            })?,
-                        ).with_boundary(boundary),
-                    ))
-                },
-            )
+                    &mounts,
+                    typed_rows::DECLARATION_VISIBILITIES_BY_DEFINITION_SQL,
+                    cancellation,
+                    visitor,
+                    decode_declaration_visibility,
+                )
             },
             |visitor| {
                 super::resolution_stage::typed::visit_declaration_visibility_pages_for_definitions(
@@ -4961,18 +5445,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         }
         let external =
             self.visit_external_member_scopes(definitions.as_slice(), cancellation, visitor)?;
-        let completion = source.evidence().combine(external.evidence());
-        Ok(match external.terminal() {
-            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
-                TypedFactReadOutcome::exhausted(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
-                TypedFactReadOutcome::stopped(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
-                TypedFactReadOutcome::cancelled(completion)
-            }
-        })
+        Ok(source.followed_by(external))
     }
 
     fn visit_jvm_alias_pages_for_definitions(
@@ -5111,18 +5584,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             cancellation,
             visitor,
         )?;
-        let completion = source.evidence().combine(external.evidence());
-        Ok(match external.terminal() {
-            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
-                TypedFactReadOutcome::exhausted(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
-                TypedFactReadOutcome::stopped(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
-                TypedFactReadOutcome::cancelled(completion)
-            }
-        })
+        Ok(source.followed_by(external))
     }
 
     fn visit_member_owner_pages_for_owners(
@@ -5157,18 +5619,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         }
         let external =
             self.visit_external_member_owners(owner_definitions.as_slice(), cancellation, visitor)?;
-        let completion = source.evidence().combine(external.evidence());
-        Ok(match external.terminal() {
-            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
-                TypedFactReadOutcome::exhausted(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
-                TypedFactReadOutcome::stopped(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
-                TypedFactReadOutcome::cancelled(completion)
-            }
-        })
+        Ok(source.followed_by(external))
     }
 
     fn visit_deferred_member_owner_pages_for_definitions(
@@ -5286,22 +5737,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         }
         let model = self.visit_model_supertypes(definitions.as_slice(), cancellation, visitor)?;
         if !model.is_exhausted() {
-            return Ok(model);
+            return Ok(source.followed_by(model));
         }
         let external =
             self.visit_external_supertypes(definitions.as_slice(), cancellation, visitor)?;
-        let completion = source.evidence().combine(external.evidence());
-        Ok(match external.terminal() {
-            crate::analyzer::resolution::TypedFactReadTerminal::Exhausted => {
-                TypedFactReadOutcome::exhausted(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Stopped => {
-                TypedFactReadOutcome::stopped(completion)
-            }
-            crate::analyzer::resolution::TypedFactReadTerminal::Cancelled => {
-                TypedFactReadOutcome::cancelled(completion)
-            }
-        })
+        Ok(source.followed_by(model).followed_by(external))
     }
 
     fn visit_supertype_pages_for_references(
@@ -5593,6 +6033,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn visit_rust_reason_owners(
         &self,
         reasons: TypedFactRequest<'_, SemanticId>,
@@ -5863,6 +6304,38 @@ fn decode_declaration_type(
     ))
 }
 
+fn decode_declaration_visibility(
+    context: TypedRowContext,
+    row: &Row<'_>,
+) -> StoreResult<SelectedTypedRow<LoweredDeclarationVisibilityProperty>> {
+    let label: String = row.get(1)?;
+    use brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary;
+    let boundary = match row.get::<_, Option<i64>>(2)? {
+        None => None,
+        Some(0) => Some(DeclarationAccessBoundary::Package(row.get(3)?)),
+        Some(1) => Some(DeclarationAccessBoundary::Template(
+            context.semantic(row.get(4)?),
+        )),
+        kind => {
+            return Err(invalid_fact(format!(
+                "stored access boundary kind {kind:?} is outside its vocabulary"
+            )));
+        }
+    };
+    Ok(SelectedTypedRow::new(
+        context.fragment,
+        LoweredDeclarationVisibilityProperty::new(
+            context.semantic(row.get(0)?),
+            DeclaredVisibility::from_label(&label).ok_or_else(|| {
+                invalid_fact(format!(
+                    "stored declaration visibility {label:?} is outside its vocabulary"
+                ))
+            })?,
+        )
+        .with_boundary(boundary),
+    ))
+}
+
 fn decode_member_scope(
     context: TypedRowContext,
     row: &Row<'_>,
@@ -5933,14 +6406,17 @@ fn decode_supertype(
             LoweredDeclaredTypeArgument::new(frontier, position as u32, context.semantic(argument))
         })
         .collect::<Vec<_>>();
-    let property = LoweredSupertypeProperty::from(typed_rows::decode_supertype(
-        context,
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-    ))
+    let property = LoweredSupertypeProperty::from_source(
+        typed_rows::decode_supertype(
+            context,
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ),
+        context.language,
+    )
     .with_source_arguments(&arguments);
     Ok(SelectedTypedRow::new(context.fragment, property))
 }
@@ -6076,6 +6552,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     }
 
     /// Produce one read key per name, including names with no matching row.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_lookup_read_keys(
         &self,
         names: &[SemanticId],
@@ -6299,7 +6776,9 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         Ok(if cancellation.is_cancelled() {
             TypedFactReadOutcome::cancelled(evidence.finish_semantic().0)
         } else {
-            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete).with_inventory_evidence(
+                TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete),
+            )
         })
     }
 
@@ -6349,7 +6828,9 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         Ok(if cancellation.is_cancelled() {
             TypedFactReadOutcome::cancelled(evidence.finish_semantic().0)
         } else {
-            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete).with_inventory_evidence(
+                TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete),
+            )
         })
     }
 
@@ -6358,6 +6839,7 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     /// The whole answer for one blob lives for one call, which is the
     /// query-lifetime shape milestone 6 allows; nothing here outlives the
     /// request.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn decode_page<T: TypedRowEvidence>(
         &self,
         mount: &SelectedResolutionMountRecord,
@@ -6435,8 +6917,26 @@ fn group_keys(coordinates: impl Iterator<Item = RequestCoordinate>) -> Vec<Mount
     grouped
 }
 
-// Both arms answer one caller request. Preserve their row order and multiplicity;
-// this buffer is dropped when that request finishes, before the next query.
+/// Merge ordinary and staged rows for one selected request.
+///
+/// On exhaustion, legacy evidence combines the two SOURCE-arm outcomes. Row
+/// semantics remain on the returned rows: a source-complete inventory does
+/// not make a transfer rule, intrinsic value, applicability obligation, or
+/// callable signature semantically complete. A consumer deriving a binding
+/// or value must retain the completion of each row it consumes. A qualified
+/// route's coarse gap is a provisional member-binding obligation; only the
+/// qualified evaluator's qualifier, owner/member inventory and exact lookup
+/// proof can discharge it. Inspecting structural fields such as qualifier
+/// coordinates, namespace or topology does not itself resolve that member.
+///
+/// Stopped and cancelled outcomes retain decoded-prefix row AND source
+/// evidence, including decoded rows not delivered to the outer visitor.
+/// Cancellation wins over callback stop. Independent inventory authority is
+/// transported separately; neither an empty row set nor legacy Complete
+/// manufactures Established(Complete) authority.
+///
+/// Preserve row order and multiplicity across both arms. The buffer is dropped
+/// when this request finishes, before the next query.
 fn visit_combined_typed_rows<T: TypedRowEvidence + Clone>(
     cancellation: &CancellationToken,
     visitor: &mut TypedFactPageVisitor<'_, T>,
@@ -6457,6 +6957,9 @@ fn visit_combined_typed_rows<T: TypedRowEvidence + Clone>(
             evidence.finish_semantic().0,
         ));
     }
+    let inventory = ordinary
+        .inventory_evidence()
+        .combine(stage.inventory_evidence());
     let terminal = SelectedResolutionTypedSource::page_out(&answer, cancellation, visitor)?;
     let (completion, cancelled) = evidence.finish_semantic();
     Ok(if cancelled || matches!(terminal, PageOutcome::Cancelled) {
@@ -6464,7 +6967,11 @@ fn visit_combined_typed_rows<T: TypedRowEvidence + Clone>(
     } else {
         match terminal {
             PageOutcome::Exhausted => {
-                TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+                // Row semantics remain on delivered rows. Retain only arm-source
+                // completion here, so exhausted complete inventories keep the
+                // normal session's existing row-observation work.
+                TypedFactReadOutcome::exhausted(ordinary.evidence().combine(stage.evidence()))
+                    .with_inventory_evidence(inventory)
             }
             PageOutcome::Stopped => TypedFactReadOutcome::stopped(completion),
             PageOutcome::Cancelled => unreachable!("handled cancelled terminal"),
@@ -6651,6 +7158,185 @@ pub mod row_evidence_tests {
                 ),
             ),
         )
+    }
+
+    // Hard-won: #11378 exhausted source unions erased an incomplete arm.
+    #[cfg(test)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11378: exhausted typed-row union dropped source-arm incompleteness"
+    )]
+    fn exhausted_typed_union_preserves_incomplete_source_arm() {
+        let cancellation = CancellationToken::new();
+        let failure =
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                SemanticId::shared_name(SharedNameId::interned(1)),
+            )]);
+        for incomplete_first in [false, true] {
+            let first = if incomplete_first {
+                failure.clone()
+            } else {
+                ResolutionCompletion::Complete
+            };
+            let second = if incomplete_first {
+                ResolutionCompletion::Complete
+            } else {
+                failure.clone()
+            };
+            let result = visit_combined_typed_rows::<
+                SelectedTypedRow<LoweredDeclarationTypeProperty>,
+            >(
+                &cancellation,
+                &mut TypedFactPageVisitor::new(&mut |_| Ok(true)),
+                |_| {
+                    Ok(TypedFactReadOutcome::exhausted(first.clone())
+                        .with_inventory_evidence(TypedFactInventoryEvidence::Established(first)))
+                },
+                |_| {
+                    Ok(TypedFactReadOutcome::exhausted(second.clone())
+                        .with_inventory_evidence(TypedFactInventoryEvidence::Established(second)))
+                },
+            )
+            .unwrap();
+            assert!(result.is_exhausted());
+            assert_eq!(result.evidence(), &failure);
+            assert_eq!(
+                result.inventory_evidence(),
+                &TypedFactInventoryEvidence::Established(failure.clone())
+            );
+        }
+
+        // A row-only gap is still delivered, without adding another copy of
+        // its reasons to an exhausted source's legacy completion.
+        let context = TypedRowContext {
+            fragment: BindingFragmentId::for_test(b"source-versus-row-evidence"),
+            ordinal: 0,
+            language: Language::Java,
+            names: crate::analyzer::resolution::test_shared_names(),
+        };
+        let row = seed(context, 1);
+        let mut delivered = Vec::new();
+        let outcome = visit_combined_typed_rows(
+            &cancellation,
+            &mut TypedFactPageVisitor::new(&mut |page| {
+                delivered.extend_from_slice(page);
+                Ok(true)
+            }),
+            |visitor| {
+                assert!(visitor.visit_page(std::slice::from_ref(&row))?);
+                Ok(
+                    TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+                        .with_inventory_evidence(TypedFactInventoryEvidence::Established(
+                            ResolutionCompletion::Complete,
+                        )),
+                )
+            },
+            |_| {
+                Ok(
+                    TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+                        .with_inventory_evidence(TypedFactInventoryEvidence::Established(
+                            ResolutionCompletion::Complete,
+                        )),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered, [row]);
+        assert_ne!(
+            delivered[0].row().frontier().completion(),
+            &ResolutionCompletion::Complete
+        );
+        assert_eq!(outcome.evidence(), &ResolutionCompletion::Complete);
+        assert_eq!(
+            outcome.inventory_evidence(),
+            &TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete)
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12917: exhausted unions promoted row-local gaps into source completion"
+    )]
+    fn exhausted_combined_rows_preserve_row_evidence_and_terminals() {
+        use crate::analyzer::resolution::TypedFactReadTerminal;
+        let context = TypedRowContext {
+            fragment: BindingFragmentId::for_test(b"combined-row-evidence"),
+            ordinal: 0,
+            language: Language::Java,
+            names: crate::analyzer::resolution::test_shared_names(),
+        };
+        let ordinary = seed(context, 1);
+        let staged = seed(context, 2);
+        let row_evidence = ordinary
+            .row()
+            .frontier()
+            .completion()
+            .combine(staged.row().frontier().completion());
+        let mut mismatches = Vec::new();
+        for (keep_going, cancel, terminal) in [
+            (true, false, TypedFactReadTerminal::Exhausted),
+            (false, false, TypedFactReadTerminal::Stopped),
+            (false, true, TypedFactReadTerminal::Cancelled),
+        ] {
+            for source_incomplete in [false, true] {
+                let source_evidence = if source_incomplete {
+                    ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(context.semantic(200)),
+                    ])
+                } else {
+                    ResolutionCompletion::Complete
+                };
+                let expected = match terminal {
+                    TypedFactReadTerminal::Exhausted => source_evidence.clone(),
+                    TypedFactReadTerminal::Stopped | TypedFactReadTerminal::Cancelled => {
+                        row_evidence.combine(&source_evidence)
+                    }
+                };
+                let cancellation = CancellationToken::new();
+                let mut observed = Vec::new();
+                let actual = visit_combined_typed_rows(
+                    &cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        observed.extend_from_slice(page);
+                        if cancel {
+                            cancellation.cancel();
+                        }
+                        Ok(keep_going)
+                    }),
+                    |visitor| {
+                        assert!(visitor.visit_page(std::slice::from_ref(&ordinary))?);
+                        Ok(TypedFactReadOutcome::exhausted(
+                            ResolutionCompletion::Complete,
+                        ))
+                    },
+                    |visitor| {
+                        assert!(visitor.visit_page(std::slice::from_ref(&staged))?);
+                        Ok(TypedFactReadOutcome::exhausted(source_evidence.clone()))
+                    },
+                )
+                .unwrap();
+                assert_eq!(observed, [ordinary.clone(), staged.clone()]);
+                // The exhausted source can be complete while both delivered rows
+                // retain their semantic gaps. Consumers must observe those rows.
+                assert_eq!(
+                    observed[0]
+                        .row()
+                        .frontier()
+                        .completion()
+                        .combine(observed[1].row().frontier().completion()),
+                    row_evidence,
+                );
+                assert_eq!(actual.terminal(), terminal);
+                if actual.evidence() != &expected {
+                    mismatches.push((terminal, source_incomplete, actual, expected));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "incorrect combined source or prefix evidence: {mismatches:#?}"
+        );
     }
 
     #[cfg(test)]

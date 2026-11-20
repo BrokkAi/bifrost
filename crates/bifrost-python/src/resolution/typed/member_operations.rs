@@ -107,8 +107,10 @@ fn callee_binding_reference(
 
 fn names(t: &mut Typed<'_, '_, '_, '_>, node: Node<'_>) -> PythonMemberNames {
     let literal = PYTHON_STRUCTURAL_SPEC.string_literal_value(node, t.p.source);
-    if let Some(literal) = literal {
-        return PythonMemberNames::Exact(vec![t.p.facts.intern_name(&mut t.p.names, &literal)]);
+    // An empty literal (`getattr(x, "")`) names no member: it stays dynamic.
+    if let Some(name) = literal.and_then(|literal| t.p.facts.intern_name(&mut t.p.names, &literal))
+    {
+        return PythonMemberNames::Exact(vec![name]);
     }
     if node.kind() == "binary_operator"
         && node
@@ -119,7 +121,8 @@ fn names(t: &mut Typed<'_, '_, '_, '_>, node: Node<'_>) -> PythonMemberNames {
             .and_then(|left| PYTHON_STRUCTURAL_SPEC.string_literal_value(left, t.p.source))
             .filter(|prefix| !prefix.is_empty())
     {
-        return PythonMemberNames::Prefix(t.p.facts.intern_name(&mut t.p.names, &prefix));
+        let prefix = t.p.facts.intern_name(&mut t.p.names, &prefix);
+        return prefix.map_or(PythonMemberNames::Any, PythonMemberNames::Prefix);
     }
     PythonMemberNames::Any
 }
@@ -207,22 +210,23 @@ fn mapping_names(t: &mut Typed<'_, '_, '_, '_>, args: &[Node<'_>]) -> PythonMemb
                         .and_then(|key| {
                             PYTHON_STRUCTURAL_SPEC.string_literal_value(key, t.p.source)
                         })
+                        .and_then(|key| t.p.facts.intern_name(&mut t.p.names, &key))
                     else {
                         return PythonMemberNames::Any;
                     };
-                    let key = t.p.facts.intern_name(&mut t.p.names, &key);
                     if seen.insert(key) {
                         keys.push(key);
                     }
                 }
             }
             "keyword_argument" => {
-                let key = arg
+                let Some(key) = arg
                     .child_by_field_name("name")
-                    .expect("keyword name")
-                    .utf8_text(t.p.source.as_bytes())
-                    .expect("UTF-8 keyword");
-                let key = t.p.facts.intern_name(&mut t.p.names, key);
+                    .and_then(|name| name.utf8_text(t.p.source.as_bytes()).ok())
+                    .and_then(|key| t.p.facts.intern_name(&mut t.p.names, key))
+                else {
+                    return PythonMemberNames::Any;
+                };
                 if seen.insert(key) {
                     keys.push(key);
                 }
@@ -547,9 +551,11 @@ pub(super) fn produce(
                             let (_, member) = target
                                 .rsplit_once('.')
                                 .expect("validated module/member path");
-                            PythonMemberNames::Exact(vec![
-                                t.p.facts.intern_name(&mut t.p.names, member),
-                            ])
+                            t.p.facts
+                                .intern_name(&mut t.p.names, member)
+                                .map_or(PythonMemberNames::Any, |member| {
+                                    PythonMemberNames::Exact(vec![member])
+                                })
                         }
                         None => PythonMemberNames::Any,
                     }
@@ -597,13 +603,17 @@ pub(super) fn produce(
                 && let Some(value) = PYTHON_STRUCTURAL_SPEC.string_literal_value(name, t.p.source)
                 && is_python_member_path(&value)
                 && let Some((owner, _)) = value.rsplit_once('.')
+                && owner.split('.').all(|part| !part.is_empty())
             {
                 // A selected API string value denotes an absolute module/
                 // attribute route, not Python expression syntax. Its real
                 // literal site is a prerequisite, never a proved operation.
                 let mut parts = owner.split('.').collect::<Vec<_>>();
                 let terminal = parts.pop().expect("nonempty owner");
-                let name_id = t.p.facts.intern_name(&mut t.p.names, terminal);
+                let name_id =
+                    t.p.facts
+                        .intern_name(&mut t.p.names, terminal)
+                        .expect("non-empty Python member path segment");
                 let reference = t.p.site(
                     name,
                     t.scopes[&name.id()],
@@ -624,7 +634,10 @@ pub(super) fn produce(
                     owner_continued: false,
                 });
                 for (position, part) in parts.into_iter().enumerate() {
-                    let name = t.p.facts.intern_name(&mut t.p.names, part);
+                    let name =
+                        t.p.facts
+                            .intern_name(&mut t.p.names, part)
+                            .expect("non-empty Python member path segment");
                     t.p.facts
                         .root_reference_segments
                         .push(ResolutionRootReferenceSegmentFact {

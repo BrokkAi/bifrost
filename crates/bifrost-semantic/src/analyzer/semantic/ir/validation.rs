@@ -288,9 +288,7 @@ impl GapIndex {
                 procedure.id,
                 SemanticIrErrorKind::GapContract,
                 format!(
-                    "procedure {} {:?} gap {} ({}) duplicates gap {} ({}) at the same scoped fact with {} and {} outcomes",
-                    procedure.locator.path(),
-                    procedure.locator.declaration(),
+                    "gap {} ({}) duplicates gap {} ({}) at the same scoped fact with {} and {} outcomes",
                     gap.id,
                     gap.detail,
                     previous.id,
@@ -414,6 +412,16 @@ fn account_text(text: &str, work: &mut SemanticWork) {
 }
 
 pub(in crate::analyzer::semantic::ir) fn validate_artifact(
+    key: &SemanticArtifactKey,
+    capabilities: &SemanticCapabilities,
+    procedures: &[ProcedureSemanticsParts],
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<(), SemanticIrError> {
+    validate_artifact_rows(key, capabilities, procedures, cancellation)
+        .map_err(|error| error.at_procedure_source(procedures))
+}
+
+fn validate_artifact_rows(
     key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
     procedures: &[ProcedureSemanticsParts],
@@ -659,8 +667,8 @@ pub(super) fn validate_ownership_projection(
         target,
         &captures,
         cancellation,
-    )?;
-    Ok(())
+    )
+    .map_err(|error| error.at_source(&target.locator))
 }
 
 fn validate_procedure(
@@ -818,6 +826,26 @@ fn validate_procedure(
                 id,
                 SemanticIrErrorKind::GapContract,
                 "data-dependency obligations require an exact withheld value",
+            ));
+        }
+        if gap.discharge == SemanticGapDischarge::CreatingRealizationBindsCaptures
+            && (gap.capability != SemanticCapability::Captures
+                || gap.kind != SemanticGapKind::Unknown
+                || !match gap.subject {
+                    SemanticGapSubject::Procedure => true,
+                    SemanticGapSubject::MemoryLocation(location) => procedure
+                        .memory_locations
+                        .get(location.index())
+                        .is_some_and(|location| {
+                            matches!(location.kind, MemoryLocationKind::Capture { .. })
+                        }),
+                    _ => false,
+                })
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                "creating-realization capture obligations require an unknown capture environment or slot",
             ));
         }
         if gap.discharge == SemanticGapDischarge::CallResolution
@@ -990,7 +1018,7 @@ fn validate_procedure(
                 id,
                 SemanticIrErrorKind::GapContract,
                 format!(
-                    "gap {} declares canonical index identity outside an unsupported index-memory gap whose point retains an access to its constant-indexed location",
+                    "gap {} declares canonical index identity outside an unsupported index-memory gap whose point retains an access to its constant-indexed or aggregate location",
                     gap.id
                 ),
             ));
@@ -1059,6 +1087,15 @@ fn validate_procedure(
     let mut default_argument_ordinals = HashSet::default();
     for value in &procedure.values {
         validate_metadata(id, value.source, value.evidence, procedure, "value")?;
+        if value.actual_borrow != crate::analyzer::semantic::ActualBorrowKind::Unknown
+            && value.kind != SemanticValueKind::Address
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::ValueFlowContract,
+                "actual borrow evidence requires an address value",
+            ));
+        }
         if let Some(StaticTypeOrigin::CallResult { call, ordinal }) = &value.static_type_origin {
             ensure_call_site(id, *call, procedure.call_sites.len(), "static type origin")?;
             if value.static_type_class != StaticTypeClass::Unknown
@@ -2059,14 +2096,40 @@ fn validate_switch_facts(
                 format!("expression switch {} has no selector", fact.id),
             ));
         }
-        if fact.default_present != fact.default_edge.is_some()
-            && fact.kind == SwitchFactKind::Expression
-        {
-            return Err(SemanticIrError::procedure(
-                id,
-                SemanticIrErrorKind::SwitchContract,
-                format!("switch {} default presence and edge disagree", fact.id),
-            ));
+        // `default_present` describes the source switch; `default_edge` is the
+        // lowered edge into the default arm. An edge without a default is
+        // invalid. A default without an edge is valid only when a constant
+        // selector matched a label: the producer then records a
+        // `ConstantBoolean(true)` guard on that label's case edge, like a
+        // folded condition. Without the proof, a dropped default edge would
+        // pass here and switch coverage would report the switch exhaustive.
+        if fact.kind == SwitchFactKind::Expression {
+            if fact.default_edge.is_some() && !fact.default_present {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::SwitchContract,
+                    format!("switch {} has a default edge but no default", fact.id),
+                ));
+            }
+            if fact.default_present
+                && fact.default_edge.is_none()
+                && !fact.cases.iter().any(|case| {
+                    procedure.guard_facts.iter().any(|guard| {
+                        guard.point == case.edge.source_point
+                            && guard.predicate == (GuardPredicate::ConstantBoolean { value: true })
+                            && guard.true_arm == Some(case.edge.arm)
+                    })
+                })
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::SwitchContract,
+                    format!(
+                        "switch {} has a default but no default edge and no folded constant-selector proof on a case edge",
+                        fact.id
+                    ),
+                ));
+            }
         }
         for case in &fact.cases {
             ensure_value(id, case.value, procedure.values.len(), "switch case value")?;
@@ -2303,6 +2366,11 @@ fn validate_guard_facts(
             GuardPredicate::Truthy { value } => {
                 ensure_value(id, value, procedure.values.len(), "guarded value")?;
             }
+            GuardPredicate::ValueEquality { left, right, .. }
+            | GuardPredicate::ValueOrdering { left, right, .. } => {
+                ensure_value(id, left, procedure.values.len(), "guard left operand")?;
+                ensure_value(id, right, procedure.values.len(), "guard right operand")?;
+            }
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::NullComparison { .. }
             | GuardPredicate::ConstantEquality { .. }
@@ -2397,14 +2465,20 @@ fn validate_memory_location(
                 SemanticCapability::Captures,
             );
             if !has_binding && !has_gap {
-                return Err(SemanticIrError::procedure(
+                let error = SemanticIrError::procedure(
                     id,
                     SemanticIrErrorKind::CaptureContract,
                     format!(
                         "capture location {} has no lexical-parent binding or explicit capture gap",
                         location.id
                     ),
-                ));
+                );
+                return Err(
+                    match procedure.source_mappings.get(location.source.index()) {
+                        Some(mapping) => error.at_source(&mapping.locator),
+                        None => error,
+                    },
+                );
             }
         }
     }

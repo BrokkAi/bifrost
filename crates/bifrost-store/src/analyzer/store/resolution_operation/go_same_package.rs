@@ -275,6 +275,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// this only after the native member answer is already incomplete; reverse
     /// inventory has its own build-selection contract and must not use this read.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_package_with_unselected_source(
         &self,
         context_id: i64,
@@ -355,6 +356,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(outcome)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn go_package_context_for_selection(
         &self,
         context_id: i64,

@@ -15,6 +15,7 @@ fn diagnostic_causes_match_the_comparator_code_and_impact_inventory() {
         PolicyDiagnosticCode::EndpointDominanceUndecidable,
         PolicyDiagnosticCode::EvaluationFailure,
         PolicyDiagnosticCode::EmptySelection,
+        PolicyDiagnosticCode::GuardRemovalVocabularyNote,
         PolicyDiagnosticCode::UnknownVerdictFailClosed,
         PolicyDiagnosticCode::BatchFindingLimit,
         PolicyDiagnosticCode::ReportRetentionBudget,
@@ -71,7 +72,7 @@ fn diagnostic_causes_match_the_comparator_code_and_impact_inventory() {
             .cloned()
             .collect()
     );
-    assert_eq!(emitted.len(), 139);
+    assert_eq!(emitted.len(), 144);
     let impacts = [
         PolicyDiagnosticImpact::Advisory,
         PolicyDiagnosticImpact::DeclaredNonExhaustive,
@@ -99,7 +100,7 @@ fn diagnostic_causes_match_the_comparator_code_and_impact_inventory() {
             }
         }
     }
-    assert_eq!(all.iter().count(), 138 * 9 + 8);
+    assert_eq!(all.iter().count(), 143 * 9 + 8);
     assert!(
         all.iter()
             .all(|cause| cause.impact() == PolicyDiagnosticImpact::RunFailed)
@@ -136,7 +137,7 @@ fn diagnostic_causes_match_the_comparator_code_and_impact_inventory() {
             .as_array()
             .unwrap()
             .len(),
-        137 * 9 + 8 + 1 // retention code is centrally certified to one origin
+        142 * 9 + 8 + 1 // retention code is centrally certified to one origin
     );
 }
 

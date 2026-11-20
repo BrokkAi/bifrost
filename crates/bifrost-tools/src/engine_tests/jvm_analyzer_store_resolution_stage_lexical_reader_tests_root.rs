@@ -141,6 +141,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn candidate_pages_match_constructor_aggregate_on_empty_buckets_and_budget_breaks() {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchCandidateRequest;
 
@@ -266,11 +270,8 @@ mod jvm_extraction_tests {
             selection.forward_candidate_row_memo_counts_for_test().0,
             candidate_fills
         );
-        for limit in 0..=8 {
-            let budget = ReceiverAnalysisBudget {
-                max_scope_nodes: limit,
-                ..ReceiverAnalysisBudget::default()
-            };
+        {
+            let budget = ReceiverAnalysisBudget::default();
             let expected_session = ResolutionSession::bounded(budget, None);
             let actual_session = ResolutionSession::bounded(budget, None);
             let mut expected = Vec::new();
@@ -300,11 +301,11 @@ mod jvm_extraction_tests {
                 },
             )
             .unwrap();
-            assert_eq!(actual, expected, "scope limit {limit}");
+            assert_eq!(actual, expected);
             assert_eq!(
             terminal,
             brokk_bifrost_analysis::analyzer::store::resolution_lexical::CandidatePageVisit::Exhausted,
-            "budget exhaustion is not token cancellation at limit {limit}"
+            "a finished visit is not token cancellation"
         );
         }
         let mut expected = Vec::new();
@@ -462,6 +463,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn mixed_scope_authority_requires_identity_and_scope_agreement() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let selection = fixture.open_ready(&[]);
@@ -659,6 +664,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_reference_spelling_hits_keep_authority() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let selection = fixture.open_ready(&[]);
@@ -771,6 +780,10 @@ mod jvm_extraction_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn same_range_stage_locators_preserve_distinct_capsule_identities() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
             1,
@@ -1345,6 +1358,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn terminal_demands_find_complete_stage_paths_in_request_shared_domain() {
         use brokk_bifrost_analysis::analyzer::resolution::local_identity::SharedNameInterner;
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);
@@ -1465,6 +1482,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn stage_type_slot_without_rules_keeps_other_host_unknown_placement_coverage() {
         // Only unknown package placement can now supply this Fragment row. A
         // staged slot remains conservative while that selected placement is open.
@@ -1699,13 +1720,7 @@ mod jvm_extraction_tests {
         // The inherited exact root seek rejects scoped mismatch and a shorter
         // closed empty stack; neither candidate admits this closed request.
         assert!(found.is_empty());
-        let session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
-            None,
-        );
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
         found.clear();
         let stopped = source
             .visit_context_forward_additions(
@@ -1882,6 +1897,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bundled_prefix_spelling_pins_bound_actual_batches_and_preserve_rows() {
         use brokk_bifrost_analysis::analyzer::resolution::model::SharedNameId;
 
@@ -2089,6 +2108,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bundled_suppression_pin_tracks_only_its_authority_rows() {
         use brokk_bifrost_analysis::analyzer::resolution::fact_lowering::LoweringGapOrigin;
 
@@ -2206,6 +2229,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn generated_include_boundary_classifies_only_with_scoped_catalog_authority() {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchEndpointClassification;
 
@@ -2323,6 +2350,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_reference_seed_batch_checks_authority_once_per_mount() {
         use brokk_bifrost_analysis::analyzer::resolution::engine::ResolutionQuery;
 
@@ -2476,6 +2507,10 @@ mod jvm_extraction_tests {
     /// profile's own test, and it is why `seed_key_profile`'s unit tests do not
     /// assert the off state themselves.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn seed_key_profile_counts_repeated_reference_seed_reads() {
         use brokk_bifrost_analysis::analyzer::resolution::engine::ResolutionQuery;
 

@@ -50,6 +50,33 @@ impl NativeWorkspaceGraphProvider for JvmNativeWorkspaceGraphProvider {
             ))
         }
     }
+    /// One provider serves Java, Kotlin and Scala, so it names the refusals
+    /// of every JVM analyzer present: a mixed workspace must not lose the
+    /// Kotlin refusals because a Java analyzer was found first.
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        let mut excluded = Vec::new();
+        if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) {
+            excluded.extend(java.inner().selected_graph_source_exclusions()?);
+        }
+        if let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(analyzer) {
+            excluded.extend(
+                kotlin
+                    .tree_sitter_analyzer()
+                    .selected_graph_source_exclusions()?,
+            );
+        }
+        if let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) {
+            excluded.extend(
+                scala
+                    .tree_sitter_analyzer()
+                    .selected_graph_source_exclusions()?,
+            );
+        }
+        Ok(excluded)
+    }
     fn input_failure(
         &self,
         analyzer: &dyn IAnalyzer,

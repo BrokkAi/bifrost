@@ -560,6 +560,10 @@ pub enum QueryValueKind {
     PointsToCandidate,
     /// Exact right-hand operand of a proven static member assignment.
     FieldWriteValue,
+    /// One modeled field store of a field declaration.
+    FieldWrite,
+    /// One modeled field load of a field declaration.
+    FieldRead,
     CallShape,
     CallResult,
     ResultSubjectUse,
@@ -652,6 +656,8 @@ pub const FILE_OF_INPUT_KINDS: &[QueryValueKind] = &[
     QueryValueKind::ReceiverOutcome,
     QueryValueKind::ReceiverEvidence,
     QueryValueKind::FieldWriteValue,
+    QueryValueKind::FieldWrite,
+    QueryValueKind::FieldRead,
     QueryValueKind::CallShape,
     QueryValueKind::CallResult,
     QueryValueKind::ResultSubjectUse,
@@ -740,6 +746,8 @@ impl QueryValueKind {
             | Self::ReceiverEvidence
             | Self::PointsToCandidate
             | Self::FieldWriteValue
+            | Self::FieldWrite
+            | Self::FieldRead
             | Self::CallShape
             | Self::CallResult
             | Self::ResultSubjectUse
@@ -829,6 +837,8 @@ impl QueryValueKind {
             Self::ReceiverEvidence => "receiver_evidence",
             Self::PointsToCandidate => "points_to_candidate",
             Self::FieldWriteValue => "field_write_value",
+            Self::FieldWrite => "field_write",
+            Self::FieldRead => "field_read",
             Self::CallShape => "call_shape",
             Self::CallResult => "call_result",
             Self::ResultSubjectUse => "result_subject_use",
@@ -2082,6 +2092,8 @@ pub enum QueryStep {
     StateEventsOf(StateEventFilter),
     BindingInitializerCallsOf,
     SelectedPropertyRelationsOf,
+    FieldWritesOf,
+    FieldReadsOf,
     FlowRelationsOf(FlowRelationFilter),
     FlowSource,
     FlowTarget,
@@ -2685,6 +2697,8 @@ impl QueryStep {
             Self::StateEventsOf(_) => QueryStepOp::StateEventsOf,
             Self::BindingInitializerCallsOf => QueryStepOp::BindingInitializerCallsOf,
             Self::SelectedPropertyRelationsOf => QueryStepOp::SelectedPropertyRelationsOf,
+            Self::FieldWritesOf => QueryStepOp::FieldWritesOf,
+            Self::FieldReadsOf => QueryStepOp::FieldReadsOf,
             Self::FlowRelationsOf(_) => QueryStepOp::FlowRelationsOf,
             Self::FlowSource => QueryStepOp::FlowSource,
             Self::FlowTarget => QueryStepOp::FlowTarget,
@@ -2898,6 +2912,8 @@ impl QueryStep {
             QueryStepOp::StateEventsOf => Some(Self::StateEventsOf(StateEventFilter::default())),
             QueryStepOp::BindingInitializerCallsOf => Some(Self::BindingInitializerCallsOf),
             QueryStepOp::SelectedPropertyRelationsOf => Some(Self::SelectedPropertyRelationsOf),
+            QueryStepOp::FieldWritesOf => Some(Self::FieldWritesOf),
+            QueryStepOp::FieldReadsOf => Some(Self::FieldReadsOf),
             QueryStepOp::FlowRelationsOf => {
                 Some(Self::FlowRelationsOf(FlowRelationFilter::default()))
             }
@@ -3351,6 +3367,8 @@ impl QueryStep {
             (Self::SelectedPropertyRelationsOf, QueryValueKind::ProgramPoint) => {
                 Some(QueryValueKind::FlowRelation)
             }
+            (Self::FieldWritesOf, QueryValueKind::Declaration) => Some(QueryValueKind::FieldWrite),
+            (Self::FieldReadsOf, QueryValueKind::Declaration) => Some(QueryValueKind::FieldRead),
             (Self::FlowRelationsOf(_), QueryValueKind::StateEvent | QueryValueKind::Procedure) => {
                 Some(QueryValueKind::FlowRelation)
             }
@@ -3760,6 +3778,7 @@ fn validate_query_steps(
             QueryStep::StateEventsOf(_) => "procedure or declaration",
             QueryStep::BindingInitializerCallsOf => "state_event",
             QueryStep::SelectedPropertyRelationsOf => "program_point",
+            QueryStep::FieldWritesOf | QueryStep::FieldReadsOf => "declaration",
             QueryStep::FlowRelationsOf(_) => "state_event or procedure",
             QueryStep::FlowSource | QueryStep::FlowTarget => "flow_relation",
             QueryStep::ControlRelations(_) => "procedure",
@@ -4484,6 +4503,13 @@ pub struct CodeQuery {
 }
 
 impl CodeQuery {
+    pub fn selected_guard_relation_id(&self) -> Option<&'static str> {
+        self.plan.steps.iter().find_map(|step| match step {
+            QueryStep::RustPointerFindings => Some("rust-pointer-findings"),
+            _ => None,
+        })
+    }
+
     pub fn seed(&self) -> Option<&CodeQuerySeed> {
         match &self.plan.source {
             CodeQueryPlanSource::Seed(seed) => Some(seed),

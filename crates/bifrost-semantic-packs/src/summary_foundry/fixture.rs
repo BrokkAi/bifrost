@@ -564,6 +564,7 @@ fn pack_source(
         shards: vec![AuthoredShard {
             id: "summaries.fixture".to_owned(),
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: Some(NameSelector {
                     name: FIXTURE_PACKAGE_NAME.to_owned(),
                     version: Some(FIXTURE_PACKAGE_REQUIREMENT.to_owned()),

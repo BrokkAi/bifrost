@@ -299,7 +299,8 @@ pub fn binding_unavailable(
     if error.is_cancelled() {
         UnavailableCause::Cancelled
     } else {
-        UnavailableCause::Failed(error.to_string().into())
+        crate::analyzer::i_analyzer::record_store_error_on_current_contexts(error);
+        UnavailableCause::StoreFailure
     }
 }
 
@@ -421,7 +422,9 @@ pub(super) fn named_main_bridge_allows(
         !active.get()
             || matches!(
                 kind.0,
-                "derivation:rust_package_units:v1"
+                "derivation:rust_name_availability:v1"
+                    | "derivation:rust_file_availability:v1"
+                    | "derivation:rust_package_units:v1"
                     | "derivation:rust_file_units:v1"
                     | "derivation:rust_unit_package_rows:v1"
             )

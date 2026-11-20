@@ -944,14 +944,14 @@ fn project_kotlin_external_boundary(
                 let Some(target) = target else {
                     return false;
                 };
-                let Some(owner) = kotlin
-                    .external_declarations(query.analyzer.semantic_model_overlay_read().published())
-                    .resolve_qualified_name(
-                        &crate::analyzer::jvm::external::QueryGapRecorder::new(kotlin),
-                        target,
-                        "",
-                    )
-                else {
+                let surface = kotlin.external_declarations(
+                    query.analyzer.semantic_model_overlay_read().published(),
+                );
+                let recorder = crate::analyzer::jvm::external::QueryGapRecorder::new(kotlin);
+                let Some(owner) = surface.or_record_miss(
+                    &recorder,
+                    surface.resolve_qualified_name(&recorder, target, ""),
+                ) else {
                     return false;
                 };
                 let crate::analyzer::jvm::external::JvmExternalDeclarationSource::SemanticPack {

@@ -102,3 +102,13 @@ mod python_definition_flags;
 mod python_receiver_evaluation;
 mod rune_rendering;
 mod semantic_policy_contracts;
+
+/// These fixtures demand a semantic diagnostic, not a presentation refusal.
+fn semantic_diagnostic(diagnostic: DiagnosticRef<'_>) -> &CodeQueryDiagnostic {
+    match diagnostic {
+        DiagnosticRef::Semantic(value) => value,
+        DiagnosticRef::Presentation(refusal) => {
+            panic!("expected semantic diagnostic, received {refusal:?}")
+        }
+    }
+}

@@ -263,6 +263,14 @@ struct FailedGoReverseImports {
     receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
 }
 
+impl brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict for FailedGoReverseImports {
+    fn reuse_verdict(&self) -> brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict {
+        brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+            &self.receipt,
+        )
+    }
+}
+
 fn reverse_import_value(index: GoReverseImportIndex) -> GoReverseImports {
     use brokk_bifrost_core::path_utils::rel_path_string;
     let mut rows = index

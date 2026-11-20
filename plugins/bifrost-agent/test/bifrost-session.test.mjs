@@ -73,6 +73,7 @@ const SERVER_TOOL_NAMES_BY_TOOLSET = {
     "list_policies",
     "run_policy",
     "explain_policy",
+    "flow_query",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "most_relevant_files",

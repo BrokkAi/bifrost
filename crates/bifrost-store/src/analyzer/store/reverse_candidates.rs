@@ -186,6 +186,7 @@ pub fn read_reverse_candidates(
     read_reverse_candidates_sql(operation, keys, REVERSE_CANDIDATES_SQL, cancellation)
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn read_reverse_candidates_sql(
     operation: &SelectedResolutionOperation<'_, '_>,
     keys: &[ReverseCandidateKey],

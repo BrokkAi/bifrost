@@ -4,6 +4,8 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::analyzer::semantic_model::ApproximationReasons;
+
 use crate::analyzer::semantic_model::ActivationSelector;
 
 use crate::analyzer::semantic_model::AuthoredProcedureFormal;
@@ -81,6 +83,34 @@ pub type DependencyEvidencePublication = (
     crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
 );
 
+/// One verified raw input slot; a source set contributes its aggregate digest.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedRawArtifact {
+    pub role: crate::analyzer::semantic_model::dependency::DependencyArtifactRole,
+    pub kind: crate::analyzer::semantic_model::ExternalArtifactKind,
+    pub module: Option<String>,
+    pub sha256: [u8; 32],
+}
+
+impl VerifiedRawArtifact {
+    pub fn from_sha256(
+        role: crate::analyzer::semantic_model::dependency::DependencyArtifactRole,
+        kind: crate::analyzer::semantic_model::ExternalArtifactKind,
+        sha256: &str,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module: None,
+            sha256: brokk_bifrost_core::analyzer::canonical_hash::parse_lower_sha256(sha256)
+                .expect("verified raw artifact digest must be lowercase SHA-256"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticModelActivationEvidence {
     pub language: String,
@@ -90,10 +120,30 @@ pub struct SemanticModelActivationEvidence {
     pub toolchain: Option<CatalogCoordinate>,
     pub target: Option<String>,
     pub configuration: Option<String>,
-    pub artifact_sha256: Option<String>,
+    /// Sorted and deduplicated by role, kind, module and digest before publication.
+    pub verified_raw_artifacts: Vec<VerifiedRawArtifact>,
+    pub production_input_digest: Option<String>,
 }
 
 impl SemanticModelActivationEvidence {
+    /// A scalar projection for consumers whose contract requires one raw slot.
+    pub fn single_raw_sha256(&self) -> Option<String> {
+        let [input] = self.verified_raw_artifacts.as_slice() else {
+            return None;
+        };
+        Some(brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&input.sha256))
+    }
+
+    pub fn contains_raw_sha256(&self, expected: &str) -> bool {
+        brokk_bifrost_core::analyzer::canonical_hash::parse_lower_sha256(expected).is_some_and(
+            |digest| {
+                self.verified_raw_artifacts
+                    .iter()
+                    .any(|input| input.sha256 == digest)
+            },
+        )
+    }
+
     /// Visit owned children; the enclosing retained owner pays inline storage
     /// and calls this leaf only once for that owner.
     #[doc(hidden)]
@@ -109,8 +159,15 @@ impl SemanticModelActivationEvidence {
             toolchain,
             target,
             configuration,
-            artifact_sha256,
+            verified_raw_artifacts,
+            production_input_digest,
         } = self;
+        census.owned_vec(verified_raw_artifacts);
+        for input in verified_raw_artifacts {
+            if let Some(module) = &input.module {
+                census.owned_string(module);
+            }
+        }
         census.owned_string(language);
         census.owned_string(ecosystem);
         for coordinate in [package, module, toolchain].into_iter().flatten() {
@@ -130,7 +187,7 @@ impl SemanticModelActivationEvidence {
                 }
             }
         }
-        for text in [target, configuration, artifact_sha256]
+        for text in [target, configuration, production_input_digest]
             .into_iter()
             .flatten()
         {
@@ -304,6 +361,9 @@ pub struct ApproximateSemanticModelExpectation {
     /// The dependency-pack ecosystem whose discovery recorded the expectation.
     pub ecosystem: String,
     pub selection: ApproximateStandardLibrarySelection,
+    /// Why the evidence is not exact. Discovery decides; the runtime only
+    /// carries it onto the shards the expectation selects.
+    pub reasons: ApproximationReasons,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -337,6 +397,8 @@ impl ApproximateSemanticModelExpectation {
 
 #[derive(Debug, Clone)]
 pub struct SemanticModelActivationRequest {
+    /// Immutable host authority; never supplied by workspace configuration.
+    pub host_activation: std::sync::Arc<super::approval::HostActivationContext>,
     pub bifrost_version: Version,
     /// Approximate expectations are never exact workspace evidence.
     pub approximate_standard_libraries: Vec<ApproximateSemanticModelExpectation>,
@@ -477,10 +539,9 @@ pub fn evidence_is_exact_python_distribution_artifact(
     if evidence.language != "python" || evidence.ecosystem != "python" {
         return false;
     }
-    let (Some(package), Some(artifact_sha256)) = (
-        evidence.package.as_ref(),
-        evidence.artifact_sha256.as_deref(),
-    ) else {
+    let (Some(package), Some(artifact_sha256)) =
+        (evidence.package.as_ref(), evidence.single_raw_sha256())
+    else {
         return false;
     };
     if !package.name.starts_with("pkg:pypi/") || package.version.is_some() {
@@ -560,12 +621,17 @@ impl FamilyOpen {
         matches!(self.cause, FamilyOpenCause::Cancelled)
     }
 
-    /// Whether rows of `language` may be missing.
-    pub fn covers(&self, language: &str) -> bool {
+    /// Whether this incomplete read depends on a transient execution outcome.
+    pub const fn is_execution_dependent(self) -> bool {
         match self.cause {
-            FamilyOpenCause::Content => self.languages.contains(&language),
+            FamilyOpenCause::Content => false,
             FamilyOpenCause::ReadFailure | FamilyOpenCause::Cancelled => true,
         }
+    }
+
+    /// Whether rows of `language` may be missing.
+    pub fn covers(&self, language: &str) -> bool {
+        self.is_execution_dependent() || self.languages.contains(&language)
     }
 }
 
@@ -793,7 +859,7 @@ pub struct ProcedureSummaryShapePostings {
 pub type ProcedureSummaryTargetPostings =
     HashMap<String, HashMap<String, HashMap<String, ProcedureSummaryShapePostings>>>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[doc(hidden)]
 pub struct NormalContinuationAbsenceMemberCandidates {
     #[doc(hidden)]
@@ -829,7 +895,7 @@ impl NormalContinuationAbsenceMemberCandidates {
 /// It is keyed by [`semantic_pack_realm`], the same durable key the procedure
 /// summary postings it is built from use, so a caller's own language label
 /// reaches the candidates a pack declared for any language of that realm.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[doc(hidden)]
 pub struct NormalContinuationAbsenceCandidateIndex {
     #[doc(hidden)]
@@ -1131,7 +1197,8 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     controls.sort_unstable();
     controls.dedup();
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.runtime-request.v5\0");
+    hasher.update(b"bifrost.semantic-model.runtime-request.v7\0");
+    hasher.update(request.host_activation.identity().as_bytes());
     hash_key_part(&mut hasher, &request.bifrost_version.to_string());
     hasher.update(
         (crate::analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.len() as u64)
@@ -1149,6 +1216,7 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
         hash_optional_key_part(&mut hasher, expectation.toolchain.as_deref());
         hash_key_part(&mut hasher, &expectation.language);
         hash_key_part(&mut hasher, &expectation.ecosystem);
+        hasher.update([expectation.reasons.bits()]);
         match &expectation.selection {
             ApproximateStandardLibrarySelection::Pack(pack_id) => {
                 hasher.update([0]);
@@ -1224,7 +1292,17 @@ pub fn hash_activation_evidence(hasher: &mut Sha256, evidence: &SemanticModelAct
     hash_optional_coordinate(hasher, evidence.toolchain.as_ref());
     hash_optional_key_part(hasher, evidence.target.as_deref());
     hash_optional_key_part(hasher, evidence.configuration.as_deref());
-    hash_optional_key_part(hasher, evidence.artifact_sha256.as_deref());
+    hash_optional_key_part(hasher, evidence.production_input_digest.as_deref());
+    hasher.update((evidence.verified_raw_artifacts.len() as u64).to_be_bytes());
+    for input in &evidence.verified_raw_artifacts {
+        hasher.update([input.role as u8]);
+        hash_key_part(
+            hasher,
+            crate::analyzer::semantic_model::dependency::artifact_kind_name(input.kind),
+        );
+        hash_optional_key_part(hasher, input.module.as_deref());
+        hasher.update(input.sha256);
+    }
 }
 
 #[doc(hidden)]
@@ -1271,11 +1349,13 @@ pub fn validate_and_canonicalize_request(
             return Err("activation evidence language and ecosystem must not be empty".to_owned());
         }
         if row
-            .artifact_sha256
+            .production_input_digest
             .as_deref()
             .is_some_and(|digest| !is_lower_sha256(digest))
         {
-            return Err("activation evidence artifact digest must be lowercase SHA-256".to_owned());
+            return Err(
+                "activation evidence production input digest must be lowercase SHA-256".to_owned(),
+            );
         }
     }
     for control in &request.controls {
@@ -1308,6 +1388,10 @@ pub fn validate_and_canonicalize_request(
             return Err("equally specific activation controls conflict".to_owned());
         }
     }
+    for row in &mut evidence {
+        row.verified_raw_artifacts.sort();
+        row.verified_raw_artifacts.dedup();
+    }
     evidence.sort();
     evidence.dedup();
     let mut approximate_standard_libraries = request.approximate_standard_libraries.clone();
@@ -1325,6 +1409,8 @@ pub fn evidence_query(
     bifrost_version: Version,
 ) -> SemanticPackSelectorQuery {
     SemanticPackSelectorQuery {
+        verified_raw_artifacts: evidence.verified_raw_artifacts.clone(),
+        production_input_digest: evidence.production_input_digest.clone(),
         language: semantic_pack_language(&evidence.language).to_owned(),
         ecosystem: evidence.ecosystem.clone(),
         package: evidence.package.clone(),
@@ -1332,7 +1418,7 @@ pub fn evidence_query(
         toolchain: evidence.toolchain.clone(),
         target: evidence.target.clone(),
         configuration: evidence.configuration.clone(),
-        artifact_sha256: evidence.artifact_sha256.clone(),
+        artifact_sha256: evidence.single_raw_sha256(),
         bifrost_version,
     }
 }
@@ -1395,7 +1481,22 @@ pub fn strict_activation_match(
     selectors: &[crate::analyzer::semantic_model::ActivationSelector],
     evidence: &[SemanticModelActivationEvidence],
     bifrost_version: &Version,
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
 ) -> Option<StrictActivationMatch> {
+    if origin == crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+        && !manifest.producer.has_current_dependency_revision()
+    {
+        return None;
+    }
+    if crate::analyzer::semantic_model::catalog::check_catalog_selector_origin(
+        origin,
+        manifest.extraction.as_ref(),
+        selectors,
+    )
+    .is_err()
+    {
+        return None;
+    }
     if !manifest
         .compatibility
         .matches_engine(manifest.schema_version, bifrost_version)
@@ -1414,26 +1515,12 @@ pub fn strict_activation_match(
         })
         .collect::<Option<Vec<_>>>()?;
     let scoped = |row: &&SemanticModelActivationEvidence| {
-        semantic_pack_language(&row.language) == manifest.language
-            && row.ecosystem == manifest.ecosystem
-            && manifest
-                .provenance
-                .rust_artifact_approximation
-                .as_ref()
-                .is_none_or(|claim| {
-                    row.package
-                        .as_ref()
-                        .and_then(|package| package.version.as_ref())
-                        .is_some_and(|version| claim.activation_reason(version).is_ok())
-                })
+        strict_manifest_language_matches(manifest, row)
+            && strict_manifest_ecosystem_matches(manifest, row)
+            && strict_manifest_origin_matches(manifest, row, origin)
+            && strict_manifest_provenance_matches(manifest, row)
             && toolchains.iter().all(|(constraint, requirement)| {
-                row.toolchain.as_ref().is_some_and(|toolchain| {
-                    toolchain.name == constraint.name
-                        && toolchain
-                            .version
-                            .as_ref()
-                            .is_some_and(|version| requirement.matches(version))
-                })
+                strict_toolchain_matches(&constraint.name, requirement, row.toolchain.as_ref())
             })
     };
     let mut matched_requirements = Vec::new();
@@ -1442,7 +1529,7 @@ pub fn strict_activation_match(
         .flat_map(|selector| {
             evidence
                 .iter()
-                .filter(move |row| scoped(row) && strict_selector_matches(selector, row))
+                .filter(move |row| strict_selector_matches(selector, row) && scoped(row))
                 .map(move |row| (selector_rank(selector), row.clone(), selector))
         })
         .max_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))?;
@@ -1452,7 +1539,7 @@ pub fn strict_activation_match(
         .flat_map(|selector| {
             evidence
                 .iter()
-                .filter(move |row| scoped(row) && strict_selector_matches(selector, row))
+                .filter(move |row| strict_selector_matches(selector, row) && scoped(row))
                 .cloned()
         })
         .collect::<Vec<_>>();
@@ -1559,6 +1646,7 @@ pub fn toolchain_floor_activation_match(
                 && selector.targets.is_empty()
                 && selector.configurations.is_empty()
                 && selector.artifact_sha256.is_none()
+                && selector.production_input_digest.is_none()
                 && selector.toolchain.as_ref().is_none_or(|coordinate| {
                     admits(&coordinate.name, coordinate.version.as_deref())
                 })
@@ -1578,7 +1666,8 @@ pub fn toolchain_floor_activation_match(
             }),
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
         matching_evidence: Vec::new(),
         matched_requirements: Vec::new(),
@@ -1643,20 +1732,107 @@ fn strict_selector_matches(
     strict_coordinate_matches(selector.package.as_ref(), evidence.package.as_ref())
         && strict_coordinate_matches(selector.module.as_ref(), evidence.module.as_ref())
         && strict_coordinate_matches(selector.toolchain.as_ref(), evidence.toolchain.as_ref())
-        && (selector.targets.is_empty()
-            || evidence
-                .target
-                .as_ref()
-                .is_some_and(|target| selector.targets.contains(target)))
-        && (selector.configurations.is_empty()
-            || evidence
-                .configuration
-                .as_ref()
-                .is_some_and(|configuration| selector.configurations.contains(configuration)))
+        && strict_value_matches(&selector.targets, evidence.target.as_ref())
+        && strict_value_matches(&selector.configurations, evidence.configuration.as_ref())
+        && selector_digests_match(selector, evidence)
+}
+
+/// Shared by strict activation and the diagnostic requirements path.
+pub fn selector_digests_match(
+    selector: &ActivationSelector,
+    evidence: &SemanticModelActivationEvidence,
+) -> bool {
+    selector_digest_constraints_match(
+        selector,
+        &evidence.verified_raw_artifacts,
+        evidence.production_input_digest.as_deref(),
+    )
+}
+
+pub fn selector_digest_constraints_match(
+    selector: &ActivationSelector,
+    slots: &[VerifiedRawArtifact],
+    production: Option<&str>,
+) -> bool {
+    selector
+        .artifact_sha256
+        .as_deref()
+        .is_none_or(|expected| selector_artifact_sha256_matches(expected, slots))
         && selector
-            .artifact_sha256
-            .as_ref()
-            .is_none_or(|expected| evidence.artifact_sha256.as_ref() == Some(expected))
+            .production_input_digest
+            .as_deref()
+            .is_none_or(|expected| selector_production_input_digest_matches(expected, production))
+}
+
+fn selector_artifact_sha256_matches(expected: &str, slots: &[VerifiedRawArtifact]) -> bool {
+    slots.iter().any(|slot| {
+        brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&slot.sha256) == expected
+    })
+}
+
+fn selector_production_input_digest_matches(expected: &str, production: Option<&str>) -> bool {
+    production == Some(expected)
+}
+
+fn strict_manifest_language_matches(
+    manifest: &CompiledPackManifest,
+    row: &SemanticModelActivationEvidence,
+) -> bool {
+    semantic_pack_language(&row.language) == manifest.language
+}
+
+fn strict_manifest_ecosystem_matches(
+    manifest: &CompiledPackManifest,
+    row: &SemanticModelActivationEvidence,
+) -> bool {
+    row.ecosystem == manifest.ecosystem
+}
+
+fn strict_manifest_origin_matches(
+    manifest: &CompiledPackManifest,
+    row: &SemanticModelActivationEvidence,
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+) -> bool {
+    match origin {
+        crate::analyzer::semantic_model::model::SemanticPackOrigin::Authored => true,
+        crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated => {
+            generated_extraction_matches(manifest, row)
+        }
+    }
+}
+
+fn strict_manifest_provenance_matches(
+    manifest: &CompiledPackManifest,
+    row: &SemanticModelActivationEvidence,
+) -> bool {
+    manifest
+        .provenance
+        .rust_artifact_approximation
+        .as_ref()
+        .is_none_or(|claim| {
+            row.package
+                .as_ref()
+                .and_then(|package| package.version.as_ref())
+                .is_some_and(|version| claim.activation_reason(version).is_ok())
+        })
+}
+
+fn strict_toolchain_matches(
+    name: &str,
+    requirement: &VersionReq,
+    evidence: Option<&CatalogCoordinate>,
+) -> bool {
+    evidence.is_some_and(|toolchain| {
+        toolchain.name == name
+            && toolchain
+                .version
+                .as_ref()
+                .is_some_and(|version| requirement.matches(version))
+    })
+}
+
+fn strict_value_matches(expected: &[String], evidence: Option<&String>) -> bool {
+    expected.is_empty() || evidence.is_some_and(|value| expected.contains(value))
 }
 
 fn strict_coordinate_matches(
@@ -1681,6 +1857,118 @@ fn strict_coordinate_matches(
     }
 }
 
+fn generated_extraction_matches(
+    manifest: &CompiledPackManifest,
+    evidence: &SemanticModelActivationEvidence,
+) -> bool {
+    let Some(extraction) = &manifest.extraction else {
+        return false;
+    };
+    if evidence.verified_raw_artifacts.is_empty() {
+        return false;
+    }
+    let recomputed = crate::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
+        extraction.kind,
+        &evidence.verified_raw_artifacts,
+    );
+    // Sysroot authorization receipts are checked independently; recompute the input claim.
+    extraction.kind == recomputed.kind && extraction.inputs == recomputed.inputs
+}
+
+/// Typed failure retained until the activation diagnostic is rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrictActivationMismatchReason {
+    StaleGeneratedSelector {
+        producer: crate::analyzer::semantic_model::Producer,
+    },
+    GeneratedExtractionInputNotVerified {
+        digest: String,
+    },
+    SelectorOriginMismatch {
+        origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+    },
+    Other {
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for StrictActivationMismatchReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleGeneratedSelector { producer } => write!(
+                f,
+                "StaleGeneratedSelector: obsolete dependency producer {producer:?}"
+            ),
+            Self::GeneratedExtractionInputNotVerified { digest } => write!(
+                f,
+                "GeneratedExtractionInputNotVerified: generated extraction input {digest} does not match the matching production's verified raw slots"
+            ),
+            Self::SelectorOriginMismatch { origin } => write!(
+                f,
+                "SelectorOriginMismatch: selectors violate recorded {origin:?} provenance"
+            ),
+            Self::Other { reason } => f.write_str(reason),
+        }
+    }
+}
+
+pub fn strict_activation_mismatch(
+    manifest: &CompiledPackManifest,
+    selectors: &[ActivationSelector],
+    evidence: &[SemanticModelActivationEvidence],
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+) -> StrictActivationMismatchReason {
+    if origin == crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+        && !manifest.producer.has_current_dependency_revision()
+    {
+        return StrictActivationMismatchReason::StaleGeneratedSelector {
+            producer: manifest.producer.clone(),
+        };
+    }
+    if crate::analyzer::semantic_model::catalog::check_catalog_selector_origin(
+        origin,
+        manifest.extraction.as_ref(),
+        selectors,
+    )
+    .is_err()
+    {
+        return StrictActivationMismatchReason::SelectorOriginMismatch { origin };
+    }
+    if origin == crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+        && let Some(extraction) = &manifest.extraction
+    {
+        let mut matching_rows = evidence
+            .iter()
+            .filter(|row| {
+                semantic_pack_language(&row.language) == manifest.language
+                    && row.ecosystem == manifest.ecosystem
+                    && selectors
+                        .iter()
+                        .any(|selector| strict_selector_matches(selector, row))
+            })
+            .peekable();
+        if matching_rows.peek().is_some()
+            && matching_rows.all(|row| !generated_extraction_matches(manifest, row))
+        {
+            return StrictActivationMismatchReason::GeneratedExtractionInputNotVerified {
+                digest: extraction.digest().to_owned(),
+            };
+        }
+    }
+    StrictActivationMismatchReason::Other {
+        reason: strict_activation_mismatch_text(manifest, selectors, evidence),
+    }
+}
+
+pub fn strict_activation_mismatch_reason(
+    manifest: &CompiledPackManifest,
+    selectors: &[ActivationSelector],
+    evidence: &[SemanticModelActivationEvidence],
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+) -> String {
+    strict_activation_mismatch(manifest, selectors, evidence, origin).to_string()
+}
+
 /// Explain a failed strict activation match. When the evidence names a
 /// required coordinate but an exact version requirement rejects it, the
 /// explanation names the workspace version and the pack requirement (#1884).
@@ -1688,18 +1976,19 @@ fn strict_coordinate_matches(
 /// explanation names the missing coordinate and the selector's remaining
 /// predicates, so a caller can act on it (#3462). When a row names the
 /// coordinate but misses the selector's target, configuration, or artifact
-/// digest, the explanation names those predicates (#3464). Every other
-/// rejection keeps the generic statement.
+/// digest, the explanation names those predicates (#3464). Otherwise compare
+/// each constraint independently on same-language rows, including rows from
+/// other ecosystems, to explain why evidence cannot be joined (#9998).
 #[doc(hidden)]
-pub fn strict_activation_mismatch_reason(
+fn strict_activation_mismatch_text(
     manifest: &CompiledPackManifest,
     selectors: &[crate::analyzer::semantic_model::ActivationSelector],
     evidence: &[SemanticModelActivationEvidence],
 ) -> String {
     let scoped = || {
         evidence.iter().filter(|row| {
-            semantic_pack_language(&row.language) == manifest.language
-                && row.ecosystem == manifest.ecosystem
+            strict_manifest_language_matches(manifest, row)
+                && strict_manifest_ecosystem_matches(manifest, row)
         })
     };
     for constraint in &manifest.compatibility.toolchains {
@@ -1707,13 +1996,7 @@ pub fn strict_activation_mismatch_reason(
             continue;
         };
         let satisfied = scoped().any(|row| {
-            row.toolchain.as_ref().is_some_and(|toolchain| {
-                toolchain.name == constraint.name
-                    && toolchain
-                        .version
-                        .as_ref()
-                        .is_some_and(|version| requirement.matches(version))
-            })
+            strict_toolchain_matches(&constraint.name, &requirement, row.toolchain.as_ref())
         });
         if satisfied {
             continue;
@@ -1747,29 +2030,27 @@ pub fn strict_activation_mismatch_reason(
                 continue;
             }
             let mut unmet = Vec::new();
-            if !selector.targets.is_empty()
-                && !row
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| selector.targets.contains(target))
-            {
+            if !strict_value_matches(&selector.targets, row.target.as_ref()) {
                 unmet.push(format!("target {}", selector.targets.join(", ")));
             }
-            if !selector.configurations.is_empty()
-                && !row
-                    .configuration
-                    .as_ref()
-                    .is_some_and(|configuration| selector.configurations.contains(configuration))
-            {
+            if !strict_value_matches(&selector.configurations, row.configuration.as_ref()) {
                 unmet.push(format!(
                     "profile configuration {}",
                     selector.configurations.join(", ")
                 ));
             }
-            if let Some(expected) = &selector.artifact_sha256
-                && row.artifact_sha256.as_ref() != Some(expected)
+            if let Some(expected) = selector.artifact_sha256.as_deref()
+                && !selector_artifact_sha256_matches(expected, &row.verified_raw_artifacts)
             {
                 unmet.push(format!("artifact sha256 {expected}"));
+            }
+            if let Some(expected) = selector.production_input_digest.as_deref()
+                && !selector_production_input_digest_matches(
+                    expected,
+                    row.production_input_digest.as_deref(),
+                )
+            {
+                unmet.push(format!("production input digest {expected}"));
             }
             if !unmet.is_empty() {
                 unmet_predicates.get_or_insert_with(|| {
@@ -1829,9 +2110,176 @@ pub fn strict_activation_mismatch_reason(
             return reason;
         }
     }
-    unmet_predicates.unwrap_or_else(|| {
-        "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
-    })
+    unmet_predicates
+        .unwrap_or_else(|| activation_constraint_rows_reason(manifest, selectors, evidence))
+}
+
+/// Compare constraints independently: a toolchain row from another ecosystem
+/// can explain a rejection, but cannot supply evidence to the package row.
+fn activation_constraint_rows_reason(
+    manifest: &CompiledPackManifest,
+    selectors: &[ActivationSelector],
+    evidence: &[SemanticModelActivationEvidence],
+) -> String {
+    const MAX_ROWS: usize = 4;
+    let mut closest = Vec::with_capacity(MAX_ROWS + 1);
+    let mut relevant_rows = 0usize;
+    for row in evidence.iter().filter(|row| {
+        strict_manifest_language_matches(manifest, row)
+            && (selectors.iter().any(|selector| {
+                [
+                    (selector.package.as_ref(), row.package.as_ref()),
+                    (selector.module.as_ref(), row.module.as_ref()),
+                ]
+                .into_iter()
+                .any(|(expected, observed)| {
+                    expected
+                        .zip(observed)
+                        .is_some_and(|(expected, observed)| expected.name == observed.name)
+                })
+            }) || row.toolchain.as_ref().is_some_and(|toolchain| {
+                manifest
+                    .compatibility
+                    .toolchains
+                    .iter()
+                    .any(|constraint| constraint.name == toolchain.name)
+                    || selectors.iter().any(|selector| {
+                        selector
+                            .toolchain
+                            .as_ref()
+                            .is_some_and(|expected| expected.name == toolchain.name)
+                    })
+            }))
+    }) {
+        // One comparison per relevant row: choose its closest alternative
+        // selector without allocating diagnostic strings for rejected rows.
+        let best = selectors
+            .iter()
+            .enumerate()
+            .map(|(index, selector)| {
+                let mut count = 0;
+                visit_unmet_activation_constraints(manifest, selector, row, |_| count += 1);
+                (count, index)
+            })
+            .min();
+        let Some((count, selector_index)) = best else {
+            continue;
+        };
+        if count == 0 {
+            return "complete activation evidence does not satisfy the manifest and shard selector"
+                .to_owned();
+        }
+        relevant_rows += 1;
+        closest.push((count, row, selector_index));
+        closest.sort_unstable();
+        closest.truncate(MAX_ROWS);
+    }
+    if closest.is_empty() {
+        return "complete activation evidence does not satisfy the manifest and shard selector"
+            .to_owned();
+    }
+    let equally_close = closest.windows(2).any(|pair| pair[0].0 == pair[1].0);
+    let rows = closest
+        .iter()
+        .map(|(count, row, selector_index)| {
+            let mut unmet = Vec::new();
+            visit_unmet_activation_constraints(
+                manifest,
+                &selectors[*selector_index],
+                row,
+                |constraint| unmet.push(constraint.to_string()),
+            );
+            format!("{row:?} ({count} unmet constraints): {unmet:?}")
+        })
+        .collect::<Vec<_>>();
+    let mut reason = format!(
+        "activation constraints must all match one evidence row; evidence rows (closest first{}): {}",
+        if equally_close {
+            "; rows with equal unmet constraint counts are equally close"
+        } else {
+            ""
+        },
+        rows.join("; ")
+    );
+    let omitted = relevant_rows - closest.len();
+    if omitted > 0 {
+        use std::fmt::Write;
+        write!(reason, "; {omitted} more relevant evidence rows omitted").expect("write to String");
+    }
+    reason
+}
+
+/// Formatting arguments defer string construction until the caller retains a
+/// row. Counting and rendering therefore use exactly the same predicates.
+fn visit_unmet_activation_constraints(
+    manifest: &CompiledPackManifest,
+    selector: &ActivationSelector,
+    row: &SemanticModelActivationEvidence,
+    mut unmet: impl FnMut(std::fmt::Arguments<'_>),
+) {
+    if !strict_manifest_ecosystem_matches(manifest, row) {
+        unmet(format_args!("manifest ecosystem {:?}", manifest.ecosystem));
+    }
+    if !strict_manifest_provenance_matches(manifest, row) {
+        unmet(format_args!(
+            "manifest Rust artifact approximation {:?}",
+            manifest.provenance.rust_artifact_approximation
+        ));
+    }
+    for constraint in &manifest.compatibility.toolchains {
+        if !VersionReq::parse(&constraint.requirement).is_ok_and(|requirement| {
+            strict_toolchain_matches(&constraint.name, &requirement, row.toolchain.as_ref())
+        }) {
+            unmet(format_args!(
+                "manifest toolchain {} {} (observed {:?})",
+                constraint.name, constraint.requirement, row.toolchain
+            ));
+        }
+    }
+    for (axis, expected, observed) in [
+        ("package", selector.package.as_ref(), row.package.as_ref()),
+        ("module", selector.module.as_ref(), row.module.as_ref()),
+        (
+            "selector toolchain",
+            selector.toolchain.as_ref(),
+            row.toolchain.as_ref(),
+        ),
+    ] {
+        if !strict_coordinate_matches(expected, observed) {
+            unmet(format_args!("{axis} {expected:?} (observed {observed:?})"));
+        }
+    }
+    for (axis, expected, observed) in [
+        ("target", &selector.targets, row.target.as_ref()),
+        (
+            "configuration",
+            &selector.configurations,
+            row.configuration.as_ref(),
+        ),
+    ] {
+        if !strict_value_matches(expected, observed) {
+            unmet(format_args!("{axis} {expected:?} (observed {observed:?})"));
+        }
+    }
+    if let Some(expected) = selector.artifact_sha256.as_deref()
+        && !selector_artifact_sha256_matches(expected, &row.verified_raw_artifacts)
+    {
+        unmet(format_args!(
+            "artifact sha256 {:?} (observed {:?})",
+            selector.artifact_sha256, row.verified_raw_artifacts
+        ));
+    }
+    if let Some(expected) = selector.production_input_digest.as_deref()
+        && !selector_production_input_digest_matches(
+            expected,
+            row.production_input_digest.as_deref(),
+        )
+    {
+        unmet(format_args!(
+            "production input digest {:?} (observed {:?})",
+            selector.production_input_digest, row.production_input_digest
+        ));
+    }
 }
 
 /// Name the selector predicates an evidence row that names the selector's
@@ -1888,6 +2336,9 @@ fn missing_activation_evidence_reason(selector: &ActivationSelector) -> Option<S
             selector.configurations.join(", ")
         ));
     }
+    if let Some(digest) = &selector.production_input_digest {
+        requirements.push(format!("production input digest {digest}"));
+    }
     if let Some(artifact_sha256) = &selector.artifact_sha256 {
         requirements.push(format!("artifact sha256 {artifact_sha256}"));
     }
@@ -1923,7 +2374,7 @@ pub(crate) fn coordinate_version_matches(
 }
 
 fn selector_rank(selector: &ActivationSelector) -> EvidenceRank {
-    if selector.artifact_sha256.is_some() {
+    if selector.artifact_sha256.is_some() || selector.production_input_digest.is_some() {
         EvidenceRank::ExactArtifact
     } else if [&selector.package, &selector.module, &selector.toolchain]
         .into_iter()
@@ -2002,6 +2453,8 @@ pub fn catalog_miss_reason(miss: &CatalogMiss) -> String {
         }
         .to_string(),
         CatalogMiss::NotFound => "catalog candidate disappeared before verified load".to_owned(),
+        CatalogMiss::StaleGeneratedSelector { reason, .. }
+        | CatalogMiss::SelectorOriginMismatch { reason, .. } => reason.clone(),
         CatalogMiss::Quarantined { reason } | CatalogMiss::Incompatible { reason } => {
             reason.clone()
         }
@@ -2013,6 +2466,30 @@ mod semantic_diagnostic_runtime_tests {
 
     use crate::analyzer::semantic_model::runtime::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn runtime_request_key_binds_host_approval_even_with_no_evidence_or_models() {
+        use crate::analyzer::semantic_model::{
+            HostActivationContext, VerifiedFirstPartyReleaseInventory,
+        };
+        let mut request = SemanticModelActivationRequest {
+            host_activation: HostActivationContext::library_none(),
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            approximate_standard_libraries: Vec::new(),
+            limits: Default::default(),
+        };
+        let before = runtime_request_key(&request).unwrap();
+        request.host_activation = HostActivationContext::from_inventory(
+            VerifiedFirstPartyReleaseInventory::compiled_default().unwrap(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        assert_ne!(before, runtime_request_key(&request).unwrap());
+        request.host_activation = HostActivationContext::library_none();
+        assert_eq!(before, runtime_request_key(&request).unwrap());
+    }
 
     #[test]
     fn toolchain_floor_admits_only_requirements_every_later_release_meets() {
@@ -2043,6 +2520,7 @@ mod semantic_diagnostic_runtime_tests {
     #[hardwon("#6233: the activation request key ignored approximate stdlib expectations")]
     fn runtime_request_key_binds_canonical_approximate_expectations() {
         let mut request = SemanticModelActivationRequest {
+            host_activation: crate::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse("0.12.0").unwrap(),
             evidence: Vec::new(),
@@ -2051,6 +2529,9 @@ mod semantic_diagnostic_runtime_tests {
         };
         let exact_key = runtime_request_key(&request).unwrap();
         let expectation = ApproximateSemanticModelExpectation {
+            reasons: crate::analyzer::semantic_model::ApproximationReasons::only(
+                crate::analyzer::semantic_model::ApproximationReason::TargetUnknown,
+            ),
             toolchain: Some("rust".into()),
             language: "rust".to_owned(),
             ecosystem: "cargo".to_owned(),
@@ -2063,6 +2544,11 @@ mod semantic_diagnostic_runtime_tests {
         request.approximate_standard_libraries[0].toolchain = None;
         assert_ne!(approximate_key, runtime_request_key(&request).unwrap());
         request.approximate_standard_libraries[0].toolchain = Some("rust".into());
+        let original_reasons = request.approximate_standard_libraries[0].reasons;
+        request.approximate_standard_libraries[0].reasons = original_reasons
+            .with(crate::analyzer::semantic_model::ApproximationReason::ToolchainVersionUnknown);
+        assert_ne!(approximate_key, runtime_request_key(&request).unwrap());
+        request.approximate_standard_libraries[0].reasons = original_reasons;
         assert_ne!(exact_key, approximate_key);
         request
             .approximate_standard_libraries
@@ -2084,6 +2570,7 @@ mod semantic_diagnostic_runtime_tests {
     #[hardwon("#3815: cached pack activation ignored the supported schema and engine contract")]
     fn runtime_request_key_binds_engine_and_supported_schema_contract() {
         let request = |bifrost_version| SemanticModelActivationRequest {
+            host_activation: crate::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version,
             evidence: Vec::new(),
@@ -2608,5 +3095,150 @@ mod procedure_claim_agreement_tests {
             !procedure_claims_agree(&left, &right),
             "the boolean result outcome is part of the modeled claim"
         );
+    }
+}
+
+#[cfg(test)]
+mod raw_input_binding_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::dependency::DependencyArtifactRole;
+    use crate::analyzer::semantic_model::{
+        ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
+    };
+
+    #[test]
+    fn generated_extraction_input_must_belong_to_the_matching_production() {
+        let production_digest = "b".repeat(64);
+        let extraction_digest = "a".repeat(64);
+        let mut pack: AuthoredSemanticModelPack = serde_json::from_value(serde_json::json!({
+            "schema_version": crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+            "pack_id":"test.raw-input-binding", "version":"1.0.0",
+            "producer":{"name":"test", "version":"1.0.0"},
+            "language":"java", "ecosystem":"maven", "compatibility":{},
+            "provenance":{"source":"test-only generated input binding"},
+            "license":"MIT", "completeness":"complete",
+            "safety":{"generated_code_only":false,"review_required":false},
+            "shards":[{"id":"declarations", "activation":[{"production_input_digest":production_digest}],
+                "payload":{"kind":"declaration_facts", "types":[{"id":"type.fixture","name":"example.Fixture","type_kind":"class","visibility":"public","locator":{"kind":"artifact","path":"example/Fixture.class","symbol":"example.Fixture"}}], "members":[]}}]
+        })).unwrap();
+        pack.extraction = Some(ArtifactExtraction::single(
+            ArtifactExtractionKind::JavaClassJar,
+            &extraction_digest,
+        ));
+        pack.producer = pack.producer.with_dependency_revision();
+        let compiled = crate::analyzer::semantic_model::compiler::compile_generated_pack(
+            &pack,
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let mut evidence = SemanticModelActivationEvidence {
+            language: "java".into(),
+            ecosystem: "maven".into(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            production_input_digest: Some(production_digest),
+            verified_raw_artifacts: vec![VerifiedRawArtifact::from_sha256(
+                DependencyArtifactRole::Binary,
+                ArtifactExtractionKind::JavaClassJar,
+                &"c".repeat(64),
+            )],
+        };
+        let selectors = pack.shards[0].activation.clone();
+        let version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        assert!(
+            strict_activation_match(
+                &compiled.manifest,
+                &selectors,
+                &[evidence.clone()],
+                &version,
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            strict_activation_mismatch(
+                &compiled.manifest,
+                &selectors,
+                &[evidence.clone()],
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated,
+            ),
+            StrictActivationMismatchReason::GeneratedExtractionInputNotVerified {
+                digest: extraction_digest.clone()
+            }
+        );
+        let mut other_production = evidence.clone();
+        other_production.production_input_digest = Some("d".repeat(64));
+        other_production.verified_raw_artifacts[0].sha256 = [0xaa; 32];
+        assert!(
+            strict_activation_match(
+                &compiled.manifest,
+                &selectors,
+                &[evidence.clone(), other_production],
+                &version,
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated,
+            )
+            .is_none()
+        );
+        evidence.verified_raw_artifacts[0].sha256 = [0xaa; 32];
+        assert!(
+            strict_activation_match(
+                &compiled.manifest,
+                &selectors,
+                &[evidence.clone()],
+                &version,
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated,
+            )
+            .is_some()
+        );
+        let mut source = VerifiedRawArtifact::from_sha256(
+            DependencyArtifactRole::Sources,
+            ArtifactExtractionKind::JavaSourceJar,
+            &"e".repeat(64),
+        );
+        source.module = Some("example.module".into());
+        evidence.verified_raw_artifacts.push(source);
+        evidence.verified_raw_artifacts.sort();
+        pack.extraction = Some(ArtifactExtraction::from_verified_slots(
+            ArtifactExtractionKind::JavaClassJar,
+            &evidence.verified_raw_artifacts,
+        ));
+        let aggregate = crate::analyzer::semantic_model::compiler::compile_generated_pack(
+            &pack,
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            strict_activation_match(
+                &aggregate.manifest,
+                &selectors,
+                &[evidence.clone()],
+                &version,
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+            )
+            .is_some()
+        );
+        evidence.verified_raw_artifacts[1].module = Some("different.module".into());
+        assert!(
+            strict_activation_match(
+                &aggregate.manifest,
+                &selectors,
+                &[evidence.clone()],
+                &version,
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            strict_activation_mismatch(
+                &aggregate.manifest,
+                &selectors,
+                &[evidence],
+                crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+            ),
+            StrictActivationMismatchReason::GeneratedExtractionInputNotVerified { .. }
+        ));
     }
 }

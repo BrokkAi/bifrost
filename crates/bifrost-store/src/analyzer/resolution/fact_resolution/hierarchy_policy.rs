@@ -42,6 +42,11 @@ pub(crate) trait HierarchyPolicy: std::fmt::Debug + Sync + std::any::Any {
             nearest
         }
     }
+    /// A member-search policy may exclude a known edge role. Unclassified
+    /// edges remain open evidence; the shared frame never drops them here.
+    fn includes_parent_kind(&self, _kind: Option<ClassifiedSupertypeKind>) -> bool {
+        true
+    }
     /// The default cannot prove that an owner has no implicit root, so it keeps
     /// the hierarchy open. A policy whose producer emits implicit roots as
     /// ordinary edges selects `ExplicitHierarchyEdges` instead.
@@ -68,12 +73,58 @@ impl HierarchyPolicy for DefaultHierarchyPolicy {
 pub(crate) static DEFAULT_HIERARCHY_POLICY: DefaultHierarchyPolicy =
     DefaultHierarchyPolicy { _identity: 0 };
 
+/// Query-local proof from classified written edges, before any default root.
+pub(crate) struct NormalizedWrittenParents {
+    pub(crate) proved_class_parent: Option<SemanticId>,
+    pub(crate) completion: ResolutionCompletion,
+    pub(crate) next_ordinal: Option<u32>,
+}
+
+pub(crate) enum ImplicitBasePreparation {
+    Ready(ImplicitBaseRead),
+    Reference(ImplicitBaseReference),
+}
+
+/// The selected reference and whole-type frontier retain their own authority.
+/// No binding or hierarchy walk is performed by provider preparation.
+pub(crate) struct ImplicitBaseReference {
+    pub(crate) language: Language,
+    pub(crate) reference: SemanticId,
+    pub(crate) frontier: SemanticId,
+    pub(crate) ordinal: u32,
+    pub(crate) kind: ClassifiedSupertypeKind,
+    pub(crate) provider: HierarchyProviderKey,
+    pub(crate) rules:
+        Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers>,
+    pub(crate) observations: Box<[HierarchyProviderObservation]>,
+    pub(crate) binding_completion: ResolutionCompletion,
+    pub(crate) context_completion: ResolutionCompletion,
+}
+
+pub(crate) struct ImplicitBaseBinding {
+    pub(crate) reference: SemanticId,
+    pub(crate) frontier: SemanticId,
+}
+
 pub(crate) struct WrittenHierarchyBase<'a> {
     pub(crate) targets: &'a [SemanticId],
     pub(crate) complete: bool,
 }
 
 pub(crate) trait HierarchyEdgeProvider: std::fmt::Debug + Sync {
+    fn prepare_implicit_base(
+        &self,
+        owner: SemanticId,
+        _written: &NormalizedWrittenParents,
+        raw_written: &[WrittenHierarchyBase<'_>],
+        source: &dyn SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ImplicitBasePreparation>> {
+        Ok(self
+            .implicit_base(owner, raw_written, source, cancellation)?
+            .map(ImplicitBasePreparation::Ready))
+    }
+
     fn base_preservation_rule(&self) -> Option<crate::analyzer::resolution::BasePreservationRule> {
         None
     }
@@ -112,6 +163,116 @@ pub(crate) trait HierarchyEdgeProvider: std::fmt::Debug + Sync {
 #[derive(Debug)]
 pub(crate) struct ExplicitHierarchyEdges;
 impl HierarchyEdgeProvider for ExplicitHierarchyEdges {
+    fn prepare_implicit_base(
+        &self,
+        owner: SemanticId,
+        written: &NormalizedWrittenParents,
+        raw_written: &[WrittenHierarchyBase<'_>],
+        source: &dyn SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ImplicitBasePreparation>> {
+        // Admission already read the immutable selected source header. Other
+        // languages retain the existing provider path without a root SQL read.
+        let rules = source
+            .admitted_owner_language(owner)
+            .and_then(|language| source.implicit_root_rules_for_language(language));
+        let Some(rules) = rules else {
+            return Ok(self
+                .implicit_base(owner, raw_written, source, cancellation)?
+                .map(ImplicitBasePreparation::Ready));
+        };
+        let Some(input) = source.selected_implicit_root_input(owner, cancellation)? else {
+            return Ok(None);
+        };
+        let open = |completion: ResolutionCompletion| {
+            let provider = HierarchyProviderKey::source(
+                owner,
+                owner,
+                ResolutionNamespace::Type,
+                HierarchyProviderAuthority::Boundary(owner),
+                HierarchyProviderOperand::SupertypeInventory,
+                owner,
+                0,
+            );
+            ImplicitBasePreparation::Ready(ImplicitBaseRead {
+                guard: None,
+                base: None,
+                observations: Box::new([HierarchyProviderObservation {
+                    provider,
+                    visit: HierarchyProviderVisit::Observed,
+                    completion: completion.clone(),
+                    inventory_complete: Some(false),
+                }]),
+                completion,
+            })
+        };
+        let root = match input {
+            super::super::SelectedImplicitRootInput::NotProvided => {
+                return Ok(Some(open(incomplete(owner))));
+            }
+            super::super::SelectedImplicitRootInput::Open(completion) => {
+                return Ok(Some(open(completion)));
+            }
+            super::super::SelectedImplicitRootInput::Source(root) => root,
+        };
+        let context_completion = root.context_completion.combine(&written.completion);
+        let kind = match root.owner_kind {
+            super::super::NominalParentTargetKind::Class
+            | super::super::NominalParentTargetKind::Struct
+            | super::super::NominalParentTargetKind::Enum => {
+                if context_completion == ResolutionCompletion::Complete {
+                    ClassifiedSupertypeKind::ImplicitSuperclass
+                } else {
+                    ClassifiedSupertypeKind::LookupOnlyRoot
+                }
+            }
+            super::super::NominalParentTargetKind::Interface => {
+                ClassifiedSupertypeKind::LookupOnlyRoot
+            }
+            super::super::NominalParentTargetKind::NonBase
+            | super::super::NominalParentTargetKind::Missing
+            | super::super::NominalParentTargetKind::Ambiguous
+            | super::super::NominalParentTargetKind::Incomplete => {
+                return Ok(Some(open(incomplete(owner))));
+            }
+        };
+        let Some(ordinal) = written.next_ordinal else {
+            return Ok(Some(open(written.completion.clone())));
+        };
+        let provider = HierarchyProviderKey::source(
+            owner,
+            owner,
+            ResolutionNamespace::Type,
+            HierarchyProviderAuthority::Declaration(owner),
+            HierarchyProviderOperand::SupertypeEdge {
+                reference: root.reference,
+                ordinal,
+            },
+            root.reference,
+            ordinal,
+        );
+        let observations = Box::new([HierarchyProviderObservation {
+            provider: provider.clone(),
+            visit: HierarchyProviderVisit::Observed,
+            completion: ResolutionCompletion::Complete,
+            inventory_complete: Some(true),
+        }]);
+        Ok(Some(ImplicitBasePreparation::Reference(
+            ImplicitBaseReference {
+                language: root.language,
+                reference: root.reference,
+                frontier: root.frontier,
+                ordinal,
+                kind,
+                provider,
+                rules: (kind == ClassifiedSupertypeKind::LookupOnlyRoot).then_some(rules),
+                observations,
+                binding_completion: ResolutionCompletion::Complete,
+                context_completion,
+            },
+        )))
+    }
+
     fn implicit_base(
         &self,
         _owner: SemanticId,
@@ -140,6 +301,11 @@ pub(crate) struct ImplicitBaseRead {
     pub(crate) completion: ResolutionCompletion,
 }
 pub(crate) struct ImplicitBaseFact {
+    pub(crate) context_completion: ResolutionCompletion,
+    pub(crate) binding: Option<ImplicitBaseBinding>,
+    pub(crate) rules:
+        Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers>,
+    pub(crate) kind: ClassifiedSupertypeKind,
     pub(crate) target: Option<SemanticId>,
     pub(crate) definite: bool,
     pub(crate) external: bool,
@@ -158,6 +324,14 @@ impl Hash for HierarchyLookupShape {
         self.candidate_policy.hash(state);
         self.namespace_aliases.hash(state);
         self.policy.hash_extension(state);
+        if let Some(HierarchyMemberAdmission::PublicInstanceMethods) = self.admission {
+            b"member_admission".hash(state);
+            b"public-instance-methods".hash(state);
+        }
+        if let Some(access) = self.access_context {
+            b"candidate-access-context".hash(state);
+            access.hash(state);
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -428,6 +602,7 @@ mod tests {
     #[test]
     fn hierarchy_policy_default_lookup_summary_and_edge_bytes_are_unchanged() {
         for language in [
+            Language::CSharp,
             Language::Rust,
             Language::Go,
             Language::Java,
@@ -455,6 +630,32 @@ mod tests {
                             bytes(&old(shape)),
                             "{language:?} {namespace:?}"
                         );
+                        let first = HierarchyLookupShape {
+                            access_context: Some(PreparedDeclarationAccessContext {
+                                context: DeclarationAccessContext::EnclosingType(owner),
+                                reference: SemanticId::for_test("first-caller-site"),
+                            }),
+                            ..shape
+                        };
+                        let second = HierarchyLookupShape {
+                            access_context: Some(PreparedDeclarationAccessContext {
+                                context: DeclarationAccessContext::EnclosingType(owner),
+                                reference: SemanticId::for_test("second-caller-site"),
+                            }),
+                            ..shape
+                        };
+                        assert_eq!(first, second, "same enclosing type is one context");
+                        assert_eq!(bytes(&first), bytes(&second));
+                        assert_ne!(bytes(&first), bytes(&shape));
+                        let outside = HierarchyLookupShape {
+                            access_context: Some(PreparedDeclarationAccessContext {
+                                context: DeclarationAccessContext::OutsideType,
+                                reference: SemanticId::for_test("outside-caller-site"),
+                            }),
+                            ..shape
+                        };
+                        assert_ne!(first, outside);
+                        assert_ne!(bytes(&first), bytes(&outside));
                         let summary = HierarchyNodeKey { shape, owner };
                         assert_eq!(
                             bytes(&summary),
@@ -468,6 +669,18 @@ mod tests {
                             bytes(&HierarchyOwnerKey::from(owner)),
                             bytes(&owner),
                             "{language:?} edges"
+                        );
+                        let constrained = HierarchyLookupShape {
+                            admission: Some(HierarchyMemberAdmission::PublicInstanceMethods),
+                            ..shape
+                        };
+                        assert_ne!(bytes(&constrained), bytes(&shape));
+                        assert_ne!(
+                            bytes(&HierarchyNodeKey {
+                                shape: constrained,
+                                owner
+                            }),
+                            bytes(&summary)
                         );
                         let custom = HierarchyLookupShape {
                             policy: HierarchyPolicyId(7),
@@ -486,6 +699,57 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn hierarchy_admission_preserves_absent_canonical_shape_identity() {
+        let source = PreloadedFactResolutionService::from_lowered_fragments([], []);
+        let cancellation = CancellationToken::new();
+        let identities = SelectedContextIdentities::new();
+        let lookup = identities.semantic([27; 32]);
+        let mut session = FactReadSession::new(&source, &cancellation);
+        session.context_identities = Some(identities);
+        let arena = HierarchyOperationArena::default();
+        for namespace in [
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Callable,
+        ] {
+            for category in [QualifierCategory::Type, QualifierCategory::Runtime] {
+                let shape = HierarchyLookupShape::new(lookup, namespace, category, 0);
+                let mut old = CanonicalHasher::new(b"test-hierarchy-absent-admission:v1");
+                old.identity_field("lookup", lookup, |key| session.identity_digest(&arena, key))
+                    .unwrap();
+                old.field("namespace", namespace.identity_label().as_bytes());
+                old.field(
+                    "category",
+                    match category {
+                        QualifierCategory::Type => b"type",
+                        QualifierCategory::Runtime => b"runtime",
+                    },
+                );
+                old.field("receiver_indirection", &0_i64.to_le_bytes());
+                let mut current = CanonicalHasher::new(b"test-hierarchy-absent-admission:v1");
+                hash_hierarchy_shape(&session, &arena, &mut current, shape).unwrap();
+                let current = current.finish();
+                assert_eq!(
+                    old.finish(),
+                    current,
+                    "absent constraint appends zero canonical bytes"
+                );
+                let constrained = HierarchyLookupShape {
+                    admission: Some(HierarchyMemberAdmission::PublicInstanceMethods),
+                    ..shape
+                };
+                let mut admitted = CanonicalHasher::new(b"test-hierarchy-absent-admission:v1");
+                hash_hierarchy_shape(&session, &arena, &mut admitted, constrained).unwrap();
+                assert_ne!(
+                    current,
+                    admitted.finish(),
+                    "constrained view has an independent identity"
+                );
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct Exhaustive;
     impl HierarchyPolicy for Exhaustive {
@@ -961,7 +1225,7 @@ impl FactEvaluation<'_, '_> {
                 );
                 let read = self.session.supertypes_for_definitions(&[target])?;
                 let rows = match read {
-                    SessionFactRead::Exhausted { rows, evidence } => {
+                    SessionFactRead::Exhausted { rows, evidence, .. } => {
                         let identity = hierarchy_support_read_identity(
                             self.session,
                             self.hierarchy,

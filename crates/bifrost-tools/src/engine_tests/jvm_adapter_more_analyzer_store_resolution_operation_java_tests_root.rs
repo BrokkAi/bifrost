@@ -1126,6 +1126,10 @@ pub mod jvm_extraction_tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#5600: JVM preparation classified and checked one reference at a time"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn jvm_preparation_batches_classification_membership_and_recipe_reads() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContext;
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_sql_trace::{
@@ -1208,6 +1212,10 @@ pub mod jvm_extraction_tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#5600: wildcard import token metadata was reread and must respect staged NULL suppression"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn jvm_import_token_projection_is_operation_owned_and_stage_sensitive() {
         use brokk_bifrost_analysis::analyzer::resolution::SemanticId;
@@ -1319,6 +1327,10 @@ pub mod jvm_extraction_tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#6291: JVM fallback source discovery read every mount's reverse inventory"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn jvm_fallback_anchor_horizon_bounds_gaps_but_keeps_overlay_inventory() {
         use brokk_bifrost_analysis::analyzer::resolution::selected_context::{
@@ -2257,6 +2269,10 @@ pub mod jvm_extraction_tests {
         assert_java_provider_visibility(&fixture, false);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_java_package_candidates_seek_published_package_index() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned;
 
@@ -2344,6 +2360,10 @@ pub mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_java_direct_dependency_access_requires_exact_coordinates_and_scope() {
         const TARGET_POM: &str = "<project><groupId>example</groupId><artifactId>provider</artifactId><version>2</version></project>";
         for (role, scope, version, expected) in [
@@ -2472,6 +2492,10 @@ pub mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_package_metadata_reads_are_scoped_and_indexed() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::package_context::SelectedPackageRows;
 
@@ -2969,6 +2993,10 @@ pub mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_java_inheritance_metadata_uses_indexed_source_rows_and_honors_cancellation() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::explain_pin;
 

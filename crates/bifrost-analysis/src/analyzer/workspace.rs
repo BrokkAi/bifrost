@@ -20,6 +20,7 @@ pub fn composition_language_supported(
             .is_some_and(|support| support.certifies_caller_inventory()))
 }
 
+use crate::analyzer::semantic_model::ActivationInputs;
 use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
 use crate::analyzer::semantic_model::DependencyDiscoveryOutcome;
 use crate::analyzer::semantic_model::DependencyPackLimits;
@@ -36,7 +37,6 @@ use crate::analyzer::semantic_model::SemanticPackCatalog;
 use crate::analyzer::semantic_model::SubprocessPolicy;
 use crate::analyzer::semantic_model::acquire_active_semantic_models_with_inputs;
 use crate::analyzer::semantic_model::prepare_installed_dependency_packs;
-use crate::analyzer::semantic_model::{ActivationInputs, RustSelectedCargoGraph};
 
 use crate::analyzer::store::StoreError;
 
@@ -67,32 +67,7 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-/// Result of acquiring the current selected source from its language provider.
-#[doc(hidden)]
-pub enum SemanticArtifactSourceOutcome<T> {
-    Held(T),
-    Refused(crate::analyzer::semantic::SemanticBudgetDimension),
-    Unavailable,
-}
-
-impl<T> SemanticArtifactSourceOutcome<T> {
-    /// Return the source or a budget refusal. Refused from the held-source
-    /// acquisition has already noted its budget stop. Unavailable means a
-    /// missing provider context, which these callers treat as a provider error.
-    pub fn held_or_refused(
-        self,
-    ) -> Result<Option<T>, crate::analyzer::semantic::SemanticProviderError> {
-        match self {
-            Self::Held(snapshot) => Ok(Some(snapshot)),
-            Self::Refused(_) => Ok(None),
-            Self::Unavailable => Err(
-                crate::analyzer::semantic::SemanticProviderError::invalid_identity(
-                    "selected source has no provider context",
-                ),
-            ),
-        }
-    }
-}
+pub use crate::analyzer::semantic::SemanticArtifactSourceOutcome;
 
 /// A selected proof's source, held on its request's resident-source ledger.
 /// The budget retains only a weak owner; dropping this value releases the hold
@@ -475,6 +450,32 @@ impl SelectedConfigurationProject {
 }
 
 impl Project for SelectedConfigurationProject {
+    fn file_listing_stamp(
+        &self,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::project::ProjectViewStamp>> {
+        // Configuration bytes are pinned separately. Listing membership and
+        // omissions still belong to the delegated project view.
+        self.project.file_listing_stamp()
+    }
+
+    fn listing_receipt_structurally_unknown(&self) -> bool {
+        self.project.listing_receipt_structurally_unknown()
+    }
+
+    fn membership_point_observation(
+        &self,
+        listing: &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+    ) -> Option<brokk_bifrost_core::analyzer::project::WorkspaceMembershipPointObservation> {
+        self.project.membership_point_observation(listing)
+    }
+
+    fn listing_ignore_inputs_verified(
+        &self,
+        listing: &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+    ) -> bool {
+        self.project.listing_ignore_inputs_verified(listing)
+    }
+
     fn has_exact_directory_entry(&self, file: &ProjectFile) -> std::io::Result<bool> {
         self.project.has_exact_directory_entry(file)
     }
@@ -858,6 +859,8 @@ impl Project for SelectedConfigurationProject {
 }
 
 pub struct EmptyAnalyzer {
+    host_activation:
+        std::sync::OnceLock<Arc<crate::analyzer::semantic_model::HostActivationContext>>,
     pending_updates: BTreeSet<ProjectFile>,
     full_refresh_pending: bool,
     update_error: Option<StoreError>,
@@ -875,6 +878,7 @@ impl Clone for EmptyAnalyzer {
     fn clone(&self) -> Self {
         let mut clone = Self::new(Arc::clone(&self.project));
         clone.build_context = self.build_context.clone();
+        clone.host_activation = self.host_activation.clone();
         clone.pending_updates = self.pending_updates.clone();
         clone.full_refresh_pending = self.full_refresh_pending;
         clone.update_error = self.update_error.clone();
@@ -890,6 +894,7 @@ impl EmptyAnalyzer {
         let project = super::project_read_facade::with_project_read_slot(project);
         let project_reads = super::tree_sitter_analyzer::ProjectReadRegistry::new(&project);
         Self {
+            host_activation: std::sync::OnceLock::new(),
             pending_updates: BTreeSet::new(),
             full_refresh_pending: false,
             update_error: None,
@@ -934,6 +939,7 @@ impl EmptyAnalyzer {
     }
     fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut analyzer = Self::new(Arc::clone(&project));
+        analyzer.host_activation = self.host_activation.clone();
         analyzer.pending_updates = self.pending_updates.clone();
         analyzer.full_refresh_pending = self.full_refresh_pending;
         analyzer.update_error = self.update_error.clone();
@@ -945,6 +951,7 @@ impl EmptyAnalyzer {
     }
     pub(crate) fn clone_for_read_attribution(&self) -> Self {
         Self {
+            host_activation: self.host_activation.clone(),
             pending_updates: self.pending_updates.clone(),
             full_refresh_pending: self.full_refresh_pending,
             update_error: self.update_error.clone(),
@@ -1039,6 +1046,35 @@ impl CodeUnitIndex for EmptyAnalyzer {
 }
 
 impl IAnalyzer for EmptyAnalyzer {
+    fn host_activation_context(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::HostActivationContext>> {
+        self.project_reads
+            .host_activation_context()
+            .unwrap_or_else(|| self.host_activation.get().cloned())
+    }
+    fn bind_host_activation_context(
+        &self,
+        host: Arc<crate::analyzer::semantic_model::HostActivationContext>,
+    ) -> Result<(), String> {
+        if self
+            .host_activation
+            .get()
+            .is_some_and(|pinned| Arc::ptr_eq(pinned, &host))
+        {
+            return Ok(());
+        }
+        if host.requires_analyzed_root_validation() {
+            host.validate_analyzed_root(self.project.root())?;
+        }
+        let wanted = host.identity();
+        match self.host_activation.set(host) {
+            Ok(()) => Ok(()),
+            Err(_) if self.host_activation.get().is_some_and(|pinned| pinned.identity() == wanted) => Ok(()),
+            Err(_) => Err("analyzer activation context is immutable; construct a new analyzer for another approval authority".into()),
+        }
+    }
+
     #[cfg(test)]
     fn selected_parse_variant(
         &self,
@@ -1069,6 +1105,22 @@ impl IAnalyzer for EmptyAnalyzer {
             })
     }
 
+    fn require_workspace_languages(&self, languages: &[Language]) -> Result<(), StoreError> {
+        self.build_context.as_ref().map_or(Ok(()), |context| {
+            context.require_workspace_languages(languages)
+        })
+    }
+
+    fn dynamic_import_sources(
+        &self,
+        seed_files: Option<&[ProjectFile]>,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if let Some(context) = &self.build_context {
+            context.require_import_source_selection(seed_files)?;
+        }
+        Ok(Vec::new())
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if let Some(error) = &self.update_error {
             context.record_store_error(error.clone());
@@ -1077,6 +1129,12 @@ impl IAnalyzer for EmptyAnalyzer {
     }
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.project_reads.end_query(context);
+    }
+    fn current_query_read_completion(&self) -> Result<(), crate::analyzer::QueryReadIncomplete> {
+        super::i_analyzer::current_domain_read_completion()
+    }
+    fn record_query_incomplete(&self, reason: crate::analyzer::QueryReadIncomplete) {
+        super::i_analyzer::record_query_incomplete_on_current_contexts(reason);
     }
     fn supports_selected_read_recording(&self) -> bool {
         true
@@ -1213,11 +1271,7 @@ pub struct DependencyPackWorkspaceContext<'a> {
 type DependencyPackDiscoveryResult = (
     &'static dyn DependencyResolver,
     DependencyPackLimits,
-    DependencyDiscoveryOutcome,
-    std::sync::Arc<[crate::analyzer::read_ledger::ReadKey]>,
-    crate::analyzer::semantic::ids::StableDigest,
-    crate::analyzer::dependency_support::ExternalDiscoveryReads,
-    Option<RustSelectedCargoGraph>,
+    crate::analyzer::semantic_model::CapturedDependencyDiscovery,
 );
 
 pub type PythonSemanticModelWorkspaceContext<'a> = DependencyPackWorkspaceContext<'a>;
@@ -1399,8 +1453,19 @@ pub struct DependencyPackActivationOutcome {
     pub diagnostic_refresh_required: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DependencyPackPublicationKind {
+    Full,
+    Subset,
+}
+
 struct DependencyPackPublicationEvidence {
+    kind: DependencyPackPublicationKind,
+    pending_previous:
+        Option<crate::analyzer::semantic_model::runtime::PendingDependencyPublication>,
     dependencies: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
+    withdrawn_languages: Vec<Language>,
+    pending_languages: Vec<Language>,
     jdk_artifacts: Option<HashMap<PathBuf, SemanticModelActivationEvidence>>,
     python_runtime:
         Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
@@ -1421,12 +1486,45 @@ pub fn prepared_jdk_artifacts_for_source_bindings(
         .find_map(|support| support.dependency_source_artifacts(config, project_root, outcomes))
 }
 
+#[derive(Debug)]
+struct StagedDependencyDiscoveryEntry {
+    ecosystem: DependencyPackEcosystem,
+    config: AnalyzerConfig,
+    limits: DependencyPackLimits,
+    discovery: crate::analyzer::semantic_model::CapturedDependencyDiscovery,
+}
+
+/// Per-ecosystem captured discovery and receipts handed from the installed
+/// stage to the configured stage within one semantic-pack warm.
+#[derive(Debug, Default)]
+pub struct StagedDependencyDiscoveryHandoff {
+    entries: Vec<StagedDependencyDiscoveryEntry>,
+}
+
+impl StagedDependencyDiscoveryHandoff {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn take_ecosystem(
+        &mut self,
+        ecosystem: DependencyPackEcosystem,
+    ) -> Option<StagedDependencyDiscoveryEntry> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.ecosystem == ecosystem)?;
+        Some(self.entries.swap_remove(index))
+    }
+}
+
 /// The installed-pack stage's activation: the published interim outcome plus
 /// every dependency whose exact acquisition remains for the full stage.
 #[derive(Debug)]
 pub struct InstalledDependencyPackActivationOutcome {
     pub outcome: DependencyPackActivationOutcome,
     pub pending: Vec<PendingDependencyPackAcquisition>,
+    pub discovery_handoff: Option<StagedDependencyDiscoveryHandoff>,
 }
 
 /// External discovery inputs must obey the same rule within and across generations.
@@ -1487,6 +1585,13 @@ fn python_runtime_publication(
 }
 
 impl WorkspaceAnalyzer {
+    pub fn bind_host_activation_context(
+        &self,
+        host: Arc<crate::analyzer::semantic_model::HostActivationContext>,
+    ) -> Result<(), String> {
+        self.analyzer().bind_host_activation_context(host)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_pending_update_paths(&self) -> &BTreeSet<ProjectFile> {
         match self {
@@ -1564,6 +1669,18 @@ impl WorkspaceAnalyzer {
             .store_captured_dependency_discovery(ecosystem, discovery);
     }
 
+    /// Whether this snapshot already holds a finished discovery of `ecosystem`
+    /// for the activation stage, so a repeat discovery would only find every
+    /// input reconciled and record none of the reads the first one made.
+    pub fn captured_dependency_discovery_is_complete(
+        &self,
+        ecosystem: DependencyPackEcosystem,
+    ) -> bool {
+        self.analyzer()
+            .snapshot_caches()
+            .is_some_and(|caches| caches.captured_dependency_discovery_is_complete(ecosystem))
+    }
+
     fn take_captured_dependency_discovery(
         &self,
         ecosystem: DependencyPackEcosystem,
@@ -1601,15 +1718,7 @@ impl WorkspaceAnalyzer {
                     },
                 )
             });
-        (
-            resolver,
-            limits,
-            discovery.outcome,
-            discovery.project_read_keys,
-            discovery.project_read_identity,
-            discovery.external_reads,
-            discovery.rust_cargo_graph,
-        )
+        (resolver, limits, discovery)
     }
 
     fn missing_membership_ecosystem(
@@ -1660,7 +1769,31 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: DependencyPackWorkspaceContext<'_>,
     ) -> DependencyPackActivationOutcome {
-        self.activate_dependency_packs_with_inputs(config, ecosystems, context, None)
+        self.activate_dependency_packs_with_inputs(
+            config,
+            ecosystems,
+            context,
+            None,
+            DependencyPackPublicationKind::Full,
+            None,
+        )
+    }
+
+    /// Refresh only the selected ecosystems, carrying all other contributions.
+    pub fn refresh_selected_dependency_packs(
+        &self,
+        config: &AnalyzerConfig,
+        selected: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+    ) -> DependencyPackActivationOutcome {
+        self.activate_dependency_packs_with_inputs(
+            config,
+            selected,
+            context,
+            None,
+            DependencyPackPublicationKind::Subset,
+            None,
+        )
     }
 
     pub(crate) fn activate_dependency_packs_with_inputs(
@@ -1669,8 +1802,46 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: DependencyPackWorkspaceContext<'_>,
         inputs: Option<&ActivationInputs>,
+        kind: DependencyPackPublicationKind,
+        handoff: Option<StagedDependencyDiscoveryHandoff>,
     ) -> DependencyPackActivationOutcome {
-        let mut activation = self.dependency_pack_activation_inputs(ecosystems, &context, inputs);
+        if let Err(reason) =
+            self.bind_host_activation_context(Arc::clone(&context.activation.host_activation))
+        {
+            let mut report = crate::analyzer::semantic_model::SemanticModelActivationReport {
+                host_activation: context.activation.host_activation.metadata().map(Box::new),
+                ..Default::default()
+            };
+            crate::analyzer::semantic_model::runtime::push_request_explanation(
+                &mut report,
+                context.activation.limits,
+                reason,
+            );
+            return DependencyPackActivationOutcome {
+                ecosystems: Vec::new(),
+                runtime: Some(SemanticModelRuntimeOutcome::Unavailable(report)),
+                diagnostic_refresh_required: false,
+            };
+        }
+
+        context.catalog.with_activation_publication(|| {
+            self.activate_dependency_packs_in_publication(
+                config, ecosystems, context, inputs, kind, handoff,
+            )
+        })
+    }
+
+    fn activate_dependency_packs_in_publication(
+        &self,
+        config: &AnalyzerConfig,
+        ecosystems: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+        inputs: Option<&ActivationInputs>,
+        kind: DependencyPackPublicationKind,
+        handoff: Option<StagedDependencyDiscoveryHandoff>,
+    ) -> DependencyPackActivationOutcome {
+        let mut activation =
+            self.dependency_pack_activation_inputs(ecosystems, &context, inputs, kind);
         let cache = self
             .analyzer()
             .snapshot_caches()
@@ -1688,15 +1859,103 @@ impl WorkspaceAnalyzer {
         // retained entry revalidates every recorded external read (#11890).
         // Comparing after discovery would discard fresh completeness evidence,
         // so cross-generation carry keeps its separate finalized key (#12435).
-        if let Some(cache) = cache
-            && let Some(outcome) = cache
-                .reuse_dependency_activation(same_generation_key.as_ref(), context.cancellation)
+        if kind == DependencyPackPublicationKind::Full
+            && let Some(cache) = cache
+            && let Some(outcome) = cache.reuse_dependency_activation(
+                same_generation_key.as_ref(),
+                context.cancellation,
+                self.analyzer(),
+                context.catalog,
+                ecosystems,
+                |mut outcome| {
+                    let republish =
+                        || -> Result<(), crate::analyzer::semantic_model::CatalogError> {
+                            if context.cancellation.is_cancelled() {
+                                return Err(
+                                    crate::analyzer::semantic_model::CatalogError::Cancelled,
+                                );
+                            }
+                            if let Some(persistence) = context.persistence {
+                                context.catalog.reconcile_workspace_active_set(
+                                    persistence.scope_id,
+                                    persistence.store,
+                                )?;
+                            }
+                            let Some(SemanticModelRuntimeOutcome::Ready { snapshot, .. }) =
+                                &outcome.runtime
+                            else {
+                                unreachable!("retained activation is Ready")
+                            };
+                            crate::analyzer::semantic_model::runtime::publish_active_models(
+                                self.analyzer(),
+                                context.catalog,
+                                context.persistence,
+                                snapshot.active_models(),
+                                context.cancellation,
+                            )?;
+                            if context.cancellation.is_cancelled() {
+                                return Err(
+                                    crate::analyzer::semantic_model::CatalogError::Cancelled,
+                                );
+                            }
+                            Ok(())
+                        };
+                    if let Err(error) = republish() {
+                        return DependencyPackActivationOutcome {
+                            ecosystems: outcome.ecosystems,
+                            runtime: Some(
+                                crate::analyzer::semantic_model::runtime::catalog_lifecycle_error(
+                                    activation.request.limits,
+                                    "republish retained activation",
+                                    error,
+                                ),
+                            ),
+                            diagnostic_refresh_required: false,
+                        };
+                    }
+                    // This invocation replayed evidence; it performed no
+                    // discovery or dependency preparation work.
+                    for ecosystem in &mut outcome.ecosystems {
+                        // Informational evidence includes semantic standard-
+                        // library expectations, so retain it while clearing
+                        // only this invocation's work counters.
+                        ecosystem.discovery.profile.metadata_inputs_considered = 0;
+                        ecosystem.discovery.profile.dependencies_resolved = 0;
+                        if let Some(preparation) = &mut ecosystem.preparation {
+                            preparation.profile = Default::default();
+                        }
+                    }
+                    if let Some(SemanticModelRuntimeOutcome::Ready { lifecycle, .. }) =
+                        &mut outcome.runtime
+                    {
+                        *lifecycle =
+                            crate::analyzer::semantic_model::SemanticModelRuntimeLifecycle::Cached;
+                    }
+                    outcome
+                },
+            )
         {
             return outcome;
         }
         let mut outcomes = Vec::with_capacity(ecosystems.len());
         let mut publication_evidence = Vec::with_capacity(ecosystems.len());
+        let mut withdrawn_languages = Vec::new();
         let mut cancelled = false;
+        let mut handoff_verification = handoff.filter(|h| !h.is_empty()).map(|handoff| {
+            let empty = crate::analyzer::semantic::ids::StableDigest::sha256([]);
+            (
+                handoff,
+                None::<super::read_verification::ChangedFacts>,
+                super::read_verification::HeadInputs {
+                    models: empty,
+                    policy_semantic_hash: empty,
+                    policy_source: empty,
+                    configuration: empty,
+                    epoch: empty,
+                },
+                super::read_verification::LookupMemo::default(),
+            )
+        });
 
         // Dependency-pack work runs before the parse phase and is attributed to
         // the workspace as a whole, so a slow ecosystem looks like slow startup
@@ -1717,15 +1976,59 @@ impl WorkspaceAnalyzer {
                 }
                 continue;
             }
-            let (
-                resolver,
-                limits,
-                discovery,
-                discovery_read_keys,
-                discovery_read_identity,
-                external_reads,
+            let (resolver, limits, captured_discovery) =
+                if let Some((handoff, changed_slot, inputs, memo)) = &mut handoff_verification
+                    && let Some(entry) = handoff.take_ecosystem(ecosystem)
+                {
+                    let resolver = ecosystem.resolver();
+                    let mut expected_limits = context.limits;
+                    resolver.adjust_limits(config, &mut expected_limits);
+                    let same_configuration =
+                        entry.config == *config && entry.limits == expected_limits;
+                    let membership_unchanged =
+                        self.analyzer().generation_membership().listing().is_ok()
+                            && self.analyzer().project().ignore_rules_digest().is_ok();
+                    let external_eligible =
+                        DependencyDiscoveryEvidence::carry_eligible_external_reads_for_parts(
+                            entry.discovery.outcome.has_unrecorded_diagnostics(|code| {
+                                resolver.diagnostic_follows_recorded_reads(code)
+                            }),
+                            0,
+                            entry.discovery.external_reads.complete,
+                            &entry.discovery.external_reads.keys,
+                        )
+                        .is_some_and(|keys| keys.iter().all(|key| key.still_matches()));
+                    let verified = external_eligible && same_configuration && {
+                        let changed = changed_slot.get_or_insert_with(|| {
+                            super::read_verification::ChangedFacts::between(self, self)
+                        });
+                        verify_dependency_discovery_project_reads(
+                            self,
+                            changed,
+                            inputs,
+                            memo,
+                            entry.discovery.project_read_identity,
+                            &entry.discovery.project_read_keys,
+                            membership_unchanged,
+                            #[cfg(any(test, feature = "test-support"))]
+                            None,
+                        )
+                    };
+                    if verified {
+                        (resolver, entry.limits, entry.discovery)
+                    } else {
+                        self.discover_dependency_pack_ecosystem(ecosystem, config, &context)
+                    }
+                } else {
+                    self.discover_dependency_pack_ecosystem(ecosystem, config, &context)
+                };
+            let crate::analyzer::semantic_model::CapturedDependencyDiscovery {
+                outcome: discovery,
                 rust_cargo_graph,
-            ) = self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+                project_read_keys: discovery_read_keys,
+                project_read_identity: discovery_read_identity,
+                external_reads,
+            } = captured_discovery;
             if ecosystem == DependencyPackEcosystem::Cargo {
                 activation.rust_cargo_graph = rust_cargo_graph;
             }
@@ -1742,6 +2045,12 @@ impl WorkspaceAnalyzer {
                 });
                 break;
             }
+            let preparation_bindings =
+                crate::analyzer::semantic_model::dependency::preparation_input_bindings(
+                    &discovery.dependencies,
+                    &limits,
+                    Some(context.cancellation),
+                );
             let preparation = {
                 let _scope = crate::profiling::scope_with(|| {
                     format!(
@@ -1767,17 +2076,41 @@ impl WorkspaceAnalyzer {
                 });
                 break;
             }
-            if preparation.complete || !preparation.evidence.is_empty() {
+            if !preparation.complete && preparation.evidence.is_empty() {
+                withdrawn_languages.extend_from_slice(ecosystem.languages());
+            }
+            {
                 activation
                     .request
                     .evidence
                     .extend(preparation.evidence.iter().cloned());
-                publication_evidence.push((
-                    ecosystem.languages().to_vec().into_boxed_slice(),
-                    DependencyDiscoveryEvidence::from_outcome(&discovery)
-                        .with_project_reads(discovery_read_keys, discovery_read_identity)
-                        .with_external_reads(external_reads.keys, external_reads.complete),
-                ));
+                let retained_status =
+                    crate::analyzer::semantic_model::RetainedEcosystemStatus::retain(
+                        &discovery,
+                        Some(&preparation),
+                        self.retention_budget(),
+                    );
+                let mut failure_evidence = DependencyDiscoveryEvidence::from_outcome(&discovery)
+                    .with_diagnostics_judged_by(&discovery, |code| {
+                        resolver.diagnostic_follows_recorded_reads(code)
+                    })
+                    .with_retained_status(retained_status)
+                    .with_preparation_failures(
+                        &discovery.dependencies,
+                        &preparation.failures,
+                        &preparation_bindings,
+                    );
+                activation
+                    .preparation_failures
+                    .append(&mut failure_evidence.preparation_failures);
+                {
+                    publication_evidence.push((
+                        ecosystem.languages().to_vec().into_boxed_slice(),
+                        failure_evidence
+                            .with_project_reads(discovery_read_keys, discovery_read_identity)
+                            .with_external_reads(external_reads.keys, external_reads.complete),
+                    ));
+                }
             }
             outcomes.push(DependencyPackEcosystemOutcome {
                 ecosystem,
@@ -1786,20 +2119,20 @@ impl WorkspaceAnalyzer {
             });
         }
 
-        let outcome = self.finalize_dependency_pack_activation(
+        self.finalize_dependency_pack_activation(
             config,
             activation,
             publication_evidence,
+            withdrawn_languages,
+            Vec::new(),
+            None,
             outcomes,
             cancelled,
-            ecosystems.is_empty(),
+            ecosystems,
+            kind,
             &context,
             same_generation_key,
-        );
-        if !cancelled && let Some(caches) = self.analyzer().snapshot_caches() {
-            caches.record_activated_dependency_ecosystems(ecosystems);
-        }
-        outcome
+        )
     }
 
     /// The installed-pack stage of [`Self::activate_dependency_packs`]: run
@@ -1821,7 +2154,29 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: DependencyPackWorkspaceContext<'_>,
     ) -> InstalledDependencyPackActivationOutcome {
-        self.activate_installed_dependency_packs_with_inputs(config, ecosystems, context, None)
+        self.activate_installed_dependency_packs_with_inputs(
+            config,
+            ecosystems,
+            context,
+            None,
+            DependencyPackPublicationKind::Full,
+        )
+    }
+
+    /// Refresh only the selected ecosystems, carrying all other contributions.
+    pub fn refresh_selected_installed_dependency_packs(
+        &self,
+        config: &AnalyzerConfig,
+        selected: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+    ) -> InstalledDependencyPackActivationOutcome {
+        self.activate_installed_dependency_packs_with_inputs(
+            config,
+            selected,
+            context,
+            None,
+            DependencyPackPublicationKind::Subset,
+        )
     }
 
     pub(crate) fn activate_installed_dependency_packs_with_inputs(
@@ -1830,14 +2185,46 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: DependencyPackWorkspaceContext<'_>,
         inputs: Option<&ActivationInputs>,
+        kind: DependencyPackPublicationKind,
     ) -> InstalledDependencyPackActivationOutcome {
+        if let Err(reason) =
+            self.bind_host_activation_context(Arc::clone(&context.activation.host_activation))
+        {
+            let mut report = crate::analyzer::semantic_model::SemanticModelActivationReport {
+                host_activation: context.activation.host_activation.metadata().map(Box::new),
+                ..Default::default()
+            };
+            crate::analyzer::semantic_model::runtime::push_request_explanation(
+                &mut report,
+                context.activation.limits,
+                reason,
+            );
+            return InstalledDependencyPackActivationOutcome {
+                outcome: DependencyPackActivationOutcome {
+                    ecosystems: Vec::new(),
+                    runtime: Some(SemanticModelRuntimeOutcome::Unavailable(report)),
+                    diagnostic_refresh_required: false,
+                },
+                pending: Vec::new(),
+                discovery_handoff: None,
+            };
+        }
+
         if let Some(caches) = self.analyzer().snapshot_caches() {
             caches.semantic_models().clear_dependency_activation();
         }
         let mut outcomes = Vec::with_capacity(ecosystems.len());
-        let mut activation = self.dependency_pack_activation_inputs(ecosystems, &context, inputs);
+        let mut activation =
+            self.dependency_pack_activation_inputs(ecosystems, &context, inputs, kind);
         let mut publication_evidence = Vec::with_capacity(ecosystems.len());
+        let mut withdrawn_languages = Vec::new();
         let mut pending = Vec::new();
+        let pending_previous = self
+            .analyzer()
+            .snapshot_caches()
+            .map(|caches| caches.semantic_models().capture_pending_publication());
+        let mut pending_languages = Vec::new();
+        let mut staged_discoveries = Vec::with_capacity(ecosystems.len());
         let mut cancelled = false;
 
         for ecosystem in ecosystems.iter().copied() {
@@ -1853,15 +2240,23 @@ impl WorkspaceAnalyzer {
                 }
                 continue;
             }
-            let (
-                resolver,
-                limits,
-                discovery,
-                discovery_read_keys,
-                discovery_read_identity,
-                external_reads,
+            let (resolver, limits, captured_discovery) =
+                self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+            if !captured_discovery.outcome.cancelled {
+                staged_discoveries.push(StagedDependencyDiscoveryEntry {
+                    ecosystem,
+                    config: config.clone(),
+                    limits,
+                    discovery: captured_discovery.clone(),
+                });
+            }
+            let crate::analyzer::semantic_model::CapturedDependencyDiscovery {
+                outcome: discovery,
                 rust_cargo_graph,
-            ) = self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+                project_read_keys: discovery_read_keys,
+                project_read_identity: discovery_read_identity,
+                external_reads,
+            } = captured_discovery;
             if ecosystem == DependencyPackEcosystem::Cargo {
                 activation.rust_cargo_graph = rust_cargo_graph;
             }
@@ -1878,6 +2273,12 @@ impl WorkspaceAnalyzer {
                 });
                 break;
             }
+            let preparation_bindings =
+                crate::analyzer::semantic_model::dependency::preparation_input_bindings(
+                    &discovery.dependencies,
+                    &limits,
+                    Some(context.cancellation),
+                );
             let preparation = {
                 let _scope = crate::profiling::scope_with(|| {
                     format!(
@@ -1903,23 +2304,95 @@ impl WorkspaceAnalyzer {
                 });
                 break;
             }
+            let previous_evidence = pending_previous
+                .as_ref()
+                .and_then(|previous| previous.contributions.get(&ecosystem));
+            if !preparation.pending.is_empty()
+                && pending_previous.as_ref().is_some_and(|previous| {
+                    ecosystem
+                        .languages()
+                        .iter()
+                        .all(|language| previous.can_substitute(*language))
+                })
+                && let Some(evidence) = previous_evidence
+            {
+                pending_languages.extend_from_slice(ecosystem.languages());
+                activation
+                    .request
+                    .evidence
+                    .extend(evidence.evidence.clone());
+                if let Some(previous) = pending_previous
+                    .as_ref()
+                    .and_then(|previous| previous.inputs.clone())
+                {
+                    activation.preparation_failures.extend(
+                        previous.preparation_failures.into_iter().filter(|failure| {
+                            ecosystem.languages().iter().any(|language| {
+                                language.config_label() == failure.dependency.evidence.language
+                            })
+                        }),
+                    );
+                    if ecosystem == DependencyPackEcosystem::Cargo {
+                        activation.rust_cargo_graph = previous.rust_cargo_graph;
+                    }
+                }
+                pending.extend(preparation.pending.into_iter().map(|dependency_id| {
+                    PendingDependencyPackAcquisition {
+                        ecosystem,
+                        dependency_id,
+                    }
+                }));
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: Some(preparation.outcome),
+                });
+                continue;
+            }
+            if preparation.pending.is_empty()
+                && !preparation.outcome.complete
+                && preparation.outcome.evidence.is_empty()
+            {
+                withdrawn_languages.extend_from_slice(ecosystem.languages());
+            }
             pending.extend(preparation.pending.into_iter().map(|dependency_id| {
                 PendingDependencyPackAcquisition {
                     ecosystem,
                     dependency_id,
                 }
             }));
-            if preparation.outcome.complete || !preparation.outcome.evidence.is_empty() {
+            {
                 activation
                     .request
                     .evidence
                     .extend(preparation.outcome.evidence.iter().cloned());
-                publication_evidence.push((
-                    ecosystem.languages().to_vec().into_boxed_slice(),
-                    DependencyDiscoveryEvidence::from_outcome(&discovery)
-                        .with_project_reads(discovery_read_keys, discovery_read_identity)
-                        .with_external_reads(external_reads.keys, external_reads.complete),
-                ));
+                let retained_status =
+                    crate::analyzer::semantic_model::RetainedEcosystemStatus::retain(
+                        &discovery,
+                        Some(&preparation.outcome),
+                        self.retention_budget(),
+                    );
+                let mut failure_evidence = DependencyDiscoveryEvidence::from_outcome(&discovery)
+                    .with_diagnostics_judged_by(&discovery, |code| {
+                        resolver.diagnostic_follows_recorded_reads(code)
+                    })
+                    .with_retained_status(retained_status)
+                    .with_preparation_failures(
+                        &discovery.dependencies,
+                        &preparation.outcome.failures,
+                        &preparation_bindings,
+                    );
+                activation
+                    .preparation_failures
+                    .append(&mut failure_evidence.preparation_failures);
+                {
+                    publication_evidence.push((
+                        ecosystem.languages().to_vec().into_boxed_slice(),
+                        failure_evidence
+                            .with_project_reads(discovery_read_keys, discovery_read_identity)
+                            .with_external_reads(external_reads.keys, external_reads.complete),
+                    ));
+                }
             }
             outcomes.push(DependencyPackEcosystemOutcome {
                 ecosystem,
@@ -1932,16 +2405,26 @@ impl WorkspaceAnalyzer {
             config,
             activation,
             publication_evidence,
+            withdrawn_languages,
+            pending_languages,
+            pending_previous,
             outcomes,
             cancelled,
-            ecosystems.is_empty(),
+            ecosystems,
+            kind,
             &context,
             None,
         );
-        if !cancelled && let Some(caches) = self.analyzer().snapshot_caches() {
-            caches.record_activated_dependency_ecosystems(ecosystems);
+
+        let discovery_handoff =
+            (!pending.is_empty() && !cancelled).then_some(StagedDependencyDiscoveryHandoff {
+                entries: staged_discoveries,
+            });
+        InstalledDependencyPackActivationOutcome {
+            outcome,
+            pending,
+            discovery_handoff,
         }
-        InstalledDependencyPackActivationOutcome { outcome, pending }
     }
 
     fn dependency_pack_activation_inputs(
@@ -1949,15 +2432,48 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: &DependencyPackWorkspaceContext<'_>,
         inputs: Option<&ActivationInputs>,
+        kind: DependencyPackPublicationKind,
     ) -> ActivationInputs {
-        let mut activation = inputs.cloned().unwrap_or_else(|| ActivationInputs {
-            request: context.activation.clone(),
-            rust_cargo_graph: self
-                .carried_activation_inputs()
-                .and_then(|carried| carried.rust_cargo_graph),
+        let mut activation = inputs
+            .cloned()
+            .or_else(|| self.carried_activation_inputs())
+            .unwrap_or_else(|| ActivationInputs {
+                preparation_failures: Vec::new(),
+                request: context.activation.clone(),
+                rust_cargo_graph: None,
+            });
+        // Fresh workspace-source inputs carry current request controls, but
+        // sibling terminal outcomes still belong to the retained publication.
+        if kind == DependencyPackPublicationKind::Subset
+            && let Some(carried) = self.carried_activation_inputs()
+        {
+            for failure in carried.preparation_failures {
+                if !activation.preparation_failures.contains(&failure) {
+                    activation.preparation_failures.push(failure);
+                }
+            }
+        }
+        activation.preparation_failures.retain(|failure| {
+            kind == DependencyPackPublicationKind::Subset
+                && !ecosystems.iter().any(|ecosystem| {
+                    ecosystem.languages().iter().any(|language| {
+                        language.config_label() == failure.dependency.evidence.language
+                    })
+                })
         });
         activation.request = context.activation.clone();
-        if ecosystems.contains(&DependencyPackEcosystem::Cargo) {
+        if kind == DependencyPackPublicationKind::Subset
+            && let Some(caches) = self.analyzer().snapshot_caches()
+        {
+            for (ecosystem, evidence) in caches.semantic_models().dependency_request_evidence() {
+                if !ecosystems.contains(&ecosystem) {
+                    activation.request.evidence.extend(evidence.evidence);
+                }
+            }
+        }
+        if kind == DependencyPackPublicationKind::Full
+            || ecosystems.contains(&DependencyPackEcosystem::Cargo)
+        {
             activation.rust_cargo_graph = None;
         }
         activation
@@ -1970,19 +2486,34 @@ impl WorkspaceAnalyzer {
         config: &AnalyzerConfig,
         mut activation: ActivationInputs,
         dependencies: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
+        withdrawn_languages: Vec<Language>,
+        pending_languages: Vec<Language>,
+        pending_previous: Option<
+            crate::analyzer::semantic_model::runtime::PendingDependencyPublication,
+        >,
         outcomes: Vec<DependencyPackEcosystemOutcome>,
         cancelled: bool,
-        ecosystems_empty: bool,
+        ecosystems: &[DependencyPackEcosystem],
+        kind: DependencyPackPublicationKind,
         context: &DependencyPackWorkspaceContext<'_>,
         same_generation_key: Option<
             crate::analyzer::semantic_model::runtime::DependencyActivationKey,
         >,
     ) -> DependencyPackActivationOutcome {
+        let cancelled_outcome = |ecosystems| DependencyPackActivationOutcome {
+            ecosystems,
+            runtime: Some(SemanticModelRuntimeOutcome::Cancelled(Default::default())),
+            diagnostic_refresh_required: false,
+        };
+        if cancelled || context.cancellation.is_cancelled() {
+            return cancelled_outcome(outcomes);
+        }
         let jdk_artifacts = prepared_jdk_artifacts_for_source_bindings(
             config,
             self.analyzer().project().root(),
             &outcomes,
-        );
+        )
+        .filter(|_| !pending_languages.contains(&Language::Java));
         let python_runtime = match python_runtime_publication(
             self,
             config,
@@ -1991,6 +2522,9 @@ impl WorkspaceAnalyzer {
         ) {
             Ok(publication) => publication,
             Err(error) => {
+                if context.cancellation.is_cancelled() {
+                    return cancelled_outcome(outcomes);
+                }
                 self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
                 return DependencyPackActivationOutcome {
                     ecosystems: outcomes,
@@ -2016,13 +2550,17 @@ impl WorkspaceAnalyzer {
             config,
             activation,
             DependencyPackPublicationEvidence {
+                kind,
+                pending_previous,
                 dependencies,
+                withdrawn_languages,
+                pending_languages,
                 jdk_artifacts,
                 python_runtime,
             },
             outcomes,
             cancelled,
-            ecosystems_empty,
+            ecosystems,
             context,
             same_generation_key,
         )
@@ -2040,15 +2578,32 @@ impl WorkspaceAnalyzer {
         publication: DependencyPackPublicationEvidence,
         outcomes: Vec<DependencyPackEcosystemOutcome>,
         cancelled: bool,
-        ecosystems_empty: bool,
+        ecosystems: &[DependencyPackEcosystem],
         context: &DependencyPackWorkspaceContext<'_>,
         same_generation_key: Option<
             crate::analyzer::semantic_model::runtime::DependencyActivationKey,
         >,
     ) -> DependencyPackActivationOutcome {
+        // A settled failure is not publication evidence. With no prior overlay
+        // there is no runtime publication to report. Still retain discovery and
+        // failure diagnostics through the atomic snapshot installation below.
+        // A prior overlay must be withdrawn through that same installation.
+        let failure_without_prior_overlay = !ecosystems.is_empty()
+            && publication.pending_languages.is_empty()
+            && activation.request.evidence.is_empty()
+            && activation.request.approximate_standard_libraries.is_empty()
+            && !outcomes.iter().any(|outcome| {
+                outcome.preparation.as_ref().is_some_and(|preparation| {
+                    preparation.complete || !preparation.evidence.is_empty()
+                })
+            })
+            && self.analyzer().semantic_model_overlay().is_none();
         if cancelled
-            || (!ecosystems_empty
+            || (publication.kind == DependencyPackPublicationKind::Subset
+                && publication.pending_languages.is_empty()
+                && !ecosystems.is_empty()
                 && publication.dependencies.is_empty()
+                && publication.withdrawn_languages.is_empty()
                 && activation.request.evidence.is_empty()
                 && activation.request.approximate_standard_libraries.is_empty())
         {
@@ -2059,6 +2614,56 @@ impl WorkspaceAnalyzer {
             };
         }
 
+        activation.request.evidence.sort();
+        activation.request.evidence.dedup();
+        if let Some(graph) = &mut activation.rust_cargo_graph {
+            graph.retain_evidence(&activation.request.evidence);
+        }
+        debug_assert!(
+            activation
+                .rust_cargo_graph
+                .as_ref()
+                .is_none_or(|graph| graph
+                    .validate_evidence(&activation.request.evidence)
+                    .is_ok()),
+            "retain_evidence leaves exactly the evidence the Cargo graph validates"
+        );
+        let mut dependency_request_evidence = self
+            .analyzer()
+            .snapshot_caches()
+            .map(|caches| caches.semantic_models().dependency_request_evidence())
+            .unwrap_or_default();
+        if publication.kind == DependencyPackPublicationKind::Full {
+            dependency_request_evidence.retain(|ecosystem, _| {
+                ecosystem
+                    .languages()
+                    .iter()
+                    .any(|language| publication.pending_languages.contains(language))
+            });
+        }
+        for outcome in &outcomes {
+            if outcome
+                .ecosystem
+                .languages()
+                .iter()
+                .any(|language| publication.pending_languages.contains(language))
+            {
+                continue;
+            }
+            dependency_request_evidence.insert(
+                outcome.ecosystem,
+                crate::analyzer::semantic_model::DependencyRequestEvidence {
+                    evidence: outcome
+                        .preparation
+                        .as_ref()
+                        .map(|preparation| preparation.evidence.clone())
+                        .unwrap_or_default(),
+                    publication_eligible: outcome.preparation.as_ref().is_some_and(|preparation| {
+                        preparation.complete || !preparation.evidence.is_empty()
+                    }),
+                },
+            );
+        }
         activation.finalize_request();
         let ecosystems = outcomes
             .iter()
@@ -2068,6 +2673,16 @@ impl WorkspaceAnalyzer {
             .analyzer()
             .snapshot_caches()
             .map(|cache| cache.semantic_models());
+        let runtime_artifacts = RuntimeArtifactPublication {
+            publication_kind: Some(publication.kind),
+            activated_ecosystems: &ecosystems,
+            pending_previous: publication.pending_previous.as_ref(),
+            pending_languages: &publication.pending_languages,
+            dependency_request_evidence: Some(&dependency_request_evidence),
+            jdk_artifacts_by_configured_home: publication.jdk_artifacts.as_ref(),
+            python_runtime: publication.python_runtime.as_ref(),
+            withdrawn_dependency_languages: &publication.withdrawn_languages,
+        };
         let publication_catalog = context.catalog.cache_identity().ok();
         let runtime = {
             let _scope = crate::profiling::scope("semantic_pack.acquire_active");
@@ -2077,18 +2692,16 @@ impl WorkspaceAnalyzer {
                 context.persistence,
                 &activation,
                 Some(&publication.dependencies),
-                RuntimeArtifactPublication {
-                    jdk_artifacts_by_configured_home: publication.jdk_artifacts.as_ref(),
-                    python_runtime: publication.python_runtime.as_ref(),
-                },
+                runtime_artifacts,
                 context.cancellation,
             )
         };
-        let diagnostic_refresh_required =
-            matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. });
+        let ready = matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. });
+        let omit_empty_runtime = failure_without_prior_overlay && ready;
+        let diagnostic_refresh_required = !omit_empty_runtime && ready;
         let outcome = DependencyPackActivationOutcome {
             ecosystems: outcomes,
-            runtime: Some(runtime),
+            runtime: (!omit_empty_runtime).then_some(runtime),
             diagnostic_refresh_required,
         };
         if let Some(cache) = cache {
@@ -2120,14 +2733,52 @@ impl WorkspaceAnalyzer {
                     cache,
                 );
             cache.retain_dependency_activation(
-                same_generation_key,
-                finalized_key,
+                (publication.kind == DependencyPackPublicationKind::Full)
+                    .then_some(same_generation_key)
+                    .flatten(),
+                (publication.kind == DependencyPackPublicationKind::Full)
+                    .then_some(finalized_key)
+                    .flatten(),
                 &outcome,
                 context.catalog,
                 publication_catalog.as_ref(),
             );
         }
         outcome
+    }
+
+    /// The ecosystem outcomes a status is reduced from after a scoped refresh.
+    /// The refresh rediscovers only the selected ecosystems, so its outcome
+    /// would show none of the carried ecosystems' diagnostics or incompleteness,
+    /// which a cold activation reports. This returns the refreshed outcomes
+    /// unchanged plus the retained status of every ecosystem the refresh did not
+    /// touch, in canonical ecosystem order. The activation outcome itself keeps
+    /// only what was refreshed, because its other consumers (the policy
+    /// coordinator's pack decisions and standard-library expectations) read
+    /// dependency lists and prepared packs that a retained status does not hold.
+    pub fn ecosystem_statuses_with_carried(
+        &self,
+        refreshed: &[DependencyPackEcosystemOutcome],
+    ) -> Vec<DependencyPackEcosystemOutcome> {
+        let mut statuses = refreshed.to_vec();
+        if let Some(caches) = self.analyzer().snapshot_caches() {
+            statuses.extend(
+                caches
+                    .semantic_models()
+                    .retained_ecosystem_statuses()
+                    .into_iter()
+                    .filter(|(ecosystem, _)| {
+                        !refreshed.iter().any(|entry| entry.ecosystem == *ecosystem)
+                    })
+                    .map(|(ecosystem, status)| DependencyPackEcosystemOutcome {
+                        ecosystem,
+                        discovery: status.discovery.clone(),
+                        preparation: status.preparation.clone(),
+                    }),
+            );
+        }
+        statuses.sort_by_key(|entry| entry.ecosystem);
+        statuses
     }
 
     /// The sole cross-generation reuse decision. A pending generation has no
@@ -2153,7 +2804,7 @@ impl WorkspaceAnalyzer {
         }
         if !old
             .semantic_models()
-            .publication_files_unchanged(changed_files)
+            .publication_files_unchanged(changed_files, next.analyzer())
         {
             return;
         }
@@ -2233,8 +2884,11 @@ impl WorkspaceAnalyzer {
         config: &AnalyzerConfig,
         context: PythonSemanticModelWorkspaceContext<'_>,
     ) -> PythonSemanticModelActivationOutcome {
-        let outcome =
-            self.activate_dependency_packs(config, &[DependencyPackEcosystem::Python], context);
+        let outcome = self.refresh_selected_dependency_packs(
+            config,
+            &[DependencyPackEcosystem::Python],
+            context,
+        );
         let mut ecosystems = outcome.ecosystems.into_iter();
         let ecosystem = ecosystems
             .next()
@@ -2905,29 +3559,16 @@ impl WorkspaceAnalyzer {
 
         store_context.workspace_snapshot = None;
 
-        if delegates.contains_key(&Language::Rust) {
-            let snapshot = {
-                use rusqlite::OptionalExtension;
-                let conn = store_context.store.read_conn()?;
-                conn.query_row(
-                    "SELECT heads.generation, heads.revision FROM workspace_heads AS heads
-                     JOIN analysis_epochs AS epochs ON epochs.lang = heads.lang AND epochs.generation = heads.generation
-                     WHERE heads.workspace_id = ?1 AND heads.lang = 'rust'",
-                    [store_context.workspace_id.as_str()],
-                    |row| Ok(crate::analyzer::store::WorkspaceSnapshotId {
-                        workspace_id: store_context.workspace_id.clone(), lang: "rust".into(),
-                        generation: crate::analyzer::store::GenerationId::from_persisted(row.get(0)?), revision: row.get(1)?,
-                    }),
-                ).optional()?
-            };
-            if let Some(snapshot) = snapshot {
+        if let Some(delegate) = delegates.get(&Language::Rust) {
+            let snapshots = delegate
+                .analyzer()
+                .selected_workspace_snapshots_for_reads()
+                .expect("a Rust delegate owns a relational workspace selection");
+            if let Some(snapshot) = snapshots.get("rust") {
                 let report = store_context
                     .store
-                    .reconcile_rust_crates_unless_current(&snapshot)?;
-                if let Some(derivations) = delegates
-                    .get(&Language::Rust)
-                    .and_then(|delegate| delegate.analyzer().derivations())
-                {
+                    .reconcile_rust_crates_unless_current(snapshot)?;
+                if let Some(derivations) = delegate.analyzer().derivations() {
                     derivations.forget_rust_units(&report);
                 }
             }
@@ -2989,6 +3630,21 @@ impl WorkspaceAnalyzer {
         question: &brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationQuestion,
     ) -> crate::analyzer::derivation_host::ReplayResult {
         use crate::analyzer::derivation_host::{ReplayMissing, ReplayResult};
+        if kind.0 == "derivation:jvm_external_provider_inventory:v1" {
+            return match (self.store(), question.name.as_deref()) {
+                (Some(store), Some(provider)) => {
+                    match store.jvm_external_provider_inventory_digest(provider) {
+                        Ok(digest) => ReplayResult::Identity(
+                            brokk_bifrost_semantic::analyzer::semantic::derivation::OutputIdentity(
+                                brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest::from_array(digest),
+                            ),
+                        ),
+                        Err(_) => ReplayResult::Missing(ReplayMissing::NoRecipe),
+                    }
+                }
+                _ => ReplayResult::Missing(ReplayMissing::NoRecipe),
+            };
+        }
         let Some(language) = question.language.as_ref() else {
             return ReplayResult::Missing(ReplayMissing::NoRecipe);
         };
@@ -3312,6 +3968,34 @@ impl WorkspaceAnalyzer {
         policy_lowering_identity_from_adapters(identities)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn selected_receiver_proofs_after_transfer_batch_for_test(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+        questions: &[crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion],
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Vec<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>>,
+    > {
+        self.analyzer()
+            .selected_receiver_proofs_after_transfer_batch_for_test(file, questions, cancellation)
+    }
+
+    /// Replay a selected source proof without activating a conditional seed.
+    #[doc(hidden)]
+    pub fn selected_receiver_proof_read(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+        question: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+    > {
+        self.analyzer()
+            .selected_receiver_proof_read(file, question, cancellation)
+    }
+
     /// Read one selected publication through its language provider.
     pub fn stored_semantic_ir_publication_read(
         &self,
@@ -3373,14 +4057,7 @@ impl WorkspaceAnalyzer {
         let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
             delegate, active,
         );
-        Ok(
-            match provider.current_artifact_source(file, max_source_bytes)? {
-                Some(snapshot) => SemanticArtifactSourceOutcome::Held(snapshot),
-                None => SemanticArtifactSourceOutcome::Refused(
-                    crate::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
-                ),
-            },
-        )
+        provider.current_artifact_source(file, max_source_bytes)
     }
 
     /// Load and hold a selected proof's source while its caller uses it.
@@ -3401,9 +4078,9 @@ impl WorkspaceAnalyzer {
             .current_program_semantics_artifact_source(file, request.budget.limits().source_bytes)?
         {
             SemanticArtifactSourceOutcome::Held(snapshot) => snapshot,
-            SemanticArtifactSourceOutcome::Refused(dimension) => {
-                request.budget.note_external_stop(dimension);
-                return Ok(SemanticArtifactSourceOutcome::Refused(dimension));
+            SemanticArtifactSourceOutcome::Refused(exceeded) => {
+                request.budget.note_admission_refusal(exceeded);
+                return Ok(SemanticArtifactSourceOutcome::Refused(exceeded));
             }
             SemanticArtifactSourceOutcome::Unavailable => {
                 return Ok(SemanticArtifactSourceOutcome::Unavailable);
@@ -3412,14 +4089,11 @@ impl WorkspaceAnalyzer {
         let snapshot = Arc::new(snapshot);
         // Only an overlay file whose buffer dispatch's session already holds
         // is counted twice; conservative per-acquisition accounting fails closed.
-        if request
+        if let Err(exceeded) = request
             .budget
             .hold_source(&snapshot, snapshot.source().len())
-            .is_err()
         {
-            return Ok(SemanticArtifactSourceOutcome::Refused(
-                crate::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
-            ));
+            return Ok(SemanticArtifactSourceOutcome::Refused(exceeded));
         }
         Ok(SemanticArtifactSourceOutcome::Held(
             HeldSemanticArtifactSourceSnapshot { snapshot },
@@ -3641,6 +4315,88 @@ impl WorkspaceAnalyzer {
             return Ok(None);
         };
         provider.stored_partial_flows(&file, key, procedure.id())
+    }
+
+    /// Read stored flows for this exact selected interpretation without
+    /// asking the language's admission owner to select the procedure again.
+    #[doc(hidden)]
+    pub fn stored_flows_for_selected_procedure(
+        &self,
+        selected: &crate::analyzer::semantic::service::SelectedProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        use crate::analyzer::semantic::service::CandidateProcedureSide;
+        use crate::analyzer::semantic::{ProcedureInterpretation, SemanticOutcome, SemanticWork};
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        let procedure = &selected.handle;
+        let (flows, work) = match procedure.interpretation() {
+            ProcedureInterpretation::Base => {
+                assert_eq!(selected.side, CandidateProcedureSide::Base);
+                let flows = self.stored_partial_flows(procedure)?;
+                if !crate::analyzer::languages::language_support(
+                    procedure.artifact().key().language().language(),
+                )
+                .is_some_and(|support| support.publishes_candidate_macro_alternates())
+                {
+                    // Match the existing non-candidate pair owner: this
+                    // lookup adds no new flow admission on that path.
+                    return Ok(SemanticOutcome::Complete {
+                        value: flows,
+                        work: SemanticWork::default(),
+                    });
+                }
+                (flows, SemanticWork::default())
+            }
+            ProcedureInterpretation::CandidateAlternate => {
+                assert_eq!(selected.side, CandidateProcedureSide::Alternate);
+                let key = procedure.artifact().key();
+                let file = crate::analyzer::ProjectFile::new(
+                    self.analyzer().project().root().to_path_buf(),
+                    key.path().as_path(),
+                );
+                let Some((analyzer, provider)) =
+                    self.program_semantics_provider_context_for_file(&file)
+                else {
+                    return Err(crate::analyzer::semantic::SemanticProviderError::internal(
+                        "selected candidate provider is unavailable".to_owned(),
+                    ));
+                };
+                let (outcome, receipt) =
+                    crate::analyzer::i_analyzer::QueryReadReceipt::capture(analyzer, || {
+                        provider.selected_candidate_alternate_flows(&file, procedure, request)
+                    });
+                receipt.replay(self.analyzer());
+                return outcome;
+            }
+            // A model-refined body cannot consume either native publication.
+            ProcedureInterpretation::ExecutableAlternate => (None, SemanticWork::default()),
+        };
+        if let Some(flows) = &flows
+            && let Err(exceeded) = request.budget.admit(flows.semantic_work())
+        {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+        Ok(SemanticOutcome::Complete { value: flows, work })
     }
 
     pub fn selected_procedure_handle(
@@ -4010,11 +4766,15 @@ impl WorkspaceAnalyzer {
         // funnels name the index answers, but cannot subsume execution state.
         // Route that state back through the original request attribution.
         if let Some(ledger) = execution {
-            for _ in 0..ledger.execution_dependences() {
+            for _ in 0..ledger.unpinned_execution_dependences() {
                 self.analyzer().mark_execution_dependent();
             }
             self.analyzer()
                 .record_budget_dependences(ledger.budget_dependences());
+            self.analyzer().record_attributed_dependences(
+                crate::analyzer::ReadLedger::mark_request_pinned_dependences,
+                ledger.request_pinned_dependences(),
+            );
             self.analyzer()
                 .join_reuse_verdict(ledger.explicit_verdict());
         }
@@ -4075,6 +4835,21 @@ impl WorkspaceAnalyzer {
         )))
     }
 
+    /// Validate a watcher-only membership event without creating a generation.
+    /// Registration drops the startup listing, so the first check can refill a
+    /// cold cache. Equal values still describe the published generation then.
+    pub fn revalidate_listing_membership(&self) -> std::io::Result<bool> {
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let project = self.analyzer().project();
+            project.revalidate_symlink_omissions(&BTreeSet::new());
+            let listing = project.all_files_with_omissions()?;
+            self.analyzer()
+                .generation_membership()
+                .matches_revalidated_listing(&listing, project)
+                .map(|unchanged| !unchanged)
+        })
+    }
+
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         self.update_with_activation_context(changed_files, None)
     }
@@ -4109,6 +4884,7 @@ impl WorkspaceAnalyzer {
             let changes = super::pending_update_paths(changed_files, pending);
             let changed_files = &changes;
             let project = self.analyzer().project();
+            let old_ignore_observation = project.retained_ignore_observation();
             project.revalidate_symlink_omissions(changed_files);
             // A configuration input stays reachable by path even when ignore
             // rules keep it out of the listing, so the workspace resolves it
@@ -4116,11 +4892,14 @@ impl WorkspaceAnalyzer {
             let is_configuration_input = |file: &crate::analyzer::ProjectFile| match self {
                 Self::Multi(analyzer) => analyzer
                     .delegates()
-                    .keys()
-                    .any(|language| super::is_language_configuration_input(*language, file)),
+                    .values()
+                    .any(|delegate| delegate.is_configuration_input(file)),
                 Self::Empty(_) => false,
             };
             let resolution = project.all_files_with_omissions().and_then(|mut listing| {
+                let before_points = project
+                    .membership_point_observation(&listing)
+                    .map(|proof| proof.lineage);
                 let resolved =
                     brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
                         project,
@@ -4128,9 +4907,9 @@ impl WorkspaceAnalyzer {
                         &mut listing,
                         &is_configuration_input,
                     )?;
-                Ok((resolved, listing))
+                Ok((resolved, listing, before_points))
             });
-            let (resolved_files, listing) = match resolution {
+            let (mut resolved_files, listing, before_points) = match resolution {
                 Ok(result) => result,
                 Err(error) => {
                     return match self {
@@ -4146,23 +4925,58 @@ impl WorkspaceAnalyzer {
                     };
                 }
             };
+            let membership =
+                super::tree_sitter_analyzer::GenerationWorkspaceMembership::observe_update(
+                    self.analyzer().generation_membership(),
+                    before_points,
+                    Some(listing.clone()),
+                    &resolved_files,
+                    project,
+                    self.retention_budget(),
+                );
+            if let Some(error) = membership.selection_error() {
+                return match self {
+                    Self::Multi(analyzer) => Self::Multi(Box::new(
+                        analyzer.failed_update(error.into(), changed_files),
+                    )),
+                    Self::Empty(analyzer) => {
+                        let mut failed = analyzer.clone();
+                        failed.update_error = Some(std::io::Error::from(error).into());
+                        failed.pending_updates.extend(changed_files.iter().cloned());
+                        Self::Empty(failed)
+                    }
+                };
+            }
+            let reported_files = resolved_files.clone();
+            if super::tree_sitter_analyzer::membership_update(
+                self.analyzer().generation_membership(),
+                &membership,
+                &resolved_files,
+                project,
+                &is_configuration_input,
+            )
+            .apply(&mut resolved_files)
+            .is_err()
+            {
+                let mut next = self.rebuild_with_membership(None, membership);
+                next.retain_failed_update_paths(&changes);
+                return next;
+            }
             let changed_files = &resolved_files;
             if profiling::enabled() {
                 profiling::note(format!("changed_files={}", changed_files.len()));
             }
             self.analyzer()
                 .invalidate_cached_file_identities_for(changed_files);
+            let mut effects = super::read_verification::UpdateEffects::AllMayHaveChanged(
+                "empty workspace update",
+            );
             let mut next = match self {
                 Self::Empty(analyzer) => {
                     let Some(build_context) = analyzer.build_context.as_ref() else {
                         return Self::Empty(analyzer.clone());
                     };
-                    let build_context = build_context.with_membership(
-                        super::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
-                            Some(listing.clone()),
-                            build_context.store_context().store.retention_budget(),
-                        ),
-                    );
+                    let build_context = build_context.with_membership(Arc::clone(&membership));
                     let languages = build_context.changed_languages(changed_files);
                     Self::updated_from_empty(analyzer, &build_context, languages, |language| {
                         build_context
@@ -4174,9 +4988,13 @@ impl WorkspaceAnalyzer {
                         })
                     })
                 }
-                Self::Multi(analyzer) => Self::from_updated_multi(
-                    analyzer.update_with_listing(changed_files, Some(&listing)),
-                ),
+                Self::Multi(analyzer) => {
+                    let (updated, report) = analyzer
+                        .with_generation_membership(Arc::clone(&membership))
+                        .update_with_listing_report(changed_files, Some(&listing));
+                    effects = report;
+                    Self::from_updated_multi(updated)
+                }
             };
             // Resolution succeeded, but a delegate can still fail while applying
             // the update. Keep the reported paths until both stages succeed.
@@ -4187,31 +5005,63 @@ impl WorkspaceAnalyzer {
                     analyzer.pending_updates.clear();
                 }
             }
-            let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-            let attribution = context.enter();
-            next.analyzer().begin_query(&context);
-            next.analyzer().end_query(&context);
-            drop(attribution);
-            if context.store_error().is_some() {
-                match &mut next {
-                    Self::Multi(analyzer) => {
-                        analyzer.pending_updates.extend(changes.iter().cloned())
-                    }
-                    Self::Empty(analyzer) => {
-                        analyzer.pending_updates.extend(changes.iter().cloned())
-                    }
-                }
+            next.retain_failed_update_paths(&changes);
+            effects.combine(next.reconcile_workspace_build_context(Some(changed_files)));
+            // The bounded read is an optimization: failing to open it only selects
+            // the full path, which reads and reports its own failures.
+            let read = self
+                .store()
+                .and_then(|store| store.begin_update_projection_read().ok());
+            if let Some(read) = read {
+                self.carry_verified_dependency_evidence(&next, Some(changed_files), |consulted| {
+                    super::read_verification::UpdateDecision::decide(
+                        self,
+                        &next,
+                        effects,
+                        old_ignore_observation,
+                        &read,
+                        consulted,
+                    )
+                });
+            } else {
+                self.carry_verified_dependency_evidence(&next, Some(changed_files), |_| {
+                    super::read_verification::UpdateDecision::AllMayHaveChanged(
+                        "projection read unavailable",
+                    )
+                });
             }
-            next.reconcile_workspace_build_context(Some(changed_files));
-            self.carry_verified_dependency_evidence(&next, Some(changed_files));
+
             // The caller's spellings and the resolved ones both count: a
             // directory event or an alias names no file the resolver lists.
+            // Paths folded in by the membership decision were not reported by
+            // anyone, yet they are real creations or removals. A model's
+            // authored source locator may name a file that was absent or
+            // ignored at publication, so folded additions and removals must
+            // invalidate the carried overlay exactly as a reported event
+            // would. An unrelated folded path leaves the overlay carried
+            // because only bindings that name an affected path are rechecked.
             let published_paths =
                 brokk_bifrost_core::analyzer::changed_paths::ChangedPaths::certified_against(
                     project,
                     &listing.0,
-                    changes.iter().chain(changed_files.iter()),
+                    changes
+                        .iter()
+                        .chain(reported_files.iter())
+                        .chain(changed_files.iter()),
                 );
+            let folded_paths =
+                brokk_bifrost_core::analyzer::changed_paths::ChangedPaths::certified_against(
+                    project,
+                    &listing.0,
+                    changed_files
+                        .iter()
+                        .filter(|file| !reported_files.contains(*file)),
+                );
+            if folded_paths.touches(Path::new(
+                super::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY,
+            )) {
+                return next;
+            }
             self.republish_unchanged_semantic_models(&next, &published_paths, activation_context);
             next
         })
@@ -4306,7 +5156,69 @@ impl WorkspaceAnalyzer {
         self.update_all_reporting_progress(Some(Arc::new(progress)))
     }
 
+    fn retain_failed_update_paths(&mut self, changes: &BTreeSet<ProjectFile>) {
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        let attribution = context.enter();
+        self.analyzer().begin_query(&context);
+        self.analyzer().end_query(&context);
+        drop(attribution);
+        if context.store_error().is_some() {
+            match self {
+                Self::Multi(analyzer) => analyzer.pending_updates.extend(changes.iter().cloned()),
+                Self::Empty(analyzer) => analyzer.pending_updates.extend(changes.iter().cloned()),
+            }
+        }
+    }
+
     fn update_all_reporting_progress(&self, progress: Option<BuildProgress>) -> Self {
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            if let Self::Empty(analyzer) = self
+                && analyzer.build_context.is_none()
+            {
+                return Self::Empty(analyzer.clone());
+            }
+            self.analyzer().invalidate_cached_file_identities();
+            let project = self.analyzer().project();
+            project.invalidate_cached_file_listing();
+            let captured = project.all_files_with_omissions().and_then(|listing| {
+                let membership =
+                    super::tree_sitter_analyzer::GenerationWorkspaceMembership::observe(
+                        Some(listing),
+                        project,
+                        self.retention_budget(),
+                    );
+                match membership.selection_error() {
+                    Some(error) => Err(error.into()),
+                    None => Ok(membership),
+                }
+            });
+            let membership = match captured {
+                Ok(membership) => membership,
+                Err(error) => {
+                    return match self {
+                        Self::Multi(analyzer) => {
+                            let mut failed = analyzer.failed_update(error, &BTreeSet::new());
+                            failed.full_refresh_pending = true;
+                            Self::Multi(Box::new(failed))
+                        }
+                        Self::Empty(analyzer) => {
+                            let mut failed = analyzer.clone();
+                            failed.update_error = Some(error.into());
+                            failed.full_refresh_pending = true;
+                            Self::Empty(failed)
+                        }
+                    };
+                }
+            };
+            self.rebuild_with_membership(progress, membership)
+        })
+    }
+
+    fn rebuild_with_membership(
+        &self,
+        progress: Option<BuildProgress>,
+        membership: Arc<super::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
             let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
             let _retention =
@@ -4314,39 +5226,20 @@ impl WorkspaceAnalyzer {
             self.analyzer().invalidate_cached_file_identities();
             let next = match self {
                 Self::Empty(analyzer) => {
-                    let Some(build_context) = analyzer.build_context.as_ref() else {
+                    let Some(context) = analyzer.build_context.as_ref() else {
                         return Self::Empty(analyzer.clone());
                     };
-                    build_context.project().invalidate_cached_file_listing();
-                    let listing = match build_context.project().all_files_with_omissions() {
-                        Ok(listing) => listing,
-                        Err(error) => {
-                            let mut failed = analyzer.clone();
-                            failed.update_error = Some(error.into());
-                            failed.full_refresh_pending = true;
-                            return Self::Empty(failed);
-                        }
-                    };
-                    let membership =
-                        super::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
-                            Some(listing),
-                            build_context.store_context().store.retention_budget(),
-                        );
                     let languages = membership
                         .listing()
-                        .map(|listing| build_context.allowed_languages_for_files(listing.0.iter()))
+                        .map(|listing| context.allowed_languages_for_files(listing.0.iter()))
                         .unwrap_or_default();
-                    let build_context = build_context.with_membership(membership);
-                    Self::updated_from_empty(analyzer, &build_context, languages, |language| {
-                        build_context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| {
-                            panic!(
-                                "failed to initialize {language:?} analyzer during full update: {error}"
-                            )
-                    })
+                    let context = context.with_membership(membership);
+                    Self::updated_from_empty(analyzer, &context, languages, |language| {
+                        context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| panic!("failed to initialize {language:?} analyzer during full update: {error}"))
                     })
                 }
                 Self::Multi(analyzer) => {
-                    let updated = analyzer.update_all_with_progress(progress);
+                    let updated = analyzer.rebuild_with_membership(progress, membership);
                     if updated.has_update_failure() {
                         return Self::from_updated_multi(updated);
                     }
@@ -4354,7 +5247,11 @@ impl WorkspaceAnalyzer {
                 }
             };
             next.reconcile_workspace_build_context(None);
-            self.carry_verified_dependency_evidence(&next, None);
+            self.carry_verified_dependency_evidence(&next, None, |_| {
+                super::read_verification::UpdateDecision::AllMayHaveChanged(
+                    "full refresh or Rescan",
+                )
+            });
             next
         })
     }
@@ -4362,29 +5259,40 @@ impl WorkspaceAnalyzer {
     fn reconcile_workspace_build_context(
         &self,
         changed: Option<&BTreeSet<crate::analyzer::ProjectFile>>,
-    ) {
+    ) -> super::read_verification::UpdateEffects {
+        use super::read_verification::UpdateEffects;
+        let mut effects = UpdateEffects::no_changes();
         for support in crate::analyzer::languages::registered_language_supports() {
-            if let Err(error) = support.reconcile_workspace_build_context(self, changed) {
-                self.analyzer().record_query_failure(error);
+            match support.reconcile_workspace_build_context(self, changed) {
+                Ok(report) => effects.combine(report),
+                Err(error) => {
+                    self.analyzer().record_query_failure(error);
+                    effects.combine(UpdateEffects::AllMayHaveChanged(
+                        "build-context reconciliation failed",
+                    ));
+                }
             }
         }
+        effects
     }
 
-    fn carry_verified_dependency_evidence(
-        &self,
-        next: &Self,
+    fn carry_verified_dependency_evidence<'a>(
+        &'a self,
+        next: &'a Self,
         changed_files: Option<&BTreeSet<ProjectFile>>,
+        prepare: impl FnOnce(
+            &crate::hash::HashMap<Language, Vec<ProjectFile>>,
+        ) -> super::read_verification::UpdateDecision<'a>,
     ) {
-        use crate::analyzer::read_verification::{
-            ChangedFacts, HeadInputs, KeyVerdict, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
-            verify_read_key,
-        };
+        use crate::analyzer::read_verification::{HeadInputs, LookupMemo};
         use crate::analyzer::semantic::ids::StableDigest;
-        use crate::analyzer::semantic::invalidation::DerivedArtifactId;
-        use crate::analyzer::semantic::read_ledger::{
-            LookupKind, LookupQuestion, ReadKey, WorkspaceFactFamily,
-        };
+        use crate::analyzer::semantic::read_ledger::ReadKey;
 
+        if let Some(host) = self.analyzer().host_activation_context()
+            && next.bind_host_activation_context(host).is_err()
+        {
+            return;
+        }
         let Some(old_cache) = self.analyzer().snapshot_caches() else {
             return;
         };
@@ -4392,10 +5300,21 @@ impl WorkspaceAnalyzer {
             return;
         };
         let activated = old_cache.activated_dependency_ecosystems();
-        let old_evidence = activated
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
+        // Subset contributions need verification even before a Full has
+        // established the authoritative ecosystem inventory.
+        let mut known = activated.clone().unwrap_or_default();
+        known.extend(
+            old_cache
+                .semantic_models()
+                .dependency_request_evidence()
+                .into_keys(),
+        );
+        known.extend(old_cache.stale_dependency_ecosystems());
+        known.sort_by_key(|ecosystem| ecosystem.label());
+        known.dedup();
+        let old_evidence = known
+            .iter()
+            .copied()
             .filter_map(|ecosystem| {
                 ecosystem
                     .languages()
@@ -4408,9 +5327,10 @@ impl WorkspaceAnalyzer {
             new_cache.install_carried_dependency_evidence(
                 old_cache.semantic_models().models_selected(),
                 Vec::new(),
-                activated.clone().unwrap_or_default(),
+                known,
                 old_cache.carried_activation_inputs(),
                 activated,
+                old_cache.semantic_models().dependency_request_evidence(),
             );
             old_cache
                 .semantic_models()
@@ -4418,15 +5338,56 @@ impl WorkspaceAnalyzer {
             return;
         }
         let mut carried = Vec::new();
-        let mut stale = activated
-            .clone()
-            .unwrap_or_default()
+        let mut stale = known
             .into_iter()
             .filter(|ecosystem| !old_evidence.iter().any(|(old, _)| old == ecosystem))
             .collect::<Vec<_>>();
         // Construct replay inputs once for all ecosystems. Discovery records
         // project reads; model, policy and epoch reads have no authority here.
-        let changed = ChangedFacts::between(self, next);
+        let collect_consulted = || {
+            let mut consulted: crate::hash::HashMap<Language, Vec<ProjectFile>> =
+                Default::default();
+            for (_, evidence) in &old_evidence {
+                for key in evidence.project_read_keys.iter() {
+                    if let ReadKey::File {
+                        language, rel_path, ..
+                    } = key
+                    {
+                        consulted
+                            .entry(*language)
+                            .or_default()
+                            .push(ProjectFile::new(
+                                next.analyzer().project().root().to_path_buf(),
+                                rel_path.as_ref(),
+                            ));
+                    }
+                }
+            }
+            for paths in consulted.values_mut() {
+                paths.sort();
+                paths.dedup();
+            }
+            consulted
+        };
+        let consulted = collect_consulted();
+        #[cfg(any(test, feature = "test-support"))]
+        assert_eq!(
+            consulted,
+            collect_consulted(),
+            "both computations replay the same ledger File-key set"
+        );
+        // Preparation is fallible; make the transaction's sole decision only
+        // after bounded delta/head reads, then replay the prepared result.
+        let decision = prepare(&consulted);
+        let changed = decision.changed_facts(self, next);
+        #[cfg(any(test, feature = "test-support"))]
+        let reference = super::read_verification::without_update_delta_observer(|| {
+            super::read_verification::ChangedFacts::between(self, next)
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        changed.assert_projection_equivalent(&reference, &consulted);
+        #[cfg(any(test, feature = "test-support"))]
+        let mut reference_memo = LookupMemo::default();
         let empty = StableDigest::sha256([]);
         let mut inputs = HeadInputs {
             models: empty,
@@ -4482,48 +5443,17 @@ impl WorkspaceAnalyzer {
                 });
             let project_reads_match = eligible
                 && same_configuration
-                && evidence.project_read_keys.iter().all(|key| {
-                    // Discovery chooses the packs to activate, so it
-                    // normally observes that no model set is active. That
-                    // absence marker keeps carry-over exactly as it was
-                    // before absence was recorded as a read; a read of an
-                    // actual model set still refuses carry-over.
-                    if let ReadKey::Models(models) = key {
-                        return *models
-                            == crate::analyzer::i_analyzer::current_model_set_digest(None);
-                    }
-                    if matches!(key, ReadKey::Policy { .. } | ReadKey::Epoch(_)) {
-                        return false;
-                    }
-                    if let ReadKey::Configuration(configuration) = key {
-                        inputs.configuration = *configuration;
-                    }
-                    let verdict = verify_read_key(
-                        DerivedArtifactId::semantic_artifact(evidence.project_read_identity),
-                        next,
-                        &changed,
-                        &inputs,
-                        key,
-                        LookupReplayLimits::default(),
-                        &NoSummaryAnswers,
-                        &mut memo,
-                    );
-                    matches!(verdict, KeyVerdict::Unchanged)
-                        || membership_unchanged
-                            && matches!(
-                                key,
-                                ReadKey::Lookup {
-                                    kind: LookupKind::WorkspaceFact,
-                                    question: LookupQuestion::WorkspaceFact {
-                                        family: WorkspaceFactFamily::WorkspaceFileInventory
-                                            | WorkspaceFactFamily::WorkspaceFileListing,
-                                        ..
-                                    },
-                                    ..
-                                }
-                            )
-                            && matches!(verdict, KeyVerdict::Changed(_))
-                });
+                && verify_dependency_discovery_project_reads(
+                    next,
+                    &changed,
+                    &mut inputs,
+                    &mut memo,
+                    evidence.project_read_identity,
+                    &evidence.project_read_keys,
+                    membership_unchanged,
+                    #[cfg(any(test, feature = "test-support"))]
+                    Some((&reference, &mut reference_memo)),
+                );
             if project_reads_match {
                 for language in ecosystem.languages() {
                     carried.push((*language, Arc::clone(&evidence)));
@@ -4538,11 +5468,95 @@ impl WorkspaceAnalyzer {
             stale,
             old_cache.carried_activation_inputs(),
             activated,
+            old_cache.semantic_models().dependency_request_evidence(),
         );
         old_cache
             .semantic_models()
             .carry_prepared_dependency_evidence_to(new_cache.semantic_models());
     }
+}
+
+/// Shared receipt verifier for cross-generation dependency carry and
+/// same-warm staged discovery handoff.
+#[allow(clippy::too_many_arguments)]
+fn verify_dependency_discovery_project_reads(
+    head: &WorkspaceAnalyzer,
+    changed: &super::read_verification::ChangedFacts,
+    inputs: &mut super::read_verification::HeadInputs,
+    memo: &mut super::read_verification::LookupMemo,
+    project_read_identity: crate::analyzer::semantic::ids::StableDigest,
+    project_read_keys: &[crate::analyzer::read_ledger::ReadKey],
+    membership_unchanged: bool,
+    #[cfg(any(test, feature = "test-support"))] reference: Option<(
+        &super::read_verification::ChangedFacts,
+        &mut super::read_verification::LookupMemo,
+    )>,
+) -> bool {
+    use crate::analyzer::read_verification::{
+        KeyVerdict, LookupReplayLimits, NoSummaryAnswers, verify_read_key,
+    };
+    use crate::analyzer::semantic::invalidation::DerivedArtifactId;
+    use crate::analyzer::semantic::read_ledger::{
+        LookupKind, LookupQuestion, ReadKey, WorkspaceFactFamily,
+    };
+
+    #[cfg(any(test, feature = "test-support"))]
+    let mut reference = reference;
+
+    project_read_keys.iter().all(|key| {
+        // Discovery chooses the packs to activate, so it normally observes that
+        // no model set is active. That absence marker keeps carry-over exactly
+        // as it was before absence was recorded as a read; a read of an actual
+        // model set still refuses carry-over.
+        if let ReadKey::Models(models) = key {
+            return *models == head.analyzer().model_set_digest(None);
+        }
+        if matches!(key, ReadKey::Policy { .. } | ReadKey::Epoch(_)) {
+            return false;
+        }
+        if let ReadKey::Configuration(configuration) = key {
+            inputs.configuration = *configuration;
+        }
+        let verdict = verify_read_key(
+            DerivedArtifactId::semantic_artifact(project_read_identity),
+            head,
+            changed,
+            inputs,
+            key,
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            memo,
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((reference_changed, reference_memo)) = &mut reference {
+            let reference_verdict = verify_read_key(
+                DerivedArtifactId::semantic_artifact(project_read_identity),
+                head,
+                reference_changed,
+                inputs,
+                key,
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                reference_memo,
+            );
+            assert_eq!(format!("{verdict:?}"), format!("{reference_verdict:?}"));
+        }
+        matches!(verdict, KeyVerdict::Unchanged)
+            || membership_unchanged
+                && matches!(
+                    key,
+                    ReadKey::Lookup {
+                        kind: LookupKind::WorkspaceFact,
+                        question: LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::WorkspaceFileInventory
+                                | WorkspaceFactFamily::WorkspaceFileListing,
+                            ..
+                        },
+                        ..
+                    }
+                )
+                && matches!(verdict, KeyVerdict::Changed(_))
+    })
 }
 
 /// The same borrowed discovery view for native readers without a workspace enum.
@@ -4554,9 +5568,428 @@ pub fn generation_dependency_discovery_project(analyzer: &dyn IAnalyzer) -> Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic_model::RustSelectedCargoGraph;
+
+    #[test]
+    fn empty_generation_keeps_host_without_a_publication_cache() {
+        use crate::analyzer::semantic_model::{
+            HostActivationContext, VerifiedFirstPartyReleaseInventory,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let project: Arc<dyn Project> =
+            Arc::new(crate::analyzer::FilesystemProject::new(root.path()).unwrap());
+        let before = WorkspaceAnalyzer::Multi(Box::default());
+        let host = HostActivationContext::from_inventory(
+            VerifiedFirstPartyReleaseInventory::compiled_default().unwrap(),
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        before
+            .bind_host_activation_context(Arc::clone(&host))
+            .unwrap();
+        let after = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(project));
+        before.carry_verified_dependency_evidence(&after, None, |_| {
+            panic!("a storeless generation has no receipt to verify")
+        });
+        assert!(Arc::ptr_eq(
+            &host,
+            &after.analyzer().host_activation_context().unwrap()
+        ));
+        assert_eq!(
+            after.analyzer().model_set_digest(None),
+            host.no_model_digest()
+        );
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#9559: refreshing Python erased carried JVM preparation failures"
+    )]
+    fn ecosystem_refresh_preserves_other_preparation_failures() {
+        use crate::analyzer::semantic_model::runtime::SemanticModelRuntimeLimits;
+        use brokk_bifrost_semantic::analyzer::semantic_model::dependency::{
+            DependencyPreparationFailureCause, RecordedPreparationFailure, ResolvedDependency,
+        };
+        let workspace = WorkspaceAnalyzer::Multi(Box::default());
+        let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+            bifrost_version: semver::Version::new(0, 15, 1),
+            evidence: vec![],
+            approximate_standard_libraries: vec![],
+            controls: vec![],
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let failure = RecordedPreparationFailure {
+            dependency: ResolvedDependency::undeclared_scope(
+                "jar".into(),
+                SemanticModelActivationEvidence {
+                    language: "java".into(),
+                    ecosystem: "maven".into(),
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    production_input_digest: None,
+verified_raw_artifacts: Vec::new(),
+                },
+                vec![],
+                vec![],
+            ),
+            cause: DependencyPreparationFailureCause::ProducerFailed,
+            inputs: brokk_bifrost_semantic::analyzer::semantic_model::dependency::PreparationFailureInputs::Bound(vec![]),
+        };
+        workspace
+            .analyzer()
+            .snapshot_caches()
+            .unwrap()
+            .semantic_models()
+            .install_carried_dependency_evidence(
+                false,
+                vec![],
+                vec![],
+                Some(ActivationInputs {
+                    request: request.clone(),
+                    rust_cargo_graph: None,
+                    preparation_failures: vec![failure.clone()],
+                }),
+                None,
+                Default::default(),
+            );
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let cancellation = crate::CancellationToken::default();
+        let context = DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &request,
+            limits: DependencyPackLimits::default(),
+            cancellation: &cancellation,
+        };
+        let python = workspace.dependency_pack_activation_inputs(
+            &[DependencyPackEcosystem::Python],
+            &context,
+            None,
+            DependencyPackPublicationKind::Subset,
+        );
+        let fresh = ActivationInputs::from(request.clone());
+        let python_fresh = workspace.dependency_pack_activation_inputs(
+            &[DependencyPackEcosystem::Python],
+            &context,
+            Some(&fresh),
+            DependencyPackPublicationKind::Subset,
+        );
+        assert_eq!(python_fresh.preparation_failures, vec![failure.clone()]);
+        assert_eq!(python.preparation_failures, vec![failure]);
+        let jvm = workspace.dependency_pack_activation_inputs(
+            &[DependencyPackEcosystem::Jvm],
+            &context,
+            None,
+            DependencyPackPublicationKind::Subset,
+        );
+        assert!(jvm.preparation_failures.is_empty());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12825: repeated Full reuse hid new preparation failures and subset withdrawal"
+    )]
+    fn full_activation_withdraws_evidence_after_subset_publication() {
+        use crate::analyzer::semantic_model::dependency::DependencyPackPreparationOutcome;
+        let root = tempfile::tempdir().unwrap();
+        let delegate = crate::analyzer::packs_document::tests::CatalogWorkspace {
+            project: Arc::new(crate::TestProject::new(root.path(), Language::Java)),
+            language: Language::Java,
+            index: None,
+            definitions: Vec::new(),
+            complete_symbol_index: false,
+        };
+        let workspace = WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(BTreeMap::from([(
+            Language::Java,
+            crate::analyzer::multi_analyzer::AnalyzerDelegate::new(delegate),
+        )]))));
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let config = AnalyzerConfig::default();
+        let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+            bifrost_version: "0.0.0".parse().unwrap(),
+            evidence: vec![],
+            approximate_standard_libraries: vec![],
+            controls: vec![],
+            limits: Default::default(),
+        };
+        let cancellation = crate::CancellationToken::default();
+        let context = || DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &request,
+            limits: Default::default(),
+            cancellation: &cancellation,
+        };
+        let first = workspace.activate_dependency_packs(&config, &[], context());
+        assert!(first.complete());
+        let original = workspace
+            .analyzer()
+            .active_semantic_model_snapshot()
+            .unwrap();
+        assert!(
+            workspace
+                .activate_dependency_packs(&config, &[], context())
+                .complete()
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &workspace
+                .analyzer()
+                .active_semantic_model_snapshot()
+                .unwrap()
+        ));
+        let cache = workspace
+            .analyzer()
+            .snapshot_caches()
+            .unwrap()
+            .semantic_models();
+        let evidence = SemanticModelActivationEvidence {
+            language: "java".into(),
+            ecosystem: "maven".into(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
+        };
+        let mut subset = ActivationInputs::from(request.clone());
+        subset.request.evidence.push(evidence.clone());
+        workspace.publish_dependency_pack_activation(
+            &config,
+            subset,
+            DependencyPackPublicationEvidence {
+                kind: DependencyPackPublicationKind::Subset,
+                pending_previous: None,
+                dependencies: vec![],
+                withdrawn_languages: vec![],
+                pending_languages: vec![],
+                jdk_artifacts: None,
+                python_runtime: None,
+            },
+            vec![DependencyPackEcosystemOutcome {
+                ecosystem: DependencyPackEcosystem::Jvm,
+                discovery: DependencyDiscoveryOutcome::complete(vec![]),
+                preparation: Some(DependencyPackPreparationOutcome {
+                    failures: vec![],
+                    packs: vec![],
+                    installed_packs: vec![],
+                    evidence: vec![evidence.clone()],
+                    diagnostics: vec![],
+                    suppressed_diagnostics: Default::default(),
+                    complete: true,
+                    cancelled: false,
+                    profile: Default::default(),
+                }),
+            }],
+            false,
+            &[DependencyPackEcosystem::Jvm],
+            &context(),
+            None,
+        );
+        assert_eq!(
+            cache.dependency_request_evidence()[&DependencyPackEcosystem::Jvm].evidence,
+            vec![evidence.clone()]
+        );
+        let second = workspace.activate_dependency_packs(&config, &[], context());
+        assert!(second.complete());
+        assert!(!Arc::ptr_eq(
+            &original,
+            &workspace
+                .analyzer()
+                .active_semantic_model_snapshot()
+                .unwrap()
+        ));
+        assert!(cache.dependency_request_evidence().is_empty());
+        assert!(
+            workspace
+                .carried_activation_inputs()
+                .unwrap()
+                .request
+                .evidence
+                .is_empty()
+        );
+        use brokk_bifrost_semantic::analyzer::semantic_model::dependency::{
+            DependencyPreparationFailureCause, RecordedPreparationFailure, ResolvedDependency,
+        };
+        let failure = RecordedPreparationFailure {
+            dependency: ResolvedDependency::undeclared_scope("new-jar".into(), evidence, vec![], vec![]),
+            cause: DependencyPreparationFailureCause::ProducerFailed,
+            inputs: brokk_bifrost_semantic::analyzer::semantic_model::dependency::PreparationFailureInputs::Bound(vec![]),
+        };
+        let mut failed = ActivationInputs::from(request.clone());
+        failed.preparation_failures.push(failure.clone());
+        workspace.publish_dependency_pack_activation(
+            &config,
+            failed,
+            DependencyPackPublicationEvidence {
+                kind: DependencyPackPublicationKind::Full,
+                pending_previous: None,
+                dependencies: vec![],
+                withdrawn_languages: vec![],
+                pending_languages: vec![],
+                jdk_artifacts: None,
+                python_runtime: None,
+            },
+            vec![],
+            false,
+            &[],
+            &context(),
+            None,
+        );
+        assert_eq!(
+            workspace
+                .carried_activation_inputs()
+                .unwrap()
+                .preparation_failures,
+            vec![failure]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13517: a failed project read left no key, so a discovery that ignored the error could carry"
+    )]
+    fn failed_project_read_makes_discovery_uncarriable() {
+        use crate::analyzer::FilesystemProject;
+        use crate::analyzer::dependency_support::declare_external_discovery_reads_complete;
+        use crate::analyzer::semantic_model::capture_dependency_discovery;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("manifest.dat"), "longer than the read cap\n").unwrap();
+        std::fs::write(root.join("README"), "readable\n").unwrap();
+        let project = Arc::new(FilesystemProject::new(&root).unwrap());
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default()).unwrap();
+        let discover = |name: &str, cap: usize| {
+            capture_dependency_discovery(workspace.analyzer(), || {
+                let project = workspace.dependency_discovery_project().unwrap();
+                let file = project.file_by_rel_path(Path::new(name)).unwrap();
+                // The discovery ignores a read that gave no snapshot, as the
+                // Cargo host-unit census does for a manifest over the cap, and
+                // reports no diagnostic.
+                let snapshot = project.read_source_snapshot_limited(&file, cap).unwrap();
+                assert_eq!(snapshot.is_none(), cap == 1);
+                declare_external_discovery_reads_complete();
+                DependencyDiscoveryOutcome::complete(Vec::new())
+            })
+        };
+        assert!(
+            !discover("manifest.dat", 1).external_reads.complete,
+            "a read with no snapshot names no key and must refuse carry"
+        );
+        assert!(
+            discover("README", 1 << 20).external_reads.complete,
+            "a read that gave a snapshot is a recorded key and does not refuse carry"
+        );
+        // A scoped worker, as Go's domain workers are, transports the request's
+        // read attribution instead of reporting on the capturing thread; its
+        // unnamed read must still refuse the capture.
+        let worker = capture_dependency_discovery(workspace.analyzer(), || {
+            let attribution = crate::analyzer::ReadAttribution::for_request();
+            let project = workspace.dependency_discovery_project().unwrap();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _attributed = attribution.install();
+                    let file = project.file_by_rel_path(Path::new("manifest.dat")).unwrap();
+                    assert!(
+                        project
+                            .read_source_snapshot_limited(&file, 1)
+                            .unwrap()
+                            .is_none()
+                    );
+                });
+            });
+            declare_external_discovery_reads_complete();
+            DependencyDiscoveryOutcome::complete(Vec::new())
+        });
+        assert!(
+            !worker.external_reads.complete,
+            "a worker's unnamed project read must refuse carry"
+        );
+    }
+
+    #[test]
+    fn full_dependency_pack_activation_drops_subset_carried_cargo_graph() {
+        use crate::analyzer::semantic_model::rust_cargo_graph::CargoResolveView;
+        let workspace = WorkspaceAnalyzer::Multi(Box::default());
+        let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+            bifrost_version: semver::Version::new(0, 15, 1),
+            evidence: vec![],
+            approximate_standard_libraries: vec![],
+            controls: vec![],
+            limits: Default::default(),
+        };
+        workspace
+            .analyzer()
+            .snapshot_caches()
+            .unwrap()
+            .semantic_models()
+            .install_carried_dependency_evidence(
+                false,
+                vec![],
+                vec![],
+                Some(ActivationInputs {
+                    request: request.clone(),
+                    preparation_failures: vec![],
+                    rust_cargo_graph: Some(
+                        RustSelectedCargoGraph::from_cargo_resolve(CargoResolveView::from_rows(
+                            vec![],
+                            vec![],
+                        ))
+                        .unwrap(),
+                    ),
+                }),
+                None,
+                Default::default(),
+            );
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let cancellation = crate::CancellationToken::default();
+        let context = DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &request,
+            limits: Default::default(),
+            cancellation: &cancellation,
+        };
+        let subset = workspace.dependency_pack_activation_inputs(
+            &[],
+            &context,
+            None,
+            DependencyPackPublicationKind::Subset,
+        );
+        assert!(subset.rust_cargo_graph.is_some());
+        workspace
+            .analyzer()
+            .snapshot_caches()
+            .unwrap()
+            .semantic_models()
+            .install_carried_dependency_evidence(
+                false,
+                vec![],
+                vec![],
+                Some(subset),
+                None,
+                Default::default(),
+            );
+        let full = workspace.dependency_pack_activation_inputs(
+            &[],
+            &context,
+            None,
+            DependencyPackPublicationKind::Full,
+        );
+        assert!(full.rust_cargo_graph.is_none());
+    }
+
+    #[test]
+    #[hardwon(
         "#12040: EmptyAnalyzer dropped store failures through the no-op record_query_failure default"
     )]
     fn empty_analyzer_failed_listing_fill_recovers() {
@@ -4694,6 +6127,7 @@ mod tests {
         )
         .unwrap();
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             bifrost_version: "0.0.0".parse().unwrap(),
             approximate_standard_libraries: Vec::new(),
             evidence: Vec::new(),
@@ -4725,7 +6159,8 @@ mod tests {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         });
         let independent = workspace.activate_dependency_packs(
             &config,

@@ -893,6 +893,15 @@ mod tests {
 
         struct UnreadableFacts(ProjectFile);
         impl NativeWorkspaceGraphProvider for UnreadableFacts {
+            // This fake has no source admission.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
             fn id(&self) -> EdgePassId {
                 EdgePassId::Rust
             }
@@ -1168,6 +1177,15 @@ mod tests {
             unresolved_names: BTreeSet<String>,
         }
         impl NativeWorkspaceGraphProvider for EmptyNativeInventory {
+            // This fake has no source admission.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
             fn id(&self) -> EdgePassId {
                 EdgePassId::Java
             }

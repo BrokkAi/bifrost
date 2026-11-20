@@ -121,11 +121,8 @@ fn bounded_receiver_hierarchy_stops_before_materializing_a_wide_walk() {
         BoundedResolution::Complete { .. }
     ));
 
-    let budget = ReceiverAnalysisBudget {
-        max_scope_nodes: 48,
-        ..ReceiverAnalysisBudget::default()
-    };
-    let bounded_session = ResolutionSession::bounded(budget, None);
+    let bounded_session =
+        ResolutionSession::bounded_with_total_work(ReceiverAnalysisBudget::default(), 48, None);
     let compatible = compatible_receiver_type_names(
         csharp,
         token,
@@ -141,9 +138,9 @@ fn bounded_receiver_hierarchy_stops_before_materializing_a_wide_walk() {
     assert!(matches!(
         bounded_session.finish(()),
         BoundedResolution::Exceeded {
-            limit: ReceiverBudgetLimit::ScopeNodes,
+            limit: ReceiverBudgetLimit::TotalWork,
             work,
-        } if work.scope_nodes == budget.max_scope_nodes
+        } if work.charged_total() == 48
     ));
 }
 

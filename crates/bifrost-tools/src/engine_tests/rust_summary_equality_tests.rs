@@ -1,6 +1,10 @@
 // Test-only #11173 M5 replay. The source fixtures build through the analyzer;
 // probes capture the actual TEMP inputs before each production reader runs.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn rust_summary_equality_reader_boundary() {
     use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation::summary_equality_probes as probes;
     let mut comparisons = Vec::new();
@@ -233,6 +237,10 @@ fn rust_summary_equality_reader_boundary() {
     );
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn summary_equality_workspace(fixture: &crate::inline_project::BuiltInlineTestProject) -> brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer {
     use brokk_bifrost_analysis::analyzer::{WorkspaceAnalyzer, tree_sitter_analyzer::ephemeral_store_context};
     use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation::summary_equality_probes as probes;
@@ -243,6 +251,10 @@ fn summary_equality_workspace(fixture: &crate::inline_project::BuiltInlineTestPr
 
 #[test]
 #[hardwon("#11173: alias normalization accepted a different real declaration endpoint")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn rust_summary_equality_rejects_wrong_alias_endpoint() {
     use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation::summary_equality_probes as probes;
     let fixture = walk_fixture("pub use kernel::Item as Alias;", "pub use mid::*;", "pub struct Item; pub struct Other;");

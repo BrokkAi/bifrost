@@ -794,3 +794,21 @@ fn assert_argument_independent_binding_keeps_callsite_gap(
     ));
     result_slot
 }
+
+
+#[test]
+#[hardwon("#13540: an expected trait-object destination is not evidence for the generic source type")]
+fn master_callable_expected_dyn_coercion_does_not_invent_complete_type() {
+    let _neutral_rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Rust,
+        ]);
+    let source = "pub trait Shape {} pub fn make<W: Shape>() -> W { loop {} } pub fn caller() { let value: &dyn Shape = make(); }";
+    let fixture = parsed_rust_fixture(source, b"12734-master-callable-coercion");
+    let reference = callable_reference_named_at(&fixture, "make();", "make");
+    let answer = fixture.service.resolve_reference(reference, &CancellationToken::new()).unwrap();
+    let result = fixture.typed.call_obligations().iter().find(|call| call.callee_reference() == reference).unwrap().result_slot();
+    assert!(answer.projected_frontiers().iter().find(|frontier| frontier.slot() == result)
+        .is_none_or(|frontier| frontier.completion() != &ResolutionCompletion::Complete),
+        "MASTER callable path gives wrong complete at a coercion expectation: {answer:?}");
+}

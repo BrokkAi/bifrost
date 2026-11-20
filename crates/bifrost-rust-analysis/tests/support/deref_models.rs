@@ -31,6 +31,7 @@ pub fn activate(
             .unwrap();
     }
     let request = SemanticModelActivationRequest {
+        host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: vec![],
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: vec![SemanticModelActivationEvidence {
@@ -44,9 +45,10 @@ pub fn activate(
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: Some(
+            production_input_digest: None,
+verified_raw_artifacts: (Some(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            ),
+            )).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::RustdocJson, &sha256)).collect(),
         }],
         controls: ["bifrost.rust-stdlib", "test.std-deref-companion"]
             .into_iter()

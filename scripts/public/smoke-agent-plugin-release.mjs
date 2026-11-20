@@ -14,6 +14,8 @@ import { parseCamelCaseArgs, required } from "./cli-argument-helpers.mjs";
 import { roundTrip, waitForSpawn, writeMessage } from "./mcp-smoke-transport.mjs";
 
 const execFileAsync = promisify(execFile);
+const WORKSPACE_READY_TIMEOUT_MS = 120_000;
+const WORKSPACE_READY_POLL_MS = 250;
 const codexHandshake = JSON.parse(
   await fs.readFile(
     new URL("../fixtures/mcp/codex-sandbox-state-handshake.json", import.meta.url),
@@ -303,12 +305,16 @@ async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, en
     assert.ok(tools.some((tool) => tool.name === "get_symbol_sources"), "MCP tools/list did not advertise get_symbol_sources");
     assert.ok(tools.some((tool) => tool.name === "list_policies"), "MCP tools/list did not advertise list_policies");
     assert.ok(tools.some((tool) => tool.name === "run_policy"), "MCP tools/list did not advertise run_policy");
-    const search = await roundTrip(
+    const search = await searchAfterWorkspaceReady(
       child,
       reader,
-      codexToolCall(3, workspaceRoot, "bifrost-release-smoke", "BifrostReleaseSmokeWorkspace")
+      (attempt) => codexToolCall(
+        `search-codex-${attempt}`,
+        workspaceRoot,
+        "bifrost-release-smoke",
+        "BifrostReleaseSmokeWorkspace"
+      )
     );
-    assert.equal(search.result?.isError, false, `MCP search_symbols returned an error: ${JSON.stringify(search)}`);
     assertWorkspaceSymbolHit(search, "Codex sandbox metadata");
     assert.deepEqual(serverRequests, [], `Codex-shaped handshake unexpectedly requested client roots: ${serverRequests}`);
   });
@@ -343,19 +349,22 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
       undefined,
       "A roots-capable client must not negotiate Codex metadata binding"
     );
-    const searchRequest = {
+    const searchRequest = (attempt) => ({
       jsonrpc: "2.0",
-      id: 2,
+      id: `search-roots-${attempt}`,
       method: "tools/call",
       params: {
         name: "search_symbols",
         arguments: { patterns: ["BifrostReleaseSmokeWorkspace"] },
       },
-    };
+    });
     const rootsRequestPromise = waitForMethod(child, reader, "roots/list");
     writeMessage(child, { jsonrpc: "2.0", method: "notifications/initialized" });
-    // RMCP requests roots when a tool call first needs a workspace.
-    const searchPromise = roundTrip(child, reader, searchRequest);
+    // RMCP requests roots when a tool call first needs a workspace. Initial
+    // preparation no longer blocks tool calls, so a cold search can answer
+    // with the retryable workspace_not_ready reason until the analyzer
+    // installs (#13391).
+    const searchPromise = searchAfterWorkspaceReady(child, reader, searchRequest);
     const rootsRequest = await rootsRequestPromise;
     writeMessage(child, {
       jsonrpc: "2.0",
@@ -365,7 +374,6 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
       },
     });
     const search = await searchPromise;
-    assert.equal(search.result?.isError, false, `MCP roots search_symbols returned an error: ${JSON.stringify(search)}`);
     assertWorkspaceSymbolHit(search, "MCP roots");
     const catalog = await roundTrip(child, reader, {
       jsonrpc: "2.0",
@@ -419,6 +427,37 @@ function assertWorkspaceSymbolHit(response, scenario) {
     fixtureFile.classes?.some((hit) => hit.symbol === "BifrostReleaseSmokeWorkspace"),
     `${scenario} search did not return the disposable workspace symbol`
   );
+}
+
+async function searchAfterWorkspaceReady(child, reader, makeRequest) {
+  const deadline = Date.now() + WORKSPACE_READY_TIMEOUT_MS;
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await roundTrip(child, reader, makeRequest(attempt));
+    if (response.result?.isError === false) {
+      return response;
+    }
+    assert.equal(
+      workspaceNotReady(response),
+      true,
+      `MCP search_symbols returned an error: ${JSON.stringify(response)}`
+    );
+    if (Date.now() >= deadline) {
+      assert.fail(
+        `MCP search_symbols stayed workspace_not_ready for ${WORKSPACE_READY_TIMEOUT_MS} ms: ` +
+        JSON.stringify(response)
+      );
+    }
+    await delay(WORKSPACE_READY_POLL_MS);
+  }
+}
+
+function workspaceNotReady(response) {
+  const incomplete = response.result?._meta?.["io.bifrost/incomplete"];
+  return incomplete?.completion?.reasons?.includes("workspace_not_ready") === true;
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function assertWorkspaceCache(workspaceRoot, scenario) {

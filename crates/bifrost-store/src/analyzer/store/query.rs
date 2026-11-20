@@ -24,6 +24,7 @@ pub(super) const SELECTED_PARSE_VARIANTS_SQL: &str = "SELECT requested.key,
 impl super::AnalyzerStore {
     /// Select only this request's paths from the revisioned source view.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_parse_variants_for_paths(
         &self,
         snapshot: &super::WorkspaceSnapshotId,

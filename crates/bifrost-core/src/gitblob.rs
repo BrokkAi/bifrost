@@ -92,6 +92,12 @@ pub const CACHE_SUBDIR_NAME: &str = "cache";
 pub const CACHE_DIR_ENV: &str = "BIFROST_CACHE_DIR";
 pub const CACHE_ROOT_ENV: &str = "BIFROST_CACHE_ROOT";
 
+/// The directory Bifrost creates beneath `BIFROST_CACHE_DIR` to hold the
+/// store. `BIFROST_CACHE_DIR` itself names a directory the user owns, possibly a
+/// repository root, so the store and its self-ignoring `.gitignore` live in a
+/// child that only Bifrost writes (#13703).
+pub const CACHE_DIR_STORE_SUBDIR: &str = "bifrost-store";
+
 /// Directory name Bifrost owns inside a machine-local cache location.
 const MACHINE_CACHE_APP_NAME: &str = "bifrost";
 
@@ -185,9 +191,10 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 /// reconciliation against that worktree's current oids, not of the file's
 /// location. `BIFROST_CACHE_ROOT` keeps that sharing contract while relocating
 /// each primary repository to a stable child of one machine-local root.
-/// `BIFROST_CACHE_DIR` deliberately overrides both locations with one exact
+/// `BIFROST_CACHE_DIR` deliberately overrides both locations with one
 /// directory, at the cost of per-root divergence and cross-repository writer
-/// contention; version-keyed naming applies inside either override too.
+/// contention; the store lives in its [`CACHE_DIR_STORE_SUBDIR`] child, and
+/// version-keyed naming applies inside either override too.
 ///
 pub fn cache_dir_path(workspace_root: &Path) -> PathBuf {
     cache_dir_path_with_overrides(
@@ -203,7 +210,7 @@ fn cache_dir_path_with_overrides(
     cache_root: Option<std::ffi::OsString>,
 ) -> PathBuf {
     if let Some(cache_dir) = cache_dir {
-        return PathBuf::from(cache_dir);
+        return PathBuf::from(cache_dir).join(CACHE_DIR_STORE_SUBDIR);
     }
     let primary_root = discover(workspace_root)
         .as_ref()
@@ -235,6 +242,166 @@ fn cache_db_path_with_overrides(
         .join(crate::cache_db::cache_db_file_name())
 }
 
+/// Whether Bifrost itself created `dir` as a store directory, so it may write a
+/// self-ignoring `.gitignore` there: the child of `BIFROST_CACHE_DIR`, or a
+/// `<name>-<16 hex digits>` child of `BIFROST_CACHE_ROOT`. A directory the user
+/// chose, or a direct-API store path, is never owned and never gets a
+/// `.gitignore`, because `*` there would hide the user's own files.
+pub fn is_bifrost_created_store_dir(dir: &Path) -> bool {
+    // The name alone is not enough: a user may own a directory with the same
+    // name. The parent must also be the configured override directory.
+    if dir.file_name() == Some(std::ffi::OsStr::new(CACHE_DIR_STORE_SUBDIR)) {
+        return parent_is_configured(dir, CACHE_DIR_ENV);
+    }
+    is_cache_root_child(dir)
+}
+
+/// Whether a run without `BIFROST_CACHE_DIR` keeps its store in `dir` too: a
+/// child of the configured `BIFROST_CACHE_ROOT`, or, when that is not set, a
+/// default `<repository>/.bifrost/cache`. This follows the precedence of
+/// [`cache_dir_path`].
+pub fn is_store_dir_without_cache_dir_override(dir: &Path) -> bool {
+    if std::env::var_os(CACHE_ROOT_ENV).is_some_and(|value| !value.is_empty()) {
+        return is_cache_root_child(dir);
+    }
+    dir.file_name() == Some(std::ffi::OsStr::new(CACHE_SUBDIR_NAME))
+        && dir.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(PROJECT_DIR_NAME))
+}
+
+/// Whether `dir` is a [`cache_repository_key`] child of the configured
+/// `BIFROST_CACHE_ROOT`.
+fn is_cache_root_child(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_cache_repository_key)
+        && parent_is_configured(dir, CACHE_ROOT_ENV)
+}
+
+/// Whether `dir`'s parent is the directory the environment variable `env`
+/// names, compared after resolving symlinks.
+fn parent_is_configured(dir: &Path, env: &str) -> bool {
+    std::env::var_os(env)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|configured| {
+            match (
+                dir.parent().map(Path::canonicalize),
+                Path::new(&configured).canonicalize(),
+            ) {
+                (Some(Ok(parent)), Ok(configured)) => parent == configured,
+                _ => false,
+            }
+        })
+}
+
+pub use live_store_safe::{diff_tree_to_workdir_with_index, status_file, worktree_statuses};
+
+/// The only place that calls libgit2's work-tree readers (#13703).
+///
+/// libgit2 opens untracked files for `show_untracked_content`, status and
+/// `status_file`, and closing any descriptor on a SQLite `-shm` file drops the
+/// process's fcntl locks on it. A store outside a self-ignoring directory can
+/// sit in a work tree unignored, so each read first teaches the handle the
+/// registered stores' files as in-memory ignore rules (no file is written). The
+/// rules are applied immediately before every read, not when the handle opens,
+/// because stores open later. `clippy.toml` denies the raw methods elsewhere.
+mod live_store_safe {
+    use super::Result;
+    use git2::{DiffOptions, Repository, Status, StatusOptions, Statuses, Tree};
+    use std::path::Path;
+
+    fn hide_open_stores(repo: &Repository) -> Result<()> {
+        let Some(workdir) = repo.workdir().and_then(|dir| dir.canonicalize().ok()) else {
+            return Ok(());
+        };
+        // libgit2 appends internal rules without deduplicating them, and this
+        // runs before every status or diff on the handle. Bifrost adds no other
+        // internal rules, so start from the defaults each time.
+        repo.clear_ignore_rules()
+            .map_err(|err| format!("unable to reset the internal ignore rules: {err}"))?;
+        for file in crate::cache_db::open_store_file_paths() {
+            let Ok(relative) = file.strip_prefix(&workdir) else {
+                continue;
+            };
+            // Build the anchored rule from path components, so a separator is
+            // never confused with a backslash inside a name on Unix, and every
+            // character of a name is matched literally.
+            let mut rule = String::new();
+            for component in relative.components() {
+                let std::path::Component::Normal(name) = component else {
+                    panic!(
+                        "a canonical store path below the canonical work tree has only \
+                         plain components: {}",
+                        relative.display()
+                    );
+                };
+                // libgit2 takes a rule as text. A store it cannot name stays
+                // visible to status and diff, which is the #13703 defect, so
+                // refuse rather than continue unhidden.
+                let name = name.to_str().ok_or_else(|| {
+                    format!(
+                        "unable to hide the open store file {} from git: its path is not valid UTF-8",
+                        file.display()
+                    )
+                })?;
+                rule.push('/');
+                for ch in name.chars() {
+                    if matches!(ch, '*' | '?' | '[' | ']' | '\\' | '!' | '#' | ' ') {
+                        rule.push('\\');
+                    }
+                    rule.push(ch);
+                }
+            }
+            repo.add_ignore_rule(&rule).map_err(|err| {
+                format!(
+                    "unable to hide the open store file {}: {err}",
+                    file.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn worktree_statuses<'repo>(
+        repo: &'repo Repository,
+        options: Option<&mut StatusOptions>,
+    ) -> Result<Statuses<'repo>> {
+        hide_open_stores(repo)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#13703: the live-store-hiding helper"
+        )]
+        let statuses = repo.statuses(options);
+        statuses.map_err(|err| format!("unable to read the work tree status: {err}"))
+    }
+
+    pub fn status_file(repo: &Repository, path: &Path) -> Result<Status> {
+        hide_open_stores(repo)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#13703: the live-store-hiding helper"
+        )]
+        let status = repo.status_file(path);
+        status.map_err(|err| format!("unable to read the status of {}: {err}", path.display()))
+    }
+
+    pub fn diff_tree_to_workdir_with_index<'repo>(
+        repo: &'repo Repository,
+        old_tree: Option<&Tree<'_>>,
+        options: Option<&mut DiffOptions>,
+    ) -> Result<git2::Diff<'repo>> {
+        hide_open_stores(repo)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#13703: the live-store-hiding helper"
+        )]
+        let diff = repo.diff_tree_to_workdir_with_index(old_tree, options);
+        diff.map_err(|err| format!("work-tree diff failed: {err}"))
+    }
+}
+
+/// Lower-case hex digits of the digest that ends a [`cache_repository_key`].
+const CACHE_REPOSITORY_KEY_DIGEST_LEN: usize = 16;
+
 fn cache_repository_key(primary_root: &Path) -> String {
     let digest = hash_domain_bytes(
         b"bifrost-cache-primary-root-v1",
@@ -243,8 +410,19 @@ fn cache_repository_key(primary_root: &Path) -> String {
     format!(
         "{}-{}",
         readable_path_name(primary_root),
-        &lower_hex_string(&digest)[..16]
+        &lower_hex_string(&digest)[..CACHE_REPOSITORY_KEY_DIGEST_LEN]
     )
+}
+
+/// Whether `name` has the shape [`cache_repository_key`] builds:
+/// `<readable name>-<lower-case hex digest>`.
+fn is_cache_repository_key(name: &str) -> bool {
+    name.rsplit_once('-').is_some_and(|(_, digest)| {
+        digest.len() == CACHE_REPOSITORY_KEY_DIGEST_LEN
+            && digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// The last path component, reduced to characters every supported filesystem
@@ -294,6 +472,65 @@ fn machine_cache_root() -> Option<PathBuf> {
 /// `BIFROST_CACHE_ROOT` override. It resolves a location and creates nothing.
 pub fn machine_cache_dir() -> Option<PathBuf> {
     machine_cache_root()
+}
+
+/// Directory holding downloaded open-pack releases, or `None` when the host has
+/// no resolvable cache location.
+///
+/// This is the single owner of the location: the pack downloader writes here and
+/// the workspace walk excludes it, so a workspace rooted at an ancestor of it
+/// (for example `$HOME`) never lists cached pack fixtures as source. It is
+/// independent of `BIFROST_CACHE_ROOT`: `BIFROST_LAUNCHER_CACHE_DIR` relocates
+/// it, otherwise it sits under the platform's per-user cache directory. The path
+/// is absolute; this resolves a location and creates nothing.
+pub fn default_open_pack_cache_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("BIFROST_LAUNCHER_CACHE_DIR")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+    {
+        Some(value) => PathBuf::from(value),
+        None => open_pack_platform_cache_base()?,
+    };
+    let base = if base.is_absolute() {
+        base
+    } else {
+        std::env::current_dir().ok()?.join(base)
+    };
+    Some(base.join(OPEN_PACK_CACHE_DIRECTORY))
+}
+
+const OPEN_PACK_CACHE_DIRECTORY: &str = "open-pack-releases";
+
+// Windows caches under LOCALAPPDATA/Bifrost/AgentPlugin rather than a
+// "bifrost-agent" directory, matching the launcher's historic layout.
+#[cfg(not(target_os = "windows"))]
+const OPEN_PACK_AGENT_DIRECTORY: &str = "bifrost-agent";
+
+#[cfg(target_os = "macos")]
+fn open_pack_platform_cache_base() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Caches")
+            .join(OPEN_PACK_AGENT_DIRECTORY)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn open_pack_platform_cache_base() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join("AppData").join("Local"))
+        })
+        .map(|root| root.join("Bifrost").join("AgentPlugin"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_pack_platform_cache_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .map(|root| root.join(OPEN_PACK_AGENT_DIRECTORY))
 }
 
 fn machine_cache_root_with_overrides(cache_root: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -670,7 +907,11 @@ impl WorkingTreeIdentity {
                     .insert(rel.clone());
                 oid
             } else {
-                hash_working_file(workdir, rel)?
+                // A live store file is not source, so it has no identity.
+                let Some(oid) = hash_working_file(workdir, rel)? else {
+                    continue;
+                };
+                oid
             };
             let Some(metadata_after) = std::fs::metadata(&abs_path).ok() else {
                 continue;
@@ -898,6 +1139,147 @@ pub fn working_tree_paths_under(repo: &Repository, subtree: &str) -> Result<Hash
     working_tree_paths(repo, Some(subtree))
 }
 
+/// The kind reached by resolving a symbolic link inside one immutable Git tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitTreeSymlinkTarget {
+    File,
+    Directory,
+    Unresolved,
+}
+
+impl GitTreeSymlinkTarget {
+    /// Use the same omission vocabulary as the filesystem listing.
+    pub fn omission_reason(self) -> crate::analyzer::project::WorkspaceFileOmissionReason {
+        use crate::analyzer::project::WorkspaceFileOmissionReason;
+        match self {
+            Self::File => WorkspaceFileOmissionReason::Symlink,
+            Self::Directory => WorkspaceFileOmissionReason::SymlinkToDirectory,
+            Self::Unresolved => WorkspaceFileOmissionReason::UnreadableSymlink,
+        }
+    }
+}
+
+/// The entry of `root` named by `components`, each matched against an entry
+/// name exactly. `Tree::get_path` takes a host `Path`, and on Windows libgit2
+/// reads a backslash in it as a separator, so one immutable tree would answer
+/// differently by host; a component here is never split or normalized.
+pub fn tree_entry_by_components<'a>(
+    repo: &Repository,
+    root: &git2::Tree<'_>,
+    components: impl IntoIterator<Item = &'a str>,
+) -> Option<git2::TreeEntry<'static>> {
+    let mut components = components.into_iter().peekable();
+    let mut tree = root.clone();
+    loop {
+        let entry = tree.get_name(components.next()?)?.to_owned();
+        if components.peek().is_none() {
+            return Some(entry);
+        }
+        if entry.kind() != Some(ObjectType::Tree) {
+            return None;
+        }
+        tree = repo.find_tree(entry.id()).ok()?;
+    }
+}
+
+/// Resolve a link component by component, including links encountered inside
+/// its target. `..` applies to the resolved real directory, not the lexical
+/// target path. Git paths and link targets use `/` on every host. Names match
+/// exactly, as on a case-sensitive volume.
+pub fn resolve_git_tree_symlink(
+    repo: &Repository,
+    root: &git2::Tree<'_>,
+    link_path: &str,
+) -> GitTreeSymlinkTarget {
+    resolve_git_tree_symlink_unless(repo, root, link_path, |_, _| false)
+}
+
+/// [`resolve_git_tree_symlink`], failing closed where `collides(tree, name)`
+/// says a different entry of `tree` is indistinguishable from the entry that
+/// `name` matched exactly (for example under a case-folded key): the link could
+/// reach either, so it is Unresolved. The exact resolver passes a predicate
+/// that never reads the siblings.
+pub fn resolve_git_tree_symlink_unless(
+    repo: &Repository,
+    root: &git2::Tree<'_>,
+    link_path: &str,
+    collides: impl Fn(&git2::Tree<'_>, &str) -> bool,
+) -> GitTreeSymlinkTarget {
+    use GitTreeSymlinkTarget::{Directory, File, Unresolved};
+    let mut pending: std::collections::VecDeque<String> =
+        link_path.split('/').map(str::to_owned).collect();
+    // The trees of the resolved real directory, the root first, so each step
+    // opens at most one tree.
+    let mut trees = vec![root.clone()];
+    let mut hops = 0;
+    while let Some(component) = pending.pop_front() {
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if trees.len() == 1 {
+                    return Unresolved;
+                }
+                trees.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let tree = trees.last().expect("the root is never popped").clone();
+        let Some(entry) = tree.get_name(&component) else {
+            return Unresolved;
+        };
+        if collides(&tree, &component) {
+            return Unresolved;
+        }
+        if entry.filemode() == 0o120000 {
+            // Linux MAXSYMLINKS is 40; following another link fails with ELOOP.
+            if hops == 40 {
+                return Unresolved;
+            }
+            hops += 1;
+            // Linux PATH_MAX is 4096 including the NUL, so a longer target
+            // cannot exist; refuse before loading an arbitrarily large blob.
+            let Ok((size, _)) = repo.odb().and_then(|odb| odb.read_header(entry.id())) else {
+                return Unresolved;
+            };
+            if size >= 4096 {
+                return Unresolved;
+            }
+            let Ok(blob) = repo.find_blob(entry.id()) else {
+                return Unresolved;
+            };
+            let Ok(target) = std::str::from_utf8(blob.content()) else {
+                return Unresolved;
+            };
+            if target.is_empty() || target.starts_with('/') || target.contains('\0') {
+                return Unresolved;
+            }
+            // Empty trailing components require a directory, just like `/.`.
+            for part in target.split('/').rev() {
+                pending.push_front(if part.is_empty() { "." } else { part }.to_owned());
+            }
+        } else if entry.kind() == Some(ObjectType::Tree) {
+            let Ok(subtree) = repo.find_tree(entry.id()) else {
+                return Unresolved;
+            };
+            trees.push(subtree);
+        } else if entry.kind() == Some(ObjectType::Commit) {
+            // `.` components (from a trailing separator or `/.`) still name
+            // the gitlink; `..` out of a submodule stays Unresolved.
+            return if pending.iter().all(|part| part == ".") {
+                Directory
+            } else {
+                Unresolved
+            };
+        } else if matches!(entry.filemode(), 0o100644 | 0o100664 | 0o100755) {
+            return if pending.is_empty() { File } else { Unresolved };
+        } else {
+            return Unresolved;
+        }
+    }
+    Directory
+}
+
 /// Whether the gitlink at `rel` has no child Git metadata in the working-tree
 /// directory `checkout`. Workspace listings never initialize or fetch a
 /// submodule, so an uninitialized gitlink contributes no source.
@@ -1020,6 +1402,133 @@ fn listed_git_paths<'a>(
     Ok(())
 }
 
+/// The stage-0 entries of one analyzer generation's Git index, for point
+/// lookups of a tracked path's blob id.
+///
+/// Opening an index reads and verifies the whole file, which costs tens of
+/// milliseconds in a large repository; discovering the repository costs well
+/// under one. Each lookup still discovers the repository, so repository
+/// selection and its configuration are exactly what a fresh lookup sees. The
+/// entries are kept in an evictable budget region, keyed by the discovered Git
+/// directory, its core.ignorecase and the index file's
+/// `content_digest::FileIdentity` (device, inode, size, mtime, ctime). The
+/// identity is sampled before a forced re-read, and the entries are kept only
+/// when it is unchanged after the read, so they are never older than their
+/// key. An index with no identity, or one the budget refuses, is used once.
+/// The entries are copied out because `git2::Index` is not `Send`.
+#[derive(Default)]
+pub struct TrackedIndexCache {
+    region:
+        std::sync::OnceLock<crate::retention_budget::BudgetRegion<TrackedIndexKey, TrackedEntries>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TrackedIndexKey {
+    git_dir: PathBuf,
+    ignore_case: bool,
+    identity: crate::content_digest::FileIdentity,
+}
+
+impl crate::retention_budget::RetainedBytes for TrackedIndexKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.git_dir.as_os_str().len()
+    }
+}
+
+impl TrackedIndexCache {
+    /// The blob id the index tracks for `rel_path` at stage 0, from the
+    /// repository containing `root`. `Ok(None)` also covers no repository.
+    pub fn blob_id(
+        &self,
+        root: &Path,
+        rel_path: &Path,
+        budget: &crate::retention_budget::RetentionBudget,
+    ) -> Result<Option<Oid>> {
+        use crate::content_digest::metadata_change_identity as identity;
+        let Some(repo) = discover(root) else {
+            return Ok(None);
+        };
+        // `repo.index()` gives the index the repository's core.ignorecase,
+        // which `Index::get_path` honors; the entries fold the same way.
+        let ignore_case = repo
+            .config()
+            .and_then(|config| config.get_bool("core.ignorecase"))
+            .unwrap_or(false);
+        // libgit2 opens the repository index at `<git dir>/index`.
+        let index_path = repo.path().join("index");
+        let region = self
+            .region
+            .get_or_init(|| budget.region("core.tracked_git_index", Some(1)));
+        let key = identity(&index_path)
+            .ok()
+            .flatten()
+            .map(|identity| TrackedIndexKey {
+                git_dir: repo.path().to_path_buf(),
+                ignore_case,
+                identity,
+            });
+        if let Some(entries) = key.as_ref().and_then(|key| region.get(key)) {
+            return Ok(entries.get(rel_path));
+        }
+        let mut index = repo.index().map_err(|error| error.to_string())?;
+        debug_assert_eq!(index.path(), Some(index_path.as_path()));
+        index.read(true).map_err(|error| error.to_string())?;
+        let mut by_path = HashMap::new();
+        for entry in index.iter().filter(|entry| (entry.flags >> 12) & 0b11 == 0) {
+            let mut path = entry.path;
+            if ignore_case {
+                path.make_ascii_lowercase();
+            }
+            by_path.entry(path).or_insert(entry.id);
+        }
+        let entries = TrackedEntries {
+            ignore_case,
+            by_path,
+        };
+        let found = entries.get(rel_path);
+        if let Some(key) = key
+            && identity(&index_path).is_ok_and(|after| after.as_ref() == Some(&key.identity))
+        {
+            region.insert(key, entries);
+        }
+        Ok(found)
+    }
+}
+
+/// Stage-0 blob ids by index path. With core.ignorecase, paths are stored and
+/// looked up ASCII-lowercased, matching libgit2's case-insensitive index
+/// comparison; of entries that differ only in case, the first is kept.
+struct TrackedEntries {
+    ignore_case: bool,
+    by_path: HashMap<Vec<u8>, Oid>,
+}
+
+impl crate::retention_budget::RetainedBytes for TrackedEntries {
+    fn retained_bytes(&self) -> usize {
+        self.by_path.capacity() * (std::mem::size_of::<(Vec<u8>, Oid)>() + 1)
+            + self.by_path.keys().map(Vec::capacity).sum::<usize>()
+    }
+}
+
+impl TrackedEntries {
+    fn get(&self, rel_path: &Path) -> Option<Oid> {
+        let bytes = rel_path.as_os_str().as_encoded_bytes();
+        #[cfg(windows)]
+        let mut key: std::borrow::Cow<[u8]> = std::borrow::Cow::Owned(
+            bytes
+                .iter()
+                .map(|byte| if *byte == b'\\' { b'/' } else { *byte })
+                .collect(),
+        );
+        #[cfg(not(windows))]
+        let mut key = std::borrow::Cow::Borrowed(bytes);
+        if self.ignore_case {
+            key.to_mut().make_ascii_lowercase();
+        }
+        self.by_path.get(&*key).copied()
+    }
+}
+
 pub fn working_tree_paths_with_non_utf8(
     repo: &Repository,
     subtree: Option<&str>,
@@ -1032,12 +1541,14 @@ pub(crate) struct WorkingTreeListing {
     pub paths: HashSet<String>,
     pub non_utf8: Vec<PathBuf>,
     pub directories: Result<std::collections::BTreeSet<PathBuf>>,
+    pub index_receipt: std::io::Result<crate::analyzer::project::ignore_inputs::IndexReceipt>,
 }
 
 pub(crate) fn working_tree_listing_with_inputs(
     repo: &Repository,
     subtree: Option<&str>,
 ) -> Result<WorkingTreeListing> {
+    let mut index_receipt = Err(std::io::Error::other("no listing index"));
     let mut directories = std::collections::BTreeSet::new();
     let mut census_failure = None;
     let mut paths = HashSet::new();
@@ -1054,8 +1565,12 @@ pub(crate) fn working_tree_listing_with_inputs(
         let workdir = workdir(&current)?
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        let mut index = current.index().map_err(|error| error.to_string())?;
-        index.read(true).map_err(|error| error.to_string())?;
+        let (index, receipt) =
+            crate::analyzer::project::ignore_inputs::read_listing_index(&current)
+                .map_err(|error| error.to_string())?;
+        if prefix.is_empty() {
+            index_receipt = receipt;
+        }
         let (dirty, invalid, ignored) =
             dirty_worktree_paths_and_ignored(&current, scope.as_deref())?;
         if !crate::analyzer::project::ignore_inputs::supports_matching(&workdir) {
@@ -1148,6 +1663,7 @@ pub(crate) fn working_tree_listing_with_inputs(
         paths,
         non_utf8,
         directories: census_failure.map_or(Ok(directories), Err),
+        index_receipt,
     })
 }
 
@@ -1471,7 +1987,10 @@ pub fn existing_working_tree_oids(root: &Path) -> Result<HashSet<String>> {
         if metadata.is_file() {
             let oid = hash_working_file(workdir, &rel)
                 .map_err(|error| format!("hashing GC file {}: {error}", path.display()))?;
-            out.insert(oid.to_string());
+            // A live store file is not source, so it has no blob identity.
+            if let Some(oid) = oid {
+                out.insert(oid.to_string());
+            }
         }
     }
     Ok(out)
@@ -1500,7 +2019,8 @@ fn background_git(workdir: &Path) -> Command {
     command
 }
 
-pub fn resolve_index_entry_oid(workdir: &Path, entry: &IndexEntry) -> Result<Oid> {
+/// `None` when the entry is a live cache store file, which has no blob identity.
+pub fn resolve_index_entry_oid(workdir: &Path, entry: &IndexEntry) -> Result<Option<Oid>> {
     let rel = index_path_to_string(entry)?;
     hash_working_file(workdir, &rel)
 }
@@ -1620,19 +2140,44 @@ pub(crate) fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
     }
 }
 
-fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
+fn hash_working_file(workdir: &Path, rel: &str) -> Result<Option<Oid>> {
     #[cfg(test)]
     HASH_WORKING_FILE_CALLS.with(|calls| calls.set(calls.get() + 1));
     working_tree_file_oid(&workdir.join(rel))
 }
 
 /// Hash one working-tree file as a Git blob without resolving it through an index.
-pub fn working_tree_file_oid(path: &Path) -> Result<Oid> {
-    Oid::hash_file(ObjectType::Blob, path).map_err(|e| e.to_string())
+///
+/// Every by-path read of a working-tree file goes through here. Hashing opens
+/// and closes the file, which would release the SQLite locks this process
+/// holds on a live cache store that sits in the working tree (#13703), so a
+/// store file returns `None` instead: it is not source and has no identity.
+pub fn working_tree_file_oid(path: &Path) -> Result<Option<Oid>> {
+    let stores = crate::cache_db::open_store_read_guard();
+    if stores.is_open_store_file(path) {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    BEFORE_WORKING_TREE_HASH.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#13703: the chokepoint that skips live stores"
+    )]
+    let oid = Oid::hash_file(ObjectType::Blob, path)
+        .map(Some)
+        .map_err(|e| e.to_string());
+    // hash_file has closed its descriptor before registration can proceed.
+    drop(stores);
+    oid
 }
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_WORKING_TREE_HASH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static HASH_WORKING_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1700,6 +2245,94 @@ mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[cfg(unix)]
+    #[test]
+    fn store_registration_lock_probe() {
+        let Some(path) = std::env::var_os("BIFROST_STORE_REGISTRATION_LOCK_PROBE") else {
+            return;
+        };
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let error = conn.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon("#14006: a work-tree hash released a just-opened store's POSIX locks")]
+    fn work_tree_hash_preserves_concurrent_store_locks() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registration-race.db");
+        // Create an unregistered database, then close it before the race.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE example(value INTEGER)")
+            .unwrap();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let hash_path = path.clone();
+        let hash = std::thread::spawn(move || {
+            BEFORE_WORKING_TREE_HASH.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    checked_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }));
+            });
+            working_tree_file_oid(&hash_path).unwrap().unwrap()
+        });
+        checked_rx.recv().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let store_path = path.clone();
+        let store = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let conn = crate::cache_db::open_owned_sqlite(
+                &store_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            conn
+        });
+        started_rx.recv().unwrap();
+        // Before the fix the store locks while H is paused. With the fix,
+        // registration waits for H to close its file before SQLite can open.
+        let locked_before_hash = match locked_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(error) => panic!("store thread disconnected: {error}"),
+        };
+        resume_tx.send(()).unwrap();
+        hash.join().unwrap();
+        if !locked_before_hash {
+            locked_rx.recv().unwrap();
+        }
+        let conn = store.join().unwrap();
+        // A separate process is essential: POSIX locks belong to this process,
+        // so another connection here cannot prove the kernel still holds them.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gitblob::tests::store_registration_lock_probe",
+                "--nocapture",
+            ])
+            .env("BIFROST_STORE_REGISTRATION_LOCK_PROBE", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "lock probe failed: {output:?}"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+
     fn reset_hash_calls() {
         HASH_WORKING_FILE_CALLS.with(|calls| calls.set(0));
     }
@@ -1718,6 +2351,196 @@ mod tests {
             .unwrap()
             .set_bool("remote.origin.promisor", true)
             .unwrap();
+    }
+
+    #[test]
+    fn tracked_index_cache_refreshes_when_the_index_file_is_replaced() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = init_repo(&root);
+        std::fs::write(root.join("a.txt"), "first\n").unwrap();
+        commit_all(&repo, "init");
+        let budget = crate::retention_budget::RetentionBudget::for_tests();
+        let cache = TrackedIndexCache::default();
+        let first = cache.blob_id(&root, Path::new("a.txt"), &budget).unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            None,
+            cache.blob_id(&root, Path::new("b.txt"), &budget).unwrap()
+        );
+        assert_eq!(
+            first,
+            cache.blob_id(&root, Path::new("a.txt"), &budget).unwrap()
+        );
+
+        let region = cache
+            .region
+            .get()
+            .expect("the first lookup creates the region");
+        region.run_pending_tasks();
+        assert_eq!(1, region.stats().entries, "the parsed index is held");
+
+        // Another handle rewrites the index file, as `git add` does.
+        std::fs::write(root.join("a.txt"), "second\n").unwrap();
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.add_path(Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+
+        let second = cache.blob_id(&root, Path::new("a.txt"), &budget).unwrap();
+        assert!(second.is_some());
+        assert_ne!(first, second, "a re-staged path must report its new blob");
+        region.run_pending_tasks();
+        assert_eq!(1, region.stats().entries, "only the current index is held");
+        assert!(
+            cache
+                .blob_id(&root, Path::new("b.txt"), &budget)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tracked_index_cache_follows_a_repointed_git_link() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let mut blobs = Vec::new();
+        for (name, content) in [("a", "first\n"), ("b", "second\n")] {
+            let dir = base.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let repo = init_repo(&dir);
+            std::fs::write(dir.join("f.txt"), content).unwrap();
+            commit_all(&repo, name);
+            blobs.push(
+                repo.index()
+                    .unwrap()
+                    .get_path(Path::new("f.txt"), 0)
+                    .unwrap()
+                    .id,
+            );
+        }
+        let root = base.join("w");
+        std::fs::create_dir(&root).unwrap();
+        let link = |name: &str| {
+            let gitdir = base.join(name).join(".git");
+            std::fs::write(root.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        };
+        link("a");
+        let budget = crate::retention_budget::RetentionBudget::for_tests();
+        let cache = TrackedIndexCache::default();
+        assert_eq!(
+            Some(blobs[0]),
+            cache.blob_id(&root, Path::new("f.txt"), &budget).unwrap()
+        );
+
+        // Neither index changes; only the work tree's link moves.
+        link("b");
+        assert_eq!(
+            Some(blobs[1]),
+            cache.blob_id(&root, Path::new("f.txt"), &budget).unwrap()
+        );
+    }
+
+    #[test]
+    fn tracked_index_cache_matches_libgit2_for_case_colliding_entries() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = init_repo(&root);
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", false)
+            .unwrap();
+        std::fs::write(root.join("Foo.txt"), "upper\n").unwrap();
+        std::fs::write(root.join("foo.txt"), "lower\n").unwrap();
+        commit_all(&repo, "both spellings");
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        let budget = crate::retention_budget::RetentionBudget::for_tests();
+        let cache = TrackedIndexCache::default();
+        let index = Repository::open(&root).unwrap().index().unwrap();
+        for spelling in ["Foo.txt", "foo.txt", "FOO.TXT"] {
+            let libgit2 = index.get_path(Path::new(spelling), 0).map(|entry| entry.id);
+            assert!(libgit2.is_some());
+            assert_eq!(
+                libgit2,
+                cache.blob_id(&root, Path::new(spelling), &budget).unwrap(),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn tracked_index_cache_matches_libgit2_under_core_ignorecase() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = init_repo(&root);
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        std::fs::write(root.join("Mixed.txt"), "x\n").unwrap();
+        commit_all(&repo, "init");
+        let budget = crate::retention_budget::RetentionBudget::for_tests();
+        let cache = TrackedIndexCache::default();
+        let index = Repository::open(&root).unwrap().index().unwrap();
+        for spelling in ["Mixed.txt", "mixed.txt", "MIXED.TXT"] {
+            let libgit2 = index.get_path(Path::new(spelling), 0).map(|entry| entry.id);
+            assert!(libgit2.is_some(), "libgit2 folds {spelling}");
+            assert_eq!(
+                libgit2,
+                cache.blob_id(&root, Path::new(spelling), &budget).unwrap()
+            );
+        }
+
+        // Turning the setting off, with the index unchanged, turns folding off.
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", false)
+            .unwrap();
+        assert_eq!(
+            None,
+            cache
+                .blob_id(&root, Path::new("mixed.txt"), &budget)
+                .unwrap()
+        );
+        assert!(
+            cache
+                .blob_id(&root, Path::new("Mixed.txt"), &budget)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tracked_index_cache_rediscovers_a_nearer_repository() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outer_root = temp.path().canonicalize().unwrap();
+        let outer = init_repo(&outer_root);
+        let root = outer_root.join("sub");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "outer\n").unwrap();
+        commit_all(&outer, "init");
+        let budget = crate::retention_budget::RetentionBudget::for_tests();
+        let cache = TrackedIndexCache::default();
+        // The outer index tracks `sub/a.txt`, not `a.txt`.
+        assert_eq!(
+            None,
+            cache.blob_id(&root, Path::new("a.txt"), &budget).unwrap()
+        );
+
+        // A repository created at the root now owns it; the outer index is
+        // unchanged.
+        let inner = init_repo(&root);
+        commit_all(&inner, "inner");
+        assert!(
+            cache
+                .blob_id(&root, Path::new("a.txt"), &budget)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1774,6 +2597,52 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("shared-name-")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon(
+        "#13703: a backslash in a store's directory name produced an ignore rule that hid nothing"
+    )]
+    fn a_store_under_a_backslash_named_directory_stays_hidden_from_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = init_repo(&root);
+        std::fs::write(root.join("a.txt"), "tracked\n").unwrap();
+        commit_all(&repo, "base");
+        let store_dir = root.join("a\\b [x]");
+        std::fs::create_dir(&store_dir).unwrap();
+        let _store = crate::cache_db::open_unified_connection(&store_dir.join("live.db")).unwrap();
+        std::fs::write(store_dir.join("note.txt"), "untracked\n").unwrap();
+        let mut options = git2::StatusOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let listed: Vec<String> = worktree_statuses(&repo, Some(&mut options))
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.path().map(str::to_owned))
+            .collect();
+        // The untracked neighbour proves the directory is walked at all.
+        assert!(
+            listed.iter().any(|path| path.ends_with("note.txt")),
+            "{listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|path| path.contains("live.db")),
+            "{listed:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13703: a user's own directory named bifrost-store would get a self-ignoring .gitignore"
+    )]
+    fn a_user_directory_named_like_the_store_child_is_not_bifrost_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_dir = temp.path().join(CACHE_DIR_STORE_SUBDIR);
+        std::fs::create_dir(&user_dir).unwrap();
+        // Its parent is a fresh temporary directory, so it can never be the
+        // configured BIFROST_CACHE_DIR, whatever the environment says.
+        assert!(!is_bifrost_created_store_dir(&user_dir));
     }
 
     #[test]
@@ -2308,6 +3177,69 @@ mod tests {
         assert!(oids.contains(&linked), "missing linked OID {linked}");
     }
 
+    #[test]
+    #[hardwon(
+        "#13399: Tree::get_path turned a backslash in a symlink target into a separator on Windows"
+    )]
+    fn tree_symlink_target_backslash_is_a_name_character_on_every_host() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let blob = |bytes: &[u8]| repo.blob(bytes).unwrap();
+        let mut dir = repo.treebuilder(None).unwrap();
+        dir.insert("file", blob(b"x\n"), 0o100644).unwrap();
+        let dir = dir.write().unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        root.insert("dir", dir, 0o040000).unwrap();
+        root.insert("slash", blob(b"dir/file"), 0o120000).unwrap();
+        root.insert("backslash", blob(b"dir\\file"), 0o120000)
+            .unwrap();
+        let root = repo.find_tree(root.write().unwrap()).unwrap();
+
+        assert_eq!(
+            resolve_git_tree_symlink(&repo, &root, "slash"),
+            GitTreeSymlinkTarget::File
+        );
+        // No entry is named `dir\file`, on any host.
+        assert_eq!(
+            resolve_git_tree_symlink(&repo, &root, "backslash"),
+            GitTreeSymlinkTarget::Unresolved
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13399: a gitlink symlink target with a trailing separator was classified unreadable"
+    )]
+    fn tree_symlink_to_gitlink_accepts_trailing_separator_spellings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let mut vendor = repo.treebuilder(None).unwrap();
+        let commit = Oid::from_str("0123456789012345678901234567890123456789").unwrap();
+        vendor.insert("dep", commit, 0o160000).unwrap();
+        let vendor = vendor.write().unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        root.insert("vendor", vendor, 0o040000).unwrap();
+        for (name, target) in [
+            ("plain", "vendor/dep"),
+            ("slash", "vendor/dep/"),
+            ("dot", "vendor/dep/."),
+            ("parent", "vendor/dep/.."),
+            ("below", "vendor/dep/x"),
+        ] {
+            let blob = repo.blob(target.as_bytes()).unwrap();
+            root.insert(name, blob, 0o120000).unwrap();
+        }
+        let root = repo.find_tree(root.write().unwrap()).unwrap();
+        let resolve = |name: &str| resolve_git_tree_symlink(&repo, &root, name);
+
+        for name in ["plain", "slash", "dot"] {
+            assert_eq!(resolve(name), GitTreeSymlinkTarget::Directory, "{name}");
+        }
+        for name in ["parent", "below"] {
+            assert_eq!(resolve(name), GitTreeSymlinkTarget::Unresolved, "{name}");
+        }
+    }
+
     /// GC keeps an analyzer row while its blob is in `live_bloom`, which joins
     /// `reachable_bloom` with `existing_working_tree_oids` for every
     /// registered worktree. Each set must hold every blob a row can name.
@@ -2554,7 +3486,7 @@ mod working_tree_identity_tests {
                 .oid
         };
         let modified = |rel: &str| {
-            repo.status_file(Path::new(rel))
+            status_file(&repo, Path::new(rel))
                 .unwrap()
                 .contains(git2::Status::WT_MODIFIED)
         };
@@ -2818,11 +3750,13 @@ mod working_tree_identity_tests {
             .unwrap();
         assert_eq!(
             resolve_index_entry_oid(temp.path(), &entry).unwrap(),
-            entry.id
+            Some(entry.id)
         );
 
         write_file(&file, b"fn changed() {}\n", 1);
-        let resolved = resolve_index_entry_oid(temp.path(), &entry).unwrap();
+        let resolved = resolve_index_entry_oid(temp.path(), &entry)
+            .unwrap()
+            .unwrap();
         assert_eq!(resolved, blob_oid(b"fn changed() {}\n"));
         assert_ne!(resolved, entry.id);
 

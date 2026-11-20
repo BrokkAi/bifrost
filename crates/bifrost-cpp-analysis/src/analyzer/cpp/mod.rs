@@ -813,10 +813,43 @@ impl CppAnalyzer {
         (!owner_name.full_name().is_empty()).then_some(owner_name)
     }
 
+    fn macro_field_dependency_files(&self, owner_file: &ProjectFile) -> Option<Vec<ProjectFile>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let source = brokk_bifrost_cpp::graph::CppGraphSource::from_source(self, scope.token());
+        let mut files = HashSet::default();
+        let cancellation = self.inner.active_query_cancellation();
+        brokk_bifrost_cpp::graph::resolver::collect_include_closure(
+            &source,
+            &self.include_target_index(),
+            owner_file,
+            &mut files,
+            cancellation.as_ref(),
+        );
+        if cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return None;
+        }
+        let mut files = files.into_iter().collect::<Vec<_>>();
+        files.sort();
+        Some(files)
+    }
+
     fn build_macro_composed_fields(&self, owner_file: &ProjectFile) -> Vec<MacroComposedField> {
         #[cfg(any(test, feature = "test-support"))]
         self.macro_composed_fields_build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.compose_macro_fields(owner_file, || {
+            self.inner.declarations(owner_file).into_iter().collect()
+        })
+    }
+
+    fn compose_macro_fields(
+        &self,
+        owner_file: &ProjectFile,
+        owner_declarations: impl FnOnce() -> Vec<CodeUnit>,
+    ) -> Vec<MacroComposedField> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let include_target_index = self.include_target_index();
@@ -933,9 +966,7 @@ impl CppAnalyzer {
             cpp_facts,
             declaration_units,
         ));
-        let owners = self
-            .inner
-            .declarations(owner_file)
+        let owners = owner_declarations()
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect::<Vec<_>>();
@@ -2699,6 +2730,57 @@ impl CodeUnitIndex for CppAnalyzer {
         fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile>;
     }
 
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        use brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome;
+        brokk_bifrost_analysis::analyzer::i_analyzer::capture_lookup_answer(self, || {
+            // Both cpp and cpp:c readings are header-blob owned (adapter's
+            // parse_file_with_projections); no including TU is a dependency.
+            // Macro-composed fields additionally depend on this owner's include
+            // closure, even when the caller subsequently excludes field units.
+            match self.inner.declarations_for_files_answer(files) {
+                LookupOutcome::Found(mut units) => {
+                    for file in files {
+                        if self.inner.live_snapshot().oid_for_path(file).is_none()
+                            && !self.inner.project().has_overlay(file)
+                        {
+                            continue;
+                        }
+                        let Some(dependencies) = self.macro_field_dependency_files(file) else {
+                            return LookupOutcome::Incomplete(brokk_bifrost_core::analyzer::query_read_incomplete::QueryReadIncomplete::Cancelled);
+                        };
+                        // Macro donors must have selected complete products too;
+                        // do not let native-source recovery hide a missing publication.
+                        if let LookupOutcome::Incomplete(reason) =
+                            self.inner.declarations_for_files_answer(&dependencies)
+                        {
+                            return LookupOutcome::Incomplete(reason);
+                        }
+                        // Use the indexed owner units already read above. The legacy
+                        // macro memo obtains owners through untyped declarations(file),
+                        // whose missing-state recovery is outside this strict API.
+                        let owners = units
+                            .iter()
+                            .filter(|unit| unit.source() == file)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        units.extend(
+                            self.compose_macro_fields(file, || owners)
+                                .into_iter()
+                                .map(|field| field.unit),
+                        );
+                    }
+                    units.sort();
+                    units.dedup();
+                    LookupOutcome::Found(units)
+                }
+                outcome => outcome,
+            }
+        })
+    }
+
     /// #1970: the relational workspace snapshot mounts a header's published C
     /// reading under `cpp:c`, so the generic declaration scan returns both
     /// identities of one declaration site without a Rust-side workspace map.
@@ -3418,8 +3500,25 @@ impl IAnalyzer for CppAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            self.with_updated_inner(self.inner.update_with_listing(changed_files, listing))
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
+            (
+                self.with_updated_inner(inner),
+                effects.no_changes_or_unreported(changed_files),
+            )
         })
     }
 
@@ -4319,6 +4418,19 @@ impl LanguageEdgePass for CppEdgePass {
         EdgePassId::Cpp
     }
 
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<CppAnalyzer>(analyzer)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |cpp| cpp.inner.selected_graph_source_exclusions(),
+            )
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         build_rooted_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeSites::Fqn)
@@ -4544,6 +4656,7 @@ mod dependency_packs {
             _config: &AnalyzerConfig,
             project: &dyn Project,
             _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {

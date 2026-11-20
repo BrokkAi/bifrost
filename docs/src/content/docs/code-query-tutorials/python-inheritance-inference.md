@@ -44,6 +44,7 @@ The `inference_failure` fact identifies a particular written base the analyzer c
     {
       "code": "python_hierarchy_derivation_incomplete",
       "impact": "incomplete",
+      "incompleteness": "content",
       "language": "python",
       "message": "Python class hierarchy is open: unresolved_base",
       "source": {
@@ -57,7 +58,8 @@ The `inference_failure` fact identifies a particular written base the analyzer c
         },
         "start_byte": 27
       },
-      "incompleteness": "content"
+      "step_index": 1,
+      "step_op": "class_hierarchy"
     }
   ],
   "results": [

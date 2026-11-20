@@ -526,6 +526,7 @@ impl AnalyzerStore {
     /// One query per batch of keys rather than one per key: a policy asks about
     /// every seed file of the workspace, and a per-key round trip would make
     /// verification cost a query per file before it reads a single fact.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn policy_units_for_keys(
         &self,
         keys: &[PolicyUnitRowKey],
@@ -889,6 +890,7 @@ impl AnalyzerStore {
 
     /// The base evaluation published under `key`, with the identities it
     /// concluded.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn policy_evaluation_for_key(
         &self,
         key: &PolicyEvaluationRowKey,
@@ -1215,8 +1217,8 @@ fn intern_read_key(conn: &rusqlite::Connection, read: &ReadKey) -> rusqlite::Res
     // Configuration and Epoch store the named non-source input's digest.
     const INTERN_READ_KEY_SQL: &str = "INSERT INTO policy_read_keys(
            key_digest, kind, family, languages, rel_path, name, index_key,
-           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword, drop_owning_unit, drop_module_path, drop_identity_digest, drop_config_digest, drop_proof_version
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18), ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword, selected_receiver_question, selected_resolution_epoch, selected_application_digest, selected_receiver_digest, selected_transfer_rule_digest, selected_reference_digest,drop_owning_unit,drop_module_path,drop_identity_digest,drop_config_digest,drop_proof_version
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18), ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
          ON CONFLICT(key_digest) DO NOTHING";
     let columns = ReadKeyColumns::of(read)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -1250,6 +1252,12 @@ fn intern_read_key(conn: &rusqlite::Connection, read: &ReadKey) -> rusqlite::Res
         columns.parse_variant_digest,
         columns.structural_role,
         columns.structural_keyword,
+        columns.selected_receiver_question,
+        columns.selected_resolution_epoch,
+        columns.selected_application_digest,
+        columns.selected_receiver_digest,
+        columns.selected_transfer_rule_digest,
+        columns.selected_reference_digest,
         columns.drop_owning_unit,
         columns.drop_module_path,
         columns.drop_identity_digest,
@@ -1469,7 +1477,7 @@ macro_rules! read_keys_by_membership {
         concat!(
             "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
                 keys.name, keys.index_key, keys.blob_oid, keys.subject,
-                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names), keys.copy_owning_unit, keys.copy_target_unit, keys.copy_module_path, keys.copy_target_identity_digest, keys.copy_census_version, keys.copy_config_digest, keys.copy_producer_digest, keys.parse_variant_kind, keys.parse_variant_digest, keys.structural_role, keys.structural_keyword, keys.drop_owning_unit, keys.drop_module_path, keys.drop_identity_digest, keys.drop_config_digest, keys.drop_proof_version
+                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names), keys.copy_owning_unit, keys.copy_target_unit, keys.copy_module_path, keys.copy_target_identity_digest, keys.copy_census_version, keys.copy_config_digest, keys.copy_producer_digest, keys.parse_variant_kind, keys.parse_variant_digest, keys.structural_role, keys.structural_keyword, keys.selected_receiver_question, keys.selected_resolution_epoch, keys.selected_application_digest, keys.selected_receiver_digest, keys.selected_transfer_rule_digest, keys.selected_reference_digest, keys.drop_owning_unit, keys.drop_module_path, keys.drop_identity_digest, keys.drop_config_digest, keys.drop_proof_version
          FROM ",
             $table,
             " AS membership
@@ -1644,7 +1652,8 @@ mod tests {
     /// fills and another leaves empty.
     fn every_read_key_shape() -> Vec<ReadKey> {
         let digest = StableDigest::sha256(b"answer");
-        vec![
+        let mut reads = super::super::read_keys::selected_receiver_proof_keys();
+        reads.extend([
             ReadKey::lookup(
                 LookupKind::ExternalSelection,
                 LookupQuestion::ExternalSelection {
@@ -1872,7 +1881,8 @@ mod tests {
             },
             ReadKey::Configuration(StableDigest::sha256(b"configuration")),
             ReadKey::Epoch(StableDigest::sha256(b"epoch")),
-        ]
+        ]);
+        reads
     }
 
     fn unit_row(rel_path: &str, reads: Vec<ReadKey>) -> PolicyUnitRow {
@@ -2299,6 +2309,48 @@ mod tests {
                 .unwrap();
                 conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
                     .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn selected_receiver_proof_future_family_is_a_policy_unit_miss() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .publish_policy_units(vec![unit_row(
+                "C.cs",
+                super::super::read_keys::selected_receiver_proof_keys(),
+            )])
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE policy_read_keys SET family='selected_receiver_proof:v2' WHERE selected_receiver_question IS NOT NULL; PRAGMA ignore_check_constraints=OFF;").unwrap();
+        }
+        assert_eq!(
+            store.policy_units_for_keys(&[seed_key("C.cs")]).unwrap(),
+            vec![None]
+        );
+        for column in [
+            "selected_application_digest",
+            "selected_receiver_digest",
+            "selected_transfer_rule_digest",
+            "selected_reference_digest",
+        ] {
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA ignore_check_constraints=ON; UPDATE policy_read_keys SET {column}=zeroblob(31) WHERE selected_receiver_question IS NOT NULL; PRAGMA ignore_check_constraints=OFF;"
+                )).unwrap();
+            }
+            let error = store
+                .policy_units_for_keys(&[seed_key("C.cs")])
+                .unwrap_err();
+            assert!(!error.is_unsupported_read_key(), "{column}: {error}");
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA ignore_check_constraints=ON; UPDATE policy_read_keys SET {column}=zeroblob(32) WHERE selected_receiver_question IS NOT NULL; PRAGMA ignore_check_constraints=OFF;"
+                )).unwrap();
             }
         }
     }

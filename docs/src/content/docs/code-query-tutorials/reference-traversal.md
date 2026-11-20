@@ -151,7 +151,9 @@ Accepted kinds are `method_call`, `constructor_call`, `field_read`, `field_write
         "operational": "provider"
       },
       "language": "java",
-      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge",
+      "step_index": 1,
+      "step_op": "uses"
     },
     {
       "code": "uses_definition_projection_missing",
@@ -160,7 +162,9 @@ Accepted kinds are `method_call`, `constructor_call`, `field_read`, `field_write
         "operational": "provider"
       },
       "language": "java",
-      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge",
+      "step_index": 1,
+      "step_op": "uses"
     }
   ],
   "results": [
@@ -328,7 +332,9 @@ To inspect all direct members of a type without attributing nested member bodies
         "operational": "provider"
       },
       "language": "java",
-      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge",
+      "step_index": 2,
+      "step_op": "uses"
     },
     {
       "code": "uses_definition_projection_missing",
@@ -337,14 +343,33 @@ To inspect all direct members of a type without attributing nested member bodies
         "operational": "provider"
       },
       "language": "java",
-      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge",
+      "step_index": 2,
+      "step_op": "uses"
     },
     {
       "code": "reference_kind_undecided",
       "impact": "incomplete",
       "incompleteness": "content",
       "language": "java",
-      "message": "reference sites without a classified kind could not be excluded for requested kinds [\"field_read\"]: [\"User.java:1@53\"]"
+      "message": "reference sites without a classified kind could not be excluded for requested kinds [\"field_read\"]: [\"User.java:1@53\"]",
+      "step_index": 2,
+      "step_op": "uses"
+    },
+    {
+      "cause_codes": [
+        "uses_candidate_unresolved",
+        "uses_definition_projection_missing",
+        "reference_kind_undecided"
+      ],
+      "code": "step_produced_no_rows",
+      "impact": "advisory",
+      "incompleteness": "content",
+      "language": "workspace",
+      "message": "step `uses` produced 0 rows from 1 input row(s) after incomplete step execution",
+      "no_rows_reason": "incomplete",
+      "step_index": 2,
+      "step_op": "uses"
     }
   ],
   "results": [],
@@ -372,7 +397,22 @@ The default external surface removes `this.target()` because it is self-receiver
 
 <!-- code-query-case:external-surface:expected -->
 ```json
-{"results":[],"truncated":false}
+{
+  "diagnostics": [
+    {
+      "code": "step_produced_no_rows",
+      "impact": "advisory",
+      "incompleteness": "content",
+      "language": "workspace",
+      "message": "step `references_of` found no rows for 2 input row(s)",
+      "no_rows_reason": "no_matching_rows",
+      "step_index": 2,
+      "step_op": "references_of"
+    }
+  ],
+  "results": [],
+  "truncated": false
+}
 ```
 
 The LSP surface retains that same exact site:

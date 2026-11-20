@@ -7,6 +7,7 @@ pub mod conversion;
 pub mod declarations;
 pub mod diagnostics;
 pub mod exceptions;
+pub mod functional;
 pub mod graph;
 pub mod graph_support;
 pub mod hierarchy;
@@ -20,7 +21,7 @@ pub(crate) mod resolution;
 pub mod source_facts;
 pub(crate) mod source_types;
 mod string_literal;
-pub use string_literal::decoded_string_literal_value;
+pub use string_literal::{decoded_char_literal_value, decoded_string_literal_value};
 pub mod structural;
 pub mod test_detection;
 

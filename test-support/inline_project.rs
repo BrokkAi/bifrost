@@ -127,14 +127,16 @@ pub fn rust_project_with_file(
         .file(relative_path, contents)
 }
 
-/// Build a Python inline project and its default workspace analyzer.
+/// Build a Python inline project and its workspace analyzer.
+/// Tests must not depend on host JDK discovery (#14290).
 pub fn python_workspace(files: &[(&str, &str)]) -> (BuiltInlineTestProject, WorkspaceAnalyzer) {
     let mut builder = InlineTestProject::with_language(Language::Python);
     for (path, source) in files {
         builder = builder.file(*path, *source);
     }
     let project = builder.build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer =
+        project.workspace_analyzer(brokk_bifrost_analysis::test_support::no_host_jdk_config());
     (project, analyzer)
 }
 

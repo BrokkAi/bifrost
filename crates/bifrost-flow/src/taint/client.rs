@@ -3152,6 +3152,7 @@ impl TaintSummaryResult {
             SummaryMetrics::default(),
             WitnessArena::new(WitnessRetentionLimits::disabled()).into_store(),
             false,
+            crate::analyzer::reuse_verdict::ReuseVerdict::Content,
         );
         Self::from_composed_facts(plan, fact_result, complete, authored)
     }
@@ -3211,6 +3212,11 @@ impl TaintSummaryResult {
                 .unwrap_or_default()
                 .into_boxed_slice(),
         }
+    }
+
+    pub(crate) fn into_verdict(mut self) -> Self {
+        self.result = self.result.into_verdict();
+        self
     }
 
     pub(crate) fn without_observed_values(mut self) -> Self {

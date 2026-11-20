@@ -229,6 +229,13 @@
             }
           ]
         },
+        "production_input_digest": {
+          "description": "Composite binding reserved for engine-generated dependency selectors.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "targets": {
           "type": "array",
           "default": [],

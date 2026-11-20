@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bifrost.dev/schemas/pack-selection-receipt-v4.schema.json",
+  "title": "Open Pack Selection Receipt",
+  "description": "The immutable, content-addressed record of verified releases selected for an open-pack acquisition. Artifact locations are derived from the current owner cache root and SHA-256, never stored in this receipt.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "receipt_schema_version": {
+      "type": "integer",
+      "const": 4
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "qualified",
+        "compatible"
+      ]
+    },
+    "selection_id": {
+      "$ref": "pack-selection-receipt-v3.schema.json#/$defs/Sha256"
+    },
+    "selection_reason": {
+      "type": "string",
+      "enum": [
+        "strict-lock",
+        "preferred-version",
+        "highest-eligible"
+      ]
+    },
+    "request": {
+      "$ref": "pack-request-v1.schema.json"
+    },
+    "engine": {
+      "$ref": "pack-selection-receipt-v3.schema.json#/$defs/ReceiptEngine"
+    },
+    "source": {
+      "$ref": "pack-selection-receipt-v3.schema.json#/$defs/SourceInventory"
+    },
+    "releases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "pack-selection-receipt-v3.schema.json#/$defs/SelectedRelease"
+      }
+    },
+    "rejections": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "pack-selection-receipt-v3.schema.json#/$defs/Rejection"
+      }
+    },
+    "extracted_files": {
+      "$ref": "pack-selection-receipt-v3.schema.json#/$defs/ExtractedFiles"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CachedArtifact"
+      }
+    },
+    "replay": {
+      "$ref": "pack-request-v1.schema.json"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "receipt_schema_version",
+    "status",
+    "selection_id",
+    "selection_reason",
+    "request",
+    "engine",
+    "source",
+    "releases",
+    "rejections",
+    "extracted_files",
+    "artifacts",
+    "replay",
+    "created_at"
+  ],
+  "$defs": {
+    "CachedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pack_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release_version": {
+          "$ref": "pack-request-v1.schema.json#/$defs/SemVer"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "pack-selection-receipt-v3.schema.json#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "pack_id",
+        "release_version",
+        "name",
+        "role",
+        "size_bytes",
+        "sha256"
+      ]
+    }
+  }
+}

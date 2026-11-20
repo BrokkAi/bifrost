@@ -130,6 +130,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((halves, outcome))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn read_package_peers(
         &self,
         request: &PeerSelection,

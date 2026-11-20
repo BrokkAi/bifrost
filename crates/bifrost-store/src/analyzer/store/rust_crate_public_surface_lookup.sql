@@ -5,7 +5,8 @@ SELECT * FROM (
 SELECT pending.owner_crate_key, pending.owner_module_path, pending.owner_namespace, pending.owner_name,
        pending.crate_key, pending.module_path, pending.name, exports.origin
 FROM cr_surface_pending AS pending
-CROSS JOIN cr_exports AS exports
+-- Namespace-specific: stay on the primary key, not the gap probes' partial cr_exports_name index.
+CROSS JOIN cr_exports AS exports INDEXED BY sqlite_autoindex_cr_exports_1
   ON exports.crate_key = pending.crate_key
  AND exports.module_path = pending.module_path
  AND exports.namespace = pending.owner_namespace AND exports.name = pending.name

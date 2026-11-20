@@ -14,11 +14,254 @@ mod tests {
     include!("rust_forwarded_surface_tests.rs");
     include!("rust_summary_equality_tests.rs");
 
+    // Entirely synthetic fixture: each group has a glob/re-export diamond and
+    // long common prefixes, without relying on any external crate or corpus.
+    fn closure_lookup_fixture(
+        modules: usize,
+        items: usize,
+    ) -> crate::inline_project::BuiltInlineTestProject {
+        use std::fmt::Write as _;
+        let mut project = InlineTestProject::new().file(
+            "Cargo.toml",
+            "[package]\nname='closure_lookup'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        let mut root = String::new();
+        for module in 0..modules {
+            writeln!(root, "pub mod shared_prefix_module_{module:04};").unwrap();
+            let mut source = String::new();
+            for item in 0..items {
+                writeln!(
+                    source,
+                    "pub struct SharedPrefixForClosureLookupItem{module:04}Number{item:04};"
+                )
+                .unwrap();
+            }
+            if module % 4 != 0 {
+                let previous = module - 1;
+                let first = module - module % 4;
+                writeln!(
+                    source,
+                    "pub use crate::shared_prefix_module_{previous:04}::*;"
+                )
+                .unwrap();
+                writeln!(source, "pub use crate::shared_prefix_module_{first:04}::SharedPrefixForClosureLookupItem{first:04}Number0000 as ExplicitAlias;").unwrap();
+                writeln!(
+                    source,
+                    "pub(crate) use crate::shared_prefix_module_{first:04} as ModuleAlias;"
+                )
+                .unwrap();
+            }
+            project = project.file(format!("src/shared_prefix_module_{module:04}.rs"), source);
+        }
+        project.file("src/lib.rs", root).build()
+    }
+
+    const CLOSURE_LOOKUP_STEMS: [&str; 8] = [
+        "shared_prefix_level_zero",
+        "shared_prefix_level_one",
+        "shared_prefix_level_two",
+        "shared_prefix_level_three",
+        "shared_prefix_level_four",
+        "shared_prefix_level_five",
+        "shared_prefix_level_six",
+        "shared_prefix_level_seven",
+    ];
+
+    fn closure_lookup_deep_fixture(
+        modules: usize,
+        items: usize,
+    ) -> crate::inline_project::BuiltInlineTestProject {
+        use std::fmt::Write as _;
+        assert_eq!(modules % 12, 0);
+        let mut project = InlineTestProject::new().file(
+            "Cargo.toml",
+            "[package]\nname='deep_closure_lookup'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        let parent_path = CLOSURE_LOOKUP_STEMS.iter().collect::<std::path::PathBuf>();
+        let parent_module = format!("crate::{}", CLOSURE_LOOKUP_STEMS.join("::"));
+        let mut root = String::new();
+        for stem in CLOSURE_LOOKUP_STEMS {
+            writeln!(root, "pub mod {stem} {{").unwrap();
+        }
+        for module in 0..modules {
+            writeln!(root, "pub mod shared_prefix_module_{module:04};").unwrap();
+            let mut source = String::new();
+            for item in 0..items {
+                writeln!(
+                    source,
+                    "pub struct SameNameWithLongSharedPrefixItem{item:04};"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "pub struct UniqueNameWithLongSharedPrefixModule{module:04}Item{item:04};"
+                )
+                .unwrap();
+            }
+            // Import toward increasing module numbers, so a forward pass cannot
+            // finish the chain. The last module closes each 12-hop glob cycle.
+            let next = module - module % 12 + (module + 1) % 12;
+            writeln!(
+                source,
+                "pub use {parent_module}::shared_prefix_module_{next:04}::*;"
+            )
+            .unwrap();
+            writeln!(source, "pub use {parent_module}::shared_prefix_module_{next:04}::UniqueNameWithLongSharedPrefixModule{next:04}Item0000 as ReexportAlias{module:04};").unwrap();
+            let path = std::path::Path::new("src")
+                .join(&parent_path)
+                .join(format!("shared_prefix_module_{module:04}.rs"));
+            project = project.file(path, source);
+        }
+        for _ in CLOSURE_LOOKUP_STEMS {
+            root.push_str("}\n");
+        }
+        project.file("src/lib.rs", root).build()
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "operator measurement of writer output, not an answer path"
+    )]
+    fn closure_lookup_row_counts(workspace: &WorkspaceAnalyzer) -> Vec<(String, i64)> {
+        let conn = workspace.store().unwrap().read_conn().unwrap();
+        [
+            "rust_resolution_unit_summary_effective_bindings",
+            "rust_resolution_unit_summary_import_route_provenance",
+            "rust_resolution_unit_summary_binding_completeness",
+        ]
+        .into_iter()
+        .map(|table| {
+            let count = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table.to_owned(), count)
+        })
+        .collect()
+    }
+
+    #[test]
+    #[ignore = "operator timing: synthetic deep modules and 12-hop glob cycles"]
+    fn measure_closure_lookup_deep_cycles() {
+        let fixture = closure_lookup_deep_fixture(192, 16);
+        let started = std::time::Instant::now();
+        let workspace = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        eprintln!("CLOSURE_LOOKUP_BUILD {:?}", started.elapsed());
+        let counts = closure_lookup_row_counts(&workspace);
+        eprintln!("CLOSURE_LOOKUP_COUNTS {counts:?}");
+        assert!(counts[0].1 > 6000);
+    }
+
+    #[test]
+    fn closure_lookup_chains_preserve_summary_rows() {
+        let fixture = closure_lookup_deep_fixture(24, 3);
+        let workspace = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let before = single_input_summary_rows(&workspace);
+        let source = fixture.file(
+            std::path::Path::new("src")
+                .join(CLOSURE_LOOKUP_STEMS.iter().collect::<std::path::PathBuf>())
+                .join("shared_prefix_module_0000.rs"),
+        );
+        let mut text = std::fs::read_to_string(source.abs_path()).unwrap();
+        text.push_str("\npub struct AddedAfterInitialClosure;\n");
+        std::fs::write(source.abs_path(), text).unwrap();
+        let updated = workspace.update(&BTreeSet::from([source]));
+        let fresh = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let after = single_input_summary_rows(&updated);
+        assert_ne!(before, after);
+        let fresh_rows = single_input_summary_rows(&fresh);
+        for (table, rows) in &after {
+            assert_eq!(rows, &fresh_rows[table], "{table}");
+        }
+        assert_eq!(after.len(), fresh_rows.len());
+    }
+
+    #[test]
+    #[ignore = "operator timing: synthetic 200-module, 3200-item Rust crate"]
+    fn measure_closure_lookup_synthetic_crate() {
+        let fixture = closure_lookup_fixture(200, 16);
+        let started = std::time::Instant::now();
+        let workspace = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        eprintln!("CLOSURE_LOOKUP_BUILD {:?}", started.elapsed());
+        let counts = closure_lookup_row_counts(&workspace);
+        eprintln!("CLOSURE_LOOKUP_COUNTS {counts:?}");
+        assert!(counts[0].1 > 3200);
+    }
+
+    #[test]
+    #[hardwon(
+        "#10979: a missing required Rust root recipe was accepted by the outgoing-call context"
+    )]
+    fn missing_root_recipe_makes_call_relations_incomplete() {
+        let fixture = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='root_recipe'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod hidden;\npub use hidden::target as exported;\npub fn call() { exported(); }\n",
+            )
+            .file("src/hidden.rs", "pub fn target() {}\n")
+            .build();
+        use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+            CallRelationDiagnosticCode, CallRelationService,
+        };
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryScope};
+        let lookup = |workspace: &WorkspaceAnalyzer| {
+            let analyzer = workspace.analyzer();
+            let caller = analyzer
+                .declarations(&fixture.file("src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "call")
+                .unwrap();
+            let scope = AnalyzerQueryScope::new(analyzer);
+            CallRelationService::outgoing(analyzer, scope.token(), &caller, 16)
+        };
+        let control = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let expected = lookup(&control);
+        assert!(!expected.cancelled && !expected.truncated, "{expected:#?}");
+        assert!(expected.diagnostics.is_empty(), "{expected:#?}");
+        assert!(
+            expected.sites.iter().any(
+                |site| site.callee.source().rel_path() == std::path::Path::new("src/hidden.rs")
+            ),
+            "{expected:#?}"
+        );
+        drop(control);
+
+        let damaged = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let changed = damaged.store().unwrap().conn.execute(|conn| {
+            conn.execute_batch("DROP TRIGGER resolution_identity_recipe_update_guard").unwrap();
+            conn.execute(
+                "UPDATE resolution_identities SET semantic_language=NULL, namespace=NULL, spelling=NULL
+                 WHERE spelling='call'", [],
+            ).unwrap()
+        });
+        assert!(
+            changed > 0,
+            "the fixture must lose a producer-registered route recipe"
+        );
+        let result = lookup(&damaged);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed),
+            "a missing required recipe must report analysis failure: {result:#?}"
+        );
+    }
+
     #[test]
     #[hardwon(
         "#13047: a carried detached unit recorded ancestor Cargo config inputs, so a scoped update re-keyed it"
     )]
     fn detached_configuration_inputs_match_fresh_after_scoped_update() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn rows(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, (i64, String, String)> {
             let conn = workspace.store().unwrap().read_conn().unwrap();
             conn.prepare("SELECT t.crate_name,s.summary_id,hex(s.lookup_digest),
@@ -192,6 +435,10 @@ mod tests {
 
     #[test]
     #[hardwon("#10381: any Cargo.toml edit invalidated every Rust unit summary")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_feature_projection_tracks_consumers_and_config_candidates() {
         fn fixture(
             sibling: &str,
@@ -234,6 +481,10 @@ mod tests {
                 workspace.test_pending_update_paths()
             );
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn projections(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, (Vec<u8>, bool)> {
             let conn = workspace.store().unwrap().read_conn().unwrap();
             conn.prepare("SELECT t.crate_name,p.projection_digest,p.complete FROM rust_feature_projections p
@@ -242,6 +493,10 @@ mod tests {
                 .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?))))
                 .unwrap().collect::<rusqlite::Result<_>>().unwrap()
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn unit_rows(workspace: &WorkspaceAnalyzer) -> Vec<(String, String)> {
             let conn = workspace.store().unwrap().read_conn().unwrap();
             conn.prepare("SELECT t.crate_name,json_array(hex(s.lookup_digest),hex(s.output_digest),s.complete,
@@ -516,6 +771,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn manifest_feature_toggle_local_import_matches_cold() {
         let manifest = "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\ndep={path=\"dep\"}\n";
         let fixture = InlineTestProject::new()
@@ -612,6 +871,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn previous_summary_version_rederives_summary_representations() {
         let fixture = InlineTestProject::new()
             .file(
@@ -675,6 +938,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn persisted_input_files_are_the_declared_list_that_placements_reference() {
         let fixture = InlineTestProject::new()
             .file(
@@ -724,6 +991,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn previous_summary_version_rederives_binding_authority() {
         let fixture = InlineTestProject::new()
             .file(
@@ -790,6 +1061,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cfg_alternative_declarations_keep_every_binding_row() {
         // Two statically active cfg alternatives of one module each declare `g1`, and
         // one glob import reaches both. Same-module duplicates collapse in the
@@ -865,6 +1140,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
         "#11173: a binding-authority mirror attached a declaration to an identical file in another module"
     )]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn binding_authority_mirror_places_identical_files_in_their_own_module() {
         // `a.rs` and `b.rs` are byte-identical, so they share one blob, yet they are
         // distinct members placed in distinct modules. A declaration is attached to
@@ -925,6 +1204,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
         "#11173: identical macro_export twins in two modules must be analyzed and named deterministically"
     )]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn binding_authority_mirror_names_identical_macro_export_twins_by_lowest_path() {
         // A `#[macro_export]` macro is re-homed to the crate root, so its topology
         // row names no declaring module. `a.rs` and `b.rs` are byte-identical and
@@ -975,6 +1258,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn previous_summary_version_rederives_inherent_impls() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers = [\"dep\", \"app\"]\nresolver = \"2\"\n")
@@ -1067,6 +1354,10 @@ CREATE TEMP VIEW IF NOT EXISTS test_export_endpoints AS SELECT e.*, a.blob_id AS
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cfg_alternative_impl_subjects_of_one_name_stay_distinct_or_unresolved() {
         // Two statically active cfg alternatives each declare `S` and implement it in
         // their own module, and the crate root re-exports both by glob. Inside the
@@ -1327,6 +1618,10 @@ replay! { mod replayed; }
 
     // Shared with the Rust derivation migration's single-input differential.
     // Store-local row IDs are addresses, not cache identity.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn single_input_summary_rows(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, Vec<String>> {
         let conn = workspace.store().unwrap().read_conn().unwrap();
         let tables = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND (name LIKE 'resolution_unit_summary_%' OR name LIKE 'rust_resolution_unit_summary_%' OR name='resolution_unit_summaries') AND name NOT LIKE '%_versions' ORDER BY name")
@@ -1341,7 +1636,7 @@ replay! { mod replayed; }
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
-            let expressions = columns.iter().filter(|column| column.as_str() != "summary_id")
+            let expressions = columns.iter().filter(|column| !matches!(column.as_str(), "summary_id" | "root_route_id"))
                 .map(|column| match column.as_str() {
                     "blob_id" => "(SELECT blob_oid FROM blobs WHERE id=child.blob_id)".to_owned(),
                     "consumed_summary_id" => "(SELECT hex(summary_digest) FROM resolution_unit_summaries WHERE summary_id=child.consumed_summary_id)".to_owned(),
@@ -1367,6 +1662,10 @@ replay! { mod replayed; }
         result
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn single_input_summary_keys(
         workspace: &WorkspaceAnalyzer,
     ) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
@@ -1704,6 +2003,10 @@ replay! { mod replayed; }
             .file("src/lib.rs", "pub struct Item; fn private() -> u32 { 1 }\n")
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn live_summaries(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, (i64, Vec<u8>)> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -1760,6 +2063,10 @@ replay! { mod replayed; }
 
     type SummaryRootRoute = (i64, String, i64, i64, Vec<u8>, String, String);
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn summary_root_routes(
         workspace: &WorkspaceAnalyzer,
         summary_id: i64,
@@ -1792,6 +2099,10 @@ replay! { mod replayed; }
 
     #[test]
     #[hardwon("ae10707fd23b: Rust topology ids and multi-namespace declarations were misread")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn summary_detail_rows_crosswalk_the_selected_topology() {
         let names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
         let members = names
@@ -2015,6 +2326,10 @@ replay! { mod replayed; }
     #[hardwon(
         "#4920: one enum reexported through two dependencies failed Rust summary reconciliation"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn reexport_routes_to_one_declaration_keep_the_smallest_dependency_ordinal() {
         // Swap the module paths as well as source order so EXPORTS_SQL visits
         // the direct and indirect dependency routes in both orders.
@@ -2091,6 +2406,10 @@ replay! { mod replayed; }
 
     #[test]
     #[hardwon("#5133: a public module alias can leave a forwarded module's physical subtree")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn vector_forwarded_module_alias_outside_subtree_publishes_first_hop() {
         let fixture = vector_reexport_fixture();
         fixture
@@ -2153,6 +2472,10 @@ replay! { mod replayed; }
 
     #[test]
     #[hardwon("#5133: a transitive reexport disappeared from the shared Rust summary")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn vector_transitive_reexport_publishes_the_direct_dependency_and_complete_header() {
         let fixture = vector_reexport_fixture();
         let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -2238,6 +2561,10 @@ replay! { mod replayed; }
     type ConsumedRow = (String, Vec<&'static str>, bool);
 
     /// Each live library summary's recorded consumed units, by crate name.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn consumed_sets(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, Vec<ConsumedRow>> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -2351,6 +2678,10 @@ replay! { mod replayed; }
 
     #[test]
     #[hardwon("#11173: foreign gap binding evidence retained another unit's blob and site")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn foreign_gap_bindings_use_name_forms_and_keep_conflicts() {
         for (case, mid, top, kernel) in [
             (
@@ -2538,6 +2869,7 @@ shards:
             )
             .unwrap();
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: registration.evidence,
@@ -2581,6 +2913,10 @@ shards:
     #[test]
     #[hardwon(
         "#11173: foreign invocation gaps retained local coordinates and missed live module membership"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn foreign_macro_invocation_reads_track_module_members_independently_of_output() {
         use brokk_bifrost_analysis::analyzer::i_analyzer::{
@@ -3017,6 +3353,10 @@ INSERT INTO rust_resolution_unit_summary_placement_attributes(summary_id,contain
 
     /// The crate names `top` published a re-export of `name` through, with the
     /// extern name of the first-hop dependency.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn first_hops(workspace: &WorkspaceAnalyzer, name: &str) -> Vec<(String, String)> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -3224,6 +3564,10 @@ pub fn run() -> u32 { 1 }
     #[hardwon(
         "#11173: removing a trait impl in a crate reached only through another crate dropped the dependent's trait endpoints incrementally"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn changing_the_declaring_unit_of_a_trait_impl_derives_the_dependent_summary_again() {
         // `top` implements its own trait for `mid::Item`, which `mid` re-exports by glob
         // from `kernel`, the declaring unit. `kernel` is not a direct dependency of `top`,
@@ -3348,6 +3692,10 @@ pub fn run() -> u32 { 1 }
     #[hardwon(
         "#11173: a transitive change that left the direct dependency's output equal left the consumer's summary reused"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_moved_transitive_output_derives_the_consumer_again_and_cuts_off_on_equal_output() {
         let fixture = vector_reexport_fixture();
         let mut workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -3387,6 +3735,10 @@ pub fn run() -> u32 { 1 }
 
     #[test]
     #[hardwon("#11904: rejected duplicate placements are not proven external endpoints")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_half_without_a_single_declaration_is_written_as_an_unresolved_endpoint() {
         // Three impls whose halves cannot name one declaration, in three shapes: `Twin` is
         // declared by two byte-identical files that both mount as module `x` (an invalid
@@ -3566,6 +3918,10 @@ pub fn run() -> u32 { 1 }
 
     #[test]
     #[hardwon("#11904: an impl half behind an open route was certified unbound_external")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn unresolved_impl_halves_require_a_closed_or_sysroot_route() {
         let cases = [
             (
@@ -3647,6 +4003,10 @@ pub fn run() -> u32 { 1 }
 
     /// The recorded consumed set and the first-hop ordinals of a consumer that
     /// reaches one declaration through two direct dependencies, rendered.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn two_route_consumed_set() -> String {
         let fixture = InlineTestProject::new()
             .file(
@@ -3741,6 +4101,10 @@ pub fn run() -> u32 { 1 }
 
     #[test]
     #[hardwon("#5133: local imports polluted module aliases and suppressed module glob exports")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn module_native_reexport_selector_5133_keeps_local_bindings_and_restricted_exports() {
         let fixture = InlineTestProject::new()
             .file(
@@ -3878,6 +4242,10 @@ pub fn enclosing() {
 
     // Keep cross-store comparisons independent of database-local ids. The
     // declaration path and source site identify the same source in either store.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn vector_surface(workspace: &WorkspaceAnalyzer) -> Vec<(String, String, String, i64)> {
         let summary_id = live_summaries(workspace)["vector"].0;
         let store = workspace.store().unwrap();
@@ -3900,6 +4268,10 @@ pub fn enclosing() {
         .unwrap()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn vector_topologies(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, i64> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -3918,6 +4290,10 @@ pub fn enclosing() {
         .collect()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn vector_lib_surface_digest(workspace: &WorkspaceAnalyzer) -> Vec<u8> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -3933,6 +4309,10 @@ pub fn enclosing() {
         .unwrap()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn assert_vector_event_export(
         workspace: &WorkspaceAnalyzer,
         unit: &str,
@@ -4033,6 +4413,10 @@ pub fn enclosing() {
             .build()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn assert_vector_body_then_manifest_churn(
         fixture: &crate::inline_project::BuiltInlineTestProject,
         declaration_path: &str,
@@ -4185,6 +4569,10 @@ pub fn enclosing() {
         );
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn assert_vector_consumed_live_facade(workspace: &WorkspaceAnalyzer) {
         let summaries = live_summaries(workspace);
         let store = workspace.store().unwrap();
@@ -4237,6 +4625,10 @@ pub fn enclosing() {
 
     #[test]
     #[hardwon("#5133: withdrawing a forwarded module must republish its named downstream alias")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn vector_transitive_reexport_edits_match_fresh_store_and_cut_off_equal_output() {
         let fixture = vector_reexport_fixture();
         let mut workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -4401,6 +4793,10 @@ pub fn enclosing() {
     #[hardwon(
         "#5133: restricted tuple constructors escaped through enclosing and cross-crate reexports"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn restricted_tuple_constructor_is_not_exported_but_public_constructor_is() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers = [\"core\", \"facade\", \"consumer\"]\nresolver = \"2\"\n")
@@ -4521,6 +4917,10 @@ pub fn enclosing() {
 
     #[test]
     #[hardwon("#5133: a tuple field attribute before pub hid a legal public constructor")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn attributed_public_tuple_fields_keep_the_constructor_public() {
         let fixture = InlineTestProject::with_language(brokk_bifrost_core::analyzer::model::Language::Rust)
             .file(
@@ -4605,6 +5005,10 @@ pub fn enclosing() {
 
     #[test]
     #[hardwon("#5133: an earlier narrow glob route hid the same declaration's later public route")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn restricted_tuple_constructor_wider_glob_route_reaches_named_downstream_alias() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers = [\"core\", \"facade\", \"consumer\"]\nresolver = \"2\"\n")
@@ -4706,6 +5110,10 @@ pub fn enclosing() {
 
     #[test]
     #[hardwon("#5133: a private glob candidate caused a false ambiguity with a public item")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_glob_export_ignores_inaccessible_private_candidate() {
         let fixture = InlineTestProject::new()
             .file(
@@ -4759,6 +5167,10 @@ pub fn enclosing() {
     }
 
     /// Live summary ids of every Rust target, keyed by crate name and target kind.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn live_target_summaries(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, i64> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -4790,6 +5202,10 @@ pub fn enclosing() {
     #[test]
     #[hardwon(
         "#11822: editing one binary's main.rs re-derived every Rust unit through a content-keyed configuration read"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn a_target_root_body_edit_and_presence_leave_unrelated_units_unchanged() {
         let fixture = InlineTestProject::new()
@@ -5059,6 +5475,10 @@ pub fn enclosing() {
     type BindingProjection = Vec<(String, String, String, Vec<u8>, String)>;
     type ProvenanceProjection = Vec<(i64, i64, String, Vec<u8>, String)>;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn summary_binding_projection(
         workspace: &WorkspaceAnalyzer,
         summary_id: i64,
@@ -5086,6 +5506,10 @@ pub fn enclosing() {
         .unwrap()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn summary_provenance_projection(
         workspace: &WorkspaceAnalyzer,
         summary_id: i64,
@@ -5116,6 +5540,10 @@ pub fn enclosing() {
     #[test]
     #[hardwon(
         "#5780: canonical endpoints discarded distinct facade dependencies and their output digest"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn canonical_binding_provenance_retains_facades_and_invalidates_consumers() {
         let fixture = InlineTestProject::new()
@@ -5326,6 +5754,10 @@ pub fn enclosing() {
     #[hardwon(
         "d04c9b381fde: a dev-dependency cycle ordered a consumer before its provider and left its trait endpoint unnamed"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn dev_dependency_cycle_does_not_leave_a_consumers_trait_endpoint_open() {
         // `cycle_a` depends on `cycle_b` and `cycle_b` dev-depends on `cycle_a`,
         // as Vector's vector-config and vector-config-macros do. Every chain
@@ -5449,6 +5881,10 @@ pub fn enclosing() {
     /// retry keeps the summary correct: after `cycle_a`'s output moves, the
     /// incremental store holds what a fresh store derives.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_closure_binding_read_across_a_dev_dependency_converges_to_the_fresh_store() {
         let fixture = InlineTestProject::new()
             .file(
@@ -5861,6 +6297,10 @@ pub fn enclosing() {
 
     #[test]
     #[ignore = "operator measurement: needs BIFROST_RUST_UNIT_SUMMARY_CORPUS, a writable Rust repository copy"]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn measure_rust_unit_summary_reconcile_on_a_corpus() {
         use std::sync::Arc;
         use std::time::Instant;
@@ -5984,6 +6424,10 @@ pub fn enclosing() {
 
     #[test]
     #[hardwon("#5898: scoped ambiguity must not hide a mixed unresolved-glob inventory")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn mixed_ambiguity_and_glob_gap_declines_incremental_import_batch() {
         use crate::analyzer::{RustAnalyzer, resolve_analyzer};
         use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
@@ -6096,6 +6540,10 @@ mod included_impl_subject_placement {
     #[test]
     #[hardwon(
         "#7226: rust_crate_unresolved_trait_impls keyed no placing module, so two module placements of one included impl kept one row"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn included_impl_subjects_preserve_module_placement() {
         let project = InlineTestProject::new()

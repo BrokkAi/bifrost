@@ -911,13 +911,13 @@ fn go_native_point_request_reuses_operation_and_path_context_per_file() {
         first_offset,
         "First",
         ReceiverAnalysisBudget {
-            max_scope_nodes: 0,
+            max_resolution_rounds: 0,
             ..ReceiverAnalysisBudget::default()
         },
     );
     assert!(
         matches!(&limited, BoundedResolution::Exceeded { .. }),
-        "the first point honors its own zero scope budget: {limited:?}"
+        "the first point honors its own zero round budget: {limited:?}"
     );
     let BoundedResolution::Complete { value: first, .. } = resolve_at(
         &mut request,
@@ -1004,6 +1004,78 @@ fn go_native_point_request_reuses_operation_and_path_context_per_file() {
 }
 
 #[test]
+#[hardwon("#12820: a refused memo fill discarded the live request's file context")]
+fn a_refused_go_file_context_fill_keeps_request_state_and_refuses_each_consumer() {
+    use brokk_bifrost_analysis::analyzer::usages::common::{
+        QueryMemoOwner, with_memo_fill_refusal_for_test,
+    };
+    let source = "package consumer\n\nimport p \"example.test/native/provider\"\n\nvar First p.Item\nvar Third = First\n";
+    let (fixture, analyzer) = fixture(source);
+    let file = fixture.file(CALLER);
+    let cancellation = CancellationToken::default();
+    let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open(
+        &analyzer,
+        analyzer.inner.semantic_model_overlay(),
+        &cancellation,
+    )
+    .unwrap() else {
+        panic!("selected Go point request must open")
+    };
+    let offset = source.rfind("First").expect("selected value");
+    let resolve = |request: &mut GoNativePointRequest<'_>| {
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: "First".into(),
+            range: Range {
+                start_byte: offset,
+                end_byte: offset + 5,
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: offset,
+            focus_end_byte: offset + 5,
+        };
+        brokk_bifrost_analysis::analyzer::capture_query_reads(&analyzer.inner, || {
+            request.resolve_type(BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: Some(&cancellation),
+            })
+        })
+    };
+    let (first, first_reads) =
+        with_memo_fill_refusal_for_test(QueryMemoOwner::GoFileContext, || resolve(&mut request));
+    assert!(first_reads.reuse_refused());
+    assert!(first_reads.publishable_keys().is_none());
+    let BoundedResolution::Complete { value: first, .. } = first else {
+        panic!("a refusal does not change completion: {first:?}");
+    };
+    assert_eq!(first.types.len(), 1, "{first:?}");
+    assert_eq!(
+        request.files.len(),
+        1,
+        "the refused fill keeps the context this request still uses"
+    );
+    assert_eq!(request.prepared_file_contexts_for_test(), 1);
+    let (repeat, later_reads) = resolve(&mut request);
+    assert!(
+        later_reads.reuse_refused(),
+        "a hit on refused state must refuse its current consumer"
+    );
+    assert!(later_reads.publishable_keys().is_none());
+    let BoundedResolution::Complete { value: repeat, .. } = repeat else {
+        panic!("a repeated point stays complete: {repeat:?}");
+    };
+    assert_eq!(repeat.types.len(), first.types.len());
+    assert_eq!(repeat.types[0].fqn, first.types[0].fqn);
+    assert_eq!(request.files.len(), 1);
+}
+
+#[test]
 #[hardwon("#3790: live Go discovery failures must surface as setup failures")]
 fn go_native_point_binds_standard_package_and_external_member_identity() {
     // The standard library comes from the host Go toolchain. Without one the
@@ -1029,6 +1101,8 @@ fn go_native_point_binds_standard_package_and_external_member_identity() {
     let workspace = fixture.workspace_analyzer(config.clone());
     let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
     let activation = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: Vec::new(),
@@ -1477,6 +1551,8 @@ func useUnknown[T interface{ Release() error }](receiver T) {
     let workspace = fixture.workspace_analyzer(config.clone());
     let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
     let activation = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: Vec::new(),
@@ -2828,6 +2904,8 @@ func run(opts *Options) { c, err := opts.Client(); _, _ = c, err }
     let workspace = fixture.workspace_analyzer(config.clone());
     let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
     let activation = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: Vec::new(),
@@ -3895,7 +3973,6 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
         method_value_start,
         ReceiverAnalysisBudget {
             max_summary_expansions: 512,
-            max_scope_nodes: 16_384,
             ..ReceiverAnalysisBudget::default()
         },
     );
@@ -3927,7 +4004,6 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
         invocation_start,
         ReceiverAnalysisBudget {
             max_summary_expansions: 512,
-            max_scope_nodes: 16_384,
             ..ReceiverAnalysisBudget::default()
         },
     );
@@ -4296,6 +4372,10 @@ func use(value Result, imported vocabulary.Item) {
 
 #[test]
 #[hardwon("#11688: a retained Go type endpoint lost the refused import's incomplete binding")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn go_native_refused_import_keeps_type_and_call_obligations_on_repeated_points() {
     use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 
@@ -4594,6 +4674,10 @@ fn go_native_point_reports_superseded_interval_context() {
     "#6524: build-excluded methods entered deferred lookup and made an interface binding incomplete"
 )]
 #[hardwon("#6524: a build-excluded method kept promoted-field lookup incomplete")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn go_native_point_excludes_nonparticipating_deferred_methods() {
     if !go_toolchain_available() {
         return;
@@ -4659,6 +4743,7 @@ func shutdown(inner pluginClient) { inner.Shutdown() }
         let workspace = fixture.workspace_analyzer(config.clone());
         let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
         let activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: Vec::new(),
@@ -4710,7 +4795,7 @@ func shutdown(inner pluginClient) { inner.Shutdown() }
                     .operation
                     .ready()
                     .typed_source()
-                    .deferred_member_participation(&[definition], &cancellation)
+                    .deferred_member_participation(&[definition], None, &cancellation)
                     .unwrap(),
                 Some(vec![false]),
                 "an excluded method in another domain must not participate"
@@ -4943,6 +5028,7 @@ func f(p string) {
                 &catalog,
                 None,
                 &SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: vec![],
                     bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                     evidence: vec![SemanticModelActivationEvidence {
@@ -4953,7 +5039,8 @@ func f(p string) {
                         module: None,
                         toolchain: None,
                         target: None,
-                        artifact_sha256: None,
+                        production_input_digest: None,
+                        verified_raw_artifacts: Vec::new(),
                     }],
                     controls: vec![],
                     limits: SemanticModelRuntimeLimits::default(),

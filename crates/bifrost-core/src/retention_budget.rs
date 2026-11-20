@@ -477,6 +477,10 @@ impl RetentionBudget {
                 .build(),
         }))
     }
+    /// Whether both handles are the same owner (one `Arc`), not merely equal capacity.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn capacity_bytes(&self) -> u64 {
         self.0.capacity
     }
@@ -782,6 +786,18 @@ impl AllocationCharge {
             drop_hooks: Mutex::new(Vec::new()),
         }
     }
+    /// Charge a required allocation together with this charge's own backing.
+    /// The control backing is a separate allocation and must not disappear from
+    /// accounting when a small provenance payload is the only added storage.
+    pub fn acquire_required_with_control(budget: &RetentionBudget, bytes: usize) -> Self {
+        Self::acquire_required(
+            budget,
+            bytes.saturating_add(crate::allocation_size::allocation_size(
+                std::mem::size_of::<SharedBacking>() + 2 * std::mem::size_of::<usize>(),
+            )),
+        )
+    }
+
     /// Control allocation only; the owning value visits its payload separately.
     pub fn retained_control_allocation(&self) -> Option<(usize, usize)> {
         self.lease
@@ -1246,6 +1262,8 @@ pub enum RefusalCause {
     EntryCap,
     Oversized,
     WeightOverflow,
+    /// The region's owner retired it; nothing is admitted after retirement.
+    Closed,
 }
 
 /// A complete value for one request, with no cache or live registration.

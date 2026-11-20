@@ -143,7 +143,7 @@ mod jvm_registry_tests {
                 Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
             ),
             (
-                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ResolutionRounds),
                 0,
                 None,
                 Some(EdgeIncompleteReason::ForwardResolutionIncomplete),

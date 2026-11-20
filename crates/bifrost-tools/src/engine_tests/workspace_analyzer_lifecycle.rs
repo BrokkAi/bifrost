@@ -10,6 +10,12 @@ mod tests {
     struct LiveProject(TestProject);
 
     impl Project for LiveProject {
+        // A hand-written project names its effective ignore rules; this one
+        // has none of its own, so it states the delegate's.
+        fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+            self.0.ignore_rules_digest()
+        }
+
         fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
             self.analyzable_files_from(&self.all_files()?, language)
         }
@@ -170,6 +176,70 @@ mod tests {
         assert!(!aliased.1);
         assert_ne!(aliased.0, complete.0);
         assert_eq!(aliased, cold());
+    }
+
+    /// The delegate's update must run when the omission that withdrew its
+    /// listing proof disappears, even though no file it owns changed.
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13641: a hiding omission that disappeared left the workspace listing proof withdrawn"
+    )]
+    fn a_disappearing_omission_restores_the_workspace_listing_proof() {
+        use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
+        let temp = tempfile::tempdir().unwrap();
+        let root = {
+            std::fs::create_dir(temp.path().join("workspace")).unwrap();
+            temp.path().join("workspace").canonicalize().unwrap()
+        };
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("A.java"), "class A {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project =
+            Arc::new(FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap());
+        let build = |project: Arc<FilesystemProject>| {
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default()).unwrap()
+        };
+        let holds_proof = |analyzer: &WorkspaceAnalyzer| {
+            analyzer
+                .analyzer()
+                .workspace_fact_indexes()
+                .iter()
+                .any(|index| index.holds_workspace_listing_proof())
+        };
+        let relist = |name: &str| {
+            if !project.update_cached_listing_for_path(std::path::Path::new(name)) {
+                project.invalidate_cached_file_listing();
+            }
+        };
+        let cold = || {
+            let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+            holds_proof(&build(Arc::new(
+                FilesystemProject::with_cached_listing(&root, cache).unwrap(),
+            )))
+        };
+
+        let analyzer = build(project.clone());
+        assert!(holds_proof(&analyzer));
+        std::os::unix::fs::symlink(&outside, root.join("callers")).unwrap();
+        relist("callers");
+        let hidden = analyzer.update(&BTreeSet::from([ProjectFile::new(root.clone(), "callers")]));
+        assert!(
+            !holds_proof(&hidden),
+            "the hiding omission withdraws the proof"
+        );
+        assert_eq!(holds_proof(&hidden), cold());
+
+        std::fs::remove_file(root.join("callers")).unwrap();
+        relist("callers");
+        let cleared = hidden.update(&BTreeSet::new());
+        assert!(cold());
+        assert_eq!(
+            holds_proof(&cleared),
+            cold(),
+            "the cleared update matches cold"
+        );
     }
 
     /// C++ adopts a file no language owns when an include names it, so an omitted

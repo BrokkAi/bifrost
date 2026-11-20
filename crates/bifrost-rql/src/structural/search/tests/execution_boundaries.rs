@@ -28,7 +28,7 @@ fn public_request_honors_exact_file_budget() {
             let roots = result
                 .diagnostics
                 .iter()
-                .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+                .flat_map(|diagnostic| &semantic_diagnostic(diagnostic).exhausted_roots)
                 .collect::<Vec<_>>();
             assert!(
                 roots.iter().any(|root| root.lane == "query/scanned_files"),
@@ -147,7 +147,7 @@ fn unmaterialized_receiver_family_is_invalid() {
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::InvalidPlan),
+            .any(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::InvalidPlan),
         "{result:?}"
     );
 }
@@ -263,7 +263,7 @@ fn registered_failure_depth_status_obeys_consumer_gate() {
                 .unwrap()
                 .diagnostics
                 .iter()
-                .any(|d| d.code == CodeQueryDiagnosticCode::UnresolvedProtocolReference)
+                .any(|d| d.code() == CodeQueryDiagnosticCode::UnresolvedProtocolReference)
         );
         for enabled in [false, true] {
             for error in [
@@ -312,14 +312,14 @@ fn budget_telemetry_distinguishes_spent_files_from_refused_bytes() {
     let lanes = result
         .diagnostics
         .iter()
-        .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+        .flat_map(|diagnostic| &semantic_diagnostic(diagnostic).exhausted_roots)
         .map(|root| root.lane.as_str())
         .collect::<Vec<_>>();
     assert_eq!(lanes, ["query/scanned_source_bytes"]);
     let root = &result
         .diagnostics
         .iter()
-        .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+        .flat_map(|diagnostic| &semantic_diagnostic(diagnostic).exhausted_roots)
         .next()
         .unwrap();
     assert_eq!(

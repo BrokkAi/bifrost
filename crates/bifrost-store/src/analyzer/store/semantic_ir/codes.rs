@@ -86,6 +86,7 @@ impl RowCode for SemanticGapDischarge {
         Self::ResidualConversion,
         Self::ImplicitDropExecution,
         Self::DataDependency,
+        Self::CreatingRealizationBindsCaptures,
     ];
 
     fn code(self) -> i64 {
@@ -105,7 +106,8 @@ impl RowCode for SemanticGapDischarge {
             | Self::NonRejoiningExceptionalExitAfterInertDrops
             | Self::ResidualConversion
             | Self::ImplicitDropExecution
-            | Self::DataDependency => self as i64,
+            | Self::DataDependency
+            | Self::CreatingRealizationBindsCaptures => self as i64,
         }
     }
 
@@ -296,7 +298,7 @@ payload_tags! {
     GuardPredicateTag for GuardPredicate {
         ConstantBoolean, NullComparison, ConstantEquality, OrderedIntegerComparison,
         OrderedFloatComparison, NanComparison, InstanceOf, ExactClass, HasMember, Truthy,
-        Opaque,
+        Opaque, ValueEquality, ValueOrdering,
     }
     PlaceTag for SemanticPlace { LocalBinding, MemoryLocation }
     DropBehaviorTag for DropBehavior { Trivial, Destructor }
@@ -434,7 +436,7 @@ mod tests {
         assert_codes::<CallableReferenceKindTag>(None);
         assert_codes::<SynchronizationPayloadTag>(Some(1));
         assert_codes::<SynchronizationPayloadCopyTag>(Some(2));
-        assert_codes::<GuardPredicateTag>(Some(10));
+        assert_codes::<GuardPredicateTag>(Some(12));
         assert_codes::<PlaceTag>(Some(1));
         assert_codes::<DropBehaviorTag>(Some(1));
         assert_codes::<ScopeEndAtTag>(Some(1));
@@ -519,6 +521,16 @@ mod tests {
             },
             GuardPredicate::Opaque {
                 digest: crate::analyzer::semantic::GuardConditionDigest::from_syntax_kind("x"),
+            },
+            GuardPredicate::ValueEquality {
+                left: crate::analyzer::semantic::ValueId::new(0),
+                right: crate::analyzer::semantic::ValueId::new(1),
+                negated: false,
+            },
+            GuardPredicate::ValueOrdering {
+                left: crate::analyzer::semantic::ValueId::new(0),
+                right: crate::analyzer::semantic::ValueId::new(1),
+                relation: IntegerComparison::LessThan,
             },
         ];
         assert_eq!(samples.len(), GuardPredicate::LABELS.len());

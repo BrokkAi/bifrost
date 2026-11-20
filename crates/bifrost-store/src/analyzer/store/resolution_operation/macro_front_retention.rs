@@ -292,6 +292,7 @@ pub(super) struct MacroFrontOutput {
     stage: StageSnapshot,
 }
 impl MacroFrontOutput {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn capture(
         operation: &SelectedResolutionOperation<'_, '_>,
         receipt: Box<dyn std::any::Any + Send + Sync>,
@@ -336,6 +337,7 @@ impl MacroFrontOutput {
         Ok(Some(output))
     }
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn state_digest(
         operation: &SelectedResolutionOperation<'_, '_>,
     ) -> Result<[u8; 32]> {

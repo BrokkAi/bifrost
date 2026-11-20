@@ -333,6 +333,8 @@ impl CodeQueryResultValue {
             | Self::ReferenceEdge { .. }
             | Self::StateEvent { .. }
             | Self::BindingInitializerCall { .. }
+            | Self::FieldWrite { .. }
+            | Self::FieldRead { .. }
             | Self::FlowRelation { .. }
             | Self::ControlRelation { .. }
             | Self::BranchRelation { .. }

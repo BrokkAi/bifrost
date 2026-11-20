@@ -53,6 +53,8 @@ pub mod correspondence;
 
 #[doc(hidden)]
 pub mod dependency_support;
+#[doc(hidden)]
+pub mod external_carry;
 
 pub use dependency_support::resolve_dependency_path;
 
@@ -75,6 +77,7 @@ pub mod lexical_definitions;
 #[doc(hidden)]
 pub mod multi_analyzer;
 // Shared bounded native point-resolution machinery used by production language routes.
+pub mod native_hierarchy;
 #[doc(hidden)]
 pub mod native_points;
 pub mod root_presence;
@@ -91,6 +94,7 @@ pub use native_points::probe_native_definition_trace;
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::probe_native_type;
 
+pub mod artifact_digest;
 pub mod packs_document;
 pub mod read_ledger;
 pub mod read_verification;
@@ -231,20 +235,6 @@ pub(crate) use brokk_bifrost_core::complete_value_cache;
 
 #[doc(hidden)]
 pub mod workspace;
-
-/// Retain a lazy external index until one of its discovery inputs changes.
-#[doc(hidden)]
-pub fn updated_external_index<T>(
-    current: &std::sync::Arc<common::QueryCacheCell<T>>,
-    changed_files: &std::collections::BTreeSet<ProjectFile>,
-    is_dependency_input: impl Fn(&ProjectFile) -> bool,
-) -> std::sync::Arc<common::QueryCacheCell<T>> {
-    if changed_files.iter().any(is_dependency_input) {
-        std::sync::Arc::new(common::QueryCacheCell::new())
-    } else {
-        std::sync::Arc::clone(current)
-    }
-}
 
 /// Add a collection's shallow size to the estimates of its retained values.
 #[doc(hidden)]
@@ -415,6 +405,7 @@ pub use i_analyzer::SearchSymbolPatternBatch;
 pub use i_analyzer::WorkspaceFileIndex;
 pub use i_analyzer::WorkspaceFileIndexCell;
 pub use i_analyzer::WorkspaceFileInventoryCell;
+pub use i_analyzer::WorkspaceFileListingCell;
 pub use i_analyzer::enter_product_entry;
 pub use i_analyzer::{OuterRequest, current_outer_request, current_outer_request_or_transient};
 pub use i_analyzer::{
@@ -593,6 +584,7 @@ pub use workspace::EmptyAnalyzer;
 pub use workspace::InstalledDependencyPackActivationOutcome;
 pub use workspace::PythonSemanticModelActivationOutcome;
 pub use workspace::PythonSemanticModelWorkspaceContext;
+pub use workspace::StagedDependencyDiscoveryHandoff;
 pub use workspace::WorkspaceAnalyzer;
 
 pub use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;

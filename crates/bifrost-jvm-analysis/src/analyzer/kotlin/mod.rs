@@ -89,7 +89,7 @@ use brokk_bifrost_core::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 
 use crate::analyzer::jvm::external::JvmExternalDeclarations;
-use crate::analyzer::jvm::external::QueryGapRecorder;
+use crate::analyzer::jvm::external::{LadderMisses, QueryGapRecorder};
 
 use crate::analyzer::jvm::external::jvm_external_qualified_name_exists;
 
@@ -215,6 +215,7 @@ pub struct KotlinAnalyzer {
     /// artifacts. Built lazily because opening jars is expensive and many
     /// workspaces never ask a question that needs it.
     jvm_config: JvmAnalyzerConfig,
+    selection_authority: Arc<crate::analyzer::jvm::catalog_reader::JvmSelectionAuthority>,
     external_index: crate::analyzer::jvm::authority::JvmExternalIndexSlot,
     memo_budget: u64,
     imported_code_units: crate::analyzer::jvm::hierarchy::DerivedMemo<
@@ -267,6 +268,14 @@ impl_forward_query_provider!(KotlinAnalyzer);
 mod hierarchy_tests;
 
 impl KotlinAnalyzer {
+    /// The slot of a new generation: it holds this generation's external index
+    /// as a candidate until the first read there finds its inputs unchanged
+    /// (#12745). Called for every generation, including one in which no file of
+    /// this language changed.
+    fn renew_external_index(&mut self) {
+        self.external_index = self.external_index.updated(self.memo_budget);
+    }
+
     pub(crate) fn read_capability(
         &self,
     ) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
@@ -372,7 +381,16 @@ impl KotlinAnalyzer {
         memo_budget: u64,
         jvm_config: JvmAnalyzerConfig,
     ) -> Self {
+        let selection_authority = Arc::new(
+            crate::analyzer::jvm::catalog_reader::JvmSelectionAuthority {
+                config: jvm_config.clone(),
+                project: inner.shared_project(),
+                digests: inner.analyzer_store().content_digests(),
+                verifications: inner.analyzer_store().toolchain_verifications(),
+            },
+        );
         Self {
+            selection_authority,
             inner,
             jvm_config,
             external_index: crate::analyzer::jvm::authority::JvmExternalIndexSlot::new(memo_budget),
@@ -464,7 +482,7 @@ impl KotlinAnalyzer {
             &self.jvm_config,
             self.inner.analyzer_store(),
         );
-        crate::analyzer::jvm::external::QueryGapRecorder::new(self).all(&index);
+        crate::analyzer::jvm::external::QueryGapRecorder::new(self).whole_index(&index);
         index
     }
 
@@ -521,12 +539,19 @@ impl KotlinAnalyzer {
             // tier still sees.
             scope_owners: Vec::new(),
         };
+        let misses = LadderMisses::default();
         let declares = |candidate: &str| {
-            external
-                .resolve_qualified_name(&recorder, candidate, &package_name)
+            misses
+                .probe(external.resolve_qualified_name(&recorder, candidate, &package_name))
                 .is_some()
         };
-        let type_evidence = match resolve_kotlin_type_name(name, &scope, declares) {
+        let resolution = resolve_kotlin_type_name(name, &scope, declares);
+        external.finish_ladder(
+            &recorder,
+            &misses,
+            matches!(resolution, KotlinTypeName::Resolved(_)),
+        );
+        let type_evidence = match resolution {
             KotlinTypeName::Resolved(fqn) => {
                 brokk_bifrost_analysis::analyzer::languages::ExternalTypeBoundaryEvidence::Indexed(Some(fqn))
             }
@@ -605,16 +630,24 @@ impl KotlinAnalyzer {
             // sees, and it is the same scope the trace's evidence tier uses.
             scope_owners: Vec::new(),
         };
-        let declares = |candidate: &str| {
-            external
-                .resolve_qualified_name(&recorder, candidate, &package_name)
-                .is_some()
-        };
         external.resolve_member_spelling(&recorder, normalized, &package_name, |owner_spelling| {
-            match resolve_kotlin_type_name(owner_spelling, &scope, declares) {
-                KotlinTypeName::Resolved(fqn) => {
-                    external.resolve_qualified_name(&recorder, &fqn, &package_name)
-                }
+            let misses = LadderMisses::default();
+            let declares = |candidate: &str| {
+                misses
+                    .probe(external.resolve_qualified_name(&recorder, candidate, &package_name))
+                    .is_some()
+            };
+            let resolution = resolve_kotlin_type_name(owner_spelling, &scope, declares);
+            external.finish_ladder(
+                &recorder,
+                &misses,
+                matches!(resolution, KotlinTypeName::Resolved(_)),
+            );
+            match resolution {
+                KotlinTypeName::Resolved(fqn) => external.or_record_miss(
+                    &recorder,
+                    external.resolve_qualified_name(&recorder, &fqn, &package_name),
+                ),
                 KotlinTypeName::Ambiguous | KotlinTypeName::Unresolved => None,
             }
         })
@@ -736,7 +769,7 @@ impl KotlinSource for KotlinAnalyzer {
 
     fn retained_external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
         self.external_index.retained(self).is_some_and(|external| {
-            jvm_external_qualified_name_exists(external, fqn, access_package)
+            jvm_external_qualified_name_exists(&external, fqn, access_package)
         })
     }
 }
@@ -822,6 +855,15 @@ impl CodeUnitIndex for KotlinAnalyzer {
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
+    }
+
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
     }
 
     delegate_inner_methods! {
@@ -1023,7 +1065,7 @@ impl IAnalyzer for KotlinAnalyzer {
         &self,
     ) -> Vec<&dyn brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority>
     {
-        vec![self]
+        vec![self.selection_authority.as_ref()]
     }
 
     fn request_row_reader_source(
@@ -1035,13 +1077,8 @@ impl IAnalyzer for KotlinAnalyzer {
         let project = self.inner.shared_project();
         Some(Arc::new(
             crate::analyzer::jvm::catalog_reader::JvmRequestRowReaderSource {
-                authority: Arc::new(
-                    crate::analyzer::jvm::catalog_reader::JvmSelectionAuthority {
-                        config: self.jvm_config.clone(),
-                        project: Arc::clone(&project),
-                        digests: self.inner.analyzer_store().content_digests(),
-                    },
-                ),
+                questions_digest: Default::default(),
+                authority: self.selection_authority.clone(),
                 project,
                 catalog: catalog.clone(),
                 store: Arc::clone(self.inner.analyzer_store()),
@@ -1099,17 +1136,27 @@ impl IAnalyzer for KotlinAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
             // Every import- and package-derived index is rebuilt from the new
             // generation: an edit anywhere can add, remove, or rename a
             // declaration that some other file's import resolves to.
-            let mut updated = Self::from_inner(
-                self.inner.update_with_listing(changed_files, listing),
-                self.memo_budget,
-                self.jvm_config.clone(),
-            );
-            updated.external_index = self.external_index.updated(changed_files, self.memo_budget);
-            updated
+            let mut updated = Self::from_inner(inner, self.memo_budget, self.jvm_config.clone());
+            updated.external_index = self.external_index.updated(self.memo_budget);
+            (updated, effects.no_changes_or_unreported(changed_files))
         })
     }
 
@@ -1359,7 +1406,10 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Kotl
         Box::new(KotlinAnalyzer::update_all_with_progress(self, progress))
     }
 
-    brokk_bifrost_analysis::delegate_generation_membership_updates!(KotlinAnalyzer);
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(
+        KotlinAnalyzer,
+        |next: &mut KotlinAnalyzer| next.renew_external_index()
+    );
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1844,8 +1894,9 @@ impl LanguageSupport for KotlinSupport {
     fn external_inventory_providers(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        models: &brokk_bifrost_analysis::analyzer::semantic_model::ResolvedActiveSemanticModels,
     ) -> Vec<String> {
-        crate::analyzer::jvm::external::kotlin_inventory_providers(analyzer)
+        crate::analyzer::jvm::external::kotlin_inventory_providers(analyzer, models)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2032,6 +2083,25 @@ impl LanguageEdgePass for KotlinEdgePass {
         EdgePassId::Kotlin
     }
 
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<KotlinAnalyzer>(
+            analyzer,
+        )
+        .map_or_else(
+            || Ok(Vec::new()),
+            |kotlin| {
+                kotlin
+                    .tree_sitter_analyzer()
+                    .selected_graph_source_exclusions()
+            },
+        )
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         brokk_bifrost_analysis::analyzer::languages::fqn_edge_sites(ctx, |token| {
             crate::analyzer::usages::kotlin_graph::build_rooted_kotlin_usage_edges(
@@ -2050,42 +2120,9 @@ impl LanguageEdgePass for KotlinEdgePass {
     }
 }
 
-impl brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority
-    for KotlinAnalyzer
-{
-    fn answer(
-        &self,
-        request: &brokk_bifrost_core::analyzer::outer_request::OuterRequest,
-        question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
-        retry: &brokk_bifrost_core::analyzer::external_selection::SelectionRetry,
-        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-    ) -> Result<
-        Arc<brokk_bifrost_core::analyzer::external_selection::VerifiedSelection>,
-        brokk_bifrost_core::analyzer::external_selection::SelectionRefused,
-    > {
-        assert!(
-            self.questions()
-                .iter()
-                .any(|candidate| candidate == question)
-        );
-        let project = self.inner.project();
-        request.external_selection(project, question.digest, || {
-            crate::analyzer::jvm::verified_selection::verify_selection(
-                &self.jvm_config,
-                project,
-                &self.inner.analyzer_store().content_digests(),
-                question,
-                retry,
-                cancellation,
-            )
-        })
-    }
-    fn questions(
-        &self,
-    ) -> Vec<brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion> {
-        brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion::for_jvm(
-            &self.jvm_config,
-        )
+impl crate::analyzer::jvm::hierarchy::JvmDerivedAnalyzer for KotlinAnalyzer {
+    fn request_memos(&self) -> Option<Arc<brokk_bifrost_core::domain_memo::DomainMemoRegistry>> {
+        self.inner.active_query_request_registry()
     }
 }
 

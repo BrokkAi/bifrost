@@ -666,14 +666,14 @@ impl CompiledProtocol {
     /// Resolve one configured uncertainty cause into an executable state
     /// transfer.
     ///
-    /// Ambiguous dispatch represents one uncertain observation and therefore
-    /// includes the current state plus every matching one-event target.
-    /// Unknown or external calls, escape, and incomplete analysis may conceal
-    /// an arbitrary event sequence, so their conservative relation is the
-    /// reflexive transitive closure of matching transitions. The caller
-    /// supplies the finite events that the binding site may actually observe,
-    /// preventing unrelated protocol events from entering that closure. All
-    /// traversals are iterative and bounded by the compiled protocol.
+    /// The caller supplies the events one uncertain observation may have
+    /// fired: alternatives, of which at most one happened. The conservative
+    /// relation is therefore the current state plus every matching one-event
+    /// target, whatever the cause. An observation fires an authored event at
+    /// most once, so a relation that repeated an eligible event would report
+    /// a transition, such as a second `close`, that no execution of the site
+    /// performs. A caller with several uncertain observations resolves them
+    /// one at a time, in the order they execute.
     pub fn resolve_uncertainty(
         &self,
         cause: ProtocolUncertaintyCause,
@@ -708,55 +708,37 @@ impl CompiledProtocol {
                 for event in eligible_events {
                     eligible[event.index()] = true;
                 }
-                let transitive = cause != ProtocolUncertaintyCause::AmbiguousDispatch;
                 Some(ProtocolUncertaintyResolution::StateSet(
-                    self.conservative_uncertainty_targets(
-                        state,
-                        cardinality,
-                        &eligible,
-                        transitive,
-                    ),
+                    self.one_event_uncertainty_targets(state, cardinality, &eligible),
                 ))
             }
         }
     }
 
-    fn conservative_uncertainty_targets(
+    /// The current state plus the target of every single eligible event.
+    /// `eligible_events` is indexed by event.
+    fn one_event_uncertainty_targets(
         &self,
         state: ProtocolStateId,
         cardinality: ProtocolObjectCardinality,
         eligible_events: &[bool],
-        transitive: bool,
     ) -> ProtocolUncertaintyStateSet {
         let mut reached = vec![false; self.state_keys.len()];
         let mut error_witnesses = Vec::new();
         reached[state.index()] = true;
-        let mut stack = vec![state];
-        while let Some(source) = stack.pop() {
-            for transition in self.outgoing_transitions(source) {
-                if !eligible_events[transition.on.index()]
-                    || !transition.guard.applies_to(cardinality)
-                {
-                    continue;
-                }
-                let target = transition.to;
-                if self.is_error(target) {
-                    error_witnesses.push(ProtocolUncertaintyViolation {
-                        event: transition.on,
-                        from: source,
-                        to: target,
-                    });
-                }
-                if !reached[target.index()] {
-                    reached[target.index()] = true;
-                    if transitive {
-                        stack.push(target);
-                    }
-                }
+        for transition in self.outgoing_transitions(state) {
+            if !eligible_events[transition.on.index()] || !transition.guard.applies_to(cardinality)
+            {
+                continue;
             }
-            if !transitive {
-                break;
+            if self.is_error(transition.to) {
+                error_witnesses.push(ProtocolUncertaintyViolation {
+                    event: transition.on,
+                    from: state,
+                    to: transition.to,
+                });
             }
+            reached[transition.to.index()] = true;
         }
         let states = reached
             .into_iter()

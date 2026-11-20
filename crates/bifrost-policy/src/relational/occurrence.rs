@@ -28,6 +28,7 @@ pub(crate) fn lower_occurrence_assert(assertion: &OccurrenceAssert) -> Relationa
         op: IrRelationOp::Source {
             binding: binding.clone(),
             schema: domain_schema(binding.as_str(), domain),
+            undecided_selections: Vec::new(),
         },
         schema: domain_schema(binding.as_str(), domain),
     };

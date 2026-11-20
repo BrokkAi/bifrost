@@ -1672,6 +1672,40 @@ where
     Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
     Reusable: ReusableIdeSummaryProvider<Problem::Fact, Problem::EdgeFunction>,
 {
+    let outcome = solve_ide_phases(
+        input,
+        provider,
+        problem,
+        reusable,
+        call_context_limits,
+        semantic_budget,
+        request,
+    );
+    // The fact solve joined its own verdict; the IDE phase's budget refusals
+    // stop the termination it reports.
+    if let Ok((result, _)) = &outcome {
+        super::summary::join_solve_verdict(
+            provider,
+            crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(result),
+        );
+    }
+    outcome
+}
+
+fn solve_ide_phases<Problem, Provider, Reusable>(
+    input: IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
+    provider: &Provider,
+    problem: &Problem,
+    reusable: &mut Reusable,
+    call_context_limits: Option<OracleLimits>,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> RecordedIdeSolveOutcome<Problem>
+where
+    Problem: IdeDataflowProblem,
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+    Reusable: ReusableIdeSummaryProvider<Problem::Fact, Problem::EdgeFunction>,
+{
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
     let seed_facts = bounded_seed_facts::<Problem>(&input, problem.zero_fact(), request);

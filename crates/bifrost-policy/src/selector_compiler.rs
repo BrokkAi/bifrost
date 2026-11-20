@@ -38,20 +38,24 @@ use brokk_bifrost_analysis::analyzer::{
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_rql::PlanWidenDetail;
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryCallBinding, CodeQueryExecutionScope, CodeQueryRowFamilySession,
-    CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence, DetailedCodeQueryDomain,
-    DetailedCodeQueryEvidence, DetailedCodeQueryResult, SelectedPatternSourceEvidence,
+    CodeQueryExecutionScope, CodeQueryRowFamilySession, CodeQuerySemanticReceipt,
+    DetailedCodeQueryDecoratedParameterEvidence, DetailedCodeQueryDomain,
+    DetailedCodeQueryEvidence, DetailedSelectorResult as DetailedCodeQueryResult,
+    SelectedPatternSourceEvidence, SelectorCallBindingFacts as CodeQueryCallBinding,
     UnitExecutionResult, UnitRowItemTerminal,
-    execute_code_query_detailed_eager_index_workspace_with_semantic_receipt,
-    execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session,
+    execute_code_query_selector_rows as execute_code_query_detailed_eager_index_workspace_with_semantic_receipt,
+    execute_code_query_selector_rows_with_row_family_session as execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session,
     execute_code_query_selector_unit, merge_unit_rows_in_scope, plan_seed_files,
+};
+use brokk_bifrost_rql::structural::search::{
+    SelectorQueryResult as CodeQueryResult, SelectorResultItem as CodeQueryResultItem,
+    SelectorResultValue as CodeQueryResultValue,
 };
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryResult, CodeQueryResultItem,
-    CodeQueryResultValue, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
-    CodeQuerySemanticLimits, CodeQuerySemanticProof, CodeQuerySemanticRowLimits,
-    CodeQuerySemanticWork,
+    CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQuerySemanticCompleteness,
+    CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
+    CodeQuerySemanticRowLimits, CodeQuerySemanticWork,
 };
 use brokk_bifrost_rql::{
     CallArgumentSelector, CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
@@ -563,16 +567,21 @@ pub(crate) mod candidate_enumeration {
                 result.result.completion(),
                 CodeQueryCompletion::Cancelled | CodeQueryCompletion::Invalid { .. }
             )
-            || result.result.diagnostics.iter().any(|diagnostic| {
-                matches!(
-                    diagnostic.incompleteness,
-                    brokk_bifrost_rql::Incompleteness::Operational(_)
-                ) || matches!(
-                    diagnostic.code,
-                    CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
-                        | CodeQueryDiagnosticCode::IdentityAxisUnsupported
-                )
-            })
+            || result
+                .result
+                .diagnostics
+                .semantic()
+                .iter()
+                .any(|diagnostic| {
+                    matches!(
+                        diagnostic.incompleteness,
+                        brokk_bifrost_rql::Incompleteness::Operational(_)
+                    ) || matches!(
+                        diagnostic.code,
+                        CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
+                            | CodeQueryDiagnosticCode::IdentityAxisUnsupported
+                    )
+                })
     }
 
     fn whole_selector(
@@ -591,7 +600,7 @@ pub(crate) mod candidate_enumeration {
             detail: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
                 format_args!("{detail}: {:?}", result.result.diagnostics),
                 format_args!("{detail}"),
-                result.result.diagnostics.iter(),
+                result.result.diagnostics.semantic().iter(),
             ),
         }
     }
@@ -1426,14 +1435,14 @@ fn admits_existing_incomplete_call_bindings(
     let declared_call_complete = declared_call
         && !result.truncated
         && !result.diagnostics.is_empty()
-        && result.diagnostics.iter().all(|diagnostic| {
+        && result.diagnostics.semantic().iter().all(|diagnostic| {
             diagnostic.code == CodeQueryDiagnosticCode::CallBindingDispatchPartial
         });
     let workspace_exact_positive = workspace_exact_call
         && !result.results.is_empty()
         && !result.truncated
         && !result.diagnostics.is_empty()
-        && result.diagnostics.iter().all(|diagnostic| {
+        && result.diagnostics.semantic().iter().all(|diagnostic| {
             matches!(
                 diagnostic.code,
                 CodeQueryDiagnosticCode::CallBindingDispatchPartial
@@ -1661,6 +1670,7 @@ fn retains_independently_proven_result_contracts(
             .any(|code| *code != CodeQueryDiagnosticCode::ResultContractDerivationIncomplete)
         || result
             .diagnostics
+            .semantic()
             .iter()
             .any(|diagnostic| match diagnostic.impact {
                 CodeQueryDiagnosticImpact::Advisory
@@ -1707,7 +1717,7 @@ fn file_scoped_gap_files(result: &CodeQueryResult) -> Option<HashSet<&str>> {
         return None;
     }
     let mut files = HashSet::new();
-    for diagnostic in &result.diagnostics {
+    for diagnostic in result.diagnostics.semantic() {
         if diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete {
             files.insert(diagnostic.withheld_rows_path.as_deref()?);
         }
@@ -1894,7 +1904,7 @@ fn taint_row_disposition(
 }
 
 fn incomplete_source_call_binding(value: &CodeQueryCallBinding) -> bool {
-    value.target.is_some()
+    value.has_source_target
         && value.declared_target_id.is_some()
         && value.target_origin == Some("source")
         && value.coverage == "incomplete"
@@ -2068,8 +2078,11 @@ impl<T> PolicySemanticContinuation<T> {
 
 /// Structured relational identity retained from one selected `call_binding` row.
 ///
-/// `actual_index` is the caller-side operand ordinal. `formal_index` is kept
-/// only as evidence and must never be passed to a `PolicyPort::ArgumentIndex`.
+/// `actual_index` is the actual's position inside its own argument group, as
+/// the call-binding row reports it; `actual_name` is the keyword a named actual
+/// is written with. Together they identify the caller-side operand.
+/// `formal_index` is kept only as evidence and must never be passed to a
+/// `PolicyPort::ArgumentIndex`.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct PolicySelectedCallBinding {
     pub(super) row_id: String,
@@ -2078,6 +2091,7 @@ pub(super) struct PolicySelectedCallBinding {
     pub(super) argument_id: String,
     pub(super) call_span: ByteRange<usize>,
     pub(super) actual_index: usize,
+    pub(super) actual_name: Option<String>,
     pub(super) formal_index: usize,
     pub(super) formal_name: Option<String>,
     pub(super) semantic_target_id: Option<String>,
@@ -2106,6 +2120,7 @@ impl PolicySelectedCallBinding {
             argument_id,
             call_span: _,
             actual_index: _,
+            actual_name,
             formal_index: _,
             formal_name,
             semantic_target_id,
@@ -2126,6 +2141,7 @@ impl PolicySelectedCallBinding {
             heap.add(text.capacity());
         }
         for text in [
+            actual_name,
             formal_name,
             semantic_target_id,
             model_callable_id,
@@ -2652,7 +2668,8 @@ impl<'a> PolicySelectorSession<'a> {
                 .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
         );
         let semantic_receipt = detailed.take_semantic_receipt();
-        self.record_query_budget_refusals(&detailed.result.diagnostics);
+        detailed.strip_step_attribution();
+        self.record_query_budget_refusals(detailed.result.diagnostics.semantic());
         self.query_work = self.query_work.saturating_add(detailed.work);
         self.execution_reuse.join_in(detailed.reuse);
         self.charge_query_semantic_work(detailed.work.semantic, semantic_receipt)?;
@@ -2964,11 +2981,15 @@ impl<'a> PolicySelectorSession<'a> {
             // sites cannot change selector identity, cause counts or routing.
             let mut identities = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            for diagnostic in &detailed.result.diagnostics {
+            for diagnostic in detailed.result.diagnostics.semantic() {
                 let mut identity = diagnostic.clone();
                 if crate::evaluator::is_call_binding_refusal(diagnostic) {
                     identity = crate::evaluator::refusal_identity(diagnostic);
                 }
+                identity.step_index = None;
+                identity.step_op = None;
+                identity.no_rows_reason = None;
+                identity.cause_codes.clear();
                 if seen.insert(identity.clone()) {
                     identities.push(identity);
                 }
@@ -2993,6 +3014,7 @@ impl<'a> PolicySelectorSession<'a> {
             let attributed_file = detailed
                 .result
                 .diagnostics
+                .semantic()
                 .iter()
                 .try_fold(None::<&str>, |prior, diagnostic| {
                     let path = diagnostic.withheld_rows_path.as_deref()?;
@@ -3041,12 +3063,12 @@ impl<'a> PolicySelectorSession<'a> {
                         diagnostics.iter(),
                     ),
                     discovery,
-                    refusal_subjects: detailed.result.diagnostics.iter()
+                    refusal_subjects: detailed.result.diagnostics.semantic().iter()
                         .filter(|diagnostic| crate::evaluator::is_call_binding_refusal(diagnostic))
                         .flat_map(crate::evaluator::refusal_subjects).collect(),
-                    refusal_reason: detailed.result.diagnostics.iter().filter(|d| crate::evaluator::is_call_binding_refusal(d)).filter_map(|d| d.message.split_once('\n').map(|(_, reason)| reason.to_owned())).min().unwrap_or_default(),
-                    has_non_utf8_refusal: detailed.result.diagnostics.iter().filter(|d| crate::evaluator::is_call_binding_refusal(d)).any(|d| d.has_non_utf8_refusal),
-                    incompleteness: detailed.result.diagnostics.iter().filter(|d| d.impact == CodeQueryDiagnosticImpact::Incomplete).map(|d| d.incompleteness).collect(),
+                    refusal_reason: detailed.result.diagnostics.semantic().iter().filter(|d| crate::evaluator::is_call_binding_refusal(d)).filter_map(|d| d.message.split_once('\n').map(|(_, reason)| reason.to_owned())).min().unwrap_or_default(),
+                    has_non_utf8_refusal: detailed.result.diagnostics.semantic().iter().filter(|d| crate::evaluator::is_call_binding_refusal(d)).any(|d| d.has_non_utf8_refusal),
+                    incompleteness: detailed.result.diagnostics.semantic().iter().filter(|d| d.impact == CodeQueryDiagnosticImpact::Incomplete).map(|d| d.incompleteness).collect(),
                     truncated: detailed.result.truncated,
                 });
             self.incomplete_selector_observations
@@ -3289,17 +3311,31 @@ impl<'a> PolicySelectorSession<'a> {
         self.units.take().map(SelectorUnits::into_outcome)
     }
 
+    #[cfg(test)]
     pub(super) fn select_with_artifact_continuation(
         &mut self,
         selector: &ResolvedPolicySelector,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        self.select_for_binding(selector, false)
+    }
+
+    pub(super) fn select_for_binding(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        receiver_binding: bool,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         let query = self.selector_query(selector)?;
+        let go_method_value_specs = if receiver_binding {
+            GoBoundMethodValueSeedSpec::from_query(&query)
+        } else {
+            Vec::new()
+        };
         if self.units.is_some() {
-            return self.select_sliced(selector, &query);
+            return self.select_sliced(selector, &query, &go_method_value_specs);
         }
         let detailed = self.execute_selector_query_with_artifact_continuation(&query)?;
         let retained_incomplete_result_contracts = detailed.retained_incomplete_result_contracts;
-        let (selected, artifact_charge) = self.selected_sites(selector, detailed)?;
+        let (mut selected, artifact_charge) = self.selected_sites(selector, detailed)?;
         if retained_incomplete_result_contracts {
             self.retained_incomplete_result_contract_selectors = self
                 .retained_incomplete_result_contract_selectors
@@ -3318,6 +3354,49 @@ impl<'a> PolicySelectorSession<'a> {
             self.result_contract_artifact_leases = self
                 .result_contract_artifact_leases
                 .saturating_add(self.artifact_leases.len().saturating_sub(retained_before));
+        }
+        if !go_method_value_specs.is_empty() {
+            let candidate_files = match self.execution_scope.seed_files() {
+                Some(seed_files) => plan_seed_files(&query.plan, seed_files),
+                None => {
+                    let workspace_files = self.workspace.analyzer().analyzed_files();
+                    plan_seed_files(&query.plan, &workspace_files)
+                }
+            };
+            for file in &candidate_files {
+                let Some((source, tree)) = file_passes_go_bound_method_value_prefilter(
+                    file,
+                    self.workspace.analyzer(),
+                    &go_method_value_specs,
+                ) else {
+                    continue;
+                };
+                let extra_sites = self.collect_go_bound_method_value_sites_from_parsed_file(
+                    file,
+                    selector,
+                    &go_method_value_specs,
+                    &source,
+                    &tree,
+                )?;
+                merge_unique_selected_sites(&mut selected, extra_sites);
+            }
+            // The merged method-value sites bypass the RQL query's own result
+            // cap, so enforce it here and fail closed, as the
+            // recovered-binding merge does.
+            if selected.len() > self.max_selector_results {
+                self.workspace.analyzer().mark_execution_dependent();
+                self.workspace.analyzer().record_budget_dependences(1);
+                return Err(PolicySelectorSessionError::Incomplete {
+                    reuse: ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal),
+                    completion: CodeQueryCompletion::Incomplete {
+                        codes: vec![CodeQueryDiagnosticCode::ResultLimitReached],
+                    },
+                    detail: format!(
+                        "bound method-value sites exceeded the selector result limit of {}",
+                        self.max_selector_results
+                    ),
+                });
+            }
         }
         #[cfg(any(test, feature = "test-support"))]
         if promoted_artifacts && !selected.is_empty() {
@@ -3339,12 +3418,13 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         selector: &ResolvedPolicySelector,
         query: &CodeQuery,
+        go_method_value_specs: &[GoBoundMethodValueSeedSpec],
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         let mut units = self
             .units
             .take()
             .expect("a sliced selector compile holds its units");
-        let selected = self.select_sliced_units(&mut units, selector, query);
+        let selected = self.select_sliced_units(&mut units, selector, query, go_method_value_specs);
         if let Err(PolicySelectorSessionError::Widen(reason)) = &selected {
             units.widened(*reason);
         }
@@ -3362,12 +3442,14 @@ impl<'a> PolicySelectorSession<'a> {
         units: &mut SelectorUnits<'_>,
         selector: &ResolvedPolicySelector,
         query: &CodeQuery,
+        go_method_value_specs: &[GoBoundMethodValueSeedSpec],
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         self.selector_scans = self.selector_scans.saturating_add(1);
         let seed_files = units.enumerate(query, selector.path.as_str())?;
         let set_source = matches!(query.plan.source, CodeQueryPlanSource::Set { .. });
         let mut products = Vec::with_capacity(seed_files.len());
         let mut selected = Vec::new();
+        let mut withheld = false;
         for (index, file) in seed_files.iter().enumerate() {
             let rows = match units.published(index)? {
                 Some(product) => {
@@ -3382,7 +3464,13 @@ impl<'a> PolicySelectorSession<'a> {
                     product.rows
                 }
                 None => {
-                    let executed = match self.execute_selector_unit(units, selector, query, file)? {
+                    let executed = match self.execute_selector_unit(
+                        units,
+                        selector,
+                        query,
+                        file,
+                        go_method_value_specs,
+                    )? {
                         SelectorUnitRun::Complete(executed) => executed,
                         // A unit that did not complete is not a partition
                         // of a complete execution, whatever it selected.
@@ -3392,8 +3480,11 @@ impl<'a> PolicySelectorSession<'a> {
                             ));
                         }
                     };
-                    if !set_source {
+                    if !set_source || !executed.sites.is_empty() {
                         selected.extend(executed.sites.iter().cloned());
+                    }
+                    if !executed.publishable {
+                        withheld = true;
                     }
                     units.publish(index, &executed);
                     executed.rows
@@ -3403,13 +3494,16 @@ impl<'a> PolicySelectorSession<'a> {
                 .map_err(PolicySelectorSessionError::Widen)?;
             products.push(rows);
         }
-        self.merge_sliced_selection(selector, query, set_source, products, selected, false)
+        self.merge_sliced_selection(
+            selector,
+            query,
+            set_source,
+            products,
+            selected,
+            withheld,
+            !go_method_value_specs.is_empty(),
+        )
     }
-
-    /// The candidate-classifying sliced compile: every recomputed seed file
-    /// runs its ordinary unit, then is classified under the request's ledger
-    /// and withheld from publication. Only a certified candidate selector
-    /// reaches this path, so ordinary selectors never pay its wider frame.
     fn select_withheld_sliced_units(
         &mut self,
         units: &mut SelectorUnits<'_>,
@@ -3432,7 +3526,7 @@ impl<'a> PolicySelectorSession<'a> {
                     product.rows
                 }
                 None => {
-                    let run = self.execute_selector_unit(units, selector, query, file)?;
+                    let run = self.execute_selector_unit(units, selector, query, file, &[])?;
                     // A complete execution does not prove that a candidate
                     // it did not select was rejected, so the file is also
                     // classified, after the unit and under the request's
@@ -3471,11 +3565,14 @@ impl<'a> PolicySelectorSession<'a> {
                 .map_err(PolicySelectorSessionError::Widen)?;
             products.push(rows);
         }
-        self.merge_sliced_selection(selector, query, set_source, products, selected, withheld)
+        self.merge_sliced_selection(
+            selector, query, set_source, products, selected, withheld, false,
+        )
     }
 
     /// Merge one sliced compile's units into the vector a whole execution
     /// would have produced, and project the sites of a set-source compile.
+    #[allow(clippy::too_many_arguments)]
     fn merge_sliced_selection(
         &self,
         selector: &ResolvedPolicySelector,
@@ -3484,6 +3581,9 @@ impl<'a> PolicySelectorSession<'a> {
         products: Vec<UnitExecutionResult>,
         selected: Vec<PolicySelectedSite>,
         withheld: bool,
+        // Method-value sites are appended without unit rows, so they can push
+        // the selection over the result cap even when every unit published.
+        extras_may_outnumber_rows: bool,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         let merged = merge_unit_rows_in_scope(
             query,
@@ -3498,7 +3598,7 @@ impl<'a> PolicySelectorSession<'a> {
         if merged
             .reached_limit(&self.query_limits, query.limit)
             .is_some()
-            || (withheld && selected.len() >= query.limit)
+            || ((withheld || extras_may_outnumber_rows) && selected.len() >= query.limit)
         {
             return Err(PolicySelectorSessionError::Widen(
                 WidenReason::MergedLimitReached,
@@ -3506,7 +3606,7 @@ impl<'a> PolicySelectorSession<'a> {
         }
         if set_source {
             let evidence = merged.detailed_evidence(self.workspace.analyzer().project().root());
-            return merged
+            let mut merged_sites = merged
                 .items
                 .iter()
                 .zip(evidence)
@@ -3555,7 +3655,11 @@ impl<'a> PolicySelectorSession<'a> {
                         selected_source_entries: None,
                     })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
+            if !selected.is_empty() {
+                merge_unique_selected_sites(&mut merged_sites, selected);
+            }
+            return Ok(merged_sites);
         }
         Ok(selected)
     }
@@ -3567,6 +3671,7 @@ impl<'a> PolicySelectorSession<'a> {
         selector: &ResolvedPolicySelector,
         query: &CodeQuery,
         file: &ProjectFile,
+        go_method_value_specs: &[GoBoundMethodValueSeedSpec],
     ) -> Result<SelectorUnitRun, PolicySelectorSessionError> {
         let query_limits = self.remaining_query_limits()?;
         let artifact_leases = self.artifact_leases.snapshot();
@@ -3609,9 +3714,13 @@ impl<'a> PolicySelectorSession<'a> {
         );
         units.reuse.record_recompute(elapsed);
         let mut detailed = executed.detailed;
-        let rows = executed.unit;
+        let mut rows = executed.unit;
         let semantic_receipt = detailed.take_semantic_receipt();
-        self.record_query_budget_refusals(&detailed.result.diagnostics);
+        detailed.strip_step_attribution();
+        brokk_bifrost_rql::structural::CodeQueryDiagnostic::strip_step_attribution(
+            &mut rows.diagnostics,
+        );
+        self.record_query_budget_refusals(detailed.result.diagnostics.semantic());
         self.query_work = self.query_work.saturating_add(detailed.work);
         self.execution_reuse.join_in(detailed.reuse);
         let complete = matches!(detailed.result.completion(), CodeQueryCompletion::Complete);
@@ -3631,22 +3740,22 @@ impl<'a> PolicySelectorSession<'a> {
         let retained_artifacts = artifact_charge
             .as_ref()
             .is_some_and(|charge| !charge.is_empty());
-        let (sites, artifact_charge) =
-            if matches!(query.plan.source, CodeQueryPlanSource::Set { .. }) {
-                (Vec::new(), artifact_charge)
-            } else {
-                self.selected_sites(
-                    selector,
-                    PolicySelectorQueryResult {
-                        result: detailed.result,
-                        evidence: detailed.evidence,
-                        artifact_charge,
-                        retained_incomplete_result_contracts: false,
-                        retained_incomplete_taint_rows: false,
-                        source_certifications: HashMap::new(),
-                    },
-                )?
-            };
+        let set_source = matches!(query.plan.source, CodeQueryPlanSource::Set { .. });
+        let (mut sites, artifact_charge) = if set_source {
+            (Vec::new(), artifact_charge)
+        } else {
+            self.selected_sites(
+                selector,
+                PolicySelectorQueryResult {
+                    result: detailed.result,
+                    evidence: detailed.evidence,
+                    artifact_charge,
+                    retained_incomplete_result_contracts: false,
+                    retained_incomplete_taint_rows: false,
+                    source_certifications: HashMap::new(),
+                },
+            )?
+        };
         if let Some(artifact_charge) = artifact_charge {
             let retained_before = self.artifact_leases.len();
             self.apply_artifact_charge(
@@ -3656,6 +3765,54 @@ impl<'a> PolicySelectorSession<'a> {
             self.result_contract_artifact_leases = self
                 .result_contract_artifact_leases
                 .saturating_add(self.artifact_leases.len().saturating_sub(retained_before));
+        }
+        if let Some((source, tree)) = file_passes_go_bound_method_value_prefilter(
+            file,
+            self.workspace.analyzer(),
+            go_method_value_specs,
+        ) {
+            let analyzer = self.workspace.analyzer();
+            let cancellation = self.cancellation;
+            let policy_id = units.policy.definition().metadata.id.clone();
+            let selector_path = selector.path.clone();
+            let (extra_sites, extra_reads, extra_elapsed, _) = recompute_unit_judged(
+                analyzer,
+                Some(cancellation),
+                || {
+                    format!(
+                        "policy={} partition=selector_go_bound_method_value selector={:?} file={}",
+                        policy_id,
+                        selector_path,
+                        rel_path_string(file)
+                    )
+                },
+                || {
+                    (
+                        self.collect_go_bound_method_value_sites_from_parsed_file(
+                            file,
+                            selector,
+                            go_method_value_specs,
+                            &source,
+                            &tree,
+                        ),
+                        ReuseVerdict::Content,
+                    )
+                },
+            );
+            units.reuse.record_recompute(extra_elapsed);
+            let extra_sites = extra_sites?;
+            reads = match (reads, extra_reads) {
+                (Some(mut combined), Some(extra)) => {
+                    for key in extra {
+                        if !combined.contains(&key) {
+                            combined.push(key);
+                        }
+                    }
+                    Some(combined)
+                }
+                _ => None,
+            };
+            merge_unique_selected_sites(&mut sites, extra_sites);
         }
         let semantic = self.semantic_budget.replay_since(&semantic_before);
         let execution_after = self.semantic_execution_budget.work();
@@ -3673,7 +3830,9 @@ impl<'a> PolicySelectorSession<'a> {
         }
         Ok(SelectorUnitRun::Complete(Box::new(ExecutedSelectorUnit {
             reads,
-            publishable: !retained_artifacts && sites.iter().all(selector_site_is_projectable),
+            publishable: !retained_artifacts
+                && !(set_source && !sites.is_empty())
+                && sites.iter().all(selector_site_is_projectable),
             product: SelectorProduct {
                 rows: rows.clone(),
                 sites: sites.iter().map(project_selector_site).collect(),
@@ -3692,6 +3851,141 @@ impl<'a> PolicySelectorSession<'a> {
             rows,
             sites,
         })))
+    }
+
+    fn collect_go_bound_method_value_sites_from_parsed_file(
+        &mut self,
+        file: &ProjectFile,
+        selector: &ResolvedPolicySelector,
+        specs: &[GoBoundMethodValueSeedSpec],
+        source: &str,
+        tree: &tree_sitter::Tree,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            CallInvocationMode, CallableTarget, CallableTargetResolution, ProcedureKind,
+        };
+
+        let rel_path = rel_path_string(file);
+        let matching_specs = specs
+            .iter()
+            .filter(|spec| spec.where_globs.matches(&rel_path))
+            .collect::<Vec<_>>();
+        if matching_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let workspace = self.workspace;
+        let leases = self.begin_semantic_lease_window();
+        let outcome = self.continue_semantic_in_window(&leases, |request| {
+            workspace.materialize_program_semantics(file, request)
+        })?;
+        self.require_uninterrupted(&outcome, "go bound method value selector")?;
+        self.require_execution_budget("go bound method value selector")?;
+        if !outcome.is_complete() {
+            return Err(PolicySelectorSessionError::Incomplete {
+                reuse: ReuseVerdict::Content,
+                completion: CodeQueryCompletion::Incomplete {
+                    codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial],
+                },
+                detail: format!(
+                    "program semantics are incomplete for {}",
+                    file.abs_path().display()
+                ),
+            });
+        }
+        let artifact = outcome
+            .available_value()
+            .ok_or_else(|| unavailable_semantic_artifact(file))?;
+
+        let root = tree.root_node();
+        let mut sites = Vec::new();
+        let mut seen_spans = HashSet::new();
+        for procedure in artifact.procedures() {
+            for call in procedure.call_sites() {
+                if call.invocation_mode != CallInvocationMode::Ordinary || call.receiver.is_none() {
+                    continue;
+                }
+                let Some(mapping) = procedure.source_mapping(call.source) else {
+                    continue;
+                };
+                let span_anchor = mapping.locator.anchor().span();
+                let call_span =
+                    (span_anchor.start_byte() as usize)..(span_anchor.end_byte() as usize);
+                if seen_spans.contains(&call_span) {
+                    continue;
+                }
+                if go_identifier_call_expression_at_span(root, &call_span).is_none() {
+                    continue;
+                }
+                let member_name = if let Some(selection) = call.member_selection.as_deref() {
+                    Some(selection.member.as_ref())
+                } else if let CallableTargetResolution::Proven(CallableTarget::Local(target_id)) =
+                    &call.declared_targets
+                {
+                    artifact
+                        .procedure(*target_id)
+                        .filter(|target| target.kind() == ProcedureKind::Method)
+                        .and_then(|target| {
+                            let decl_mapping = target.source_mapping(target.source())?;
+                            let decl_anchor = decl_mapping.locator.anchor().span();
+                            let decl_span = (decl_anchor.start_byte() as usize)
+                                ..(decl_anchor.end_byte() as usize);
+                            go_method_declaration_name_at_span(root, source, &decl_span)
+                        })
+                } else {
+                    None
+                };
+                let Some(member_name) = member_name else {
+                    continue;
+                };
+                let arg_len = call.arguments.len();
+                let Some(matched_spec) = matching_specs.iter().copied().find(|spec| {
+                    spec.callee_name.matches(member_name)
+                        && spec
+                            .arity
+                            .is_none_or(|constraint| constraint.matches(arg_len))
+                }) else {
+                    continue;
+                };
+                let call_shape = if matched_spec.emit_call_shape {
+                    let argument_count = u32::try_from(arg_len).map_err(|_| {
+                        PolicySelectorSessionError::Unavailable(format!(
+                            "selector `{}` produced a call with too many arguments",
+                            selector.path
+                        ))
+                    })?;
+                    Some(PolicyCallShapeSelection {
+                        callee_name: Some(member_name.to_owned()),
+                        argument_count,
+                    })
+                } else {
+                    None
+                };
+                seen_spans.insert(call_span.clone());
+                sites.push(PolicySelectedSite {
+                    file: file.clone(),
+                    span: call_span,
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Complete,
+                    result_contract: None,
+                    call_shape,
+                    call_binding: None,
+                    selected_model_record: None,
+                    selected_summary_record: None,
+                    modeled_member_id: None,
+                    modeled_target_origin: None,
+                    decorated_parameter: None,
+                    runtime_keyed_read: None,
+                    runtime_keyed_read_row: false,
+                    runtime_keyed_read_conclusive_exclusion: false,
+                    occurrence_role: None,
+                    retained_incomplete_result_contract_query: false,
+                    selected_source_entries: None,
+                });
+            }
+        }
+        drop(outcome);
+        leases.finish_scalar(sites, "go bound method value selector")
     }
 
     /// Charge what a reused unit's own execution took out of the shared
@@ -3897,7 +4191,7 @@ impl<'a> PolicySelectorSession<'a> {
             truncated: false,
             depth_bound_status: batch.depth_bound_status,
             session_subset: batch.session_subset,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
         };
         let mut evidence = Vec::new();
         for (index, _) in classified.candidates().enumerate() {
@@ -3962,7 +4256,8 @@ impl<'a> PolicySelectorSession<'a> {
             &mut self.row_family_session,
         );
         let semantic_receipt = detailed.take_semantic_receipt();
-        self.record_query_budget_refusals(&detailed.result.diagnostics);
+        detailed.strip_step_attribution();
+        self.record_query_budget_refusals(detailed.result.diagnostics.semantic());
         self.query_work = self.query_work.saturating_add(detailed.work);
         self.execution_reuse.join_in(detailed.reuse);
         Ok((detailed, semantic_receipt))
@@ -4187,6 +4482,7 @@ impl<'a> PolicySelectorSession<'a> {
             let diagnostics = detailed
                 .result
                 .diagnostics
+                .semantic()
                 .iter()
                 .map(|diagnostic| format!("{}: {}", diagnostic.code.as_str(), diagnostic.message))
                 .collect::<Vec<_>>()
@@ -4401,6 +4697,7 @@ impl<'a> PolicySelectorSession<'a> {
                                     selector.path
                                 ))
                             })?,
+                            actual_name: value.actual_name.clone(),
                             formal_index: value.formal_index.ok_or_else(|| {
                                 PolicySelectorSessionError::Unavailable(format!(
                                     "selector `{}` selected a binding without a formal index",
@@ -4489,7 +4786,7 @@ impl<'a> PolicySelectorSession<'a> {
                 let selected_model_record = match &item.value {
                     CodeQueryResultValue::CallBinding { value } => accepted_model_record(
                         value.selector_exact,
-                        value.target.is_some(),
+                        value.has_source_target,
                         value.model_callable_id.is_some()
                             && value.formal_layout_id.is_some()
                             && value.signature_id.is_some(),
@@ -5607,6 +5904,524 @@ fn lane(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+#[derive(Clone)]
+struct GoBoundMethodValueSeedSpec {
+    callee_name: brokk_bifrost_rql::query::StringPredicate,
+    arity: Option<brokk_bifrost_rql::query::ArityConstraint>,
+    where_globs: brokk_bifrost_rql::query::QueryPathScope,
+    emit_call_shape: bool,
+}
+
+impl GoBoundMethodValueSeedSpec {
+    fn from_query(query: &CodeQuery) -> Vec<Self> {
+        use brokk_bifrost_rql::query::SetOperator;
+
+        let outer_call_shape = match query.plan.steps.as_slice() {
+            [] => false,
+            [QueryStep::CallShape] => true,
+            _ => return Vec::new(),
+        };
+        let mut specs = Vec::new();
+        let mut stack = vec![(&query.plan, outer_call_shape)];
+        while let Some((plan, inherited_call_shape)) = stack.pop() {
+            let branch_call_shape = match plan.steps.as_slice() {
+                [] => inherited_call_shape,
+                [QueryStep::CallShape] => true,
+                _ => continue,
+            };
+            match &plan.source {
+                CodeQueryPlanSource::Seed(seed) => {
+                    if let Some(spec) = Self::from_seed(seed, branch_call_shape) {
+                        specs.push(spec);
+                    }
+                }
+                CodeQueryPlanSource::Set {
+                    op: SetOperator::Union,
+                    branches,
+                } => {
+                    for branch in branches.iter().rev() {
+                        stack.push((branch, branch_call_shape));
+                    }
+                }
+                _ => {}
+            }
+        }
+        specs
+    }
+
+    fn from_seed(
+        seed: &brokk_bifrost_rql::query::CodeQuerySeed,
+        emit_call_shape: bool,
+    ) -> Option<Self> {
+        use brokk_bifrost_core::analyzer::Language;
+        use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+
+        if !seed.languages.is_empty() && !seed.languages.contains(&Language::Go) {
+            return None;
+        }
+        if seed.inside_decl.is_some() || seed.not_inside.is_some() {
+            return None;
+        }
+        if let Some(inside) = &seed.inside
+            && !pattern_is_unconstrained_callable(inside)
+        {
+            return None;
+        }
+
+        let brokk_bifrost_rql::query::Pattern {
+            kinds,
+            not_kinds,
+            name: None,
+            text: None,
+            comment_block_text: None,
+            boolean_value: None,
+            is_async: None,
+            unsafe_context: None,
+            modifier: None,
+            type_kind: None,
+            string_value: None,
+            language_rule: None,
+            body_state: None,
+            body_owner: None,
+            parenthesized: None,
+            integer_value: None,
+            duplicate_key: None,
+            integer_has_any_bits: None,
+            integer_has_all_bits: None,
+            integer_has_no_bits: None,
+            assignment_target_kind: None,
+            assignment_value_kind: None,
+            assignment_target_unstarred_count: None,
+            assignment_value_unstarred_count: None,
+            assignment_target_starred: None,
+            assignment_value_starred: None,
+            assignment_unstarred_count_mismatch: None,
+            index: None,
+            arity,
+            count: None,
+            visibility,
+            parameter_type: None,
+            capture: _,
+            has: None,
+            each: None,
+            argument_modes,
+            local_value: None,
+            not_has: None,
+            not: None,
+            all,
+            any,
+            type_operand: None,
+            operand: None,
+            consequence: None,
+            alternative: None,
+            body: None,
+            label: None,
+            binding: None,
+            initializer_of: None,
+            indices,
+            dimensions,
+            parameters,
+            members,
+            callee: Some(callee_pattern),
+            receiver: None,
+            args,
+            kwargs,
+            left: None,
+            right: None,
+            operator: None,
+            module: None,
+            decorators,
+            object: None,
+            field: None,
+            iterable: None,
+            elements,
+            tag: None,
+            attributes,
+            children,
+            parts,
+            value: None,
+            key: None,
+            test: None,
+            type_arguments,
+            qualifying_type: None,
+        } = &seed.root
+        else {
+            return None;
+        };
+
+        if kinds.as_slice() != [NormalizedKind::Call]
+            || !not_kinds.is_empty()
+            || !visibility.is_empty()
+            || !argument_modes.is_empty()
+            || !all.is_empty()
+            || !any.is_empty()
+            || !indices.is_empty()
+            || !dimensions.is_empty()
+            || !parameters.is_empty()
+            || !members.is_empty()
+            || !args.is_empty()
+            || !kwargs.is_empty()
+            || !decorators.is_empty()
+            || !elements.is_empty()
+            || !attributes.is_empty()
+            || !children.is_empty()
+            || !parts.is_empty()
+            || !type_arguments.is_empty()
+        {
+            return None;
+        }
+
+        let callee_name = pattern_callee_name_only(callee_pattern)?;
+        Some(Self {
+            callee_name: callee_name.clone(),
+            arity: *arity,
+            where_globs: seed.where_globs.clone(),
+            emit_call_shape,
+        })
+    }
+}
+
+fn pattern_is_unconstrained_callable(pattern: &brokk_bifrost_rql::query::Pattern) -> bool {
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+
+    let brokk_bifrost_rql::query::Pattern {
+        kinds,
+        not_kinds,
+        name: None,
+        text: None,
+        comment_block_text: None,
+        boolean_value: None,
+        is_async: None,
+        unsafe_context: None,
+        modifier: None,
+        type_kind: None,
+        string_value: None,
+        language_rule: None,
+        body_state: None,
+        body_owner: None,
+        parenthesized: None,
+        integer_value: None,
+        duplicate_key: None,
+        integer_has_any_bits: None,
+        integer_has_all_bits: None,
+        integer_has_no_bits: None,
+        assignment_target_kind: None,
+        assignment_value_kind: None,
+        assignment_target_unstarred_count: None,
+        assignment_value_unstarred_count: None,
+        assignment_target_starred: None,
+        assignment_value_starred: None,
+        assignment_unstarred_count_mismatch: None,
+        index: None,
+        arity: None,
+        count: None,
+        visibility,
+        parameter_type: None,
+        capture: _,
+        has: None,
+        each: None,
+        argument_modes,
+        local_value: None,
+        not_has: None,
+        not: None,
+        all,
+        any,
+        type_operand: None,
+        operand: None,
+        consequence: None,
+        alternative: None,
+        body: None,
+        label: None,
+        binding: None,
+        initializer_of: None,
+        indices,
+        dimensions,
+        parameters,
+        members,
+        callee: None,
+        receiver: None,
+        args,
+        kwargs,
+        left: None,
+        right: None,
+        operator: None,
+        module: None,
+        decorators,
+        object: None,
+        field: None,
+        iterable: None,
+        elements,
+        tag: None,
+        attributes,
+        children,
+        parts,
+        value: None,
+        key: None,
+        test: None,
+        type_arguments,
+        qualifying_type: None,
+    } = pattern
+    else {
+        return false;
+    };
+
+    kinds.as_slice() == [NormalizedKind::Callable]
+        && not_kinds.is_empty()
+        && visibility.is_empty()
+        && argument_modes.is_empty()
+        && all.is_empty()
+        && any.is_empty()
+        && indices.is_empty()
+        && dimensions.is_empty()
+        && parameters.is_empty()
+        && members.is_empty()
+        && args.is_empty()
+        && kwargs.is_empty()
+        && decorators.is_empty()
+        && elements.is_empty()
+        && attributes.is_empty()
+        && children.is_empty()
+        && parts.is_empty()
+        && type_arguments.is_empty()
+}
+
+fn pattern_callee_name_only(
+    pattern: &brokk_bifrost_rql::query::Pattern,
+) -> Option<&brokk_bifrost_rql::query::StringPredicate> {
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+
+    let brokk_bifrost_rql::query::Pattern {
+        kinds,
+        not_kinds,
+        name: Some(callee_name),
+        text: None,
+        comment_block_text: None,
+        boolean_value: None,
+        is_async: None,
+        unsafe_context: None,
+        modifier: None,
+        type_kind: None,
+        string_value: None,
+        language_rule: None,
+        body_state: None,
+        body_owner: None,
+        parenthesized: None,
+        integer_value: None,
+        duplicate_key: None,
+        integer_has_any_bits: None,
+        integer_has_all_bits: None,
+        integer_has_no_bits: None,
+        assignment_target_kind: None,
+        assignment_value_kind: None,
+        assignment_target_unstarred_count: None,
+        assignment_value_unstarred_count: None,
+        assignment_target_starred: None,
+        assignment_value_starred: None,
+        assignment_unstarred_count_mismatch: None,
+        index: None,
+        arity: None,
+        count: None,
+        visibility,
+        parameter_type: None,
+        capture: _,
+        has: None,
+        each: None,
+        argument_modes,
+        local_value: None,
+        not_has: None,
+        not: None,
+        all,
+        any,
+        type_operand: None,
+        operand: None,
+        consequence: None,
+        alternative: None,
+        body: None,
+        label: None,
+        binding: None,
+        initializer_of: None,
+        indices,
+        dimensions,
+        parameters,
+        members,
+        callee: None,
+        receiver: None,
+        args,
+        kwargs,
+        left: None,
+        right: None,
+        operator: None,
+        module: None,
+        decorators,
+        object: None,
+        field: None,
+        iterable: None,
+        elements,
+        tag: None,
+        attributes,
+        children,
+        parts,
+        value: None,
+        key: None,
+        test: None,
+        type_arguments,
+        qualifying_type: None,
+    } = pattern
+    else {
+        return None;
+    };
+
+    let allowed_kinds = kinds.is_empty() || kinds.as_slice() == [NormalizedKind::Identifier];
+    if !allowed_kinds
+        || !not_kinds.is_empty()
+        || !visibility.is_empty()
+        || !argument_modes.is_empty()
+        || !all.is_empty()
+        || !any.is_empty()
+        || !indices.is_empty()
+        || !dimensions.is_empty()
+        || !parameters.is_empty()
+        || !members.is_empty()
+        || !args.is_empty()
+        || !kwargs.is_empty()
+        || !decorators.is_empty()
+        || !elements.is_empty()
+        || !attributes.is_empty()
+        || !children.is_empty()
+        || !parts.is_empty()
+        || !type_arguments.is_empty()
+    {
+        return None;
+    }
+
+    Some(callee_name)
+}
+
+fn file_passes_go_bound_method_value_prefilter(
+    file: &ProjectFile,
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    specs: &[GoBoundMethodValueSeedSpec],
+) -> Option<(String, tree_sitter::Tree)> {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
+    use brokk_bifrost_core::analyzer::Language;
+
+    if specs.is_empty() || language_for_file(file) != Language::Go {
+        return None;
+    }
+    let rel_path = rel_path_string(file);
+    let matching_specs = specs
+        .iter()
+        .filter(|spec| spec.where_globs.matches(&rel_path))
+        .collect::<Vec<_>>();
+    if matching_specs.is_empty() {
+        return None;
+    }
+    let source = analyzer.indexed_source(file)?;
+    let tree = parse_tree_for_language(file, Language::Go, &source)?;
+    let mut stack = vec![tree.root_node()];
+    let mut found_candidate = false;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "selector_expression"
+            && !go_selector_is_direct_call_callee(node)
+            && let Some(mut operand) = node.child_by_field_name("operand")
+        {
+            while operand.kind() == "parenthesized_expression" {
+                let mut cursor = operand.walk();
+                let Some(inner) = operand.named_children(&mut cursor).next() else {
+                    break;
+                };
+                operand = inner;
+            }
+            if operand.kind() == "identifier"
+                && let Some(field) = node.child_by_field_name("field")
+                && let Some(field_text) = source.get(field.byte_range())
+                && matching_specs
+                    .iter()
+                    .any(|spec| spec.callee_name.matches(field_text))
+            {
+                found_candidate = true;
+                break;
+            }
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    found_candidate.then_some((source, tree))
+}
+
+fn go_selector_is_direct_call_callee(node: tree_sitter::Node<'_>) -> bool {
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        if parent.kind() == "parenthesized_expression" {
+            cur = parent;
+            continue;
+        }
+        return parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == cur.id());
+    }
+    false
+}
+
+fn go_identifier_call_expression_at_span<'tree>(
+    root: tree_sitter::Node<'tree>,
+    span: &ByteRange<usize>,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut node = root.descendant_for_byte_range(span.start, span.end)?;
+    loop {
+        if node.byte_range() == *span && node.kind() == "call_expression" {
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "parenthesized_expression" {
+                let mut cursor = function.walk();
+                function = function.named_children(&mut cursor).next()?;
+            }
+            return (function.kind() == "identifier").then_some(node);
+        }
+        let parent = node.parent()?;
+        if parent.start_byte() > span.start || parent.end_byte() < span.end {
+            return None;
+        }
+        node = parent;
+    }
+}
+
+fn go_method_declaration_name_at_span<'a>(
+    root: tree_sitter::Node<'_>,
+    source: &'a str,
+    span: &ByteRange<usize>,
+) -> Option<&'a str> {
+    let mut node = root.descendant_for_byte_range(span.start, span.end)?;
+    loop {
+        if node.kind() == "method_declaration" {
+            let name_node = node.child_by_field_name("name")?;
+            if node.byte_range() == *span || name_node.byte_range() == *span {
+                return source.get(name_node.byte_range());
+            }
+            return None;
+        }
+        let parent = node.parent()?;
+        node = parent;
+    }
+}
+
+fn merge_unique_selected_sites(
+    existing: &mut Vec<PolicySelectedSite>,
+    extra: Vec<PolicySelectedSite>,
+) {
+    for site in extra {
+        if !existing
+            .iter()
+            .any(|prior| prior.file == site.file && prior.span == site.span)
+        {
+            existing.push(site);
+        }
+    }
+}
+
 /// The per-seed selector units of one policy compile.
 ///
 /// One of these is built per compile that holds an incremental context. It
@@ -6146,6 +6961,29 @@ pub(super) fn selected_site_quality(
             CodeQueryResultValue::BindingInitializerCall { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)
             }
+            // A field access row is a store or load of the production IR; its
+            // own proof and completeness are the IR record's. Whether the
+            // whole answer is complete is carried by query diagnostics.
+            CodeQueryResultValue::FieldWrite { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("field write completeness is {}", value.completeness).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::FieldRead { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("field read completeness is {}", value.completeness).into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::FlowRelation { value } => (
                 ProofStatus::Proven,
                 flow_state_completeness(value.completeness, &value.uncovered_axes),
@@ -6519,8 +7357,12 @@ pub(super) fn selected_site_quality(
                     && value.coverage == "exhaustive"
                     && value.selector_exact
                     && value.selector_proof.is_some()
+                    // A receiver row binds the receiver operand, which has no
+                    // argument identity; the exact site proof identifies it,
+                    // as it does for a taint endpoint (#10014, #14297).
                     && ((!value.terminal
-                        && value.argument_id.is_some())
+                        && (value.argument_id.is_some()
+                            || value.binding_kind == Some("receiver")))
                         || (value.terminal && value.actual_count == 0))
                 {
                     EvidenceCompleteness::Complete
@@ -7416,6 +8258,7 @@ mod tests {
 
     #[test]
     #[hardwon("#10985: isolation exhausted file budgets and discarded recovered binding rows")]
+    #[hardwon("#14413: host JDK discovery required shards outside the fixture's activated pack")]
     fn candidate_isolation_keeps_the_complete_sibling_selected() {
         use super::candidate_enumeration::{CandidateOutcome, CandidateReason};
         // Test-only declarations, derived from the small receiver fixture in
@@ -7491,9 +8334,11 @@ mod tests {
             );
         }
         let project = project.build();
+        // This fixture supplies its entire JVM inventory through the test pack.
+        // A discovered host JDK would require additional, unactivated shards.
         let workspace = project.workspace_analyzer(AnalyzerConfig {
             parallelism: Some(1),
-            ..AnalyzerConfig::default()
+            ..brokk_bifrost_analysis::test_support::no_host_jdk_config()
         });
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
         catalog
@@ -7510,6 +8355,7 @@ mod tests {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -7520,7 +8366,8 @@ mod tests {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),
@@ -8283,6 +9130,7 @@ mod tests {
             assert_eq!(result.completion(), baseline.completion());
             let subjects = result
                 .diagnostics
+                .semantic()
                 .iter()
                 .filter(|diagnostic| crate::evaluator::is_call_binding_refusal(diagnostic))
                 .collect::<Vec<_>>();
@@ -8350,6 +9198,7 @@ mod tests {
             for diagnostic in detailed
                 .result
                 .diagnostics
+                .semantic()
                 .iter()
                 .filter(|diagnostic| crate::evaluator::is_call_binding_refusal(diagnostic))
             {
@@ -8533,7 +9382,7 @@ mod tests {
             CodeQueryExecutionScope::whole_workspace().with_refusal_subject_limit(Some(2)),
         );
         let run = session
-            .execute_selector_unit(&units, &selector, query, &project.file("subject.rs"))
+            .execute_selector_unit(&units, &selector, query, &project.file("subject.rs"), &[])
             .unwrap();
         let SelectorUnitRun::Incomplete(rows) = run else {
             panic!("refused selector must return before constructing a publishable product");
@@ -8546,6 +9395,70 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(sites.len(), 6);
         assert!(units.keys.is_empty());
+    }
+
+    #[test]
+    #[hardwon("#10143: method-value sites past the selector result cap fail closed")]
+    fn bound_method_value_sites_respect_the_selector_result_cap() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "subject.go",
+                r#"package subject
+
+type Res struct{}
+func (r *Res) Close() {}
+func OpenRes() *Res { return &Res{} }
+func a() { r := OpenRes(); f := r.Close; f() }
+func b() { r := OpenRes(); f := r.Close; f() }
+"#,
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let selector = resolved_selector(
+            "(language go (call-shape (call :callee (name \"Close\"))))",
+            "/analysis/events/close",
+        );
+        let cancellation = CancellationToken::default();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let budget = PolicyBudget::default();
+
+        // The two method-value calls both select under a wide cap.
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            &flow,
+            "test",
+            budget.query_limits(),
+            16,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let selected = session
+            .select_for_binding(&selector, true)
+            .expect("both method-value sites select under a wide cap");
+        assert_eq!(selected.len(), 2);
+
+        // At a cap of 1 the same compile fails closed instead of returning
+        // an over-limit selection.
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            &flow,
+            "test",
+            budget.query_limits(),
+            1,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let error = session
+            .select_for_binding(&selector, true)
+            .map(|selected| selected.len())
+            .expect_err("two method-value sites exceed the cap of 1");
+        let PolicySelectorSessionError::Incomplete { completion, .. } = error else {
+            panic!("expected Incomplete, got {error:?}");
+        };
+        let CodeQueryCompletion::Incomplete { codes } = completion else {
+            panic!("expected incomplete completion, got {completion:?}");
+        };
+        assert_eq!(codes, vec![CodeQueryDiagnosticCode::ResultLimitReached]);
     }
 
     #[test]
@@ -8638,7 +9551,7 @@ mod tests {
         };
         // Give the located row the proof fields of the model-backed JDK row
         // that was dropped (`File.exists()` in the CodeQL CWE-022 test).
-        value.target = None;
+        value.has_source_target = false;
         value.declared_target_id = None;
         value.target_origin = Some("model");
         value.coverage = "exhaustive";
@@ -8716,7 +9629,7 @@ mod tests {
             if value.binding_kind != Some("receiver") {
                 continue;
             }
-            value.target = None;
+            value.has_source_target = false;
             value.declared_target_id = None;
             value.target_origin = Some("model");
             value.coverage = "exhaustive";
@@ -8894,6 +9807,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
@@ -8906,7 +9820,8 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),

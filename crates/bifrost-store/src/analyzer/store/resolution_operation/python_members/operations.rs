@@ -220,6 +220,7 @@ impl<'query, 'store> PythonMutationQuery<'query, 'store> {
         Ok(())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn with_outcome<T>(
         &self,
         consume: impl FnOnce(&mut MutationOutcome) -> Result<T>,
@@ -271,6 +272,7 @@ impl<'query, 'store> PythonMutationQuery<'query, 'store> {
         answer
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn operations_for_owners(
         &self,
         spelling: &str,
@@ -456,6 +458,7 @@ impl crate::analyzer::store::resolution_typed::SelectedImplicitInputProvider
         Ok(())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn workspace_module_may_shadow(
         &self,
         name: &str,
@@ -533,6 +536,7 @@ impl OperationRow {
     // Receiver disjointness is enough for universe exclusion. Demanding the
     // builtin setter while proving that same builtin would create a cycle.
     // Unresolved candidates stay open; member rows also prove API authority.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn module_receiver(
         &self,
         rules: &PythonRules<'_, '_, '_>,
@@ -704,6 +708,7 @@ pub(in crate::analyzer::store::resolution_operation) fn source_rows(
     Ok(Read::ready(operations))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn lookup_spelling(rules: &PythonRules<'_, '_, '_>, name: SemanticId) -> Result<String> {
     let identity = name
         .shared_name_id()
@@ -732,6 +737,7 @@ pub(super) fn attribute_rows(
     source_rows(half.rules, spelling, &[owner])
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store::resolution_operation) fn import_rows(
     rules: &PythonRules<'_, '_, '_>,
     blob: i64,
@@ -819,6 +825,7 @@ pub(in crate::analyzer::store::resolution_operation) fn universe_rows(
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn late_inventory(
     half: &PythonMemberContext<'_, '_, '_>,
     context: &MemberAccessContext<'_>,
@@ -1256,6 +1263,7 @@ fn structural_mutations(
     Ok(rows.rows.into())
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn read_structural_mutations(
     selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
     summary: i64,
@@ -1763,7 +1771,10 @@ mod tests {
         ) -> Option<crate::analyzer::CodeUnit> {
             None
         }
-        fn external_inventory_providers(&self) -> Vec<String> {
+        fn external_inventory_providers(
+            &self,
+            _: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+        ) -> Vec<String> {
             Vec::new()
         }
         fn active_models(
@@ -1809,6 +1820,10 @@ mod tests {
 
     #[test]
     #[hardwon("#9575: Python mutation reads reused results without dependency evidence")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn python_import_mutation_reads_recheck_selected_context() {
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in_language(
             AnalyzerStore::open_ephemeral().unwrap(),
@@ -1883,11 +1898,9 @@ mod tests {
                 },
             )
         };
-        let limited = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let limited = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            0,
             Some(&cancellation),
         );
         let blob = selection.connection().query_row(
@@ -1924,7 +1937,7 @@ mod tests {
         .unwrap();
         assert!(
             lexical.selection.stopped.is_some(),
-            "zero scope budget must stop the real lexical receiver path"
+            "a zero work allowance must stop the real lexical receiver path"
         );
         let stopped = read(&limited, &cancellation).unwrap();
         assert_eq!(stopped.len(), 1);
@@ -1946,7 +1959,7 @@ mod tests {
         let services = MutationServices::default();
         let bounded =
             ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
-        let budget_before = bounded.remaining_budget().unwrap().max_scope_nodes;
+        let work_before = bounded.finish(()).work().scope_nodes;
         let cohort = query(&selection, &store, Some(&services), &bounded, &cancellation).unwrap();
         assert!(cohort.dynamic_receiver_obligation().unwrap().is_none());
         let class = cohort.outcome.borrow().as_ref().unwrap().rows[0].classes[0];
@@ -1959,9 +1972,9 @@ mod tests {
             mount.fragment(),
             ResolutionSiteId::new(104),
         );
-        let budget_filled = bounded.remaining_budget().unwrap().max_scope_nodes;
+        let work_filled = bounded.finish(()).work().scope_nodes;
         assert!(
-            budget_filled < budget_before,
+            work_filled > work_before,
             "cold cohort must walk the actual receiver binding"
         );
         let refusal_before = services.0.load(std::sync::atomic::Ordering::Relaxed);
@@ -1987,10 +2000,7 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(
-            bounded.remaining_budget().unwrap().max_scope_nodes,
-            budget_filled
-        );
+        assert_eq!(bounded.finish(()).work().scope_nodes, work_filled);
         assert!(
             services.0.load(std::sync::atomic::Ordering::Relaxed) > refusal_before,
             "derived cache hits must refuse retained reuse too"

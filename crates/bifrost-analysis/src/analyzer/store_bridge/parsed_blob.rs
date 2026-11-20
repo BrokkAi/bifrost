@@ -1,5 +1,4 @@
 //! Engine retained-source publication and configured epoch conveniences.
-use super::epoch;
 use crate::CancellationToken;
 use crate::analyzer::store::semantic_ir::semantic_ir_producer_epoch;
 use crate::analyzer::store::*;
@@ -12,7 +11,6 @@ use crate::analyzer::{Language, ProjectFile};
 use crate::hash::HashMap;
 use brokk_bifrost_core::gitblob::BlobKey;
 use std::sync::Arc;
-use tree_sitter::Language as TsLanguage;
 #[doc(hidden)]
 pub trait AnalyzerStoreEngineExt {
     #[allow(clippy::too_many_arguments)]
@@ -26,6 +24,7 @@ pub trait AnalyzerStoreEngineExt {
         state: Arc<FileState>,
         required_existing_additional_storage_languages: &[String],
         cancellation: &CancellationToken,
+        memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<PreparedParsedBlobPreparation>;
 
     #[cfg(any(test, feature = "test-support"))]
@@ -56,11 +55,7 @@ pub trait AnalyzerStoreEngineExt {
         state: Arc<FileState>,
     ) -> Result<PreparedParsedBlob>;
 
-    fn ensure_language_epoch(
-        &self,
-        language: Language,
-        ts_language: &TsLanguage,
-    ) -> Result<GenerationId>;
+    fn ensure_language_epoch<A: LanguageAdapter>(&self, adapter: &A) -> Result<GenerationId>;
 }
 
 impl AnalyzerStoreEngineExt for AnalyzerStore {
@@ -75,6 +70,7 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
         state: Arc<FileState>,
         required_existing_additional_storage_languages: &[String],
         cancellation: &CancellationToken,
+        memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<PreparedParsedBlobPreparation> {
         prepare_parsed_blob_at_generations(
             file,
@@ -85,6 +81,7 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
             state,
             required_existing_additional_storage_languages,
             cancellation,
+            memory_owner,
         )
     }
 
@@ -167,6 +164,7 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
             Arc::new(state.clone()),
             &[],
             &CancellationToken::default(),
+            self.retention_budget(),
         )? {
             PreparedParsedBlobPreparation::Prepared(prepared) => *prepared,
             PreparedParsedBlobPreparation::Cancelled => {
@@ -193,13 +191,9 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
         prepare_parsed_blob(key, generation, adapter, state)
     }
 
-    fn ensure_language_epoch(
-        &self,
-        language: Language,
-        ts_language: &TsLanguage,
-    ) -> Result<GenerationId> {
-        let epoch = epoch::epoch_for(language, ts_language);
-        self.ensure_language_epoch_value(language.config_label(), epoch.as_ref())
+    fn ensure_language_epoch<A: LanguageAdapter>(&self, adapter: &A) -> Result<GenerationId> {
+        let epoch = adapter.canonical_source_epoch(&adapter.parser_language());
+        self.ensure_language_epoch_value(adapter.language().config_label(), epoch.as_ref())
     }
 }
 
@@ -230,6 +224,7 @@ pub fn prepare_parsed_blob<A: LanguageAdapter>(
         state,
         &[],
         &CancellationToken::default(),
+        &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
     )? {
         PreparedParsedBlobPreparation::Prepared(prepared) => Ok(*prepared),
         PreparedParsedBlobPreparation::Cancelled => {
@@ -270,6 +265,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     state: Arc<FileState>,
     required_existing_additional_storage_languages: &[String],
     cancellation: &CancellationToken,
+    memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<PreparedParsedBlobPreparation> {
     assert_eq!(
         key.variant,
@@ -493,8 +489,14 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     // reading has its own dialect and carries no semantic IR rows (C++ only).
     let semantic_ir = match adapter.parse_time_semantic_lowerer() {
         Some(lowerer) if lang == adapter.storage_language_key_for_file(file) => {
-            let Some(prepared) =
-                prepare_parse_time_semantic_ir(lowerer.lowerer(), file, syntax, key, cancellation)?
+            let Some(prepared) = prepare_parse_time_semantic_ir(
+                lowerer.lowerer(),
+                file,
+                syntax,
+                key,
+                cancellation,
+                memory_owner,
+            )?
             else {
                 return Ok(PreparedParsedBlobPreparation::Cancelled);
             };
@@ -537,6 +539,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             Arc::clone(projection_state),
             &[],
             cancellation,
+            memory_owner,
         )?;
         match projection {
             PreparedParsedBlobPreparation::Prepared(projection) => additional.push(*projection),
@@ -585,6 +588,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             Arc::new(projection_state),
             &[],
             cancellation,
+            memory_owner,
         )?;
         match projection {
             PreparedParsedBlobPreparation::Prepared(projection) => additional.push(*projection),
@@ -1203,6 +1207,7 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
             state,
             &[],
             &CancellationToken::default(),
+            self.store.retention_budget(),
         )?;
         let PreparedParsedBlobPreparation::Prepared(prepared) = prepared else {
             return Err(StoreError::new("native Python preparation was cancelled"));

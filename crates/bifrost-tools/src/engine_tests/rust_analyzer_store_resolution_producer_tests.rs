@@ -41,6 +41,282 @@ mod rust_departing_root_tests {
     use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::producer_test_support::ROUTE_ISOLATING_HOLDER;
 
     #[test]
+    #[hardwon(
+        "#10979: detected canonical corruption remained sealed and ordinary sync skipped repair"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: test assertion reads raw persisted publication state"
+    )]
+    fn corrupt_source_read_is_healed_by_next_ordinary_sync() {
+        use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+        use brokk_bifrost_rust::graph_support::RustSource;
+        use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
+        use brokk_bifrost_rust_analysis::analyzer::rust::source_storage::RustSourceStorage;
+
+        const SOURCE: &str = "struct Local; type Alias = Option<Local>; fn target(_: Alias) {}\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='repair-fixture'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", SOURCE)
+            .build();
+        let file = fixture.file("src/lib.rs");
+        let analyzer = RustAnalyzer::new(fixture.certified_project_dyn());
+        let store = analyzer.analyzer_store();
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE.as_bytes()), "rust");
+        let generation = store.current_generation("rust").unwrap();
+        let read = || {
+            store.rust_hierarchy_source_facts(
+                key.oid,
+                generation,
+                &RustAdapter::for_tests(),
+                &file,
+                &|| true,
+            )
+        };
+        let expected = read().unwrap().unwrap();
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let routes = RustSource::file_routes(&analyzer, &file, None).unwrap();
+            assert!(routes.is_complete());
+            assert!(scope.read_completion().is_ok());
+        }
+        store
+            .conn
+            .execute(|conn| {
+                conn.execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER source_rust_type_segments_no_delete_after_seal;
+             DELETE FROM source_rust_type_segments;
+             PRAGMA foreign_keys = ON;",
+                )
+            })
+            .unwrap();
+        let error = read().unwrap_err();
+        assert!(error.is_corrupt(), "{error:?}");
+        let complete = || {
+            store.read_conn().unwrap().query_row(
+            "SELECT is_complete FROM blob_meta JOIN blobs ON blobs.id=blob_id WHERE blob_oid=?1 AND blobs.lang='rust'",
+            [key.oid.to_string()], |row| row.get::<_, bool>(0),
+        ).unwrap()
+        };
+        assert!(
+            !complete(),
+            "the failing reader withdraws exactly its source publication"
+        );
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            match RustSource::file_routes(&analyzer, &file, None) {
+                Ok(routes) => assert!(
+                    !routes.is_complete(),
+                    "withdrawn source cannot prove an empty route answer complete"
+                ),
+                Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {}
+                Err(error) => panic!("unexpected route failure: {error:?}"),
+            }
+            assert!(
+                scope.read_completion().is_err(),
+                "the caller must see typed incompleteness"
+            );
+        }
+        let updated = analyzer.update_all();
+        assert!(complete(), "ordinary sync must publish the repair");
+        assert_eq!(read().unwrap().unwrap(), expected);
+        let scope = AnalyzerQueryScope::new(&updated);
+        let routes = RustSource::file_routes(&updated, &file, None).unwrap();
+        assert!(routes.is_complete());
+        assert!(scope.read_completion().is_ok());
+    }
+
+    #[test]
+    #[hardwon(
+        "#10979: a delayed integrity failure could withdraw a newer repair or a non-corrupt read"
+    )]
+    fn late_integrity_failure_preserves_repairs_and_nonrepairable_errors() {
+        use brokk_bifrost_analysis::analyzer::store::StoreError;
+        use brokk_bifrost_analysis::analyzer::store::derived_publication_test_support as audit;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&directory.path().join("source.db")).unwrap();
+        let adapter = RustAdapter::for_tests();
+        let source = "pub fn target() {}\n";
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(source.as_bytes()), "rust");
+        let state = parsed_fixture_state(&adapter, "src/lib.rs", source);
+        store.write_parsed_blob(&key, &adapter, &state).unwrap();
+        let generation = store.current_generation("rust").unwrap();
+        let before = audit::source_publications(&store, std::slice::from_ref(&key));
+        let repair = AnalyzerStore::prepare_parsed_blob(&key, generation, &adapter, state).unwrap();
+        let result: Result<(), _> = store.read_blob_source_transaction(&key, generation, |_| {
+            store.repair_prepared_blob(repair)?;
+            Err(StoreError::corrupt("the old read detected damaged source"))
+        });
+        assert!(result.unwrap_err().is_corrupt());
+        let after = audit::source_publications(&store, std::slice::from_ref(&key));
+        assert_eq!(after.len(), 1);
+        assert_ne!(before, after, "the concurrent repair mints its own nonce");
+        for error in [
+            StoreError::stale_resolution("selected source moved"),
+            StoreError::cancelled("source read cancelled"),
+            StoreError::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(5),
+                None,
+            )),
+        ] {
+            let expected = error.clone();
+            let result: Result<(), _> =
+                store.read_blob_source_transaction(&key, generation, |_| Err(error));
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(
+                audit::source_publications(&store, std::slice::from_ref(&key)),
+                after
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#10979: derived admission must trust its seal without repeating canonical integrity reads"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: test assertion reads raw persisted publication state"
+    )]
+    fn sealed_derived_admission_does_not_recount_corrupt_source() {
+        use brokk_bifrost_analysis::analyzer::store::derived_publication_test_support as audit;
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let adapter = RustAdapter::for_tests();
+        let source = "struct Local; type Alias = Option<Local>;\n";
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(source.as_bytes()), "rust");
+        let state = parsed_fixture_state(&adapter, "src/lib.rs", source);
+        store.write_parsed_blob(&key, &adapter, &state).unwrap();
+        let generation = store.current_generation("rust").unwrap();
+        let source = audit::source_publications(&store, std::slice::from_ref(&key));
+        let prepared =
+            AnalyzerStore::prepare_parsed_blob(&key, generation, &adapter, state).unwrap();
+        store
+            .conn
+            .execute(|conn| {
+                conn.execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER source_rust_type_segments_no_delete_after_seal;
+             DELETE FROM source_rust_type_segments;
+             PRAGMA foreign_keys = ON;",
+                )
+            })
+            .unwrap();
+        let (outcomes, _) = audit::publish_without_source_recount(
+            &store,
+            prepared.preserve_source_publications(&source),
+        );
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+        assert_eq!(
+            audit::source_publications(&store, std::slice::from_ref(&key)),
+            source
+        );
+        assert_eq!(
+            store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM source_rust_type_segments",
+                    [],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+            0,
+            "derived publication cannot silently repair source"
+        );
+    }
+
+    #[test]
+    fn rust_impl_scope_and_include_invocation_rows_round_trip() {
+        const SOURCE: &str = r#"
+struct Thing;
+impl Thing { fn module_method() {} }
+trait Marker { fn body_method(); }
+fn outer() { impl Marker for Thing { fn body_method() {} } }
+macro_rules! items { ($($item:item)*) => { $($item)* }; }
+items! { impl Thing { fn replayed_method() {} } }
+include!("part.rs");
+"#;
+        let state = parsed_fixture_state(&RustAdapter::for_tests(), "src/lib.rs", SOURCE);
+        let source = state.source_facts.as_ref().unwrap();
+        let items = &source.rust_items;
+        assert_eq!(
+            items.impls.len(),
+            3,
+            "fixture includes a replayed impl: {items:?}"
+        );
+        assert_eq!(items.native_impl_scopes.len(), 2);
+        let mut expected = items
+            .impls
+            .iter()
+            .map(|item| {
+                let scope = items
+                    .native_impl_scopes
+                    .iter()
+                    .find(|(declaration, _)| *declaration == item.declaration)
+                    .map(|(_, scope)| scope.get());
+                (item.declaration.get(), scope)
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        let scopes = items
+            .native_impl_scopes
+            .iter()
+            .map(|(_, scope)| state.resolution_facts.scopes[scope.index()].kind)
+            .collect::<Vec<_>>();
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind;
+        assert_eq!(
+            scopes,
+            [
+                ResolutionScopeKind::CompilationUnit,
+                ResolutionScopeKind::Executable
+            ]
+        );
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        persist_alias_fixture(
+            &store,
+            oid(SOURCE),
+            "rust",
+            &RustAdapter::for_tests(),
+            "src/lib.rs",
+            SOURCE,
+        );
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE), "rust");
+        assert_eq!(
+            store.rust_usage_facts(&key).unwrap().include_edges,
+            state.rust_usage_facts.include_edges,
+        );
+        let expected_invocation = state.rust_usage_facts.include_edges[0]
+            .invocation_occurrence_id
+            .map(|id| id.get());
+        let macro_invocations = items
+            .macros
+            .iter()
+            .map(|item| item.invocation.get())
+            .collect::<Vec<_>>();
+        store.conn.execute(move |conn| {
+            let actual = conn.prepare("SELECT declaration,enclosing_scope FROM resolution_rust_impl_declarations ORDER BY declaration").unwrap()
+                .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<u32>>(1)?))).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(actual, expected);
+            let unknown = actual.iter().find(|(_, scope)| scope.is_none()).unwrap().0;
+            // A scope reader must require a known attachment. NULL cannot
+            // discharge lexical ownership for a replayed declaration.
+            let known: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM resolution_rust_impl_declarations WHERE declaration=?1 AND enclosing_scope IS NOT NULL)", [unknown], |row| row.get(0)).unwrap();
+            assert!(!known);
+            let invocation: u32 = conn.query_row("SELECT invocation_occurrence_id FROM rust_include_edges", [], |row| row.get(0)).unwrap();
+            assert_eq!(Some(invocation), expected_invocation);
+            assert!(macro_invocations.contains(&invocation));
+        });
+    }
+
+    #[test]
     fn rust_attribute_macro_argument_keeps_its_primary_source_provenance() {
         let source = r#"
 mod setup {
@@ -182,7 +458,12 @@ fn bench() {}
             .unwrap();
             failed.inject_invalid_range_for_test();
             let (outcomes, _) =
-                store.persist_prepared_blobs(vec![failed], PersistBatchTargets::PRODUCTION);
+                brokk_bifrost_analysis::analyzer::store::test_support::repair_prepared_blobs(
+                    &store,
+                    vec![failed],
+                    &CancellationToken::default(),
+                    PersistBatchTargets::PRODUCTION,
+                );
             assert!(outcomes[0].error.is_some());
             assert_eq!(
                 store
@@ -727,6 +1008,10 @@ fn bench() {}
             .zip(snapshot.family_counts)
             .collect::<Vec<_>>();
         let catalogs = [
+            (
+                "expected_rust_impl_declaration_count",
+                "resolution_rust_impl_declarations",
+            ),
             (
                 "expected_rust_reference_context_count",
                 "resolution_rust_reference_contexts",

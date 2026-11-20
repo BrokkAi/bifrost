@@ -96,6 +96,7 @@ mod js_ts_extraction_tests {
             _prepared: &PreparedSyntaxTree,
             _budget: &SemanticBudget,
             cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+            _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
         ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             match self.mode {
@@ -144,6 +145,7 @@ mod js_ts_extraction_tests {
             _prepared: &PreparedSyntaxTree,
             _budget: &SemanticBudget,
             _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+            _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
         ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
             panic!("artifact-key lookup must not invoke semantic lowering")
         }
@@ -192,6 +194,7 @@ mod js_ts_extraction_tests {
             _prepared: &PreparedSyntaxTree,
             _budget: &SemanticBudget,
             _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+            _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
         ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered
@@ -225,8 +228,13 @@ mod js_ts_extraction_tests {
         file: &ProjectFile,
         max_source_bytes: usize,
     ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
-        current_artifact_source_with_lowerer(analyzer, lowerer, file, max_source_bytes)
-            .map(|snapshot| snapshot.map(|snapshot| snapshot.key().clone()))
+        current_artifact_source_with_lowerer(analyzer, lowerer, file, max_source_bytes).and_then(
+            |snapshot| {
+                snapshot
+                    .map(|snapshot| snapshot.key().clone())
+                    .held_or_refused()
+            },
+        )
     }
     fn materialize(
         analyzer: &TreeSitterAnalyzer<TypescriptAdapter>,
@@ -425,6 +433,8 @@ mod js_ts_extraction_tests {
             let _scope = AnalyzerQueryScope::new(&analyzer);
             current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len())
                 .expect("first artifact source lookup")
+                .held_or_refused()
+                .unwrap()
                 .expect("first artifact source")
         };
         let first_key = first.key().clone();
@@ -456,6 +466,8 @@ mod js_ts_extraction_tests {
             let _scope = AnalyzerQueryScope::new(&analyzer);
             current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len())
                 .expect("second artifact source lookup")
+                .held_or_refused()
+                .unwrap()
                 .expect("second artifact source")
         };
         assert_eq!(second.source(), source);
@@ -466,11 +478,11 @@ mod js_ts_extraction_tests {
         assert_ne!(artifact.key(), second.key());
 
         let _scope = AnalyzerQueryScope::new(&analyzer);
-        assert!(
-            current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len() - 1,)
-                .expect("bounded overlay lookup")
-                .is_none()
-        );
+        assert!(matches!(
+            current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, source.len() - 1)
+                .expect("bounded overlay lookup"),
+            brokk_bifrost_analysis::analyzer::semantic::SemanticArtifactSourceOutcome::Refused(_)
+        ));
     }
     #[test]
     fn complete_cache_reuses_arc_but_charges_each_request() {
@@ -1387,6 +1399,8 @@ mod js_ts_extraction_tests {
 
         let current = current_artifact_source_with_lowerer(&analyzer, &lowerer, &file, usize::MAX)
             .expect("current artifact source lookup")
+            .held_or_refused()
+            .unwrap()
             .expect("current artifact source");
         assert_eq!(current.source(), "export const value = 1;\n");
         let current = current.key().clone();
@@ -1646,6 +1660,7 @@ mod js_ts_extraction_tests {
                 _prepared: &PreparedSyntaxTree,
                 budget: &SemanticBudget,
                 _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+                _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
             ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>
             {
                 let work = SemanticWork {

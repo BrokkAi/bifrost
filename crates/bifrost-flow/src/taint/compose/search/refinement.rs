@@ -378,39 +378,12 @@ where
             };
             let seed = super::super::report::interior_seed(&self.inputs.sources, &from)
                 .expect("a recorded seed is a source or port");
-            let (observations, target) = match &to {
-                Endpoint::StoreWrite(write) => {
-                    let writes = self.provider.store_writes();
-                    let write = &writes[*write];
-                    (
-                        vec![InteriorObservation::Sink {
-                            point: write.point,
-                            phase: write.phase,
-                            carrier: write.carrier.clone(),
-                        }],
-                        InteriorTarget::Observation(0),
-                    )
-                }
-                Endpoint::Sink(sink) => (
-                    vec![super::super::report::interior_observation(
-                        self.value_flow.expect("value refinement has a value plan"),
-                        *sink,
-                    )],
-                    InteriorTarget::Observation(0),
-                ),
-                Endpoint::Location(location) => (
-                    vec![InteriorObservation::Location(location.clone())],
-                    InteriorTarget::Observation(0),
-                ),
-                Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
-                Endpoint::Source(_)
-                | Endpoint::Execution(_)
-                | Endpoint::Object(_)
-                | Endpoint::Writeback { .. }
-                | Endpoint::CallHandoff { .. } => {
-                    unreachable!("a recorded output is not a source or execution")
-                }
-            };
+            let (observations, target) = super::super::report::interior_endpoint_observation(
+                self.value_flow,
+                &to,
+                |write| self.inputs.store_writes[write].clone(),
+            )
+            .expect("a recorded output is not a source or execution");
             let flows = if stored {
                 self.provider.stored_interior_flows(
                     procedure,
@@ -524,6 +497,7 @@ where
         procedure: &DurableProcedureKey,
         uncertain: bool,
         crossed: &[Box<[CallSiteId]>],
+        target: &Endpoint,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(HopQuality, Box<[CallSiteId]>), ComposeError> {
         let extra = crossed
@@ -538,9 +512,9 @@ where
             })
             .collect::<HashSet<_>>();
         self.extra_proof_lookups += extra.len();
-        // This only reads continuation evidence. It never calls descend,
+        // This reads continuation and selected-model evidence. It never calls descend,
         // process_item or add_item, hence cannot expand the frozen topology.
-        self.flow_quality(procedure, uncertain, crossed, request)
+        self.flow_quality(procedure, uncertain, crossed, target, request)
     }
 
     fn refine_hop(
@@ -620,6 +594,7 @@ where
                             procedure,
                             flow.uncertain,
                             &flow.crossed,
+                            &Endpoint::Port(to.clone()),
                             request,
                         )?;
                         Some(Hop::Stored {
@@ -672,40 +647,12 @@ where
                     }
                     _ => unreachable!("an interior seed is a source or input port"),
                 };
-                let observations = match to {
-                    Endpoint::StoreWrite(write) => {
-                        let writes = self.provider.store_writes();
-                        let write = &writes[*write];
-                        vec![InteriorObservation::Sink {
-                            point: write.point,
-                            phase: write.phase,
-                            carrier: write.carrier.clone(),
-                        }]
-                    }
-                    Endpoint::Sink(id) => {
-                        let sink = self
-                            .value_flow
-                            .expect("value refinement has a value plan")
-                            .sink(*id)
-                            .expect("a recorded sink is in its plan");
-                        vec![InteriorObservation::Sink {
-                            point: sink.point().id(),
-                            phase: sink.phase(),
-                            carrier: sink.carrier().clone(),
-                        }]
-                    }
-                    Endpoint::Location(location) => {
-                        vec![InteriorObservation::Location(location.clone())]
-                    }
-                    Endpoint::Port(_) => Vec::new(),
-                    Endpoint::Source(_)
-                    | Endpoint::Execution(_)
-                    | Endpoint::Object(_)
-                    | Endpoint::Writeback { .. }
-                    | Endpoint::CallHandoff { .. } => {
-                        unreachable!("an interior output is not a source or execution")
-                    }
-                };
+                let (observations, target) = super::super::report::interior_endpoint_observation(
+                    self.value_flow,
+                    to,
+                    |write| self.inputs.store_writes[write].clone(),
+                )
+                .expect("an interior output is not a source or execution");
                 let projections = self
                     .provider
                     .projected_interior_flows(procedure, &[seed], &observations, false, request)
@@ -728,13 +675,7 @@ where
                         reason,
                     });
                 }
-                let flow = flows.flows.iter().find(|flow| match (&flow.target, to) {
-                    (InteriorTarget::Port(port), Endpoint::Port(target)) => port == target,
-                    (InteriorTarget::Observation(0), Endpoint::Sink(_) | Endpoint::Location(_)) => {
-                        true
-                    }
-                    _ => false,
-                });
+                let flow = flows.flows.iter().find(|flow| flow.target == target);
                 match flow {
                     // An unavailable projection cannot prove a barrier killed
                     // the original path. Keep its positive evidence partial.
@@ -765,6 +706,7 @@ where
                             procedure,
                             flow.uncertain,
                             &flow.crossed,
+                            to,
                             request,
                         )?;
                         Some(Hop::Interior {

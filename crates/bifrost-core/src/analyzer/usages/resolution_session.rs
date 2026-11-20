@@ -50,13 +50,32 @@ impl<T> BoundedResolution<T> {
     }
 }
 
-/// An exceeded or cancelled resolution is execution dependent by its shape;
-/// [`ResolutionSession::finish`] marks exactly these. A complete value can
+/// The reasons a session reports through [`ResolutionSession::mark_unavailable`].
+/// Each is execution dependent, as the budget stops they replaced were: the
+/// incompleteness may come from the files or providers a request happened to
+/// see. A reason outside this list is not a session stop.
+pub const SESSION_UNAVAILABLE_REASONS: [&str; 5] = [
+    "provider_rows_incomplete",
+    "csharp_unresolved_ancestry",
+    "csharp_unseeded_variable_declarator",
+    "php_source_facts_unavailable",
+    "ruby_cross_language_lookup",
+];
+
+/// An exceeded, cancelled or store-failed resolution is execution dependent;
+/// [`ResolutionSession::finish`] marks these. A complete value can
 /// still depend on a caller's cancellation, which only the session's own
 /// verdict reports.
 impl<T> CarriesReuseVerdict for BoundedResolution<T> {
     fn reuse_verdict(&self) -> ReuseVerdict {
         match self {
+            Self::Unavailable {
+                reason: "native_store_error",
+                ..
+            } => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            Self::Unavailable { reason, .. } if SESSION_UNAVAILABLE_REASONS.contains(reason) => {
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+            }
             Self::Complete { .. } | Self::Unavailable { .. } => ReuseVerdict::Content,
             Self::Exceeded { .. } | Self::Cancelled { .. } => {
                 ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
@@ -69,6 +88,10 @@ impl<T> CarriesReuseVerdict for BoundedResolution<T> {
 enum ResolutionStop {
     Exceeded(ReceiverBudgetLimit),
     Cancelled,
+    StoreFailure,
+    /// The session cannot prove its answer. This is a terminal fact about the
+    /// input, not a work refusal.
+    Unavailable(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,6 +103,18 @@ struct ResolutionState {
 }
 
 impl ResolutionState {
+    fn for_request(work: ReceiverAnalysisWork) -> Self {
+        let mut state = Self {
+            work,
+            ..Self::default()
+        };
+        if crate::analyzer::carried_context::request_store_failed() {
+            state.stop = Some(ResolutionStop::StoreFailure);
+            state.join_execution_dependence();
+        }
+        state
+    }
+
     /// Mark the ambient capture and keep the same verdict for the caller.
     #[track_caller]
     fn join_execution_dependence(&mut self) {
@@ -163,7 +198,7 @@ impl ResolutionSession {
             total_work_limit: None,
             cancellation: None,
             call_cancellation: RefCell::new(Vec::new()),
-            state: RefCell::new(ResolutionState::default()),
+            state: RefCell::new(ResolutionState::for_request(ReceiverAnalysisWork::default())),
             expanded_owners: RefCell::default(),
         }
     }
@@ -179,7 +214,7 @@ impl ResolutionSession {
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
             call_cancellation: RefCell::new(Vec::new()),
-            state: RefCell::new(ResolutionState::default()),
+            state: RefCell::new(ResolutionState::for_request(ReceiverAnalysisWork::default())),
             expanded_owners: RefCell::default(),
         }
     }
@@ -197,7 +232,7 @@ impl ResolutionSession {
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
             call_cancellation: RefCell::new(Vec::new()),
-            state: RefCell::new(ResolutionState::default()),
+            state: RefCell::new(ResolutionState::for_request(ReceiverAnalysisWork::default())),
             expanded_owners: RefCell::default(),
         }
     }
@@ -212,7 +247,6 @@ impl ResolutionSession {
         cancellation: Option<&CancellationToken>,
         shared_work: ReceiverAnalysisWork,
     ) -> Self {
-        assert!(shared_work.scope_nodes <= budget.max_scope_nodes);
         assert!(shared_work.summary_expansions <= budget.max_summary_expansions);
         assert!(shared_work.resolution_rounds <= budget.max_resolution_rounds);
         assert!(shared_work.hierarchy_order_steps <= budget.max_hierarchy_order_work);
@@ -223,11 +257,7 @@ impl ResolutionSession {
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
             call_cancellation: RefCell::new(Vec::new()),
-            state: RefCell::new(ResolutionState {
-                work: shared_work,
-                stop: None,
-                reuse: ReuseVerdict::Content,
-            }),
+            state: RefCell::new(ResolutionState::for_request(shared_work)),
             expanded_owners: RefCell::default(),
         }
     }
@@ -271,7 +301,15 @@ impl ResolutionSession {
         session.is_none_or(Self::scope_step)
     }
 
+    /// The terminal status together with the value built before it. A caller
+    /// that can state its partial result as incomplete keeps the finished work
+    /// instead of discarding it as [`Self::finish`] does.
+    pub fn finish_keeping<T>(&self, value: T) -> (BoundedResolution<()>, T) {
+        (self.finish(()), value)
+    }
+
     pub fn finish<T>(&self, value: T) -> BoundedResolution<T> {
+        self.observe_store_failure();
         self.observe_cancellation();
         let state = {
             let mut state = self.state.borrow_mut();
@@ -286,6 +324,14 @@ impl ResolutionSession {
                 work: state.work,
             },
             Some(ResolutionStop::Cancelled) => BoundedResolution::Cancelled { work: state.work },
+            Some(ResolutionStop::StoreFailure) => BoundedResolution::Unavailable {
+                reason: "native_store_error",
+                work: state.work,
+            },
+            Some(ResolutionStop::Unavailable(reason)) => BoundedResolution::Unavailable {
+                reason,
+                work: state.work,
+            },
             None => BoundedResolution::Complete {
                 value,
                 work: state.work,
@@ -301,8 +347,17 @@ impl ResolutionSession {
         )
     }
 
+    /// Count one scope step. Visiting syntax and rows is work and never
+    /// refuses (#13216): only cancellation, a deadline or the opt-in aggregate
+    /// work cap stops a session.
     pub fn scope_step(&self) -> bool {
-        self.charge(ReceiverBudgetLimit::ScopeNodes)
+        match self.admit() {
+            Admission::Settled(admitted) => admitted,
+            Admission::Open(mut state, _) => {
+                state.work.scope_nodes += 1;
+                true
+            }
+        }
     }
 
     pub fn hierarchy_order_step(&self) -> bool {
@@ -391,18 +446,22 @@ impl ResolutionSession {
     }
 
     pub fn query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
+        self.observe_store_failure();
         if !self.scope_step() {
             return None;
         }
         let value = query();
+        self.observe_store_failure();
         self.observe_cancellation().then_some(value)
     }
 
     pub fn summary_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
+        self.observe_store_failure();
         if !self.summary_step() {
             return None;
         }
         let value = query();
+        self.observe_store_failure();
         self.observe_cancellation().then_some(value)
     }
 
@@ -418,23 +477,26 @@ impl ResolutionSession {
         self.track_rows(rows)
     }
 
-    /// Runs a provider query whose source-row inspection is capped before it
-    /// allocates the complete result set.
+    /// Runs a provider query and counts the rows it inspects as scope steps.
     ///
-    /// The provider receives one lookahead row beyond the remaining scope
-    /// budget. Seeing that row proves exhaustion without silently truncating a
-    /// complete answer. Provider-reported source rows are charged even when
+    /// The lookahead limit is unlimited unless an explicit total-work cap is
+    /// set; scope steps themselves never refuse. An incomplete batch is the
+    /// provider's own incompleteness (omitted files, an unreadable blob): the
+    /// session stops as `Unavailable("provider_rows_incomplete")`, which is
+    /// execution dependent. Provider-reported source rows are counted even when
     /// liveness filtering produces fewer `rows`; live-path expansion is
-    /// charged via `rows.len()`.
+    /// counted via `rows.len()`.
     pub fn query_limited_rows<T>(
         &self,
         query: impl FnOnce(usize) -> LimitedQueryRows<T>,
     ) -> Vec<T> {
+        self.observe_store_failure();
         if !self.scope_step() {
             return Vec::new();
         }
         let limit = self.scope_lookahead_limit();
         let batch = query(limit);
+        self.observe_store_failure();
         if !self.observe_cancellation() {
             return Vec::new();
         }
@@ -445,7 +507,13 @@ impl ResolutionSession {
             }
         }
         if !batch.complete {
-            self.mark_scope_incomplete();
+            // The lookahead is `usize::MAX` unless an opt-in total-work cap
+            // limits it, and a capped lookahead reaches the provider's limit
+            // only after the charge loop above has already stopped on
+            // `TotalWork`. An incomplete batch that survives the loop is
+            // therefore the provider's own incompleteness (omitted workspace
+            // files, an unreadable blob), which is not a budget stop.
+            self.mark_unavailable("provider_rows_incomplete");
             return Vec::new();
         }
         batch.rows
@@ -463,7 +531,11 @@ impl ResolutionSession {
             && self.cancellation.is_none()
             && self.call_cancellation.borrow().is_empty()
         {
-            return rows;
+            return if matches!(self.state.borrow().stop, Some(ResolutionStop::StoreFailure)) {
+                Vec::new()
+            } else {
+                rows
+            };
         }
         for _ in &rows {
             if !self.scope_step() {
@@ -478,7 +550,7 @@ impl ResolutionSession {
             && self.cancellation.is_none()
             && self.call_cancellation.borrow().is_empty()
         {
-            return true;
+            return !matches!(self.state.borrow().stop, Some(ResolutionStop::StoreFailure));
         }
         let mut state = self.state.borrow_mut();
         if state.stop.is_none()
@@ -527,7 +599,6 @@ impl ResolutionSession {
             let mut budget = budget.remaining_after(&state.work);
             if let Some(total_work_limit) = self.total_work_limit {
                 let remaining_total = total_work_limit.saturating_sub(total_work(&state.work));
-                budget.max_scope_nodes = budget.max_scope_nodes.min(remaining_total);
                 budget.max_hierarchy_order_work =
                     budget.max_hierarchy_order_work.min(remaining_total);
                 budget.max_summary_expansions = budget.max_summary_expansions.min(remaining_total);
@@ -537,20 +608,45 @@ impl ResolutionSession {
         })
     }
 
+    /// The budget fields that define a question, as opposed to its work
+    /// allowances: receiver context depth and the target cap. They are constant
+    /// for a session, so a memo key may bind them.
+    pub fn question_parameters(&self) -> Option<(usize, usize)> {
+        self.budget
+            .map(|budget| (budget.context_depth, budget.max_targets))
+    }
+
     /// Preserve a nested resolver's terminal budget reason in this request.
     pub fn mark_exceeded(&self, limit: ReceiverBudgetLimit) {
         self.stop(ResolutionStop::Exceeded(limit));
     }
 
-    /// Maximum provider rows needed to either consume the remaining scope
-    /// budget or observe the first row that proves exhaustion.
+    /// A provider failed during this session; later reads cannot recover it.
+    pub fn mark_store_failure(&self) {
+        self.stop(ResolutionStop::StoreFailure);
+    }
+
+    fn observe_store_failure(&self) {
+        if crate::analyzer::carried_context::request_store_failed() {
+            self.mark_store_failure();
+        }
+    }
+
+    /// The row limit handed to a provider query: unlimited, except that an
+    /// explicit total-work cap bounds it to the remaining work plus one row.
+    /// Scope steps have no allowance of their own.
     pub fn scope_lookahead_limit(&self) -> usize {
         self.remaining_scope_steps().saturating_add(1)
     }
 
-    pub fn mark_scope_incomplete(&self) {
-        let limit = self.scope_binding_limit();
-        self.stop(ResolutionStop::Exceeded(limit));
+    /// Stop the session because it cannot prove its answer. The incompleteness
+    /// is reported as `BoundedResolution::Unavailable` with `reason`.
+    pub fn mark_unavailable(&self, reason: &'static str) {
+        assert!(
+            SESSION_UNAVAILABLE_REASONS.contains(&reason),
+            "unregistered session stop reason {reason}"
+        );
+        self.stop(ResolutionStop::Unavailable(reason));
     }
 
     fn remaining_scope_steps(&self) -> usize {
@@ -558,30 +654,9 @@ impl ResolutionSession {
         if state.stop.is_some() {
             return 0;
         }
-        self.budget.map_or(usize::MAX, |budget| {
-            let axis_remaining = budget
-                .max_scope_nodes
-                .saturating_sub(state.work.scope_nodes);
-            self.total_work_limit.map_or(axis_remaining, |limit| {
-                axis_remaining.min(limit.saturating_sub(total_work(&state.work)))
-            })
+        self.total_work_limit.map_or(usize::MAX, |limit| {
+            limit.saturating_sub(total_work(&state.work))
         })
-    }
-
-    fn scope_binding_limit(&self) -> ReceiverBudgetLimit {
-        let Some(budget) = self.budget else {
-            return ReceiverBudgetLimit::ScopeNodes;
-        };
-        let state = self.state.borrow();
-        let axis_remaining = budget
-            .max_scope_nodes
-            .saturating_sub(state.work.scope_nodes);
-        match self.total_work_limit {
-            Some(limit) if limit.saturating_sub(total_work(&state.work)) <= axis_remaining => {
-                ReceiverBudgetLimit::TotalWork
-            }
-            _ => ReceiverBudgetLimit::ScopeNodes,
-        }
     }
 
     fn stop(&self, stop: ResolutionStop) {
@@ -590,26 +665,34 @@ impl ResolutionSession {
         if state.stop.is_none() {
             state.stop = Some(stop);
             drop(state);
-            if matches!(stop, ResolutionStop::Exceeded(_))
-                && let Some(cancellation) = self.cancellation.as_ref()
+            if matches!(
+                stop,
+                ResolutionStop::Exceeded(_) | ResolutionStop::Unavailable(_)
+            ) && let Some(cancellation) = self.cancellation.as_ref()
             {
                 cancellation.cancel();
             }
         }
     }
 
-    fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
+    /// The checks every step shares: store failure, cancellation and the opt-in
+    /// aggregate work cap. `Open` hands back the session state for the caller
+    /// to add its own work to.
+    fn admit(&self) -> Admission<'_> {
         if self.budget.is_none()
             && self.cancellation.is_none()
             && self.call_cancellation.borrow().is_empty()
         {
-            return true;
+            return Admission::Settled(!matches!(
+                self.state.borrow().stop,
+                Some(ResolutionStop::StoreFailure)
+            ));
         }
         if !self.observe_cancellation() {
-            return false;
+            return Admission::Settled(false);
         }
         let Some(budget) = self.budget else {
-            return true;
+            return Admission::Settled(true);
         };
         let mut state = self.state.borrow_mut();
         if let Some(Err(refused)) = self.total_work_limit.map(|maximum| {
@@ -626,12 +709,17 @@ impl ResolutionSession {
                 .as_ref()
                 .expect("a bounded session has an operation cancellation token")
                 .cancel();
-            return false;
+            return Admission::Settled(false);
         }
+        Admission::Open(state, budget)
+    }
+
+    fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
+        let (mut state, budget) = match self.admit() {
+            Admission::Settled(admitted) => return admitted,
+            Admission::Open(state, budget) => (state, budget),
+        };
         let (used, maximum) = match limit {
-            ReceiverBudgetLimit::ScopeNodes => {
-                (&mut state.work.scope_nodes, budget.max_scope_nodes)
-            }
             ReceiverBudgetLimit::SummaryExpansions => (
                 &mut state.work.summary_expansions,
                 budget.max_summary_expansions,
@@ -645,6 +733,9 @@ impl ResolutionSession {
                 budget.max_hierarchy_order_work,
             ),
             ReceiverBudgetLimit::TotalWork => unreachable!("aggregate work is checked above"),
+            ReceiverBudgetLimit::ResidentRows => {
+                unreachable!("residency is admitted by the semantic budget")
+            }
         };
         if let Err(refused) =
             crate::analyzer::work_budget::LimitedCounter::from_usage(*used, maximum).try_allow(1)
@@ -664,6 +755,15 @@ impl ResolutionSession {
     }
 }
 
+enum Admission<'a> {
+    /// The step is already decided.
+    Settled(bool),
+    Open(
+        std::cell::RefMut<'a, ResolutionState>,
+        ReceiverAnalysisBudget,
+    ),
+}
+
 /// Every execution dependence this session has marked so far: its stops,
 /// refused limits and observed caller cancellations. A caller joins it into
 /// the answer it builds from the session's lookups.
@@ -681,6 +781,79 @@ fn total_work(work: &ReceiverAnalysisWork) -> usize {
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#11775: a workspace-status store failure allowed a repeated lookup to recover in the same request"
+    )]
+    fn store_failure_stops_provider_retries_and_unbounded_sessions() {
+        use crate::analyzer::carried_context::{
+            RequestCompletion, push_request_state_with_completion,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Completion(AtomicBool);
+        impl RequestCompletion for Completion {
+            fn store_failed(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+        let owner = Arc::new(Completion(AtomicBool::new(false)));
+        let _request = push_request_state_with_completion(Some(owner.clone()));
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        assert!(
+            session
+                .query(|| {
+                    owner.0.store(true, Ordering::Relaxed);
+                    1
+                })
+                .is_none()
+        );
+        assert!(
+            session
+                .query(|| panic!("failed request retried its provider"))
+                .is_none()
+        );
+        let result = session.finish(());
+        assert!(matches!(
+            result,
+            BoundedResolution::Unavailable {
+                reason: "native_store_error",
+                ..
+            }
+        ));
+        assert_eq!(
+            result.reuse_verdict(),
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+        );
+        let repeated = ResolutionSession::unbounded();
+        assert!(
+            repeated
+                .query(|| panic!("new session ignored the failed request"))
+                .is_none()
+        );
+        assert!(matches!(
+            repeated.finish(()),
+            BoundedResolution::Unavailable {
+                reason: "native_store_error",
+                ..
+            }
+        ));
+        let _fresh =
+            push_request_state_with_completion(Some(Arc::new(Completion(AtomicBool::new(false)))));
+        let fresh = ResolutionSession::unbounded();
+        assert_eq!(fresh.query(|| 7), Some(7));
+        assert!(matches!(
+            fresh.finish(()),
+            BoundedResolution::Complete { value: (), .. }
+        ));
+        fresh.mark_store_failure();
+        assert!(
+            fresh
+                .query(|| panic!("explicit store stop was ignored without a budget"))
+                .is_none()
+        );
+    }
 
     #[test]
     fn call_cancellation_does_not_latch_operation_stop() {
@@ -793,20 +966,15 @@ mod tests {
         token.cancel();
         assert!(!token_only.charge_work(&none));
 
-        let stopped = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
-                ..ReceiverAnalysisBudget::default()
-            },
-            None,
-        );
+        let stopped =
+            ResolutionSession::bounded_with_total_work(ReceiverAnalysisBudget::default(), 1, None);
         assert!(stopped.scope_step());
         assert!(!stopped.scope_step());
         assert!(!stopped.charge_work(&none));
         assert!(matches!(
             stopped.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::TotalWork,
                 ..
             }
         ));
@@ -853,7 +1021,6 @@ mod tests {
         assert!(unbounded.hierarchy_order_steps(2));
         assert_eq!(unbounded.finish(()).work(), ReceiverAnalysisWork::default());
         let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 1,
             max_hierarchy_order_work: 1,
             ..ReceiverAnalysisBudget::default()
         };
@@ -867,13 +1034,19 @@ mod tests {
                 ..
             }
         ));
+        // Scope steps are telemetry: they count and never refuse (#13216).
         let scope = ResolutionSession::bounded(budget, None);
-        assert!(scope.scope_step());
-        assert!(!scope.scope_step());
+        for _ in 0..100 {
+            assert!(scope.scope_step());
+        }
+        assert!(scope.scope_steps(1_000));
         assert!(matches!(
             scope.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+            BoundedResolution::Complete {
+                work: ReceiverAnalysisWork {
+                    scope_nodes: 1_100,
+                    ..
+                },
                 ..
             }
         ));
@@ -943,46 +1116,29 @@ mod tests {
     }
 
     #[test]
-    #[hardwon("011426732633: bulk scope resolution failed to charge bounded work")]
-    fn bulk_scope_charges_preserve_budgets_and_skip_unbounded_work() {
-        let unbounded = ResolutionSession::unbounded();
-        assert!(unbounded.scope_steps(usize::MAX));
-        assert_eq!(unbounded.finish(()).work(), ReceiverAnalysisWork::default());
-        for count in 0..=5 {
-            let budget = ReceiverAnalysisBudget {
-                max_scope_nodes: 3,
-                ..ReceiverAnalysisBudget::default()
-            };
-            let bulk = ResolutionSession::bounded(budget, None);
-            let individual = ResolutionSession::bounded(budget, None);
+    fn every_session_unavailable_stop_is_execution_dependent() {
+        for reason in SESSION_UNAVAILABLE_REASONS {
+            let session = ResolutionSession::unbounded();
+            session.mark_unavailable(reason);
+            let result = session.finish(());
+            assert!(matches!(
+                result,
+                BoundedResolution::Unavailable { reason: seen, .. } if seen == reason
+            ));
             assert_eq!(
-                bulk.scope_steps(count),
-                (0..count).all(|_| individual.scope_step())
-            );
-            assert_eq!(bulk.finish(()).work(), individual.finish(()).work());
-            assert_eq!(
-                bulk.cancellation().unwrap().is_cancelled(),
-                individual.cancellation().unwrap().is_cancelled()
+                result.reuse_verdict(),
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+                "{reason}"
             );
         }
-        let caller = CancellationToken::new();
-        let cancelled =
-            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&caller));
-        caller.cancel();
-        assert!(!cancelled.scope_steps(1));
-        assert!(matches!(
-            cancelled.finish(()),
-            BoundedResolution::Cancelled { .. }
-        ));
     }
+
     #[test]
     fn budget_stop_cancels_only_the_operation_token() {
         let caller = CancellationToken::new();
-        let session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let session = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            0,
             Some(&caller),
         );
 
@@ -997,7 +1153,7 @@ mod tests {
         assert!(matches!(
             session.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::TotalWork,
                 work: ReceiverAnalysisWork { scope_nodes: 0, .. }
             }
         ));
@@ -1007,28 +1163,31 @@ mod tests {
     fn shared_work_counts_against_independent_locator_budgets() {
         let caller = CancellationToken::new();
         let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 2,
+            max_summary_expansions: 2,
             ..ReceiverAnalysisBudget::default()
         };
         let setup = ResolutionSession::bounded(budget, Some(&caller));
-        assert!(setup.scope_step());
+        assert!(setup.summary_step());
         let shared_work = setup.finish(()).work();
 
         let exhausted =
             ResolutionSession::bounded_after_shared_work(budget, Some(&caller), shared_work);
-        assert!(exhausted.scope_step());
-        assert!(!exhausted.scope_step());
+        assert!(exhausted.summary_step());
+        assert!(!exhausted.summary_step());
         assert!(matches!(
             exhausted.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work: ReceiverAnalysisWork { scope_nodes: 2, .. }
+                limit: ReceiverBudgetLimit::SummaryExpansions,
+                work: ReceiverAnalysisWork {
+                    summary_expansions: 2,
+                    ..
+                }
             }
         ));
 
         let sibling =
             ResolutionSession::bounded_after_shared_work(budget, Some(&caller), shared_work);
-        assert!(sibling.scope_step());
+        assert!(sibling.summary_step());
         assert!(!sibling.cancellation().unwrap().is_cancelled());
         assert!(!caller.is_cancelled());
     }
@@ -1038,7 +1197,6 @@ mod tests {
     fn aggregate_work_cap_bounds_mixed_axes_and_provider_rows() {
         let caller = CancellationToken::new();
         let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 8,
             max_summary_expansions: 8,
             max_resolution_rounds: 8,
             ..ReceiverAnalysisBudget::default()
@@ -1114,18 +1272,18 @@ mod tests {
 
         let tight_axis = ResolutionSession::bounded_with_total_work(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
+                max_summary_expansions: 1,
                 ..budget
             },
             9,
             None,
         );
-        assert!(tight_axis.scope_step());
-        assert!(!tight_axis.scope_step());
+        assert!(tight_axis.summary_step());
+        assert!(!tight_axis.summary_step());
         assert!(matches!(
             tight_axis.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::SummaryExpansions,
                 ..
             }
         ));
@@ -1210,6 +1368,7 @@ mod tests {
         let ambient = crate::analyzer::reuse_verdict::ReuseVerdict::from_counts(
             capture.execution.load(std::sync::atomic::Ordering::Relaxed),
             capture.budget.load(std::sync::atomic::Ordering::Relaxed),
+            0,
         );
         assert_eq!(explicit, ambient, "{case}");
     }
@@ -1227,15 +1386,15 @@ mod tests {
             let finished = session.finish(());
             session.reuse_verdict().join(finished.reuse_verdict())
         });
-        assert_verdict_matches_ambient("scope limit", || {
+        assert_verdict_matches_ambient("summary limit", || {
             let session = ResolutionSession::bounded(
                 ReceiverAnalysisBudget {
-                    max_scope_nodes: 0,
+                    max_summary_expansions: 0,
                     ..ReceiverAnalysisBudget::default()
                 },
                 None,
             );
-            assert!(!session.scope_step());
+            assert!(!session.summary_step());
             let finished = session.finish(());
             assert!(matches!(finished, BoundedResolution::Exceeded { .. }));
             session.reuse_verdict().join(finished.reuse_verdict())
@@ -1277,11 +1436,11 @@ mod tests {
         });
         assert_verdict_matches_ambient("tracker limit and truncation", || {
             let mut tracker = ReceiverAnalysisBudgetTracker::new(ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
+                max_summary_expansions: 0,
                 max_targets: 1,
                 ..ReceiverAnalysisBudget::default()
             });
-            assert!(tracker.record_scope_node().is_err());
+            assert!(tracker.record_summary_expansion().is_err());
             let report = tracker.report(ReceiverAnalysisOutcome::Ambiguous(vec![1, 2]));
             tracker.reuse_verdict().join(report.reuse_verdict())
         });

@@ -47,7 +47,44 @@ mod csharp_extraction_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#7314: stored C# class metadata defaulted staticness to false before the staticness epoch"
+    )]
+    fn csharp_class_like_static_epoch_invalidates_prior_parsed_blobs() {
+        use brokk_bifrost_core::analyzer::model::ClassLikeKind;
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Static.cs", "static class Utility {}");
+        let mut state = parse_state(&CSharpAdapter, &file);
+        let metadata = state
+            .signature_metadata
+            .values_mut()
+            .flat_map(|rows| rows.iter_mut())
+            .find(|metadata| metadata.class_like_kind() == Some(ClassLikeKind::Class))
+            .expect("static class signature metadata");
+        assert!(metadata.class_like_is_static());
+        *metadata = metadata.clone().with_class_like_static(false);
+        let prior_epoch = epoch::csharp_epoch_before_class_like_static();
+        assert_prior_parsed_blob_invalidated(&CSharpAdapter, &state, &prior_epoch);
+
+        let reparsed = parse_state(&CSharpAdapter, &file);
+        assert!(
+            reparsed
+                .signature_metadata
+                .values()
+                .flat_map(|rows| rows.iter())
+                .any(|metadata| {
+                    metadata.class_like_kind() == Some(ClassLikeKind::Class)
+                        && metadata.class_like_is_static()
+                })
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#7314: retained source gaps caused a full compilation scan per publication"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn csharp_extent_publication_tracks_edits_and_overlay_inventory() {
         // This regression now runs on the pooled store.
@@ -484,7 +521,13 @@ mod csharp_extraction_tests {
                 selection.connection(), &snapshots["csharp"],
             ).unwrap().expect("selected C# set");
             let mut reader =
-                CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+                CSharpUnitReader::new(
+                    &selection,
+                    &snapshots["csharp"],
+                    &certified,
+                    &identities,
+                    &brokk_bifrost_analysis::analyzer::store::resolution_operation::UnrecordedSelectedServices,
+                )
                     .unwrap();
             let compilation_id: i64 = selection.connection().query_row(
                 "SELECT compilation_id FROM csharp_compilations WHERE project_path='A/A.csproj' AND set_id=(SELECT set_id FROM csharp_compilation_selections WHERE workspace_id=?1 AND lang='csharp' AND generation=?2 AND revision=?3)",
@@ -540,7 +583,13 @@ mod csharp_extraction_tests {
                 selection.connection(), &snapshots["csharp"],
             ).unwrap().expect("selected C# set");
             let mut reader =
-                CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+                CSharpUnitReader::new(
+                    &selection,
+                    &snapshots["csharp"],
+                    &certified,
+                    &identities,
+                    &brokk_bifrost_analysis::analyzer::store::resolution_operation::UnrecordedSelectedServices,
+                )
                     .unwrap();
             let compilation_id: i64 = selection.connection().query_row(
                 "SELECT compilation_id FROM csharp_compilations WHERE project_path='B/B.csproj' AND set_id=(SELECT set_id FROM csharp_compilation_selections WHERE workspace_id=?1 AND lang='csharp' AND generation=?2 AND revision=?3)",
@@ -815,6 +864,10 @@ mod csharp_extraction_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn csharp_new_selected_source_has_placement_without_persisted_version() {
         use crate::inline_project::InlineTestProject;
         use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
@@ -924,7 +977,13 @@ mod csharp_extraction_tests {
             selection.connection(), &snapshots["csharp"],
         ).unwrap().expect("selected C# set");
         let mut reader =
-            CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+            CSharpUnitReader::new(
+                    &selection,
+                    &snapshots["csharp"],
+                    &certified,
+                    &identities,
+                    &brokk_bifrost_analysis::analyzer::store::resolution_operation::UnrecordedSelectedServices,
+                )
                 .unwrap();
         let placements = reader.placements(path).unwrap().unwrap();
         assert_eq!(placements.len(), 1, "{placements:?}");
@@ -976,6 +1035,10 @@ mod csharp_extraction_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn csharp_linked_file_access_agrees_per_caller_compilation() {
         use crate::inline_project::InlineTestProject;
         use brokk_bifrost_analysis::analyzer::read_ledger::{DerivationExecutionCause, reason};
@@ -1050,7 +1113,13 @@ mod csharp_extraction_tests {
             selection.connection(), &snapshots["csharp"],
         ).unwrap().expect("selected C# set");
         let mut reader =
-            CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+            CSharpUnitReader::new(
+                    &selection,
+                    &snapshots["csharp"],
+                    &certified,
+                    &identities,
+                    &brokk_bifrost_analysis::analyzer::store::resolution_operation::UnrecordedSelectedServices,
+                )
                 .unwrap();
         begin_production_selected_sql_trace_on_connection(selection.connection());
         let linked = reader.placements("Linked.cs").unwrap().unwrap();

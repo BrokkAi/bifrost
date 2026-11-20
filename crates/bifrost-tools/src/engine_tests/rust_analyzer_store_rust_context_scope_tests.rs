@@ -446,6 +446,10 @@ fn host(value: u8) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_primary_context_query_is_populated_blob_first_before_and_after_analyze() {
         let mut project = InlineTestProject::new();
         let mut sources = Vec::new();

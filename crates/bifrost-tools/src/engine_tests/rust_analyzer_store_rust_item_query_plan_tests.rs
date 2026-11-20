@@ -72,6 +72,10 @@ wrap! { pub mod embedded { pub struct Embedded; } }
     .unwrap_or_else(|error| panic!("{} query plan failed: {error}", case.name))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn reader_explain(store: &AnalyzerStore, case: &QueryPlanCase) -> Vec<String> {
         let connection = store
             .read_conn()
@@ -462,6 +466,10 @@ wrap! { pub mod embedded { pub struct Embedded; } }
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_item_reader_queries_are_blob_first_before_and_after_analyze() {
         let sources = (0..=16)
             .map(|index| format!("{QUERY_FIXTURE}\n// planner fixture variant {index}\n"))

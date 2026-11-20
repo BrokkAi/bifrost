@@ -615,6 +615,34 @@ impl brokk_bifrost_core::retention_budget::RetainedBytes for RustGlobNameAbsence
 }
 
 pub trait RustFactSource: RustSource {
+    /// Capture completion without creating another input-read owner. Calls
+    /// `build` exactly once; operational causes abort the capture. A completed
+    /// capture without a live binding can be returned to its own caller but
+    /// cannot authorize retention.
+    fn capture_walk_completion(
+        &self,
+        build: &mut dyn FnMut(),
+    ) -> Option<crate::usage_walks::WalkCompletion>;
+
+    /// Capture one leaf route read. A Closed leaf owns no receipt: only an Open
+    /// completion is ever observed, so a Closed read builds no binding check,
+    /// cause set or digest. Operational causes still abort.
+    fn capture_leaf_completion(
+        &self,
+        build: &mut dyn FnMut(),
+    ) -> crate::usage_walks::LeafCompletion;
+
+    /// Replay a request-local failed route's original typed causes through the
+    /// current completion owner. This does not re-demand the failed producer.
+    fn replay_route_failure(
+        &self,
+        reasons: &[brokk_bifrost_core::analyzer::query_read_incomplete::QueryReadIncomplete],
+    );
+
+    /// Exact live-reader validation only. Cross-binding verification belongs
+    /// to the separate warm-request reuse layer.
+    fn walk_completion_is_current(&self, completion: &crate::usage_walks::WalkCompletion) -> bool;
+
     /// This question must record its answer in the calling consumer's ledger.
     fn local_glob_name_absence(
         &self,
@@ -4382,6 +4410,15 @@ pub fn is_rust_enum_declaration(
     })
 }
 
+pub fn is_rust_union_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::Union
+    })
+}
+
 pub fn is_rust_enum_variant_declaration(
     rust: &dyn RustSource,
     code_unit: &CodeUnit,
@@ -5035,6 +5072,22 @@ mod fact_source_coverage_guard {
     // Every set-membership read needs wrapper recording or a documented enclosing
     // recompute-verified lookup. Other methods name their content/capability cover.
     const COVERAGE: &[(&str, &str)] = &[
+        (
+            "capture_walk_completion",
+            "(b) Completion capture only: it records no input read of its own and creates no read owner; the walk entry that wraps it retains the named reads.",
+        ),
+        (
+            "capture_leaf_completion",
+            "(b) The leaf form of capture_walk_completion: a Closed leaf returns no receipt, an Open one the same typed-cause receipt. No read owner is created.",
+        ),
+        (
+            "replay_route_failure",
+            "(b) Replays original request-local typed failure causes through completion routing; reads no workspace input and creates no cache owner.",
+        ),
+        (
+            "walk_completion_is_current",
+            "(b) Exact live-reader validation of a receipt's binding; reads nothing from the workspace.",
+        ),
         (
             "local_glob_name_absence",
             "(a) RustLocalGlobNameAbsence: the selected-closure bridge records the question receipt and replays it after the operation frame is restored. Callers certify primitive and standard-macro shadow absence.",

@@ -80,118 +80,123 @@ fn fixture() -> BuiltInlineTestProject {
 fn rust_walk_caches_and_route_memo_record_the_reads_their_fills_recorded() {
     let project = fixture();
     let (base, analyzer) = super::test_support::certified_analyzer(project.root());
-    let head = Head::of(project.project_dyn(), &base);
-    let mut rows = Rows::new(&analyzer, &head);
-    let files: Vec<_> = ["src/hub.rs", "src/cyc.rs", "src/util.rs", "src/u_a.rs"]
-        .into_iter()
-        .map(|path| project.file(path))
-        .collect();
+    brokk_bifrost_rust::graph_support::with_usage_read_frame(&analyzer, || {
+        // Reader construction is operation setup, not the per-question memo.
+        // Establish it before measuring either side of the replay contract.
+        super::walk_completion::capture(&analyzer, &mut || {}).expect("live read frame");
+        let head = Head::of(project.project_dyn(), &base);
+        let mut rows = Rows::new(&analyzer, &head);
+        let files: Vec<_> = ["src/hub.rs", "src/cyc.rs", "src/util.rs", "src/u_a.rs"]
+            .into_iter()
+            .map(|path| project.file(path))
+            .collect();
 
-    {
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let route_hits = || analyzer.walk_caches().route_memo_hits();
+            rows.row(
+                "route and package-file request memo",
+                Class::Replay,
+                Evidence::Hits(&route_hits),
+                || {
+                    drop(RustUsageWalks::new(&analyzer, scope.token()).expect("walks"));
+                    analyzer.file_routes(&files[0], None).expect("file routes");
+                },
+            );
+            assert!(
+                route_hits() > 0,
+                "the file-route request memo was exercised"
+            );
+        }
         let scope = AnalyzerQueryScope::new(&analyzer);
-        let route_hits = || analyzer.walk_caches().route_memo_hits();
+        // The identities and macro declarations the walks start from come from
+        // `declaration_facts`, a cache whose hits record nothing of their own (a
+        // row below); asking for them first keeps that out of the walk row.
+        let (identities, macros) = {
+            let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("walks");
+            let identities: Vec<_> = files
+                .iter()
+                .flat_map(|file| {
+                    ["relay", "Holder"].into_iter().flat_map(|name| {
+                        walks
+                            .queries()
+                            .identities_in_file_named(file, name)
+                            .expect("identities")
+                    })
+                })
+                .map(|(identity, _)| identity)
+                .collect();
+            (
+                identities,
+                walks.macro_declarations_named("shout").expect("macros"),
+            )
+        };
+        let walk_hits = |name: &'static str| {
+            let analyzer = &analyzer;
+            move || {
+                analyzer
+                    .walk_caches()
+                    .hit_counts()
+                    .into_iter()
+                    .find(|(cache, _)| *cache == name)
+                    .map(|(_, hits)| hits)
+                    .expect("a named walk cache")
+            }
+        };
+        let names = [
+            "rust.walk.module_files",
+            "rust.walk.module_probes",
+            "rust.walk.owner_roots",
+            "rust.walk.module_domains",
+            "rust.walk.alias_routes",
+            "rust.walk.forward_import_edges",
+            "rust.walk.binding_edges",
+            "rust.walk.module_bindings",
+            "rust.walk.origin_routes",
+            "rust.walk.macro_scope_edges",
+            "rust.walk.macro_visible_ranges",
+        ];
+        let counters: Vec<_> = names.iter().map(|name| walk_hits(name)).collect();
+        let evidence: Vec<(&str, &dyn Fn() -> u64)> = names
+            .iter()
+            .zip(&counters)
+            .map(|(name, counter)| (*name, counter as &dyn Fn() -> u64))
+            .collect();
         rows.row(
-            "route and package-file request memo",
+            "Rust walk caches",
             Class::Replay,
-            Evidence::Hits(&route_hits),
+            Evidence::EachHits(&evidence),
             || {
-                drop(RustUsageWalks::new(&analyzer, scope.token()).expect("walks"));
-                analyzer.file_routes(&files[0], None).expect("file routes");
+                let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("walks");
+                for file in &files {
+                    walks.probed_module_files_from_segments(file, &["util".to_owned()]);
+                    walks.owner_roots_of(file).expect("owner roots");
+                    walks.macro_scope_edges_of(file).expect("macro scope edges");
+                    walks.forward_import_edges_of(file).expect("forward edges");
+                    walks.origin_routes_of(file).expect("origin routes");
+                    for module in walks.binding_modules_of(file).expect("binding modules") {
+                        walks.bindings_at(file, &module).expect("bindings");
+                        walks
+                            .effective_module_domains_of(&module)
+                            .expect("module domains");
+                        walks.alias_routes_at(&module).expect("alias routes");
+                        walks.files_for_module(&module);
+                    }
+                }
+                for identity in &identities {
+                    walks
+                        .edges_binding_identity(identity)
+                        .expect("binding edges");
+                }
+                for declaration in &macros {
+                    walks
+                        .macro_visible_ranges_of(declaration)
+                        .expect("macro visible ranges");
+                }
             },
         );
-        assert!(
-            route_hits() > 0,
-            "the file-route request memo was exercised"
-        );
-    }
-    let scope = AnalyzerQueryScope::new(&analyzer);
-    // The identities and macro declarations the walks start from come from
-    // `declaration_facts`, a cache whose hits record nothing of their own (a
-    // row below); asking for them first keeps that out of the walk row.
-    let (identities, macros) = {
-        let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("walks");
-        let identities: Vec<_> = files
-            .iter()
-            .flat_map(|file| {
-                ["relay", "Holder"].into_iter().flat_map(|name| {
-                    walks
-                        .queries()
-                        .identities_in_file_named(file, name)
-                        .expect("identities")
-                })
-            })
-            .map(|(identity, _)| identity)
-            .collect();
-        (
-            identities,
-            walks.macro_declarations_named("shout").expect("macros"),
-        )
-    };
-    let walk_hits = |name: &'static str| {
-        let analyzer = &analyzer;
-        move || {
-            analyzer
-                .walk_caches()
-                .hit_counts()
-                .into_iter()
-                .find(|(cache, _)| *cache == name)
-                .map(|(_, hits)| hits)
-                .expect("a named walk cache")
-        }
-    };
-    let names = [
-        "rust.walk.module_files",
-        "rust.walk.module_probes",
-        "rust.walk.owner_roots",
-        "rust.walk.module_domains",
-        "rust.walk.alias_routes",
-        "rust.walk.forward_import_edges",
-        "rust.walk.binding_edges",
-        "rust.walk.module_bindings",
-        "rust.walk.origin_routes",
-        "rust.walk.macro_scope_edges",
-        "rust.walk.macro_visible_ranges",
-    ];
-    let counters: Vec<_> = names.iter().map(|name| walk_hits(name)).collect();
-    let evidence: Vec<(&str, &dyn Fn() -> u64)> = names
-        .iter()
-        .zip(&counters)
-        .map(|(name, counter)| (*name, counter as &dyn Fn() -> u64))
-        .collect();
-    rows.row(
-        "Rust walk caches",
-        Class::Replay,
-        Evidence::EachHits(&evidence),
-        || {
-            let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("walks");
-            for file in &files {
-                walks.probed_module_files_from_segments(file, &["util".to_owned()]);
-                walks.owner_roots_of(file).expect("owner roots");
-                walks.macro_scope_edges_of(file).expect("macro scope edges");
-                walks.forward_import_edges_of(file).expect("forward edges");
-                walks.origin_routes_of(file).expect("origin routes");
-                for module in walks.binding_modules_of(file).expect("binding modules") {
-                    walks.bindings_at(file, &module).expect("bindings");
-                    walks
-                        .effective_module_domains_of(&module)
-                        .expect("module domains");
-                    walks.alias_routes_at(&module).expect("alias routes");
-                    walks.files_for_module(&module);
-                }
-            }
-            for identity in &identities {
-                walks
-                    .edges_binding_identity(identity)
-                    .expect("binding edges");
-            }
-            for declaration in &macros {
-                walks
-                    .macro_visible_ranges_of(declaration)
-                    .expect("macro visible ranges");
-            }
-        },
-    );
-    rows.finish();
+        rows.finish();
+    });
 }
 
 #[test]
@@ -231,33 +236,35 @@ fn a_walk_fill_after_its_walker_asked_the_routes_records_the_route_reads() {
     assert!(!expected.is_empty(), "the edges fill asks route questions");
 
     let (_base, analyzer) = super::test_support::certified_analyzer(project.root());
-    {
-        // The walker asks the file's routes, and then the edges fill asks them
-        // again: the fill's receipt must still hold the route reads.
+    brokk_bifrost_rust::graph_support::with_usage_read_frame(&analyzer, || {
+        {
+            // The walker asks the file's routes, and then the edges fill asks them
+            // again: the fill's receipt must still hold the route reads.
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("walks");
+            walks.file_routes(&file);
+            walks.forward_import_edges_of(&file).expect("forward edges");
+        }
+        let edge_hits = || {
+            analyzer
+                .walk_caches()
+                .hit_counts()
+                .into_iter()
+                .find(|(cache, _)| *cache == "rust.walk.forward_import_edges")
+                .map(|(_, hits)| hits)
+                .expect("the forward-edge walk cache")
+        };
+        let before = edge_hits();
         let scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("walks");
-        walks.file_routes(&file);
-        walks.forward_import_edges_of(&file).expect("forward edges");
-    }
-    let edge_hits = || {
-        analyzer
-            .walk_caches()
-            .hit_counts()
-            .into_iter()
-            .find(|(cache, _)| *cache == "rust.walk.forward_import_edges")
-            .map(|(_, hits)| hits)
-            .expect("the forward-edge walk cache")
-    };
-    let before = edge_hits();
-    let scope = AnalyzerQueryScope::new(&analyzer);
-    let (_, ledger) = capture_query_reads(&analyzer, || forward_edges(&analyzer, &scope));
-    assert!(edge_hits() > before, "a later request hits the kept edges");
-    let replayed = derivation_lookups(&ledger);
-    let missing: Vec<_> = expected.difference(&replayed).collect();
-    assert!(
-        missing.is_empty(),
-        "the kept edges replay the route reads their fill depended on: {missing:?}"
-    );
+        let (_, ledger) = capture_query_reads(&analyzer, || forward_edges(&analyzer, &scope));
+        assert!(edge_hits() > before, "a later request hits the kept edges");
+        let replayed = derivation_lookups(&ledger);
+        let missing: Vec<_> = expected.difference(&replayed).collect();
+        assert!(
+            missing.is_empty(),
+            "the kept edges replay the route reads their fill depended on: {missing:?}"
+        );
+    });
 }
 
 #[test]

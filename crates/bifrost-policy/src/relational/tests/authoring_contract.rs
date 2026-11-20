@@ -16,6 +16,7 @@ fn unknown_columns_report_only_the_addressed_binding_fields() {
     right.op = IrRelationOp::Source {
         binding: binding("other"),
         schema: other_schema,
+        undecided_selections: Vec::new(),
     };
     let joined = join(
         2,
@@ -129,6 +130,7 @@ fn illegal_enum_label_reports_the_authored_value() {
         op: IrRelationOp::Source {
             binding: binding("occ"),
             schema: schema.clone(),
+            undecided_selections: Vec::new(),
         },
         schema,
     };
@@ -242,6 +244,7 @@ fn projected_enum_alias_keeps_its_validation_domain() {
         op: IrRelationOp::Source {
             binding: binding("occ"),
             schema: schema.clone(),
+            undecided_selections: Vec::new(),
         },
         schema,
     };

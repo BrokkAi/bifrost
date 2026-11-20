@@ -914,6 +914,7 @@ pub fn compare_partial_flows_with_reference<F: ObservationFilter>(
         record_witnesses,
         implicit_reads,
         &[],
+        GuardProjectionMode::LegacyAutomatic,
         filter,
         &mut reference_request,
     )?;
@@ -927,6 +928,7 @@ pub fn compare_partial_flows_with_reference<F: ObservationFilter>(
         record_witnesses,
         implicit_reads,
         &[],
+        GuardProjectionMode::LegacyAutomatic,
         filter,
         request,
     )?;
@@ -1640,6 +1642,15 @@ impl BuiltinSeeds {
     }
 }
 
+/// Query-local projection contract. Published parse-time partial flows use
+/// LegacyAutomatic exclusively; PolicyProvedOnly is never a stored product.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GuardProjectionMode {
+    #[default]
+    LegacyAutomatic,
+    PolicyProvedOnly,
+}
+
 /// Partial flows of one procedure, from its relation snapshot and its IR.
 ///
 /// The snapshot must belong to `procedure`. The result is computed without
@@ -1728,6 +1739,7 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
         record_witnesses,
         implicit_reads,
         &[],
+        GuardProjectionMode::LegacyAutomatic,
         filter,
         request,
     )
@@ -1755,6 +1767,37 @@ pub fn compute_partial_flows_with_edge_kills<F: ObservationFilter>(
         record_witnesses,
         implicit_reads,
         extra_edge_kills,
+        GuardProjectionMode::LegacyAutomatic,
+        filter,
+        request,
+    )
+}
+
+/// The existing projection with an explicit query-local guard contract.
+/// Unlike parse-time wrappers, this entry point may omit legacy automatic
+/// kills. Its output must stay in mode-keyed query-local memos.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_partial_flows_in_mode<F: ObservationFilter>(
+    procedure: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
+    extra_seeds: &[ExtraSeed],
+    observations: &[ExtraObservation],
+    record_witnesses: bool,
+    implicit_reads: &[ImplicitHeapRead],
+    extra_edge_kills: &[GuardEdgeKill],
+    guard_mode: GuardProjectionMode,
+    filter: &mut F,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ExtendedPartialFlows, F::Error> {
+    compute_partial_flows_filtered_impl::<F, false>(
+        procedure,
+        snapshot,
+        extra_seeds,
+        observations,
+        record_witnesses,
+        implicit_reads,
+        extra_edge_kills,
+        guard_mode,
         filter,
         request,
     )
@@ -1769,6 +1812,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     record_witnesses: bool,
     implicit_reads: &[ImplicitHeapRead],
     extra_edge_kills: &[GuardEdgeKill],
+    guard_mode: GuardProjectionMode,
     filter: &mut F,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ExtendedPartialFlows, F::Error> {
@@ -2476,7 +2520,11 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     }
     let mut edge_kills: HashMap<(ProgramPointId, ProgramPointId, ControlEdgeKind), Vec<u32>> =
         HashMap::new();
-    for kill in guard_edge_kills(procedure).iter().chain(extra_edge_kills) {
+    let automatic = match guard_mode {
+        GuardProjectionMode::LegacyAutomatic => guard_edge_kills(procedure),
+        GuardProjectionMode::PolicyProvedOnly => Vec::new(),
+    };
+    for kill in automatic.iter().chain(extra_edge_kills) {
         let carrier = carriers.intern(&kill.carrier);
         edge_kills
             .entry((kill.point, kill.target_point, kill.kind))
@@ -4040,10 +4088,43 @@ pub fn partial_flows_from_projection(
     >,
     request: &mut SemanticRequest<'_>,
 ) -> Option<ProcedurePartialFlows> {
-    Some(match projected {
-        Ok(SemanticOutcome::Complete { value, .. }) => {
-            compute_partial_flows(handle, &value, request)
+    partial_flows_from_projection_in_mode(
+        handle,
+        projected,
+        GuardProjectionMode::LegacyAutomatic,
+        request,
+    )
+}
+
+/// Same status-preserving projection for query-local, mode-keyed products.
+pub fn partial_flows_from_projection_in_mode(
+    handle: &crate::analyzer::semantic::ProcedureHandle,
+    projected: Result<
+        SemanticOutcome<crate::analyzer::semantic::ValueFlowSnapshot>,
+        crate::analyzer::semantic::SemanticProviderError,
+    >,
+    guard_mode: GuardProjectionMode,
+    request: &mut SemanticRequest<'_>,
+) -> Option<ProcedurePartialFlows> {
+    let project = |snapshot: &ValueFlowSnapshot, request: &mut SemanticRequest<'_>| {
+        match compute_partial_flows_in_mode(
+            handle,
+            snapshot,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+            guard_mode,
+            &mut PassThrough,
+            request,
+        ) {
+            Ok(flows) => flows.partial,
+            Err(never) => match never {},
         }
+    };
+    Some(match projected {
+        Ok(SemanticOutcome::Complete { value, .. }) => project(&value, request),
         Ok(SemanticOutcome::Cancelled { .. }) => return None,
         Ok(SemanticOutcome::ExceededBudget { .. }) => {
             ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget)
@@ -4053,7 +4134,7 @@ pub fn partial_flows_from_projection(
         // procedure is open, and its flows are the ones the snapshot proves.
         Ok(outcome) => match outcome.available_value() {
             Some(snapshot) => {
-                let mut result = compute_partial_flows(handle, snapshot, request);
+                let mut result = project(snapshot, request);
                 match result.outcome {
                     // A budget stop records no flows and no label.
                     PartialFlowOutcome::ExceededBudget => {}

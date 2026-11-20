@@ -366,12 +366,29 @@ impl ExternalSelectionAuthority for ToolchainAuthority {
             Ok(VerifiedSelection {
                 question_digest: question.digest,
                 answer_digest: prepared.answer_digest,
+                // A later run can ask again and compare exactly when a view
+                // stamp names the inputs; `certified` is `complete && verified`.
+                verified: view_stamp.is_some(),
                 certified: prepared.reusable && view_stamp.is_some(),
                 view_stamp,
                 complete: prepared.reusable,
+                // A toolchain gap may clear on the next attempt (PATH or
+                // rustup changes), so none is replayable.
+                only_replayable_gaps: false,
                 records: prepared,
             })
         })
+    }
+    // A toolchain question has no tree part: it is not a `Split` question.
+    fn basis(&self, _: &ExternalSelectionQuestion, _: [u8; 32]) -> Option<JvmDependencyBasis> {
+        None
+    }
+    fn answer_under_basis(
+        &self,
+        _: &ExternalSelectionQuestion,
+        _: &JvmDependencyBasis,
+    ) -> Option<[u8; 32]> {
+        None
     }
 }
 // Read the selected view and disk together: compiler observations can describe

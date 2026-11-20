@@ -202,6 +202,11 @@ function collectProjectionUpdates(repoRoot, version) {
         json.minimumBinaryVersion ??= version;
       }
       json.allowPrerelease ??= false;
+      // Only a real release stamp (a new binary version) consumes the marker;
+      // `check` projects the current version and must leave it pending.
+      if (previousPreferred !== version) {
+        applyRaiseMinimumBinaryVersion(json, version);
+      }
     },
   );
   // The dsh bundle vendors bifrost-release.json; the copies must stay
@@ -300,6 +305,18 @@ function collectProjectionUpdates(repoRoot, version) {
   ].filter(Boolean);
 
   return updates;
+}
+
+// A change that makes launchers depend on a newer engine (for example engine
+// pack-approval support) sets `raiseMinimumBinaryVersion: true` in
+// bifrost-release.json. The next release stamp raises the minimum to that
+// release and clears the marker, so the minimum can never name an engine that
+// lacks the feature.
+export function applyRaiseMinimumBinaryVersion(json, version) {
+  if (json.raiseMinimumBinaryVersion === true) {
+    json.minimumBinaryVersion = version;
+  }
+  delete json.raiseMinimumBinaryVersion;
 }
 
 export function sameMinorSeries(left, right) {

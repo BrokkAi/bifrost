@@ -7,8 +7,7 @@
 //!   projecting the evidence the run already kept. It executes nothing, so it
 //!   can never disagree with the report it reads. It serves `match`,
 //!   `assertion`, `flow`, `taint` and `typestate` findings, dispatching on the
-//!   evidence the finding carries; [`explain_match_finding`] is the `match`
-//!   adapter a caller that already knows the family can call directly.
+//!   evidence the finding carries.
 //! - [`rank_near_misses`] answers **which came closest**, by relaxing the
 //!   policy's own declared predicates one at a time over a bounded candidate
 //!   set the caller either supplies or asks to have searched inside the
@@ -133,7 +132,10 @@ mod host_bounds_contract;
 mod tests;
 
 pub use host::{
-    ExplanationTarget, explain_loaded_policy, explain_policy_inputs, rank_policy_near_misses,
+    ExplanationTarget, explain_loaded_policy, explain_policy_inputs,
+    explain_policy_inputs_with_host_activation_context, explain_policy_inputs_with_semantic_models,
+    rank_policy_near_misses, rank_policy_near_misses_with_host_activation_context,
+    rank_policy_near_misses_with_semantic_models,
 };
 pub use model::{
     ExplainError, ExplanationBudgetLimit, ExplanationGeneration, ExplanationGenerationParseError,
@@ -146,7 +148,7 @@ pub use near_miss::{
     NearMissCandidates, NearMissEntry, NearMissEnumeration, NearMissTruncation,
     POLICY_NEAR_MISS_FORMAT, PolicyNearMissRanking, rank_near_misses,
 };
-pub use why::{explain_finding, explain_match_finding};
+pub use why::explain_finding;
 pub use why_not::{ExplanationCandidate, explain_candidate, explain_match_candidate};
 pub(crate) use why_not::{absence_reasons, row_covers_candidate};
 pub use why_not_flow::{FlowExplanationCandidate, explain_flow_candidate};

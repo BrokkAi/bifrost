@@ -175,6 +175,7 @@ fn emit(mut target: u32, value: u32) {
             &prepared,
             &SemanticBudget::default(),
             &cancellation,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
         ) {
             Ok(SemanticOutcome::Complete { value, .. }) => value,
             other => panic!("candidate source lowers completely: {other:?}"),
@@ -366,6 +367,45 @@ fn emit(mut target: u32, value: u32) {
         payload_bytes: usize,
     }
 
+    /// One nextest SLOW period for the round-trip override in
+    /// `.config/nextest.toml`.
+    const SLOW_FILE_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Reports a file whose whole round trip took at least one nextest SLOW
+    /// period. Nextest prints a timed-out test's captured output, but the walk
+    /// itself reports only when it finishes. The queue is largest-first, so
+    /// the files that did print show which slow files completed and, by
+    /// omission, what was still in flight at the kill. This adds no assertion
+    /// and does nothing for a healthy run except count completed files.
+    struct SlowFile<'a> {
+        path: &'a Path,
+        source_bytes: usize,
+        started: std::time::Instant,
+        completed: &'a std::sync::atomic::AtomicUsize,
+        total: usize,
+    }
+
+    impl Drop for SlowFile<'_> {
+        fn drop(&mut self) {
+            let completed = self
+                .completed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let elapsed = self.started.elapsed();
+            if elapsed >= SLOW_FILE_REPORT_AFTER {
+                eprintln!(
+                    "[semantic-ir round trip] {} ({} source bytes) took {:.1}s; \
+                     {} of {} files done",
+                    self.path.display(),
+                    self.source_bytes,
+                    elapsed.as_secs_f64(),
+                    completed,
+                    self.total
+                );
+            }
+        }
+    }
+
     /// Lower, store, read and decode every matching file under `root` on
     /// `workers` threads, each with its own store. Compare the decoded IR and
     /// partial flows with the materialization path's results. Workers take the
@@ -386,18 +426,21 @@ fn emit(mut target: u32, value: u32) {
             .collect::<Vec<_>>();
         files.sort_unstable_by(|left, right| right.cmp(left));
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let total = files.len();
         let reports = std::thread::scope(|scope| {
             let handles = (0..workers)
                 .map(|_| {
                     let root = &root;
                     let files = &files;
                     let next = &next;
+                    let completed = &completed;
                     scope.spawn(move || {
                         let queue = std::iter::from_fn(|| {
                             let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             files.get(index).map(|(_, path)| path)
                         });
-                        round_trip_files(root, queue, adapter)
+                        round_trip_files(root, queue, adapter, completed, total)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -437,6 +480,8 @@ fn emit(mut target: u32, value: u32) {
         root: &Path,
         files: impl Iterator<Item = &'a PathBuf>,
         adapter: &A,
+        completed: &std::sync::atomic::AtomicUsize,
+        total: usize,
     ) -> RoundTripReport {
         let root = root.to_path_buf();
         let lowerer = adapter
@@ -475,6 +520,13 @@ fn emit(mut target: u32, value: u32) {
                 continue;
             };
             report.files += 1;
+            let _slow_file = SlowFile {
+                path: path.as_path(),
+                source_bytes: source.len(),
+                started: std::time::Instant::now(),
+                completed,
+                total,
+            };
             let source: Arc<str> = Arc::from(source);
             let rel_path = path.strip_prefix(&root).expect("file under root");
             let file = ProjectFile::new(root.clone(), rel_path);
@@ -538,10 +590,16 @@ fn emit(mut target: u32, value: u32) {
             let language = LanguageDialect::for_path(adapter.language(), file.rel_path());
             let cancellation = CancellationToken::default();
             let blob_key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, storage_language);
-            let produced =
-                prepare_parse_time_semantic_ir(lowerer, &file, &prepared, &blob_key, &cancellation)
-                    .unwrap()
-                    .expect("parse-time preparation completes");
+            let produced = prepare_parse_time_semantic_ir(
+                lowerer,
+                &file,
+                &prepared,
+                &blob_key,
+                &cancellation,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+            )
+            .unwrap()
+            .expect("parse-time preparation completes");
             // A lowerer with a primary-declaration path (C#) materializes through
             // that path, so its lowering and partial flows are the oracle the
             // parse-time rows must equal. Any other lowerer materializes with the
@@ -875,6 +933,10 @@ fn emit(mut target: u32, value: u32) {
     /// A Rust file served through the public provider comes from its semantic IR
     /// rows, and its artifact is the one that lowering the same source produces.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn rust_artifact_served_from_rows_matches_direct_lowering() {
         pub(crate) const LIB: &str = "pub fn first(value: i32) -> i32 { value + 1 }\n";
         pub(crate) const OTHER: &str = "pub struct Holder { pub item: String }\n\
@@ -939,6 +1001,7 @@ fn emit(mut target: u32, value: u32) {
             &prepared,
             &SemanticBudget::default(),
             &cancellation,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
         ) {
             Ok(SemanticOutcome::Complete { value, .. }) => value,
             Ok(other) => panic!("direct lowering must complete: {}", other.label()),
@@ -1031,6 +1094,7 @@ fn emit(mut target: u32, value: u32) {
             &prepared,
             &SemanticBudget::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
         ) {
             Ok(SemanticOutcome::Complete { value, .. }) => value,
             other => panic!("the fixture lowers completely: {other:?}"),
@@ -3019,6 +3083,10 @@ fn emit(target: &mut Target, value: u32) -> u32 {
 
     #[test]
     fn candidate_macro_rows_cascade_on_blob_gc() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn guarded_counts(store: &AnalyzerStore) -> Vec<(String, i64)> {
             let conn = store.read_conn().unwrap();
             let tables = conn

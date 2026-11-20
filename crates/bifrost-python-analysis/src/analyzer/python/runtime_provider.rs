@@ -24,6 +24,7 @@ use brokk_bifrost_core::analyzer::config::{
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 struct PythonRuntimeArtifactInventory {
@@ -107,6 +108,115 @@ pub(crate) struct PythonRuntimeProviderContext<'a> {
     pub(crate) workspace_root: &'a Path,
     pub(crate) limits: &'a DependencyPackLimits,
     pub(crate) cancellation: &'a CancellationToken,
+    /// The outer request's disk checks; `None` outside a request, where each
+    /// lookup checks the disk itself.
+    pub(crate) verification: Option<&'a PythonRuntimeVerificationMemo>,
+}
+
+/// One request's disk checks of its published runtime environments (#13725).
+///
+/// Every external definition lookup revalidates the declared launch inputs
+/// and the installed trees against the publication. Each check used to read
+/// and rehash the same files, so a request's cost grew with its call sites.
+/// Within one request the disk is read once per environment; every lookup
+/// still compares that answer with the published rows. The memo is a resource
+/// of the outer request, carried to its workers and closed with it. It is not
+/// in the analyzer's query-scope memos, which overlapping requests share until
+/// the last one ends: another request, including the replay of a captured
+/// binding fact, reads the disk itself and sees a changed launch input or
+/// installed tree. A check interrupted by cancellation proves nothing and is
+/// not kept.
+#[derive(Default)]
+pub(crate) struct PythonRuntimeVerificationMemo {
+    declared: VerifiedEntries<PythonDeclaredCheck>,
+    artifacts: VerifiedEntries<
+        Arc<crate::analyzer::python::runtime_artifact::PythonRuntimeArtifactReport>,
+    >,
+    #[cfg(any(test, feature = "test-support"))]
+    disk_checks: std::sync::atomic::AtomicUsize,
+}
+
+type VerifiedEntries<T> = Mutex<Vec<(PythonRuntimeVerificationKey, T)>>;
+
+type PythonDeclaredCheck = Result<
+    Arc<crate::analyzer::python::runtime_environment::CheckedPythonDeclaredEnvironment>,
+    Arc<str>,
+>;
+
+/// Everything a disk check reads besides the disk. The configuration is
+/// rebuilt from the published rows on every lookup, so a reused row id can
+/// never select another environment's answer. The limits are a validity
+/// condition: an answer computed under other limits is not reused.
+#[derive(PartialEq)]
+struct PythonRuntimeVerificationKey {
+    publication: PythonRuntimeProviderPublication,
+    environment_id: i64,
+    workspace_root: PathBuf,
+    environment: PythonRuntimeEnvironmentConfig,
+    limits: DependencyPackLimits,
+}
+
+impl brokk_bifrost_core::analyzer::outer_request::RequestResource
+    for PythonRuntimeVerificationMemo
+{
+    fn close(&self) {}
+}
+
+/// The current outer request's memo; `None` outside a request or once it has
+/// closed.
+pub(crate) fn request_runtime_verification() -> Option<Arc<PythonRuntimeVerificationMemo>> {
+    brokk_bifrost_analysis::analyzer::i_analyzer::current_outer_request()?
+        .resource::<PythonRuntimeVerificationMemo, std::convert::Infallible>(
+            brokk_bifrost_core::analyzer::outer_request::RequestEntryKey::PythonRuntimeVerification,
+            || Ok(Arc::default()),
+        )
+        .ok()
+}
+
+impl PythonRuntimeVerificationMemo {
+    /// Disk checks this request performed: declared-environment
+    /// acquisitions plus installed-artifact verifications.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn disk_checks(&self) -> usize {
+        self.disk_checks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn read_or_check<T: Clone>(
+    memo: Option<&PythonRuntimeVerificationMemo>,
+    entries: fn(&PythonRuntimeVerificationMemo) -> &VerifiedEntries<T>,
+    key: PythonRuntimeVerificationKey,
+    cancellation: &CancellationToken,
+    check: impl FnOnce(&PythonRuntimeVerificationKey) -> T,
+) -> T {
+    let Some(memo) = memo else {
+        return check(&key);
+    };
+    let entries = entries(memo);
+    if let Some((_, answer)) = entries
+        .lock()
+        .expect("Python runtime verification memo poisoned")
+        .iter()
+        .find(|(entry, _)| *entry == key)
+    {
+        return answer.clone();
+    }
+    // The lock is not held across disk reads; concurrent first lookups may
+    // each check, and they reach the same answer.
+    let answer = check(&key);
+    #[cfg(any(test, feature = "test-support"))]
+    memo.disk_checks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cancellation.is_cancelled() {
+        let mut entries = entries
+            .lock()
+            .expect("Python runtime verification memo poisoned");
+        entries.retain(|(entry, _)| entry.publication == key.publication);
+        if !entries.iter().any(|(entry, _)| *entry == key) {
+            entries.push((key, answer.clone()));
+        }
+    }
+    answer
 }
 
 impl PythonRuntimeProviderContext<'_> {
@@ -117,7 +227,7 @@ impl PythonRuntimeProviderContext<'_> {
         &self,
         environment_id: i64,
     ) -> Result<
-        crate::analyzer::python::runtime_environment::CheckedPythonDeclaredEnvironment,
+        Arc<crate::analyzer::python::runtime_environment::CheckedPythonDeclaredEnvironment>,
         StoreError,
     > {
         let Self {
@@ -126,6 +236,7 @@ impl PythonRuntimeProviderContext<'_> {
             workspace_root,
             limits,
             cancellation,
+            verification,
         } = *self;
         let (environment, expected) = store.with_python_runtime_acquisition(
         publication.acquisition_id, &publication.snapshot, |tx| {
@@ -145,18 +256,34 @@ impl PythonRuntimeProviderContext<'_> {
             }, digest))
         },
     )?;
-        let (checked, _, _) =
-            crate::analyzer::python::runtime_artifact::acquire_python_declared_environment(
-                workspace_root,
-                &environment,
-                limits,
-                Some(cancellation),
-            )
-            .map_err(|error| {
-                StoreError::stale_resolution(format!(
-                    "Python declared environment could not be revalidated: {error:?}"
-                ))
-            })?;
+        let key = PythonRuntimeVerificationKey {
+            publication: publication.clone(),
+            environment_id,
+            workspace_root: workspace_root.to_path_buf(),
+            environment,
+            limits: *limits,
+        };
+        let checked = read_or_check(
+            verification,
+            |memo| &memo.declared,
+            key,
+            cancellation,
+            |key| {
+                crate::analyzer::python::runtime_artifact::acquire_python_declared_environment(
+                    &key.workspace_root,
+                    &key.environment,
+                    &key.limits,
+                    Some(cancellation),
+                )
+                .map(|(checked, _, _)| Arc::new(checked))
+                .map_err(|error| Arc::from(format!("{error:?}")))
+            },
+        )
+        .map_err(|error| {
+            StoreError::stale_resolution(format!(
+                "Python declared environment could not be revalidated: {error}"
+            ))
+        })?;
         if checked.project_config() != &expected {
             return Err(StoreError::stale_resolution(format!(
                 "Python declared environment changed: recorded={expected:?}, current={:?}",
@@ -186,6 +313,7 @@ impl PythonRuntimeProviderContext<'_> {
             workspace_root,
             limits,
             cancellation,
+            verification,
         } = *self;
         let (candidate, artifacts, selected_artifact_index, scopes, frontiers) = store
             .with_python_runtime_acquisition(
@@ -312,7 +440,7 @@ impl PythonRuntimeProviderContext<'_> {
             .package
             .as_ref()
             .is_none_or(|package| package.name != artifact.purl())
-            || selected.artifact_sha256.as_deref() != Some(artifact.archive_sha256())
+            || !selected.contains_raw_sha256(artifact.archive_sha256())
             || selected.language != "python"
             || selected.ecosystem != "python"
             || selected
@@ -378,11 +506,26 @@ impl PythonRuntimeProviderContext<'_> {
                 .map(|artifact| declared_runtime_artifact_config(workspace_root, artifact))
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        let report = verify_python_runtime_artifacts(
-            workspace_root,
-            &[environment],
-            limits,
-            Some(cancellation),
+        let key = PythonRuntimeVerificationKey {
+            publication: publication.clone(),
+            environment_id: candidate.environment_id,
+            workspace_root: workspace_root.to_path_buf(),
+            environment,
+            limits: *limits,
+        };
+        let report = read_or_check(
+            verification,
+            |memo| &memo.artifacts,
+            key,
+            cancellation,
+            |key| {
+                Arc::new(verify_python_runtime_artifacts(
+                    &key.workspace_root,
+                    std::slice::from_ref(&key.environment),
+                    &key.limits,
+                    Some(cancellation),
+                ))
+            },
         );
         if !report.complete()
             || report.suppressed_diagnostics != 0

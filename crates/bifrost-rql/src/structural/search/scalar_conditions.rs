@@ -173,6 +173,8 @@ fn supported_scalar_guard(
         | GuardPredicate::ExactClass { .. }
         | GuardPredicate::HasMember { .. }
         | GuardPredicate::Truthy { .. }
+        | GuardPredicate::ValueEquality { .. }
+        | GuardPredicate::ValueOrdering { .. }
         | GuardPredicate::Opaque { .. } => false,
     };
     match language {

@@ -88,6 +88,7 @@ pub struct CSharpImportProbe {
 
 /// Exercise both shared layers against one selected file's authored imports.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn probe_imports(
     operation: &SelectedResolutionOperation<'_, '_>,
     path: &str,
@@ -128,10 +129,11 @@ pub fn probe_imports(
     let mut result = CSharpImportProbe {
         binders: Vec::new(),
         bindings: Vec::new(),
+        // Synthetic root references publish no range. Collect authored positions only.
         references: ready.inventory.connection().prepare_cached(
             "SELECT DISTINCT site.start_byte FROM resolution_semantic_sites semantic
              JOIN resolution_sites site ON site.blob_id=semantic.blob_id AND site.site=semantic.source_site
-             WHERE semantic.blob_id=?1 AND semantic.semantic_role='reference'"
+             WHERE semantic.blob_id=?1 AND semantic.semantic_role='reference' AND site.site_kind IS NOT NULL"
         )?.query_map([record.blob_id()], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?,
     };
     let mut seen = HashSet::default();

@@ -72,6 +72,9 @@ mod jvm_extraction_tests {
                 state,
             )
             .unwrap();
+            store
+                .ensure_prepared_resolution_epochs(std::slice::from_ref(&parsed))
+                .unwrap();
             let witness = ready(
                 store
                     .publish_selected_parsed_content(

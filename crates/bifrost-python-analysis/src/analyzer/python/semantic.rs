@@ -191,6 +191,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (
             mut specs,
@@ -9209,6 +9210,7 @@ mod tests {
                 &prepared,
                 &SemanticBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
             )
             .expect("Python lowering succeeds")
         else {

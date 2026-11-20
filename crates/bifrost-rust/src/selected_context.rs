@@ -1319,8 +1319,33 @@ impl RustCallerTargetProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustTargetRootUnavailableReason {
+    OutsideWorkspace,
+    OutsidePackageUnsupported,
+}
+
+impl RustTargetRootUnavailableReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OutsideWorkspace => "outside_workspace",
+            Self::OutsidePackageUnsupported => "outside_package_unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustUnavailableTargetRoot {
+    pub manifest_path: PathBuf,
+    pub target_kind: RustCallerTargetKind,
+    pub declared_root: PathBuf,
+    pub normalized_root: Option<PathBuf>,
+    pub reason: RustTargetRootUnavailableReason,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RustSelectedWorkspaceProfiles {
+    pub unavailable_roots: Vec<RustUnavailableTargetRoot>,
     pub profiles: Box<[RustCallerTargetProfile]>,
     pub target_inventory_complete: bool,
     /// Manifest-local causes that prevented complete target discovery.
@@ -1425,6 +1450,7 @@ fn rust_workspace_profiles_from_paths_with_progress(
     }
 
     let mut profiles = Vec::new();
+    let mut unavailable_roots = Vec::new();
     for manifest in manifests.values() {
         if !progress(RustSelectedContextWork::ScopeNode) {
             return Ok(RustSelectedBuildOutcome::Stopped);
@@ -1450,6 +1476,7 @@ fn rust_workspace_profiles_from_paths_with_progress(
         if cargo_library_target_enabled(package) {
             add_selected_target_profiles(
                 &mut profiles,
+                &mut unavailable_roots,
                 &source_paths,
                 &manifest.relative_path,
                 TargetCandidate {
@@ -1469,6 +1496,7 @@ fn rust_workspace_profiles_from_paths_with_progress(
                 }
                 add_selected_target_profiles(
                     &mut profiles,
+                    &mut unavailable_roots,
                     &source_paths,
                     &manifest.relative_path,
                     TargetCandidate {
@@ -1482,6 +1510,7 @@ fn rust_workspace_profiles_from_paths_with_progress(
         if let Some(build_script) = package.build_script.as_deref() {
             add_selected_target_profiles(
                 &mut profiles,
+                &mut unavailable_roots,
                 &source_paths,
                 &manifest.relative_path,
                 TargetCandidate {
@@ -1558,10 +1587,12 @@ fn rust_workspace_profiles_from_paths_with_progress(
             .then_with(|| left.test.cmp(&right.test))
     });
     profiles.dedup();
+    let target_inventory_complete = incomplete_reasons.is_empty() && unavailable_roots.is_empty();
     Ok(RustSelectedBuildOutcome::Ready(
         RustSelectedWorkspaceProfiles {
+            unavailable_roots,
             profiles: profiles.into_boxed_slice(),
-            target_inventory_complete: incomplete_reasons.is_empty(),
+            target_inventory_complete,
             incomplete_reasons: incomplete_reasons.into_iter().collect(),
         },
     ))
@@ -1611,17 +1642,35 @@ struct TargetCandidate<'a> {
 
 fn add_selected_target_profiles(
     profiles: &mut Vec<RustCallerTargetProfile>,
+    unavailable_roots: &mut Vec<RustUnavailableTargetRoot>,
     source_paths: &BTreeSet<&Path>,
     manifest_path: &Path,
     candidate: TargetCandidate<'_>,
 ) {
     let directory = manifest_path.parent().unwrap_or(Path::new(""));
-    let Some(target_root) = normalize_selected_path(directory, candidate.path) else {
-        return;
+    let target_root = normalize_selected_path(directory, candidate.path);
+    let reason = match &target_root {
+        None => Some(RustTargetRootUnavailableReason::OutsideWorkspace),
+        Some(root) if !root.starts_with(directory) => {
+            Some(RustTargetRootUnavailableReason::OutsidePackageUnsupported)
+        }
+        Some(_) => None,
     };
-    let Ok(profile_target_root) = target_root.strip_prefix(directory) else {
+    if let Some(reason) = reason {
+        unavailable_roots.push(RustUnavailableTargetRoot {
+            manifest_path: manifest_path.to_path_buf(),
+            target_kind: candidate.kind,
+            declared_root: candidate.path.to_path_buf(),
+            normalized_root: target_root,
+            reason,
+        });
         return;
-    };
+    }
+    let target_root = target_root.expect("available target root is normalized");
+    let profile_target_root = target_root
+        .strip_prefix(directory)
+        .expect("available target is in package");
+    // Absent optional autodiscovery candidates are not targets; required absent roots have discovery reasons.
     if source_paths.contains(target_root.as_path()) {
         add_default_workspace_profiles(
             profiles,
@@ -2334,7 +2383,7 @@ fn build_rust_selected_context_from_maps_with_progress(
             .package
             .as_ref()
             .expect("a selected Cargo target has package facts");
-        if let Some(library_root) = same_package_library_root(&profile, package, sources)? {
+        if let Some(library_root) = same_package_library_root(&profile, package, sources) {
             roots.insert(library_root.clone());
             dependency_edges.insert(RustSelectedDependencyEdge {
                 source_crate_root: caller_root.clone(),
@@ -4108,20 +4157,27 @@ fn same_package_library_root(
     profile: &RustCallerTargetProfile,
     package: &RustCargoPackageFact,
     sources: &BTreeMap<PathBuf, RustSelectedSourceMount>,
-) -> Result<Option<PathBuf>, String> {
-    if matches!(
-        profile.target_kind,
+) -> Option<PathBuf> {
+    if !has_same_package_library_dependency(profile.target_kind, package) {
+        return None;
+    }
+    let directory = profile.manifest_path.parent().unwrap_or(Path::new(""));
+    // This source-only builder can mount only available roots. Persisted target
+    // discovery retains the dependency even when its root is unavailable.
+    let root = normalize_selected_path(directory, &package.library_path)?;
+    (root.starts_with(directory) && sources.contains_key(&root)).then_some(root)
+}
+
+fn has_same_package_library_dependency(
+    target_kind: RustCallerTargetKind,
+    package: &RustCargoPackageFact,
+) -> bool {
+    !matches!(
+        target_kind,
         RustCallerTargetKind::Library
             | RustCallerTargetKind::Build
             | RustCallerTargetKind::Detached
-    ) || !cargo_library_target_enabled(package)
-    {
-        return Ok(None);
-    }
-    let directory = profile.manifest_path.parent().unwrap_or(Path::new(""));
-    let root = normalize_selected_path(directory, &package.library_path)
-        .ok_or_else(|| "caller package library root escapes inventory".to_string())?;
-    Ok(sources.contains_key(&root).then_some(root))
+    ) && cargo_library_target_enabled(package)
 }
 
 fn dependency_available(

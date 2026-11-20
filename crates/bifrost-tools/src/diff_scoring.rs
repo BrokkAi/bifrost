@@ -260,7 +260,7 @@ pub fn score_diff_at_root(
     )
 }
 
-/// Retains one immutable target's analysis across diff-scoring requests.
+/// Retains one immutable target's analysis across `score_diff` requests.
 ///
 /// The retained value is an analyzer, not a score: a different base still
 /// computes its own changed symbols, edges, and feature vector. Replacing the
@@ -281,12 +281,33 @@ struct CachedTargetSlot {
     analysis: Arc<PoolSafeMemo<CachedTarget>>,
 }
 
-struct CachedTarget {
-    endpoint: EndpointAnalysis,
+pub(crate) struct CachedTarget {
+    // Distinguishes this request's acquisition from a retained endpoint,
+    // including one obtained by waiting on another request's in-flight build.
+    acquisition_request: Arc<()>,
+    pub(crate) endpoint: EndpointAnalysis,
     epochs: HashMap<String, i64>,
     references: ReferenceCache,
 }
 
+/// Identity check shared by retained revision consumers. The caller must first
+/// match the requested root, revision and object directory. Store generations
+/// alone do not track edits to ambient inputs consumed by the private export.
+/// On false, retire the endpoint and every reference-query cache tied to it.
+pub(crate) fn retained_endpoint_identity_is_current(
+    endpoint: &EndpointAnalysis,
+    epochs: &HashMap<String, i64>,
+) -> Result<bool, String> {
+    let current = target_epochs(endpoint)?;
+    Ok(epochs
+        .iter()
+        .all(|(language, generation)| current.get(language) == Some(generation))
+        && endpoint
+            .analyzer()
+            .configuration_external_inputs_unchanged())
+}
+
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn target_epochs(endpoint: &EndpointAnalysis) -> Result<HashMap<String, i64>, String> {
     let store = endpoint
         .workspace()
@@ -336,7 +357,29 @@ impl DiffScoringSession {
                 cancellation,
             ));
         }
-        let whole_target = loop {
+        let whole_target = self.retained_target(root, &prepared, options)?;
+        let analyzed =
+            analyze_prepared_diff_with_target_image(&prepared, true, &whole_target.endpoint)?;
+        Ok(score_analyzed_diff(
+            analyzed,
+            whole_target.endpoint.analyzer(),
+            &whole_target.references,
+            cancellation,
+        ))
+    }
+
+    /// The one acquisition path for a retained immutable target: the slot is
+    /// keyed by root, snapshot and object directory, built once through the
+    /// memo, and validated on every reuse. `score_diff` calls it to reuse a
+    /// target across requests.
+    pub(crate) fn retained_target(
+        &self,
+        root: &Path,
+        prepared: &PreparedDiff,
+        options: &DiffAnalysisOptions,
+    ) -> Result<Arc<CachedTarget>, String> {
+        assert!(prepared.target.is_immutable());
+        loop {
             let memo = {
                 let mut slot = self.target.lock().expect("diff scoring cache poisoned");
                 let reusable = slot.as_ref().is_some_and(|cached| {
@@ -354,6 +397,7 @@ impl DiffScoringSession {
                 }
                 Arc::clone(&slot.as_ref().expect("target slot installed").analysis)
             };
+            let acquisition_request = Arc::new(());
             let build = || {
                 #[cfg(any(test, feature = "test-support"))]
                 self.target_builds
@@ -361,6 +405,7 @@ impl DiffScoringSession {
                 let endpoint = prepared.whole_target_analysis()?;
                 let epochs = target_epochs(&endpoint)?;
                 Ok::<_, String>(CachedTarget {
+                    acquisition_request: Arc::clone(&acquisition_request),
                     endpoint,
                     epochs,
                     references: ReferenceCache {
@@ -371,13 +416,14 @@ impl DiffScoringSession {
                 })
             };
             let target = memo.get_or_try_build(build, build)?;
-            let current = target_epochs(&target.endpoint)?;
-            if target
-                .epochs
-                .iter()
-                .all(|(language, generation)| current.get(language) == Some(generation))
+            // A request may use its own fresh acquisition even when incomplete,
+            // but must validate every reused acquisition. This includes waiting
+            // on another request's build, or losing a parallel memo publication.
+            // Incomplete receipts therefore cannot cause an endless rebuild.
+            if Arc::ptr_eq(&target.acquisition_request, &acquisition_request)
+                || retained_endpoint_identity_is_current(&target.endpoint, &target.epochs)?
             {
-                break target;
+                return Ok(target);
             }
             let mut slot = self.target.lock().expect("diff scoring cache poisoned");
             if slot
@@ -386,15 +432,7 @@ impl DiffScoringSession {
             {
                 *slot = None;
             }
-        };
-        let analyzed =
-            analyze_prepared_diff_with_target_image(&prepared, true, &whole_target.endpoint)?;
-        Ok(score_analyzed_diff(
-            analyzed,
-            whole_target.endpoint.analyzer(),
-            &whole_target.references,
-            cancellation,
-        ))
+        }
     }
 
     /// Score a worktree target using the host's complete source generation.
@@ -413,12 +451,7 @@ impl DiffScoringSession {
         );
         let analyzer = workspace.analyzer();
         let project = analyzer.project();
-        if project.coverage().subset().is_some()
-            || analyzer.languages() != project.analyzer_languages()
-            || project
-                .overlay_content()
-                .is_some_and(|overlay| !overlay.entries().is_empty())
-        {
+        if !workspace_serves_disk_worktree(workspace) {
             // Worktree endpoints select disk bytes over the complete project.
             // Partial analyzers and unsaved editor buffers cannot answer that
             // question, but the ordinary full disk analysis can.
@@ -463,6 +496,19 @@ impl DiffScoringSession {
         self.target_builds
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Whether the host's live workspace can answer a question about the disk
+/// worktree. Worktree endpoints select disk bytes over the complete project;
+/// partial analyzers and unsaved editor buffers cannot answer that.
+pub(crate) fn workspace_serves_disk_worktree(workspace: &WorkspaceAnalyzer) -> bool {
+    let analyzer = workspace.analyzer();
+    let project = analyzer.project();
+    project.coverage().subset().is_none()
+        && analyzer.languages() == project.analyzer_languages()
+        && !project
+            .overlay_content()
+            .is_some_and(|overlay| !overlay.entries().is_empty())
 }
 
 impl ScoreDiffParams {
@@ -1361,6 +1407,94 @@ mod tests {
     use brokk_bifrost_core::test_support::write_file as write;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13340: a retained diff-scoring endpoint served an obsolete score after an external Cargo config edit"
+    )]
+    fn retained_endpoint_revalidates_external_cargo_configuration() {
+        // Both live fixtures and private revision exports must inherit this
+        // config. Isolate the process temp root so parallel tests cannot read it.
+        const CHILD: &str = "BIFROST_DIFF_SCORING_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diff_scoring::tests::retained_endpoint_revalidates_external_cargo_configuration",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("TMPDIR", temp.path())
+                .env("TMP", temp.path())
+                .env("TEMP", temp.path())
+                .env("BIFROST_CACHE_ROOT", temp.path().join("cache"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child failed: {output:?}");
+            return;
+        }
+        let config = std::env::temp_dir().join(".cargo/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "[build]\ntarget='x86_64-pc-windows-msvc'\n").unwrap();
+        let fixture = crate::inline_project::InlineTestProject::with_language(
+            brokk_bifrost_analysis::Language::Rust,
+        )
+        .file("Cargo.toml", MANIFEST)
+        .file("src/lib.rs", "pub fn example() -> i32 { 1 }\n")
+        .file(
+            "tests/check.rs",
+            "#[cfg(windows)]\n#[test]\nfn checks() { let _ = repro::example(); }\n",
+        )
+        .with_git()
+        .build();
+        write(
+            fixture.root(),
+            "src/lib.rs",
+            "pub fn example() -> i64 { 2 }\n",
+        );
+        fixture.commit("after");
+        let params = || ScoreDiffParams {
+            base: Some("HEAD~1".into()),
+            target: Some("HEAD".into()),
+        };
+        let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        let cancellation = CancellationToken::default();
+        let options = DiffAnalysisOptions::default();
+        let session = super::DiffScoringSession::default();
+        let score = |session: &super::DiffScoringSession| {
+            session
+                .score_at_root(fixture.root(), params(), &options, &cancellation, &budget)
+                .unwrap()
+        };
+        let initial = score(&session);
+        assert_eq!(
+            initial.coordination.signature_change_external_caller_sites,
+            1
+        );
+        assert_eq!(initial.verification.untested_fraction, 0.0);
+        assert_eq!(session.target_build_count_for_test(), 1);
+        let unchanged = score(&session);
+        assert_eq!(session.target_build_count_for_test(), 1);
+        assert_eq!(
+            serde_json::to_value(&initial).unwrap(),
+            serde_json::to_value(&unchanged).unwrap()
+        );
+
+        fs::write(&config, "[build]\ntarget='x86_64-unknown-linux-gnu'\n").unwrap();
+        let retained = score(&session);
+        assert_eq!(session.target_build_count_for_test(), 2);
+        let fresh = score(&super::DiffScoringSession::default());
+        assert_eq!(
+            retained.coordination.signature_change_external_caller_sites,
+            0
+        );
+        assert_eq!(retained.verification.untested_fraction, 1.0);
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap(),
+            serde_json::to_value(&fresh).unwrap()
+        );
+    }
 
     const MANIFEST: &str = "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 

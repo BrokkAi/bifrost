@@ -125,6 +125,29 @@ mod tests {
         }))
     }
 
+    /// A placeholder site for a hand-built row: the policy projection never reads it.
+    fn placeholder_site() -> brokk_bifrost_tools::site_context::SiteContextView {
+        use brokk_bifrost_tools::site_context::{
+            SiteContextView, SiteLocationView, SiteRoleView, SiteValueView, UnknownValueCauseView,
+        };
+        SiteContextView {
+            site: SiteLocationView::Source {
+                path: brokk_bifrost_core::admitted_text::AdmittedText::from_static("app.py"),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 2,
+                text: brokk_bifrost_core::admitted_text::AdmittedText::empty(),
+            },
+            role: SiteRoleView::Value,
+            value: SiteValueView::Unknown {
+                cause: UnknownValueCauseView::NotConstant,
+            },
+        }
+    }
+
     fn unit_range() -> CodeQueryRange {
         CodeQueryRange {
             start_line: 1,
@@ -380,6 +403,7 @@ mod tests {
                     name: Some(name.to_string()),
                     literal_value: None,
                     spread: false,
+                    site: placeholder_site(),
                 },
             ),
         })

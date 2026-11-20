@@ -1234,6 +1234,8 @@ pub(super) fn tested_boolean_bindings_from_copy_graph(
             | GuardPredicate::InstanceOf { .. }
             | GuardPredicate::ExactClass { .. }
             | GuardPredicate::HasMember { .. }
+            | GuardPredicate::ValueEquality { .. }
+            | GuardPredicate::ValueOrdering { .. }
             | GuardPredicate::Opaque { .. } => {}
         }
     }
@@ -1325,6 +1327,8 @@ fn guard_binding_condition(
         | GuardPredicate::InstanceOf { .. }
         | GuardPredicate::ExactClass { .. }
         | GuardPredicate::HasMember { .. }
+        | GuardPredicate::ValueEquality { .. }
+        | GuardPredicate::ValueOrdering { .. }
         | GuardPredicate::Opaque { .. } => return None,
     };
     let binding = binding_origins

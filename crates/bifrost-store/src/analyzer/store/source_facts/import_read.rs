@@ -18,7 +18,7 @@ fn path_kind(value: Option<String>, label: &str) -> Result<Option<StructuredImpo
     value
         .map(|value| {
             StructuredImportPathKind::from_persist_tag(&value).ok_or_else(|| {
-                StoreError::new(format!(
+                StoreError::corrupt(format!(
                     "invalid {label} structured import path kind {value:?}"
                 ))
             })
@@ -33,13 +33,13 @@ fn import_path_mut<'a>(
 ) -> Result<&'a mut SourceImportPathFact> {
     let import_id = source_import(import_id, label)?;
     let import = imports.get_mut(import_id.index()).ok_or_else(|| {
-        StoreError::new(format!(
+        StoreError::corrupt(format!(
             "{label} references missing source import id {:?}",
             import_id
         ))
     })?;
     import.path.as_mut().ok_or_else(|| {
-        StoreError::new(format!(
+        StoreError::corrupt(format!(
             "{label} references unavailable path for source import {import_id:?}"
         ))
     })
@@ -83,12 +83,12 @@ pub fn read_source_imports(
         prefix_count,
     )) = manifest
     else {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "source import facts for blob {blob_id} have no publication manifest"
         )));
     };
     if publication_state != "complete" || facts_version != SOURCE_FACTS_VERSION {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "source import facts for blob {blob_id} are not complete: state={publication_state:?}, facts_version={facts_version}"
         )));
     }
@@ -113,7 +113,7 @@ pub fn read_source_imports(
         }
         let import_id = source_import(row.get(0)?, "source import")?;
         if import_id.index() != imports.len() {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "source import ids are not dense for blob {blob_id}: got {:?}, expected {}",
                 import_id,
                 imports.len()
@@ -131,7 +131,7 @@ pub fn read_source_imports(
         let has_path = strict_bool(row.get(10)?, "source import path availability")?;
         let kind = path_kind(row.get(6)?, "source import")?;
         if !has_path && kind.is_some() {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "unavailable source import path {import_id:?} has kind {kind:?}"
             )));
         }
@@ -156,7 +156,7 @@ pub fn read_source_imports(
     drop(rows);
     drop(statement);
     if imports.len() != expected_imports {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "source import count mismatch for blob {blob_id}: manifest={expected_imports}, imports={imports:?}"
         )));
     }
@@ -176,7 +176,7 @@ pub fn read_source_imports(
         let ordinal = nonnegative_usize(row.get(1)?, "source import segment ordinal")?;
         let import = import_path_mut(&mut imports, row.get(0)?, "source import segment")?;
         if ordinal != import.segments.len() {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "source import segment ordinals are not dense: got {ordinal}, expected {}",
                 import.segments.len()
             )));
@@ -187,7 +187,7 @@ pub fn read_source_imports(
     drop(rows);
     drop(statement);
     if segments != expected_segments {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "source import segment count mismatch for blob {blob_id}: manifest={expected_segments}, rows={segments}, imports={imports:?}"
         )));
     }
@@ -208,7 +208,7 @@ pub fn read_source_imports(
         let occurrence = source_occurrence(row.get(2)?, "source import scope")?;
         let import = import_path_mut(&mut imports, row.get(0)?, "source import scope")?;
         if ordinal != import.lexical_scopes.len() {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "source import scope ordinals are not dense: got {ordinal}, expected {}",
                 import.lexical_scopes.len()
             )));
@@ -219,7 +219,7 @@ pub fn read_source_imports(
     drop(rows);
     drop(statement);
     if scopes != expected_scopes {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "source import scope count mismatch for blob {blob_id}: manifest={expected_scopes}, rows={scopes}, imports={imports:?}"
         )));
     }
@@ -239,7 +239,7 @@ pub fn read_source_imports(
         let ordinal = nonnegative_usize(row.get(1)?, "source import prefix ordinal")?;
         let import = import_path_mut(&mut imports, row.get(0)?, "source import prefix")?;
         if ordinal != import.lexical_prefixes.len() {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "source import prefix ordinals are not dense: got {ordinal}, expected {}",
                 import.lexical_prefixes.len()
             )));
@@ -248,7 +248,7 @@ pub fn read_source_imports(
         prefixes += 1;
     }
     if prefixes != expected_prefixes {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "source import prefix count mismatch for blob {blob_id}: manifest={expected_prefixes}, rows={prefixes}, imports={imports:?}"
         )));
     }

@@ -4,11 +4,12 @@
 //! `SignatureMetadata`. Language relations use this small query-local projection
 //! to join those rows back to the source ranges selected by their AST walks.
 
-use crate::analyzer::{IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
 
 #[derive(Clone)]
 pub(super) struct FieldSite {
+    pub(super) unit: CodeUnit,
     pub(super) range: Range,
     pub(super) metadata: SignatureMetadata,
 }
@@ -28,6 +29,7 @@ pub(super) fn field_sites(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<F
                 .ranges_of(&unit)
                 .into_iter()
                 .map(|range| FieldSite {
+                    unit: unit.clone(),
                     range,
                     metadata: metadata.clone(),
                 }),

@@ -102,7 +102,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer::for_name("bifrost-composer-package")
+        (Producer::for_name("bifrost-composer-package")).with_dependency_revision()
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -227,6 +227,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
         members.sort_by(|left, right| left.id.cmp(&right.id));
 
         let activation = vec![ActivationSelector {
+            production_input_digest: None,
             package: dependency
                 .evidence
                 .package
@@ -265,8 +266,8 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
 
         DependencyPackProduction {
             pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
-                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_dependency_artifacts(
-                    ExternalArtifactKind::ComposerPackageSourceSet, artifacts)),
+                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
+                    ExternalArtifactKind::ComposerPackageSourceSet, &brokk_bifrost_analysis::analyzer::semantic_model::dependency::verified_raw_slots(artifacts))),
                 schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: "bifrost.external.php".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -1326,6 +1327,7 @@ mod declaration_stub_tests {
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: None,
                 module: None,
                 toolchain: None,

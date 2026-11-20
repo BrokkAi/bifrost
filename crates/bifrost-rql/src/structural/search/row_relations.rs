@@ -107,6 +107,10 @@ fn undecided_owner_relation(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     })
 }
 
@@ -479,6 +483,7 @@ pub(super) fn binding_identity_for_range(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
         return None;
     }
@@ -733,6 +738,10 @@ pub(super) fn binding_uses_expansions(
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
         }
     }
@@ -982,13 +991,13 @@ pub(super) fn inverse_edge_expansions(
 
 /// The state events of one seed procedure.
 ///
-/// The file's whole derivation is computed (and memoised) once; this narrows it
-/// to the seed procedure and applies the author's filter. The derivation's own
-/// completeness is reported *before* the filter runs, so a filter that drops
-/// every row still leaves the reason the answer is partial on the response.
-pub(super) fn state_event_expansions(
-    workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache<'_>,
+/// Derive the seed procedure through its file's shared operation and apply
+/// the author's filter. Completeness is reported before applying the filter so
+/// the response retains the reason for a partial answer even with no rows.
+pub(super) fn state_event_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     procedure: &SemanticProcedureValue,
     filter: &StateEventFilter,
     cancellation: Option<&CancellationToken>,
@@ -996,6 +1005,7 @@ pub(super) fn state_event_expansions(
 ) -> Vec<PipelineExpansion> {
     let Some((file_state, procedure_index, procedure_id, file)) = seed_derivation(
         workspace,
+        semantic,
         flow_state_cache,
         procedure,
         flow_state::STATE_EVENT_AXES,
@@ -1027,9 +1037,10 @@ pub(super) fn state_event_expansions(
 }
 
 /// The flow relations of one seed procedure.
-pub(super) fn flow_relation_expansions(
-    workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache<'_>,
+pub(super) fn flow_relation_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     procedure: &SemanticProcedureValue,
     filter: &FlowRelationFilter,
     cancellation: Option<&CancellationToken>,
@@ -1037,6 +1048,7 @@ pub(super) fn flow_relation_expansions(
 ) -> Vec<PipelineExpansion> {
     let Some((file_state, procedure_index, procedure_id, file)) = seed_derivation(
         workspace,
+        semantic,
         flow_state_cache,
         procedure,
         flow_state::FLOW_RELATION_AXES,
@@ -1090,10 +1102,11 @@ pub(super) fn selected_property_relation_expansions<'a>(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
         return Vec::new();
     }
-    let Some(outcome) = semantic.materialized_outcome(file) else {
+    let Ok(outcome) = semantic.materialized_outcome(file) else {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
                 has_non_utf8_refusal: false,
                 refusal_sites: Default::default(),
@@ -1113,6 +1126,7 @@ pub(super) fn selected_property_relation_expansions<'a>(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
         return Vec::new();
     };
@@ -1212,7 +1226,9 @@ fn selected_property_incomplete_message(
             Reason::ModeledControlProjectionIncomplete { .. } => {
                 "ModeledControlProjectionIncomplete"
             }
-            Reason::BudgetExhausted { .. } => "BudgetExhausted",
+            Reason::BudgetExhausted { .. } | Reason::PropertySnapshotBudgetExhausted { .. } => {
+                "BudgetExhausted"
+            }
             Reason::PropertyBaseNotCanonical { .. } => "PropertyBaseNotCanonical",
             Reason::SelectedPropertyEndpointUnavailable { .. } => {
                 "SelectedPropertyEndpointUnavailable"
@@ -1315,47 +1331,49 @@ fn report_selected_property_completeness(
     scoped: &super::super::flow_state::FileFlowState,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    let reasons = scoped
-        .completeness
-        .reasons()
-        .iter()
-        .filter(|reason| {
-            reason.blocks(super::super::flow_state::FlowStateAxis::PropertyReachingRelation)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if reasons.is_empty() {
-        return;
+    // Each diagnostic has one typed cause. Keep separate cause groups so a
+    // later cancellation cannot disappear behind an earlier budget refusal.
+    let mut reasons_by_cause = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for reason in scoped.completeness.reasons().iter().filter(|reason| {
+        reason.blocks(super::super::flow_state::FlowStateAxis::PropertyReachingRelation)
+    }) {
+        reasons_by_cause
+            .entry(flow_state::classify_reason(reason).2)
+            .or_default()
+            .push(reason.clone());
     }
-
-    let cause = reasons
-        .iter()
-        .find_map(|reason| flow_state::classify_reason(reason).2);
-    diagnostics.push(QueryExecutionState::diagnostic(
-        analyzer,
-        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-            has_non_utf8_refusal: false,
-            refusal_sites: Default::default(),
-            call_relation_facts: None,
-            uses_omissions: Vec::new(),
-            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
-            related: procedure.related_flow_reasons(&reasons),
-            source: procedure.diagnostic_source(),
-            code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message: selected_property_incomplete_message(
-                &rel_path_string(procedure.file()),
-                point_id,
-                scoped.generation,
-                &reasons,
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        }),
-        cause,
-    ));
+    for (cause, reasons) in reasons_by_cause {
+        diagnostics.push(QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                // A property-flow gap has no call-binding refusal site.
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: procedure.related_flow_reasons(&reasons),
+                source: procedure.diagnostic_source(),
+                code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: selected_property_incomplete_message(
+                    &rel_path_string(procedure.file()),
+                    point_id,
+                    scoped.generation,
+                    &reasons,
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
+            }),
+            cause,
+        ));
+    }
 }
 
 /// The flow relations incident to one state event: seeded from an event, an
@@ -1775,15 +1793,20 @@ fn binding_initializer_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 
-/// Derive one seed procedure's file, locate the seed inside it, and report the
-/// derivation's completeness. `None` when the file's derivation produced no
-/// procedures at all -- which the reported diagnostics already explain.
-pub(super) fn seed_derivation(
-    workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache<'_>,
+/// Derive one exact selected procedure and report its applicable completeness.
+/// Unavailable artifacts and stopped empty derivations publish their actual
+/// diagnostics before returning `None`, independently of downstream filters.
+pub(super) fn seed_derivation<'a>(
+    workspace: &'a WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     procedure: &SemanticProcedureValue,
     axes: &[brokk_bifrost_core::analyzer::structural::flow_state::FlowStateAxis],
     cancellation: Option<&CancellationToken>,
@@ -1796,7 +1819,20 @@ pub(super) fn seed_derivation(
 )> {
     let file = procedure.file().clone();
     let language = crate::analyzer::common::language_for_file(&file);
-    let file_state = flow_state_cache.for_file(workspace, &file, cancellation);
+    let native = semantic.materialized_outcome(&file).ok()?;
+    let file_state = match flow_state_cache.for_seed_procedure(
+        workspace,
+        &file,
+        native,
+        &procedure.handle,
+        cancellation,
+    ) {
+        Ok(state) => state,
+        Err(exceeded) => {
+            semantic.report_seed_admission_refusal(&file, exceeded);
+            return None;
+        }
+    };
     flow_state_cache.report_completeness(
         workspace.analyzer(),
         &rel_path_string(&file),
@@ -1808,10 +1844,21 @@ pub(super) fn seed_derivation(
         diagnostics,
     );
     let wanted = procedure.handle.id();
-    let procedure_index = file_state
+    let Some(procedure_index) = file_state
         .procedures
         .iter()
-        .position(|derivation| derivation.procedure == wanted)?;
+        .position(|derivation| derivation.procedure == wanted)
+    else {
+        assert!(
+            file_state
+                .completeness
+                .reasons()
+                .iter()
+                .any(|reason| axes.iter().any(|axis| reason.blocks(*axis))),
+            "a procedure-scoped derivation without its selected row reports why"
+        );
+        return None;
+    };
     flow_state_cache.report_completeness(
         workspace.analyzer(),
         &rel_path_string(&file),
@@ -1826,25 +1873,28 @@ pub(super) fn seed_derivation(
     Some((file_state, procedure_index, procedure_id, file))
 }
 
-/// The control relations of one seed procedure.
-///
-/// The procedure's whole derivation runs (and is memoised) once; this applies
-/// the author's filter. The derivation's completeness is reported *before* the
-/// filter runs, so a `:relation postdominates` filter that drops every row
-/// still leaves the reason the answer is partial on the response.
+/// Compact requested control relations, expanded only as the pipeline consumes
+/// them. Coverage is reported even when a requested family has no emitted row.
 pub(super) fn control_relation_expansions(
     analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
     control_relation_cache: &mut ControlRelationTraversalCache,
     procedure: &SemanticProcedureValue,
-    generation: u64,
     filter: &ControlRelationFilter,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> Vec<PipelineExpansion> {
-    let file = procedure.file().clone();
-    let language = crate::analyzer::common::language_for_file(&file);
-    let relations =
-        control_relation_cache.for_procedure(analyzer, procedure, generation, cancellation);
+) -> Box<
+    dyn Iterator<Item = Result<PipelineExpansion, control_relations::ControlRelationExpansionStop>>,
+> {
+    let language = crate::analyzer::common::language_for_file(procedure.file());
+    let relations = control_relation_cache.for_procedure(
+        analyzer,
+        semantic,
+        procedure,
+        analyzer.project().analysis_generation(),
+        filter,
+        cancellation,
+    );
     control_relation_cache.report_completeness(
         analyzer,
         &procedure.wire_id(),
@@ -1852,31 +1902,36 @@ pub(super) fn control_relation_expansions(
         &relations,
         diagnostics,
     );
-    let mut expansions = Vec::new();
-    for index in 0..relations.rows.len() {
-        if !control_relations::control_relation_filter_matches(filter, &relations.rows[index]) {
-            continue;
-        }
-        expansions.push(pipeline_expansion(PipelineValue::ControlRelation(
-            Box::new(ControlRelationValue {
-                relations: Arc::clone(&relations),
-                index,
-                procedure: procedure.clone(),
-            }),
-        )));
-    }
-    expansions
+    let rows = control_relations::ControlRelationRows::new(
+        relations,
+        procedure.clone(),
+        cancellation.cloned().unwrap_or_default(),
+    );
+    let filter = filter.clone();
+    let procedure = procedure.clone();
+    Box::new(
+        rows.filter(move |value| match value {
+            Ok(value) => control_relations::control_relation_filter_matches(&filter, &value.row),
+            Err(_) => true,
+        })
+        .map(move |value| {
+            value.map(|value| {
+                pipeline_expansion(PipelineValue::ControlRelation(Box::new(
+                    value.project(&procedure),
+                )))
+            })
+        }),
+    )
 }
 
 /// The guard facts one seed procedure's lowerer recorded (#2443 slice 2).
 ///
-/// Nothing is derived and nothing is filtered: the rows are already in the
-/// artifact, so this reads them in the dense order the lowerer minted them. An
-/// empty answer is not a diagnostic either -- the procedure's adapter states
-/// whether it publishes guard facts at all through its `guard_facts`
-/// capability, which is a stronger and cheaper answer than a per-query reason.
-pub(super) fn guard_expansions(procedure: &SemanticProcedureValue) -> Vec<PipelineExpansion> {
-    guards::guards_of_procedure(procedure)
+/// Project the recorded guards and report uncovered procedure decisions.
+pub(super) fn guard_expansions(
+    procedure: &SemanticProcedureValue,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    guards::guards_of_procedure(procedure, diagnostics)
         .into_iter()
         .map(|guard| pipeline_expansion(PipelineValue::Guard(Box::new(guard))))
         .collect()
@@ -2158,6 +2213,7 @@ pub(super) fn edge_row_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     expansions
@@ -2171,6 +2227,99 @@ mod owner_relation_tests {
         EdgeProvenance, OwnerRelation, SiteClass,
     };
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#14370: selected-property reporting kept only the first of budget and cancellation causes"
+    )]
+    fn selected_property_diagnostics_preserve_budget_and_cancellation() {
+        use super::super::tests::inline_project::InlineTestProject;
+        use brokk_bifrost_flow::flow_state::{
+            FlowStateCompleteness, FlowStateIncompleteReason, FlowStateRequest,
+            FlowStateRequestMemos, flow_state_for_file,
+        };
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file(
+                "src/main.js",
+                "function sample() { const ns = {}; ns.value = 1; return ns.value; }",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let file = project.file("src/main.js");
+        let declarations = workspace.analyzer().declarations_named(&file, "sample");
+        let [declaration] = declarations.as_slice() else {
+            panic!("one fixture declaration: {declarations:?}");
+        };
+        let ranges = workspace.analyzer().ranges_of(declaration);
+        let [range] = ranges.as_slice() else {
+            panic!("one fixture range: {ranges:?}");
+        };
+        let source = workspace
+            .analyzer()
+            .indexed_source(&file)
+            .expect("fixture source");
+        let mut context = SemanticQueryContext::new(&workspace, None, Default::default());
+        let procedures = context.procedure_of_source_range(
+            &file,
+            *range,
+            crate::analyzer::semantic::ContentIdentity::hash_bytes(source.as_bytes()),
+        );
+        let [procedure] = procedures.as_slice() else {
+            panic!("one fixture procedure: {procedures:?}");
+        };
+        let token = CancellationToken::default();
+        let mut scoped = flow_state_for_file(
+            &workspace,
+            &file,
+            &mut FlowStateRequest::new(
+                &token,
+                FlowStateRequestMemos::new(workspace.retention_budget()),
+            ),
+        );
+        let budget = FlowStateIncompleteReason::PropertySnapshotBudgetExhausted {
+            detail: crate::analyzer::semantic::SemanticBudgetExceeded::new(
+                crate::analyzer::semantic::SemanticBudgetDimension::Values,
+                1,
+                2,
+            )
+            .to_string(),
+        };
+        // Inject the two typed stops at the reporting boundary in both orders;
+        // duplicate cancellation evidence must not create duplicate causes.
+        for reasons in [
+            vec![budget.clone(), FlowStateIncompleteReason::Cancelled],
+            vec![
+                FlowStateIncompleteReason::Cancelled,
+                budget.clone(),
+                FlowStateIncompleteReason::Cancelled,
+            ],
+        ] {
+            scoped.completeness = FlowStateCompleteness::Incomplete { reasons };
+            let mut diagnostics = Vec::new();
+            report_selected_property_completeness(
+                workspace.analyzer(),
+                procedure,
+                "point",
+                &scoped,
+                &mut diagnostics,
+            );
+            assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| { diagnostic.incompleteness.execution_cause() })
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some(DerivationExecutionCause::Cancelled),
+                    Some(DerivationExecutionCause::Budget),
+                ]
+            );
+            assert!(diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::FlowStateDerivationIncomplete
+                    && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+            }));
+        }
+    }
 
     #[test]
     #[hardwon("#12482: oversized real locator records hid later selected-property cause kinds")]

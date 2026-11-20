@@ -137,6 +137,15 @@ pub enum DeferredMemberOwnerProof {
     Unknown,
 }
 
+/// One observed receiver-chain identity. The language owns the proof that
+/// this identity's impl inventory closes the chain; absence of a descriptor
+/// never means that an external type has no Deref implementation.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredMemberReceiverType {
+    pub identity: SemanticId,
+    pub intrinsic_kind: Option<IntrinsicTypeKind>,
+}
+
 /// Exact selected Go member metadata, retained only for the current query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoMemberDeclaration {
@@ -376,10 +385,103 @@ pub struct NamedArgumentLabel {
     pub spelling: String,
 }
 
+/// Exact canonical parser source behind an access endpoint. These values are
+/// query-local; their conservative File input certificate is retained normally.
+#[derive(Debug, Clone)]
+pub struct SelectedAccessSource {
+    pub file: crate::analyzer::ProjectFile,
+    pub language: Language,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedAccessReference {
+    pub source: SelectedAccessSource,
+    pub owner: Option<Option<SemanticId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedAccessDeclaration {
+    pub source: SelectedAccessSource,
+    /// Affirmative canonical parser binder kind; absence is not nonmembership.
+    pub lexical_kind: Option<crate::analyzer::DeclarationKind>,
+    pub partial: Option<bool>,
+    pub is_type: bool,
+    /// An exact ordinary owner, an established empty owner inventory, or an
+    /// unproven/malformed inventory. Absence must not close a containing chain.
+    pub ordinary_owner: Option<Option<SemanticId>>,
+    pub visibility:
+        Option<brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility>,
+}
+
+/// Caller authority for candidate admission. An unproven context is enabled
+/// access with Unknown evidence, never the legacy absence of an access policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeclarationAccessContext {
+    EnclosingType(SemanticId),
+    OutsideType,
+    Unproven,
+}
+
+/// The reference is an input witness for ordinary access requests. Cache keys
+/// compare only the established enclosing-type context, so call sites in the
+/// same nonpartial type share their hierarchy entry.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedDeclarationAccessContext {
+    pub context: DeclarationAccessContext,
+    pub reference: SemanticId,
+}
+impl PartialEq for PreparedDeclarationAccessContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+    }
+}
+impl Eq for PreparedDeclarationAccessContext {}
+impl PartialOrd for PreparedDeclarationAccessContext {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PreparedDeclarationAccessContext {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.context.cmp(&other.context)
+    }
+}
+impl Hash for PreparedDeclarationAccessContext {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.context.hash(state);
+    }
+}
+
 /// Immutable selected-context access policy, not a name resolver. Implementors
 /// authorize only supplied endpoint pairs using canonical selected source facts.
 #[doc(hidden)]
 pub trait SelectedDeclarationAccessSource: Send + Sync {
+    /// None disables this capability without reads. Enabled callers must
+    /// distinguish a proven outside-type site from unestablished ownership.
+    fn prepare_candidate_context(
+        &self,
+        _facts: &dyn SelectedTypedFactSource,
+        _reference: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<PreparedDeclarationAccessContext>> {
+        Ok(None)
+    }
+
+    /// Prepare ordinary access requests before candidate selection. The default
+    /// has no candidate-sensitive authority and performs no reads. Decisions
+    /// retain their normal input dependencies even when a candidate is denied.
+    fn prepare_candidate_access(
+        &self,
+        _facts: &dyn SelectedTypedFactSource,
+        _reference: SemanticId,
+        _definitions: &[SemanticId],
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<DeclarationAccessRequest>> {
+        Ok(Vec::new())
+    }
+
     /// Languages without activation premises leave precedence unchanged.
     fn qualify_selection_path(
         &self,
@@ -612,6 +714,25 @@ pub enum TypedFactReadTerminal {
 /// Storage-neutral terminal shared by typed and Java placement sources.
 pub type FactReadTerminal = TypedFactReadTerminal;
 
+/// Independent source-inventory authority for exactly the requested selectors.
+/// Row-local semantics never establish this axis, including an empty row slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedFactInventoryEvidence {
+    Established(ResolutionCompletion),
+    Unestablished,
+}
+
+impl TypedFactInventoryEvidence {
+    pub fn combine(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Established(left), Self::Established(right)) => {
+                Self::Established(left.combine(right))
+            }
+            _ => Self::Unestablished,
+        }
+    }
+}
+
 /// Exact terminal state and semantic evidence returned by one typed read.
 ///
 /// Only [`TypedFactReadTerminal::Exhausted`] can prove that an absent row does
@@ -627,6 +748,7 @@ pub type FactReadTerminal = TypedFactReadTerminal;
 pub struct TypedFactReadOutcome {
     terminal: TypedFactReadTerminal,
     evidence: ResolutionCompletion,
+    inventory_evidence: TypedFactInventoryEvidence,
 }
 
 /// Storage-neutral read outcome shared by typed and Java placement sources.
@@ -637,6 +759,7 @@ impl TypedFactReadOutcome {
         Self {
             terminal: TypedFactReadTerminal::Exhausted,
             evidence,
+            inventory_evidence: TypedFactInventoryEvidence::Unestablished,
         }
     }
 
@@ -644,6 +767,7 @@ impl TypedFactReadOutcome {
         Self {
             terminal: TypedFactReadTerminal::Stopped,
             evidence,
+            inventory_evidence: TypedFactInventoryEvidence::Unestablished,
         }
     }
 
@@ -651,6 +775,45 @@ impl TypedFactReadOutcome {
         Self {
             terminal: TypedFactReadTerminal::Cancelled,
             evidence,
+            inventory_evidence: TypedFactInventoryEvidence::Unestablished,
+        }
+    }
+
+    /// Attach an independently established source assertion, never inferred
+    /// from the legacy completion. The terminal still controls publication.
+    pub fn with_inventory_evidence(
+        mut self,
+        inventory_evidence: TypedFactInventoryEvidence,
+    ) -> Self {
+        self.inventory_evidence = inventory_evidence;
+        self
+    }
+
+    pub const fn inventory_evidence(&self) -> &TypedFactInventoryEvidence {
+        &self.inventory_evidence
+    }
+
+    pub fn into_complete_parts(
+        self,
+    ) -> (
+        TypedFactReadTerminal,
+        ResolutionCompletion,
+        TypedFactInventoryEvidence,
+    ) {
+        (self.terminal, self.evidence, self.inventory_evidence)
+    }
+
+    /// Compose consecutive source arms of one selected question. A partial
+    /// first arm must be returned directly instead of running another source.
+    pub fn followed_by(self, next: Self) -> Self {
+        assert!(
+            self.is_exhausted(),
+            "only an exhausted arm can precede another source"
+        );
+        Self {
+            terminal: next.terminal,
+            evidence: self.evidence.combine(&next.evidence),
+            inventory_evidence: self.inventory_evidence.combine(&next.inventory_evidence),
         }
     }
 
@@ -1910,6 +2073,35 @@ pub struct ImplicitBaseInputs {
     pub completion: ResolutionCompletion,
 }
 
+/// Selected declaration facts for a constrained public-instance method view.
+/// Unknown fields never certify either eligibility or an empty inventory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectedDeclarationMethodAttributes {
+    pub is_method: Option<bool>,
+    pub is_static: Option<bool>,
+    pub is_public: Option<bool>,
+}
+
+/// A neutral selected-source root result. Unavailable authority is Open;
+/// NotProvided is reserved for languages without this capability.
+#[derive(Debug)]
+pub enum SelectedImplicitRootInput {
+    NotProvided,
+    Open(ResolutionCompletion),
+    Source(SelectedSourceImplicitRoot),
+}
+
+#[derive(Debug)]
+pub struct SelectedSourceImplicitRoot {
+    /// Owner identity is selected; unseen partial parts affect written context,
+    /// never the independent root-reference binding authority.
+    pub context_completion: ResolutionCompletion,
+    pub language: Language,
+    pub owner_kind: super::NominalParentTargetKind,
+    pub reference: SemanticId,
+    pub frontier: SemanticId,
+}
+
 /// Static qualified-member rules available in one selected source. This table
 /// contains no selected owners, provider rows or workspace-sized state.
 #[derive(Clone, Copy, Debug)]
@@ -1932,6 +2124,319 @@ pub struct ConditionalTypeSeed {
     pub discharged_gap_reasons: Vec<SemanticId>,
 }
 
+/// A language hook distinguishes absent support from selected open evidence.
+/// This transport is query-local and is never persisted.
+#[derive(Clone, Debug)]
+pub enum ConditionalTypeSeedRead {
+    Ready(ConditionalTypeSeed),
+    Open {
+        slot: SemanticId,
+        completion: ResolutionCompletion,
+    },
+    NotProvided,
+}
+
+/// Sparse authored declaration modifier, read through the normal typed session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedDeclarationModifier {
+    pub definition: SemanticId,
+    pub partial: bool,
+}
+
+/// One recorded class-like source-metadata part. The vector is kept per
+/// metadata entry; consumers must not turn a partial declaration's single
+/// selected part into whole-owner authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedClassLikeMetadataPart {
+    pub kind: Option<brokk_bifrost_core::analyzer::model::ClassLikeKind>,
+    pub is_static: Option<bool>,
+}
+
+/// Staticness authority combined from exact modifier inventory and every
+/// selected class-like metadata part for one owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerStaticAuthority {
+    KnownStatic,
+    KnownNonStatic,
+    Unknown,
+}
+
+/// Whether an exact selected proof was actually captured or replayed through
+/// the ordinary read ledger. A computed observation alone is not a receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedReceiverProofReceipt {
+    Captured,
+    Replayed,
+    Unretained,
+}
+
+/// Opaque proof that the selected service admitted one receiver-proof read
+/// ledger for capture or replay. The payload remains owned by that service.
+pub struct UsableReceiverProofReceipt {
+    _receipts: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for UsableReceiverProofReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UsableReceiverProofReceipt(..)")
+    }
+}
+
+impl UsableReceiverProofReceipt {
+    pub(crate) fn from_service_receipt(
+        receipt: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            _receipts: vec![receipt],
+        }
+    }
+
+    pub(crate) fn combine(mut self, other: Self) -> Self {
+        self._receipts.extend(other._receipts);
+        self
+    }
+}
+
+/// Query-local proof observation plus its real retained-receipt disposition.
+#[derive(Debug)]
+pub struct ReceiptUse<T> {
+    pub observation: T,
+    pub receipt: SelectedReceiverProofReceipt,
+    pub usable_receipt: Option<UsableReceiverProofReceipt>,
+}
+
+/// Recorded per-entry class metadata returned through the normal selected
+/// source service. `None` from the reader means the selected metadata read was
+/// unavailable; an empty part vector is also non-authoritative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedDeclarationClassLikeMetadata {
+    pub definition: SemanticId,
+    pub metadata_complete: bool,
+    pub staticness_recorded: bool,
+    pub parts: Vec<SelectedClassLikeMetadataPart>,
+}
+
+impl super::SpliceMount for SelectedDeclarationClassLikeMetadata {
+    fn splice<T: super::ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            definition: translation.semantic(self.definition),
+            metadata_complete: self.metadata_complete,
+            staticness_recorded: self.staticness_recorded,
+            parts: self.parts.clone(),
+        }
+    }
+}
+
+/// Affirmative source application proof; positions were read to exhaustion.
+#[derive(Clone, Copy, Debug)]
+pub struct ConditionalOwnerApplication {
+    pub owner: SemanticId,
+    pub partial: Option<bool>,
+    pub complete_positions: bool,
+}
+
+/// Bounded selected evidence for the source application or receiver marker.
+#[derive(Clone, Debug)]
+pub struct ConditionalOwnerApplicationInputs {
+    pub outcome: TypedFactReadOutcome,
+    pub application: Option<ConditionalOwnerApplication>,
+    pub unsupported_implicit_receiver: bool,
+    pub ambiguous_application: bool,
+}
+
+/// Structural base intent only. No variant certifies source legality, a
+/// retained proof, an application, or a runtime value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeferredBaseReceiverIntentRead {
+    NotProvided,
+    Intent {
+        receiver_slot: SemanticId,
+        source_reference: SemanticId,
+    },
+    Open {
+        slot: SemanticId,
+        completion: ResolutionCompletion,
+    },
+}
+
+/// One exact indexed route arm and its source reference metadata. Readers
+/// retain every arm, including separate Type and Value arms of TypeOrValue.
+#[derive(Clone, Debug)]
+pub struct DeferredBaseReceiverCandidate {
+    pub receiver_slot: SemanticId,
+    pub source_reference: SemanticId,
+    pub namespace: ResolutionNamespace,
+    pub metadata: Option<super::FactReferenceSiteMetadata>,
+}
+
+/// A bounded selected inventory, not a receiver proof. Semantic completion
+/// remains independent of inventory completion; member gaps do not invalidate
+/// an otherwise exact structural locator.
+#[derive(Clone, Debug)]
+pub struct DeferredBaseReceiverCandidatesRead {
+    pub candidates: Vec<DeferredBaseReceiverCandidate>,
+    pub outcome: TypedFactReadOutcome,
+}
+
+impl DeferredBaseReceiverCandidatesRead {
+    /// Shared uniqueness over ALL captured arms. The hook supplies only its
+    /// structured grammar rule; it never chooses the first namespace arm.
+    pub fn unique_intent(
+        &self,
+        slot: SemanticId,
+        accepts: impl Fn(&DeferredBaseReceiverCandidate) -> bool,
+    ) -> DeferredBaseReceiverIntentRead {
+        let open = || {
+            let mut completion = self.outcome.evidence().clone();
+            if let TypedFactInventoryEvidence::Established(inventory) =
+                self.outcome.inventory_evidence()
+            {
+                completion = completion.combine(inventory);
+            }
+            if self.outcome.is_cancelled() {
+                completion = completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::Cancelled,
+                ]));
+            }
+            DeferredBaseReceiverIntentRead::Open {
+                slot,
+                completion: completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(slot),
+                ])),
+            }
+        };
+        if !matches!(
+            self.outcome.inventory_evidence(),
+            TypedFactInventoryEvidence::Established(completion) if matches!(completion, ResolutionCompletion::Complete)
+        ) || !self.outcome.is_exhausted()
+        {
+            return open();
+        }
+        let Some(candidate) = self.candidates.first() else {
+            return DeferredBaseReceiverIntentRead::NotProvided;
+        };
+        if self.candidates.iter().any(|row| {
+            row.receiver_slot != slot
+                || row.source_reference != candidate.source_reference
+                || row.metadata.is_none()
+        }) {
+            return open();
+        }
+        if !self.candidates.iter().any(&accepts) {
+            return DeferredBaseReceiverIntentRead::NotProvided;
+        }
+        if !self.candidates.iter().all(accepts) {
+            return open();
+        }
+        DeferredBaseReceiverIntentRead::Intent {
+            receiver_slot: slot,
+            source_reference: candidate.source_reference,
+        }
+    }
+}
+
+/// Lazy normal-session adapter. Implementations use the existing indexed
+/// qualifier routes and exact reference-head reads; no hierarchy walk or
+/// source proof is performed here. Default language hooks never call it.
+#[doc(hidden)]
+pub trait DeferredBaseReceiverIntentReader {
+    fn candidates(
+        &self,
+        slot: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<DeferredBaseReceiverCandidatesRead>;
+}
+
+/// A hook can inspect only the exact source application, not recurse into seeds.
+#[doc(hidden)]
+pub trait ConditionalOwnerApplicationReader {
+    fn owner_application(
+        &self,
+        slot: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<ReceiptUse<ConditionalOwnerApplicationInputs>>;
+
+    fn owner_static_authority(
+        &self,
+        _owner: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<OwnerStaticAuthority> {
+        Ok(OwnerStaticAuthority::Unknown)
+    }
+}
+
+/// Borrowed authority for language-owned diagnostics in one selected operation.
+#[doc(hidden)]
+pub struct ConditionalTypeSeedContext<'a> {
+    identities: &'a super::SelectedContextIdentities,
+    reader: Option<&'a dyn ConditionalOwnerApplicationReader>,
+}
+
+impl<'a> ConditionalTypeSeedContext<'a> {
+    pub(crate) fn new(identities: &'a super::SelectedContextIdentities) -> Self {
+        Self {
+            identities,
+            reader: None,
+        }
+    }
+
+    pub(crate) fn with_reader(mut self, reader: &'a dyn ConditionalOwnerApplicationReader) -> Self {
+        self.reader = Some(reader);
+        self
+    }
+
+    pub fn owner_application(
+        &self,
+        slot: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<ReceiptUse<ConditionalOwnerApplicationInputs>> {
+        self.reader
+            .expect("selected conditional seed has its current source reader")
+            .owner_application(slot, cancellation)
+    }
+
+    pub fn owner_static_authority(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<OwnerStaticAuthority> {
+        self.reader
+            .expect("selected conditional seed has its current source reader")
+            .owner_static_authority(owner, cancellation)
+    }
+
+    pub fn open(
+        &self,
+        slot: SemanticId,
+        name: &'static str,
+        evidence: &str,
+    ) -> ConditionalTypeSeedRead {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        let mut hash = CanonicalHasher::new(b"bifrost-conditional-type-seed-open:v1");
+        hash.field("name", name.as_bytes());
+        hash.field("evidence", evidence.as_bytes());
+        let reason = self.identities.named_semantic(
+            hash.finish(),
+            name,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            evidence,
+        );
+        ConditionalTypeSeedRead::Open {
+            slot,
+            completion: ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(reason),
+            ]),
+        }
+    }
+
+    pub fn cancelled(&self, slot: SemanticId) -> ConditionalTypeSeedRead {
+        ConditionalTypeSeedRead::Open {
+            slot,
+            completion: ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
+        }
+    }
+}
+
 /// A selected nominal constructor candidate. A present head certifies its
 /// language identity; element agreement and activation belong to the shared
 /// solver. Never persisted as a solved type.
@@ -1941,6 +2446,46 @@ pub struct ConditionalTypeProduction {
     pub elements: Vec<SemanticId>,
     pub head: Option<&'static str>,
     pub language: Language,
+}
+
+/// One unannotated identifier binder of a closure written as a call argument,
+/// with the call that closure is an argument of. A language reports it only
+/// when every parameter of the closure is such a binder, so the evaluator may
+/// fill each from the selected callee's function-family bound. Never persisted
+/// as a solved type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosureBinderContext {
+    /// The binder's declared-value slot.
+    pub binder: SemanticId,
+    /// The binder's position among the closure's parameters.
+    pub ordinal: usize,
+    /// How many parameters the closure has.
+    pub binder_count: usize,
+    /// The call's argument slot the closure's value feeds.
+    pub argument: SemanticId,
+    /// The callee reference of the call the closure is an argument of.
+    pub callee_reference: SemanticId,
+}
+
+/// One written type of a function shape: its identity slot and the layers
+/// written around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormalFunctionShapeType {
+    pub slot: SemanticId,
+    pub indirection: u8,
+    pub reference_indirection: u8,
+}
+
+/// The written function-family bound of one type slot (`F: FnMut(A) -> B`,
+/// `impl Fn(A)`). Whether `trait_head` is the standard `Fn`, `FnMut` or
+/// `FnOnce` is decided by the consumer from the head's resolution, never from
+/// the written spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormalFunctionShape {
+    pub owner: SemanticId,
+    pub trait_head: SemanticId,
+    pub parameters: Vec<FormalFunctionShapeType>,
+    pub result: Option<FormalFunctionShapeType>,
 }
 
 /// Whether written operands name proven class objects for an implicit-base rule.
@@ -1966,6 +2511,26 @@ pub struct ImplicitAppendedBase {
 }
 
 pub trait SelectedTypedFactSource {
+    /// Closure binders among the requested slots, each with its call. Default
+    /// languages publish none and perform no reads.
+    fn closure_binder_contexts(
+        &self,
+        _binders: &[SemanticId],
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<ClosureBinderContext>> {
+        Ok(Vec::new())
+    }
+
+    /// The function shapes of the requested owner slots. Default languages
+    /// publish none and perform no reads.
+    fn formal_function_shapes(
+        &self,
+        _owners: &[SemanticId],
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<FormalFunctionShape>> {
+        Ok(Vec::new())
+    }
+
     /// The reference a class-object alias copies: for a declaration that is
     /// the only writer of its name and is the direct, unconditional assignment
     /// `name = <reference>`, that reference. A base spelled through such a name
@@ -2076,12 +2641,69 @@ pub trait SelectedTypedFactSource {
         false
     }
 
+    /// Exact persisted ordinary locators, or no retained authority.
+    fn selected_receiver_proof_question(
+        &self,
+        _application: SemanticId,
+        _transfer: Option<(SemanticId, SemanticId)>,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        Ok(None)
+    }
+
+    /// Exact selected source locator for a base receiver context. Languages
+    /// without this source proof do no additional reads and refuse reuse.
+    fn selected_base_receiver_context_question(
+        &self,
+        _reference: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        Ok(None)
+    }
+
+    fn selected_access_reference(
+        &self,
+        _reference: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SelectedAccessReference>> {
+        Ok(None)
+    }
+
+    fn selected_access_declaration(
+        &self,
+        _definition: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SelectedAccessDeclaration>> {
+        Ok(None)
+    }
+
+    fn receiver_proof_services(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::resolution_operation::SelectedAnalyzerServices> {
+        None
+    }
+
+    /// Raw language intent only. Default languages perform zero reader calls.
+    /// The normal evaluator must later consume both genuine source proofs in
+    /// the receiver output scope before constructing any deferred request.
+    fn deferred_base_receiver_intent(
+        &self,
+        _slot: SemanticId,
+        _reader: &dyn DeferredBaseReceiverIntentReader,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<DeferredBaseReceiverIntentRead> {
+        Ok(DeferredBaseReceiverIntentRead::NotProvided)
+    }
+
     /// Default languages add no facts and perform no reads.
     fn conditional_type_seeds(
         &self,
         _slots: &[SemanticId],
+        _reader: &dyn ConditionalOwnerApplicationReader,
         _cancellation: &CancellationToken,
-    ) -> StoreResult<Vec<ConditionalTypeSeed>> {
+    ) -> StoreResult<Vec<ConditionalTypeSeedRead>> {
         Ok(Vec::new())
     }
 
@@ -2132,6 +2754,8 @@ pub trait SelectedTypedFactSource {
 
     /// The exact selected declaration owner for a JVM type. The outer None
     /// means unacquired; Some(None) means competing selected declarations.
+    /// Inventory drift returns a stale-resolution error, never either None.
+    /// Callers propagate it so the request records unavailable resolution.
     /// This is a read of operation-pinned provider authority, not a name guess.
     fn selected_jvm_declaration_owner(
         &self,
@@ -2450,12 +3074,22 @@ pub trait SelectedTypedFactSource {
         Ok((!cancellation.is_cancelled()).then(Vec::new))
     }
 
-    /// Whether each declaration participates in the selected language build.
-    /// Missing build metadata preserves participation; None means cancellation.
-    /// Apply this before demanding a deferred candidate's owner frontier.
+    /// Whether this language's participation rule needs receiver evidence.
+    /// Pure capability metadata: false must incur no receiver reads or charges.
+    fn deferred_participation_uses_receiver(&self, _language: Language) -> bool {
+        false
+    }
+
+    /// Whether each deferred declaration can participate in this member lookup.
+    /// `receivers` lists the observed autoderef-chain identities, or is absent
+    /// when a receiver or step is unknown. A language must certify closure of
+    /// those chains before excluding an owner. Missing build or owner metadata
+    /// preserves participation; None means cancellation. Apply this before
+    /// demanding a deferred candidate's owner frontier.
     fn deferred_member_participation(
         &self,
         definitions: &[SemanticId],
+        _receivers: Option<&[DeferredMemberReceiverType]>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<bool>>> {
         Ok((!cancellation.is_cancelled()).then(|| vec![true; definitions.len()]))
@@ -2549,6 +3183,137 @@ pub trait SelectedTypedFactSource {
         gaps: &[SelectedGapReasonProvenance],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<(SemanticId, BindingNodeId)>>>;
+
+    /// Immutable selected admission metadata only; this never probes SQL.
+    fn admitted_owner_language(&self, _owner: SemanticId) -> Option<Language> {
+        None
+    }
+
+    fn implicit_root_rules_for_language(
+        &self,
+        _language: Language,
+    ) -> Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers> {
+        None
+    }
+
+    fn selected_implicit_root_input(
+        &self,
+        _owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SelectedImplicitRootInput>> {
+        Ok((!cancellation.is_cancelled()).then_some(SelectedImplicitRootInput::NotProvided))
+    }
+
+    /// Full selected source metadata or selected model authority, with the
+    /// ordinary outer read receipt. This hook performs no member search.
+    fn declaration_method_attributes(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, SelectedDeclarationMethodAttributes)>>> {
+        Ok((!cancellation.is_cancelled()).then(|| {
+            definitions
+                .iter()
+                .copied()
+                .map(|definition| (definition, SelectedDeclarationMethodAttributes::default()))
+                .collect()
+        }))
+    }
+
+    /// Exact full SignatureMetadata projection, retained per selected
+    /// metadata entry. The default has no capability and performs no reads.
+    fn declaration_class_like_metadata(
+        &self,
+        _definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SelectedDeclarationClassLikeMetadata>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Whether this selected producer records class-like staticness under its
+    /// active producer epoch. The default producer has no such authority.
+    fn records_class_like_staticness(&self, _language: Language) -> bool {
+        false
+    }
+
+    /// Existing languages keep their producer's concrete roles. A deferred
+    /// stored role always requires evidence even when this capability is false.
+    fn requires_selected_nominal_parent_kind(&self, _language: Language) -> bool {
+        false
+    }
+
+    /// Obtain selected evidence after binding and alias expansion. This is
+    /// query-local input to the one pure classifier, not a row decoder.
+    fn supertype_kind_evidence(
+        &self,
+        language: Language,
+        stored: Option<ResolutionSupertypeKind>,
+        targets: &[SemanticId],
+        completion: &ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::SupertypeKindEvidence>> {
+        use super::{NominalParentTargetKind as Target, SupertypeKindEvidence as Evidence};
+        let selected = match stored {
+            Some(ResolutionSupertypeKind::AuthoredNominalParent) => true,
+            Some(ResolutionSupertypeKind::Interface) => {
+                self.requires_selected_nominal_parent_kind(language)
+            }
+            None
+            | Some(
+                ResolutionSupertypeKind::Superclass
+                | ResolutionSupertypeKind::GoInterfaceElement
+                | ResolutionSupertypeKind::ImplicitSuperclass
+                | ResolutionSupertypeKind::SelfType
+                | ResolutionSupertypeKind::ImplicitInterfaceMembers,
+            ) => false,
+        };
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if !selected {
+            return Ok(Some(Evidence::ProducerClassified));
+        }
+        if completion != &ResolutionCompletion::Complete {
+            return Ok(Some(Evidence::Selected(Target::Incomplete)));
+        }
+        let [target] = targets else {
+            return Ok(Some(Evidence::Selected(if targets.is_empty() {
+                Target::Missing
+            } else {
+                Target::Ambiguous
+            })));
+        };
+        let Some(rows) = self.nominal_parent_target_kinds(&[*target], cancellation)? else {
+            return Ok(None);
+        };
+        assert!(
+            rows.iter().all(|(definition, _)| definition == target),
+            "nominal kind reader returned foreign targets: {rows:?}"
+        );
+        assert!(
+            rows.len() <= 1,
+            "one nominal kind per selected target: {rows:?}"
+        );
+        Ok(Some(Evidence::Selected(
+            rows.first().map_or(Target::Missing, |(_, kind)| *kind),
+        )))
+    }
+
+    /// Complete selected nominal-kind evidence, including honest misses. No
+    /// binding or hierarchy recursion is permitted while reading this metadata.
+    fn nominal_parent_target_kinds(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, super::NominalParentTargetKind)>>> {
+        Ok((!cancellation.is_cancelled()).then(|| {
+            definitions
+                .iter()
+                .copied()
+                .map(|definition| (definition, super::NominalParentTargetKind::Missing))
+                .collect()
+        }))
+    }
 
     /// Selected JVM type and callable properties for lexical hierarchy replay.
     /// Omitted declarations have no available metadata; None is cancellation.
@@ -2859,6 +3624,19 @@ pub trait SelectedTypedFactSource {
         visitor: &mut TypedFactPageVisitor<'_, SelectedQualifiedRoute>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
+    fn visit_declaration_modifier_pages_for_definitions(
+        &self,
+        _definitions: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        _visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<SelectedDeclarationModifier>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
+        } else {
+            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        })
+    }
+
     fn visit_declaration_type_pages_for_definitions(
         &self,
         definitions: TypedFactRequest<'_, SemanticId>,
@@ -3131,6 +3909,16 @@ impl JvmDeclarationAccessRules {
     /// type is the accessing subclass or one of its subtypes. Kotlin and
     /// Scala keep their existing subclass access rules.
     pub(crate) const fn protected_access_requires_qualifier_subtype(self) -> bool {
+        matches!(self, Self::Java)
+    }
+
+    /// Whether the caller's language rules decide access to a protected
+    /// external member from the class file alone. Java does (JLS 6.6.2 on
+    /// ACC_PROTECTED). Kotlin and Scala read a Java-declared member as
+    /// package-visible but a Kotlin-declared one as subclass-only, and the
+    /// external inventory records no per-owner declaring origin, so their
+    /// decision is unknown and keeps both the target and the gap.
+    pub(crate) const fn decides_protected_external_access(self) -> bool {
         matches!(self, Self::Java)
     }
 }
@@ -3462,6 +4250,124 @@ mod tests {
         ResolutionIncompleteReason, TypeTransferRule, TypeTransferValueTransform,
     };
     use crate::analyzer::resolution::test_support::{fragment, selected_transfer, semantic};
+
+    #[test]
+    fn base_intent_requires_all_route_arms_and_independent_inventory() {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionCallableReceiverOrigin;
+        let slot = semantic("base-slot");
+        let reference = semantic("base-reference");
+        let member_gap = semantic("member-gap");
+        let metadata = super::super::FactReferenceSiteMetadata::new(
+            ResolutionSiteId::new(1),
+            ResolutionNamespace::TypeOrValue,
+            ResolutionSiteKind::MemberReference,
+            0,
+            1,
+            false,
+            None,
+            Some(ResolutionCallableReceiverOrigin::Super),
+        );
+        let mut read = DeferredBaseReceiverCandidatesRead {
+            candidates: [ResolutionNamespace::Type, ResolutionNamespace::Value]
+                .into_iter()
+                .map(|namespace| DeferredBaseReceiverCandidate {
+                    receiver_slot: slot,
+                    source_reference: reference,
+                    namespace,
+                    metadata: Some(metadata),
+                })
+                .collect(),
+            outcome: TypedFactReadOutcome::exhausted(ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(member_gap),
+            ]))
+            .with_inventory_evidence(TypedFactInventoryEvidence::Established(
+                ResolutionCompletion::Complete,
+            )),
+        };
+        let grammar = |row: &DeferredBaseReceiverCandidate| {
+            row.metadata.is_some_and(|metadata| {
+                metadata.receiver_origin() == Some(ResolutionCallableReceiverOrigin::Super)
+            })
+        };
+        let intent = DeferredBaseReceiverIntentRead::Intent {
+            receiver_slot: slot,
+            source_reference: reference,
+        };
+        assert_eq!(read.unique_intent(slot, grammar), intent);
+        read.candidates.reverse();
+        assert_eq!(read.unique_intent(slot, grammar), intent);
+        assert!(
+            !matches!(read.outcome.evidence(), ResolutionCompletion::Complete),
+            "locator selection must not retire member evidence"
+        );
+        read.candidates[1].source_reference = semantic("other-reference");
+        assert!(matches!(
+            read.unique_intent(slot, grammar),
+            DeferredBaseReceiverIntentRead::Open { .. }
+        ));
+        read.candidates[1].source_reference = reference;
+        read.candidates[1].receiver_slot = semantic("other-slot");
+        assert!(matches!(
+            read.unique_intent(slot, grammar),
+            DeferredBaseReceiverIntentRead::Open { .. }
+        ));
+        read.candidates[1].receiver_slot = slot;
+        assert!(matches!(
+            read.unique_intent(slot, |row| row.namespace == ResolutionNamespace::Type),
+            DeferredBaseReceiverIntentRead::Open { .. }
+        ));
+        read.outcome = TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete);
+        assert!(matches!(
+            read.unique_intent(slot, grammar),
+            DeferredBaseReceiverIntentRead::Open { .. }
+        ));
+        read.outcome = TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete);
+        let DeferredBaseReceiverIntentRead::Open { completion, .. } =
+            read.unique_intent(slot, grammar)
+        else {
+            panic!("cancelled intent stays open")
+        };
+        assert_eq!(
+            completion,
+            ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::Cancelled,
+                ResolutionIncompleteReason::UnsupportedSemantic(slot),
+            ])
+        );
+    }
+
+    #[test]
+    fn base_intent_default_and_decorators_do_not_read_candidates() {
+        struct NoRead;
+        impl DeferredBaseReceiverIntentReader for NoRead {
+            fn candidates(
+                &self,
+                _: SemanticId,
+                _: &CancellationToken,
+            ) -> StoreResult<DeferredBaseReceiverCandidatesRead> {
+                panic!("default base intent must not read selected facts")
+            }
+        }
+        let source =
+            super::super::fact_resolution::PreloadedFactResolutionService::from_lowered_fragments(
+                [],
+                [],
+            );
+        let profiled = super::super::seam_profile::SeamProfiled::observing(&source);
+        let mounted = super::super::mounted::Mounted::at(
+            &profiled,
+            super::super::SelectedResolutionMountOrdinal::new(7),
+        );
+        let cancellation = CancellationToken::new();
+        for source in [&source as &dyn SelectedTypedFactSource, &profiled, &mounted] {
+            assert_eq!(
+                source
+                    .deferred_base_receiver_intent(SemanticId::local(7, 3), &NoRead, &cancellation)
+                    .unwrap(),
+                DeferredBaseReceiverIntentRead::NotProvided
+            );
+        }
+    }
 
     #[test]
     fn transfer_stable_identity_is_distinct_from_directional_stream_order() {

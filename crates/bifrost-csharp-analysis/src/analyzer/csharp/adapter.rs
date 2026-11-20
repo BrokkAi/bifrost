@@ -33,23 +33,56 @@ use brokk_bifrost_csharp::syntax::csharp_source_identifier;
 
 use brokk_bifrost_csharp::syntax::strip_csharp_generic_arity;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy)]
+enum CanonicalSourceProducer {
+    Legacy,
+    #[cfg(any(test, feature = "test-support"))]
+    NativeFacts,
+}
+
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct CSharpAdapter {
     trial: brokk_bifrost_core::analyzer::config::CSharpNativeTrial,
+    source_producer: CanonicalSourceProducer,
 }
 
 #[allow(non_upper_case_globals)]
 pub const CSharpAdapter: CSharpAdapter = CSharpAdapter {
     trial: brokk_bifrost_core::analyzer::config::CSharpNativeTrial::Off,
+    source_producer: CanonicalSourceProducer::Legacy,
 };
+
+impl Default for CSharpAdapter {
+    fn default() -> Self {
+        // Preserve the adapter's default trial-off behavior; AnalyzerConfig
+        // owns environment selection at the actual construction boundary.
+        Self::from_config(
+            &brokk_bifrost_core::analyzer::config::CSharpAnalyzerConfig {
+                assembly_paths: Vec::new(),
+                native_trial: brokk_bifrost_core::analyzer::config::CSharpNativeTrial::Off,
+            },
+        )
+    }
+}
 
 impl CSharpAdapter {
     pub fn from_config(
         config: &brokk_bifrost_core::analyzer::config::CSharpAnalyzerConfig,
     ) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        let source_producer = if config.native_trial.is_on()
+            || LEGACY_NATIVE_FIXTURE.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            CanonicalSourceProducer::NativeFacts
+        } else {
+            CanonicalSourceProducer::Legacy
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let source_producer = CanonicalSourceProducer::Legacy;
         Self {
             trial: config.native_trial,
+            source_producer,
         }
     }
 
@@ -173,6 +206,21 @@ impl CSharpAdapter {
 }
 
 impl LanguageAdapter for CSharpAdapter {
+    fn canonical_source_epoch(&self, parser: &tree_sitter::Language) -> String {
+        use brokk_bifrost_core::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
+        let base =
+            brokk_bifrost_analysis::analyzer::store::epoch::epoch_for(Language::CSharp, parser);
+        let mut hasher = CanonicalHasher::new(b"bifrost-csharp-canonical-source-producer:v1");
+        hasher.field("grammar_admission_epoch", base.as_bytes());
+        let producer = match self.source_producer {
+            CanonicalSourceProducer::Legacy => b"legacy".as_slice(),
+            #[cfg(any(test, feature = "test-support"))]
+            CanonicalSourceProducer::NativeFacts => b"native-facts".as_slice(),
+        };
+        hasher.field("canonical_source_producer", producer);
+        lower_hex_string(&hasher.finish())
+    }
+
     fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
         brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
             literals: &[
@@ -431,7 +479,7 @@ impl LanguageAdapter for CSharpAdapter {
         )>,
     ) {
         #[cfg(any(test, feature = "test-support"))]
-        if self.trial.is_on() || LEGACY_NATIVE_FIXTURE.load(std::sync::atomic::Ordering::SeqCst) {
+        if matches!(self.source_producer, CanonicalSourceProducer::NativeFacts) {
             let scan = preprocessor
                 .expect("C# preprocessing precedes parsing")
                 .as_any()

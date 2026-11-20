@@ -60,6 +60,7 @@ pub(super) fn cpp_class_fact_expansions(
                     message: format!("cpp-undisciplined-multiple-inheritance: base declaration evidence is incomplete for {}", rel_path_string(&seed.file)),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
                 false
             }

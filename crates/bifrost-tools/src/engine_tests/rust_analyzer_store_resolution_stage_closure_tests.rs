@@ -24,6 +24,10 @@ mod tests {
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn structured_closure_kinds_preserve_exact_authority_repeat_and_atomicity() {
         // The three APIs accept a structured decision established by the caller.
         // This stage law tests descriptor/authority/transaction behavior; it does

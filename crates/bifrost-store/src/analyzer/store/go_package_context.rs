@@ -354,6 +354,7 @@ impl AnalyzerStore {
     /// publication and every member path's selected version to contain the
     /// request revision; closed intervals remain readable at older revisions.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_context_head_status(
         &self,
         identity: &GoContextIdentity,
@@ -409,6 +410,7 @@ impl AnalyzerStore {
 
     /// Validate the exact immutable bytes supplied to this request's Go tool.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn observe_go_context_inputs_with_overlay(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -595,6 +597,10 @@ impl AnalyzerStore {
 
     /// Reconciliation must be able to replace a placement whose member was deleted.
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn go_context_for_reconciliation(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -743,6 +749,10 @@ impl AnalyzerStore {
     /// observations. All normalization collections die with this publication.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn publish_go_package_context(
         &self,
         snapshot: WorkspaceSnapshotId,
@@ -1509,6 +1519,7 @@ impl AnalyzerStore {
     /// The context's immutable origin, rather than separately published summary
     /// members, is the authority for reuse. Unknown membership requires refresh.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_source_inventory_membership_unchanged(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1607,6 +1618,7 @@ impl AnalyzerStore {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn derive_go_source_context(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -1948,6 +1960,7 @@ impl AnalyzerStore {
     /// The same manifest digests used by transient placement decide whether
     /// buffers require tool discovery. No second parser or header hash exists.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_overlay_placement(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2079,6 +2092,7 @@ impl AnalyzerStore {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_discovery_domain_inputs_replacing(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2162,6 +2176,10 @@ impl AnalyzerStore {
 
 impl AnalyzerStore {
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn validate_go_context_members(&self, identity: &GoContextIdentity) -> Result<()> {
         let conn = self.read_conn()?;
         let mut query = conn.prepare_cached(MISSING_MEMBER_PATHS_SQL)?;
@@ -2384,6 +2402,7 @@ fn go_configuration_inputs(rows: &[GoSelectedFileRow]) -> Result<Vec<(PathBuf, S
 }
 
 impl AnalyzerStore {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_selected_file_rows(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2618,6 +2637,7 @@ impl GoDomainMembershipRows {
 impl AnalyzerStore {
     /// Keys of revision-selected domains. This includes domains with no packages.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_selected_domain_keys(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2650,6 +2670,7 @@ impl AnalyzerStore {
     /// outside the checkout, so their directory and digest are evidence.
     /// Hashing belongs to Go's authority owner.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_domain_membership_rows(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2711,6 +2732,7 @@ impl AnalyzerStore {
 
     /// All source files with no non-ignored membership in any selected context.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_files_outside_selected_build(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2732,6 +2754,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_contexts_for_file(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2748,6 +2771,7 @@ impl AnalyzerStore {
         Ok(contexts)
     }
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_owner_context_for_file(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -2874,6 +2898,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn go_domain_intervals_cut_off_and_revalidate_superseded_or_missing_paths() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store

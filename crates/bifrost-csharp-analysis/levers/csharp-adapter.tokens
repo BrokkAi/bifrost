@@ -16,3 +16,7 @@
 12804-csharp-walk-incompleteness
 12546-csharp-membership-completeness
 8785-csharp-expression-variable-locals
+13045-csharp-params-invocation-form
+10979-csharp-source-producer-identity
+12745-jvm-external-receipt-carry
+12804-csharp-input-identity

@@ -28,6 +28,7 @@ use std::fmt;
 use std::io::{Cursor, Read};
 
 const MANIFEST_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.manifest.v1";
+const SHARD_IDENTITY_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.shard.identity.v1";
 const SEMANTIC_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.shard.semantic.v1";
 const PROCEDURE_TARGET_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-target.inventory.v1";
 const PROCEDURE_ID_INVENTORY_PREFIX: &str = "procedure:";
@@ -1424,6 +1425,28 @@ pub fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactError> {
     Ok(digest_hex(SEMANTIC_HASH_DOMAIN, &bytes))
 }
 
+/// The identity of one shard as a model-set member: its verified content
+/// digest plus the pack's audit revision. The content digest alone cannot
+/// carry the revision, because descriptors pin it and loading verifies it, but
+/// audited consumers admit a pack by its exact revision, so every key that
+/// answers can depend on must use this identity (#14077). A missing revision is
+/// encoded as a distinct tag, so no revision never equals an empty one.
+#[doc(hidden)]
+pub fn shard_identity(semantic_sha256: &str, revision: Option<&str>) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(semantic_sha256.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(semantic_sha256.as_bytes());
+    match revision {
+        None => bytes.push(0),
+        Some(revision) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&(revision.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(revision.as_bytes());
+        }
+    }
+    digest_hex(SHARD_IDENTITY_HASH_DOMAIN, &bytes)
+}
+
 #[doc(hidden)]
 pub fn manifest_semantic_digest(manifest: &CompiledPackManifest) -> Result<String, ArtifactError> {
     #[derive(Serialize)]
@@ -1781,6 +1804,10 @@ pub fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>
                 }
 
                 if let Some(signature) = &fact.signature {
+                    for bound in signature.bounds.iter().flatten() {
+                        collect_declared_type_refs(&bound.subject, &mut referenced);
+                        collect_implemented_trait_refs(&bound.bound, &mut referenced);
+                    }
                     for parameter in &signature.parameters {
                         collect_declared_type_refs(&parameter.r#type, &mut referenced);
                     }
@@ -1903,7 +1930,7 @@ pub(crate) fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<Strin
     });
 }
 
-fn authored_pack_from_compiled_shard(shard: &CompiledShard) -> AuthoredSemanticModelPack {
+pub fn authored_pack_from_compiled_shard(shard: &CompiledShard) -> AuthoredSemanticModelPack {
     AuthoredSemanticModelPack {
         extraction: shard.extraction.clone(),
         schema_version: shard.schema_version,

@@ -614,7 +614,11 @@ mod tests {
             assert_eq!(calls, 2);
             assert_eq!(leader.value, "call 0");
             assert_eq!(follower.value, "call 1");
-            let expected = reasons(0)
+            // Completion presents reasons in canonical order, independent of
+            // the order the leader recorded them (95797831e8).
+            let mut canonical = reasons(0);
+            canonical.sort_by_cached_key(QueryReadIncomplete::answer_order_key);
+            let expected = canonical
                 .iter()
                 .map(|reason| format!("{reason:?}"))
                 .collect::<Vec<_>>();

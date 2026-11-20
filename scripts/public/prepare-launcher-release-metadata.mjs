@@ -4,7 +4,7 @@ import path from "node:path";
 import { SUPPORTED_TARGETS } from "../../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 
 import { parseCamelCaseArgs, required } from "./cli-argument-helpers.mjs";
-import { escapeRegExp, sameMinorSeries } from "./release-version.mjs";
+import { applyRaiseMinimumBinaryVersion, escapeRegExp, sameMinorSeries } from "./release-version.mjs";
 
 const supportedTargetSet = new Set(SUPPORTED_TARGETS);
 
@@ -21,6 +21,7 @@ const minimumBinaryVersion = sameMinorSeries(pluginRelease.binaryVersion, versio
 pluginRelease.binaryVersion = version;
 pluginRelease.minimumBinaryVersion = minimumBinaryVersion;
 pluginRelease.allowPrerelease = pluginRelease.allowPrerelease ?? false;
+applyRaiseMinimumBinaryVersion(pluginRelease, version);
 pluginRelease.archiveSha256 = archiveSha256;
 fs.writeFileSync(pluginReleasePath, `${JSON.stringify(pluginRelease, null, 2)}\n`);
 

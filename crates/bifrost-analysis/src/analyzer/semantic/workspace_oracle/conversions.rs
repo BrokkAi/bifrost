@@ -311,23 +311,19 @@ impl WorkspaceSemanticOracle<'_> {
         let mut sources = Vec::new();
         for procedure in [call.procedure(), candidate.target()] {
             let maximum_source_bytes = request.budget.limits().source_bytes;
-            let Some(source) =
-                exact_source_for_procedure(self.workspace, procedure, maximum_source_bytes)?
-            else {
-                let census = SemanticWork {
-                    source_bytes: maximum_source_bytes.saturating_add(1),
-                    ..SemanticWork::default()
+            let source =
+                match exact_source_for_procedure(self.workspace, procedure, maximum_source_bytes)?
+                    .on_budget(request.budget)?
+                {
+                    Ok(source) => source,
+                    Err(exceeded) => {
+                        return Ok(SemanticOutcome::ExceededBudget {
+                            partial: None,
+                            exceeded,
+                            work,
+                        });
+                    }
                 };
-                let exceeded = request
-                    .budget
-                    .check_admission(census)
-                    .expect_err("source preparation exceeds the resident byte grant");
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            };
             if crate::analyzer::common::language_for_file(&source.0)
                 == crate::analyzer::Language::Rust
                 && let Some(parsed) = self
@@ -426,19 +422,26 @@ impl WorkspaceSemanticOracle<'_> {
                     let shape =
                         self.conversion_sources
                             .shape(analyzer, file, &range, Some(&selected))?;
-                    if !candidate
-                        .proof()
-                        .establishes_complete_evidence(candidate.completeness())
+                    let java = crate::analyzer::common::language_for_file(file)
+                        == crate::analyzer::Language::Java;
+                    // Java converts each argument to the compile-time
+                    // declaration's formal type, and every runtime override
+                    // receives that value unchanged (#11296). A unique static
+                    // selection, checked below, replaces the candidate's own
+                    // proof there.
+                    if !java
+                        && !candidate
+                            .proof()
+                            .establishes_complete_evidence(candidate.completeness())
                         && !lookup_status_incomplete
                     {
                         return None;
                     }
+                    let mut static_declaration = None;
                     // Java conversion evidence requires a uniquely selected overload.
                     // A complete candidate declaration alone does not establish that
                     // this call selected its signature.
-                    if crate::analyzer::common::language_for_file(file)
-                        == crate::analyzer::Language::Java
-                    {
+                    if java {
                         let selected = match crate::analyzer::usages::common::query_memo_result(
                             &self.conversion_java_targets,
                             analyzer,
@@ -506,81 +509,116 @@ impl WorkspaceSemanticOracle<'_> {
                                     && range.end_byte == span.end_byte() as usize
                             })
                         {
+                            static_declaration = Some(target.clone());
+                        } else if !candidate
+                            .proof()
+                            .establishes_complete_evidence(candidate.completeness())
+                            && !lookup_status_incomplete
+                        {
+                            // The candidate is the static selection itself; its
+                            // own evidence still governs, as for other languages.
                             return None;
                         }
                         if let Some(reason) = selection_incomplete {
                             lookup_incomplete_reason.get_or_insert_with(|| reason.to_string());
                         }
                     }
-                    let prepared = match crate::analyzer::usages::common::query_memo_result(
-                        &self.conversion_candidates,
-                        analyzer,
-                        candidate.target(),
-                        || {
-                            let mut examined = 0;
-                            let mut lookup_cancelled = false;
-                            let declaration = (|| {
-                                let span = candidate.target().semantics().locator().anchor().span();
-                                let declarations = analyzer.get_declarations(&sources[1].0);
-                                let mut matches = declarations.into_iter().filter(|unit| {
-                                    analyzer.ranges_of(unit).iter().any(|range| {
-                                        range.start_byte == span.start_byte() as usize
-                                            && range.end_byte == span.end_byte() as usize
-                                    })
-                                });
-                                let target = matches.next()?;
-                                if matches.next().is_some() {
-                                    return None;
-                                }
-                                let target = &target;
-                                let procedures = procedures_for_definition_with_limits(
-                                    analyzer,
-                                    target,
-                                    candidate.target().artifact(),
-                                    usize::MAX,
-                                    request.cancellation,
-                                );
-                                examined = procedures.examined;
-                                if procedures.status == ProcedureRangeLookupStatus::Cancelled {
-                                    lookup_cancelled = true;
-                                    return None;
-                                }
-                                if procedures.status != ProcedureRangeLookupStatus::Complete
-                                    || procedures.handles.as_slice() != [candidate.target().clone()]
-                                {
-                                    return None;
-                                }
-                                let ranges = analyzer.ranges_of(target);
-                                let [range] = ranges.as_slice() else {
-                                    return None;
-                                };
-                                let metadata = analyzer.signature_metadata(target);
-                                if metadata.len() != 1 {
-                                    return None;
-                                }
-                                let site_id = target
-                                    .declaration_site_id(range.start_byte, range.end_byte)
-                                    .to_string();
-                                let signatures =
-                                    callable_signature_reports(&site_id, target, &metadata);
-                                let [signature] = signatures.as_slice() else {
-                                    return None;
-                                };
-                                Some((target.clone(), signature.clone()))
-                            })();
-                            if lookup_cancelled {
-                                return Err(LookupCancelled);
-                            }
-                            Ok(ConversionCandidate {
-                                declaration,
-                                examined,
-                            })
-                        },
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(LookupCancelled) => {
-                            cancelled = true;
+                    let static_signature;
+                    let prepared = if let Some(declaration) = &static_declaration {
+                        let ranges = analyzer.ranges_of(declaration);
+                        let [range] = ranges.as_slice() else {
                             return None;
+                        };
+                        let metadata = analyzer.signature_metadata(declaration);
+                        if metadata.len() != 1 {
+                            return None;
+                        }
+                        let site_id = declaration
+                            .declaration_site_id(range.start_byte, range.end_byte)
+                            .to_string();
+                        let signatures =
+                            callable_signature_reports(&site_id, declaration, &metadata);
+                        let [signature] = signatures.as_slice() else {
+                            return None;
+                        };
+                        static_signature = ConversionCandidate {
+                            declaration: Some((declaration.clone(), signature.clone())),
+                            examined: 0,
+                        };
+                        &static_signature
+                    } else {
+                        &match crate::analyzer::usages::common::query_memo_result(
+                            &self.conversion_candidates,
+                            analyzer,
+                            candidate.target(),
+                            || {
+                                let mut examined = 0;
+                                let mut lookup_cancelled = false;
+                                let declaration = (|| {
+                                    let span =
+                                        candidate.target().semantics().locator().anchor().span();
+                                    let declarations = analyzer.get_declarations(&sources[1].0);
+                                    let mut matches = declarations.into_iter().filter(|unit| {
+                                        analyzer.ranges_of(unit).iter().any(|range| {
+                                            range.start_byte == span.start_byte() as usize
+                                                && range.end_byte == span.end_byte() as usize
+                                        })
+                                    });
+                                    let target = matches.next()?;
+                                    if matches.next().is_some() {
+                                        return None;
+                                    }
+                                    let target = &target;
+                                    let procedures = procedures_for_definition_with_limits(
+                                        analyzer,
+                                        target,
+                                        candidate.target().artifact(),
+                                        usize::MAX,
+                                        request.cancellation,
+                                    );
+                                    examined = procedures.examined;
+                                    if procedures.status == ProcedureRangeLookupStatus::Cancelled {
+                                        lookup_cancelled = true;
+                                        return None;
+                                    }
+                                    if procedures.status != ProcedureRangeLookupStatus::Complete
+                                        || procedures.handles.as_slice()
+                                            != [candidate.target().clone()]
+                                    {
+                                        return None;
+                                    }
+                                    let ranges = analyzer.ranges_of(target);
+                                    let [range] = ranges.as_slice() else {
+                                        return None;
+                                    };
+                                    let metadata = analyzer.signature_metadata(target);
+                                    if metadata.len() != 1 {
+                                        return None;
+                                    }
+                                    let site_id = target
+                                        .declaration_site_id(range.start_byte, range.end_byte)
+                                        .to_string();
+                                    let signatures =
+                                        callable_signature_reports(&site_id, target, &metadata);
+                                    let [signature] = signatures.as_slice() else {
+                                        return None;
+                                    };
+                                    Some((target.clone(), signature.clone()))
+                                })();
+                                if lookup_cancelled {
+                                    return Err(LookupCancelled);
+                                }
+                                Ok(ConversionCandidate {
+                                    declaration,
+                                    examined,
+                                })
+                            },
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(LookupCancelled) => {
+                                cancelled = true;
+                                return None;
+                            }
                         }
                     };
                     examined = prepared.examined;

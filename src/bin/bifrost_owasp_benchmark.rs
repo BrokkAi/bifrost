@@ -41,8 +41,9 @@
 //!
 //! A catalog must already have its bundle installed
 //! (`bifrost-semantic-pack install <bundle-dir> <catalog-dir>`, from a
-//! `BrokkAi/bifrost-packs` release); the runner never installs into it and
-//! opens it read-only.
+//! `BrokkAi/bifrost-packs` release). The runner never installs into it. It
+//! opens the Java catalog read-write, because preparation produces packs for
+//! the dependency jars into it, and the Python catalog read-only.
 //!
 //! The heavy logic is gated behind the `release-tooling` feature so it stays out
 //! of normal runtime builds, matching the other facade tooling binaries.
@@ -527,6 +528,9 @@ mod imp {
         /// proof (#2401); this is the honesty budget the product activation
         /// path enforces.
         gaps: usize,
+        /// Dependency jars whose pack preparation failed, with the cause.
+        /// The run treats them as unknown.
+        unprepared_dependencies: Vec<String>,
     }
 
     #[derive(Serialize)]
@@ -934,11 +938,15 @@ mod imp {
                     coordinate: "org.owasp.esapi:esapi:2.7.0.0",
                     artifact_sha256: flags.get("esapi-digest").cloned(),
                 }),
-                jdk: match result.activation {
-                    SuiteActivation::Java { jdk_pack_gaps } => Some(JdkPackMeta {
+                jdk: match &result.activation {
+                    SuiteActivation::Java {
+                        jdk_pack_gaps,
+                        unprepared_dependencies,
+                    } => Some(JdkPackMeta {
                         pack_version: "21.0.8",
                         activation_route: "product:activate_dependency_packs",
-                        gaps: jdk_pack_gaps,
+                        gaps: *jdk_pack_gaps,
+                        unprepared_dependencies: unprepared_dependencies.clone(),
                     }),
                     SuiteActivation::Python { .. } => None,
                 },

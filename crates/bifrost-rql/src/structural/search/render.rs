@@ -1,6 +1,7 @@
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
 
 use super::dispatch::{DispatchCompleteness, DispatchProof};
+use super::presentation::PresentationRefusal;
 use super::results::CodeQueryConfigurationFact;
 use super::results::CodeQueryCrossDomain;
 use super::results::CodeQueryMatchRelations;
@@ -9,7 +10,12 @@ use super::results::CodeQueryReferenceFacets;
 use super::results::CodeQueryRuntimeKeyedReadValue;
 use super::results::CodeQuerySourceSpan;
 use super::*;
+use brokk_bifrost_core::admitted_text::AdmittedText;
 use std::sync::Arc;
+
+use brokk_bifrost_tools::site_context::{
+    SiteAdmission, SiteAdmissionRefusal, SiteContextView, SiteLocationView, UnrenderedReason,
+};
 
 use brokk_bifrost_core::analyzer::model::CallableArity;
 use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
@@ -132,7 +138,7 @@ pub(super) fn render_pipeline_item(
     row: PipelineRow,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryResultItem {
+) -> Result<CodeQueryResultItem, PresentationRefusal> {
     let provenance = row
         .traces
         .iter()
@@ -163,10 +169,10 @@ pub(super) fn render_pipeline_item(
             value: Box::new(render_reference_site(analyzer, &site, detail, cache)),
         },
         PipelineValue::CallSite(site) => CodeQueryResultValue::CallSite {
-            value: Box::new(render_call_site(analyzer, &site, detail, cache)),
+            value: Box::new(render_call_site(analyzer, &site, detail, cache)?),
         },
         PipelineValue::ExpressionSite(site) => CodeQueryResultValue::ExpressionSite {
-            value: Box::new(render_expression_site(analyzer, &site, cache)),
+            value: Box::new(render_expression_site(analyzer, &site, cache)?),
         },
         PipelineValue::JsxAttributeValue(value) => CodeQueryResultValue::JsxAttributeValue {
             value: Box::new(render_jsx_attribute_value(analyzer, &value, detail, cache)),
@@ -203,10 +209,10 @@ pub(super) fn render_pipeline_item(
             value: Box::new(render_call_argument_group(analyzer, &value, cache)),
         },
         PipelineValue::CallArgument(value) => CodeQueryResultValue::CallArgument {
-            value: Box::new(render_call_shape_argument(analyzer, &value, cache)),
+            value: Box::new(render_call_shape_argument(analyzer, &value, cache)?),
         },
         PipelineValue::CallBinding(value) => CodeQueryResultValue::CallBinding {
-            value: Box::new(render_call_binding(analyzer, &value, detail, cache)),
+            value: Box::new(render_call_binding(analyzer, &value, detail, cache)?),
         },
         PipelineValue::CallEffect(value) => CodeQueryResultValue::CallEffect {
             value: Box::new(render_call_effect(analyzer, &value, detail, cache)),
@@ -341,6 +347,12 @@ pub(super) fn render_pipeline_item(
                 value: Box::new(value.row.clone()),
             }
         }
+        PipelineValue::FieldWrite(value) => CodeQueryResultValue::FieldWrite {
+            value: Box::new(value.row.clone()),
+        },
+        PipelineValue::FieldRead(value) => CodeQueryResultValue::FieldRead {
+            value: Box::new(value.row.clone()),
+        },
         PipelineValue::FlowRelation(value) => CodeQueryResultValue::FlowRelation {
             value: Box::new(render_flow_relation(analyzer, &value, cache)),
         },
@@ -404,12 +416,12 @@ pub(super) fn render_pipeline_item(
             value: Box::new(render_cross_domain(analyzer, *value, detail, cache)),
         },
     };
-    CodeQueryResultItem {
+    Ok(CodeQueryResultItem {
         value,
         provenance,
         provenance_truncated: row.provenance_truncated,
         row_projection: row.row_projection,
-    }
+    })
 }
 
 pub(super) fn render_provenance(
@@ -520,38 +532,10 @@ pub(super) fn render_trace_value_ref(
             }
         }
         PipelineTraceValue::CallArgument(value) => {
-            let rendered = render_call_shape_argument(analyzer, value, cache);
-            CodeQueryResultRef::CallArgument {
-                id: rendered.id,
-                group_id: rendered.group_id,
-                path: rendered.path,
-                range: rendered.range,
-                argument_index: rendered.argument_index,
-            }
+            super::scalar_projection::project_call_argument_ref(analyzer, value, cache)
         }
         PipelineTraceValue::CallBinding(value) => {
-            let rendered = render_call_binding(analyzer, value, detail, cache);
-            CodeQueryResultRef::CallBinding {
-                id: rendered.id,
-                site_id: rendered.site_id,
-                path: rendered.path,
-                range: rendered.range,
-                semantic_target_id: rendered.semantic_target_id,
-                target_origin: rendered.target_origin,
-                model_id: rendered.model_id,
-                receiver_type_id: rendered.receiver_type_id,
-                pack_id: rendered.pack_id,
-                model_record_id: rendered.model_record_id,
-                model_activation_status: rendered.model_activation_status,
-                model_activation_source_kind: rendered.model_activation_source_kind,
-                model_activation_source_id: rendered.model_activation_source_id,
-                model_origin: rendered.model_origin,
-                model_proof: rendered.model_proof,
-                model_completeness: rendered.model_completeness,
-                binding_kind: rendered.binding_kind,
-                mapping: rendered.mapping,
-                coverage: rendered.coverage,
-            }
+            super::scalar_projection::project_call_binding_ref(analyzer, value, cache)
         }
         PipelineTraceValue::CallEffect(value) => {
             let rendered = render_call_effect(analyzer, value, detail, cache);
@@ -814,6 +798,20 @@ pub(super) fn render_trace_value_ref(
         }
         PipelineTraceValue::ReferenceEdge(value) => render_edge_ref(analyzer, value, cache),
         PipelineTraceValue::StateEvent(value) => render_state_event_ref(analyzer, value, cache),
+        PipelineTraceValue::FieldWrite(value) => CodeQueryResultRef::FieldWrite {
+            id: value.row.id.clone(),
+            path: value.row.path.clone(),
+            range: value.row.range,
+            procedure_id: value.row.procedure_id.clone(),
+            program_point_id: value.row.program_point_id.clone(),
+        },
+        PipelineTraceValue::FieldRead(value) => CodeQueryResultRef::FieldRead {
+            id: value.row.id.clone(),
+            path: value.row.path.clone(),
+            range: value.row.range,
+            procedure_id: value.row.procedure_id.clone(),
+            program_point_id: value.row.program_point_id.clone(),
+        },
         PipelineTraceValue::BindingInitializerCall(value) => {
             let row = &value.row;
             CodeQueryResultRef::BindingInitializerCall {
@@ -2632,16 +2630,8 @@ pub(super) fn augment_public_result_with_semantic_overlay(
             let include = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol| {
                 model_pattern_matches(&seed.root, symbol)
             };
-            let (records, _, complete) = match family_language {
-                Some(language) => overlay.search_with_limit_filter_in_family(
-                    &patterns,
-                    usize::MAX,
-                    None,
-                    language,
-                    include,
-                ),
-                None => overlay.search_with_limit_filter(&patterns, usize::MAX, None, include),
-            };
+            let (records, complete) =
+                overlay.augmentation_symbols(&patterns, usize::MAX, family_language, include);
             // As for an exact name: an unread row could make a returned
             // record ambiguous or compose with it, so none is emitted.
             if complete {
@@ -2655,6 +2645,9 @@ pub(super) fn augment_public_result_with_semantic_overlay(
     let mut roots = Vec::new();
     let mut ambiguous_match = false;
     for symbol in candidates {
+        if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(None) {
+            break;
+        }
         if symbol.externally_visible()
             && (seed.languages.is_empty()
                 || seed
@@ -2673,7 +2666,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
 
     let mut modeled = Vec::new();
     let mut missing_names = Vec::new();
-    for root in roots {
+    for root in roots.iter().cloned() {
+        if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(None) {
+            break;
+        }
         match traversal {
             None => modeled.push(root),
             Some(QueryStep::Members) => {
@@ -2700,22 +2696,18 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     }
                 }
             }
-            Some(QueryStep::Supertypes(hierarchy)) => {
-                let hierarchy_result = model_hierarchy_symbols(&overlay, &root, *hierarchy, true);
-                modeled.extend(hierarchy_result.symbols);
-                ambiguous_match |= hierarchy_result.ambiguous;
-                open |= hierarchy_result.open;
-                missing_names.extend(hierarchy_result.missing_names);
-            }
-            Some(QueryStep::Subtypes(hierarchy)) => {
-                let hierarchy_result = model_hierarchy_symbols(&overlay, &root, *hierarchy, false);
-                modeled.extend(hierarchy_result.symbols);
-                ambiguous_match |= hierarchy_result.ambiguous;
-                open |= hierarchy_result.open;
-                missing_names.extend(hierarchy_result.missing_names);
-            }
+            // The hierarchy steps walk all roots together below.
+            Some(QueryStep::Supertypes(_) | QueryStep::Subtypes(_)) => {}
             Some(_) => unreachable!("model overlay traversal was validated above"),
         }
+    }
+    if let Some(QueryStep::Supertypes(hierarchy) | QueryStep::Subtypes(hierarchy)) = traversal {
+        let supertypes = matches!(traversal, Some(QueryStep::Supertypes(_)));
+        let hierarchy_result = model_hierarchy_symbols(&overlay, &roots, *hierarchy, supertypes);
+        modeled.extend(hierarchy_result.symbols);
+        ambiguous_match |= hierarchy_result.ambiguous;
+        open |= hierarchy_result.open;
+        missing_names.extend(hierarchy_result.missing_names);
     }
     modeled.sort_by(|left, right| {
         left.qualified_name
@@ -2776,9 +2768,9 @@ pub(super) fn augment_public_result_with_semantic_overlay(
     }
     if ambiguous_match
         && !result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+            diagnostic.code() == CodeQueryDiagnosticCode::SemanticResultsOmitted
                 && diagnostic
-                    .message
+                    .message()
                     .contains("semantic-model declaration conflict")
         })
     {
@@ -2801,6 +2793,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     .to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
     missing_names.sort();
@@ -2826,6 +2822,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
     }
     // A read stopped by the enclosing operation's cancellation reports the
@@ -2834,7 +2834,7 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         if !result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled)
+            .any(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::Cancelled)
         {
             result
                 .diagnostics
@@ -2855,6 +2855,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     message: "semantic-model augmentation was cancelled".to_string(),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }));
         }
     } else if open {
@@ -2875,6 +2879,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                 message: "semantic-model inventory is incomplete".to_string(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
     }
 }
@@ -2887,9 +2895,13 @@ struct ModelHierarchyResult {
     open: bool,
 }
 
+/// The hierarchy of every root, walked one breadth-first level at a time across
+/// all roots: the level's supertype relations are read together, so the walk
+/// costs a few set reads per level and not a lookup per type. Each root keeps
+/// its own visited set, so the answer is the union of the roots' own walks.
 fn model_hierarchy_symbols(
     overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
-    root: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    roots: &[Arc<crate::analyzer::semantic_model::SemanticModelSymbol>],
     traversal: HierarchyTraversal,
     supertypes: bool,
 ) -> ModelHierarchyResult {
@@ -2898,83 +2910,130 @@ fn model_hierarchy_symbols(
         HierarchyTraversal::Depth(depth) => depth.get(),
         HierarchyTraversal::Transitive => usize::MAX,
     };
-    let mut queue = VecDeque::from([(root.id.clone(), 0usize)]);
-    let mut visited = HashSet::default();
-    visited.insert(root.id.clone());
+    // (root, type ID) pairs of the current level.
+    let mut level = roots
+        .iter()
+        .enumerate()
+        .map(|(root, symbol)| (root, symbol.id.clone()))
+        .collect::<Vec<_>>();
+    let mut visited = roots
+        .iter()
+        .map(|root| HashSet::from_iter([root.id.clone()]))
+        .collect::<Vec<HashSet<String>>>();
     let mut symbols = Vec::new();
     let mut ambiguous = false;
     let mut open = false;
     let mut missing_names = Vec::new();
-    while let Some((id, depth)) = queue.pop_front() {
-        if depth >= max_depth {
-            continue;
+    let mut depth = 0usize;
+    while !level.is_empty() && depth < max_depth {
+        if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(None) {
+            break;
         }
-        let relations = if supertypes {
-            overlay.relations_from_for(&id, &root.language)
-        } else {
-            overlay.relations_to_for(&id, &root.language)
-        };
-        // An open read's relations are candidates only, so they are withheld
-        // and the walk reports itself incomplete.
-        if matches!(
-            relations.disposition,
-            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
-        ) {
-            open = true;
-            continue;
-        }
-        for relation in relations.records {
-            if relation.provenance.ambiguous {
-                ambiguous = true;
-                continue;
-            }
-            if !matches!(
-                relation.kind.as_str(),
-                "extends" | "implements" | "uses_trait"
-            ) {
-                continue;
-            }
-            let endpoint = if supertypes {
-                &relation.to
+        // The relations of each distinct (language, type) of the level.
+        let mut languages = level
+            .iter()
+            .map(|(root, _)| roots[*root].language.as_str())
+            .collect::<Vec<_>>();
+        languages.sort_unstable();
+        languages.dedup();
+        let mut relations = HashMap::default();
+        for language in languages {
+            let mut ids = level
+                .iter()
+                .filter(|(root, _)| roots[*root].language == language)
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            let answers = if supertypes {
+                overlay.relations_from_many_for(&ids, language)
             } else {
-                &relation.from
+                ids.iter()
+                    .map(|id| overlay.relations_to_for(id, language))
+                    .collect()
             };
-            let is_open = |matched: &crate::analyzer::semantic_model::SemanticModelOverlayMatch<
-                crate::analyzer::semantic_model::SemanticModelSymbol,
-            >| {
-                matches!(
-                    matched.disposition,
-                    crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
-                )
-            };
-            let mut matched = overlay.symbols_with_id_in_family(endpoint, &root.language);
-            if matched.records.is_empty() && !is_open(&matched) {
-                matched = overlay.symbols_named_in_family(
-                    endpoint,
-                    &root.language,
-                    SemanticModelNamespace::Unknown,
-                );
-            }
-            if is_open(&matched) {
+            relations.extend(
+                ids.into_iter()
+                    .zip(answers)
+                    .map(|(id, answer)| ((language, id), answer)),
+            );
+        }
+        let mut next = Vec::new();
+        for (root, id) in level {
+            let root_symbol = &roots[root];
+            let found = &relations[&(root_symbol.language.as_str(), id)];
+            // An open read's relations are candidates only, so they are withheld
+            // and the walk reports itself incomplete.
+            if matches!(
+                found.disposition,
+                crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+            ) {
                 open = true;
                 continue;
             }
-            if matched.disposition
-                != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-            {
-                if matched.records.is_empty() {
-                    missing_names.push(endpoint.clone());
-                } else {
-                    ambiguous = true;
+            for relation in &found.records {
+                if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(None)
+                {
+                    break;
                 }
-                continue;
-            }
-            let symbol = matched.records[0].clone();
-            if visited.insert(symbol.id.clone()) {
-                symbols.push(symbol.clone());
-                queue.push_back((symbol.id.clone(), depth.saturating_add(1)));
+                if relation.provenance.ambiguous {
+                    ambiguous = true;
+                    continue;
+                }
+                if !matches!(
+                    relation.kind.as_str(),
+                    "extends" | "implements" | "uses_trait"
+                ) {
+                    continue;
+                }
+                let endpoint = if supertypes {
+                    &relation.to
+                } else {
+                    &relation.from
+                };
+                let is_open =
+                    |matched: &crate::analyzer::semantic_model::SemanticModelOverlayMatch<
+                        crate::analyzer::semantic_model::SemanticModelSymbol,
+                    >| {
+                        matches!(
+                            matched.disposition,
+                            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                                _
+                            )
+                        )
+                    };
+                let mut matched =
+                    overlay.symbols_with_id_in_family(endpoint, &root_symbol.language);
+                if matched.records.is_empty() && !is_open(&matched) {
+                    matched = overlay.symbols_named_in_family(
+                        endpoint,
+                        &root_symbol.language,
+                        SemanticModelNamespace::Unknown,
+                    );
+                }
+                if is_open(&matched) {
+                    open = true;
+                    continue;
+                }
+                if matched.disposition
+                    != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                {
+                    if matched.records.is_empty() {
+                        missing_names.push(endpoint.clone());
+                    } else {
+                        ambiguous = true;
+                    }
+                    continue;
+                }
+                let symbol = matched.records[0].clone();
+                if visited[root].insert(symbol.id.clone()) {
+                    symbols.push(symbol.clone());
+                    next.push((root, symbol.id.clone()));
+                }
             }
         }
+        level = next;
+        depth = depth.saturating_add(1);
     }
     ModelHierarchyResult {
         symbols,
@@ -3097,7 +3156,7 @@ pub(super) fn render_call_site(
     site: &CallSiteValue,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryCallSite {
+) -> Result<CodeQueryCallSite, PresentationRefusal> {
     let caller = declaration_value_for_unit(analyzer, &site.0.caller, site.0.range);
     let callee = site
         .6
@@ -3105,7 +3164,7 @@ pub(super) fn render_call_site(
         .filter(|target| target.boundary_kind.is_some() || target.reason.is_some())
         .is_none()
         .then(|| declaration_value_for_unit(analyzer, &site.0.callee, site.0.callee_range));
-    CodeQueryCallSite {
+    Ok(CodeQueryCallSite {
         site_id: site.4.clone(),
         program_point_id: site.3.clone(),
         path: rel_path_string(&site.0.file),
@@ -3146,28 +3205,129 @@ pub(super) fn render_call_site(
             .receiver
             .as_ref()
             .map(|range| render_source_range(analyzer, &site.0.file, range, cache)),
+        receiver_site: site
+            .0
+            .receiver
+            .as_ref()
+            .map(|range| written_site_context(analyzer, cache, &site.0.file, range))
+            .transpose()?,
         arguments: site
             .0
             .arguments
             .iter()
             .enumerate()
-            .map(|(index, argument)| CodeQueryCallArgument {
-                range: render_source_range(analyzer, &site.0.file, &argument.range, cache),
-                name: argument.name.clone(),
-                position: argument.position,
-                formal_index: argument.formal_index,
-                formal_name: argument.formal_name.clone(),
-                variadic: argument.variadic,
-                spread: argument.spread,
-                identity: site.5.argument_identities.get(index).cloned().flatten(),
-                caller_parameter_identity: site
-                    .5
-                    .caller_parameter_identities
-                    .get(index)
-                    .cloned()
-                    .flatten(),
+            .map(|(index, argument)| {
+                Ok(CodeQueryCallArgument {
+                    range: render_source_range(analyzer, &site.0.file, &argument.range, cache),
+                    name: argument.name.clone(),
+                    position: argument.position,
+                    formal_index: argument.formal_index,
+                    formal_name: argument.formal_name.clone(),
+                    variadic: argument.variadic,
+                    spread: argument.spread,
+                    identity: site.5.argument_identities.get(index).cloned().flatten(),
+                    caller_parameter_identity: site
+                        .5
+                        .caller_parameter_identities
+                        .get(index)
+                        .cloned()
+                        .flatten(),
+                    site: written_site_context(analyzer, cache, &site.0.file, &argument.range)?,
+                })
             })
-            .collect(),
+            .collect::<Result<_, PresentationRefusal>>()?,
+    })
+}
+
+/// Consume one compact demanded projection and add optional admitted source.
+fn written_site_context(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut PipelineRenderCache,
+    file: &ProjectFile,
+    range: &Range,
+) -> Result<SiteContextView, PresentationRefusal> {
+    let window = cache
+        .presentation
+        .as_mut()
+        .expect("site presentation has a demanded window");
+    let projection = window.take()?;
+    let owner = window.owner().cloned();
+    let admission = SiteAdmission::new(owner.as_ref());
+    let located = if cache.source_probe_is_sealed(file) {
+        None
+    } else {
+        cache
+            .coordinates_for(analyzer, file, || analyzer.indexed_source(file))
+            .map(|coordinates| {
+                let source = coordinates
+                    .source
+                    .get(range.start_byte..range.end_byte)
+                    .expect("site range lies inside its pinned source");
+                let lines = range_for_offsets(
+                    &coordinates.source,
+                    &coordinates.line_starts,
+                    range.start_byte,
+                    range.end_byte,
+                );
+                (admission.copy(source), lines)
+            })
+    };
+    let site = match located {
+        Some((Ok(text), lines)) => SiteLocationView::Source {
+            path: projection.path,
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+            start_line: lines.start_line,
+            start_column: lines.start_column,
+            end_line: lines.end_line,
+            end_column: lines.end_column,
+            text,
+        },
+        Some((Err(SiteAdmissionRefusal::RetainedBytes), _)) => {
+            cache
+                .presentation
+                .as_mut()
+                .expect("presentation window")
+                .source_refused = true;
+            SiteLocationView::Unrendered {
+                path: projection.path,
+                start_byte: range.start_byte,
+                end_byte: range.end_byte,
+                reason: UnrenderedReason::RenderBudget,
+            }
+        }
+        Some((Err(error), _)) => return Err(error),
+        None => SiteLocationView::Unrendered {
+            path: projection.path,
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+            reason: cache.unrendered_reason(file),
+        },
+    };
+    Ok(SiteContextView {
+        site,
+        role: projection.role,
+        value: projection.value,
+    })
+}
+
+/// Match the existing flat snippet byte-for-byte, without a staging String.
+fn admitted_site_snippet(
+    site: &SiteContextView,
+    admission: &SiteAdmission<'_>,
+) -> Result<AdmittedText, PresentationRefusal> {
+    let SiteLocationView::Source { text, .. } = &site.site else {
+        return Ok(AdmittedText::empty());
+    };
+    let first_line = text.lines().next().unwrap_or("");
+    let mut end = first_line.len().min(SNIPPET_MAX_CHARS);
+    while !first_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        admission.formatted(format_args!("{}\u{2026}", &first_line[..end]))
+    } else {
+        admission.copy(&first_line[..end])
     }
 }
 
@@ -3175,7 +3335,7 @@ pub(super) fn render_expression_site(
     analyzer: &dyn IAnalyzer,
     site: &ExpressionSiteValue,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryExpressionSite {
+) -> Result<CodeQueryExpressionSite, PresentationRefusal> {
     let CodeQueryResultRef::ExpressionSite {
         path,
         range,
@@ -3187,27 +3347,41 @@ pub(super) fn render_expression_site(
         unreachable!("expression-site reference renderer returns its expression-site variant")
     };
     let file = &site.call_site.0.file;
-    let text = cache
-        .coordinates_for(analyzer, file, || analyzer.indexed_source(file))
-        .and_then(|coordinates| {
-            coordinates
-                .source
-                .get(site.range.start_byte..site.range.end_byte)
-        })
-        .map(snippet)
-        .unwrap_or_default();
-    CodeQueryExpressionSite {
+    // The site projection (path, role, value) is required: without it the row
+    // has no `site`. The flat snippet is optional display context, so an
+    // unadmittable snippet renders empty and is reported through the existing
+    // source_refused flag, not by refusing the row.
+    let site_context = written_site_context(analyzer, cache, file, &site.range)?;
+    let owner = cache
+        .presentation
+        .as_ref()
+        .expect("presentation window")
+        .owner()
+        .cloned();
+    let text = match admitted_site_snippet(&site_context, &SiteAdmission::new(owner.as_ref())) {
+        Ok(text) => text,
+        Err(_) => {
+            cache
+                .presentation
+                .as_mut()
+                .expect("presentation window")
+                .source_refused = true;
+            AdmittedText::empty()
+        }
+    };
+    Ok(CodeQueryExpressionSite {
         path,
         language: crate::analyzer::common::language_for_file(file).config_label(),
         range,
         text,
+        site: site_context,
         input_kind,
         parameter_index,
         parameter_name,
         caller_fq_name: site.call_site.0.caller.fq_name(),
         callee_fq_name: site.call_site.0.callee.fq_name(),
         call_range: render_source_range(analyzer, file, &site.call_site.0.range, cache),
-    }
+    })
 }
 
 pub(super) fn render_jsx_attribute_value(
@@ -3783,10 +3957,11 @@ pub(super) fn render_call_shape_argument(
     analyzer: &dyn IAnalyzer,
     value: &CallArgumentValue,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryCallShapeArgument {
+) -> Result<CodeQueryCallShapeArgument, PresentationRefusal> {
     let outcome = &value.shape.report.outcome;
     let argument = &value.shape.report.arguments[value.argument_index];
-    CodeQueryCallShapeArgument {
+    let site_context = written_site_context(analyzer, cache, &outcome.file, &argument.range)?;
+    Ok(CodeQueryCallShapeArgument {
         id: argument.id.clone(),
         group_id: argument.group_id.clone(),
         site_id: outcome.site_id.clone(),
@@ -3794,9 +3969,10 @@ pub(super) fn render_call_shape_argument(
         range: render_source_range(analyzer, &outcome.file, &argument.range, cache),
         argument_index: argument.argument_index,
         name: argument.name.clone(),
-        literal_value: argument.literal_value.clone(),
+        literal_value: site_context.value.known_str().cloned(),
         spread: argument.spread,
-    }
+        site: site_context,
+    })
 }
 
 pub(super) fn render_call_binding(
@@ -3804,7 +3980,7 @@ pub(super) fn render_call_binding(
     value: &CallBindingValue,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryCallBinding {
+) -> Result<CodeQueryCallBinding, PresentationRefusal> {
     let report = &value.site.report;
     let row = value.row();
     let conversion_applicable = row.argument_id.is_some()
@@ -3823,28 +3999,42 @@ pub(super) fn render_call_binding(
     let provenance = value.site.semantic_model_provenance.as_deref();
     let summary = value.site.selector.summary_provenance.as_deref();
     let binding_id = value.site.binding_ids.get(value.index).cloned().flatten();
-    let literal_value = row.argument_id.as_ref().and_then(|argument_id| {
-        let argument = value
+    let argument = row.argument_id.as_ref().map(|argument_id| {
+        value
             .site
             .shape
             .report
             .arguments
             .iter()
-            .find(|argument| &argument.id == argument_id)?;
-        value
-            .site
-            .shape
-            .facts
-            .as_ref()?
-            .nodes()
-            .iter()
-            .find_map(|node| {
-                (node.kind == NormalizedKind::StringLiteral && node.range == argument.range)
-                    .then(|| node.string_value.clone())
-                    .flatten()
-            })
+            .find(|argument| &argument.id == argument_id)
+            .expect("a binding row names an argument of its own call shape")
     });
-    CodeQueryCallBinding {
+    // Only a row that stands for a written expression at the call site has a
+    // site: a written actual or a written receiver. Terminal, defaulted,
+    // missing-required and implicit-receiver rows have none.
+    let site_context = match (argument, row.binding_kind) {
+        (Some(argument), _) => Some(written_site_context(
+            analyzer,
+            cache,
+            &report.file,
+            &argument.range,
+        )?),
+        (None, Some(crate::analyzer::usages::call_binding::CallBindingKind::Receiver))
+            if !row.terminal =>
+        {
+            Some(written_site_context(
+                analyzer,
+                cache,
+                &report.file,
+                &row.range,
+            )?)
+        }
+        (None, _) => None,
+    };
+    let literal_value = site_context
+        .as_ref()
+        .and_then(|context| context.value.known_str().cloned());
+    Ok(CodeQueryCallBinding {
         id: row.id.clone(),
         site_id: row.site_id.clone(),
         site_ast_id: report.site_ast_id.clone(),
@@ -3856,6 +4046,7 @@ pub(super) fn render_call_binding(
         argument_id: row.argument_id.clone(),
         binding_id,
         literal_value,
+        site: site_context,
         path_identity: value
             .site
             .path_identities
@@ -3934,7 +4125,7 @@ pub(super) fn render_call_binding(
         actual_count: report.actual_count,
         bound_count: report.bound_count,
         terminal: row.terminal,
-    }
+    })
 }
 
 pub(super) fn render_call_effect(
@@ -4737,7 +4928,7 @@ pub(super) fn expression_input_parts(
 ) -> (&'static str, Option<usize>, Option<String>) {
     match input {
         ExpressionInput::Receiver => ("receiver", None, None),
-        ExpressionInput::Parameter { index, name } => ("parameter", Some(*index), name.clone()),
+        ExpressionInput::Parameter { index, name, .. } => ("parameter", Some(*index), name.clone()),
     }
 }
 
@@ -5006,7 +5197,7 @@ fn execution_budget_diagnostic(budget: &CodeQueryExecutionBudget) -> CodeQueryDi
     note_budget_work(CodeQueryDiagnosticCode::ExecutionBudgetExhausted, budget);
     incomplete_diagnostic(
         CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
-        brokk_bifrost_rql::Incompleteness::Content,
+        brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
         "workspace",
         "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
         Vec::new(),
@@ -5191,7 +5382,7 @@ pub(super) fn push_pipeline_budget_diagnostic(
     }
     let mut diagnostic = incomplete_diagnostic(
         CodeQueryDiagnosticCode::PipelineBudgetExhausted,
-        brokk_bifrost_rql::Incompleteness::Content,
+        brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
         "workspace",
         "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
         Vec::new(),
@@ -5228,7 +5419,7 @@ pub(super) fn push_import_graph_budget_diagnostic(
     });
     let mut diagnostic = incomplete_diagnostic(
         CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
-        brokk_bifrost_rql::Incompleteness::Content,
+        brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
         "workspace",
         "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(), Vec::new(),
     );
@@ -5305,6 +5496,7 @@ pub(super) fn push_broad_query_diagnostic(
         message: "broad unanchored query_code query scanned the workspace without a source anchor; add where, languages, exact name predicates, or a more specific pattern to reduce work and output".to_string(),
     exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
     }));
 }
 
@@ -5593,4 +5785,287 @@ pub(super) fn snippet(text: &str) -> String {
         result.push('…');
     }
     result
+}
+
+#[cfg(test)]
+mod site_render_tests {
+    use super::super::presentation::{PresentationWindow, SiteProjection};
+    use super::*;
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::structural::search::tests::inline_project::InlineTestProject;
+    use brokk_bifrost_core::retention_budget::RetentionBudget;
+    use brokk_bifrost_test_macros::hardwon;
+    use brokk_bifrost_tools::site_context::{KnownValueView, SiteRoleView, SiteValueView};
+
+    const SOURCE: &str = "def f(a, b):\n    pass\n\n\ndef g():\n    f(\"x\", 2)\n";
+
+    /// Every way a file's source can be missing from the render cache renders
+    /// the argument site as `unrendered` with its reason, and the value still
+    /// comes from the structural node, so the flat columns stay what they were.
+    #[test]
+    fn a_site_without_rendered_source_is_unrendered_and_keeps_its_value() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file("m.py", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = project.file("m.py");
+        let start = SOURCE.find("\"x\"").unwrap();
+        let range = Range {
+            start_byte: start,
+            end_byte: start + 3,
+            start_line: 6,
+            end_line: 6,
+        };
+        let site_in = |cache: &mut PipelineRenderCache| {
+            let owner = workspace.retention_budget().clone();
+            let admission = SiteAdmission::new(Some(&owner));
+            let projection = SiteProjection {
+                path: admission.path(&file).unwrap(),
+                role: SiteRoleView::Argument {
+                    index: 0,
+                    name: None,
+                },
+                value: SiteValueView::Known {
+                    value: KnownValueView::Str {
+                        value: admission.copy("x").unwrap(),
+                    },
+                },
+            };
+            cache.presentation = Some(PresentationWindow::from_test_projection(owner, projection));
+            written_site_context(analyzer, cache, &file, &range).unwrap()
+        };
+
+        let mut sealed = PipelineRenderCache::default();
+        sealed.seal_source_loads();
+        let mut refused = PipelineRenderCache::default();
+        refused.retain_loaded_source(&file, RetainedSource::BudgetRefused);
+        let mut conflicting = PipelineRenderCache::default();
+        assert!(conflicting.retain_source_snapshot(&file, SOURCE));
+        assert!(!conflicting.retain_source_snapshot(&file, "def other(): pass\n"));
+
+        for (mut cache, reason) in [
+            (sealed, UnrenderedReason::RenderBudget),
+            (refused, UnrenderedReason::RenderBudget),
+            (conflicting, UnrenderedReason::ConflictingSources),
+        ] {
+            let context = site_in(&mut cache);
+            assert!(
+                matches!(&context.site, SiteLocationView::Unrendered { path, start_byte, end_byte, reason: actual } if path.as_ref() == "m.py" && *start_byte == start && *end_byte == start + 3 && *actual == reason)
+            );
+            assert_eq!(context.value.known_str().unwrap().as_ref(), "x");
+            assert_eq!(
+                admitted_site_snippet(
+                    &context,
+                    &SiteAdmission::new(Some(workspace.retention_budget()))
+                )
+                .unwrap()
+                .as_ref(),
+                ""
+            );
+        }
+    }
+
+    fn expression_site_value_for_snippet_test(
+        file: &crate::analyzer::ProjectFile,
+        range: Range,
+        call_range: Range,
+    ) -> ExpressionSiteValue {
+        let caller = crate::analyzer::CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "g",
+        );
+        let callee = crate::analyzer::CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "f",
+        );
+        let call_site = CallSite {
+            file: file.clone(),
+            range: call_range,
+            callee_range: call_range,
+            caller,
+            callee,
+            kind: CallSyntaxKind::Function,
+            proof: UsageProof::Unproven,
+            receiver: None,
+            arguments: Vec::new(),
+        };
+        let call_value = CallSiteValue::new(
+            call_site,
+            CallBindingStatus::Complete,
+            None,
+            CallSiteIdentityFacts::default(),
+        );
+        ExpressionSiteValue {
+            call_site: call_value,
+            range,
+            input: ExpressionInput::Parameter {
+                index: 0,
+                name: Some("a".to_string()),
+                actual_written_position: Some(0),
+                actual_name: None,
+            },
+        }
+    }
+
+    #[test]
+    #[hardwon("#14518: an unadmittable optional snippet refused the whole expression-site row")]
+    fn an_unadmittable_snippet_renders_without_snippet() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file("m.py", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = project.file("m.py");
+        let start = SOURCE.find("\"x\"").unwrap();
+        let range = Range {
+            start_byte: start,
+            end_byte: start + 3,
+            start_line: 6,
+            end_line: 6,
+        };
+        let call_start = SOURCE.find("f(\"x\"").unwrap();
+        let call_end = call_start + SOURCE[call_start..].find(")\n").unwrap() + 1;
+        let call_range = Range {
+            start_byte: call_start,
+            end_byte: call_end,
+            start_line: 6,
+            end_line: 6,
+        };
+        let site = expression_site_value_for_snippet_test(&file, range, call_range);
+        let workspace_budget = workspace.retention_budget().clone();
+        // Search for a pressured window owner where the admitted source still
+        // fits but its second snippet copy does not. The projection itself is
+        // admitted against the large workspace budget so only the snippet is
+        // under pressure.
+        let mut snippet_capacity = None;
+        for capacity in (2000..8000).step_by(100) {
+            let owner = RetentionBudget::for_test_capacity(capacity as u64);
+            let admission = SiteAdmission::new(Some(&workspace_budget));
+            let projection = SiteProjection {
+                path: admission.path(&file).unwrap(),
+                role: SiteRoleView::Argument {
+                    index: 0,
+                    name: None,
+                },
+                value: SiteValueView::Known {
+                    value: KnownValueView::Str {
+                        value: admission.copy("x").unwrap(),
+                    },
+                },
+            };
+            let mut probe = PipelineRenderCache {
+                presentation: Some(PresentationWindow::from_test_projection(
+                    owner.clone(),
+                    projection,
+                )),
+                ..PipelineRenderCache::default()
+            };
+            let Ok(context) = written_site_context(analyzer, &mut probe, &file, &range) else {
+                continue;
+            };
+            if !matches!(context.site, SiteLocationView::Source { .. }) {
+                continue;
+            }
+            if admitted_site_snippet(&context, &SiteAdmission::new(Some(&owner))).is_err() {
+                snippet_capacity = Some(capacity as u64);
+                break;
+            }
+        }
+        let capacity = snippet_capacity
+            .expect("test budget must admit the source but refuse the snippet copy");
+        let owner = RetentionBudget::for_test_capacity(capacity);
+        let admission = SiteAdmission::new(Some(&workspace_budget));
+        let projection = SiteProjection {
+            path: admission.path(&file).unwrap(),
+            role: SiteRoleView::Argument {
+                index: 0,
+                name: None,
+            },
+            value: SiteValueView::Known {
+                value: KnownValueView::Str {
+                    value: admission.copy("x").unwrap(),
+                },
+            },
+        };
+        let mut cache = PipelineRenderCache {
+            presentation: Some(PresentationWindow::from_test_projection(owner, projection)),
+            ..PipelineRenderCache::default()
+        };
+        let rendered = render_expression_site(analyzer, &site, &mut cache)
+            .expect("an unadmittable optional snippet must render without the snippet");
+        assert_eq!(rendered.text.as_ref(), "");
+        assert!(
+            matches!(&rendered.site.site, SiteLocationView::Source { .. }),
+            "the admitted source stays while only the snippet copy is refused: {:?}",
+            rendered.site.site
+        );
+        assert_eq!(rendered.path, "m.py");
+        assert_eq!(rendered.input_kind, "parameter");
+        assert!(
+            rendered.caller_fq_name.ends_with("g"),
+            "caller carries the enclosing owner: {}",
+            rendered.caller_fq_name
+        );
+        assert!(
+            rendered.callee_fq_name.ends_with("f"),
+            "callee carries the invoked owner: {}",
+            rendered.callee_fq_name
+        );
+        assert!(
+            cache
+                .presentation
+                .as_ref()
+                .is_some_and(|window| window.source_refused),
+            "the omitted snippet must be reported through the existing source_refused flag"
+        );
+    }
+
+    #[test]
+    #[hardwon("#14518: an unadmittable optional snippet refused the whole expression-site row")]
+    fn a_missing_required_site_projection_still_refuses() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file("m.py", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = project.file("m.py");
+        let start = SOURCE.find("\"x\"").unwrap();
+        let range = Range {
+            start_byte: start,
+            end_byte: start + 3,
+            start_line: 6,
+            end_line: 6,
+        };
+        let call_start = SOURCE.find("f(\"x\"").unwrap();
+        let call_end = call_start + SOURCE[call_start..].find(")\n").unwrap() + 1;
+        let call_range = Range {
+            start_byte: call_start,
+            end_byte: call_end,
+            start_line: 6,
+            end_line: 6,
+        };
+        let site = expression_site_value_for_snippet_test(&file, range, call_range);
+        let mut cache = PipelineRenderCache {
+            presentation: Some(PresentationWindow::from_test_refusal(
+                workspace.retention_budget().clone(),
+                SiteAdmissionRefusal::RetainedBytes,
+            )),
+            ..PipelineRenderCache::default()
+        };
+        assert!(
+            matches!(
+                render_expression_site(analyzer, &site, &mut cache),
+                Err(SiteAdmissionRefusal::RetainedBytes)
+            ),
+            "the required site projection must still refuse"
+        );
+    }
 }

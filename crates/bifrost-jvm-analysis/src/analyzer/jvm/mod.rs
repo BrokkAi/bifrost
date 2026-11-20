@@ -125,6 +125,20 @@ pub(crate) fn java_array_dimension_count(dimensions: Node<'_>) -> usize {
     count
 }
 
+// #10572: unchanged JVM artifacts must regenerate distinct class-finality facts.
+// #13800: unchanged source-bearing artifacts must regenerate complete merged packs.
+const JVM_PACK_PRODUCER_VERSION: u32 = 2;
+
+pub(crate) fn jvm_pack_producer_version() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "{}+jvm-pack-{JVM_PACK_PRODUCER_VERSION}",
+            env!("CARGO_PKG_VERSION")
+        )
+    });
+    VERSION.as_str()
+}
+
 pub(crate) fn equivalent_java_type_identity(left: &TypeFact, right: &TypeFact) -> bool {
     left.id == right.id
         && left.name == right.name
@@ -132,6 +146,7 @@ pub(crate) fn equivalent_java_type_identity(left: &TypeFact, right: &TypeFact) -
         && left.visibility == right.visibility
         && left.is_abstract == right.is_abstract
         && left.is_sealed == right.is_sealed
+        && (left.is_final.is_none() || right.is_final.is_none() || left.is_final == right.is_final)
         && left.type_parameters == right.type_parameters
 }
 
@@ -170,6 +185,7 @@ pub(crate) fn jdk_artifact_request(
             }],
         },
         activation: vec![ActivationSelector {
+            production_input_digest: None,
             package: None,
             module: None,
             toolchain: Some(NameSelector {
@@ -441,7 +457,8 @@ pub(crate) fn retained_external_index_state(
 /// The overlay is the *dispatching* analyzer's, so this is built at the
 /// analysis-side shim where that analyzer is in hand, not inside a language
 /// analyzer that only knows its own generation.
-pub(crate) struct JvmOverlayModel {
+pub(crate) struct JvmOverlayModel<'a> {
+    analyzer: &'a dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
     overlay: Option<
         std::sync::Arc<
             brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
@@ -450,7 +467,7 @@ pub(crate) struct JvmOverlayModel {
     truncated_discovery: bool,
 }
 
-impl JvmOverlayModel {
+impl<'a> JvmOverlayModel<'a> {
     /// Read the dispatching analyzer's published JVM external surface: the
     /// overlay, and whether the discovery that produced it reached everything
     /// the build declared (#2887).
@@ -461,7 +478,7 @@ impl JvmOverlayModel {
     /// Asking all three -- the ecosystem's own language list, not a second
     /// copy of it -- keeps this independent of which keys a publication used.
     pub(crate) fn new(
-        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        analyzer: &'a dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
     ) -> Self {
         let truncated_discovery =
             brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem::Jvm
@@ -470,13 +487,14 @@ impl JvmOverlayModel {
                 .filter_map(|language| analyzer.dependency_discovery_evidence(*language))
                 .any(|evidence| evidence.truncated());
         Self {
+            analyzer,
             overlay: analyzer.semantic_model_overlay_read().published(),
             truncated_discovery,
         }
     }
 }
 
-impl JvmActiveSemanticModel for JvmOverlayModel {
+impl JvmActiveSemanticModel for JvmOverlayModel<'_> {
     fn is_published(&self) -> bool {
         // Publication means a declaration surface, not merely an overlay: a
         // bare JVM workspace activates generator-rule packs (e.g.
@@ -493,7 +511,46 @@ impl JvmActiveSemanticModel for JvmOverlayModel {
     }
 
     fn discovery_truncated(&self) -> bool {
-        self.truncated_discovery
+        // This rung is reached only after the name missed the model. Positive
+        // JDK answers therefore remain independent of dependency content gaps.
+        let gaps = match &self.overlay {
+            Some(overlay) => overlay.jvm_dependency_gaps(),
+            None => self
+                .analyzer
+                .active_semantic_model_snapshot()
+                .map_or_else(|| Ok(Vec::new()), |snapshot| snapshot.jvm_dependency_gaps()),
+        };
+        match gaps {
+            Ok(gaps) => {
+                for gap in &gaps {
+                    self.analyzer.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(gap.message().into()),
+                    );
+                }
+                self.truncated_discovery || !gaps.is_empty()
+            }
+            Err(open) => {
+                // An open model read must remain open, but must not erase the
+                // terminal preparation outcomes published with this snapshot.
+                if let Some(snapshot) = self.analyzer.active_semantic_model_snapshot() {
+                    for gap in
+                        brokk_bifrost_analysis::analyzer::semantic_model::overlay::dependency_gaps(
+                            &snapshot.active_models().preparation_failures,
+                            snapshot.active_models(),
+                        )
+                    {
+                        self.analyzer.record_query_incomplete(
+                            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(gap.message().into()),
+                        );
+                    }
+                }
+
+                self.analyzer.record_query_incomplete(
+                    brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay::open_read_incompleteness(open),
+                );
+                true
+            }
+        }
     }
 
     fn qualified_name_disposition(&self, fqn: &str) -> JvmModelDisposition {
@@ -646,6 +703,7 @@ pub(crate) mod dependency_packs {
             config: &AnalyzerConfig,
             project: &dyn Project,
             digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -653,6 +711,7 @@ pub(crate) mod dependency_packs {
                 &config.jvm,
                 project,
                 digests,
+                verifications,
                 limits,
                 cancellation,
             )
@@ -684,7 +743,7 @@ pub(crate) mod dependency_packs {
                 ) else {
                     continue;
                 };
-                if evidence.artifact_sha256.is_some() {
+                if !evidence.verified_raw_artifacts.is_empty() {
                     by_home.insert(home.to_path_buf(), (*evidence).clone());
                 }
             }

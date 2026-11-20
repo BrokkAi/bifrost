@@ -235,17 +235,14 @@ pub fn scan_file_evidence(
         return JavaFileEvidenceBuildOutcome::Cancelled;
     }
 
-    // Evidence must include every hit, so the request-level maximum cannot
-    // truncate or poison publication; the analysis layer applies it on merge.
-    let mut usages = UsageAccumulator::unbounded();
-    scan_prepared_file(
+    let usages = scan_prepared_file(
         java,
         graph,
         file,
         spec,
         return_caches,
         &prepared,
-        &mut usages,
+        cancellation,
     );
     if cancellation.is_cancelled() {
         return JavaFileEvidenceBuildOutcome::Cancelled;
@@ -314,10 +311,13 @@ fn scan_prepared_file(
     spec: &TargetSpec,
     return_caches: &ReturnTypeCaches<'_>,
     prepared: &PreparedJavaFile,
-    usages: &mut UsageAccumulator,
-) {
+    cancellation: &CancellationToken,
+) -> UsageAccumulator {
+    // Evidence must include every hit, so the request-level maximum cannot
+    // truncate or poison publication; the analysis layer applies it on merge.
+    let mut usages = UsageAccumulator::unbounded();
     if !prepared.target_present {
-        return;
+        return usages;
     }
     let token = graph.token;
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -332,7 +332,7 @@ fn scan_prepared_file(
         line_starts: &prepared.line_starts,
         spec,
         bindings: &mut bindings,
-        usages,
+        usages: &mut usages,
         class_ranges: prepared.class_ranges.clone(),
         method_call_return_cache: CaptureScopedMemo::default(),
         receiver_target_match_cache: CaptureScopedMemo::default(),
@@ -342,7 +342,8 @@ fn scan_prepared_file(
         enclosing_cache: HashMap::default(),
         class_scope_depths: Vec::new(),
     };
-    scan_node(prepared.tree.root_node(), token, &mut ctx);
+    scan_node(prepared.tree.root_node(), token, &mut ctx, cancellation);
+    usages
 }
 
 /// Whether this parsed file contains the target's terminal symbol at all.
@@ -375,7 +376,12 @@ fn tree_contains_target_terminal(root: Node<'_>, source: &str, target: &str) -> 
     found
 }
 
-fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_node(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+    cancellation: &CancellationToken,
+) {
     enum Work<'tree> {
         Visit(Node<'tree>),
         ExitScope,
@@ -384,6 +390,9 @@ fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     }
     let mut work = vec![Work::Visit(node)];
     while let Some(item) = work.pop() {
+        if cancellation.is_cancelled() {
+            return;
+        }
         let node = match item {
             Work::ExitScope => {
                 ctx.bindings.exit_scope();

@@ -93,6 +93,7 @@ use std::ops::Range;
 use serde::Serialize;
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayStatus;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, execute_code_query_detailed_eager_index_in_scope,
     execute_code_query_detailed_eager_index_workspace_in_scope,
@@ -326,6 +327,10 @@ pub struct PolicyNearMissRanking {
     executions_used: u64,
     entries: Vec<NearMissEntry>,
     truncation: NearMissTruncation,
+    /// Whether the semantic models the workspace selected were active when
+    /// this ranking was computed; anything but `ready` or `no_models` makes
+    /// every entry `unknown` (#13182). Present even when `entries` is empty.
+    semantic_models: SemanticModelOverlayStatus,
     /// The workspace generation this ranking was produced under, when the
     /// surface that produced it knew one. Stated for the same reason an
     /// explanation states it: a caller pins it on the next question.
@@ -348,6 +353,9 @@ impl PolicyNearMissRanking {
     }
     pub const fn analysis_type(&self) -> PolicyAnalysisType {
         self.analysis_type
+    }
+    pub const fn semantic_models(&self) -> &SemanticModelOverlayStatus {
+        &self.semantic_models
     }
     pub const fn enumeration(&self) -> &NearMissEnumeration {
         &self.enumeration
@@ -410,6 +418,8 @@ pub fn rank_near_misses(
     budget: &PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyNearMissRanking, ExplainError> {
+    let semantic_models = limits.stating_semantic_models_of(context.analyzer)?;
+    let limits = semantic_models.limits();
     if limits.max_near_miss_executions() == 0 {
         return Err(ExplainError::BudgetExhausted {
             limit: ExplanationBudgetLimit::NearMissExecutions,
@@ -449,14 +459,7 @@ pub fn rank_near_misses(
         NearMissCandidates::PolicySeedSearch => ladder.enumerate_scope_subjects(&plan.scope_label),
     };
 
-    Ok(build_ranking(
-        policy,
-        plan,
-        ladder,
-        subjects,
-        enumeration,
-        limits,
-    ))
+    build_ranking(policy, plan, ladder, subjects, enumeration, limits)
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,12 +1155,23 @@ fn build_ranking(
     subjects: Vec<ExplanationCandidate>,
     enumeration: NearMissEnumeration,
     limits: &ExplanationLimits,
-) -> PolicyNearMissRanking {
+) -> Result<PolicyNearMissRanking, ExplainError> {
     let declared = ladder.declared_conjuncts;
+    let gap = limits.semantic_models().cause().is_some();
     let mut measured = subjects
         .iter()
         .map(|candidate| {
-            let measurement = ladder.measure(candidate, plan.verdict);
+            let mut measurement = ladder.measure(candidate, plan.verdict);
+            if gap {
+                // Independence from models is not proved: a gap makes every
+                // subject undecided. The distance itself is unchanged.
+                measurement.outcome = ExplanationOutcome::Unknown;
+                measurement
+                    .reasons
+                    .push(PolicyIncompleteReason::PartialDiscovery);
+                measurement.reasons.sort();
+                measurement.reasons.dedup();
+            }
             (candidate, measurement)
         })
         .collect::<Vec<_>>();
@@ -1175,7 +1189,15 @@ fn build_ranking(
     truncation.omit_executions(ladder.omitted_executions);
 
     let mut entries = Vec::new();
-    let mut bytes_used = 0usize;
+    let semantic_models = super::model::bounded_semantic_models(limits, &mut |bytes| {
+        truncation.omit_text_bytes(bytes);
+    });
+    let mut bytes_used = super::model::status_bytes(&semantic_models);
+    if bytes_used > limits.max_retained_bytes() {
+        return Err(ExplainError::BudgetExhausted {
+            limit: ExplanationBudgetLimit::RetainedBytes,
+        });
+    }
     for (index, (candidate, measurement)) in measured.into_iter().enumerate() {
         if index >= limits.max_near_miss_candidates() {
             truncation.omit_candidates(1);
@@ -1212,7 +1234,7 @@ fn build_ranking(
         entries.push(entry);
     }
 
-    PolicyNearMissRanking {
+    Ok(PolicyNearMissRanking {
         format: POLICY_NEAR_MISS_FORMAT,
         question: ExplanationQuestion::NearMiss,
         policy_id: policy.definition().metadata.id.clone(),
@@ -1224,6 +1246,7 @@ fn build_ranking(
         executions_used: u64::try_from(ladder.rungs.len()).unwrap_or(u64::MAX),
         entries,
         truncation,
+        semantic_models,
         workspace_generation: None,
-    }
+    })
 }

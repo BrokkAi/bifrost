@@ -1026,6 +1026,7 @@ impl<'f> MemberFormStep<'f> {
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 })
             })
             .collect()
@@ -1393,55 +1394,28 @@ pub(super) fn record_receiver_pipeline_output_omission(
 
 /// Project CodeQuery's single remaining fact budget onto the receiver axes.
 ///
-/// Scope, summary and hierarchy-order work all count as facts; resolution
-/// rounds are iterations, not facts, and keep their own limit. Scope and
-/// summary are allocated first. Hierarchy-order work gets only what they
-/// leave, so the three never exceed the fact budget together. It can be zero
-/// while facts remain (a small custom budget, or a nearly spent one); order
-/// work then stops with the ordinary hierarchy budget stop and fails closed.
-/// This scope-and-summary-first priority makes RQL the exception to the rule
-/// that a preset's hierarchy allowance equals its scope allowance
-/// (`DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK`).
+/// Summary and hierarchy-order work count as facts; resolution rounds are
+/// iterations, not facts, and keep their own limit. Visiting scope is work and
+/// reserves no facts (#13216). Summary is allocated first and hierarchy-order
+/// work gets what it leaves, so the two never exceed the fact budget together.
+/// It can be zero while facts remain; order work then stops with the ordinary
+/// hierarchy budget stop and fails closed. #13660 removes this allocation.
 pub(super) fn receiver_budget_for_remaining_work(
     base: ReceiverAnalysisBudget,
     remaining_facts: usize,
     remaining_targets: usize,
 ) -> ReceiverAnalysisBudget {
-    let desired_scope = base.max_scope_nodes.min(remaining_facts);
-    let desired_summaries = base.max_summary_expansions.min(remaining_facts);
-    let with_hierarchy_remainder = |max_scope_nodes: usize, max_summary_expansions: usize| {
-        let allocated = max_scope_nodes
-            .checked_add(max_summary_expansions)
-            .filter(|allocated| *allocated <= remaining_facts)
-            .expect("scope and summary projections fit the remaining fact budget");
-        let unallocated = remaining_facts - allocated;
-        ReceiverAnalysisBudget {
-            context_depth: base.context_depth,
-            max_targets: base.max_targets.min(remaining_targets),
-            max_summary_expansions,
-            max_resolution_rounds: base.max_resolution_rounds,
-            max_hierarchy_order_steps: base.max_hierarchy_order_steps,
-            max_scope_nodes,
-            max_hierarchy_order_work: base.max_hierarchy_order_work.min(unallocated),
-        }
-    };
-    if desired_scope
-        .checked_add(desired_summaries)
-        .is_some_and(|desired| desired <= remaining_facts)
-    {
-        return with_hierarchy_remainder(desired_scope, desired_summaries);
+    let max_summary_expansions = base.max_summary_expansions.min(remaining_facts);
+    ReceiverAnalysisBudget {
+        context_depth: base.context_depth,
+        max_targets: base.max_targets.min(remaining_targets),
+        max_summary_expansions,
+        max_resolution_rounds: base.max_resolution_rounds,
+        max_hierarchy_order_steps: base.max_hierarchy_order_steps,
+        max_hierarchy_order_work: base
+            .max_hierarchy_order_work
+            .min(remaining_facts - max_summary_expansions),
     }
-
-    // CodeQuery has one fact-node budget, while receiver analysis exposes
-    // separate scope and summary caps. Reserve up to one quarter for summary
-    // expansion, then give scope traversal the remainder; this prevents the
-    // two dimensions from each spending the same scalar remainder in full.
-    let summary_reserve = desired_summaries.min(remaining_facts / 4);
-    let max_scope_nodes = desired_scope.min(remaining_facts - summary_reserve);
-    let unallocated = remaining_facts - summary_reserve - max_scope_nodes;
-    let max_summary_expansions =
-        summary_reserve.saturating_add((desired_summaries - summary_reserve).min(unallocated));
-    with_hierarchy_remainder(max_scope_nodes, max_summary_expansions)
 }
 
 pub(super) fn receiver_candidate_count(report: &ReceiverQueryReport) -> usize {

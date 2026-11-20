@@ -55,11 +55,16 @@ fn workspace_profile(
 /// ledger records the same reads; a cold lookup publishes; every refusal falls
 /// back to the cold lookup. One slot, so the memo never grows with the
 /// workspace; it dies with the analyzer's query read cache.
-#[derive(Default)]
-pub(super) struct PythonSelectedSummaryRequestMemo {
-    published: std::sync::Mutex<Option<std::sync::Arc<PublishedSelectedSummary>>>,
-    #[cfg(test)]
-    pub(super) hits: std::sync::atomic::AtomicUsize,
+impl brokk_bifrost_core::domain_memo::ReplayEntry for PublishedSelectedSummary {}
+
+brokk_bifrost_core::domain_memo_set! {
+    #[derive(Default)]
+    pub(super) struct PythonSelectedSummaryRequestMemo {
+        published: brokk_bifrost_core::domain_memo::ReplayingStore<
+            std::sync::Mutex<Option<std::sync::Arc<PublishedSelectedSummary>>>,
+        >,
+        ; test_only { pub(super) hits: std::sync::atomic::AtomicUsize }
+    }
 }
 
 /// Everything the store lookup depends on. The snapshot and profile are its
@@ -431,9 +436,12 @@ impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedAnal
         brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)
             .verified_declaration(expected)
     }
-    fn external_inventory_providers(&self) -> Vec<String> {
+    fn external_inventory_providers(
+        &self,
+        models: &brokk_bifrost_analysis::analyzer::store::active_models::ResolvedActiveSemanticModels,
+    ) -> Vec<String> {
         brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)
-            .external_inventory_providers()
+            .external_inventory_providers(models)
     }
     fn active_models(
         &self,
@@ -448,6 +456,12 @@ impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedAnal
     fn model_authority(&self) -> Option<std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>>{
         brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)
             .model_authority()
+    }
+    fn record_model_authority_read(&self, hash: &str) {
+        // The operation's provider gate reads its model authority, so the
+        // authority digest must reach this analyzer's read frame.
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)
+            .record_model_authority_read(hash);
     }
     fn record_source_read(&self, file: &brokk_bifrost_analysis::analyzer::ProjectFile) {
         brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)

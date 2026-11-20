@@ -30,6 +30,7 @@ mod ruby_extraction_tests {
             "example.new",
             "new",
             Some(Signature {
+                bounds: None,
                 type_parameters: Vec::new(),
                 parameters: Vec::new(),
                 returns: Some(TypeRef::Declared {

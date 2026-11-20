@@ -70,6 +70,7 @@ fn lower_prepared_source(
             prepared,
             &SemanticBudget::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
         )
         .unwrap_or_else(|_| panic!("{language} semantic lowering must succeed"));
     let SemanticOutcome::Complete { value, .. } = outcome else {
@@ -871,7 +872,13 @@ fn typescript_structural_identity_pass_is_charged_to_semantic_budget() {
     limits.nested_entries = inventory_work.nested_entries;
     let budget = SemanticBudget::new(limits).expect("inventory-sized budget is positive");
     let outcome = JsTsSemanticLowerer::typescript()
-        .lower(&file, &prepared, &budget, &CancellationToken::default())
+        .lower(
+            &file,
+            &prepared,
+            &budget,
+            &CancellationToken::default(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+        )
         .expect("TypeScript semantic lowering must report its bounded outcome");
     let SemanticOutcome::ExceededBudget { exceeded, work, .. } = outcome else {
         panic!("the structural identity pass must not run outside the semantic budget");
@@ -2335,6 +2342,7 @@ fn module_await_has_valid_async_contract_in_both_dialects() {
                     &prepared,
                     &SemanticBudget::default(),
                     &CancellationToken::default(),
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
                 )
                 .unwrap();
             let SemanticOutcome::Complete { value, .. } = outcome else {

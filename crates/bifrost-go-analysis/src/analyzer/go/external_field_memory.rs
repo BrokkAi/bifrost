@@ -606,7 +606,8 @@ pub fn bind_go_aggregate_operand_source(
         return Ok(incomplete(GoExternalFieldGap::SourceStateUnknown));
     }
     let Some((file, source)) =
-        exact_source_for_procedure(workspace, procedure, max_source_bytes.min(1024 * 1024))?
+        exact_source_for_procedure(workspace, procedure, max_source_bytes.min(1024 * 1024))
+            .and_then(|source| source.held_or_refused())?
     else {
         return Ok(incomplete(GoExternalFieldGap::SourceStateUnknown));
     };
@@ -844,10 +845,7 @@ pub fn bind_go_aggregate_operand_source(
             source: &source,
             tree: Some(&tree),
             site: &site,
-            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: remaining,
-                ..Default::default()
-            },
+            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
             cancellation: Some(cancellation),
         },
     ) {
@@ -2815,6 +2813,7 @@ impl<'a> GoExternalFieldQuery<'a> {
         }
         let Some((_file, source)) =
             exact_source_for_procedure(workspace, procedure, max_source_bytes.min(1024 * 1024))
+                .and_then(|source| source.held_or_refused())
                 .map_err(|_| GoExternalFieldGap::SourceStateUnknown)?
         else {
             return Err(GoExternalFieldGap::SourceStateUnknown);
@@ -2888,13 +2887,19 @@ impl<'a> GoExternalFieldQuery<'a> {
 
 #[cfg(test)]
 mod tests {
+    fn complete_symbols(
+        overlay: &SemanticModelOverlay,
+    ) -> Vec<std::sync::Arc<SemanticModelSymbol>> {
+        let (symbols, complete) = overlay.symbols();
+        assert!(complete, "test requires complete symbol enumeration");
+        symbols
+    }
 
     use crate::analyzer::go::external_field_memory::*;
 
     fn selection(overlay: &SemanticModelOverlay) -> ModelProviderSelection {
         ModelProviderSelection::new(
-            overlay
-                .symbols()
+            complete_symbols(overlay)
                 .iter()
                 .map(|symbol| ModelProvider::from(&symbol.provenance)),
         )
@@ -2916,6 +2921,7 @@ mod tests {
         let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
         for id in 0..5 {
             parts.values.push(SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(id),
@@ -2998,6 +3004,7 @@ mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             for id in 0..2 {
                 parts.values.push(SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(id),
@@ -3237,12 +3244,12 @@ mod tests {
         let artifact = std::sync::Arc::new(artifact());
         let procedure = artifact.procedure_handle(ProcedureId::new(0)).unwrap();
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-        let symbol = &overlay.symbols()[0];
+        let symbol = &complete_symbols(&overlay)[0];
         // The state engine receives a resolved field; resolver provenance is
         // tested separately. This test checks ordered state rather than names.
         let field = GoExternalField {
             symbol: std::sync::Arc::clone(symbol),
-            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
+            owner: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3310,8 +3317,8 @@ mod tests {
             },
         ] {
             let field = GoExternalField {
-                symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
-                owner: std::sync::Arc::clone(&overlay.symbols()[0]),
+                symbol: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
+                owner: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
                 artifact_sha256: "bytes",
                 copy,
             };
@@ -3336,8 +3343,8 @@ mod tests {
             assert_eq!(field.value_copy(), copy);
         }
         let field = GoExternalField {
-            symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
-            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
+            symbol: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
+            owner: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Value,
         };
@@ -3366,8 +3373,8 @@ mod tests {
         let procedure = artifact.procedure_handle(ProcedureId::new(0)).unwrap();
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
         let field = GoExternalField {
-            symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
-            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
+            symbol: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
+            owner: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3402,8 +3409,8 @@ mod tests {
         let foreign = foreign.procedure_handle(ProcedureId::new(0)).unwrap();
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
         let field = GoExternalField {
-            symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
-            owner: std::sync::Arc::clone(&overlay.symbols()[0]),
+            symbol: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
+            owner: std::sync::Arc::clone(&complete_symbols(&overlay)[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3456,16 +3463,16 @@ mod tests {
             &ArtifactProducerLimits::default(),
         )
         .unwrap();
-        let mut symbols = go_callback_source_field_test_overlay(artifact.sha256())
-            .symbols()
-            .into_iter()
-            .map(|symbol| (*symbol).clone())
-            .collect::<Vec<_>>();
+        let mut symbols =
+            complete_symbols(&go_callback_source_field_test_overlay(artifact.sha256()))
+                .into_iter()
+                .map(|symbol| (*symbol).clone())
+                .collect::<Vec<_>>();
         symbols.extend((0..256).map(|index| class(&format!("unrelated.Type{index}"), "rust")));
         let overlay = overlay(symbols, Vec::new());
         let budget = 128;
         assert!(
-            overlay.symbols().len() > budget,
+            complete_symbols(&overlay).len() > budget,
             "the old whole-set scan must exceed this budget"
         );
         let field = resolve_go_external_field(

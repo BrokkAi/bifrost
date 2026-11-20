@@ -45,7 +45,7 @@ impl PythonRuntimeCallProof for ExactExternalCallProof {
         assert_eq!(package.name, artifact.purl());
         assert!(package.version.is_none());
         assert_eq!(
-            evidence.artifact_sha256.as_deref(),
+            evidence.single_raw_sha256().as_deref(),
             Some(artifact.archive_sha256()),
             "provider evidence retains the raw installed archive SHA-256"
         );
@@ -387,11 +387,14 @@ fn environment_binding_fact(
                         // This portable digest covers checked launch inputs,
                         // ordered roots and inventory. It contains no mount path
                         // or transient acquisition/environment row IDs.
-                        let selected = python.and_then(|python| python.python_runtime_store_snapshot()).and_then(|(store, _)| {
+                        let selected = python.and_then(|python| {
+                            let (store, _) = python.python_runtime_store_snapshot()?;
+                            let verification = crate::analyzer::python::runtime_provider::request_runtime_verification();
                             let cancellation = CancellationToken::default();
                             let limits = brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default();
                             crate::analyzer::python::runtime_provider::PythonRuntimeProviderContext {
                                 store: &store, publication, workspace_root: analyzer.project().root(), limits: &limits, cancellation: &cancellation,
+                                verification: verification.as_deref(),
                             }.checked_environment(checked.provider.environment_id()).ok()
                         });
                         if let Some(selected) = selected {
@@ -571,9 +574,12 @@ fn resolve_python_runtime_binding_with_environment_in_snapshot(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: candidate.archive_sha256.clone(),
+                production_input_digest: None,
+verified_raw_artifacts: (candidate.archive_sha256.clone()).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::PythonSource, &sha256)).collect(),
             };
         let fallback_cancellation = CancellationToken::default();
+        let verification =
+            crate::analyzer::python::runtime_provider::request_runtime_verification();
         let provider_limits =
             brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default();
         let provider_context =
@@ -583,6 +589,7 @@ fn resolve_python_runtime_binding_with_environment_in_snapshot(
                 workspace_root: analyzer.project().root(),
                 limits: &provider_limits,
                 cancellation: cancellation.unwrap_or(&fallback_cancellation),
+                verification: verification.as_deref(),
             };
         let binding =
             match provider_context.checked_environment(candidate.environment_id) {
@@ -1004,7 +1011,7 @@ pub(crate) fn python_model_symbol_matches_provider(
         && coordinate_matches(matched.toolchain.as_ref(), evidence.toolchain.as_ref())
         && matched.target == evidence.target
         && matched.configuration == evidence.configuration
-        && matched.artifact_sha256 == evidence.artifact_sha256
+        && matched.artifact_sha256 == evidence.single_raw_sha256()
 }
 
 /// The complete static callee chain stops at the first non-attribute node.

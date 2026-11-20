@@ -156,6 +156,10 @@ pub fn assert_reader_rejects_tampering<T>(
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 pub fn assert_source_lookup_plan(
     store: &super::AnalyzerStore,
     explain: impl Fn(&Connection) -> Vec<String>,
@@ -203,12 +207,14 @@ pub fn source_import(value: i64, label: &str) -> Result<SourceImportId> {
 
 #[doc(hidden)]
 pub fn checked_source_id(value: i64, label: &str, kind: &str) -> Result<u32> {
-    u32::try_from(value).map_err(|_| StoreError::new(format!("invalid {label} {kind} id {value}")))
+    u32::try_from(value)
+        .map_err(|_| StoreError::corrupt(format!("invalid {label} {kind} id {value}")))
 }
 
 #[doc(hidden)]
 pub fn nonnegative_usize(value: i64, label: &str) -> Result<usize> {
-    usize::try_from(value).map_err(|_| StoreError::new(format!("invalid {label} value {value}")))
+    usize::try_from(value)
+        .map_err(|_| StoreError::corrupt(format!("invalid {label} value {value}")))
 }
 
 #[doc(hidden)]
@@ -216,7 +222,9 @@ pub fn strict_bool(value: i64, label: &str) -> Result<bool> {
     match value {
         0 => Ok(false),
         1 => Ok(true),
-        _ => Err(StoreError::new(format!("invalid {label} boolean {value}"))),
+        _ => Err(StoreError::corrupt(format!(
+            "invalid {label} boolean {value}"
+        ))),
     }
 }
 
@@ -283,7 +291,7 @@ fn decode_rust_declaration_boundary(boundary: i64) -> Result<RustDeclarationBoun
         2 => RustDeclarationBoundary::Impl,
         3 => RustDeclarationBoundary::Trait,
         _ => {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "invalid Rust declaration boundary {boundary}"
             )));
         }
@@ -308,7 +316,7 @@ pub(crate) fn decode_rust_declaration_kind(kind: i64) -> Result<RustDeclarationK
         13 => RustDeclarationKind::TypeAlias,
         14 => RustDeclarationKind::AssociatedType,
         _ => {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "invalid Rust declaration kind {kind}"
             )));
         }
@@ -363,6 +371,10 @@ impl super::AnalyzerStore {
     /// Candidate declarations are joined by their source IDs, not these spans.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn rust_primary_contexts_at(
         &self,
         key: &super::BlobKey,
@@ -411,11 +423,55 @@ impl super::AnalyzerStore {
         Ok(Some(contexts))
     }
 
+    /// Source-only macro contract inputs. None means the publication, boundary,
+    /// or argument format is unavailable; an empty vector is a complete inventory.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    pub fn rust_macro_argument_attributes(
+        &self,
+        key: &super::BlobKey,
+        generation: super::GenerationId,
+        boundary_ordinal: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<brokk_bifrost_core::analyzer::rust_facts::RustMacroAttributeSourceFact>>>
+    {
+        check_cancelled(cancellation)?;
+        assert_eq!(key.lang, "rust");
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        super::require_current_generation(&tx, "rust", generation)?;
+        let boundary = usize_to_i64(boundary_ordinal)?;
+        let blob_id: Option<i64> = tx
+            .query_row(
+                "SELECT b.blob_id FROM rust_published_fact_blobs b
+             JOIN source_rust_impl_census_files f ON f.blob_id=b.blob_id AND f.arguments_version=1
+             JOIN source_rust_impl_census_boundaries c ON c.blob_id=b.blob_id AND c.ordinal=?4
+             WHERE b.blob_oid=?1 AND b.generation=?2 AND b.parse_variant=?3",
+                params![key.oid.to_string(), generation.get(), key.variant, boundary],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(blob_id) = blob_id else {
+            return Ok(None);
+        };
+        let attributes = rust_items::read_rust_macro_argument_attributes(
+            &tx,
+            blob_id,
+            boundary..=boundary,
+            &|| !cancellation.is_cancelled(),
+        )?;
+        check_cancelled(cancellation)?;
+        Ok(attributes)
+    }
+
     /// Translate a primary query AST location into canonical source identities.
     /// Spans only select the query location; declaration relationships are read
     /// through the returned IDs, never reconstructed from display ranges.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn rust_primary_occurrences_at(
         &self,
         key: &super::BlobKey,
@@ -483,9 +539,7 @@ impl super::AnalyzerStore {
         if !keep_going() {
             return Ok(None);
         }
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        super::require_current_generation(&tx, "rust", generation)?;
+        self.read_blob_source_transaction(key, generation, |tx| {
         let oid_text = oid.to_string();
         let publication = tx
             .query_row(
@@ -527,10 +581,10 @@ impl super::AnalyzerStore {
             let visibility_text: String = row.get(1)?;
             let cfg_text: String = row.get(2)?;
             let visibility = super::decode_rust_visibility(&visibility_text).ok_or_else(|| {
-                StoreError::new(format!("invalid Rust declaration visibility {visibility_text:?} for {oid}/{declaration:?}"))
+                StoreError::corrupt(format!("invalid Rust declaration visibility {visibility_text:?} for {oid}/{declaration:?}"))
             })?;
             let cfg_condition = super::decode_rust_cfg_condition(&cfg_text).ok_or_else(|| {
-                StoreError::new(format!(
+                StoreError::corrupt(format!(
                     "invalid Rust declaration cfg {cfg_text:?} for {oid}/{declaration:?}"
                 ))
             })?;
@@ -544,12 +598,12 @@ impl super::AnalyzerStore {
                 .get::<_, Option<String>>(9)?
                 .map(|encoded| {
                     let names = serde_json::from_str::<Vec<String>>(&encoded).map_err(|error| {
-                        StoreError::new(format!(
+                        StoreError::corrupt(format!(
                             "invalid Rust derive-helper attribute names {encoded:?} for {oid}/{declaration:?}: {error}"
                         ))
                     })?;
                     if names.is_empty() || names.windows(2).any(|pair| pair[0] >= pair[1]) {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust derive-helper attribute names are not nonempty, sorted and distinct for {oid}/{declaration:?}: {names:?}"
                         )));
                     }
@@ -560,12 +614,12 @@ impl super::AnalyzerStore {
                 .get::<_, Option<String>>(11)?
                 .map(|encoded| {
                     let names = serde_json::from_str::<Vec<String>>(&encoded).map_err(|error| {
-                        StoreError::new(format!(
+                        StoreError::corrupt(format!(
                             "invalid Rust built-in derive names {encoded:?} for {oid}/{declaration:?}: {error}"
                         ))
                     })?;
                     if names.is_empty() || names.windows(2).any(|pair| pair[0] >= pair[1]) {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust built-in derive names are not nonempty, sorted and distinct for {oid}/{declaration:?}: {names:?}"
                         )));
                     }
@@ -593,7 +647,7 @@ impl super::AnalyzerStore {
         drop(rows);
         drop(statement);
         if properties.len() != expected_properties {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "incomplete Rust declaration properties for {oid}: {properties:?}; expected {expected_properties}"
             )));
         }
@@ -611,30 +665,30 @@ impl super::AnalyzerStore {
                 .get_mut(&declaration)
                 .and_then(|property| property.value_constructor.as_mut())
                 .ok_or_else(|| {
-                    StoreError::new(format!(
+                    StoreError::corrupt(format!(
                         "Rust constructor field has no constructor for {oid}/{declaration:?}"
                     ))
                 })?;
             if ordinal != constructor.field_visibilities.len() {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "non-dense Rust constructor field {ordinal} for {oid}/{declaration:?}: {constructor:?}"
                 )));
             }
             constructor.field_visibilities.push(super::decode_rust_visibility(&visibility_text)
-                .ok_or_else(|| StoreError::new(format!("invalid Rust constructor field visibility {visibility_text:?} for {oid}/{declaration:?}")))?);
+                .ok_or_else(|| StoreError::corrupt(format!("invalid Rust constructor field visibility {visibility_text:?} for {oid}/{declaration:?}")))?);
             field_count += 1;
         }
         drop(rows);
         drop(statement);
         if field_count != expected_fields {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "incomplete Rust constructor fields for {oid}: {properties:?}; expected {expected_fields}"
             )));
         }
         if !keep_going() {
             return Ok(None);
         }
-        let Some(units) = super::read_unit_rows_while(&tx, key, adapter, file, keep_going)? else {
+        let Some(units) = super::read_unit_rows_while(tx, key, adapter, file, keep_going)? else {
             return Ok(None);
         };
         let units: HashMap<_, _> = units.into_iter().map(|row| (row.key, row.unit)).collect();
@@ -648,12 +702,12 @@ impl super::AnalyzerStore {
             let declaration = SourceDeclarationId::new(row.get(0)?);
             let key: i64 = row.get(1)?;
             let property = properties.get(&declaration).ok_or_else(|| {
-                StoreError::new(format!(
+                StoreError::corrupt(format!(
                     "Rust declaration bridge has no source properties for {oid}/{declaration:?}"
                 ))
             })?;
             let unit = units.get(&key).ok_or_else(|| {
-                StoreError::new(format!(
+                StoreError::corrupt(format!(
                     "Rust declaration bridge has no unit {key} for {oid}/{declaration:?}"
                 ))
             })?;
@@ -662,21 +716,25 @@ impl super::AnalyzerStore {
         drop(rows);
         drop(statement);
         if out.len() != expected_links {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "incomplete Rust declaration bridges for {oid}: {out:?}; expected {expected_links}"
             )));
         }
         if !keep_going() {
             return Ok(None);
         }
-        tx.commit()?;
         Ok(Some(out))
+        })
     }
 
     /// Hydrate only the demanded import ordinals under one generation-checked
     /// snapshot. No complete source arena or unrelated import rows are loaded.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn load_rust_import_source_locations(
         &self,
         key: &super::BlobKey,
@@ -764,7 +822,7 @@ fn provenance_from_code(code: i64) -> Result<SourceOccurrenceProvenance> {
         0 => Ok(SourceOccurrenceProvenance::PrimaryNode),
         1 => Ok(SourceOccurrenceProvenance::ExplicitSubspan),
         2 => Ok(SourceOccurrenceProvenance::Embedded),
-        other => Err(StoreError::new(format!(
+        other => Err(StoreError::corrupt(format!(
             "invalid source occurrence provenance code {other}"
         ))),
     }
@@ -1565,6 +1623,7 @@ WHERE spelling IN (SELECT value FROM json_each(?2)) GROUP BY spelling
 impl super::AnalyzerStore {
     /// Match normalized terminal names against source-owned references in one batch.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn reference_names_in_files(
         &self,
         files: &[(super::WorkspaceSnapshotId, String)],
@@ -1638,6 +1697,10 @@ mod roundtrip_properties {
     use brokk_bifrost_core::compact_graph::CompactRows;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn source_families_roundtrip_distinct_ranges_flags_and_import_counts() {
         let occurrence =
             |start_byte, end_byte, start_line, end_line, provenance| SourceOccurrence {

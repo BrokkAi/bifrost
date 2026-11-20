@@ -959,11 +959,11 @@ fn kotlin_source_alias_parent_closes_in_selected_native_hierarchy() {
         receipts.captured,
         receipts.replayed
     );
-    let budget = brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-        max_scope_nodes: 1,
-        ..Default::default()
-    };
-    let limited = ResolutionSession::bounded(budget, Some(&cancellation));
+    let limited = ResolutionSession::bounded_with_total_work(
+        brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+        1,
+        Some(&cancellation),
+    );
     operation.with_jvm_hierarchy_query(JvmForwardOperationContext {
         storage_language: "kotlin", blueprint: &blueprint, caller_path: "app/Child.kt",
         import_gaps: &gaps, lexical: &lexical, typed: &typed,
@@ -1403,11 +1403,11 @@ fn jvm_descendant_r4_profile() {
                 )?;
                 drop(profile);
                 brokk_bifrost_core::cache_db::sql_profile::flush();
-                for max_scope_nodes in [1, 3] {
+                for max_total_work in [1, 3] {
                     // One step cuts membership; three steps reach hydration
                     // and cut there. Neither cut promises a surviving subset.
-                    let budget = brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget { max_scope_nodes, ..Default::default() };
-                    let limited = ResolutionSession::bounded(budget, Some(&cancellation));
+                    let budget = brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default();
+                    let limited = ResolutionSession::bounded_with_total_work(budget, max_total_work, Some(&cancellation));
                     let cut = operation.jvm_descendant_walk(query, target, "Base", Language::Java, &cancellation, &limited)?;
                     assert!(cut.answer.open_reasons.iter().any(|reason| matches!(reason, brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::MemberFamily(brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated))), "{:?}", cut.answer);
                 }
@@ -1426,12 +1426,14 @@ struct ScalaAliasWalkObservation {
     completion: brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion,
     replayed: usize,
     scope_nodes: usize,
+    /// All charged work; the stop used by the cut tests (`max_total_work`).
+    total: usize,
 }
 
 fn selected_scala_alias_walk(
     aliases: &str,
     other_files: &[(&str, &str)],
-    max_scope_nodes: Option<usize>,
+    max_total_work: Option<usize>,
 ) -> ScalaAliasWalkObservation {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::resolution::{
@@ -1531,12 +1533,10 @@ fn selected_scala_alias_walk(
     else {
         panic!("locate Scala child")
     };
-    let session = max_scope_nodes.map_or_else(ResolutionSession::unbounded, |max_scope_nodes| {
-        ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes,
-                ..Default::default()
-            },
+    let session = max_total_work.map_or_else(ResolutionSession::unbounded, |max_total_work| {
+        ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            max_total_work,
             Some(&cancellation),
         )
     });
@@ -1581,6 +1581,7 @@ fn selected_scala_alias_walk(
         completion,
         replayed: receipts.replayed,
         scope_nodes: work.scope_nodes,
+        total: work.charged_total(),
     }
 }
 
@@ -1652,7 +1653,7 @@ fn scala_selected_alias_fanout_charges_and_stays_open() {
         full.scope_nodes,
         single.scope_nodes
     );
-    let cut = selected_scala_alias_walk(aliases, &files, Some(full.scope_nodes - 1));
+    let cut = selected_scala_alias_walk(aliases, &files, Some(full.total - 1));
     assert_ne!(
         cut.completion,
         brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete
@@ -1663,7 +1664,7 @@ fn scala_selected_alias_fanout_charges_and_stays_open() {
         "{:?}",
         cut.completion
     );
-    assert_eq!(cut.scope_nodes, full.scope_nodes - 1);
+    assert_eq!(cut.total, full.total - 1);
 }
 
 #[test]
@@ -1683,7 +1684,7 @@ fn scala_selected_alias_budget_cut_is_deterministic() {
         "{:?}",
         full.completion
     );
-    let budget = full.scope_nodes - 1;
+    let budget = full.total - 1;
     let first = selected_scala_alias_walk(aliases, &files, Some(budget));
     let second = selected_scala_alias_walk(aliases, &files, Some(budget));
     assert_ne!(

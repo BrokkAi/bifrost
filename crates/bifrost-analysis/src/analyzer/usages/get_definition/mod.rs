@@ -229,7 +229,6 @@ pub(crate) use call_sites::call_reference_ranges_in_tree;
 pub(crate) use call_sites::call_reference_requires_point_lookup;
 pub(crate) use call_sites::call_site_syntax_for_reference;
 pub(crate) use call_sites::exact_call_reference_for_call;
-pub(crate) use call_sites::is_call_reference_range_in_tree;
 pub(crate) use call_sites::range_is_call_keyword_label;
 
 pub(crate) use resolution_session::BoundedResolution;
@@ -526,6 +525,326 @@ pub enum DefinitionLookupReason {
     UnprovedClosedWorld,
     LexicalBindingUnproven,
     Execution(crate::analyzer::read_ledger::DerivationExecutionCause),
+    /// Associate a producer's read stop with one native gap. The identity
+    /// associates evidence; determinism belongs to the typed cause, not the
+    /// association. Snapshot provenance alone is not a certificate (#11510).
+    QueryRead {
+        semantic: crate::analyzer::resolution::SemanticId,
+        cause: crate::analyzer::i_analyzer::QueryReadIncomplete,
+    },
+}
+
+impl DefinitionLookupOutcome {
+    /// Conservative structural heap bytes, for retention accounting: every
+    /// owned string, element slot and code unit, and each model symbol as the
+    /// model overlay's own cache charges it. Typed reasons and completions
+    /// count one slot each, as `ResolutionAnswer::structural_bytes` counts
+    /// shared reasons.
+    #[doc(hidden)]
+    pub fn retained_heap_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        use brokk_bifrost_core::hash::allocated_vec_slot_bytes;
+        use brokk_bifrost_core::retention_budget::RetainedBytes;
+        let completion =
+            |completion: &crate::analyzer::resolution::ResolutionCompletion| match completion {
+                crate::analyzer::resolution::ResolutionCompletion::Complete => 0,
+                crate::analyzer::resolution::ResolutionCompletion::Incomplete(reasons) => {
+                    allocation_size(
+                        reasons.len()
+                            * std::mem::size_of::<
+                                crate::analyzer::resolution::ResolutionIncompleteReason,
+                            >(),
+                    )
+                }
+            };
+        let Self {
+            selected_sites,
+            inventory_evidence,
+            incomplete_evidence,
+            modeled_definitions,
+            status: _,
+            reference,
+            definitions,
+            lexical_definition,
+            diagnostics,
+        } = self;
+        let evidence = incomplete_evidence.as_ref().map_or(0, |evidence| {
+            let DefinitionLookupEvidence {
+                completion: reasons,
+                reasons: lookup_reasons,
+                snapshot_stops,
+            } = evidence;
+            completion(reasons)
+                + allocated_vec_slot_bytes(lookup_reasons)
+                + lookup_reasons
+                    .iter()
+                    .map(|reason| match reason {
+                        DefinitionLookupReason::UnprojectedDefinition { target_files } => {
+                            allocated_vec_slot_bytes(target_files)
+                                + target_files
+                                    .iter()
+                                    .map(|(path, _)| allocation_size(path.capacity()))
+                                    .sum::<usize>()
+                        }
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+                + allocated_vec_slot_bytes(snapshot_stops)
+        });
+        let lexical = lexical_definition.as_ref().map_or(0, |definition| {
+            let LexicalDefinition {
+                source_file,
+                identifier,
+                kind: _,
+                name_range: _,
+                declaration_range: _,
+            } = definition;
+            allocation_size(identifier.capacity())
+                + source_file
+                    .as_ref()
+                    .map_or(0, RetainedBytes::retained_bytes)
+        });
+        allocated_vec_slot_bytes(selected_sites)
+            + selected_sites
+                .iter()
+                .map(|target| target.code_unit.retained_bytes())
+                .sum::<usize>()
+            + inventory_evidence.as_ref().map_or(0, |inventory| match inventory {
+                crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Incomplete(
+                    reasons,
+                ) => completion(reasons),
+                _ => 0,
+            })
+            + evidence
+            + allocated_vec_slot_bytes(modeled_definitions)
+            + modeled_definitions
+                .iter()
+                .map(|symbol| {
+                    crate::analyzer::semantic_model::overlay::symbol_retained_bytes(symbol)
+                })
+                .sum::<usize>()
+            + reference.as_ref().map_or(0, |site| {
+                allocation_size(site.path.capacity()) + allocation_size(site.text.capacity())
+            })
+            + allocated_vec_slot_bytes(definitions)
+            + definitions.iter().map(RetainedBytes::retained_bytes).sum::<usize>()
+            + lexical
+            + allocated_vec_slot_bytes(diagnostics)
+            + diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let DefinitionLookupDiagnostic {
+                        kind,
+                        message,
+                        claim,
+                    } = diagnostic;
+                    allocation_size(kind.capacity())
+                        + allocation_size(message.capacity())
+                        + claim.as_ref().map_or(0, |claim| {
+                            allocated_vec_slot_bytes(&claim.subjects)
+                                + claim
+                                    .subjects
+                                    .iter()
+                                    .map(|subject| allocation_size(subject.capacity()))
+                                    .sum::<usize>()
+                        })
+                })
+                .sum::<usize>()
+    }
+}
+
+impl CallEvidence {
+    /// Conservative structural heap bytes, for retention accounting. A
+    /// native resolution completion counts its inline storage only.
+    #[doc(hidden)]
+    pub fn retained_heap_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        let Self {
+            source_member_evidence,
+            fixed_array_source,
+            native_resolution,
+            model_member_selection,
+            authority: _,
+            call_application: _,
+            dispatch_extensibility: _,
+            exact_external_call,
+            external_callee_identity,
+        } = self;
+        source_member_evidence.as_ref().map_or(0, |evidence| {
+            allocation_size(std::mem::size_of_val(evidence.as_ref()))
+                + evidence
+                    .iter()
+                    .map(|member| member.definition.retained_bytes())
+                    .sum::<usize>()
+        }) + fixed_array_source
+            .as_ref()
+            .map_or(0, |(unit, _)| unit.retained_bytes())
+            + native_resolution.as_ref().map_or(0, |native| {
+                allocation_size(std::mem::size_of_val(native.as_ref()))
+            })
+            + model_member_selection.as_ref().map_or(0, |selection| {
+                allocation_size(std::mem::size_of_val(selection.as_ref()))
+            })
+            + exact_external_call
+                .as_ref()
+                .map_or(0, ExactExternalCallProof::retained_heap_bytes)
+            + external_callee_identity.as_ref().map_or(
+                0,
+                crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::retained_heap_bytes,
+            )
+    }
+}
+
+impl DefinitionLookupEvidence {
+    /// Classify each gap at the typed resolver boundary. Consumers transport
+    /// these stops without interpreting a diagnostic code or message.
+    pub fn incomplete_reads(
+        &self,
+    ) -> impl Iterator<Item = crate::analyzer::i_analyzer::QueryReadIncomplete> + '_ {
+        use crate::analyzer::i_analyzer::{DETERMINISTIC_PROOF_STOP_LABELS, QueryReadIncomplete};
+        use crate::analyzer::read_ledger::DerivationExecutionCause as Cause;
+        use crate::analyzer::resolution::{
+            ResolutionCompletion, ResolutionIncompleteReason as Native,
+        };
+        let native = match &self.completion {
+            ResolutionCompletion::Complete => None,
+            ResolutionCompletion::Incomplete(reasons) => Some(reasons),
+        };
+        native
+            .into_iter()
+            .flat_map(|reasons| reasons.iter())
+            .map(|reason| {
+                let (label, cause) = match reason {
+                    Native::Cancelled => ("cancelled", Cause::Cancelled),
+                    Native::ReceiverBudgetExhausted(_) => {
+                        ("resolution_receiver_budget_exhausted", Cause::Budget)
+                    }
+                    Native::TimeBudgetExceeded(_) => {
+                        ("resolution_time_budget_exceeded", Cause::Budget)
+                    }
+                    Native::UnsupportedSemantic(semantic)
+                    | Native::ReceiverSubclassObligation(semantic) => {
+                        // One certificate covers exactly its own gap. A mixed
+                        // completion retains every other uncertified stop.
+                        if let Some(certificate) =
+                            self.reasons.iter().find_map(|reason| match reason {
+                                DefinitionLookupReason::QueryRead {
+                                    semantic: candidate,
+                                    cause,
+                                } if candidate == semantic
+                                    && matches!(cause.base_cause(),
+                                    QueryReadIncomplete::ProofStopped { reason, cause: None }
+                                    if DETERMINISTIC_PROOF_STOP_LABELS.contains(reason)) =>
+                                {
+                                    Some(cause)
+                                }
+                                _ => None,
+                            })
+                        {
+                            return certificate.clone();
+                        }
+                        let label = if matches!(reason, Native::UnsupportedSemantic(_)) {
+                            "resolution_unsupported_semantic"
+                        } else {
+                            "resolution_receiver_subclass_obligation"
+                        };
+                        (label, Cause::Provider)
+                    }
+                    Native::CyclicPrefixDependency(_) => {
+                        ("resolution_cyclic_prefix_dependency", Cause::Provider)
+                    }
+                    Native::OpenBoundary { .. } => ("resolution_open_boundary", Cause::Provider),
+                    Native::CyclicExpansion(_) => ("resolution_cyclic_expansion", Cause::Provider),
+                    Native::InconsistentPrecedence(_) => {
+                        ("resolution_inconsistent_precedence", Cause::Provider)
+                    }
+                    Native::OverlayFrontierUnknown(_) => {
+                        ("resolution_overlay_frontier_unknown", Cause::Provider)
+                    }
+                    Native::Unclassified(_) => ("resolution_unclassified", Cause::Provider),
+                    Native::UnmountedFile { .. } => ("resolution_unmounted_file", Cause::Provider),
+                };
+                QueryReadIncomplete::ProofStopped {
+                    reason: label,
+                    cause: Some(cause),
+                }
+            })
+            .chain(self.reasons.iter().map(|reason| {
+                let (label, cause) = match reason {
+                    DefinitionLookupReason::QueryRead { cause, .. } => {
+                        if cause.execution_cause().is_some()
+                            || matches!(cause.base_cause(),
+                        QueryReadIncomplete::ProofStopped { reason, cause: None }
+                        if DETERMINISTIC_PROOF_STOP_LABELS.contains(reason))
+                        {
+                            return cause.clone();
+                        }
+                        ("incomplete", Some(Cause::Provider))
+                    }
+                    DefinitionLookupReason::Execution(cause) => ("incomplete", Some(*cause)),
+                    DefinitionLookupReason::UnprojectedDefinition { .. } => {
+                        ("resolution_unprojected_definition", None)
+                    }
+                    DefinitionLookupReason::UnplacedDefinition => {
+                        ("incomplete", Some(Cause::Provider))
+                    }
+                    DefinitionLookupReason::MacroExpansionContextRequired => (
+                        "resolution_macro_expansion_context_required",
+                        Some(Cause::Provider),
+                    ),
+                    DefinitionLookupReason::UnknownActivation => {
+                        ("resolution_unknown_activation", Some(Cause::Provider))
+                    }
+                    DefinitionLookupReason::MacroFragmentNoNamespace => (
+                        "resolution_macro_fragment_no_namespace",
+                        Some(Cause::Provider),
+                    ),
+                    DefinitionLookupReason::MacroModuleHeadUnbound => (
+                        "resolution_macro_module_head_unbound",
+                        Some(Cause::Provider),
+                    ),
+                    DefinitionLookupReason::UnprojectedTypeFrontier => (
+                        "resolution_unprojected_type_frontier",
+                        Some(Cause::Provider),
+                    ),
+                    DefinitionLookupReason::UnprovedClosedWorld => {
+                        ("resolution_unproved_closed_world", Some(Cause::Provider))
+                    }
+                    DefinitionLookupReason::LexicalBindingUnproven => {
+                        ("resolution_lexical_binding_unproven", Some(Cause::Provider))
+                    }
+                };
+                QueryReadIncomplete::ProofStopped {
+                    reason: label,
+                    cause,
+                }
+            }))
+    }
+
+    /// Any operational gap prevents content reuse. Missing evidence fails
+    /// closed; certified gaps never hide an uncertified sibling.
+    pub fn execution_cause(
+        &self,
+    ) -> Option<crate::analyzer::read_ledger::DerivationExecutionCause> {
+        let mut observed = false;
+        let mut cause = None;
+        for stop in self.incomplete_reads() {
+            observed = true;
+            if let Some(next) = stop.execution_cause() {
+                cause = Some(cause.map_or(
+                    next,
+                    |current: crate::analyzer::read_ledger::DerivationExecutionCause| {
+                        current.min(next)
+                    },
+                ));
+            }
+        }
+        if observed {
+            cause
+        } else {
+            Some(crate::analyzer::read_ledger::DerivationExecutionCause::Provider)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -847,7 +1166,99 @@ pub struct ExactExternalCallProof {
 }
 
 impl ExactExternalCallProof {
-    #[cfg(any(test, feature = "test-support"))]
+    /// Conservative structural heap bytes, for retention accounting: owned
+    /// text, element slots and receiver adjustments. Type bindings and member
+    /// identities count their inline storage only.
+    #[doc(hidden)]
+    pub fn retained_heap_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        use brokk_bifrost_core::hash::allocated_vec_slot_bytes;
+        let Self {
+            implicit_receiver: _,
+            unadmitted_receiver_deref: _,
+            fixed_array_invocation: _,
+            receiver_adjustments,
+            canonical_callee,
+            call_application: _,
+            dispatch_extensibility: _,
+            declaration_is_abstract: _,
+            parameter_count: _,
+            source_jdk_artifact,
+            python_runtime_artifact,
+            python_formal_slots,
+            python_model_manifest_sha256,
+            external_member_identity: _,
+            type_argument_bindings: _,
+            receiver_result_discharges,
+        } = self;
+        let activation =
+            |evidence: &crate::analyzer::semantic_model::SemanticModelActivationEvidence| {
+                let crate::analyzer::semantic_model::SemanticModelActivationEvidence {
+                    language,
+                    ecosystem,
+                    package,
+                    module,
+                    toolchain,
+                    target,
+                    configuration,
+                    verified_raw_artifacts,
+                    production_input_digest,
+                } = evidence;
+                [
+                    Some(language),
+                    Some(ecosystem),
+                    target.as_ref(),
+                    configuration.as_ref(),
+                    production_input_digest.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .chain(
+                    [package, module, toolchain]
+                        .into_iter()
+                        .flatten()
+                        .map(|coordinate| &coordinate.name),
+                )
+                .chain(
+                    verified_raw_artifacts
+                        .iter()
+                        .filter_map(|artifact| artifact.module.as_ref()),
+                )
+                .map(|text| allocation_size(text.capacity()))
+                .sum::<usize>()
+                    + allocated_vec_slot_bytes(verified_raw_artifacts)
+            };
+        allocation_size(std::mem::size_of_val(receiver_adjustments.as_ref()))
+            + receiver_adjustments
+                .iter()
+                .map(crate::analyzer::semantic_model::ReceiverAdjustment::retained_heap_bytes)
+                .sum::<usize>()
+            + allocation_size(canonical_callee.len())
+            + source_jdk_artifact.as_ref().map_or(0, activation)
+            + python_runtime_artifact.as_ref().map_or(0, activation)
+            + python_formal_slots.as_ref().map_or(0, |slots| {
+                allocation_size(std::mem::size_of_val(slots.as_ref()))
+                    + slots
+                        .iter()
+                        .map(|slot| {
+                            allocated_vec_slot_bytes(&slot.names)
+                                + slot
+                                    .names
+                                    .iter()
+                                    .map(|name| allocation_size(name.capacity()))
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            + python_model_manifest_sha256
+                .as_ref()
+                .map_or(0, |digest| allocation_size(digest.len()))
+            + allocated_vec_slot_bytes(receiver_result_discharges)
+    }
+
+    /// Attach the provider-inventory identity of the one declaration this
+    /// proof selected, so model consumers bind that record and not every
+    /// same-keyed member (#13916).
     #[doc(hidden)]
     pub fn with_external_member_identity(
         mut self,
@@ -1327,7 +1738,7 @@ impl ExactExternalCallProof {
             artifact.as_ref().is_none_or(|evidence| {
                 evidence.language == "java"
                     && evidence.ecosystem == "jdk"
-                    && evidence.artifact_sha256.is_some()
+                    && !evidence.verified_raw_artifacts.is_empty()
             }),
             "only an exact prepared Java JDK can be selected as a source toolchain"
         );
@@ -2168,7 +2579,11 @@ pub fn definition_resolution_from_bounded(
         .into(),
         BoundedResolution::Unavailable { reason, .. } => diagnostic_outcome(
             DefinitionLookupStatus::Unavailable,
-            "resolution_input_unavailable",
+            if reason == "native_store_error" {
+                "native_store_error"
+            } else {
+                "resolution_input_unavailable"
+            },
             format!("{language:?} definition resolution input unavailable: {reason}"),
         )
         .into(),
@@ -2305,7 +2720,7 @@ pub trait DefinitionBatchResolver<'a> {
 /// caller that answers a *call* question keeps it, so that no route has to
 /// know which languages publish evidence.
 #[doc(hidden)]
-pub fn resolve_definition_requests<'a>(
+pub(crate) fn resolve_definition_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a, '_>,
@@ -3183,7 +3598,7 @@ pub(crate) struct ScalarCallTargetSession<'a> {
 }
 
 struct ScalarDefinitionMemo {
-    reads: Option<super::common::QueryMemoReads>,
+    reads: Option<super::common::RequestReadState>,
     language_state: HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
     sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
@@ -3858,44 +4273,6 @@ fn resolve_precomputed_call_target_requests<'a>(
         .collect()
 }
 
-pub fn resolve_call_reference_definition_with_source(
-    analyzer: &dyn IAnalyzer,
-    request: DefinitionLookupRequest,
-    file: ProjectFile,
-    source: Arc<str>,
-) -> Option<DefinitionLookupOutcome> {
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
-    let language = language_for_file(&request.file);
-    if matches!(language, Language::None | Language::Ruby) {
-        return None;
-    }
-    let start_byte = request.start_byte?;
-    let end_byte = request.end_byte?;
-    if start_byte >= end_byte {
-        return None;
-    }
-
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-    context.sources.insert(file, Ok(source));
-    let source = context.source(&request.file).ok()?;
-    let tree = context.tree(&request.file, language, &source)?;
-    if !is_call_reference_range_in_tree(&tree, language, start_byte, end_byte) {
-        return None;
-    }
-
-    record_definition_batch_probe_reads(analyzer, &mut context, std::slice::from_ref(&request));
-    Some(resolve_one(
-        analyzer,
-        token,
-        &mut context,
-        request,
-        None,
-        None,
-    ))
-}
-
 #[doc(hidden)]
 pub struct DefinitionBatchContext<'a: 'token, 'token> {
     #[cfg(any(test, feature = "test-support"))]
@@ -4096,27 +4473,6 @@ pub fn focused_reference_site(
     })
 }
 
-fn resolve_one<'a>(
-    analyzer: &'a dyn IAnalyzer,
-    token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'a, '_>,
-    request: DefinitionLookupRequest,
-    operation: Option<NavigationOperation>,
-    cancellation: Option<&CancellationToken>,
-) -> DefinitionLookupOutcome {
-    resolve_one_with_evidence(
-        analyzer,
-        token,
-        context,
-        request,
-        operation,
-        cancellation,
-        None,
-        None,
-    )
-    .outcome
-}
-
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn resolve_one_with_evidence<'a>(
@@ -4129,121 +4485,169 @@ pub fn resolve_one_with_evidence<'a>(
     go_session: Option<&ResolutionSession>,
     definition_batch: Option<&mut dyn DefinitionBatchResolver<'a>>,
 ) -> DefinitionResolution {
-    let _scope = profiling::scope("get_definition::resolve_one");
-    context.navigation_operation = operation;
-    let language = language_for_file(&request.file);
-    context.bounded_support.set_language(language);
-    if profiling::enabled() {
-        profiling::note(format!("language={language:?}"));
-    }
-    if matches!(language, Language::None) {
-        return diagnostic_outcome(
-            DefinitionLookupStatus::UnsupportedLanguage,
-            "unsupported_language",
-            format!("{language:?} get_definition is not implemented yet"),
-        )
-        .into();
-    }
+    // A nested function cannot be called by another entry point, so raw
+    // outcomes cannot bypass the request's operational completion fold.
+    fn resolve_one_inner<'a>(
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
+        context: &mut DefinitionBatchContext<'a, '_>,
+        request: DefinitionLookupRequest,
+        operation: Option<NavigationOperation>,
+        cancellation: Option<&CancellationToken>,
+        go_session: Option<&ResolutionSession>,
+        definition_batch: Option<&mut dyn DefinitionBatchResolver<'a>>,
+    ) -> DefinitionResolution {
+        let _scope = profiling::scope("get_definition::resolve_one");
+        brokk_bifrost_core::profile_count!("resolve_one.calls", 1);
+        context.navigation_operation = operation;
+        let language = language_for_file(&request.file);
+        context.bounded_support.set_language(language);
+        if profiling::enabled() {
+            profiling::note(format!("language={language:?}"));
+        }
+        if matches!(language, Language::None) {
+            return diagnostic_outcome(
+                DefinitionLookupStatus::UnsupportedLanguage,
+                "unsupported_language",
+                format!("{language:?} get_definition is not implemented yet"),
+            )
+            .into();
+        }
 
-    let source = {
-        let _scope = profiling::scope("get_definition::source");
-        match context.source(&request.file) {
-            Ok(source) => source,
+        let source = {
+            let _scope = profiling::scope("get_definition::source");
+            match context.source(&request.file) {
+                Ok(source) => source,
+                Err(message) => {
+                    return diagnostic_outcome(
+                        DefinitionLookupStatus::NotFound,
+                        "file_read_failed",
+                        message,
+                    )
+                    .into();
+                }
+            }
+        };
+
+        let tree = {
+            let _scope = profiling::scope("get_definition::parse_tree");
+            context.tree(&request.file, language, &source)
+        };
+
+        let site = match focused_reference_site(context, &request, language, &source, tree.as_ref())
+        {
+            Ok(site) => site,
             Err(message) => {
                 return diagnostic_outcome(
-                    DefinitionLookupStatus::NotFound,
-                    "file_read_failed",
+                    DefinitionLookupStatus::InvalidLocation,
+                    "invalid_location",
                     message,
                 )
                 .into();
             }
-        }
-    };
-
-    let tree = {
-        let _scope = profiling::scope("get_definition::parse_tree");
-        context.tree(&request.file, language, &source)
-    };
-
-    let site = match focused_reference_site(context, &request, language, &source, tree.as_ref()) {
-        Ok(site) => site,
-        Err(message) => {
-            return diagnostic_outcome(
-                DefinitionLookupStatus::InvalidLocation,
-                "invalid_location",
-                message,
-            )
-            .into();
-        }
-    };
-    let site = match language_support_for_hook(language, "definition_lexical_site")
-        .expect("supported definition language")
-        .definition_lexical_site(analyzer, context, &request, &source, tree.as_ref(), site)
-    {
-        std::ops::ControlFlow::Break(resolution) => return resolution,
-        std::ops::ControlFlow::Continue(site) => site,
-    };
-    // Languages whose native operation owns local declarations bypass shared
-    // lexical discovery so both paths keep the same authority and completion.
-    if language_support_for_hook(language, "definition_lexical_authority")
-        .expect("supported definition language")
-        .lexical_definitions_are_authoritative()
-        && let Some(tree) = tree.as_ref()
-        && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
-    {
-        let lexical_binding = match resolve_lexical_binding_with_visibility(
-            language,
-            tree.root_node(),
-            &source,
-            site.focus_start_byte,
-            site.focus_end_byte,
-            identifier,
-        ) {
-            Ok(binding) => binding,
-            // A field/type name is refused lexical lookup by syntax. Its
-            // namespace-specific lookup remains authoritative (#11830).
-            Err(crate::analyzer::lexical_definitions::LexicalBindingUnproven::NonLexicalFocus) => {
-                None
-            }
-            Err(_) => {
-                return finish_lookup_outcome(
-                    diagnostic_outcome(
-                        DefinitionLookupStatus::Incomplete,
-                        "lexical_binding_unproven",
-                        "the lexical binding is unavailable from the source syntax",
+        };
+        let site = match language_support_for_hook(language, "definition_lexical_site")
+            .expect("supported definition language")
+            .definition_lexical_site(analyzer, context, &request, &source, tree.as_ref(), site)
+        {
+            std::ops::ControlFlow::Break(resolution) => return resolution,
+            std::ops::ControlFlow::Continue(site) => site,
+        };
+        // Languages whose native operation owns local declarations bypass shared
+        // lexical discovery so both paths keep the same authority and completion.
+        if language_support_for_hook(language, "definition_lexical_authority")
+            .expect("supported definition language")
+            .lexical_definitions_are_authoritative()
+            && let Some(tree) = tree.as_ref()
+            && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
+        {
+            let lexical_binding = match resolve_lexical_binding_with_visibility(
+                language,
+                tree.root_node(),
+                &source,
+                site.focus_start_byte,
+                site.focus_end_byte,
+                identifier,
+            ) {
+                Ok(binding) => binding,
+                // A field/type name is refused lexical lookup by syntax. Its
+                // namespace-specific lookup remains authoritative (#11830).
+                Err(
+                    crate::analyzer::lexical_definitions::LexicalBindingUnproven::NonLexicalFocus,
+                ) => None,
+                Err(_) => {
+                    return finish_lookup_outcome(
+                        diagnostic_outcome(
+                            DefinitionLookupStatus::Incomplete,
+                            "lexical_binding_unproven",
+                            "the lexical binding is unavailable from the source syntax",
+                        )
+                        .with_incomplete_reason(DefinitionLookupReason::LexicalBindingUnproven),
+                        site,
                     )
-                    .with_incomplete_reason(DefinitionLookupReason::LexicalBindingUnproven),
-                    site,
+                    .into();
+                }
+            }
+            .or_else(|| {
+                language_support_for_hook(language, "definition_lexical_fallback").and_then(
+                    |support| {
+                        support.definition_lexical_fallback(
+                            analyzer,
+                            token,
+                            &request.file,
+                            &source,
+                            tree,
+                            &site,
+                            identifier,
+                        )
+                    },
                 )
-                .into();
+            });
+            match lexical_binding {
+                Some(
+                    LexicalBindingResolution::Parameter(definition)
+                    | LexicalBindingResolution::OtherLocal(definition),
+                ) => {
+                    return finish_lookup_outcome(lexical_definition_outcome(definition), site)
+                        .into();
+                }
+                None => {}
             }
         }
-        .or_else(|| {
-            language_support_for_hook(language, "definition_lexical_fallback").and_then(|support| {
-                support.definition_lexical_fallback(
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(resolution) =
+            language_support_for_hook(language, "trial_definition").and_then(|support| {
+                let query = crate::analyzer::languages::BoundedReceiverQuery {
                     analyzer,
-                    token,
-                    &request.file,
-                    &source,
-                    tree,
-                    &site,
-                    identifier,
-                )
+                    file: &request.file,
+                    source: &source,
+                    tree: tree.as_ref(),
+                    site: &site,
+                    budget:
+                        crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                    cancellation,
+                };
+                support.trial_definition_in_batch(query, context.native_points.as_ref())
             })
-        });
-        match lexical_binding {
-            Some(
-                LexicalBindingResolution::Parameter(definition)
-                | LexicalBindingResolution::OtherLocal(definition),
-            ) => {
-                return finish_lookup_outcome(lexical_definition_outcome(definition), site).into();
-            }
-            None => {}
+        {
+            return resolution;
         }
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(resolution) =
-        language_support_for_hook(language, "trial_definition").and_then(|support| {
+        let native_points = language_support_for_hook(language, "default_definition_points")
+            .and_then(|support| support.default_definition_points());
+        #[cfg(any(test, feature = "test-support"))]
+        let native_points = native_points.or_else(|| {
+            (language == Language::Scala
+                && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
+            .then(|| {
+                language_support_for_hook(language, "native_rollout_points")
+                    .and_then(|support| support.native_rollout_points())
+            })
+            .flatten()
+        });
+        // The caller's batch owns the selected operation across these points.
+        if definition_batch.is_none()
+            && let Some(native_points) = native_points
+        {
             let query = crate::analyzer::languages::BoundedReceiverQuery {
                 analyzer,
                 file: &request.file,
@@ -4253,93 +4657,94 @@ pub fn resolve_one_with_evidence<'a>(
                 budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
                 cancellation,
             };
-            support.trial_definition_in_batch(query, context.native_points.as_ref())
-        })
-    {
-        return resolution;
-    }
-    let native_points = language_support_for_hook(language, "default_definition_points")
-        .and_then(|support| support.default_definition_points());
-    #[cfg(any(test, feature = "test-support"))]
-    let native_points = native_points.or_else(|| {
-        (language == Language::Scala && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
-            .then(|| {
-                language_support_for_hook(language, "native_rollout_points")
-                    .and_then(|support| support.native_rollout_points())
-            })
-            .flatten()
-    });
-    // The caller's batch owns the selected operation across these points.
-    if definition_batch.is_none()
-        && let Some(native_points) = native_points
-    {
-        let query = crate::analyzer::languages::BoundedReceiverQuery {
-            analyzer,
-            file: &request.file,
-            source: &source,
-            tree: tree.as_ref(),
-            site: &site,
-            budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-            cancellation,
-        };
-        return definition_resolution_from_bounded(
+            return definition_resolution_from_bounded(
             crate::analyzer::languages::StructuralReceiverResolver::resolve_definition_with_call_evidence_bounded(native_points, query),
             language,
         );
-    }
-    let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
-    let support = language_support_for_hook(language, "resolve_definition_dispatch")
-        .expect("supported definition language");
-    let resolution = match definition_batch {
-        Some(batch) => batch.resolve_definition_dispatch(
-            analyzer,
-            token,
-            context,
-            &request,
-            &source,
-            &tree,
-            &site,
-            operation,
-            cancellation,
-            go_session,
-        ),
-        None => support.resolve_definition_dispatch(
-            analyzer,
-            token,
-            context,
-            &request,
-            &source,
-            &tree,
-            &site,
-            operation,
-            cancellation,
-            go_session,
-        ),
-    };
-    let DefinitionResolution {
-        outcome: resolved,
-        evidence,
-        call_binding_discharge_digests,
-    } = match resolution {
-        std::ops::ControlFlow::Break(resolution) => return resolution,
-        std::ops::ControlFlow::Continue(resolution) => resolution,
-    };
-
-    let resolved = if let Some(operation) = operation {
-        if language == Language::Cpp {
-            resolved
-        } else {
-            finalize_navigation_outcome(resolved, operation)
         }
-    } else {
-        resolved
-    };
+        let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
+        let support = language_support_for_hook(language, "resolve_definition_dispatch")
+            .expect("supported definition language");
+        let resolution = match definition_batch {
+            Some(batch) => batch.resolve_definition_dispatch(
+                analyzer,
+                token,
+                context,
+                &request,
+                &source,
+                &tree,
+                &site,
+                operation,
+                cancellation,
+                go_session,
+            ),
+            None => support.resolve_definition_dispatch(
+                analyzer,
+                token,
+                context,
+                &request,
+                &source,
+                &tree,
+                &site,
+                operation,
+                cancellation,
+                go_session,
+            ),
+        };
+        let DefinitionResolution {
+            outcome: resolved,
+            evidence,
+            call_binding_discharge_digests,
+        } = match resolution {
+            std::ops::ControlFlow::Break(resolution) => return resolution,
+            std::ops::ControlFlow::Continue(resolution) => resolution,
+        };
 
-    DefinitionResolution {
-        outcome: finish_lookup_outcome(resolved, site),
-        evidence,
-        call_binding_discharge_digests,
+        let resolved = if let Some(operation) = operation {
+            if language == Language::Cpp {
+                resolved
+            } else {
+                finalize_navigation_outcome(resolved, operation)
+            }
+        } else {
+            resolved
+        };
+
+        DefinitionResolution {
+            outcome: finish_lookup_outcome(resolved, site),
+            evidence,
+            call_binding_discharge_digests,
+        }
     }
+
+    let refuse = |error: crate::analyzer::store::StoreError| {
+        crate::analyzer::i_analyzer::join_execution_dependence(analyzer);
+        diagnostic_outcome(
+            DefinitionLookupStatus::Unavailable,
+            crate::analyzer::native_points::native_store_error_kind(&error),
+            error.to_string(),
+        )
+        .into()
+    };
+    // This precedes every memo and lexical/source early return. Both probes
+    // read the existing request completion, rather than a caller-owned flag.
+    if let Some(error) = context.read_scope.request_store_error() {
+        return refuse(error);
+    }
+    let resolution = resolve_one_inner(
+        analyzer,
+        token,
+        context,
+        request,
+        operation,
+        cancellation,
+        go_session,
+        definition_batch,
+    );
+    context
+        .read_scope
+        .request_store_error()
+        .map_or(resolution, refuse)
 }
 
 #[doc(hidden)]
@@ -5186,6 +5591,52 @@ fn diagnostic_outcome_with_claim(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12410: one certified native gap must not hide an uncertified sibling"
+    )]
+    fn native_gap_certificates_are_per_origin_and_never_snapshot_only() {
+        use super::{DefinitionLookupEvidence, DefinitionLookupReason};
+        use crate::analyzer::i_analyzer::QueryReadIncomplete;
+        use crate::analyzer::read_ledger::DerivationExecutionCause as Cause;
+        use crate::analyzer::resolution::{
+            ResolutionCompletion, ResolutionIncompleteReason as Native, SemanticId,
+        };
+        let first = SemanticId::for_test("certified origin");
+        let second = SemanticId::for_test("uncertified sibling");
+        let certificate = |semantic, reason| DefinitionLookupReason::QueryRead {
+            semantic,
+            cause: QueryReadIncomplete::ProofStopped {
+                reason,
+                cause: None,
+            },
+        };
+        let mut evidence = DefinitionLookupEvidence {
+            completion: ResolutionCompletion::incomplete([
+                Native::UnsupportedSemantic(first),
+                Native::UnsupportedSemantic(second),
+            ]),
+            reasons: Vec::new(),
+            snapshot_stops: vec![first, second],
+        };
+        assert_eq!(evidence.execution_cause(), Some(Cause::Provider));
+        evidence.reasons.push(certificate(first, "depth_limit"));
+        assert_eq!(evidence.execution_cause(), Some(Cause::Provider));
+        evidence
+            .reasons
+            .push(certificate(second, "not_a_registered_certificate"));
+        assert_eq!(evidence.execution_cause(), Some(Cause::Provider));
+        evidence.reasons.pop();
+        evidence.reasons.push(certificate(second, "depth_limit"));
+        assert_eq!(evidence.execution_cause(), None);
+        evidence.completion = evidence
+            .completion
+            .combine(&ResolutionCompletion::incomplete([Native::Cancelled]));
+        assert_eq!(evidence.execution_cause(), Some(Cause::Cancelled));
+        evidence.completion =
+            ResolutionCompletion::incomplete([Native::ReceiverBudgetExhausted(first)]);
+        assert_eq!(evidence.execution_cause(), Some(Cause::Budget));
+    }
 
     use super::*;
 

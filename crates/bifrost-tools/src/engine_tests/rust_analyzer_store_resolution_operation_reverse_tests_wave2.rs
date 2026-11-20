@@ -31,6 +31,10 @@ mod rust_departing_wave2_root_tests {
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_selected_mount_table_visits_for_test;
     use brokk_bifrost_test_macros::hardwon;
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn immutable_selected_point_reads_hit_without_changing_evidence() {
         let fixture = RustRootResolutionOperationFixture::new_with_unrelated_crate_source_count(1);
         let cancellation = CancellationToken::new();
@@ -74,6 +78,10 @@ mod rust_departing_wave2_root_tests {
     /// fill input: the rows it returns are the sealed rows of that blob, and a
     /// second read is a hit that returns the same rows and fills nothing.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_macro_inputs_hit_with_the_fill_rows() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_path_key;
         let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
@@ -128,12 +136,139 @@ pub fn caller(t: &Tensor) {
         );
     }
 
+    const CFG_IMPORT_CONSUMER: &str = r#"
+pub fn helper() -> u8 { 1 }
+#[cfg(test)]
+use crate::helper as test_helper;
+#[cfg(unix)]
+use crate::helper as unix_helper;
+pub fn caller() -> u8 { helper() }
+"#;
+
+    /// The import-provenance memo is caller-keyed by the blob, the exact fill
+    /// input: a hit returns the fill's index and builds nothing, `clear` (as
+    /// `Drop` does) empties the region, and a budget that retains nothing
+    /// returns the same index, rebuilding it for each read.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn selected_rust_import_provenance_hits_with_the_fill_rows() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::{
+            build_rust_import_provenance_rows_for_test,
+            clear_selected_rust_import_provenance_for_test,
+            selected_rust_import_provenance_probe_for_test,
+            selected_rust_import_provenance_stats_for_test,
+            take_rust_import_provenance_builds_for_test,
+        };
+        let consumer_blob = |operation: &SelectedResolutionOperation<'_, '_>| -> i64 {
+            operation
+                .ready
+                .inventory
+                .connection()
+                .query_row(
+                    "SELECT blob_id FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1",
+                    [RUST_ROOT_CONSUMER_PATH],
+                    |row| row.get(0),
+                )
+                .expect("the consumer is a selected mount")
+        };
+        let cancellation = CancellationToken::new();
+
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        fixture.replace_persisted_consumer_source(CFG_IMPORT_CONSUMER);
+        let operation = fixture.open_ready(&cancellation);
+        let blob = consumer_blob(&operation);
+        let sealed = build_rust_import_provenance_rows_for_test(
+            operation.ready.inventory.connection(),
+            blob,
+        )
+        .unwrap();
+        assert!(
+            sealed.len() >= 2,
+            "both conditional imports are indexed: {sealed:?}"
+        );
+        take_rust_import_provenance_builds_for_test();
+        let (first, held) = selected_rust_import_provenance_probe_for_test(
+            &operation.ready.inventory,
+            blob,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(
+            first, sealed,
+            "the region returns exactly the builder's rows"
+        );
+        assert_eq!(held, 1);
+        assert_eq!(take_rust_import_provenance_builds_for_test(), 1);
+        let (second, held_after) = selected_rust_import_provenance_probe_for_test(
+            &operation.ready.inventory,
+            blob,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(second, sealed, "a hit returns the fill's rows");
+        assert_eq!(held_after, held);
+        assert_eq!(
+            take_rust_import_provenance_builds_for_test(),
+            0,
+            "the second read is a hit and builds nothing"
+        );
+        clear_selected_rust_import_provenance_for_test(&operation.ready.inventory);
+        assert_eq!(
+            selected_rust_import_provenance_stats_for_test(&operation.ready.inventory).entries,
+            0
+        );
+        assert_eq!(
+            selected_rust_import_provenance_probe_for_test(
+                &operation.ready.inventory,
+                blob,
+                &cancellation
+            )
+            .unwrap()
+            .0,
+            sealed,
+            "an invalidated entry is rebuilt by the same builder"
+        );
+
+        // Refusal: nothing is retained, every read rebuilds, answers agree.
+        let mut refusing = RustRootResolutionOperationFixture::new_with_sources_and_budget(
+            3,
+            0,
+            "",
+            default_scale_source,
+            default_unrelated_source,
+            Some(brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing()),
+        );
+        refusing.replace_persisted_consumer_source(CFG_IMPORT_CONSUMER);
+        let operation = refusing.open_ready(&cancellation);
+        let blob = consumer_blob(&operation);
+        take_rust_import_provenance_builds_for_test();
+        for _ in 0..3 {
+            let (rows, held) = selected_rust_import_provenance_probe_for_test(
+                &operation.ready.inventory,
+                blob,
+                &cancellation,
+            )
+            .unwrap();
+            assert_eq!(rows, sealed, "refusal does not change the answer");
+            assert_eq!(held, 0, "an oversized or refused value stays uncached");
+        }
+        assert_eq!(take_rust_import_provenance_builds_for_test(), 3);
+    }
+
     /// The main hydration statement must seek a fixed requested declaration,
     /// even when the workspace or that declaration's own blob grows. VM steps
     /// measure SQLite work; the mount-visit regression below measures Rust work.
     #[test]
     #[hardwon(
         "ed9135b9cc0a: definition hydration scanned units outside the requested declaration keys"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn selected_definition_hydration_vm_work_is_bounded_by_requested_keys() {
         use brokk_bifrost_core::analyzer::model::CodeUnitType;
@@ -558,6 +693,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn root_prefix_public_reader_preserves_admission_order_pages_and_cancellation() {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchCandidateMatch;
 

@@ -1,4 +1,5 @@
 use crate::graph::extractor::ScanCtx;
+use crate::graph::membership_scope::SiteAdmission;
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
@@ -14,7 +15,10 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     // A derivation that admitted a declaration of unproven membership does
     // not prove this site.
-    if ctx.site_doubt.tripped(ctx.membership) {
+    if matches!(
+        ctx.membership.admit_site(ctx.site_mark),
+        SiteAdmission::Withdrawn
+    ) {
         push_unproven_hit(node, ctx);
         return;
     }

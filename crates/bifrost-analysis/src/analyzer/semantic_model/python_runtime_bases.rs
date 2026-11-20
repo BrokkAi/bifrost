@@ -147,7 +147,7 @@ fn collect_claim_ids(
     let mut records = Vec::new();
     let mut declared = false;
     for id in ids {
-        for activated in python_rows(active.all_type_records_with_id(id)) {
+        for activated in python_rows(active.all_type_records_with_id(id))? {
             budget.charge(1, 1)?;
             if activated.shard.manifest.language == "python" {
                 declared |= activated.record.runtime_bases.is_some();
@@ -170,7 +170,7 @@ fn runtime_claim_owner_ids(
     let mut ids = vec![symbol_id.to_owned()];
     let mut seen_ids = HashSet::default();
     seen_ids.insert(symbol_id.to_owned());
-    for activated in python_rows(active.all_type_records_named(qualified_name)) {
+    for activated in python_rows(active.all_type_records_named(qualified_name))? {
         budget.charge(1, 1)?;
         if activated.shard.manifest.language == "python"
             && activated.record.name == qualified_name
@@ -211,7 +211,7 @@ pub fn retain_open_claims(
 ) -> Result<bool, PythonHierarchyReason> {
     let mut ids = Vec::new();
     let mut seen_ids = HashSet::default();
-    for activated in python_rows(active.all_type_records_named(name)) {
+    for activated in python_rows(active.all_type_records_named(name))? {
         budget.charge(1, 1)?;
         if activated.shard.manifest.language == "python"
             && seen_ids.insert(activated.record.id.clone())
@@ -345,7 +345,7 @@ pub fn runtime_bases(
                 retain_open_claims(active, &name, overlay, basis, budget)?;
             }
             TypeRef::Declared { id, .. } => {
-                for activated in python_rows(active.all_type_records_with_id(&id)) {
+                for activated in python_rows(active.all_type_records_with_id(&id))? {
                     budget.charge(1, 1)?;
                     if activated.shard.manifest.language == "python" {
                         let _retained_index =
@@ -382,7 +382,7 @@ pub fn runtime_base_claim_declared(
     let ids = runtime_claim_owner_ids(active, qualified_name, symbol_id, budget)?;
     let mut declared = false;
     for id in ids {
-        for activated in python_rows(active.all_type_records_with_id(&id)) {
+        for activated in python_rows(active.all_type_records_with_id(&id))? {
             budget.charge(1, 1)?;
             declared |= activated.shard.manifest.language == "python"
                 && activated.record.runtime_bases.is_some();
@@ -392,14 +392,167 @@ pub fn runtime_base_claim_declared(
 }
 
 impl From<crate::analyzer::semantic_model::FamilyOpen> for PythonHierarchyReason {
-    fn from(_: crate::analyzer::semantic_model::FamilyOpen) -> Self {
-        unreachable!("Python runtime bases read no JVM-family part")
+    fn from(open: crate::analyzer::semantic_model::FamilyOpen) -> Self {
+        let _cause = SemanticModelOverlay::record_open_proof(open, "model_catalog_open");
+        if open.is_cancellation() {
+            Self::Cancelled
+        } else {
+            Self::ModelCatalogOpen(open)
+        }
     }
 }
 
 fn python_rows<T>(
     rows: crate::analyzer::store::active_models::FamilyRows<impl Iterator<Item = T>>,
-) -> impl Iterator<Item = T> {
-    assert!(rows.open_for_language("python").is_none());
-    rows.rows
+) -> Result<impl Iterator<Item = T>, PythonHierarchyReason> {
+    if let Some(open) = rows.open_for_language("python") {
+        return Err(open.into());
+    }
+    Ok(rows.rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::QueryReadIncomplete;
+    use crate::analyzer::i_analyzer::{AnalyzerQueryScope, current_captured_proof_stop};
+    use crate::analyzer::read_ledger::DerivationExecutionCause;
+    use crate::analyzer::semantic_model::FamilyOpen;
+    use crate::analyzer::semantic_model::catalog::CatalogError;
+    use crate::analyzer::store::model_catalog::{CatalogRowReader, OwnedCatalogRows};
+    use crate::analyzer::workspace::EmptyAnalyzer;
+    use crate::{CancellationToken, Language, TestProject};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct ClaimBudget(HashSet<(*const ActiveSemanticModelShard, *const TypeFact)>);
+
+    impl PythonRuntimeClaimBudget for ClaimBudget {
+        fn charge(&mut self, _: usize, _: usize) -> Result<(), PythonHierarchyReason> {
+            Ok(())
+        }
+
+        fn has_claim(&self, key: (*const ActiveSemanticModelShard, *const TypeFact)) -> bool {
+            self.0.contains(&key)
+        }
+
+        fn mark_claim(&mut self, key: (*const ActiveSemanticModelShard, *const TypeFact)) {
+            self.0.insert(key);
+        }
+    }
+
+    #[derive(Default)]
+    struct QuestionOwner(Mutex<Option<FamilyOpen>>);
+
+    impl CatalogRowReader for QuestionOwner {
+        fn owned_rows(
+            &self,
+            _: &str,
+            _: &[(&str, &dyn rusqlite::ToSql)],
+            _: &CancellationToken,
+        ) -> Result<OwnedCatalogRows, CatalogError> {
+            match *self.0.lock().unwrap() {
+                Some(open) => Err(CatalogError::FamilyOpen(open)),
+                None => Ok(OwnedCatalogRows {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#14073: Python runtime-base reads panicked or admitted partial claims when another catalog owner failed"
+    )]
+    fn python_runtime_claim_open_preserves_cause_and_refuses_proof_reuse() {
+        let active = crate::analyzer::semantic_model::overlay::catalog_row_parity::python_runtime_claim_fixture();
+        let owner = Arc::new(QuestionOwner::default());
+        let active = active.test_with_question_reader(owner.clone());
+        let identity = ClassIdentity::External {
+            qualified_name: "com.acme.Widget".into(),
+            symbol_id: "type.widget".into(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(
+            directory.path(),
+            Language::Python,
+        )));
+        let read = || runtime_base_claim_declared(&active, &identity, &mut ClaimBudget::default());
+        let (healthy, healthy_receipt) =
+            crate::analyzer::common::capture_query_cache_build(&analyzer, read);
+        assert_eq!(healthy, Ok(true));
+        assert!(healthy_receipt.is_complete(), "{healthy_receipt:?}");
+
+        for open in [
+            FamilyOpen::jvm("Python claim owner unavailable"),
+            FamilyOpen::jvm_cancelled(),
+        ] {
+            *owner.0.lock().unwrap() = Some(open);
+            let raw = active.all_type_records_with_id("type.widget");
+            assert_eq!(raw.open_for_language("python"), Some(open));
+            assert!(
+                raw.rows.count() > 0,
+                "the successful owner's claim must survive"
+            );
+            let ((), receipt) = crate::analyzer::common::capture_query_cache_build(
+                &analyzer,
+                || {
+                    let scope = AnalyzerQueryScope::capturing_proof_completion(&analyzer);
+                    let reason = read().unwrap_err();
+                    assert_eq!(
+                        reason.label(),
+                        if open.is_cancellation() {
+                            "cancelled"
+                        } else {
+                            "model_catalog_open"
+                        }
+                    );
+                    assert_eq!(
+                        reason,
+                        if open.is_cancellation() {
+                            PythonHierarchyReason::Cancelled
+                        } else {
+                            PythonHierarchyReason::ModelCatalogOpen(open)
+                        }
+                    );
+                    let cause = if open.is_cancellation() {
+                        DerivationExecutionCause::Cancelled
+                    } else {
+                        DerivationExecutionCause::Provider
+                    };
+                    assert!(
+                        matches!(current_captured_proof_stop(), Some(QueryReadIncomplete::ProofStopped { reason: "model_catalog_open", cause: Some(actual) }) if actual == cause)
+                    );
+                    let reasons = scope.captured_read_incompleteness();
+                    assert!(
+                        reasons.iter().any(|reason| matches!(
+                            reason,
+                            QueryReadIncomplete::Cancelled
+                                | QueryReadIncomplete::SemanticEvidenceUnavailable(_)
+                        )),
+                        "{reasons:?}"
+                    );
+                    assert!(
+                        !reasons
+                            .iter()
+                            .any(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_))),
+                        "{reasons:?}"
+                    );
+                    // The proof consumer deliberately swallows the typed error.
+                },
+            );
+            assert!(receipt.has_execution_dependences(), "{receipt:?}");
+            assert!(!receipt.is_complete(), "{receipt:?}");
+            assert!(!receipt.request_memo_admissible(), "{receipt:?}");
+            *owner.0.lock().unwrap() = None;
+            for _ in 0..2 {
+                let (recovered, receipt) =
+                    crate::analyzer::common::capture_query_cache_build(&analyzer, read);
+                assert_eq!(recovered, Ok(true));
+                assert!(receipt.is_complete(), "{receipt:?}");
+            }
+        }
+    }
 }

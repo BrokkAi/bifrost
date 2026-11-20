@@ -109,6 +109,7 @@ use brokk_bifrost_rql::{
     SetOperator,
 };
 use brokk_bifrost_tools::searchtools::session_subset;
+use brokk_bifrost_tools::site_context::UnrenderedReason;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -168,6 +169,7 @@ pub use expansions::{
     CallPathSource, StaticCallPath, StaticCallProof,
 };
 mod failure_handler_state;
+mod field_access;
 mod field_metadata;
 mod field_write;
 mod flow_state;
@@ -201,6 +203,7 @@ use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
 pub use edges::{SelectedEdgesOfTelemetry, SelectedEdgesOfTelemetrySnapshot};
 mod paths;
 mod pipeline;
+mod presentation;
 mod procedure_return_profile;
 mod provenance;
 mod python_comparisons;
@@ -211,6 +214,11 @@ mod receiver;
 mod relation_capabilities;
 mod relations;
 mod render;
+mod scalar_projection;
+pub use scalar_projection::{
+    DetailedSelectorResult, SelectorCallBindingFacts, SelectorQueryResult, SelectorResultItem,
+    SelectorResultValue,
+};
 mod resolved_value;
 mod scalar_conditions;
 use super::occurrence_rows::OccurrenceDerivationOptions;
@@ -266,6 +274,8 @@ use topology_rows::{
     TopologyEdgeKey, TopologyEdgeValue, TopologyEntityKey, TopologyEntityValue,
     TopologyTraversalCache,
 };
+#[cfg(test)]
+mod admission_acceptance;
 mod build_configuration_rows;
 mod results;
 mod rewrite_paths;
@@ -307,7 +317,252 @@ pub(crate) mod test_support {
     }
 }
 
+/// Whether a native row owns a semantic artifact that must remain registered.
+/// Every native value must state its ownership, including nested code values.
+///
+/// Legacy provenance traces can also clone handle-owning values even when the
+/// row's own value is handle-free. The row pins while either its value or any
+/// trace step retains a semantic artifact. Semantic traces already use public
+/// snapshots, so they never pin. See `pipeline_trace_value`.
+fn pipeline_row_retains_semantic_artifact(row: &PipelineRow) -> bool {
+    pipeline_value_retains_semantic_artifact(&row.value)
+        || row.traces.iter().any(|trace| {
+            trace
+                .steps
+                .iter()
+                .any(|step| pipeline_trace_value_retains_semantic_artifact(&step.value))
+        })
+}
+
+fn pipeline_value_retains_semantic_artifact(value: &PipelineValue) -> bool {
+    let mut value = value;
+    loop {
+        return match value {
+            PipelineValue::Semantic(value) => match value {
+                SemanticPipelineValue::Procedure(_)
+                | SemanticPipelineValue::ProgramPoint(_)
+                | SemanticPipelineValue::ControlEdge(_)
+                | SemanticPipelineValue::CallResult(_) => true,
+                SemanticPipelineValue::FlowEndpoint(value) => value.retains_semantic_artifact(),
+                SemanticPipelineValue::TypestateFinding(value) => value.retains_semantic_artifact(),
+                SemanticPipelineValue::ProcedureReference(_)
+                | SemanticPipelineValue::ProgramPointReference(_)
+                | SemanticPipelineValue::ControlEdgeReference(_)
+                | SemanticPipelineValue::TypestateWitness(_)
+                | SemanticPipelineValue::FlowWitness(_)
+                | SemanticPipelineValue::AbsentMemberWitness(_)
+                | SemanticPipelineValue::TaintFinding(_)
+                | SemanticPipelineValue::RustMarkerImpl(_)
+                | SemanticPipelineValue::RustPointerFinding(_) => false,
+            },
+            PipelineValue::StateEvent(_)
+            | PipelineValue::FlowRelation(_)
+            | PipelineValue::Guard(_) => true,
+            PipelineValue::RuntimeKeyedReadValue(value) => value.endpoint.is_some(),
+            PipelineValue::ReceiverAnalysis(value)
+            | PipelineValue::MemberTargetAnalysis(value)
+            | PipelineValue::ReceiverOutcome(value) => value.retains_semantic_artifact(),
+            PipelineValue::ReceiverEvidence(value) => value.receiver.retains_semantic_artifact(),
+            PipelineValue::FieldWriteValue(value) => value.analysis.retains_semantic_artifact(),
+            PipelineValue::CrossDomain(cross_domain) => match cross_domain.code() {
+                Some(code) => {
+                    value = code;
+                    continue;
+                }
+                None => false,
+            },
+            PipelineValue::StructuralMatch(_)
+            | PipelineValue::Declaration(_)
+            | PipelineValue::File(_)
+            | PipelineValue::ReferenceSite(_)
+            | PipelineValue::CallSite(_)
+            | PipelineValue::ExpressionSite(_)
+            | PipelineValue::JsxAttributeValue(_)
+            | PipelineValue::PointsToCandidate(_)
+            | PipelineValue::CallShape(_)
+            | PipelineValue::CallArgumentGroup(_)
+            | PipelineValue::CallArgument(_)
+            | PipelineValue::CallBinding(_)
+            | PipelineValue::CallEffect(_)
+            | PipelineValue::CallResultContract(_)
+            | PipelineValue::CallResultObligation(_)
+            | PipelineValue::ResultSubjectUse(_)
+            | PipelineValue::ResultContractUse(_)
+            | PipelineValue::ResultContractFailureUse(_)
+            | PipelineValue::NilnessOperation(_)
+            | PipelineValue::SwitchCoverage(_)
+            | PipelineValue::AssignmentRelation(_)
+            | PipelineValue::ClassSetRow(_)
+            | PipelineValue::AbsentMemberFinding(_)
+            | PipelineValue::DetachedTaskTransfer(_)
+            | PipelineValue::ProcedureEffect(_)
+            | PipelineValue::CallableSignature(_)
+            | PipelineValue::LiteralOccurrence(_)
+            | PipelineValue::CallableMetrics(_)
+            | PipelineValue::SignatureParameter(_)
+            | PipelineValue::DecoratedParameter(_)
+            | PipelineValue::CallableApplicability(_)
+            | PipelineValue::OverloadSelection(_)
+            | PipelineValue::MemberSelection(_)
+            | PipelineValue::DispatchOutcome(_)
+            | PipelineValue::DispatchTarget(_)
+            | PipelineValue::MemberFamily(_)
+            | PipelineValue::MemberFamilyEdge(_)
+            | PipelineValue::PythonHierarchyFact(_)
+            | PipelineValue::Occurrence(_)
+            | PipelineValue::LexicalScope(_)
+            | PipelineValue::Binding(_)
+            | PipelineValue::ResolutionCandidate(_)
+            | PipelineValue::CandidateHop(_)
+            | PipelineValue::GenerationSite(_)
+            | PipelineValue::Export(_)
+            | PipelineValue::DeclarationState(_)
+            | PipelineValue::ReferenceEdge(_)
+            | PipelineValue::BindingInitializerCall(_)
+            | PipelineValue::FieldWrite(_)
+            | PipelineValue::FieldRead(_)
+            | PipelineValue::ControlRelation(_)
+            | PipelineValue::BranchRelation(_)
+            | PipelineValue::LoopRelation(_)
+            | PipelineValue::CppExpression(_)
+            | PipelineValue::FailureHandlerState(_)
+            | PipelineValue::StatementReachability(_)
+            | PipelineValue::PendingCleanupFlow(_)
+            | PipelineValue::PythonRuleFact(_)
+            | PipelineValue::SourceSet(_)
+            | PipelineValue::BuildTarget(_)
+            | PipelineValue::TopologyEdge(_)
+            | PipelineValue::BuildConfiguration(_)
+            | PipelineValue::RewritePath(_)
+            | PipelineValue::QualifiedPath(_)
+            | PipelineValue::PathSegment(_)
+            | PipelineValue::ConfigurationFact(_)
+            | PipelineValue::DependencyEvidence(_) => false,
+        };
+    }
+}
+
+fn pipeline_trace_value_retains_semantic_artifact(value: &PipelineTraceValue) -> bool {
+    match value {
+        PipelineTraceValue::Semantic(_) => false,
+        PipelineTraceValue::StateEvent(_)
+        | PipelineTraceValue::FlowRelation(_)
+        | PipelineTraceValue::Guard(_) => true,
+        PipelineTraceValue::RuntimeKeyedReadValue(value) => value.endpoint.is_some(),
+        PipelineTraceValue::ReceiverAnalysis(value)
+        | PipelineTraceValue::MemberTargetAnalysis(value)
+        | PipelineTraceValue::ReceiverOutcome(value) => value.retains_semantic_artifact(),
+        PipelineTraceValue::ReceiverEvidence(value) => value.receiver.retains_semantic_artifact(),
+        PipelineTraceValue::FieldWriteValue(value) => value.analysis.retains_semantic_artifact(),
+        PipelineTraceValue::CrossDomain(wrapper) => wrapper
+            .code()
+            .is_some_and(pipeline_value_retains_semantic_artifact),
+        PipelineTraceValue::StructuralMatch(_)
+        | PipelineTraceValue::Declaration(_)
+        | PipelineTraceValue::File(_)
+        | PipelineTraceValue::ReferenceSite(_)
+        | PipelineTraceValue::CallSite(_)
+        | PipelineTraceValue::ExpressionSite(_)
+        | PipelineTraceValue::JsxAttributeValue(_)
+        | PipelineTraceValue::PointsToCandidate(_)
+        | PipelineTraceValue::CallShape(_)
+        | PipelineTraceValue::CallArgumentGroup(_)
+        | PipelineTraceValue::CallArgument(_)
+        | PipelineTraceValue::CallBinding(_)
+        | PipelineTraceValue::CallEffect(_)
+        | PipelineTraceValue::CallResultContract(_)
+        | PipelineTraceValue::CallResultObligation(_)
+        | PipelineTraceValue::ResultSubjectUse(_)
+        | PipelineTraceValue::ResultContractUse(_)
+        | PipelineTraceValue::ResultContractFailureUse(_)
+        | PipelineTraceValue::NilnessOperation(_)
+        | PipelineTraceValue::SwitchCoverage(_)
+        | PipelineTraceValue::AssignmentRelation(_)
+        | PipelineTraceValue::ClassSetRow(_)
+        | PipelineTraceValue::AbsentMemberFinding(_)
+        | PipelineTraceValue::DetachedTaskTransfer(_)
+        | PipelineTraceValue::ProcedureEffect(_)
+        | PipelineTraceValue::CallableSignature(_)
+        | PipelineTraceValue::LiteralOccurrence(_)
+        | PipelineTraceValue::CallableMetrics(_)
+        | PipelineTraceValue::SignatureParameter(_)
+        | PipelineTraceValue::DecoratedParameter(_)
+        | PipelineTraceValue::CallableApplicability(_)
+        | PipelineTraceValue::OverloadSelection(_)
+        | PipelineTraceValue::MemberSelection(_)
+        | PipelineTraceValue::DispatchOutcome(_)
+        | PipelineTraceValue::DispatchTarget(_)
+        | PipelineTraceValue::MemberFamily(_)
+        | PipelineTraceValue::MemberFamilyEdge(_)
+        | PipelineTraceValue::PythonHierarchyFact(_)
+        | PipelineTraceValue::Occurrence(_)
+        | PipelineTraceValue::LexicalScope(_)
+        | PipelineTraceValue::Binding(_)
+        | PipelineTraceValue::ResolutionCandidate(_)
+        | PipelineTraceValue::CandidateHop(_)
+        | PipelineTraceValue::GenerationSite(_)
+        | PipelineTraceValue::Export(_)
+        | PipelineTraceValue::DeclarationState(_)
+        | PipelineTraceValue::ReferenceEdge(_)
+        | PipelineTraceValue::BindingInitializerCall(_)
+        | PipelineTraceValue::FieldWrite(_)
+        | PipelineTraceValue::FieldRead(_)
+        | PipelineTraceValue::ControlRelation(_)
+        | PipelineTraceValue::BranchRelation(_)
+        | PipelineTraceValue::LoopRelation(_)
+        | PipelineTraceValue::CppExpression(_)
+        | PipelineTraceValue::FailureHandlerState(_)
+        | PipelineTraceValue::StatementReachability(_)
+        | PipelineTraceValue::PendingCleanupFlow(_)
+        | PipelineTraceValue::PythonRuleFact(_)
+        | PipelineTraceValue::SourceSet(_)
+        | PipelineTraceValue::BuildTarget(_)
+        | PipelineTraceValue::TopologyEdge(_)
+        | PipelineTraceValue::BuildConfiguration(_)
+        | PipelineTraceValue::RewritePath(_)
+        | PipelineTraceValue::QualifiedPath(_)
+        | PipelineTraceValue::PathSegment(_)
+        | PipelineTraceValue::ConfigurationFact(_)
+        | PipelineTraceValue::DependencyEvidence(_) => false,
+    }
+}
+
 impl QueryExecutionState<'_> {
+    fn set_pinned_row_artifacts(&mut self, count: usize) {
+        self.pinned_row_artifacts = count;
+        if let Some(semantic) = self.semantic.as_mut() {
+            semantic.set_pinned_downstream_row_holders(count);
+        }
+    }
+
+    /// Count `rows` as a holder while a later operand runs, when they retain
+    /// a semantic artifact handle.
+    fn pin_rows_if_retaining(&mut self, rows: &[PipelineRow]) {
+        if rows.iter().any(pipeline_row_retains_semantic_artifact) {
+            self.set_pinned_row_artifacts(self.pinned_row_artifacts.saturating_add(1));
+        }
+    }
+
+    /// Drop the request's semantic artifacts and every memo keyed by their
+    /// handles once no live row or sibling operand borrows one.
+    fn release_unreferenced_semantic_artifacts(&mut self) {
+        self.set_pinned_row_artifacts(self.pinned_row_artifacts);
+        if self.pinned_row_artifacts != 0 {
+            return;
+        }
+        if let Some(semantic) = self.semantic.as_mut() {
+            semantic.release_unreferenced_artifacts();
+        }
+        self.flow_state_cache.release_file_window();
+        self.control_relation_cache.release_file_window();
+        self.branch_relation_cache.release_file_window();
+        self.call_cache
+            .effects
+            .read_mut(&memo_attribution(self.analyzer), |effects| {
+                effects.release_file_window()
+            });
+    }
+
     /// Dual write while the ambient channel still decides: mark the active
     /// captures and join the dependence into the execution's own verdict.
     #[track_caller]
@@ -530,6 +785,25 @@ fn normalize_query_diagnostics(diagnostics: Vec<CodeQueryDiagnostic>) -> Vec<Cod
         .collect()
 }
 
+/// A registration producer owns the typed error; presentation codes do not
+/// recover cancellation/budget causes from a generic provider fallback.
+fn context_error_incompleteness(error: &QueryAnalysisContextError) -> Incompleteness {
+    let mut error = error;
+    while let QueryAnalysisContextError::ValueFlowRegistrationInvalid { detail }
+    | QueryAnalysisContextError::TaintRegistrationInvalid { detail } = error
+    {
+        error = detail;
+    }
+    let cause = match error {
+        QueryAnalysisContextError::Cancelled => DerivationExecutionCause::Cancelled,
+        QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
+            DerivationExecutionCause::Budget
+        }
+        _ => DerivationExecutionCause::Provider,
+    };
+    Incompleteness::Operational(cause)
+}
+
 fn incomplete_diagnostic(
     code: CodeQueryDiagnosticCode,
     incompleteness: Incompleteness,
@@ -552,6 +826,10 @@ fn incomplete_diagnostic(
         message,
         exhausted_roots,
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     })
 }
 
@@ -604,6 +882,10 @@ pub fn fold_query_read_incompleteness(
                 },
                 reason.to_string(),
             ),
+            QueryReadIncomplete::InternalInvariant(detail) => (
+                CodeQueryDiagnosticCode::SemanticProviderFailed,
+                format!("internal invariant: {detail}"),
+            ),
             QueryReadIncomplete::SemanticModelsPending => (
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                 "semantic models selected but not published".to_owned(),
@@ -641,6 +923,55 @@ fn same_range(left: &Range, right: &Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }
 
+/// Per-procedure guard bindings supplied to relation-producing Match queries.
+pub trait MatchGuardBindingSource: Send + Sync {
+    fn bindings_for_procedure(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        cancellation: &CancellationToken,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> Result<brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::CompiledGuardBindings, String>;
+}
+
+/// Non-global registry of producer-owned Match guard removal vocabularies, keyed by relation ID.
+#[derive(Default, Clone)]
+pub struct GuardRemovalVocabularyRegistry {
+    vocabularies: std::collections::BTreeMap<
+        &'static str,
+        Arc<dyn brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardRemovalVocabulary>,
+    >,
+}
+
+impl std::fmt::Debug for GuardRemovalVocabularyRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardRemovalVocabularyRegistry")
+            .field("producers", &self.vocabularies.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl GuardRemovalVocabularyRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &mut self,
+        vocabulary: Arc<dyn brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardRemovalVocabulary>,
+    ) {
+        self.vocabularies
+            .insert(vocabulary.producer_id(), vocabulary);
+    }
+
+    pub fn get(
+        &self,
+        producer_id: &str,
+    ) -> Option<&Arc<dyn brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardRemovalVocabulary>>{
+        self.vocabularies.get(producer_id)
+    }
+}
+
 /// Flow reuse resources for a query, optionally including one policy run's root memo.
 /// Converting a workspace state alone deliberately supplies no run memo.
 #[derive(Clone)]
@@ -651,6 +982,7 @@ pub struct SemanticFlowResources {
     /// The run's known identifier misspellings. Every execution that receives
     /// these resources reports against them unless its scope names its own.
     identifier_typos: Option<Arc<crate::structural::identifier_typos::IdentifierTypoTable>>,
+    guard_bindings: Option<Arc<dyn MatchGuardBindingSource>>,
 }
 
 impl SemanticFlowResources {
@@ -663,6 +995,7 @@ impl SemanticFlowResources {
             state: state.clone(),
             root_memo: None,
             identifier_typos: None,
+            guard_bindings: None,
         }
     }
     /// An already-bound request capability, safe to carry through read captures.
@@ -683,6 +1016,14 @@ impl SemanticFlowResources {
         typos: Option<Arc<crate::structural::identifier_typos::IdentifierTypoTable>>,
     ) -> Self {
         self.identifier_typos = typos;
+        self
+    }
+
+    pub fn with_guard_bindings(
+        mut self,
+        guard_bindings: Option<Arc<dyn MatchGuardBindingSource>>,
+    ) -> Self {
+        self.guard_bindings = guard_bindings;
         self
     }
 }
@@ -853,11 +1194,12 @@ pub use units::{
     UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowKey, UnitRowProvenance,
     UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowReferenceFacets, UnitRowScalar,
     UnitRowUnknownField, continue_empty_operand_zero, continue_intersect_prefix,
+    continue_selector_empty_operand_zero, continue_selector_intersect_prefix,
     execute_call_reachability_sink, execute_call_reachability_source,
-    execute_code_query_selector_unit, execute_code_query_unit, execute_intersect_prefix,
-    merge_unit_rows, merge_unit_rows_in_scope, plan_seed_files, push_skipped_unit_diagnostic,
-    push_unit_budget_diagnostic, remaining_unit_limits, seed_file_order,
-    structural_seed_file_order, unit_plan_node_count,
+    execute_code_query_selector_unit, execute_code_query_semantic_unit_in_scope,
+    execute_code_query_unit, execute_intersect_prefix, merge_unit_rows, merge_unit_rows_in_scope,
+    plan_seed_files, push_skipped_unit_diagnostic, push_unit_budget_diagnostic,
+    remaining_unit_limits, seed_file_order, structural_seed_file_order, unit_plan_node_count,
 };
 use units::{join_depth_bound_status, unit_row_key};
 pub(crate) use value_flow::public_witness_step;
@@ -940,6 +1282,8 @@ pub use results::CodeQueryExport;
 pub use results::CodeQueryExportBinding;
 pub use results::CodeQueryExportLocalDefinition;
 pub use results::CodeQueryExpressionSite;
+pub use results::CodeQueryFieldRead;
+pub use results::CodeQueryFieldWrite;
 pub use results::CodeQueryFieldWriteValue;
 pub use results::CodeQueryFile;
 pub use results::CodeQueryFlowCarrierSymbol;
@@ -1029,6 +1373,7 @@ pub use results::CodeQuerySourceSite;
 pub use results::CodeQueryStableOwnerCandidate;
 pub use results::CodeQueryStableOwnerDerivation;
 pub use results::CodeQueryStatementReachability;
+pub use results::CodeQueryStepNoRowsReason;
 pub use results::CodeQuerySwitchCoverage;
 pub use results::CodeQueryTaintFinding;
 pub use results::CodeQueryTaintFindingKey;
@@ -1074,6 +1419,10 @@ pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEven
 pub use results::{CodeQueryRelatedSource, CodeQuerySourceSpan};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 pub use results::{CodeQueryRustMarkerImpl, CodeQueryRustMarkerUse};
+pub use results::{
+    DetailedQueryResult, DiagnosticHandle, DiagnosticRef, PresentationDiagnostic, QueryDiagnostics,
+    QueryResult, QueryResultItem, QueryResultValue,
+};
 pub use results::{DiagnosticExecutionCause, Incompleteness};
 pub use results::{MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, render_exhausted_roots};
 pub use results::{UsesOmissionEvidence, UsesOmissionSite};
@@ -1371,7 +1720,15 @@ impl CallSiteValue {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ExpressionInput {
     Receiver,
-    Parameter { index: usize, name: Option<String> },
+    Parameter {
+        /// The callee formal the expression binds to.
+        index: usize,
+        name: Option<String>,
+        /// The written actual: its written position (`None` without a written
+        /// argument list) and optional keyword.
+        actual_written_position: Option<usize>,
+        actual_name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1444,6 +1801,13 @@ struct ReceiverAnalysisValue {
 }
 
 impl ReceiverAnalysisValue {
+    fn retains_semantic_artifact(&self) -> bool {
+        self.report
+            .points_to
+            .as_ref()
+            .is_some_and(|result| !result.observations().is_empty())
+    }
+
     fn member_form(&self, target: &ReceiverMemberTarget) -> MemberForm {
         let ReceiverMemberTarget::Workspace { member, .. } = target else {
             return (None, None);
@@ -1776,6 +2140,8 @@ enum PipelineValue {
     ReferenceEdge(Box<EdgeValue>),
     StateEvent(Box<StateEventValue>),
     BindingInitializerCall(Box<BindingInitializerCallValue>),
+    FieldWrite(Box<field_access::FieldAccessValue<CodeQueryFieldWrite>>),
+    FieldRead(Box<field_access::FieldAccessValue<CodeQueryFieldRead>>),
     FlowRelation(Box<FlowRelationValue>),
     ControlRelation(Box<ControlRelationValue>),
     BranchRelation(Box<BranchRelationValue>),
@@ -1998,6 +2364,8 @@ enum PipelineKey {
     ReferenceEdge(EdgeKey),
     StateEvent(StateEventKey),
     BindingInitializerCall(String),
+    FieldWrite(String),
+    FieldRead(String),
     FlowRelation(FlowRelationKey),
     ControlRelation(ControlRelationKey),
     BranchRelation(String),
@@ -2255,6 +2623,8 @@ impl PipelineValue {
             Self::BindingInitializerCall(value) => {
                 PipelineKey::BindingInitializerCall(value.row.id.clone())
             }
+            Self::FieldWrite(value) => PipelineKey::FieldWrite(value.row.id.clone()),
+            Self::FieldRead(value) => PipelineKey::FieldRead(value.row.id.clone()),
             Self::FlowRelation(value) => PipelineKey::FlowRelation(value.key()),
             Self::ControlRelation(value) => PipelineKey::ControlRelation(value.key()),
             Self::BranchRelation(value) => PipelineKey::BranchRelation(value.key()),
@@ -2760,6 +3130,8 @@ enum PipelineTraceValue {
     ReferenceEdge(Box<EdgeValue>),
     StateEvent(Box<StateEventValue>),
     BindingInitializerCall(Box<BindingInitializerCallValue>),
+    FieldWrite(Box<field_access::FieldAccessValue<CodeQueryFieldWrite>>),
+    FieldRead(Box<field_access::FieldAccessValue<CodeQueryFieldRead>>),
     FlowRelation(Box<FlowRelationValue>),
     ControlRelation(Box<ControlRelationValue>),
     BranchRelation(Box<BranchRelationValue>),
@@ -2936,11 +3308,46 @@ type CachedProcedureSourceOwners = (
     HashMap<(usize, usize), CodeQueryStableOwnerCandidate>,
 );
 
+/// What the render cache holds for one file's source. Every variant but
+/// `Retained` reads as "no source" to the coordinate and snapshot lookups; only
+/// site rendering tells them apart.
+enum RetainedSource {
+    Retained(CachedSourceCoordinates),
+    /// The response's source render budget refused to load the file.
+    BudgetRefused,
+    /// Two different source snapshots of the file were held.
+    Conflicting,
+    /// The analyzer has no source to give for the file.
+    Unavailable,
+}
+
+impl RetainedSource {
+    fn coordinates(&self) -> Option<&CachedSourceCoordinates> {
+        match self {
+            Self::Retained(coordinates) => Some(coordinates),
+            Self::BudgetRefused | Self::Conflicting | Self::Unavailable => None,
+        }
+    }
+
+    fn loaded(source: Option<String>) -> Self {
+        match source {
+            Some(source) => Self::Retained(CachedSourceCoordinates {
+                blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                    .expect("hash retained source"),
+                line_starts: compute_line_starts(&source),
+                source,
+            }),
+            None => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Default)]
 struct PipelineRenderCache {
+    presentation: Option<presentation::PresentationWindow>,
     rendered_capture_bytes: usize,
     capture_truncated_rows: usize,
-    sources: HashMap<ProjectFile, Option<CachedSourceCoordinates>>,
+    sources: HashMap<ProjectFile, RetainedSource>,
     procedure_owners: HashMap<ProjectFile, CachedProcedureSourceOwners>,
     procedure_owner_work: ProcedureOwnerWork,
     procedure_owner_target_facts: HashMap<ProjectFile, Arc<FileFacts>>,
@@ -2954,6 +3361,35 @@ struct PipelineRenderCache {
 }
 
 impl PipelineRenderCache {
+    /// Why `file` has no rendered source: the typed cache entry, or the sealed
+    /// probe (which leaves no entry).
+    fn unrendered_reason(&self, file: &ProjectFile) -> UnrenderedReason {
+        match self.sources.get(file) {
+            None => {
+                debug_assert!(
+                    self.source_probe_is_sealed(file),
+                    "an unsealed pass loads or caches the source of {}",
+                    rel_path_string(file)
+                );
+                UnrenderedReason::RenderBudget
+            }
+            Some(RetainedSource::BudgetRefused) => UnrenderedReason::RenderBudget,
+            Some(RetainedSource::Conflicting) => UnrenderedReason::ConflictingSources,
+            // A retained source still renders nothing when its read cannot be
+            // attributed to the file's parse variant (source_coordinates ->
+            // record_render_source_read), for example after a store error.
+            Some(RetainedSource::Unavailable | RetainedSource::Retained(_)) => {
+                UnrenderedReason::SourceUnavailable
+            }
+        }
+    }
+
+    /// Whether a source probe of `file` is refused because the pass sealed
+    /// source loads before the file's source was retained.
+    fn source_probe_is_sealed(&self, file: &ProjectFile) -> bool {
+        self.source_loads_sealed && !self.sources.contains_key(file)
+    }
+
     fn report_capture_truncation(&self, diagnostics: &mut Vec<CodeQueryDiagnostic>) {
         if self.capture_truncated_rows > 0 {
             diagnostics.push(incomplete_diagnostic(
@@ -2976,16 +3412,21 @@ impl PipelineRenderCache {
         }
         if let Some(existing) = self.sources.get(file) {
             match existing {
-                Some(coordinates) if coordinates.source == source => return true,
-                Some(_) => {
+                RetainedSource::Retained(coordinates) if coordinates.source == source => {
+                    return true;
+                }
+                RetainedSource::Retained(_) => {
                     // Conflicting snapshots cannot support exact evidence or
                     // rendering. Retain the negative cache entry so a later
                     // renderer cannot silently hydrate a third source version.
-                    self.sources.insert(file.clone(), None);
+                    self.sources
+                        .insert(file.clone(), RetainedSource::Conflicting);
                     self.conflicting_sources.insert(file.clone());
                     return false;
                 }
-                None => {
+                RetainedSource::BudgetRefused
+                | RetainedSource::Conflicting
+                | RetainedSource::Unavailable => {
                     // A held fact snapshot has already been charged by seed
                     // execution and may safely replace an earlier negative
                     // hydration entry.
@@ -2995,7 +3436,7 @@ impl PipelineRenderCache {
         }
         self.sources.insert(
             file.clone(),
-            Some(CachedSourceCoordinates {
+            RetainedSource::Retained(CachedSourceCoordinates {
                 blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
                     .expect("hash retained source"),
                 line_starts: compute_line_starts(source),
@@ -3028,26 +3469,14 @@ impl PipelineRenderCache {
             // certify, and must not become a cached failed load.
             return None;
         }
-        self.sources.entry(file.clone()).or_insert_with(|| {
-            load().map(|source| CachedSourceCoordinates {
-                blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
-                    .expect("hash retained source"),
-                line_starts: compute_line_starts(&source),
-                source,
-            })
-        });
+        self.sources
+            .entry(file.clone())
+            .or_insert_with(|| RetainedSource::loaded(load()));
         self.source_coordinates(analyzer, file)
     }
 
-    fn retain_loaded_source(&mut self, file: &ProjectFile, source: Option<String>) {
-        self.sources.entry(file.clone()).or_insert_with(|| {
-            source.map(|source| CachedSourceCoordinates {
-                blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
-                    .expect("hash retained source"),
-                line_starts: compute_line_starts(&source),
-                source,
-            })
-        });
+    fn retain_loaded_source(&mut self, file: &ProjectFile, entry: RetainedSource) {
+        self.sources.entry(file.clone()).or_insert(entry);
     }
 
     fn seal_source_loads(&mut self) {
@@ -3060,7 +3489,7 @@ impl PipelineRenderCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Option<&CachedSourceCoordinates> {
-        let coordinates = self.sources.get(file).and_then(Option::as_ref);
+        let coordinates = self.sources.get(file).and_then(RetainedSource::coordinates);
         if !record_render_source_read(
             analyzer,
             file,
@@ -3930,6 +4359,10 @@ struct QueryExecutionState<'a> {
     /// receiver steps that resolve additional selected native sites.
     receiver_service: Option<ReceiverQueryService<'a>>,
     semantic: Option<SemanticQueryContext<'a>>,
+    /// Completed rows held by an enclosing frame or by a finished sibling
+    /// operand while this frame runs. Each holder whose rows retain a semantic
+    /// artifact handle keeps the request from releasing its artifacts.
+    pinned_row_artifacts: usize,
     semantic_factory: Box<dyn Fn() -> Option<SemanticQueryContext<'a>> + Send + Sync + 'a>,
     call_shape_work: CodeQuerySemanticWork,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -4968,6 +5401,7 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
         artifact_leases,
         execution_scope,
         None,
+        PresentQueryRows,
     )
 }
 
@@ -5001,11 +5435,79 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_a
         artifact_leases,
         execution_scope,
         Some(row_family_session),
+        PresentQueryRows,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
+pub fn execute_code_query_selector_rows(
+    workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    root_allotment: CodeQueryRootAllotment,
+    cancellation: Option<&CancellationToken>,
+    parent_semantic: &SemanticBudget,
+    parent_execution: &SemanticExecutionBudget,
+    artifact_leases: SemanticArtifactLeaseSnapshot,
+    execution_scope: CodeQueryExecutionScope<'_>,
+) -> DetailedSelectorResult {
+    execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
+        workspace,
+        flow_state,
+        query,
+        limits,
+        root_allotment,
+        cancellation,
+        parent_semantic,
+        parent_execution,
+        artifact_leases,
+        execution_scope,
+        None,
+        ProjectSelectorRows,
+    )
+    .detailed
+}
+
+/// Eager workspace query execution that also reuses complete occurrence and
+/// lexical-environment row families across one explicitly bounded selector
+/// compilation.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn execute_code_query_selector_rows_with_row_family_session(
+    workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    root_allotment: CodeQueryRootAllotment,
+    cancellation: Option<&CancellationToken>,
+    parent_semantic: &SemanticBudget,
+    parent_execution: &SemanticExecutionBudget,
+    artifact_leases: SemanticArtifactLeaseSnapshot,
+    execution_scope: CodeQueryExecutionScope<'_>,
+    row_family_session: &mut CodeQueryRowFamilySession,
+) -> DetailedSelectorResult {
+    execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
+        workspace,
+        flow_state,
+        query,
+        limits,
+        root_allotment,
+        cancellation,
+        parent_semantic,
+        parent_execution,
+        artifact_leases,
+        execution_scope,
+        Some(row_family_session),
+        ProjectSelectorRows,
+    )
+    .detailed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core<
+    F: QueryRowsFinalizer,
+>(
     workspace: &WorkspaceAnalyzer,
     flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
@@ -5017,7 +5519,8 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
     artifact_leases: SemanticArtifactLeaseSnapshot,
     execution_scope: CodeQueryExecutionScope<'_>,
     row_family_session: Option<&mut CodeQueryRowFamilySession>,
-) -> DetailedCodeQueryResult {
+    finalizer: F,
+) -> F::Output {
     let parent_scope = parent_semantic.scope_snapshot();
     let (execution_before, execution_child) =
         parent_execution.fork_with_materialized_file_limit(limits.semantic.max_materialized_files);
@@ -5030,7 +5533,7 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
             OccurrenceDerivationOptions::IDENTITY_ONLY,
         )
     });
-    execute_internal_with_analysis_strategy_and_row_family_session(
+    execute_query_rows_with_finalizer(
         workspace.analyzer(),
         token,
         None,
@@ -5061,6 +5564,7 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
         None,
         None,
         EdgeTraversalCache::default(),
+        finalizer,
     )
 }
 
@@ -5538,10 +6042,65 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     semantic_continuation: Option<SemanticQueryContinuation>,
     access_failure_out: Option<&mut Option<String>>,
     scope: CodeQueryExecutionScope<'_>,
-    mut row_keys_out: Option<&mut Vec<UnitRowKey>>,
+    row_keys_out: Option<&mut Vec<UnitRowKey>>,
     native_rows_out: Option<&mut Vec<PipelineRow>>,
     edge_cache: EdgeTraversalCache,
 ) -> DetailedCodeQueryResult {
+    execute_query_rows_with_finalizer(
+        analyzer,
+        token,
+        read_scope,
+        workspace,
+        semantic_flow_resources,
+        analysis_context,
+        workspace_generation,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+        union_strategy,
+        scheduler_workers,
+        access_mode,
+        occurrence_options,
+        row_family_stores,
+        semantic_continuation,
+        access_failure_out,
+        scope,
+        row_keys_out,
+        native_rows_out,
+        edge_cache,
+        PresentQueryRows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_query_rows_with_finalizer<F: QueryRowsFinalizer>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    read_scope: Option<&AnalyzerQueryScope<'_>>,
+    workspace: Option<&WorkspaceAnalyzer>,
+    semantic_flow_resources: Option<SemanticFlowResources>,
+    analysis_context: Option<&QueryAnalysisContext>,
+    workspace_generation: u64,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+    union_strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+    access_mode: StructuralAccessMode,
+    occurrence_options: OccurrenceDerivationOptions,
+    row_family_stores: Option<SharedRowFamilyStores>,
+    semantic_continuation: Option<SemanticQueryContinuation>,
+    access_failure_out: Option<&mut Option<String>>,
+    scope: CodeQueryExecutionScope<'_>,
+    row_keys_out: Option<&mut Vec<UnitRowKey>>,
+    native_rows_out: Option<&mut Vec<PipelineRow>>,
+    edge_cache: EdgeTraversalCache,
+    finalizer: F,
+) -> F::Output {
     let incoming_file = scope.reverse_entered_file().cloned();
     assert!(
         incoming_file.is_none()
@@ -5583,14 +6142,13 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     );
     let request_started = capture_profile.then(Instant::now);
     let planning_started = capture_profile.then(Instant::now);
-    // A requested traversal that never started cannot certify an empty frontier.
-    // The producer preserves typed absence for consumers that did not request it.
-    let unexecuted_result = |mut result: CodeQueryResult| {
-        result = unexecuted_depth_result(result, query, &scope);
-        detailed_result_without_evidence(result, CodeQueryExecutionBudget::default())
-    };
     if !capture_profile && cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unexecuted_result(cancelled_query_result(session_subset(analyzer)));
+        return finish_unexecuted_query(
+            finalizer,
+            cancelled_query_result(session_subset(analyzer)),
+            query,
+            &scope,
+        );
     }
     let physical_plan = match select_physical_plan(
         query,
@@ -5600,7 +6158,12 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            return unexecuted_result(invalid_plan_result(session_subset(analyzer), error));
+            return finish_unexecuted_query(
+                finalizer,
+                invalid_plan_result(session_subset(analyzer), error),
+                query,
+                &scope,
+            );
         }
     };
     let requires_semantic = query_plan_requires_semantic(&query.plan)
@@ -5609,22 +6172,37 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     let optional_call_site_identity =
         workspace.is_some() && query_plan_has_call_site_rows(&query.plan);
     if requires_semantic && semantic_continuation.is_none() && !limits.semantic.all_positive() {
-        return unexecuted_result(invalid_plan_result(
-            session_subset(analyzer),
-            "semantic execution limits must all be positive for a semantic query",
-        ));
+        return finish_unexecuted_query(
+            finalizer,
+            invalid_plan_result(
+                session_subset(analyzer),
+                "semantic execution limits must all be positive for a semantic query",
+            ),
+            query,
+            &scope,
+        );
     }
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
-        return unexecuted_result(invalid_plan_result(
-            session_subset(analyzer),
-            "typestate execution limits must be positive and no greater than their hard maxima",
-        ));
+        return finish_unexecuted_query(
+            finalizer,
+            invalid_plan_result(
+                session_subset(analyzer),
+                "typestate execution limits must be positive and no greater than their hard maxima",
+            ),
+            query,
+            &scope,
+        );
     }
     if query_plan_requires_value_flow(&query.plan) && !limits.value_flow.is_valid() {
-        return unexecuted_result(invalid_plan_result(
-            session_subset(analyzer),
-            "value-flow execution limits must be positive and no greater than their hard maxima",
-        ));
+        return finish_unexecuted_query(
+            finalizer,
+            invalid_plan_result(
+                session_subset(analyzer),
+                "value-flow execution limits must be positive and no greater than their hard maxima",
+            ),
+            query,
+            &scope,
+        );
     }
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let active_models = active_semantic_model_snapshot
@@ -5721,6 +6299,9 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     let root_memo = semantic_flow_resources
         .as_ref()
         .and_then(|resources| resources.root_memo.clone());
+    let guard_bindings = semantic_flow_resources
+        .as_ref()
+        .and_then(|resources| resources.guard_bindings.clone());
     let factory_models = active_semantic_model_snapshot.clone();
     let semantic_factory = Box::new(move || {
         workspace
@@ -5764,6 +6345,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     &query.plan,
                 ));
                 semantic.set_root_memo(root_memo.clone());
+                semantic.set_guard_bindings(guard_bindings.clone());
                 semantic
             })
     });
@@ -5835,6 +6417,23 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             semantic: (requires_semantic || optional_call_site_identity)
                 .then(&semantic_factory)
                 .flatten(),
+            pinned_row_artifacts: usize::from(
+                scope.intersect_operands().is_some_and(|operands| {
+                    operands
+                        .iter()
+                        .flatten()
+                        .any(pipeline_row_retains_semantic_artifact)
+                }) || scope
+                    .reachability_operands
+                    .as_ref()
+                    .is_some_and(|operands| {
+                        operands
+                            .sources
+                            .values()
+                            .flat_map(|(rows, _)| rows)
+                            .any(pipeline_row_retains_semantic_artifact)
+                    }),
+            ),
             semantic_factory,
             call_shape_work: CodeQuerySemanticWork::default(),
             import_graph: None,
@@ -5923,6 +6522,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             message: "workspace content changed after structural posting selection; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }), Some(DerivationExecutionCause::Snapshot)));
         }
         if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
@@ -5962,11 +6562,10 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 .read(&memo_attribution(state.analyzer), |effects| {
                     effects.truncated
                 })
-            || state.control_relation_cache.refusal_count() > 0
         {
             brokk_bifrost_core::profiling::note_with(|| {
                 format!(
-                    "policy.units unbounded origin={}:{} cause=query_boundary cancelled={} truncated={} provider={} semantic={} effect_coverage={} cfg={}",
+                    "policy.units unbounded origin={}:{} cause=query_boundary cancelled={} truncated={} provider={} semantic={} effect_coverage={}",
                     file!(),
                     line!(),
                     execution.is_cancelled(),
@@ -5977,294 +6576,123 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                         .call_cache
                         .effects
                         .read(&memo_attribution(state.analyzer), |effects| effects
-                            .truncated),
-                    state.control_relation_cache.refusal_count() > 0
+                            .truncated)
                 )
             });
             state.mark_execution_dependent();
         }
-        let execution_work_profile =
-            capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
-        let rendering_started = capture_profile.then(Instant::now);
-        let mut cancelled = execution.is_cancelled();
-        let mut truncated = execution.is_truncated();
-        let mut rendering_truncated = false;
-        // A narrowed union leaf keeps the executor's actual traces and carries
-        // the authored path through every projection. The ordinary root query
-        // retains its historical plain-structural response shape, which omits
-        // seed-only traces.
-        if let Some(native_rows) = native_rows_out {
-            native_rows.extend(execution.rows.iter().cloned());
-        }
-        if !scope.branch_path().is_empty() {
-            let branch_path = scope.branch_path();
-            // Execution, including prepared operands, reports paths relative
-            // to this leaf. Prefix before rendering; its later diagnostics
-            // start empty and receive the same path at the final check.
-            for diagnostic in &mut diagnostics {
-                diagnostic.branch.splice(0..0, branch_path.iter().copied());
-            }
-            for row in &mut execution.rows {
-                for trace in &mut row.traces {
-                    // A projecting leaf may itself select ordinary set-plan
-                    // sources. Preserve that inner branch below the leaf's path.
-                    trace.branch.splice(0..0, branch_path.iter().copied());
-                }
-            }
-        } else if query.seed().is_some() && query.plan.steps.is_empty() {
-            for row in &mut execution.rows {
-                row.traces.clear();
-                row.provenance_truncated = false;
-            }
-        }
-        if scope.branch_path().is_empty()
-            && let Some(seed) = query.seed()
-        {
-            let plan = QueryPlan::for_query(seed);
-            if should_report_broad_query(&plan, seed, &state.budget, truncated) {
-                push_broad_query_diagnostic(&mut diagnostics, &state.budget);
-            }
-        }
-        let mut render_cache = PipelineRenderCache {
-            procedure_owner_work: ProcedureOwnerWork::new(
-                state.budget.provenance_steps,
-                limits.max_pipeline_rows,
-                cancellation.cloned(),
-            ),
-            ..PipelineRenderCache::default()
-        };
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            cancelled = true;
-            push_cancelled_diagnostic(&mut diagnostics);
-        }
-        let mut results = Vec::with_capacity(execution.rows.len());
-        let mut evidence = Vec::with_capacity(execution.rows.len());
-        for (result_index, row) in execution.rows.into_iter().enumerate() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                cancelled = true;
-                truncated = true;
-                push_cancelled_diagnostic(&mut diagnostics);
-                break;
-            }
-            if retain_budgeted_pipeline_sources(
+        let owner = workspace
+            .map(|workspace| workspace.retention_budget().clone())
+            .or_else(|| {
+                analyzer
+                    .owned_lookup_memo()
+                    .map(|registry| registry.owner().clone())
+            });
+        finalizer.finish(
+            ExecutedQueryRows {
+                state,
+                execution,
+                diagnostics,
+                semantic_work,
+                configured_cap,
+                owner,
+            },
+            QueryFinalizationContext {
                 analyzer,
-                &row,
-                &mut render_cache,
-                &mut state.budget,
-                limits,
-                &mut diagnostics,
-            ) {
-                truncated = true;
-                rendering_truncated = true;
-            }
-            if retain_procedure_owner_facts(
-                analyzer,
-                &row,
-                &mut render_cache,
-                &mut state.receiver_facts,
-                &mut state.budget,
+                query,
                 limits,
                 cancellation,
-                &mut diagnostics,
-            ) {
-                truncated = true;
-                rendering_truncated = true;
-            }
-            render_cache.seal_source_loads();
-            if let Some(row_keys) = row_keys_out.as_deref_mut() {
-                row_keys.push(unit_row_key(&row.value.key()));
-            }
-            let terminal_source_file = terminal_source_file(&row.value);
-            let retained_source =
-                terminal_source_file.and_then(|file| render_cache.source_snapshot(analyzer, file));
-            let binding_range = pipeline_export_binding_range(analyzer, &row.value, &render_cache);
-            let mut row_evidence = detailed_evidence_for_pipeline_value(
-                result_index,
-                &row.value,
-                retained_source,
-                binding_range,
-            );
-            if matches!(
-                row_evidence.selected_pattern_source,
-                SelectedPatternSourceEvidence::Conflict
-            ) {
-                diagnostics.push(incomplete_diagnostic(
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                    Incompleteness::Content,
-                    "rust",
-                    format!(
-                        "selected source-entry proofs conflict for {} at {:?}",
-                        rel_path_string(&row_evidence.file),
-                        row_evidence.byte_span
-                    ),
-                    Vec::new(),
-                ));
-            }
-            row_evidence.call_path_evidence = row.call_path_evidence.clone();
-            row_evidence.provenance =
-                detailed_provenance_for_row(analyzer, &row, &mut render_cache);
-            evidence.push(row_evidence);
-            results.push(render_pipeline_item(
-                analyzer,
-                row,
-                query.result_detail,
-                &mut render_cache,
-            ));
-        }
-        state.budget.provenance_steps = render_cache.procedure_owner_work.used;
-        if let Some(attempted) = render_cache.procedure_owner_work.refused {
-            if !diagnostics.iter().any(|diagnostic| {
-                matches!(
-                    diagnostic.code,
-                    CodeQueryDiagnosticCode::PipelineBudgetExhausted
-                        | CodeQueryDiagnosticCode::ExecutionBudgetExhausted
-                )
-            }) {
-                let mut projected = state.budget;
-                projected.provenance_steps = attempted;
-                push_budget_diagnostic(
-                    &mut diagnostics,
-                    &projected,
-                    limits,
-                    Some(&state.budget),
-                    "procedure_source_owner",
-                );
-            }
-            truncated = true;
-        }
-        if render_cache.procedure_owner_work.cancelled {
-            cancelled = true;
-            push_cancelled_diagnostic(&mut diagnostics);
-        }
-        render_cache.report_capture_truncation(&mut diagnostics);
-        let structural_index_stale = !state
-            .structural_index_session
-            .selections_are_current(|content| state.analyzer.workspace_content_matches(content));
-        if structural_index_stale {
-            results.clear();
-            evidence.clear();
-            truncated = true;
-            state.access_failure.get_or_insert_with(|| {
-                "workspace content changed during result rendering".to_string()
-            });
-            if !diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
-                    && diagnostic.message.contains("structural posting")
-            }) {
-                diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-                has_non_utf8_refusal: false,
-                refusal_sites: Default::default(),
-                call_relation_facts: None,
-                uses_omissions: Vec::new(),
-                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
-                related: Vec::new(),
-                source: None,
-                code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language: "workspace",
-                message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
-            exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
-            }), Some(DerivationExecutionCause::Snapshot)));
-            }
-        }
-        if !cancelled && !structural_index_stale {
-            state.structural_index_session.publish_auto_observations();
-        }
-        if !scope.branch_path().is_empty() {
-            let branch_path = scope.branch_path();
-            for diagnostic in &mut diagnostics {
-                if diagnostic.branch.is_empty() {
-                    diagnostic.branch.extend_from_slice(branch_path);
-                } else {
-                    assert!(
-                        diagnostic.branch.starts_with(branch_path),
-                        "a union leaf diagnostic must carry its full branch path"
-                    );
-                }
-            }
-        }
-        // Rendering can itself exhaust provenance/output limits or observe a
-        // stale source after the plan has finished.
-        if cancelled
-            || (truncated && !configured_cap)
-            || rendering_truncated
-            || state.access_failure.is_some()
-        {
-            brokk_bifrost_core::profiling::note_with(|| {
-                format!(
-                    "policy.units unbounded origin={}:{} cause=render_boundary cancelled={} truncated={} provider={}",
-                    file!(),
-                    line!(),
-                    cancelled,
-                    truncated,
-                    state.access_failure.is_some()
-                )
-            });
-            state.mark_execution_dependent();
-        }
-        let total_work = execution_work_snapshot(state.budget, semantic_work);
-        let work = public_execution_work(total_work);
-        let candidate_site_set = std::mem::take(&mut state.candidate_sites);
-        let budgeted_work = budgeted_execution_work(
-            state.budget,
-            Some(std::mem::take(&mut state.step_outputs)),
-            Some(candidate_site_set.len()),
-        );
-        if let Some(profile) = &mut state.profile {
-            let execution_work = execution_work_profile.unwrap_or_default();
-            profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
-            profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
-            profile.execution_work = execution_work;
-            profile.rendering_work = total_work.saturating_sub(execution_work);
-            profile.work = total_work;
-            profile.cache = state.cache_profile.unwrap_or_default();
-        }
-        let profile = state.profile;
-        if let Some(out) = access_failure_out {
-            *out = state.access_failure.take();
-        }
-        let semantic = state.semantic.take();
-        let mut reuse = semantic
-            .as_ref()
-            .map_or(state.reuse, |semantic| state.reuse.join(semantic.reuse()))
-            .join(preflight_files.reuse());
-        let semantic_receipt = semantic.and_then(SemanticQueryContext::into_receipt);
-        let mut result = CodeQueryResult {
-            results,
-            truncated: truncated || cancelled,
-            depth_bound_status: state.depth_bound_status,
-            session_subset: session_subset(analyzer),
-            diagnostics: normalize_query_diagnostics(
-                diagnostics
-                    .into_iter()
-                    .map(|diagnostic| QueryExecutionState::diagnostic(analyzer, diagnostic, None))
-                    .collect(),
-            ),
-        };
-        // Every returned execution-state diagnostic was marked as it was mapped
-        // above, so each carries its dependence into the verdict. This is the
-        // verdict of the marks whose only product is such a diagnostic.
-        for diagnostic in &result.diagnostics {
-            reuse.join_in(diagnostic.reuse_verdict());
-        }
-        fold_query_read_incompleteness(
-            &mut result.diagnostics,
-            read_scope.captured_read_incompleteness(),
-        );
-        result.cap_flow_status_by_run();
-        if result.depth_bound_status == Some(DepthBoundStatus::NotReached)
-            && !matches!(
-                result.completion(),
-                CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
-            )
-        {
-            // An early stop cannot certify a negative depth frontier. The real
-            // query incompleteness remains the policy run's primary cause.
-            result.depth_bound_status = Some(DepthBoundStatus::Unknown);
-        }
-        let detailed = DetailedCodeQueryResult {
+                capture_profile,
+                request_started,
+                read_scope,
+                preflight_reuse: preflight_files.reuse(),
+                access_failure_out,
+                row_keys_out,
+                native_rows_out,
+            },
+        )
+    };
+    render()
+}
+
+/// The executed native rows, consumed by exactly one semantic or presentation
+/// finalizer while the query's source and model-publication scopes remain live.
+struct ExecutedQueryRows<'a> {
+    state: Box<QueryExecutionState<'a>>,
+    execution: PlanExecution,
+    diagnostics: Vec<CodeQueryDiagnostic>,
+    semantic_work: CodeQuerySemanticWork,
+    configured_cap: bool,
+    owner: Option<brokk_bifrost_core::retention_budget::RetentionBudget>,
+}
+
+struct QueryFinalizationContext<'a, 'source> {
+    analyzer: &'a dyn IAnalyzer,
+    query: &'a CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&'a CancellationToken>,
+    capture_profile: bool,
+    request_started: Option<Instant>,
+    read_scope: &'a AnalyzerQueryScope<'source>,
+    preflight_reuse: ReuseVerdict,
+    access_failure_out: Option<&'a mut Option<String>>,
+    row_keys_out: Option<&'a mut Vec<UnitRowKey>>,
+    native_rows_out: Option<&'a mut Vec<PipelineRow>>,
+}
+
+trait QueryRowsFinalizer {
+    type Output;
+
+    fn unexecuted(self, detailed: DetailedCodeQueryResult) -> Self::Output;
+    fn finish(
+        self,
+        rows: ExecutedQueryRows<'_>,
+        context: QueryFinalizationContext<'_, '_>,
+    ) -> Self::Output;
+}
+
+// #14068: keep large unexecuted result temporaries out of the executor's
+// frame while the plan and its nested semantic operations use the stack.
+fn finish_unexecuted_query<F: QueryRowsFinalizer>(
+    finalizer: F,
+    result: CodeQueryResult,
+    query: &CodeQuery,
+    scope: &CodeQueryExecutionScope<'_>,
+) -> F::Output {
+    // A requested traversal that never started cannot certify an empty frontier.
+    // Preserve typed absence for consumers that did not request it.
+    let result = unexecuted_depth_result(result, query, scope);
+    finalizer.unexecuted(detailed_result_without_evidence(
+        result,
+        CodeQueryExecutionBudget::default(),
+    ))
+}
+
+struct PresentQueryRows;
+
+impl QueryRowsFinalizer for PresentQueryRows {
+    type Output = DetailedCodeQueryResult;
+
+    fn unexecuted(self, detailed: DetailedCodeQueryResult) -> Self::Output {
+        detailed
+    }
+
+    fn finish(
+        self,
+        rows: ExecutedQueryRows<'_>,
+        context: QueryFinalizationContext<'_, '_>,
+    ) -> Self::Output {
+        present_query_rows(rows, context)
+    }
+}
+
+struct ProjectSelectorRows;
+
+impl QueryRowsFinalizer for ProjectSelectorRows {
+    type Output = SelectorUnitExecution;
+
+    fn unexecuted(self, detailed: DetailedCodeQueryResult) -> Self::Output {
+        let DetailedQueryResult {
             result,
             work,
             budgeted_work,
@@ -6272,13 +6700,844 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             evidence,
             profile,
             semantic_receipt,
-            depth_answers: state.depth_answers,
+            depth_answers,
             reuse,
+        } = detailed;
+        assert!(result.results.is_empty(), "an unexecuted query has no rows");
+        let result = QueryResult {
+            results: Vec::new(),
+            truncated: result.truncated,
+            depth_bound_status: result.depth_bound_status,
+            session_subset: result.session_subset,
+            diagnostics: result.diagnostics,
         };
-        detailed.assert_invariants();
-        detailed
+        selector_execution(
+            DetailedSelectorResult {
+                result,
+                work,
+                budgeted_work,
+                candidate_site_set,
+                evidence,
+                profile,
+                semantic_receipt,
+                depth_answers,
+                reuse,
+            },
+            Vec::new(),
+        )
+    }
+
+    fn finish(
+        self,
+        rows: ExecutedQueryRows<'_>,
+        context: QueryFinalizationContext<'_, '_>,
+    ) -> Self::Output {
+        project_selector_rows(rows, context, CodeQueryResultDetail::Full)
+    }
+}
+
+/// Generic query units preserve requested output metadata for every row family.
+/// Policy selectors retain complete semantic projections independently.
+struct ProjectQueryUnitRows;
+
+impl QueryRowsFinalizer for ProjectQueryUnitRows {
+    type Output = SelectorUnitExecution;
+
+    fn unexecuted(self, detailed: DetailedCodeQueryResult) -> Self::Output {
+        ProjectSelectorRows.unexecuted(detailed)
+    }
+
+    fn finish(
+        self,
+        rows: ExecutedQueryRows<'_>,
+        context: QueryFinalizationContext<'_, '_>,
+    ) -> Self::Output {
+        let detail = context.query.result_detail;
+        project_selector_rows(rows, context, detail)
+    }
+}
+
+fn selector_execution(
+    detailed: DetailedSelectorResult,
+    rows: Vec<UnitRow>,
+) -> SelectorUnitExecution {
+    let unit = UnitExecutionResult {
+        except_left_complete_empty: None,
+        rows,
+        work: detailed.work,
+        budgeted_work: detailed.budgeted_work.clone(),
+        completion: detailed.result.completion(),
+        depth_bound_status: detailed.result.depth_bound_status,
+        depth_answers: detailed.depth_answers.clone(),
+        diagnostics: detailed.result.diagnostics.semantic().to_vec(),
+        truncated: detailed.result.truncated,
+        reuse: detailed.reuse,
     };
-    render()
+    SelectorUnitExecution { unit, detailed }
+}
+
+struct SelectedRowProduct {
+    item: SelectorResultItem,
+    unit: UnitRow,
+}
+
+/// The selector and unit projections consume semantic facts, never wire sites.
+fn project_selector_rows(
+    rows: ExecutedQueryRows<'_>,
+    mut context: QueryFinalizationContext<'_, '_>,
+    detail: CodeQueryResultDetail,
+) -> SelectorUnitExecution {
+    let analyzer = context.analyzer;
+    let mut prepared = prepare_native_rows(rows, &mut context);
+    let mut selected = Vec::with_capacity(prepared.native.len());
+    let mut evidence = Vec::with_capacity(prepared.evidence.len());
+    for (row, row_evidence) in std::mem::take(&mut prepared.native)
+        .into_iter()
+        .zip(std::mem::take(&mut prepared.evidence))
+    {
+        if context
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            break;
+        }
+        let provenance = row
+            .traces
+            .iter()
+            .map(|trace| render_provenance(analyzer, trace, detail, &mut prepared.render_cache))
+            .collect::<Vec<_>>();
+        // The final run cap is applied below, after late provider/capture work.
+        let (item, live) = scalar_projection::project_selector_row(
+            analyzer,
+            &row,
+            detail,
+            &mut prepared.render_cache,
+            &CodeQueryCompletion::Complete,
+            provenance,
+        );
+        selected.push(SelectedRowProduct {
+            item: live,
+            unit: UnitRow {
+                item,
+                evidence: UnitRowEvidence::project(&row_evidence),
+                key: unit_row_key(&row.value.key()),
+            },
+        });
+        evidence.push(row_evidence);
+    }
+    let detailed = finalize_consumed_rows(prepared, context, selected, evidence);
+    let completion = detailed.result.completion();
+    let DetailedQueryResult {
+        result,
+        work,
+        budgeted_work,
+        candidate_site_set,
+        evidence,
+        profile,
+        semantic_receipt,
+        depth_answers,
+        reuse,
+    } = detailed;
+    let QueryResult {
+        results: selected,
+        truncated,
+        depth_bound_status,
+        session_subset,
+        diagnostics,
+    } = result;
+    let mut results = Vec::with_capacity(selected.len());
+    let mut unit_rows = Vec::with_capacity(selected.len());
+    for SelectedRowProduct { item, mut unit } in selected {
+        let QueryResultItem {
+            value,
+            provenance,
+            provenance_truncated,
+            row_projection,
+        } = item;
+        let item = match value {
+            SelectorResultValue::FlowEndpoint { mut value } => {
+                let before = value.status;
+                results::cap_flow_status_for_completion(&mut value, &completion);
+                let wire = CodeQueryResultItem {
+                    value: CodeQueryResultValue::FlowEndpoint { value },
+                    provenance,
+                    provenance_truncated,
+                    row_projection,
+                };
+                if let CodeQueryResultValue::FlowEndpoint { value } = &wire.value
+                    && value.status != before
+                {
+                    // Pure projection of an already owned endpoint; no provider read.
+                    unit.item = UnitRowItem::project(&wire);
+                }
+                SelectorResultItem {
+                    value: wire.value.into_selector_value(),
+                    provenance: wire.provenance,
+                    provenance_truncated: wire.provenance_truncated,
+                    row_projection: wire.row_projection,
+                }
+            }
+            value => SelectorResultItem {
+                value,
+                provenance,
+                provenance_truncated,
+                row_projection,
+            },
+        };
+        results.push(item);
+        unit_rows.push(unit);
+    }
+    selector_execution(
+        DetailedSelectorResult {
+            result: SelectorQueryResult {
+                results,
+                truncated,
+                depth_bound_status,
+                session_subset,
+                diagnostics,
+            },
+            work,
+            budgeted_work,
+            candidate_site_set,
+            evidence,
+            profile,
+            semantic_receipt,
+            depth_answers,
+            reuse,
+        },
+        unit_rows,
+    )
+}
+
+struct PreparedQueryRows<'a> {
+    state: Box<QueryExecutionState<'a>>,
+    diagnostics: Vec<CodeQueryDiagnostic>,
+    native: Vec<PipelineRow>,
+    evidence: Vec<DetailedCodeQueryEvidence>,
+    render_cache: PipelineRenderCache,
+    // Keep the existing analyzer owner alive through consumed finalization.
+    _owner: Option<brokk_bifrost_core::retention_budget::RetentionBudget>,
+    configured_cap: bool,
+    cancelled: bool,
+    truncated: bool,
+    rendering_truncated: bool,
+    execution_work_profile: Option<QueryOperatorWorkProfile>,
+    rendering_started: Option<Instant>,
+}
+
+/// Presentation owns only output admission. The closed refusal flag is attached
+/// after semantic finalization; it cannot enter execution or its receipt.
+fn present_query_rows(
+    rows: ExecutedQueryRows<'_>,
+    mut context: QueryFinalizationContext<'_, '_>,
+) -> DetailedCodeQueryResult {
+    let analyzer = context.analyzer;
+    let (mut prepared, presentation) =
+        prepare_native_rows_with(rows, &mut context, presentation::PreparePresentationSources);
+    let mut results = Vec::new();
+    let mut evidence = Vec::new();
+    let mut refusal = None;
+    match presentation {
+        Ok(window) => {
+            prepared.render_cache.presentation = Some(window);
+            for (row, mut row_evidence) in std::mem::take(&mut prepared.native)
+                .into_iter()
+                .zip(std::mem::take(&mut prepared.evidence))
+            {
+                if context
+                    .cancellation
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    break;
+                }
+                let key = unit_row_key(&row.value.key());
+                match render_pipeline_item(
+                    analyzer,
+                    row,
+                    context.query.result_detail,
+                    &mut prepared.render_cache,
+                ) {
+                    Ok(item) => {
+                        row_evidence.result_index = results.len();
+                        results.push(item);
+                        evidence.push(row_evidence);
+                        if let Some(keys) = context.row_keys_out.as_deref_mut() {
+                            keys.push(key);
+                        }
+                    }
+                    Err(reason) => {
+                        refusal = Some(presentation::presentation_diagnostic(reason));
+                        break;
+                    }
+                }
+            }
+            if refusal.is_none()
+                && prepared
+                    .render_cache
+                    .presentation
+                    .as_ref()
+                    .is_some_and(|window| window.source_refused)
+            {
+                refusal = Some(PresentationDiagnostic::SourceTextRefused);
+            }
+        }
+        Err(presentation::PreparationError::Admission(reason)) => {
+            refusal = Some(presentation::presentation_diagnostic(reason))
+        }
+        Err(presentation::PreparationError::Snapshot(file)) => {
+            refuse_prepared_source(
+                &mut prepared,
+                analyzer,
+                &file,
+                DerivationExecutionCause::Snapshot,
+                format!(
+                    "selected site facts for {} differ from the pinned source snapshot; retry the query",
+                    rel_path_string(&file)
+                ),
+            );
+            if let Some(keys) = context.row_keys_out.as_deref_mut() {
+                keys.clear();
+            }
+        }
+        Err(presentation::PreparationError::SourceBudget(file)) => {
+            assert!(
+                prepared.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                        && diagnostic.exhausted_roots.iter().any(|root| {
+                            root.stage.as_deref() == Some("source_hydration")
+                                && matches!(
+                                    root.lane.as_str(),
+                                    "query/scanned_files" | "query/scanned_source_bytes"
+                                )
+                        })
+                }),
+                "unavailable site facts for {file} require the actual source-hydration budget diagnostic: {:?}",
+                prepared.diagnostics,
+            );
+            assert!(prepared.truncated && prepared.rendering_truncated);
+            // No source was admitted and no facts were held. Withhold this
+            // unpublished batch, keeping the original budget witness/cause.
+            if let Some(keys) = context.row_keys_out.as_deref_mut() {
+                keys.clear();
+            }
+        }
+        Err(presentation::PreparationError::Cancelled) => {
+            prepared.cancelled = true;
+            push_cancelled_diagnostic(&mut prepared.diagnostics);
+        }
+        Err(presentation::PreparationError::ProviderBudget {
+            file,
+            minimum_fact_nodes,
+        }) => {
+            refuse_prepared_source(
+                &mut prepared,
+                analyzer,
+                &file,
+                DerivationExecutionCause::Budget,
+                format!(
+                    "selected site facts provider refused at least {minimum_fact_nodes} fact nodes for {}",
+                    rel_path_string(&file)
+                ),
+            );
+        }
+    }
+    let mut detailed = finalize_consumed_rows(prepared, context, results, evidence);
+    if let Some(refusal) = refusal {
+        detailed.result.diagnostics.set_presentation(refusal);
+        detailed.result.truncated = true;
+        detailed
+            .reuse
+            .join_in(DiagnosticRef::Presentation(refusal).reuse_verdict());
+    }
+    detailed.result.cap_flow_status_by_run();
+    detailed.assert_invariants();
+    detailed
+}
+
+fn refuse_prepared_source(
+    prepared: &mut PreparedQueryRows<'_>,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cause: DerivationExecutionCause,
+    message: String,
+) {
+    let diagnostic = incomplete_diagnostic(
+        CodeQueryDiagnosticCode::SemanticResultsOmitted,
+        Incompleteness::Operational(cause),
+        "workspace",
+        message,
+        Vec::new(),
+    );
+    // Preparation withholds the entire unpublished batch, including rows in
+    // other files. Leave its omission scope at the whole-query default.
+    let diagnostic = QueryExecutionState::diagnostic(analyzer, diagnostic, Some(cause));
+    let reuse = diagnostic.reuse_verdict();
+    prepared.state.reuse.join_in(reuse);
+    if let Some(semantic) = &mut prepared.state.semantic {
+        semantic.join_reuse(reuse);
+    }
+    prepared.state.access_failure.get_or_insert_with(|| {
+        format!(
+            "selected site source unavailable for {}",
+            rel_path_string(file)
+        )
+    });
+    prepared.diagnostics.push(diagnostic);
+    prepared.truncated = true;
+}
+
+struct NativeRowMetadata {
+    evidence: Vec<DetailedCodeQueryEvidence>,
+    render_cache: PipelineRenderCache,
+    cancelled: bool,
+    truncated: bool,
+    rendering_truncated: bool,
+}
+
+/// The consumer receives only source bytes already loaded by ordinary
+/// preparation. Selector preparation creates no presentation allocations.
+trait NativeSourcePreparation {
+    type Output;
+
+    fn prepare(
+        self,
+        analyzer: &dyn IAnalyzer,
+        rows: &[PipelineRow],
+        owner: Option<brokk_bifrost_core::retention_budget::RetentionBudget>,
+        cancellation: Option<&CancellationToken>,
+        prepare: impl FnOnce(&mut dyn FnMut(&ProjectFile, &str)) -> NativeRowMetadata,
+    ) -> (NativeRowMetadata, Self::Output);
+}
+
+struct PrepareSelectorSources;
+
+impl NativeSourcePreparation for PrepareSelectorSources {
+    type Output = ();
+
+    fn prepare(
+        self,
+        _analyzer: &dyn IAnalyzer,
+        _rows: &[PipelineRow],
+        _owner: Option<brokk_bifrost_core::retention_budget::RetentionBudget>,
+        _cancellation: Option<&CancellationToken>,
+        prepare: impl FnOnce(&mut dyn FnMut(&ProjectFile, &str)) -> NativeRowMetadata,
+    ) -> (NativeRowMetadata, Self::Output) {
+        (prepare(&mut |_, _| {}), ())
+    }
+}
+
+fn prepare_native_rows<'a>(
+    rows: ExecutedQueryRows<'a>,
+    context: &mut QueryFinalizationContext<'_, '_>,
+) -> PreparedQueryRows<'a> {
+    prepare_native_rows_with(rows, context, PrepareSelectorSources).0
+}
+
+fn prepare_native_rows_with<'a, S: NativeSourcePreparation>(
+    rows: ExecutedQueryRows<'a>,
+    context: &mut QueryFinalizationContext<'_, '_>,
+    source_preparation: S,
+) -> (PreparedQueryRows<'a>, S::Output) {
+    let ExecutedQueryRows {
+        mut state,
+        mut execution,
+        mut diagnostics,
+        semantic_work,
+        configured_cap,
+        owner,
+    } = rows;
+    let analyzer = context.analyzer;
+    let query = context.query;
+    let capture_profile = context.capture_profile;
+    let native_rows_out = context.native_rows_out.take();
+    let scope = state.scope.clone();
+    let execution_work_profile =
+        capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
+    let rendering_started = capture_profile.then(Instant::now);
+    let truncated = execution.is_truncated();
+    // A narrowed union leaf keeps the executor's actual traces and carries
+    // the authored path through every projection. The ordinary root query
+    // retains its historical plain-structural response shape, which omits
+    // seed-only traces.
+    if let Some(native_rows) = native_rows_out {
+        native_rows.extend(execution.rows.iter().cloned());
+    }
+    if !scope.branch_path().is_empty() {
+        let branch_path = scope.branch_path();
+        // Execution, including prepared operands, reports paths relative
+        // to this leaf. Prefix before rendering; its later diagnostics
+        // start empty and receive the same path at the final check.
+        for diagnostic in &mut diagnostics {
+            diagnostic.branch.splice(0..0, branch_path.iter().copied());
+        }
+        for row in &mut execution.rows {
+            for trace in &mut row.traces {
+                // A projecting leaf may itself select ordinary set-plan
+                // sources. Preserve that inner branch below the leaf's path.
+                trace.branch.splice(0..0, branch_path.iter().copied());
+            }
+        }
+    } else if query.seed().is_some() && query.plan.steps.is_empty() {
+        for row in &mut execution.rows {
+            row.traces.clear();
+            row.provenance_truncated = false;
+        }
+    }
+    if scope.branch_path().is_empty()
+        && let Some(seed) = query.seed()
+    {
+        let plan = QueryPlan::for_query(seed);
+        if should_report_broad_query(&plan, seed, &state.budget, truncated) {
+            push_broad_query_diagnostic(&mut diagnostics, &state.budget);
+        }
+    }
+    let (metadata, output) = source_preparation.prepare(
+        analyzer,
+        &execution.rows,
+        owner.clone(),
+        context.cancellation,
+        |observe_source| {
+            prepare_native_metadata(
+                &mut state,
+                &execution,
+                &mut diagnostics,
+                context,
+                observe_source,
+            )
+        },
+    );
+    let NativeRowMetadata {
+        evidence,
+        render_cache,
+        cancelled,
+        truncated,
+        rendering_truncated,
+    } = metadata;
+    // Cancellation can stop preparation before the executor's final row.
+    // The consumer's borrowed source window is finished before this move.
+    execution.rows.truncate(evidence.len());
+    (
+        PreparedQueryRows {
+            state,
+            diagnostics,
+            native: execution.rows,
+            evidence,
+            render_cache,
+            _owner: owner,
+            configured_cap,
+            cancelled,
+            truncated,
+            rendering_truncated,
+            execution_work_profile,
+            rendering_started,
+        },
+        output,
+    )
+}
+
+fn prepare_native_metadata(
+    state: &mut QueryExecutionState<'_>,
+    execution: &PlanExecution,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    context: &QueryFinalizationContext<'_, '_>,
+    observe_source: &mut dyn FnMut(&ProjectFile, &str),
+) -> NativeRowMetadata {
+    let analyzer = context.analyzer;
+    let limits = context.limits;
+    let cancellation = context.cancellation;
+    let mut cancelled = execution.is_cancelled();
+    let mut truncated = execution.is_truncated();
+    let mut rendering_truncated = false;
+    let mut render_cache = PipelineRenderCache {
+        procedure_owner_work: ProcedureOwnerWork::new(
+            state.budget.provenance_steps,
+            limits.max_pipeline_rows,
+            cancellation.cloned(),
+        ),
+        ..PipelineRenderCache::default()
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        cancelled = true;
+        push_cancelled_diagnostic(diagnostics);
+    }
+    let mut evidence = Vec::with_capacity(execution.rows.len());
+    for (result_index, row) in execution.rows.iter().enumerate() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            truncated = true;
+            push_cancelled_diagnostic(diagnostics);
+            break;
+        }
+        if retain_budgeted_pipeline_sources(
+            analyzer,
+            row,
+            &mut render_cache,
+            &mut state.budget,
+            limits,
+            diagnostics,
+            observe_source,
+        ) {
+            truncated = true;
+            rendering_truncated = true;
+        }
+        if retain_procedure_owner_facts(
+            analyzer,
+            row,
+            &mut render_cache,
+            &mut state.receiver_facts,
+            &mut state.budget,
+            limits,
+            cancellation,
+            diagnostics,
+        ) {
+            truncated = true;
+            rendering_truncated = true;
+        }
+        render_cache.seal_source_loads();
+        let terminal_source_file = terminal_source_file(&row.value);
+        let retained_source =
+            terminal_source_file.and_then(|file| render_cache.source_snapshot(analyzer, file));
+        let binding_range = pipeline_export_binding_range(analyzer, &row.value, &render_cache);
+        let mut row_evidence = detailed_evidence_for_pipeline_value(
+            result_index,
+            &row.value,
+            retained_source,
+            binding_range,
+        );
+        if matches!(
+            row_evidence.selected_pattern_source,
+            SelectedPatternSourceEvidence::Conflict
+        ) {
+            diagnostics.push(incomplete_diagnostic(
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                Incompleteness::Content,
+                "rust",
+                format!(
+                    "selected source-entry proofs conflict for {} at {:?}",
+                    rel_path_string(&row_evidence.file),
+                    row_evidence.byte_span
+                ),
+                Vec::new(),
+            ));
+        }
+        row_evidence.call_path_evidence = row.call_path_evidence.clone();
+        row_evidence.provenance = detailed_provenance_for_row(analyzer, row, &mut render_cache);
+        evidence.push(row_evidence);
+    }
+    NativeRowMetadata {
+        evidence,
+        render_cache,
+        cancelled,
+        truncated,
+        rendering_truncated,
+    }
+}
+
+/// Finalize once after either consumer has made every provider and provenance
+/// read. New site-output refusal is not part of these semantic inputs.
+fn finalize_consumed_rows<I>(
+    prepared: PreparedQueryRows<'_>,
+    context: QueryFinalizationContext<'_, '_>,
+    mut results: Vec<I>,
+    mut evidence: Vec<DetailedCodeQueryEvidence>,
+) -> DetailedQueryResult<I> {
+    let PreparedQueryRows {
+        mut state,
+        mut diagnostics,
+        render_cache,
+        configured_cap,
+        mut cancelled,
+        mut truncated,
+        rendering_truncated,
+        execution_work_profile,
+        rendering_started,
+        ..
+    } = prepared;
+    let QueryFinalizationContext {
+        analyzer,
+        limits,
+        cancellation,
+        request_started,
+        read_scope,
+        preflight_reuse,
+        access_failure_out,
+        row_keys_out,
+        ..
+    } = context;
+    let scope = state.scope.clone();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        cancelled = true;
+        push_cancelled_diagnostic(&mut diagnostics);
+    }
+    state.budget.provenance_steps = render_cache.procedure_owner_work.used;
+    if let Some(attempted) = render_cache.procedure_owner_work.refused {
+        if !diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::PipelineBudgetExhausted
+                    | CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            )
+        }) {
+            let mut projected = state.budget;
+            projected.provenance_steps = attempted;
+            push_budget_diagnostic(
+                &mut diagnostics,
+                &projected,
+                limits,
+                Some(&state.budget),
+                "procedure_source_owner",
+            );
+        }
+        truncated = true;
+    }
+    if render_cache.procedure_owner_work.cancelled {
+        cancelled = true;
+        push_cancelled_diagnostic(&mut diagnostics);
+    }
+    render_cache.report_capture_truncation(&mut diagnostics);
+    let structural_index_stale = !state
+        .structural_index_session
+        .selections_are_current(|content| state.analyzer.workspace_content_matches(content));
+    if structural_index_stale {
+        results.clear();
+        evidence.clear();
+        if let Some(keys) = row_keys_out {
+            keys.clear();
+        }
+        truncated = true;
+        state
+            .access_failure
+            .get_or_insert_with(|| "workspace content changed during result rendering".to_string());
+        if !diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                && diagnostic.message.contains("structural posting")
+        }) {
+            diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
+        exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
+        }), Some(DerivationExecutionCause::Snapshot)));
+        }
+    }
+    if !cancelled && !structural_index_stale {
+        state.structural_index_session.publish_auto_observations();
+    }
+    if !scope.branch_path().is_empty() {
+        let branch_path = scope.branch_path();
+        for diagnostic in &mut diagnostics {
+            if diagnostic.branch.is_empty() {
+                diagnostic.branch.extend_from_slice(branch_path);
+            } else {
+                assert!(
+                    diagnostic.branch.starts_with(branch_path),
+                    "a union leaf diagnostic must carry its full branch path"
+                );
+            }
+        }
+    }
+    // Rendering can itself exhaust provenance/output limits or observe a
+    // stale source after the plan has finished.
+    if cancelled
+        || (truncated && !configured_cap)
+        || rendering_truncated
+        || state.access_failure.is_some()
+    {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=render_boundary cancelled={} truncated={} provider={}",
+                file!(),
+                line!(),
+                cancelled,
+                truncated,
+                state.access_failure.is_some()
+            )
+        });
+        state.mark_execution_dependent();
+    }
+    let semantic_work = state
+        .semantic
+        .as_ref()
+        .map_or_else(CodeQuerySemanticWork::default, SemanticQueryContext::work)
+        .saturating_add(state.call_shape_work);
+    let total_work = execution_work_snapshot(state.budget, semantic_work);
+    let work = public_execution_work(total_work);
+    let candidate_site_set = std::mem::take(&mut state.candidate_sites);
+    let budgeted_work = budgeted_execution_work(
+        state.budget,
+        Some(std::mem::take(&mut state.step_outputs)),
+        Some(candidate_site_set.len()),
+    );
+    if let Some(profile) = &mut state.profile {
+        let execution_work = execution_work_profile.unwrap_or_default();
+        profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
+        profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
+        profile.execution_work = execution_work;
+        profile.rendering_work = total_work.saturating_sub(execution_work);
+        profile.work = total_work;
+        profile.cache = state.cache_profile.unwrap_or_default();
+    }
+    let profile = state.profile;
+    if let Some(out) = access_failure_out {
+        *out = state.access_failure.take();
+    }
+    fold_query_read_incompleteness(&mut diagnostics, read_scope.captured_read_incompleteness());
+    let diagnostics = normalize_query_diagnostics(
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| QueryExecutionState::diagnostic(analyzer, diagnostic, None))
+            .collect(),
+    );
+    let semantic = state.semantic.take();
+    let mut reuse = semantic
+        .as_ref()
+        .map_or(state.reuse, |semantic| state.reuse.join(semantic.reuse()))
+        .join(preflight_reuse);
+    for diagnostic in &diagnostics {
+        reuse.join_in(diagnostic.reuse_verdict());
+    }
+    let semantic_receipt = semantic.and_then(SemanticQueryContext::into_receipt);
+    let mut result = QueryResult {
+        results,
+        truncated: truncated || cancelled,
+        depth_bound_status: state.depth_bound_status,
+        session_subset: session_subset(analyzer),
+        diagnostics: diagnostics.into(),
+    };
+    if result.depth_bound_status == Some(DepthBoundStatus::NotReached)
+        && !matches!(
+            result.completion(),
+            CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
+        )
+    {
+        // An early stop cannot certify a negative depth frontier. The real
+        // query incompleteness remains the policy run's primary cause.
+        result.depth_bound_status = Some(DepthBoundStatus::Unknown);
+    }
+    let detailed = DetailedQueryResult {
+        result,
+        work,
+        budgeted_work,
+        candidate_site_set,
+        evidence,
+        profile,
+        semantic_receipt,
+        depth_answers: state.depth_answers,
+        reuse,
+    };
+    assert_eq!(detailed.result.results.len(), detailed.evidence.len());
+    detailed
 }
 
 /// Whether the root terminal-cap backstop (issue #2779) must push its own
@@ -7631,6 +8890,44 @@ fn detailed_evidence_for_pipeline_value(
                 runtime_keyed_read: None,
             }
         }
+        PipelineValue::FieldWrite(value) => {
+            let byte_span = value.range.start_byte..value.range.end_byte;
+            DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
+                result_index,
+                domain: DetailedCodeQueryDomain::FieldWrite,
+                key: value.detailed_key(),
+                file: value.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                call_path_evidence: None,
+                runtime_keyed_read: None,
+            }
+        }
+        PipelineValue::FieldRead(value) => {
+            let byte_span = value.range.start_byte..value.range.end_byte;
+            DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
+                result_index,
+                domain: DetailedCodeQueryDomain::FieldRead,
+                key: value.detailed_key(),
+                file: value.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                call_path_evidence: None,
+                runtime_keyed_read: None,
+            }
+        }
         PipelineValue::BindingInitializerCall(value) => {
             let row = &value.row;
             let byte_span = row.start_byte..row.end_byte;
@@ -8388,8 +9685,10 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ReferenceEdge(value) => Some(value.file()),
         PipelineValue::StateEvent(value) => Some(value.file()),
         PipelineValue::BindingInitializerCall(value) => Some(&value.file),
+        PipelineValue::FieldWrite(value) => Some(&value.file),
+        PipelineValue::FieldRead(value) => Some(&value.file),
         PipelineValue::FlowRelation(value) => Some(value.file()),
-        PipelineValue::ControlRelation(value) => Some(value.procedure.file()),
+        PipelineValue::ControlRelation(value) => Some(&value.file),
         PipelineValue::BranchRelation(value) => Some(&value.file),
         PipelineValue::LoopRelation(value) => Some(&value.file),
         PipelineValue::CppExpression(value) => Some(&value.file),
@@ -8458,7 +9757,11 @@ fn retain_procedure_owner_facts(
             continue;
         }
         if !procedure_owner_file_is_certified(analyzer, &file)
-            || cache.sources.get(&file).is_none_or(Option::is_none)
+            || cache
+                .sources
+                .get(&file)
+                .and_then(RetainedSource::coordinates)
+                .is_none()
         {
             cache.procedure_owner_unavailable.insert(file);
             continue;
@@ -8512,6 +9815,7 @@ fn retain_budgeted_pipeline_sources(
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    observe_source: &mut dyn FnMut(&ProjectFile, &str),
 ) -> bool {
     let mut files = BTreeSet::new();
     let mut exhausted = false;
@@ -8564,8 +9868,15 @@ fn retain_budgeted_pipeline_sources(
     }
 
     for file in files {
-        exhausted |=
-            retain_budgeted_source_snapshot(analyzer, &file, cache, budget, limits, diagnostics);
+        exhausted |= retain_budgeted_source_snapshot(
+            analyzer,
+            &file,
+            cache,
+            budget,
+            limits,
+            diagnostics,
+            observe_source,
+        );
     }
     exhausted
 }
@@ -8620,6 +9931,7 @@ fn retain_held_source_snapshot(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }), Some(DerivationExecutionCause::Snapshot)));
     }
     true
@@ -8789,12 +10101,18 @@ macro_rules! collect_pipeline_source_files {
             $value_type::BindingInitializerCall(value) => {
                 files.insert(value.file.clone());
             }
+            $value_type::FieldWrite(value) => {
+                files.insert(value.file.clone());
+            }
+            $value_type::FieldRead(value) => {
+                files.insert(value.file.clone());
+            }
             $value_type::FlowRelation(value) => {
                 files.insert(value.source().site.file.clone());
                 files.insert(value.target().site.file.clone());
             }
             $value_type::ControlRelation(value) => {
-                files.insert(value.procedure.file().clone());
+                files.insert(value.file.clone());
             }
             $value_type::BranchRelation(value) => {
                 files.insert(value.file.clone());
@@ -8969,6 +10287,7 @@ fn retain_budgeted_source_snapshot(
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    observe_source: &mut dyn FnMut(&ProjectFile, &str),
 ) -> bool {
     if cache.sources.contains_key(file) {
         return false;
@@ -8985,7 +10304,7 @@ fn retain_budgeted_source_snapshot(
     .try_allow(0)
     .is_err()
     {
-        cache.retain_loaded_source(file, None);
+        cache.retain_loaded_source(file, RetainedSource::BudgetRefused);
         push_budget_diagnostic(
             diagnostics,
             &projected,
@@ -8996,10 +10315,15 @@ fn retain_budgeted_source_snapshot(
         return true;
     }
 
+    #[cfg(test)]
+    admission_acceptance::observe_source_load(file);
     let source = analyzer.indexed_source(file);
     projected.scanned_source_bytes = projected
         .scanned_source_bytes
         .saturating_add(source.as_ref().map_or(0, String::len));
+    if let Some(source) = source.as_deref() {
+        observe_source(file, source);
+    }
     if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
         projected
             .scanned_source_bytes
@@ -9009,7 +10333,7 @@ fn retain_budgeted_source_snapshot(
     .try_allow(0)
     .is_err()
     {
-        cache.retain_loaded_source(file, None);
+        cache.retain_loaded_source(file, RetainedSource::BudgetRefused);
         push_budget_diagnostic(
             diagnostics,
             &projected,
@@ -9022,7 +10346,7 @@ fn retain_budgeted_source_snapshot(
 
     budget.scanned_files = projected.scanned_files;
     budget.scanned_source_bytes = projected.scanned_source_bytes;
-    cache.retain_loaded_source(file, source);
+    cache.retain_loaded_source(file, RetainedSource::loaded(source));
     false
 }
 
@@ -9731,6 +11055,22 @@ fn detailed_trace_provenance_ref(
                 cache,
             )
         }
+        PipelineTraceValue::FieldWrite(value) => detailed_provenance_ref_no_identity(
+            analyzer,
+            DetailedCodeQueryDomain::FieldWrite,
+            value.detailed_key(),
+            &value.file,
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::FieldRead(value) => detailed_provenance_ref_no_identity(
+            analyzer,
+            DetailedCodeQueryDomain::FieldRead,
+            value.detailed_key(),
+            &value.file,
+            value.range,
+            cache,
+        ),
         PipelineTraceValue::BindingInitializerCall(value) => {
             let row = &value.row;
             detailed_provenance_ref_no_identity(
@@ -10479,7 +11819,10 @@ fn procedure_source_owner(
     if !cache.procedure_owner_work.charge(0)
         || !procedure_owner_file_is_certified(analyzer, file)
         || cache.conflicting_sources.contains(file)
-        || matches!(cache.sources.get(file), Some(None))
+        || cache
+            .sources
+            .get(file)
+            .is_some_and(|entry| entry.coordinates().is_none())
     {
         return None;
     }
@@ -10793,6 +12136,8 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::BindingInitializerCall(value) => {
             Some(PipelineTraceValue::BindingInitializerCall(value.clone()))
         }
+        PipelineValue::FieldWrite(value) => Some(PipelineTraceValue::FieldWrite(value.clone())),
+        PipelineValue::FieldRead(value) => Some(PipelineTraceValue::FieldRead(value.clone())),
         PipelineValue::FlowRelation(value) => Some(PipelineTraceValue::FlowRelation(value.clone())),
         PipelineValue::ControlRelation(value) => {
             Some(PipelineTraceValue::ControlRelation(value.clone()))

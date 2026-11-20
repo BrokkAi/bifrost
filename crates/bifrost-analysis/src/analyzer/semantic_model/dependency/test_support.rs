@@ -124,7 +124,7 @@ pub fn install_fixture_pack(
         .map_err(|error| error.to_string())
 }
 
-struct NeverProducingAdapter;
+pub(super) struct NeverProducingAdapter;
 
 impl DependencyPackAdapter for NeverProducingAdapter {
     fn adapter_name(&self) -> &str {

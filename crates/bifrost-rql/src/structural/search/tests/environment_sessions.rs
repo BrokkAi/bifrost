@@ -53,7 +53,7 @@ fn recovered_python_withholds_constant_comparison_proofs() {
                 result
                     .diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.message.contains("recovered syntax")),
+                    .any(|diagnostic| diagnostic.message().contains("recovered syntax")),
                 "{}",
                 result.render_text()
             );

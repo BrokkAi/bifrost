@@ -1,5 +1,9 @@
 //! Direct parent bindings owned by one selected hierarchy request.
+use super::direct_supertypes::{DirectSupertype, DirectSupertypeAnswer};
 use super::*;
+use crate::analyzer::resolution::{
+    ClassifiedSupertypeKind, SupertypeClassification, classify_supertype_kind,
+};
 use crate::analyzer::resolution::{
     FactResolutionOperation, LoweredSupertypeProperty, TypedFactPageVisitor, TypedFactRequest,
 };
@@ -14,7 +18,11 @@ pub fn jvm_intrinsic_parent(
     language: brokk_bifrost_core::analyzer::model::Language,
     kind: Option<ResolutionSupertypeKind>,
 ) -> Option<crate::analyzer::resolution::ExternalOwnerIdentity> {
-    if kind != Some(ResolutionSupertypeKind::ImplicitSuperclass) {
+    if classify_supertype_kind(
+        kind,
+        crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified,
+    ) != SupertypeClassification::Classified(Some(ClassifiedSupertypeKind::ImplicitSuperclass))
+    {
         return None;
     }
     let root = brokk_bifrost_jvm::intrinsics::implicit_superclass_root(language)
@@ -94,47 +102,6 @@ pub(crate) fn combine_implicit_root_reference(
     targets.push(identity);
     *completion = ResolutionCompletion::Complete;
     Ok(true)
-}
-
-/// One authored or implicit parent, with all binding alternatives preserved.
-#[derive(Debug)]
-pub struct JvmDirectSupertype {
-    pub kind: Option<ResolutionSupertypeKind>,
-    pub parent_ordinal: u32,
-    pub reference: SemanticId,
-    pub targets: Vec<SemanticId>,
-    pub completion: ResolutionCompletion,
-}
-
-/// Request-local parent bindings. Empty or incomplete bindings remain open.
-#[derive(Debug)]
-pub struct JvmDirectSupertypeAnswer {
-    pub parents: Vec<JvmDirectSupertype>,
-    pub completion: ResolutionCompletion,
-}
-
-impl JvmDirectSupertypeAnswer {
-    /// Definite parents, preserving language parent order.
-    pub fn edges(&self) -> impl Iterator<Item = &JvmDirectSupertype> {
-        self.parents.iter().filter(|parent| {
-            parent.targets.len() == 1 && parent.completion == ResolutionCompletion::Complete
-        })
-    }
-
-    /// Alternatives for one parent reference; never definite edges.
-    pub fn ambiguous(&self) -> impl Iterator<Item = &JvmDirectSupertype> {
-        self.parents
-            .iter()
-            .filter(|parent| parent.targets.len() > 1)
-    }
-
-    /// Unresolved or incomplete parents with their original binding evidence.
-    /// An empty complete binding still leaves the declared parent open.
-    pub fn open(&self) -> impl Iterator<Item = &JvmDirectSupertype> {
-        self.parents.iter().filter(|parent| {
-            parent.targets.is_empty() || parent.completion != ResolutionCompletion::Complete
-        })
-    }
 }
 
 /// Reverse bindings for one hydrated candidate round. All identities and
@@ -608,13 +575,17 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
         let mut edges = Vec::new();
         let mut ambiguous = Vec::new();
         let mut open = Vec::new();
+        let mut owner_complete = HashMap::default();
         for candidate in candidates {
+            let language = candidate.producer_language();
             if matches!(
-                candidate.source_kind(),
-                Some(
-                    ResolutionSupertypeKind::SelfType
-                        | ResolutionSupertypeKind::ImplicitInterfaceMembers
-                )
+                classify_supertype_kind(
+                    candidate.source_kind(),
+                    crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified
+                ),
+                SupertypeClassification::Classified(Some(
+                    ClassifiedSupertypeKind::SelfType | ClassifiedSupertypeKind::LookupOnlyRoot
+                ))
             ) {
                 continue;
             }
@@ -627,6 +598,53 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
                 candidate.source_kind(),
                 Some(candidate.frontier()),
             )?;
+            let selected_kind = self.typed.requires_selected_nominal_parent_kind(language)
+                || candidate.source_kind() == Some(ResolutionSupertypeKind::AuthoredNominalParent);
+            let binding = if selected_kind {
+                self.expand_alias_parents(binding)?
+            } else {
+                binding
+            };
+            if selected_kind {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    owner_complete.entry(candidate.definition())
+                {
+                    let answer = self.jvm_direct_supertype_answer(candidate.definition())?;
+                    let complete = answer.completion == ResolutionCompletion::Complete
+                        && !answer.parents.is_empty()
+                        && answer.parents.iter().all(|parent| {
+                            parent.targets.len() == 1
+                                && parent.completion == ResolutionCompletion::Complete
+                        });
+                    entry.insert(complete);
+                    completion = completion.combine(&answer.completion);
+                }
+                if !owner_complete[&candidate.definition()] {
+                    open.push(candidate.reference());
+                    continue;
+                }
+            }
+            let Some(evidence) = self.typed.supertype_kind_evidence(
+                language,
+                candidate.source_kind(),
+                &binding.targets,
+                &binding.completion,
+                self.cancellation,
+            )?
+            else {
+                completion = completion.combine(&cancelled_completion());
+                break;
+            };
+            let classification = classify_supertype_kind(candidate.source_kind(), evidence);
+            if let SupertypeClassification::Open(reason) = classification {
+                completion = completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(
+                        reason.semantic(self.identities),
+                    ),
+                ]));
+                open.push(candidate.reference());
+                continue;
+            }
             if binding.targets.is_empty() || binding.completion != ResolutionCompletion::Complete {
                 open.push(candidate.reference());
             }
@@ -653,11 +671,48 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
         })
     }
 
+    /// Resolve a typed argument's reference under this selected query's demand
+    /// authority. The caller reads its slot and components from the same typed
+    /// source; this does not reconstruct source syntax or decode another edge.
+    pub fn type_argument_reference_answer(
+        &mut self,
+        reference: SemanticId,
+    ) -> Result<Option<crate::analyzer::resolution::FactResolutionAnswer>> {
+        if !self.session.scope_step() || self.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let forward = &mut self.forward;
+        let (answer, receipt) = self.receipts.capture(|| {
+            forward
+                .resolve_reference_with_metrics(reference, &mut ResolutionBatchMetrics::default())
+        });
+        self.receipts.replay(&receipt);
+        answer.map(Some)
+    }
+
+    /// A qualified `super` qualifier must resolve to one complete target,
+    /// under the same demand authority, budget step and read receipts as any
+    /// other reference this query resolves.
+    pub(super) fn qualified_super_qualifier(
+        &mut self,
+        reference: SemanticId,
+    ) -> Result<Option<SemanticId>> {
+        let Some(answer) = self.type_argument_reference_answer(reference)? else {
+            return Ok(None);
+        };
+        Ok(
+            match (answer.binding().targets(), answer.binding().completion()) {
+                ([target], ResolutionCompletion::Complete) => Some(*target),
+                _ => None,
+            },
+        )
+    }
+
     /// Resolve every parent reference through the same demand-aware operation.
     pub fn jvm_direct_supertype_answer(
         &mut self,
         definition: SemanticId,
-    ) -> Result<JvmDirectSupertypeAnswer> {
+    ) -> Result<DirectSupertypeAnswer> {
         let mut rows = Vec::new();
         let outcome = self.typed.visit_supertype_pages_for_definitions(
             TypedFactRequest::new(&[definition]),
@@ -666,10 +721,12 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
                 rows.extend(page.iter().map(|selected| {
                     let row = selected.row();
                     (
+                        selected.row().producer_language(),
                         row.source_kind(),
                         row.parent_ordinal(),
                         row.reference(),
                         row.frontier(),
+                        row.applied_arguments().cloned(),
                     )
                 }));
                 Ok(true)
@@ -678,29 +735,44 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
         let mut completion = outcome.evidence().clone();
         if !outcome.is_exhausted() || self.cancellation.is_cancelled() {
             completion = completion.combine(&cancelled_completion());
-            return Ok(JvmDirectSupertypeAnswer {
+            return Ok(DirectSupertypeAnswer {
                 parents: Vec::new(),
                 completion,
             });
         }
-        rows.sort_by_key(|(kind, ordinal, reference, _)| {
-            let tier = match kind {
-                Some(
-                    ResolutionSupertypeKind::Superclass
-                    | ResolutionSupertypeKind::ImplicitSuperclass,
-                ) => 0,
-                _ => 1,
+        // Producer-authoritative roles are already proven by the classifier.
+        // Preserve their historical binding admission order, including under
+        // cutoff. Deferred roles and selected Interface expectations receive
+        // no class priority until the post-alias classification below.
+        rows.sort_by_key(|(language, stored, ordinal, reference, _, _)| {
+            let evidence = if self.typed.requires_selected_nominal_parent_kind(*language) {
+                crate::analyzer::resolution::SupertypeKindEvidence::Selected(
+                    crate::analyzer::resolution::NominalParentTargetKind::Incomplete,
+                )
+            } else {
+                crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified
+            };
+            let tier = match classify_supertype_kind(*stored, evidence) {
+                SupertypeClassification::Classified(kind) => {
+                    kind.map_or(1, ClassifiedSupertypeKind::nominal_order_tier)
+                }
+                SupertypeClassification::Open(_) => 1,
             };
             (tier, *ordinal, *reference)
         });
         let mut parents = Vec::new();
-        for (kind, parent_ordinal, reference, supertype_slot) in rows {
+        let mut requires_kind = false;
+        for (language, kind, parent_ordinal, reference, supertype_slot, applied_arguments) in rows {
+            requires_kind |= self.typed.requires_selected_nominal_parent_kind(language)
+                || kind == Some(ResolutionSupertypeKind::AuthoredNominalParent);
             if matches!(
-                kind,
-                Some(
-                    ResolutionSupertypeKind::SelfType
-                        | ResolutionSupertypeKind::ImplicitInterfaceMembers
-                )
+                classify_supertype_kind(
+                    kind,
+                    crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified
+                ),
+                SupertypeClassification::Classified(Some(
+                    ClassifiedSupertypeKind::SelfType | ClassifiedSupertypeKind::LookupOnlyRoot
+                ))
             ) {
                 continue;
             }
@@ -709,16 +781,72 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
                 break;
             }
             let binding = self.resolve_reference(reference, kind, Some(supertype_slot))?;
-            let binding = self.expand_alias_parents(binding)?;
-            parents.push(JvmDirectSupertype {
+            let mut binding = self.expand_alias_parents(binding)?;
+            let Some(evidence) = self.typed.supertype_kind_evidence(
+                language,
+                kind,
+                &binding.targets,
+                &binding.completion,
+                self.cancellation,
+            )?
+            else {
+                completion = completion.combine(&cancelled_completion());
+                break;
+            };
+            let kind = match classify_supertype_kind(kind, evidence) {
+                SupertypeClassification::Classified(kind) => kind,
+                SupertypeClassification::Open(reason) => {
+                    binding.targets.clear();
+                    binding.completion =
+                        binding
+                            .completion
+                            .combine(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::UnsupportedSemantic(
+                                    reason.semantic(self.identities),
+                                ),
+                            ]));
+                    None
+                }
+            };
+            parents.push(DirectSupertype {
                 kind,
                 parent_ordinal,
                 reference,
+                applied_arguments,
                 targets: binding.targets,
                 completion: binding.completion,
             });
         }
-        Ok(JvmDirectSupertypeAnswer {
+        if requires_kind {
+            let classes = parents
+                .iter()
+                .filter(|parent| parent.kind == Some(ClassifiedSupertypeKind::Superclass))
+                .collect::<Vec<_>>();
+            if classes.len() > 1 || classes.iter().any(|parent| parent.parent_ordinal != 0) {
+                let reason =
+                    crate::analyzer::resolution::SupertypeKindOpenReason::InvalidParentList
+                        .semantic(self.identities);
+                let open = ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                ]);
+                completion = completion.combine(&open);
+                for parent in &mut parents {
+                    parent.kind = None;
+                    parent.targets.clear();
+                    parent.completion = parent.completion.combine(&open);
+                }
+            }
+        }
+        parents.sort_by_key(|parent| {
+            (
+                parent
+                    .kind
+                    .map_or(1, ClassifiedSupertypeKind::nominal_order_tier),
+                parent.parent_ordinal,
+                parent.reference,
+            )
+        });
+        Ok(DirectSupertypeAnswer {
             parents,
             completion,
         })
@@ -728,7 +856,7 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
 impl SelectedResolutionOperation<'_, '_> {
     /// Only a selected provider reference with an actual external coordinate
     /// certifies a canonical unread parent. Nominal fallbacks are excluded.
-    pub fn jvm_hierarchy_reference_owner(
+    pub fn hierarchy_reference_owner(
         &self,
         reference: SemanticId,
     ) -> Option<crate::analyzer::resolution::ExternalOwnerIdentity> {
@@ -943,7 +1071,7 @@ impl SelectedResolutionOperation<'_, '_> {
             };
             let Some(mut candidates) = typed.jvm_candidate_hierarchy_rows(
                 &mounts,
-                language.config_label(),
+                language,
                 &visited_names.iter().cloned().collect::<Vec<_>>(),
                 cancellation,
                 session,
@@ -1058,7 +1186,7 @@ impl SelectedResolutionOperation<'_, '_> {
 impl SelectedResolutionOperation<'_, '_> {
     /// A resolved external identity's coordinate was read by the selected
     /// resolver. Expose that coordinate without attempting source-unit mapping.
-    pub fn jvm_hierarchy_external_owner(
+    pub fn hierarchy_external_owner(
         &self,
         definition: SemanticId,
     ) -> Option<crate::analyzer::resolution::ExternalOwnerIdentity> {

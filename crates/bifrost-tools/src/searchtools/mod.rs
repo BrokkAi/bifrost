@@ -391,6 +391,8 @@ pub use crate::searchtools::scan_usages::legacy_usage_graph_withheld_references_
 pub use crate::searchtools::scan_usages::usage_graph;
 
 pub use crate::searchtools::scan_usages::usage_graph_with_cancellation;
+#[cfg(all(test, unix))]
+pub(crate) use crate::searchtools::scan_usages::usage_graph_with_passes;
 
 pub use crate::searchtools::selectors::AmbiguousSymbol;
 
@@ -687,48 +689,34 @@ pub struct RefreshResult {
     pub declarations: usize,
 }
 
-/// Runtime state of the semantic-model declaration overlay, separate from warm-up completion.
+pub use brokk_bifrost_analysis::analyzer::semantic_model::{
+    PendingSemanticPackAcquisition, SemanticModelOverlayStatus, SemanticModelWarmStage,
+};
+
+/// A superseded binding that still owns a construction or teardown slot.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum SemanticModelOverlayStatus {
-    Ready,
-    NoModels,
-    Pending {
-        stage: SemanticModelWarmStage,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        pending_acquisitions: Vec<PendingSemanticPackAcquisition>,
-        /// The host's shipped-pack acquisition the warm still waits for.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        shipped_pack_acquisition: Option<String>,
-    },
-    Partial {
-        reasons: Vec<String>,
-    },
-    Unavailable {
-        reason: String,
-        #[serde(flatten, skip_serializing_if = "Option::is_none")]
-        budget: Option<
-            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayBudgetExceeded,
-        >,
-    },
+pub struct RetiringWorkspace {
+    pub root: String,
+    pub generation: u64,
+    pub phase: String,
 }
 
+/// Initial analyzer construction, observed from the service's build progress.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticModelWarmStage {
-    ActivatingInstalledPacks,
-    ActivatingConfiguredPacks,
-    AcquisitionPending,
-}
-
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-pub struct PendingSemanticPackAcquisition {
-    pub ecosystem: String,
-    pub dependency_id: String,
+pub struct WorkspaceBuildStatus {
+    pub status: String,
+    pub generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ActiveWorkspaceResult {
+    pub retiring_workspaces: Vec<RetiringWorkspace>,
+    pub analyzer_ready: bool,
+    pub workspace_build: WorkspaceBuildStatus,
     pub workspace_path: String,
     /// Present only when this session was built over an explicitly named
     /// subset of the workspace, in which case every cross-file answer it gives

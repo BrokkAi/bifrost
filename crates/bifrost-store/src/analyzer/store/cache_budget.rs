@@ -7,8 +7,9 @@ use super::resolution_operation::go_named::{
 };
 use super::schema_lease::{LastTemp, LastTempKey};
 use super::semantic_composition::{
-    ComposedGroup, ComposedGroupCacheKey, CompositionDiscoveryCacheKey, CompositionGroupKey,
-    RequestSourceAnchorsKey, SearchCandidateKey, SearchCandidateStream, SourceAnchors,
+    ComposedGroup, ComposedGroupCacheKey, ComposedSearchInputs, CompositionDiscoveryCacheKey,
+    CompositionGroupKey, RequestSourceAnchorsKey, SearchCandidateKey, SearchCandidateStream,
+    SourceAnchors,
 };
 use crate::analyzer::resolution::SharedNameId;
 use brokk_bifrost_core::retention_budget::{
@@ -42,6 +43,10 @@ impl RetainedBytes for SharedNameId {
 #[derive(Clone)]
 pub struct StoreCacheBudget {
     pub pinned_readers: BudgetRegion<u64, super::model_catalog::PreparedPinnedReader>,
+    pub composed_search_inputs: brokk_bifrost_core::budgeted_value_cache::BudgetedValueCache<
+        [u8; 32],
+        ComposedSearchInputs,
+    >,
     search_candidates: BudgetRegion<SearchCandidateKey, SearchCandidateStream>,
     composed_groups: BudgetRegion<ComposedGroupCacheKey, ComposedGroup>,
     composition_discovery: BudgetRegion<CompositionDiscoveryCacheKey, Vec<CompositionGroupKey>>,
@@ -73,6 +78,10 @@ impl StoreCacheBudget {
     pub fn new(budget: &RetentionBudget) -> Self {
         Self {
             pinned_readers: budget.region("store.pinned-readers", Some(8)),
+            composed_search_inputs:
+                brokk_bifrost_core::budgeted_value_cache::BudgetedValueCache::new(
+                    budget.region("store.composed-search-inputs", None),
+                ),
             search_candidates: budget.region("store.search-candidates", None),
             composed_groups: budget.region("store.composed-groups", None),
             composition_discovery: budget.region("store.composition-discovery", None),
@@ -98,6 +107,10 @@ impl StoreCacheBudget {
     pub fn region_stats(&self) -> Vec<(&'static str, RegionStats)> {
         vec![
             (self.pinned_readers.name(), self.pinned_readers.stats()),
+            (
+                self.composed_search_inputs.region().name(),
+                self.composed_search_inputs.region().stats(),
+            ),
             (
                 self.search_candidates.name(),
                 self.search_candidates.stats(),
@@ -756,6 +769,17 @@ pub fn retained_read_key(heap: &mut RetainedHeap, key: &crate::analyzer::read_le
                 );
                 heap.add_entries(2);
             }
+            LookupQuestion::SelectedReceiverProof(question) => {
+                let source = question.source();
+                heap.add(
+                    source
+                        .rel_path
+                        .len()
+                        .saturating_add(source.storage_language.len())
+                        .saturating_add(source.producer_epoch.len()),
+                );
+                heap.add_entries(3);
+            }
             LookupQuestion::StoredSemanticIrPublication(question) => {
                 heap.add(
                     heap.allocation_bytes(question.rel_path.len())
@@ -1049,6 +1073,115 @@ mod tests {
         assert_eq!(bytes, single.total());
         assert_eq!(entries, 6); // One Arc, two elements, three explicit visits.
         assert_eq!(visits, 1);
+    }
+    #[test]
+    fn composed_search_inputs_single_flight_failure_and_budget_lifecycle() {
+        use super::super::semantic_composition::*;
+        use super::{RetainedBytes, StoreCacheBudget};
+        use brokk_bifrost_core::budgeted_value_cache::BudgetedValueAcquisition;
+        use brokk_bifrost_core::cancellation::CancellationToken;
+        struct Receipt;
+        impl RetainedBytes for Receipt {
+            fn retained_bytes(&self) -> usize {
+                0
+            }
+        }
+        impl SearchInputReceipt for Receipt {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let value = || ComposedSearchInputs {
+            anchors: Default::default(),
+            stream: SearchCandidateStream {
+                candidates: Vec::new(),
+                groups: Vec::new(),
+                seeds_by_group: Vec::new(),
+                single_contributors: Vec::new(),
+                owner_qualifications: Default::default(),
+                orphans: Vec::new(),
+            },
+            records: Vec::new(),
+            groups: Vec::new(),
+            receipt: Box::new(Receipt),
+            index: Default::default(),
+        };
+        let key = [1; 32];
+        let token = CancellationToken::new();
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(4096);
+        let owner = StoreCacheBudget::new(&budget);
+        let cache = &owner.composed_search_inputs;
+        // Failed fills abandon their permit; the next request can lead again.
+        let BudgetedValueAcquisition::Leader { permit } = cache.acquire(&key, &token).0 else {
+            panic!("leader")
+        };
+        drop(permit);
+        assert!(cache.get_ready(&key, &token).is_none());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            cache.acquire(&key, &cancelled).0,
+            BudgetedValueAcquisition::Cancelled
+        ));
+        assert!(cache.get_ready(&key, &token).is_none());
+        let BudgetedValueAcquisition::Leader { permit } = cache.acquire(&key, &token).0 else {
+            panic!("retry leader")
+        };
+        std::thread::scope(|scope| {
+            let follower = scope.spawn(|| cache.acquire(&key, &token).0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while cache.waiters_for_test(&key) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "follower did not join the fill"
+                );
+                std::thread::yield_now();
+            }
+            let filled = permit.publish_complete(value());
+            let BudgetedValueAcquisition::Cached { value: followed } = follower.join().unwrap()
+            else {
+                panic!("shared fill")
+            };
+            assert!(std::ptr::eq(&*filled, &*followed));
+        });
+        let changed = [3; 32];
+        assert!(matches!(
+            cache.acquire(&changed, &token).0,
+            BudgetedValueAcquisition::Leader { .. }
+        ));
+        // Two individually admissible entries exceed this small budget together,
+        // counting allocated sizes (about 2 KiB each for this payload).
+        let first_large = [4; 32];
+        let second_large = [5; 32];
+        for large in [&first_large, &second_large] {
+            let BudgetedValueAcquisition::Leader { permit } = cache.acquire(large, &token).0 else {
+                panic!("large leader")
+            };
+            let mut large_value = value();
+            large_value
+                .stream
+                .orphans
+                .push((("x".repeat(2000), String::new()), Vec::new()));
+            drop(permit.publish_complete(large_value));
+            assert!(cache.get_ready(large, &token).is_some());
+        }
+        assert!(cache.get_ready(&first_large, &token).is_none());
+        assert!(cache.region().stats().evictions > 0);
+        // A small budget cannot retain an oversized fill across requests.
+        let tiny = StoreCacheBudget::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1),
+        );
+        let BudgetedValueAcquisition::Leader { permit } =
+            tiny.composed_search_inputs.acquire(&key, &token).0
+        else {
+            panic!("tiny leader")
+        };
+        drop(permit.publish_complete(value()));
+        assert!(
+            tiny.composed_search_inputs
+                .get_ready(&key, &token)
+                .is_none()
+        );
     }
 }
 

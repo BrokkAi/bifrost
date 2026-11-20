@@ -35,6 +35,7 @@ use crate::{
     searchtools_render::RenderOptions,
     searchtools_service::{PreparedRunPolicyPreflight, RunPolicyPreflight, TransportTimings},
 };
+use brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext;
 use rmcp::model::{
     Annotations, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
     CancelTaskParams, ContentBlock, CreateTaskResult, CustomRequest, CustomResult, ErrorData,
@@ -137,10 +138,16 @@ struct NamedWorkspaceRouter {
     entries: Vec<NamedWorkspaceEntry>,
     by_name: HashMap<String, usize>,
     watch_files: bool,
+    /// The one host context every named workspace's service is built with.
+    host_activation: Arc<HostActivationContext>,
 }
 
 impl NamedWorkspaceRouter {
-    fn new(workspaces: Vec<NamedWorkspace>, watch_files: bool) -> Result<Self, String> {
+    fn new(
+        workspaces: Vec<NamedWorkspace>,
+        watch_files: bool,
+        host: Arc<HostActivationContext>,
+    ) -> Result<Self, String> {
         if workspaces.is_empty() {
             return Err("named workspace mode requires at least one workspace".to_string());
         }
@@ -177,7 +184,7 @@ impl NamedWorkspaceRouter {
                 ));
             }
             let service = if index == 0 {
-                Some(Arc::new(new_workspace_service(&root, watch_files)?))
+                Some(Arc::new(new_workspace_service(&root, watch_files, &host)?))
             } else {
                 None
             };
@@ -193,6 +200,7 @@ impl NamedWorkspaceRouter {
             entries,
             by_name,
             watch_files,
+            host_activation: host,
         })
     }
 
@@ -221,6 +229,7 @@ impl NamedWorkspaceRouter {
             *service = Some(Arc::new(new_workspace_service(
                 &entry.root,
                 self.watch_files,
+                &self.host_activation,
             )?));
         }
         Ok(Arc::clone(
@@ -256,11 +265,19 @@ impl NamedWorkspaceRouter {
     }
 }
 
-fn new_workspace_service(root: &Path, watch_files: bool) -> Result<SearchToolsService, String> {
+fn new_workspace_service(
+    root: &Path,
+    watch_files: bool,
+    host: &Arc<HostActivationContext>,
+) -> Result<SearchToolsService, String> {
+    let host = Arc::clone(host);
     if watch_files {
-        SearchToolsService::new_deferred(root.to_path_buf())
+        SearchToolsService::new_deferred_with_host_activation_context(root.to_path_buf(), host)
     } else {
-        SearchToolsService::new_deferred_manual(root.to_path_buf())
+        SearchToolsService::new_deferred_manual_with_host_activation_context(
+            root.to_path_buf(),
+            host,
+        )
     }
 }
 
@@ -652,6 +669,16 @@ impl RootsActivations {
         nonce
     }
 
+    /// Check without spending a retry that can still meet transient contention.
+    /// Activation callers hold the connection guard through validation/binding.
+    fn contains(&self, nonce: &str) -> bool {
+        self.outstanding
+            .lock()
+            .expect("roots activation lock poisoned")
+            .iter()
+            .any(|issued| issued == nonce)
+    }
+
     /// Consume a nonce, reporting whether it was one Bifrost issued and had not
     /// already spent. Single use: a replayed retry is not an activation.
     fn redeem(&self, nonce: &str) -> bool {
@@ -1033,6 +1060,39 @@ pub struct BifrostMcpHandler {
     workspace: tokio::sync::Mutex<ConnectionState>,
 }
 
+// Authorization is one algorithm; callers supply blocking or observational
+// binding operations. A probe never converts a contended mutation into a wait.
+trait WorkspaceBindingOps {
+    fn root(&self) -> Result<Option<PathBuf>, crate::SearchToolsServiceError>;
+    fn bind(&self, root: PathBuf) -> Result<PathBuf, crate::SearchToolsServiceError>;
+    fn unbind(&self) -> Result<(), crate::SearchToolsServiceError>;
+}
+
+impl WorkspaceBindingOps for &SearchToolsService {
+    fn root(&self) -> Result<Option<PathBuf>, crate::SearchToolsServiceError> {
+        Ok(self.active_workspace_root())
+    }
+    fn bind(&self, root: PathBuf) -> Result<PathBuf, crate::SearchToolsServiceError> {
+        self.bind_client_workspace(root)
+    }
+    fn unbind(&self) -> Result<(), crate::SearchToolsServiceError> {
+        self.unbind_client_workspace()
+    }
+}
+
+struct ProbeWorkspace<'a>(&'a SearchToolsService);
+impl WorkspaceBindingOps for ProbeWorkspace<'_> {
+    fn root(&self) -> Result<Option<PathBuf>, crate::SearchToolsServiceError> {
+        self.0.try_active_workspace_root()
+    }
+    fn bind(&self, root: PathBuf) -> Result<PathBuf, crate::SearchToolsServiceError> {
+        self.0.try_bind_client_workspace(root)
+    }
+    fn unbind(&self) -> Result<(), crate::SearchToolsServiceError> {
+        self.0.try_unbind_client_workspace()
+    }
+}
+
 impl BifrostMcpHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1112,73 +1172,145 @@ impl BifrostMcpHandler {
     /// across that gap comes from two re-checks rather than from exclusion:
     /// another call may have bound already, and the client may have revoked the
     /// roots it is about to name.
-    #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    async fn ensure_client_workspace(&self, context: &RequestContext<RoleServer>) {
-        let cancelled = &context.ct;
-        let (peer, revocations_at_request) = {
-            let mut state = self.workspace.lock().await;
-            if self.client_roots_binding_is_stale(&state) {
-                self.revoke_client_roots(&mut state);
-            }
-            if !state.accepts_client_roots || state.binding != WorkspaceBinding::Unbound {
-                return;
-            }
-            let Some(negotiated) = state.negotiated.as_ref() else {
-                // A stateless 2026-07-28 request has no connection-level
-                // negotiation to consult and no post-handshake roots
-                // lifecycle; its route to a workspace is the MRTR exchange in
-                // `activate_workspace_over_mrtr`, so silence is correct here.
-                if !request_negotiates_per_request(&context.meta) {
-                    eprintln!(
-                        "bifrost: refusing to request MCP roots before the initialize handshake completes"
-                    );
-                }
-                return;
-            };
-            if !negotiated.client_supports_roots {
-                return;
-            }
-            // Snapshotted before the request goes out, so an answer that the
-            // client supersedes mid-flight can be recognized as stale. Reading
-            // it after the round trip would fold the revocation into the new
-            // binding and mark the withdrawn scope permanently fresh.
-            (negotiated.peer.clone(), self.roots_revocations.observed())
-        };
+    fn try_probe_connection(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ConnectionState>, ErrorData> {
+        self.workspace.try_lock().map_err(|_| {
+            map_service_failure(
+                self.service
+                    .workspace_busy("connection workspace lock is busy"),
+            )
+        })
+    }
 
-        // Bounded and cancellable: a client that never answers must not pin a
-        // request forever, and one that gives up must not keep us waiting.
-        // This bounds client liveness on a protocol round trip, not analyzer
-        // work, so it stays fixed even when the analyzer request budget is
-        // unset or raised for an eval.
+    fn client_roots_request(
+        &self,
+        binding: &impl WorkspaceBindingOps,
+        state: &mut ConnectionState,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Option<(rmcp::service::Peer<RoleServer>, u64)>, ErrorData> {
+        if self.client_roots_binding_is_stale(state) {
+            self.revoke_client_roots(binding, state)?;
+        }
+        if !state.accepts_client_roots || state.binding != WorkspaceBinding::Unbound {
+            return Ok(None);
+        }
+        let Some(negotiated) = state.negotiated.as_ref() else {
+            if !request_negotiates_per_request(&context.meta) {
+                eprintln!(
+                    "bifrost: refusing to request MCP roots before the initialize handshake completes"
+                );
+            }
+            return Ok(None);
+        };
+        if !negotiated.client_supports_roots {
+            return Ok(None);
+        }
+        Ok(Some((
+            negotiated.peer.clone(),
+            self.roots_revocations.observed(),
+        )))
+    }
+
+    // Only owned request data crosses this await. Neither connection nor
+    // service binding guards can be held while the client chooses its roots.
+    #[allow(deprecated)]
+    async fn request_client_roots(
+        &self,
+        peer: rmcp::service::Peer<RoleServer>,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<rmcp::model::ListRootsResult> {
         let result = tokio::select! {
             result = tokio::time::timeout(ROOTS_LIST_LIVENESS_BOUND, peer.list_roots()) => result,
-            () = cancelled.cancelled() => {
+            () = context.ct.cancelled() => {
                 eprintln!("bifrost: MCP roots/list abandoned; the client cancelled the request that asked for it");
-                return;
+                return None;
             }
         };
+        match result {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(error)) => {
+                eprintln!("bifrost: MCP roots/list failed: {error}");
+                None
+            }
+            Err(_) => {
+                eprintln!(
+                    "bifrost: MCP roots/list timed out after {ROOTS_LIST_LIVENESS_BOUND:?}; the client did not supply a workspace"
+                );
+                None
+            }
+        }
+    }
 
-        let mut state = self.workspace.lock().await;
+    #[allow(deprecated)]
+    fn apply_client_roots_reply(
+        &self,
+        binding: &impl WorkspaceBindingOps,
+        state: &mut ConnectionState,
+        revocations_at_request: u64,
+        roots: &[Root],
+    ) -> Result<(), ErrorData> {
         if state.binding != WorkspaceBinding::Unbound {
-            // A concurrent call already negotiated a workspace. Its binding is
-            // as good as the one this answer would produce.
-            return;
+            return Ok(());
         }
         if self.roots_revocations.observed() != revocations_at_request {
             eprintln!(
                 "bifrost: discarding a superseded MCP roots/list answer; the client changed its roots while the request was in flight"
             );
-            return;
+            return Ok(());
         }
-        match result {
-            Ok(Ok(result)) => {
-                self.bind_first_usable_root(&mut state, &result.roots);
-            }
-            Ok(Err(error)) => eprintln!("bifrost: MCP roots/list failed: {error}"),
-            Err(_elapsed) => eprintln!(
-                "bifrost: MCP roots/list timed out after {ROOTS_LIST_LIVENESS_BOUND:?}; the client did not supply a workspace"
-            ),
-        }
+        self.bind_first_usable_root(binding, state, roots)?;
+        Ok(())
+    }
+
+    #[allow(deprecated)] // Roots: see the note on the Root import.
+    async fn ensure_client_workspace(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let request = {
+            let mut state = self.workspace.lock().await;
+            self.client_roots_request(&self.service.as_ref(), &mut state, context)?
+        };
+        let Some((peer, revocations)) = request else {
+            return Ok(());
+        };
+        let Some(reply) = self.request_client_roots(peer, context).await else {
+            return Ok(());
+        };
+        let mut state = self.workspace.lock().await;
+        self.apply_client_roots_reply(
+            &self.service.as_ref(),
+            &mut state,
+            revocations,
+            &reply.roots,
+        )
+    }
+
+    #[allow(deprecated)] // Roots: see the note on the Root import.
+    async fn ensure_probe_workspace(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let request = {
+            let mut state = self.try_probe_connection()?;
+            self.client_roots_request(&ProbeWorkspace(&self.service), &mut state, context)?
+        };
+        let Some((peer, revocations)) = request else {
+            return Ok(());
+        };
+        let Some(reply) = self.request_client_roots(peer, context).await else {
+            return Ok(());
+        };
+        // Another call may have bound, revoked, or acquired the serial guard
+        // during the round trip. Never queue behind it; a retry negotiates again.
+        let mut state = self.try_probe_connection()?;
+        self.apply_client_roots_reply(
+            &ProbeWorkspace(&self.service),
+            &mut state,
+            revocations,
+            &reply.roots,
+        )
     }
 
     /// Whether the client withdrew authorization for the currently bound scope.
@@ -1197,8 +1329,12 @@ impl BifrostMcpHandler {
     }
 
     /// Drop the client-roots scope and stop any work admitted against it.
-    fn revoke_client_roots(&self, state: &mut ConnectionState) {
-        self.revoke_workspace(state, "changed MCP workspace roots");
+    fn revoke_client_roots(
+        &self,
+        binding: &impl WorkspaceBindingOps,
+        state: &mut ConnectionState,
+    ) -> Result<(), ErrorData> {
+        self.revoke_workspace(binding, state, "changed MCP workspace roots")
     }
 
     /// The one way a workspace is given up.
@@ -1208,8 +1344,16 @@ impl BifrostMcpHandler {
     /// performs two of the three leaves analyzer threads grinding against a
     /// directory the client has withdrawn. Splitting them by hand is how the
     /// Codex paths came to skip the cancellation.
-    fn revoke_workspace(&self, state: &mut ConnectionState, reason: &str) {
-        if let Err(error) = self.service.unbind_client_workspace() {
+    fn revoke_workspace(
+        &self,
+        binding: &impl WorkspaceBindingOps,
+        state: &mut ConnectionState,
+        reason: &str,
+    ) -> Result<(), ErrorData> {
+        if let Err(error) = binding.unbind() {
+            if error.workspace_incomplete.is_some() {
+                return Err(map_service_failure(error));
+            }
             eprintln!("bifrost: failed to revoke {reason}: {error}");
         }
         self.in_flight.cancel_stale(WorkspaceRequestScope {
@@ -1217,6 +1361,7 @@ impl BifrostMcpHandler {
             generation: self.service.workspace_generation(),
         });
         state.clear_binding();
+        Ok(())
     }
 
     /// Bind the first root in `roots` that Bifrost can actually analyze.
@@ -1228,7 +1373,12 @@ impl BifrostMcpHandler {
     /// roots arrive alongside a client-controlled `requestState` and are no
     /// more trusted for it.
     #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    fn bind_first_usable_root(&self, state: &mut ConnectionState, roots: &[Root]) -> bool {
+    fn bind_first_usable_root(
+        &self,
+        binding: &impl WorkspaceBindingOps,
+        state: &mut ConnectionState,
+        roots: &[Root],
+    ) -> Result<bool, ErrorData> {
         let mut last_error = None;
         for root in roots {
             let candidate = match client_root_to_path(&root.uri) {
@@ -1238,7 +1388,7 @@ impl BifrostMcpHandler {
                     continue;
                 }
             };
-            match self.service.bind_client_workspace(candidate) {
+            match binding.bind(candidate) {
                 Ok(root) => {
                     self.in_flight.cancel_stale(WorkspaceRequestScope {
                         workspace_id: 0,
@@ -1251,9 +1401,14 @@ impl BifrostMcpHandler {
                         "bifrost: bound MCP workspace source=roots/list root={}",
                         escape_terminal_text(root.to_string_lossy().as_ref())
                     );
-                    return true;
+                    return Ok(true);
                 }
-                Err(error) => last_error = Some(error.to_string()),
+                Err(error) => {
+                    if error.workspace_incomplete.is_some() {
+                        return Err(map_service_failure(error));
+                    }
+                    last_error = Some(error.to_string());
+                }
             }
         }
 
@@ -1263,7 +1418,7 @@ impl BifrostMcpHandler {
                 eprintln!("bifrost: MCP client returned no workspace roots; server remains unbound")
             }
         }
-        false
+        Ok(false)
     }
 
     /// Re-validate the Codex sandbox scope carried on this call.
@@ -1275,6 +1430,7 @@ impl BifrostMcpHandler {
     /// scope the current request did not itself authorize.
     fn reconcile_codex_sandbox_workspace(
         &self,
+        binding: &impl WorkspaceBindingOps,
         state: &mut ConnectionState,
         meta: &rmcp::model::RequestMetaObject,
     ) -> Result<(), ErrorData> {
@@ -1289,12 +1445,12 @@ impl BifrostMcpHandler {
             .and_then(Value::as_str);
 
         let Some(sandbox_cwd) = sandbox_cwd else {
-            self.revoke_codex_sandbox_workspace(state, thread_id, "metadata missing");
+            self.revoke_codex_sandbox_workspace(binding, state, thread_id, "metadata missing")?;
             log_codex_workspace_event("workspace metadata missing", thread_id);
             return Err(unbound_workspace_error());
         };
 
-        let active_root = self.service.active_workspace_root();
+        let active_root = binding.root().map_err(map_service_failure)?;
         if let WorkspaceBinding::CodexSandbox { cwd_uri, root } = &state.binding
             && cwd_uri == sandbox_cwd
             && active_root.as_ref() == Some(root)
@@ -1305,7 +1461,7 @@ impl BifrostMcpHandler {
         let candidate = match file_uri_to_path(sandbox_cwd) {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.revoke_codex_sandbox_workspace(state, thread_id, "metadata invalid");
+                self.revoke_codex_sandbox_workspace(binding, state, thread_id, "metadata invalid")?;
                 log_codex_workspace_event(
                     &format!(
                         "rejected workspace metadata error={}",
@@ -1325,17 +1481,21 @@ impl BifrostMcpHandler {
         // unreachable given the first (reaching this function already implies
         // the binding can only be Codex or nothing), and two adjacent copies of
         // a security teardown guarded differently is how they drift apart.
-        if self.service.active_workspace_root().is_some()
+        if binding.root().map_err(map_service_failure)?.is_some()
             || state.binding != WorkspaceBinding::Unbound
         {
-            self.revoke_workspace(state, "the previous workspace reason=metadata changed");
+            self.revoke_workspace(
+                binding,
+                state,
+                "the previous workspace reason=metadata changed",
+            )?;
             log_codex_workspace_event(
                 "revoked previous workspace reason=metadata changed",
                 thread_id,
             );
         }
 
-        match self.service.bind_client_workspace(candidate) {
+        match binding.bind(candidate) {
             Ok(root) => {
                 state.binding = WorkspaceBinding::CodexSandbox {
                     cwd_uri: sandbox_cwd.to_string(),
@@ -1351,7 +1511,7 @@ impl BifrostMcpHandler {
                 Ok(())
             }
             Err(error) => {
-                self.revoke_workspace(state, "the failed Codex workspace bind");
+                self.revoke_workspace(binding, state, "the failed Codex workspace bind")?;
                 log_codex_workspace_event(
                     &format!(
                         "failed workspace bind source={CODEX_SANDBOX_STATE_META_CAPABILITY} error={}",
@@ -1359,22 +1519,28 @@ impl BifrostMcpHandler {
                     ),
                     thread_id,
                 );
-                Err(map_service_error(error.code, error.message))
+                Err(map_service_failure(error))
             }
         }
     }
 
     fn revoke_codex_sandbox_workspace(
         &self,
+        binding: &impl WorkspaceBindingOps,
         state: &mut ConnectionState,
         thread_id: Option<&str>,
         reason: &str,
-    ) {
+    ) -> Result<(), ErrorData> {
         if !matches!(state.binding, WorkspaceBinding::CodexSandbox { .. }) {
-            return;
+            return Ok(());
         }
-        self.revoke_workspace(state, &format!("the Codex workspace reason={reason}"));
+        self.revoke_workspace(
+            binding,
+            state,
+            &format!("the Codex workspace reason={reason}"),
+        )?;
         log_codex_workspace_event(&format!("revoked MCP workspace reason={reason}"), thread_id);
+        Ok(())
     }
 
     /// Bind a workspace for a `2026-07-28` client, which has no post-handshake
@@ -1388,24 +1554,25 @@ impl BifrostMcpHandler {
     /// root falls through to the ordinary unbound-workspace error rather than
     /// being asked again, so a misbehaving client cannot loop the server.
     #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    async fn activate_workspace_over_mrtr(
+    fn activate_workspace_over_mrtr(
         &self,
+        binding: &impl WorkspaceBindingOps,
         state: &mut ConnectionState,
         request: &CallToolRequestParams,
         context: &RequestContext<RoleServer>,
-    ) -> Option<rmcp::model::InputRequiredResult> {
+    ) -> Result<Option<rmcp::model::InputRequiredResult>, ErrorData> {
         if !state.accepts_client_roots || state.binding != WorkspaceBinding::Unbound {
-            return None;
+            return Ok(None);
         }
         // Gate on the negotiated revision rather than letting rmcp reject the
         // result for older peers: a legacy client should read Bifrost's plain
         // "not bound to a workspace" message, not an opaque protocol error.
         if !speaks_2026_07_28(context) {
-            return None;
+            return Ok(None);
         }
 
         let Some(request_state) = request.request_state.as_deref() else {
-            return Some(rmcp::model::InputRequiredResult::new(
+            return Ok(Some(rmcp::model::InputRequiredResult::new(
                 Some(
                     [(
                         ROOTS_INPUT_REQUEST_KEY.to_string(),
@@ -1417,16 +1584,16 @@ impl BifrostMcpHandler {
                     .collect(),
                 ),
                 Some(self.roots_activations.issue()),
-            ));
+            )));
         };
 
         // `requestState` is client-controlled and echoed verbatim, so it
         // authorizes nothing. It is only a nonce proving this call is the
         // retry of an activation Bifrost actually asked for; the roots
         // themselves are re-validated below exactly as on the legacy path.
-        if !self.roots_activations.redeem(request_state) {
+        if !self.roots_activations.contains(request_state) {
             eprintln!("bifrost: ignoring MCP roots activation with an unrecognized requestState");
-            return None;
+            return Ok(None);
         }
         match request
             .input_responses
@@ -1439,7 +1606,7 @@ impl BifrostMcpHandler {
             Some(value) => {
                 match serde_json::from_value::<rmcp::model::ListRootsResult>(value.clone()) {
                     Ok(result) => {
-                        self.bind_first_usable_root(state, &result.roots);
+                        self.bind_first_usable_root(binding, state, &result.roots)?;
                     }
                     // The error names the offending field; "no usable response"
                     // alone leaves a client author nothing to act on.
@@ -1449,7 +1616,12 @@ impl BifrostMcpHandler {
                 }
             }
         }
-        None
+        // The connection guard serializes nonce issuance and redemption. A
+        // retryable binding error returned above must retain this same nonce;
+        // only a terminal outcome (including unusable roots) spends it.
+        let redeemed = self.roots_activations.redeem(request_state);
+        debug_assert!(redeemed);
+        Ok(None)
     }
 
     /// Everything a tool call needs decided before it may touch the analyzer:
@@ -1457,6 +1629,7 @@ impl BifrostMcpHandler {
     /// workspace lock so concurrent calls cannot interleave with a rebind.
     fn prepare_tool_call(
         &self,
+        binding: &impl WorkspaceBindingOps,
         state: &mut ConnectionState,
         name: &str,
         arguments: Value,
@@ -1488,15 +1661,20 @@ impl BifrostMcpHandler {
         // it in wire order, so this comparison is what actually makes the rule
         // hold; `on_roots_list_changed` only makes revocation prompt.
         if self.client_roots_binding_is_stale(state) {
-            self.revoke_client_roots(state);
+            self.revoke_client_roots(binding, state)?;
         }
 
-        self.reconcile_codex_sandbox_workspace(state, meta)?;
+        self.reconcile_codex_sandbox_workspace(binding, state, meta)?;
 
         if state.binding == WorkspaceBinding::Unbound {
+            if self.service.workspace_binding_capacity_exhausted() {
+                return Err(map_service_failure(
+                    self.service.workspace_activation_not_ready(),
+                ));
+            }
             return Err(unbound_workspace_error());
         }
-        let Some(workspace_root) = self.service.active_workspace_root() else {
+        let Some(workspace_root) = binding.root().map_err(map_service_failure)? else {
             return Err(unbound_workspace_error());
         };
 
@@ -1523,7 +1701,7 @@ impl BifrostMcpHandler {
                 Ok(RunPolicyPreflight::Invalid(output)) => {
                     return Ok(PreparedToolCall::Reply(tool_success_result(output)));
                 }
-                Err(error) => return Err(map_service_error(error.code, error.message)),
+                Err(error) => return Err(map_service_failure(error)),
             }
         } else {
             None
@@ -1532,10 +1710,12 @@ impl BifrostMcpHandler {
         Ok(PreparedToolCall::Ready {
             arguments,
             run_policy_preflight,
-            workspace_scope: (!serial_tool_request(name)).then(|| WorkspaceRequestScope {
-                workspace_id: 0,
-                generation: self.service.workspace_generation(),
-            }),
+            workspace_scope: (!serial_tool_request(name) || name == "get_active_workspace").then(
+                || WorkspaceRequestScope {
+                    workspace_id: 0,
+                    generation: self.service.workspace_generation(),
+                },
+            ),
         })
     }
 
@@ -1578,7 +1758,7 @@ impl BifrostMcpHandler {
                         PreparedToolCall::Reply(tool_success_result(output)),
                     ));
                 }
-                Err(error) => return Err(map_service_error(error.code, error.message)),
+                Err(error) => return Err(map_service_failure(error)),
             }
         } else {
             None
@@ -1820,28 +2000,16 @@ impl BifrostMcpHandler {
                     bifrost_cancellation.cancel();
                     // The truthful last phase for this request: its analyzer
                     // work is now cooperatively cancelling. Sent before the
-                    // error response, and never again after it -- the loop
+                    // deadline result, and never again after it -- the loop
                     // that forwards the analyzer's phases ends here.
                     if let Some(progress) = progress {
                         progress.workspace(&service, Some(RequestOutcome::Cancelled)).await;
                         progress.phase(format!("cancelling {name}")).await;
                     }
-                    // The budget this request was accepted under, not a second
-                    // reading of the configured knob: since #3279 an execution
-                    // timer can fire on a fallback rung alone (#3396).
-                    let budget = request_budget
-                        .expect("the deadline fired, so the request had a budget")
-                        .budget();
-                    let phase = bifrost_cancellation.phase().expect(
+                    let phase = bifrost_cancellation.deadline_phase().expect(
                         "the request entered its execution phase before the budget could fire",
                     );
-                    return Err(ErrorData::internal_error(
-                        format!(
-                            "{name} exhausted its {budget:?} request budget while {phase}; \
-                             cancellation continues in the background"
-                        ),
-                        None,
-                    ));
+                    return Ok(deadline_result(IncompleteStage::Execution, &phase, None));
                 }
             }
         };
@@ -1858,10 +2026,26 @@ impl BifrostMcpHandler {
 
         match output {
             Ok(output) => Ok(tool_success_result(output)),
+            // The worker can observe its deadline and return before the host
+            // timer wins the select. Only a recorded token timeout projects
+            // that failure; a late internal error alone is still an error.
+            // Successful family partials above retain their own completion.
+            Err(error) if bifrost_cancellation.is_timed_out() => {
+                // The worker has already unwound the phase guards it held when
+                // it observed the deadline, so read the phase it recorded then.
+                let phase = bifrost_cancellation.deadline_phase().expect(
+                    "the request entered its execution phase before the worker could time out",
+                );
+                Ok(deadline_result(
+                    IncompleteStage::Execution,
+                    &phase,
+                    Some(&error.message),
+                ))
+            }
             Err(error) if error.code == SearchToolsServiceErrorCode::UnknownTool => {
                 Ok(tool_error_result(error.message))
             }
-            Err(error) => Err(map_service_error(error.code, error.message)),
+            Err(error) => Err(map_service_failure(error)),
         }
     }
 
@@ -1989,6 +2173,12 @@ enum PreparedToolCall {
     Reply(CallToolResult),
 }
 
+#[derive(Debug)]
+enum AnalyzerAdmissionError {
+    DeadlineExceeded,
+    Protocol(ErrorData),
+}
+
 /// Take one analyzer slot, bounded by the request's own budget.
 ///
 /// `request_budget` is the exact value that produced the request's deadline,
@@ -1996,12 +2186,41 @@ enum PreparedToolCall {
 /// configured knob a second time. Since #3279 that budget can be a fallback
 /// rung with nothing configured, and #3396 is the panic that followed from
 /// asking the configured knob alone.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceObservationStop {
+    DeadlineExceeded,
+    Cancelled,
+}
+
+/// Observing an unfinished build answers immediately, but installing a finished
+/// one can race another request's session lock. Bound that await by the same
+/// absolute deadline as admission and execution; stopping it never stops shared
+/// preparation or its off-runtime observer.
+async fn await_workspace_observation<T>(
+    observation: impl std::future::Future<Output = T>,
+    request_budget: Option<RequestBudget>,
+    cancelled: &McpCancellationToken,
+) -> Result<T, WorkspaceObservationStop> {
+    let deadline = async {
+        match request_budget {
+            Some(budget) => tokio::time::sleep_until(budget.deadline().into()).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err(WorkspaceObservationStop::Cancelled),
+        _ = deadline => Err(WorkspaceObservationStop::DeadlineExceeded),
+        observed = observation => Ok(observed),
+    }
+}
+
 async fn await_analyzer_admission(
     pool: &AnalyzerExecutionPool,
     request_budget: Option<RequestBudget>,
     name: &str,
     cancelled: &McpCancellationToken,
-) -> Result<AnalyzerPermit, ErrorData> {
+) -> Result<AnalyzerPermit, AnalyzerAdmissionError> {
     let admission = match request_budget {
         Some(request_budget) => {
             tokio::time::timeout(
@@ -2016,21 +2235,23 @@ async fn await_analyzer_admission(
     };
     match admission {
         Ok(Admission::Granted(permit)) => Ok(permit),
-        Ok(Admission::Cancelled) => Err(ErrorData::internal_error(
-            "the tool call was cancelled while waiting for analyzer capacity",
-            None,
-        )),
+        Ok(Admission::Cancelled) => {
+            Err(AnalyzerAdmissionError::Protocol(ErrorData::internal_error(
+                "the tool call was cancelled while waiting for analyzer capacity",
+                None,
+            )))
+        }
         Ok(Admission::Saturated) => {
             eprintln!(
                 "bifrost: refusing {name}; more than {} analyzer requests are already queued",
                 MAX_QUEUED_ANALYZER_REQUESTS
             );
-            Err(ErrorData::internal_error(
+            Err(AnalyzerAdmissionError::Protocol(ErrorData::internal_error(
                 format!(
                     "too many analyzer requests are queued; retry {name} once earlier calls complete"
                 ),
                 None,
-            ))
+            )))
         }
         Err(_elapsed) => {
             // Only the budgeted arm above can produce an elapsed timeout, and
@@ -2042,10 +2263,7 @@ async fn await_analyzer_admission(
                 "bifrost: {name} exhausted its {:?} budget waiting for analyzer capacity",
                 request_budget.budget()
             );
-            Err(ErrorData::internal_error(
-                format!("{name} timed out waiting for analyzer capacity"),
-                None,
-            ))
+            Err(AnalyzerAdmissionError::DeadlineExceeded)
         }
     }
 }
@@ -2174,8 +2392,7 @@ async fn run_tool_as_task_inner(
             )
             .await;
     }
-    ready
-        .map_err(|error| task_exit(&task_context, map_service_error(error.code, error.message)))?;
+    ready.map_err(|error| task_exit(&task_context, map_service_failure(error)))?;
 
     task_context.set_status_message(format!("{name}: waiting for analyzer admission"));
     let admission = tokio::time::timeout(
@@ -2272,10 +2489,7 @@ async fn run_tool_as_task_inner(
         Err(error) if error.code == SearchToolsServiceErrorCode::UnknownTool => {
             Ok(tool_error_result(error.message))
         }
-        Err(error) => Err(task_exit(
-            &task_context,
-            map_service_error(error.code, error.message),
-        )),
+        Err(error) => Err(task_exit(&task_context, map_service_failure(error))),
     }
 }
 
@@ -2297,7 +2511,11 @@ fn workspace_revoked_error() -> ErrorData {
 }
 
 fn tool_success_result(output: crate::ToolOutput) -> CallToolResult {
-    match output {
+    // SDK-owned Value/text copies start at this compatibility boundary.
+    match output.into_compat_output() {
+        crate::ToolOutput::QueryResponse(_) => {
+            unreachable!("compatibility conversion erases typed queries")
+        }
         crate::ToolOutput::Text(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
         crate::ToolOutput::Structured {
             structured,
@@ -2322,12 +2540,99 @@ fn tool_error_result(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
+/// Host stops carry no family payload: outputSchema applies to a tool's
+/// structuredContent, so this result deliberately uses only content and _meta.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IncompleteStage {
+    WorkspaceActivation,
+    WorkspaceReadiness,
+    AnalyzerAdmission,
+    Execution,
+}
+
+fn deadline_result(
+    stage: IncompleteStage,
+    phase: &str,
+    stopped_with: Option<&str>,
+) -> CallToolResult {
+    let stage_name = match stage {
+        IncompleteStage::WorkspaceActivation => "workspace_activation",
+        IncompleteStage::WorkspaceReadiness => "workspace_readiness",
+        IncompleteStage::AnalyzerAdmission => "analyzer_admission",
+        IncompleteStage::Execution => "execution",
+    };
+    let mut text = format!("request deadline exceeded at {stage_name} while {phase}");
+    if matches!(stage, IncompleteStage::WorkspaceReadiness) {
+        // wait_workspace_ready_until only stops the waiter. The shared build
+        // retains its own lifetime and is not cancelled by this deadline.
+        text.push_str("; workspace preparation continues");
+    }
+    if let Some(message) = stopped_with {
+        text.push_str("; the work stopped with: ");
+        text.push_str(message);
+    }
+    incomplete_result("deadline_exceeded", stage, phase, text)
+}
+
+fn workspace_not_ready_result(phase: &str, named_mode: bool) -> CallToolResult {
+    let next = if named_mode {
+        "retry"
+    } else {
+        "check get_active_workspace or retry"
+    };
+    incomplete_result(
+        "workspace_not_ready",
+        IncompleteStage::WorkspaceReadiness,
+        phase,
+        format!(
+            "workspace not ready at workspace_readiness while {phase}; workspace preparation continues; {next}"
+        ),
+    )
+}
+
+fn incomplete_result(
+    reason: &str,
+    stage: IncompleteStage,
+    phase: &str,
+    text: String,
+) -> CallToolResult {
+    let mut incomplete = json!({
+        "status": "inconclusive",
+        "completion": {"type": "inconclusive", "reasons": [reason]},
+        "stage": stage,
+        "phase": phase,
+        "partial": false,
+    });
+    if matches!(stage, IncompleteStage::WorkspaceReadiness) {
+        incomplete["workspace_preparation"] = json!("continues");
+    }
+    let mut result = tool_error_result(text);
+    let mut meta = MetaObject::new();
+    meta.0
+        .insert("io.bifrost/incomplete".to_owned(), incomplete);
+    result.meta = Some(meta);
+    result
+}
+
 fn unbound_workspace_error() -> ErrorData {
     ErrorData::internal_error(UNBOUND_WORKSPACE_MESSAGE, None)
 }
 
+fn map_service_failure(error: crate::SearchToolsServiceError) -> ErrorData {
+    let incomplete = error.workspace_incomplete;
+    let mut mapped = map_service_error(error.code, error.message);
+    if let Some(incomplete) = incomplete {
+        mapped.data = Some(json!({"io.bifrost/workspace-incomplete": incomplete}));
+    }
+    mapped
+}
+
 fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> ErrorData {
     match code {
+        SearchToolsServiceErrorCode::WorkspaceUnavailable => {
+            ErrorData::internal_error(message, None)
+        }
         SearchToolsServiceErrorCode::InvalidParams => ErrorData::invalid_params(message, None),
         SearchToolsServiceErrorCode::StaleWorkspaceGeneration { requested, current } => {
             ErrorData::invalid_params(
@@ -2641,8 +2946,10 @@ impl ServerHandler for BifrostMcpHandler {
         // this handler can be scheduled arbitrarily late: by the time it runs,
         // a tool call may already have re-negotiated a fresh scope, and tearing
         // that one down would fail a call the client is still waiting on.
-        if self.client_roots_binding_is_stale(&state) {
-            self.revoke_client_roots(&mut state);
+        if self.client_roots_binding_is_stale(&state)
+            && let Err(error) = self.revoke_client_roots(&self.service.as_ref(), &mut state)
+        {
+            eprintln!("bifrost: failed to revoke client roots: {error}");
         }
     }
 
@@ -2651,7 +2958,9 @@ impl ServerHandler for BifrostMcpHandler {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let result: Result<CallToolResponse, ErrorData> = async {
         let name = request.name.to_string();
+        let is_readiness_probe = name == "get_active_workspace";
         // A measurement control, deliberately absent from every descriptor and
         // public tools/list. rmcp's default get_tool returns None, permitting
         // dispatch without inventing a second protocol or advertising a schema.
@@ -2671,7 +2980,7 @@ impl ServerHandler for BifrostMcpHandler {
             .map_err(|error| {
                 ErrorData::internal_error(format!("retention census panicked: {error}"), None)
             })?
-            .map_err(|error| map_service_error(error.code, error.message))?;
+            .map_err(map_service_failure)?;
             return Ok(tool_success_result(output).into());
         }
         if !self.tool_names.contains(&name) {
@@ -2712,7 +3021,7 @@ impl ServerHandler for BifrostMcpHandler {
             .map_err(|error| {
                 ErrorData::internal_error(format!("list_policies panicked: {error}"), None)
             })?
-            .map_err(|error| map_service_error(error.code, error.message))?;
+            .map_err(map_service_failure)?;
             return Ok(tool_success_result(output).into());
         }
 
@@ -2720,21 +3029,31 @@ impl ServerHandler for BifrostMcpHandler {
         let (service, prepared, state) = if named_mode {
             let (service, prepared) = self.prepare_named_tool_call(&name, arguments)?;
             (service, prepared, None)
+        } else if is_readiness_probe {
+            self.ensure_probe_workspace(&context).await?;
+            let mut state = self.try_probe_connection()?;
+            let binding = ProbeWorkspace(&self.service);
+            if self.client_roots_binding_is_stale(&state) { self.revoke_client_roots(&binding, &mut state)?; }
+            if let Some(input_required) = self.activate_workspace_over_mrtr(&binding, &mut state, &request, &context)? { return Ok(input_required.into()); }
+            let prepared = self.prepare_tool_call(&binding, &mut state, &name, arguments, &context.meta)?;
+            // This guard protects authorization only; the service poll observes
+            // its own locks after it has been released.
+            drop(state);
+            (Arc::clone(&self.service), prepared, None)
         } else {
             // Negotiating a workspace can require a client round trip, so it
             // happens before the preparation lock is taken.
-            self.ensure_client_workspace(&context).await;
+            self.ensure_client_workspace(&context).await?;
             let mut state = self.workspace.lock().await;
             if self.client_roots_binding_is_stale(&state) {
-                self.revoke_client_roots(&mut state);
+                self.revoke_client_roots(&self.service.as_ref(), &mut state)?;
             }
             if let Some(input_required) = self
-                .activate_workspace_over_mrtr(&mut state, &request, &context)
-                .await
+                .activate_workspace_over_mrtr(&self.service.as_ref(), &mut state, &request, &context)?
             {
                 return Ok(input_required.into());
             }
-            let prepared = self.prepare_tool_call(&mut state, &name, arguments, &context.meta)?;
+            let prepared = self.prepare_tool_call(&self.service.as_ref(), &mut state, &name, arguments, &context.meta)?;
             (Arc::clone(&self.service), prepared, Some(state))
         };
         let correlation_id = serde_json::to_value(&context.id)
@@ -2778,6 +3097,8 @@ impl ServerHandler for BifrostMcpHandler {
         // `mcp_fairness` benchmark failure). `then_some` evaluates its
         // argument eagerly, so the guard moves and drops now for non-serial
         // calls.
+        // The readiness poll remains admission-exempt, but never holds the
+        // connection workspace lock while observing service locks.
         let _serial_guard = serial.then_some(state).flatten();
 
         let progress = ProgressReporter::from_request(
@@ -2821,66 +3142,84 @@ impl ServerHandler for BifrostMcpHandler {
         // executing call.
 
         let accepted_at = Instant::now();
-        let cold_workspace = service.workspace_build_pending();
-        let mut workspace_readiness_wait = Duration::ZERO;
-        // Resolved once for the whole request: the readiness wait, the
-        // admission wait, and the execution timer all run under the same
-        // budget, and each timeout names the budget that actually expired
-        // (#3396). Since #3279 that budget can be a fallback rung with no
-        // `BIFROST_MCP_REQUEST_BUDGET_SECS` set.
-        let request_budget = RequestBudget::resolve(&name, cold_workspace, accepted_at);
-        let deadline = request_budget.map(|request_budget| request_budget.deadline());
-        if !serial || name == "refresh" {
-            if let Some(progress) = &progress {
-                progress.phase("waiting for workspace readiness").await;
-            }
+        let request_budget = RequestBudget::resolve(&name, accepted_at);
+        let cold_workspace = !is_readiness_probe && service.workspace_build_pending();
+        let workspace_readiness_wait = Duration::ZERO;
+        // Observe initial construction without waiting for it. Scheduling and
+        // installation contention share the normal request budget; durable
+        // workers above retain their blocking preparation path.
+        if !matches!(name.as_str(), "get_active_workspace" | "activate_workspace") {
+            // Observation can install a finished build under synchronous
+            // service locks. Keep that work off the transport runtime.
             let readiness_service = Arc::clone(&service);
-            let ct = context.ct.clone();
-            let mut readiness = tokio::task::spawn_blocking(move || {
-                readiness_service.wait_workspace_ready_until(&|| ct.is_cancelled(), deadline)
+            let observation = tokio::task::spawn_blocking(move || {
+                // The request can stop waiting before this shared install
+                // finishes. Report any panic even when nobody awaits the job.
+                crate::panic_report::report_panics("workspace readiness observation", || {
+                    readiness_service.observe_or_start_workspace()
+                })
+                .map_err(|panic| {
+                    let message = panic.to_string();
+                    eprintln!("{message}");
+                    ErrorData::internal_error(message, None)
+                })
             });
-            let mut ticks = tokio::time::interval(Duration::from_millis(100));
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let readiness = loop {
-                tokio::select! {
-                    result = &mut readiness => match result {
-                        Ok(readiness) => break readiness,
-                        Err(error) => {
-                            if let Some(progress) = &progress {
-                                progress.finish().await;
-                            }
-                            return Err(ErrorData::internal_error(
-                                format!("workspace readiness wait panicked: {error}"),
-                                None,
-                            ));
-                        }
-                    },
-                    _ = ticks.tick(), if progress.is_some() => {
-                        progress.as_ref().unwrap().workspace_tick(&service).await;
+            let observed = await_workspace_observation(
+                async {
+                    observation.await.map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("workspace readiness observation task failed: {error}"),
+                            None,
+                        )
+                    })?
+                },
+                request_budget,
+                &context.ct,
+            )
+            .await;
+            let observed = match observed {
+                Ok(result) => result?,
+                Err(stop) => {
+                    if let Some(progress) = &progress {
+                        progress.finish().await;
                     }
+                    return match stop {
+                        WorkspaceObservationStop::Cancelled => Err(ErrorData::internal_error(
+                            "the tool call was cancelled while observing workspace readiness",
+                            None,
+                        )),
+                        WorkspaceObservationStop::DeadlineExceeded => {
+                            let phase = service
+                                .workspace_build_progress(service.workspace_generation())
+                                .and_then(|snapshot| snapshot.phase)
+                                .unwrap_or_else(|| "observing workspace readiness".to_owned());
+                            Ok(
+                                deadline_result(IncompleteStage::WorkspaceReadiness, &phase, None)
+                                    .into(),
+                            )
+                        }
+                    };
                 }
             };
-            if let Some(progress) = &progress {
-                progress
-                    .workspace(
-                        &service,
-                        readiness
-                            .as_ref()
-                            .err()
-                            .map(|_| RequestOutcome::after_error(context.ct.is_cancelled())),
-                    )
-                    .await;
-            }
-            if cold_workspace && readiness.is_err() {
-                profiling::duration("mcp_cold.first_tool_execution", std::time::Duration::ZERO);
-            }
-            if let Err(error) = readiness {
-                if let Some(progress) = &progress {
-                    progress.finish().await;
+            match observed {
+                Ok(true) => {
+                    if let Some(progress) = &progress {
+                        progress.workspace(&service, None).await;
+                    }
                 }
-                return Err(map_service_error(error.code, error.message));
+                Ok(false) => {
+                    let phase = service
+                        .workspace_build_progress(service.workspace_generation())
+                        .and_then(|snapshot| snapshot.phase)
+                        .unwrap_or_else(|| "preparing workspace analyzer".to_owned());
+                    if let Some(progress) = &progress {
+                        progress.workspace(&service, None).await;
+                        progress.finish().await;
+                    }
+                    return Ok(workspace_not_ready_result(&phase, named_mode).into());
+                }
+                Err(error) => return Err(map_service_failure(error)),
             }
-            workspace_readiness_wait = accepted_at.elapsed();
         }
 
         // One deadline spans admission and execution. Starting the clock after
@@ -2909,7 +3248,15 @@ impl ServerHandler for BifrostMcpHandler {
                             .await;
                         progress.finish().await;
                     }
-                    return Err(error);
+                    return match error {
+                        AnalyzerAdmissionError::DeadlineExceeded => Ok(deadline_result(
+                            IncompleteStage::AnalyzerAdmission,
+                            "waiting for analyzer admission",
+                            None,
+                        )
+                        .into()),
+                        AnalyzerAdmissionError::Protocol(error) => Err(error),
+                    };
                 }
             }
         };
@@ -2944,6 +3291,9 @@ impl ServerHandler for BifrostMcpHandler {
         if workspace_scope.is_some_and(|scope| scope.generation != service.workspace_generation()) {
             if let Some(progress) = &progress {
                 progress.finish().await;
+            }
+            if is_readiness_probe {
+                return Err(map_service_failure(service.workspace_busy("workspace binding changed before observing readiness")));
             }
             return Err(ErrorData::resource_not_found(
                 "workspace changed before the tool call could start; retry the request",
@@ -2985,7 +3335,47 @@ impl ServerHandler for BifrostMcpHandler {
         if let Some(progress) = &progress {
             progress.finish().await;
         }
+        // The poll releases the connection guard before observing the service.
+        // Unlike the previous serial path, another call can now change Codex's
+        // per-call grant during that gap. Discard a snapshot whose binding was
+        // not the one authorized above, after draining any progress delivery.
+        if is_readiness_probe && workspace_scope.is_some_and(|scope| scope.generation != service.workspace_generation()) {
+            return Err(map_service_failure(service.workspace_busy("workspace binding changed while observing readiness")));
+        }
         Ok(response?.into())
+        }.await;
+        match result {
+            Err(error)
+                if error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("io.bifrost/workspace-incomplete"))
+                    .is_some() =>
+            {
+                let incomplete = &error.data.as_ref().unwrap()["io.bifrost/workspace-incomplete"];
+                let reason = incomplete["reason"]
+                    .as_str()
+                    .expect("workspace failure has a reason");
+                let phase = incomplete["phase"]
+                    .as_str()
+                    .expect("workspace failure has a phase");
+                let mut result = incomplete_result(
+                    reason,
+                    IncompleteStage::WorkspaceActivation,
+                    phase,
+                    error.message.to_string(),
+                );
+                result
+                    .meta
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .get_mut("io.bifrost/incomplete")
+                    .unwrap()["retiring_workspaces"] = incomplete["retiring_workspaces"].clone();
+                Ok(result.into())
+            }
+            result => result,
+        }
     }
 
     async fn get_task(
@@ -3098,16 +3488,43 @@ pub fn run_stdio_server_with_build_identity(
     diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
+    run_stdio_server_with_host_activation_context(
+        root,
+        render_options,
+        spec,
+        diff_snapshot_object_dir,
+        build_identity,
+        HostActivationContext::library_none(),
+    )
+}
+
+/// [`run_stdio_server_with_build_identity`] under the host's approval
+/// authority. The context is built once by the host and the same `Arc` is
+/// bound to every analyzer the server builds, before any pack activation.
+/// Nothing a client sends (tool arguments, roots, metadata) can supply or
+/// replace it.
+pub fn run_stdio_server_with_host_activation_context(
+    root: Option<PathBuf>,
+    render_options: McpRenderOptions,
+    spec: &McpServerSpec,
+    diff_snapshot_object_dir: Option<PathBuf>,
+    build_identity: &str,
+    host: Arc<HostActivationContext>,
+) -> Result<(), String> {
     // Explicit roots build in the background. Rootless servers answer
     // initialize without touching process cwd and bind only from a
     // client-provided workspace.
     let accepts_client_roots = root.is_none();
     let watch_files = stdio_file_watching_enabled()?;
     let service = match (root, watch_files) {
-        (Some(root), true) => SearchToolsService::new_deferred(root)?,
-        (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
-        (None, true) => SearchToolsService::new_unbound(),
-        (None, false) => SearchToolsService::new_unbound_manual(),
+        (Some(root), true) => {
+            SearchToolsService::new_deferred_with_host_activation_context(root, host)?
+        }
+        (Some(root), false) => {
+            SearchToolsService::new_deferred_manual_with_host_activation_context(root, host)?
+        }
+        (None, true) => SearchToolsService::new_unbound_with_host_activation_context(host),
+        (None, false) => SearchToolsService::new_unbound_manual_with_host_activation_context(host),
     };
     let service = match diff_snapshot_object_dir {
         Some(dir) => service.with_diff_snapshot_object_dir(dir),
@@ -3131,8 +3548,26 @@ pub fn run_named_workspace_stdio_server_with_build_identity(
     spec: &McpServerSpec,
     build_identity: &str,
 ) -> Result<(), String> {
+    run_named_workspace_stdio_server_with_host_activation_context(
+        workspaces,
+        render_options,
+        spec,
+        build_identity,
+        HostActivationContext::library_none(),
+    )
+}
+
+/// [`run_named_workspace_stdio_server_with_build_identity`] under the host's
+/// approval authority; every named workspace's service shares the one `Arc`.
+pub fn run_named_workspace_stdio_server_with_host_activation_context(
+    workspaces: Vec<NamedWorkspace>,
+    render_options: McpRenderOptions,
+    spec: &McpServerSpec,
+    build_identity: &str,
+    host: Arc<HostActivationContext>,
+) -> Result<(), String> {
     let watch_files = stdio_file_watching_enabled()?;
-    let router = Arc::new(NamedWorkspaceRouter::new(workspaces, watch_files)?);
+    let router = Arc::new(NamedWorkspaceRouter::new(workspaces, watch_files, host)?);
     let service = router.primary_service();
     run_stdio_server_impl(
         service,
@@ -3260,6 +3695,7 @@ mod named_workspace_tests {
             by_name: HashMap::from([("api".to_string(), 0), ("ui".to_string(), 1)]),
             entries,
             watch_files: false,
+            host_activation: HostActivationContext::library_none(),
         }
     }
 
@@ -3282,6 +3718,7 @@ mod named_workspace_tests {
                     temp.path().to_path_buf(),
                 )],
                 false,
+                HostActivationContext::library_none(),
             )
             .expect("named router"),
         );
@@ -3397,19 +3834,175 @@ mod named_workspace_tests {
 /// whatever budget bounded the wait.
 ///
 /// Since #3279 a request can be bounded by the fallback ladder with no
-/// `BIFROST_MCP_REQUEST_BUDGET_SECS` set -- 60 s interactive, 4.5 s cold
-/// non-discovery, 240 s for a synchronous `run_policy`. The timeout arm used
+/// `BIFROST_MCP_REQUEST_BUDGET_SECS` set -- 60 s interactive and
+/// 240 s for a synchronous `run_policy`. The timeout arm used
 /// to re-read the configured knob and `expect` it, so exactly those waits
 /// panicked the server instead of answering "timed out waiting for analyzer
 /// capacity".
 #[cfg(test)]
 mod analyzer_admission_budget_tests {
     use super::*;
-    use crate::mcp_common::{
-        COLD_WORKSPACE_REQUEST_BUDGET, DEFAULT_INTERACTIVE_REQUEST_BUDGET,
-        DEFAULT_POLICY_REQUEST_BUDGET,
-    };
+    use crate::mcp_common::{DEFAULT_INTERACTIVE_REQUEST_BUDGET, DEFAULT_POLICY_REQUEST_BUDGET};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[tokio::test]
+    #[hardwon("#13391: retryable roots binding errors spent the MRTR activation nonce")]
+    async fn mrtr_roots_retry_reuses_its_nonce_after_busy_and_capacity_refusal() {
+        struct RetryBinding<'a> {
+            service: &'a SearchToolsService,
+            attempts: AtomicUsize,
+        }
+        impl WorkspaceBindingOps for RetryBinding<'_> {
+            fn root(&self) -> Result<Option<PathBuf>, crate::SearchToolsServiceError> {
+                self.service.try_active_workspace_root()
+            }
+            fn unbind(&self) -> Result<(), crate::SearchToolsServiceError> {
+                self.service.try_unbind_client_workspace()
+            }
+            fn bind(&self, root: PathBuf) -> Result<PathBuf, crate::SearchToolsServiceError> {
+                match self.attempts.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(self.service.workspace_busy("workspace publication is busy")),
+                    1 => Err(self.service.workspace_activation_not_ready()),
+                    _ => self.service.try_bind_client_workspace(root),
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let service = Arc::new(SearchToolsService::new_unbound_manual());
+        let spec = crate::mcp_registry::resolve_server_spec("searchtools").unwrap();
+        let handler = BifrostMcpHandler::new(
+            Arc::clone(&service),
+            None,
+            McpRenderOptions::default(),
+            &spec,
+            "test",
+            true,
+            Arc::new(RootsRevocations::default()),
+            Arc::new(OutboundResponseTimings::default()),
+        )
+        .unwrap();
+        let (server_transport, _client_transport) = tokio::io::duplex(4096);
+        let server = rmcp::service::serve_directly(handler, server_transport, None);
+        let handler = server.service();
+        let mut context = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            server.peer().clone(),
+        );
+        context.meta = serde_json::from_value(json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28", "io.modelcontextprotocol/clientCapabilities":{}})).unwrap();
+        let first =
+            serde_json::from_value(json!({"name":"get_active_workspace", "arguments":{}})).unwrap();
+        let binding = RetryBinding {
+            service: &service,
+            attempts: AtomicUsize::new(0),
+        };
+        let mut state = handler.workspace.lock().await;
+        let input = handler
+            .activate_workspace_over_mrtr(&binding, &mut state, &first, &context)
+            .unwrap()
+            .unwrap();
+        let nonce = input.request_state.unwrap();
+        let uri = url::Url::from_directory_path(temp.path()).unwrap();
+        let retry = serde_json::from_value(json!({"name":"get_active_workspace", "arguments":{}, "requestState":nonce, "inputResponses":{"roots":{"roots":[{"uri":uri.as_str()}]}}})).unwrap();
+        for reason in ["busy", "workspace_not_ready"] {
+            let error = handler
+                .activate_workspace_over_mrtr(&binding, &mut state, &retry, &context)
+                .unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["io.bifrost/workspace-incomplete"]["reason"],
+                reason
+            );
+            assert!(handler.roots_activations.contains(&nonce));
+            assert_eq!(state.binding, WorkspaceBinding::Unbound);
+        }
+        assert!(
+            handler
+                .activate_workspace_over_mrtr(&binding, &mut state, &retry, &context)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            state.binding,
+            WorkspaceBinding::ClientRoots { .. }
+        ));
+        assert!(!handler.roots_activations.contains(&nonce));
+        assert!(!handler.roots_activations.redeem(&nonce));
+        drop(state);
+        server.cancel().await.unwrap();
+        service.close().unwrap();
+    }
+
+    #[tokio::test]
+    #[hardwon("#13391: readiness probes queued behind a serial tool's connection guard")]
+    async fn readiness_probe_reports_busy_while_connection_guard_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            Arc::new(SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap());
+        let spec = crate::mcp_registry::resolve_server_spec("searchtools").unwrap();
+        let handler = BifrostMcpHandler::new(
+            service,
+            None,
+            McpRenderOptions::default(),
+            &spec,
+            "test",
+            false,
+            Arc::new(RootsRevocations::default()),
+            Arc::new(OutboundResponseTimings::default()),
+        )
+        .unwrap();
+        let (server_transport, _client_transport) = tokio::io::duplex(4096);
+        let server = rmcp::service::serve_directly(handler, server_transport, None);
+        let held = server.service().workspace.lock().await;
+        let request =
+            serde_json::from_value(json!({"name":"get_active_workspace", "arguments":{}})).unwrap();
+        let context = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            server.peer().clone(),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            server.service().call_tool(request, context),
+        )
+        .await
+        .expect("probe must answer while the serial guard remains held")
+        .unwrap();
+        let CallToolResponse::Complete(response) = response else {
+            panic!("a busy probe must be a completed tool result")
+        };
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["isError"], true);
+        let details = &wire["_meta"]["io.bifrost/incomplete"];
+        assert_eq!(details["stage"], "workspace_activation");
+        assert_eq!(details["completion"]["reasons"], json!(["busy"]));
+        assert_eq!(details["retiring_workspaces"], json!([]));
+        drop(held);
+        server.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[hardwon("#13391: a finished-build observation ignored its request deadline and cancellation")]
+    async fn workspace_observation_stops_at_its_deadline_or_cancellation() {
+        let expired = RequestBudget::with_configured(
+            Some(Duration::from_secs(1)),
+            "search_symbols",
+            Instant::now() - Duration::from_secs(1),
+        );
+        let cancellation = McpCancellationToken::new();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(30),
+            await_workspace_observation(std::future::pending::<()>(), expired, &cancellation),
+        )
+        .await
+        .expect("expired observation did not answer");
+        assert_eq!(stopped, Err(WorkspaceObservationStop::DeadlineExceeded));
+        cancellation.cancel();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(30),
+            await_workspace_observation(std::future::pending::<()>(), None, &cancellation),
+        )
+        .await
+        .expect("cancelled observation did not answer");
+        assert_eq!(stopped, Err(WorkspaceObservationStop::Cancelled));
+    }
 
     /// A request that has already spent its budget by the time admission
     /// starts -- the readiness wait is bounded by the same deadline -- against
@@ -3427,18 +4020,17 @@ mod analyzer_admission_budget_tests {
         };
 
         for (tool_name, cold_workspace, fallback) in [
-            ("get_summaries", true, COLD_WORKSPACE_REQUEST_BUDGET),
+            ("get_summaries", true, DEFAULT_INTERACTIVE_REQUEST_BUDGET),
             ("search_symbols", false, DEFAULT_INTERACTIVE_REQUEST_BUDGET),
             ("run_policy", false, DEFAULT_POLICY_REQUEST_BUDGET),
         ] {
             // No configured budget: only the fallback rung can bound this
             // request, which is the shape the issue's panic came from.
             let accepted_at = Instant::now() - fallback;
-            let request_budget =
-                RequestBudget::with_configured(None, tool_name, cold_workspace, accepted_at)
-                    .unwrap_or_else(|| {
-                        panic!("{tool_name} (cold={cold_workspace}) has a fallback budget")
-                    });
+            let request_budget = RequestBudget::with_configured(None, tool_name, accepted_at)
+                .unwrap_or_else(|| {
+                    panic!("{tool_name} (cold={cold_workspace}) has a fallback budget")
+                });
             assert_eq!(request_budget.budget(), fallback);
 
             let Err(error) =
@@ -3446,11 +4038,9 @@ mod analyzer_admission_budget_tests {
             else {
                 panic!("a saturated pool must not grant admission");
             };
-            let wire = serde_json::to_value(error).expect("errors serialize");
-            assert_eq!(wire["code"], -32603, "{tool_name}");
-            assert_eq!(
-                wire["message"],
-                format!("{tool_name} timed out waiting for analyzer capacity")
+            assert!(
+                matches!(error, AnalyzerAdmissionError::DeadlineExceeded),
+                "{tool_name}: {error:?}"
             );
         }
     }
@@ -3464,7 +4054,7 @@ mod analyzer_admission_budget_tests {
     #[hardwon("#3396: unbounded admission waits must remain cancellable without a timer")]
     async fn an_unbounded_admission_wait_keeps_waiting() {
         assert_eq!(
-            RequestBudget::with_configured(None, "refresh", false, Instant::now()),
+            RequestBudget::with_configured(None, "refresh", Instant::now()),
             None,
             "a serial workspace-mutating tool has no fallback rung to bound it"
         );
@@ -3479,6 +4069,9 @@ mod analyzer_admission_budget_tests {
 
         let Err(error) = await_analyzer_admission(&pool, None, "refresh", &cancelled).await else {
             panic!("a cancelled unbounded wait must refuse, not time out");
+        };
+        let AnalyzerAdmissionError::Protocol(error) = error else {
+            panic!("cancellation is not a deadline");
         };
         assert_eq!(
             serde_json::to_value(error).expect("errors serialize")["message"],
@@ -3618,5 +4211,27 @@ mod progress_delivery_tests {
         release.notify_one();
         delivery.finish().await;
         assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn named_workspace_services_share_the_one_host_context() {
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let host = HostActivationContext::library_none();
+        let router = NamedWorkspaceRouter::new(
+            vec![
+                NamedWorkspace::new("one".to_string(), first.path().to_path_buf()),
+                NamedWorkspace::new("two".to_string(), second.path().to_path_buf()),
+            ],
+            false,
+            Arc::clone(&host),
+        )
+        .expect("named router");
+        assert!(Arc::ptr_eq(
+            router.primary_service().host_activation_context(),
+            &host
+        ));
+        let (_, lazily_built) = router.service("two").expect("second workspace");
+        assert!(Arc::ptr_eq(lazily_built.host_activation_context(), &host));
     }
 }

@@ -57,6 +57,49 @@ impl LanguageKnowledge for RustKnowledge {
         true
     }
 
+    fn aggregate_member_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        match node.kind() {
+            "field_initializer" => Some((
+                node.child_by_field_name("field")?,
+                node.child_by_field_name("value")?,
+            )),
+            "shorthand_field_initializer" => {
+                let ident = node.named_child(0)?;
+                Some((ident, ident))
+            }
+            _ => None,
+        }
+    }
+
+    fn unmodeled_field_access_macros<'t>(
+        &self,
+        _root: tree_sitter::Node<'t>,
+        owner: Option<tree_sitter::Node<'t>>,
+        field: Option<tree_sitter::Node<'t>>,
+        source: &str,
+    ) -> Vec<String> {
+        const OWNERS: &[&str] = &["struct_item", "enum_item", "union_item"];
+        let mut owner = owner.or(field).map(crate::syntax::unwrap_attributes);
+        while let Some(node) = owner
+            && !OWNERS.contains(&node.kind())
+        {
+            owner = node.parent();
+        }
+        let Some(owner) = owner else {
+            return Vec::new();
+        };
+        let mut field = field;
+        while let Some(node) = field
+            && node.kind() != "field_declaration"
+        {
+            field = node.parent().filter(|parent| parent.id() != owner.id());
+        }
+        crate::resolution::rust_unmodeled_field_access_macros(owner, field, source)
+    }
+
     fn language(&self) -> Language {
         Language::Rust
     }

@@ -76,6 +76,10 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn read(
         selection: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
         context: SelectedContextPathToken,
@@ -90,6 +94,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn context_paths_are_atomic_isolated_and_live_only_for_the_request() {
         let mut fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);
         fixture.retain_one_reader();
@@ -220,6 +228,10 @@ mod tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#5600: named JVM contexts repeatedly published identical provider cells"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn context_cell_reuse_batches_identical_cells_and_rejects_changed_completion() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);

@@ -16,18 +16,54 @@
 //! whole-workspace session omits the field entirely.
 
 use crate::analyzer::{
-    AnalyzerConfig, FileSetProject, OverlayProject, Project, SourceIngestionKind,
-    ingest_source_bytes,
+    AnalyzerConfig, FileSetProject, FilesystemProject, OverlayProject, Project, ProjectFile,
+    SourceIngestionKind, ingest_source_bytes,
 };
 use crate::git_file::{list_git_files_at_revision, read_git_file_bytes};
 use crate::mcp_common::contains_glob_syntax;
 use crate::tool_arguments::GitHistoryOverlay;
 use crate::{SearchToolsService, collect_workspace_files};
+use brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext;
 use brokk_bifrost_analysis::path_utils::is_windows_absolute_path;
 use glob::Pattern;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+/// Options for a source-scoped session. Historical scopes remain incomplete
+/// until a full revision build authority exists (#12427).
+///
+/// `host_activation` is the host's approval authority, handed in by the entry
+/// point. It is deliberately not part of `AnalyzerConfig`, and `Default` is the
+/// explicit library-none context for embedders that have no host inventory.
+#[derive(Clone, Debug)]
+pub struct ScopedProjectOptions {
+    pub without_project_build: bool,
+    pub host_activation: Arc<HostActivationContext>,
+}
+
+impl Default for ScopedProjectOptions {
+    fn default() -> Self {
+        Self {
+            without_project_build: false,
+            host_activation: HostActivationContext::library_none(),
+        }
+    }
+}
+
+impl ScopedProjectOptions {
+    #[must_use]
+    pub fn with_host_activation_context(mut self, host: Arc<HostActivationContext>) -> Self {
+        self.host_activation = host;
+        self
+    }
+
+    fn analyzer_config(&self) -> AnalyzerConfig {
+        let mut config = AnalyzerConfig::default();
+        config.jvm.without_project_build = self.without_project_build;
+        config
+    }
+}
 
 /// Prepare the source selection and inline directives for both policy entry points.
 /// Source selection has the CLI's file, directory and glob semantics, with no
@@ -76,22 +112,25 @@ pub fn create_scoped_service(
     sources: &[String],
     revision: Option<&str>,
 ) -> Result<SearchToolsService, String> {
+    create_scoped_service_with_options(root, sources, revision, ScopedProjectOptions::default())
+}
+
+pub fn create_scoped_service_with_options(
+    root: PathBuf,
+    sources: &[String],
+    revision: Option<&str>,
+    options: ScopedProjectOptions,
+) -> Result<SearchToolsService, String> {
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     let Some(revision) = revision.map(str::trim).filter(|rev| !rev.is_empty()) else {
-        let rel_paths = resolve_sources(&root, sources)?;
-        #[cfg(test)]
-        CONSTRUCTION_HOOK.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook();
-            }
-        });
-        let project = Arc::new(FileSetProject::new(root, rel_paths));
+        let project = live_subset(&root, sources)?;
         // Isolate the partial file set while sharing persistent blob facts.
-        return SearchToolsService::new_manual_scoped_persisted_for_project(
+        return SearchToolsService::new_manual_scoped_persisted_for_project_with_host_activation_context(
             project,
-            AnalyzerConfig::default(),
+            options.analyzer_config(),
+            options.host_activation,
         );
     };
     let rel_paths = resolve_sources_at_revision(&root, sources, revision)?;
@@ -130,10 +169,10 @@ pub fn create_scoped_service(
     }
     // Construct the file set only after admission. If a rejected path remained
     // in the delegate, OverlayProject would fall through to the live checkout.
-    let project = Arc::new(FileSetProject::new(
-        root.clone(),
-        admitted.iter().map(|(path, _)| path.clone()),
-    ));
+    let project = Arc::new(
+        FileSetProject::new(root.clone(), admitted.iter().map(|(path, _)| path.clone()))
+            .with_missing_revision_build_authority(),
+    );
     let overlay_project = Arc::new(OverlayProject::new(project));
     for (rel_path, content) in admitted {
         let abs_path = root.join(&rel_path);
@@ -146,7 +185,11 @@ pub fn create_scoped_service(
     }
     let project: Arc<dyn Project> = overlay_project;
     // Isolate the partial file set while sharing persistent blob facts.
-    SearchToolsService::new_manual_scoped_persisted_for_project(project, AnalyzerConfig::default())
+    SearchToolsService::new_manual_scoped_persisted_for_project_with_host_activation_context(
+        project,
+        options.analyzer_config(),
+        options.host_activation,
+    )
 }
 
 pub fn create_cli_tool_service(
@@ -156,34 +199,66 @@ pub fn create_cli_tool_service(
     sources: &[String],
     overlays: Vec<GitHistoryOverlay>,
 ) -> Result<SearchToolsService, String> {
+    create_cli_tool_service_with_options(
+        root,
+        tool_name,
+        arguments,
+        sources,
+        overlays,
+        ScopedProjectOptions::default(),
+    )
+}
+
+pub fn create_cli_tool_service_with_options(
+    root: PathBuf,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    sources: &[String],
+    overlays: Vec<GitHistoryOverlay>,
+    options: ScopedProjectOptions,
+) -> Result<SearchToolsService, String> {
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    // A workspace-independent tool (`analyze_diff`, `blast_radius`) never reads
-    // the live workspace or semantic index; it builds its own per-endpoint
-    // analyzers over revision images. Serve it from a lazy service so the
-    // one-shot CLI does not boot a whole-repo analyzer it will never touch,
+    // A workspace-independent tool never reads the live workspace or semantic
+    // index. Git-only reports read the root; diff tools build their own
+    // per-endpoint analyzers over revision images. Serve it from a lazy service
+    // so the one-shot CLI does not boot a whole-repo analyzer it will never touch,
     // which otherwise dwarfs the analysis itself on a large repo. An immutable
     // endpoint's own build does share the repository's content-addressed cache,
     // so what this avoids is the whole-repo parse, not every write. `--sources`
     // and git-history overlays do not apply to such tools, so they are
     // irrelevant here.
     if SearchToolsService::tool_is_workspace_independent(tool_name, arguments) {
-        return SearchToolsService::new_one_shot_workspace_independent(root);
+        return SearchToolsService::new_one_shot_workspace_independent_with_host_activation_context(
+            root,
+            options.host_activation,
+        );
     }
     if overlays.is_empty() && sources.is_empty() {
         // A one-shot `--tool` call over the whole root. Every other branch here
         // already builds a manual, watcher-free service; this one used to
         // install a whole-tree watcher the process exits without ever polling.
-        return SearchToolsService::new_one_shot(root);
+        if options.without_project_build {
+            let project = live_filesystem(&root)?;
+            return SearchToolsService::new_manual_persisted_for_project_with_host_activation_context(
+                project,
+                options.analyzer_config(),
+                options.host_activation,
+            );
+        }
+        return SearchToolsService::new_one_shot_with_host_activation_context(
+            root,
+            options.host_activation,
+        );
     }
     if overlays.is_empty() {
-        let rel_paths = resolve_sources(&root, sources)?;
-        let project = Arc::new(FileSetProject::new(root, rel_paths));
+        let project = live_subset(&root, sources)?;
         // Isolate the partial file set while sharing persistent blob facts.
-        return SearchToolsService::new_manual_scoped_persisted_for_project(
+        return SearchToolsService::new_manual_scoped_persisted_for_project_with_host_activation_context(
             project,
-            AnalyzerConfig::default(),
+            options.analyzer_config(),
+            options.host_activation,
         );
     }
 
@@ -204,12 +279,44 @@ pub fn create_cli_tool_service(
     for overlay in &overlays {
         rel_paths.insert(overlay.rel_path.clone());
     }
-    let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
+    let project = Arc::new(
+        FileSetProject::new(root.clone(), rel_paths).with_missing_revision_build_authority(),
+    );
     let overlay_project = Arc::new(OverlayProject::new(project));
     install_git_history_overlays(&root, &overlay_project, overlays)?;
     let project: Arc<dyn Project> = overlay_project;
     // Isolate the partial file set while sharing persistent blob facts.
-    SearchToolsService::new_manual_scoped_persisted_for_project(project, AnalyzerConfig::default())
+    SearchToolsService::new_manual_scoped_persisted_for_project_with_host_activation_context(
+        project,
+        options.analyzer_config(),
+        options.host_activation,
+    )
+}
+
+fn live_filesystem(root: &Path) -> Result<Arc<FilesystemProject>, String> {
+    FilesystemProject::new(root)
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+}
+
+fn live_subset(root: &Path, sources: &[String]) -> Result<Arc<FileSetProject>, String> {
+    // Source resolution already pays for the root inventory. Reuse that
+    // authority for build discovery without retaining a frozen root inventory
+    // in the source subset.
+    let delegate = live_filesystem(root)?;
+    let inventory = delegate
+        .all_files_shared()
+        .map_err(|error| error.to_string())?;
+    let selected = resolve_sources_in_files(root, sources, &inventory)?;
+    #[cfg(test)]
+    CONSTRUCTION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    Ok(Arc::new(
+        FileSetProject::new(root, selected).with_project_build(delegate),
+    ))
 }
 
 pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -219,6 +326,14 @@ pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, S
             root.display()
         )
     })?;
+    resolve_sources_in_files(root, inputs, &workspace_files)
+}
+
+fn resolve_sources_in_files(
+    root: &Path,
+    inputs: &[String],
+    workspace_files: &BTreeSet<ProjectFile>,
+) -> Result<Vec<PathBuf>, String> {
     let workspace_rel_paths: Vec<String> = workspace_files
         .iter()
         .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
@@ -498,4 +613,76 @@ fn normalize_relative_path(raw: &str) -> Result<PathBuf, String> {
 
 fn looks_like_absolute_path(raw: &str) -> bool {
     Path::new(raw).is_absolute() || is_windows_absolute_path(raw)
+}
+
+#[cfg(test)]
+mod host_activation_tests {
+    use super::*;
+
+    fn host_of(service: &SearchToolsService) -> Arc<HostActivationContext> {
+        service
+            .analyzer_snapshot()
+            .unwrap()
+            .analyzer()
+            .host_activation_context()
+            .expect("scoped analyzers are bound before activation")
+    }
+
+    #[test]
+    fn scoped_and_cli_services_keep_the_options_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("A.java"), "class A {}\n").unwrap();
+        let host = HostActivationContext::library_none();
+        let options =
+            ScopedProjectOptions::default().with_host_activation_context(Arc::clone(&host));
+
+        let scoped = create_scoped_service_with_options(
+            root.clone(),
+            &["A.java".to_string()],
+            None,
+            options.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(scoped.host_activation_context(), &host));
+        assert!(Arc::ptr_eq(&host_of(&scoped), &host));
+
+        let whole = create_cli_tool_service_with_options(
+            root.clone(),
+            "get_active_workspace",
+            &serde_json::json!({}),
+            &[],
+            Vec::new(),
+            options.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(whole.host_activation_context(), &host));
+        assert!(Arc::ptr_eq(&host_of(&whole), &host));
+
+        let jvm = ScopedProjectOptions {
+            without_project_build: true,
+            ..options.clone()
+        };
+        let no_build = create_cli_tool_service_with_options(
+            root.clone(),
+            "get_active_workspace",
+            &serde_json::json!({}),
+            &[],
+            Vec::new(),
+            jvm,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&host_of(&no_build), &host));
+
+        let independent = create_cli_tool_service_with_options(
+            root,
+            "analyze_diff",
+            &serde_json::json!({}),
+            &[],
+            Vec::new(),
+            options,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(independent.host_activation_context(), &host));
+    }
 }

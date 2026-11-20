@@ -11,6 +11,47 @@ use crate::analyzer::resolution::{
     SelectedDeclarationAccessSource, TypedFactPageVisitor, TypedFactReadTerminal,
 };
 
+/// Complete canonical source type containment, using only the normal indexed
+/// owner reader and its File certificates. Empty is affirmative OutsideType;
+/// missing, partial, inconsistent or cyclic authority never closes the chain.
+pub(super) fn complete_source_type_containment(
+    facts: &dyn SelectedTypedFactSource,
+    reference: &crate::analyzer::resolution::fact_source::SelectedAccessReference,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<SemanticId>>> {
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let Some(mut owner) = reference.owner else {
+        return Ok(None);
+    };
+    let mut chain = Vec::new();
+    let mut seen = HashSet::default();
+    while let Some(current) = owner {
+        if cancellation.is_cancelled() || !seen.insert(current) {
+            return Ok(None);
+        }
+        let Some(declaration) = facts.selected_access_declaration(current, cancellation)? else {
+            return Ok(None);
+        };
+        if !declaration.is_type
+            || declaration.partial != Some(false)
+            || declaration.source.language != reference.source.language
+            || declaration.source.file != reference.source.file
+            || declaration.source.start_byte > reference.source.start_byte
+            || reference.source.end_byte > declaration.source.end_byte
+        {
+            return Ok(None);
+        }
+        let Some(parent) = declaration.ordinary_owner else {
+            return Ok(None);
+        };
+        chain.push(current);
+        owner = parent;
+    }
+    Ok(Some(chain))
+}
+
 pub(super) struct AccessEvidence {
     pub(super) decision: DeclarationAccessDecision,
     pub(super) activation_reason: Option<SemanticId>,
@@ -263,6 +304,47 @@ pub(in crate::analyzer::store) fn owner_templates(
         }
     }
     enclosing_templates
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_candidate_access_rows(
+    source: &dyn SelectedDeclarationAccessSource,
+    typed_source: &dyn SelectedTypedFactSource,
+    resolution_session: Option<&ResolutionSession>,
+    cancellation: &CancellationToken,
+    cache: &mut HashMap<DeclarationAccessRequest, DeclarationAccessRow>,
+    reference: SemanticId,
+    definitions: &[SemanticId],
+    observe_completion: impl FnMut(&ResolutionCompletion),
+) -> Result<Option<HashMap<SemanticId, DeclarationAccessRow>>> {
+    let mut requests =
+        source.prepare_candidate_access(typed_source, reference, definitions, cancellation)?;
+    requests.sort_unstable();
+    requests.dedup();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.reference == reference
+                && definitions.contains(&request.definition)),
+        "candidate access requests belong to supplied endpoints"
+    );
+    if !ensure_declaration_access_rows(
+        source,
+        typed_source,
+        resolution_session,
+        cancellation,
+        cache,
+        &requests,
+        observe_completion,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(
+        requests
+            .into_iter()
+            .map(|request| (request.definition, cache[&request].clone()))
+            .collect(),
+    ))
 }
 
 pub(crate) fn ensure_declaration_access_rows(

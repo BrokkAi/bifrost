@@ -966,7 +966,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     ) -> (ResolutionSiteId, ResolutionTypeSlotId, ResolutionNameId) {
         let scope = self.scope_for_source_range(node.start_byte(), node.end_byte());
         let declaration = self.add_site_in_scope(node, ResolutionSiteKind::TypeDeclaration, scope);
-        let name = self.intern_name(&crate::declarations::go_synthetic_name(node));
+        let name = self
+            .intern_name(&crate::declarations::go_synthetic_name(node))
+            .expect("a synthetic name is `$kind$rank`, never empty");
         self.facts.identifiers.push(PositionedIdentifierFact {
             site: declaration,
             name,
@@ -1464,8 +1466,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         id
     }
 
-    fn intern_name(&mut self, spelling: &str) -> ResolutionNameId {
+    /// Intern a source-derived spelling; an empty one has no name.
+    fn intern_name(&mut self, spelling: &str) -> Option<ResolutionNameId> {
         self.facts.intern_name(&mut self.name_ids, spelling)
+    }
+
+    fn intern_static_name(&mut self, spelling: &'static str) -> ResolutionNameId {
+        self.intern_name(spelling)
+            .expect("static non-empty literal")
     }
 
     fn add_identifier_to_site(
@@ -1481,8 +1489,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             return false;
         }
         let spelling = go_node_text(node, self.source).trim();
-        assert!(!spelling.is_empty(), "identifier token needs a spelling");
-        let name = self.intern_name(spelling);
+        let Some(name) = self.intern_name(spelling) else {
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return false;
+        };
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -1629,7 +1639,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     });
             }
             for (position, segment) in spec.segments.iter().enumerate() {
-                let name = self.intern_name(segment);
+                let name = self
+                    .intern_name(segment)
+                    .expect("import specs with an empty segment were skipped above");
                 self.facts
                     .root_import_segments
                     .push(ResolutionRootImportSegmentFact {
@@ -2708,7 +2720,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     self.callable_contexts
                         .last_mut()
                         .expect("receiver belongs to the active callable")
-                        .receiver_name = Some(receiver_name);
+                        .receiver_name = receiver_name;
                 }
                 (declaration, value_type)
             } else {
@@ -3487,7 +3499,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     fn attach_defaulted_initializer_type(
         &mut self,
         declaration: ResolutionSiteId,
-        spelling: &str,
+        spelling: &'static str,
     ) -> ResolutionTypeSlotId {
         let defaulted = self.add_slot(declaration, ResolutionTypeSlotRole::ExpressionValue);
         self.add_intrinsic_type_seed(defaulted, spelling, IntrinsicTypeKind::Primitive);
@@ -4044,7 +4056,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     fn lower_function_type(&mut self, node: Node<'tree>) -> LoweredTypeSyntax {
         let site = self.add_site(node, ResolutionSiteKind::TypeReference);
         let output = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-        let name = self.intern_name("function-type");
+        let name = self.intern_static_name("function-type");
         self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
             output,
             name,
@@ -4160,7 +4172,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     ) -> (ResolutionSiteId, ResolutionTypeSlotId) {
         let site = self.add_site(node, ResolutionSiteKind::TypeReference);
         let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-        let name = self.intern_name(spelling);
+        let name = self
+            .intern_name(spelling)
+            .expect("callers pass a non-empty structural-type spelling");
         self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
             output: container,
             name,
@@ -4472,7 +4486,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
 
     fn add_qualified_root_reference(&mut self, prefix: Node<'_>, reference: ResolutionSiteId) {
         let prefix_reference = self.facts.type_slots[self.expression_slot(prefix).index()].site;
-        let name = self.intern_name(go_node_text(prefix, self.source).trim());
+        let Some(name) = self.intern_name(go_node_text(prefix, self.source).trim()) else {
+            self.add_gap(reference, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
         self.facts
             .root_references
             .push(ResolutionRootReferenceFact {
@@ -6376,7 +6393,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         assert!(self.function_types_by_slot.insert(output, node).is_none());
     }
 
-    fn lower_intrinsic_literal(&mut self, node: Node<'_>, spelling: &str, kind: IntrinsicTypeKind) {
+    fn lower_intrinsic_literal(
+        &mut self,
+        node: Node<'_>,
+        spelling: &'static str,
+        kind: IntrinsicTypeKind,
+    ) {
         let site = self.add_site(node, ResolutionSiteKind::Literal);
         let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
         self.add_intrinsic_type_seed(output, spelling, kind);
@@ -6386,10 +6408,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     fn add_intrinsic_type_seed(
         &mut self,
         output: ResolutionTypeSlotId,
-        spelling: &str,
+        spelling: &'static str,
         kind: IntrinsicTypeKind,
     ) {
-        let name = self.intern_name(spelling);
+        let name = self.intern_static_name(spelling);
         self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
             output,
             name,
@@ -12614,5 +12636,35 @@ func use() { var value string; _ = value }
             assert!(facts.gaps.iter().any(|gap| gap.site == source.site
                 && gap.kind == ResolutionGapKind::UnsupportedExpressionType));
         }
+    }
+
+    /// A MISSING or zero-width identifier leaves a malformed-syntax gap and no
+    /// empty spelling (Go counterpart of Rust's
+    /// `missing_names_leave_gaps_not_empty_spellings`, #4286).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: a MISSING Go identifier panicked the producer on an empty spelling"
+    )]
+    fn missing_names_leave_gaps_not_empty_spellings() {
+        let mut saw_missing = false;
+        for source in [
+            "package p\nfunc f() { x := }\n",
+            "package p\nfunc f() { f(a, }\n",
+            "package p\nfunc f() []\n",
+            "package p\nfunc f(",
+        ] {
+            let tree = crate::declarations::parse_go_tree(source);
+            saw_missing |= tree.root_node().to_sexp().contains("MISSING");
+            let facts = extract_go_resolution_facts(tree.root_node(), source);
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}: {facts:#?}"
+            );
+            assert!(
+                !facts.gaps.is_empty(),
+                "the recovered tree keeps gap evidence for {source:?}"
+            );
+        }
+        assert!(saw_missing, "recovery inserts a MISSING node in this table");
     }
 }

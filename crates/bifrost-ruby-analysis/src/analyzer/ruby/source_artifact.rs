@@ -408,6 +408,7 @@ fn project_type<'tree>(
         }
     }
     types.push(TypeFact {
+        type_parameter_kinds: Vec::new(),
         alias_target: None,
         tuple_fields: None,
         implemented_traits_complete: false,
@@ -427,6 +428,7 @@ fn project_type<'tree>(
         },
         visibility: Visibility::Public,
         is_abstract: false,
+        is_final: None,
         is_sealed: false,
         callable_surface_complete: false,
         has_explicit_type_terms: false,
@@ -494,6 +496,7 @@ fn project_method(
         .map(|parameter| parameter.r#type.clone())
         .collect::<Vec<_>>();
     let signature = Signature {
+        bounds: None,
         type_parameters: Vec::new(),
         parameters,
         returns: sorbet_signature.and_then(|signature| signature.returns),
@@ -511,6 +514,8 @@ fn project_method(
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -614,6 +619,7 @@ fn project_call(
             };
             let property_type = TypeRef::named("untyped".to_owned());
             let signature = Signature {
+                bounds: None,
                 type_parameters: Vec::new(),
                 parameters: Vec::new(),
                 returns: Some(property_type),
@@ -631,6 +637,8 @@ fn project_call(
                 return_type: signature.returns.as_ref(),
             });
             members.push(MemberFact {
+                target_independent: None,
+                inherent_impl_self_arguments: None,
                 implemented_trait: None,
                 self_form: None,
                 non_overridable: None,

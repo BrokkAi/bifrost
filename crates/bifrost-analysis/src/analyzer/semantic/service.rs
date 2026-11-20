@@ -163,8 +163,12 @@ pub fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
     lowerer: &dyn ProgramSemanticsLowerer,
     file: &ProjectFile,
     max_source_bytes: usize,
-) -> Result<Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>, SemanticProviderError>
-{
+) -> Result<
+    crate::analyzer::semantic::SemanticArtifactSourceOutcome<
+        crate::analyzer::semantic::SemanticArtifactSourceSnapshot,
+    >,
+    SemanticProviderError,
+> {
     validate_semantic_file(analyzer, file)?;
     let (source_identity, snapshot) = match analyzer.source_snapshot_limited(file, max_source_bytes)
     {
@@ -174,13 +178,22 @@ pub fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
                 "could not capture the current source snapshot for `{file}`"
             )));
         }
-        Err(failure @ PreparedSourceFailure::Exceeded(_)) => {
-            // No artifact source carries the refused limit; it joins the
-            // current captures, where its ambient mark went.
+        Err(failure @ PreparedSourceFailure::Exceeded(exceeded)) => {
+            // Preserve both the operational capture and the bounded reader's
+            // proven minimum. A request records this admission on its ledger;
+            // uncharged validation probes still retain the typed refusal.
             analyzer.join_reuse_verdict(
                 crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(&failure),
             );
-            return Ok(None);
+            return Ok(
+                crate::analyzer::semantic::SemanticArtifactSourceOutcome::Refused(
+                    crate::analyzer::semantic::SemanticBudgetExceeded::new(
+                        crate::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+                        max_source_bytes,
+                        exceeded.minimum_source_bytes(),
+                    ),
+                ),
+            );
         }
         Err(PreparedSourceFailure::Refused(reason)) => {
             return Err(SemanticProviderError::source_admission_refused(
@@ -230,9 +243,11 @@ pub fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
         overlay_revision,
         lowerer.identity(),
     )?;
-    Ok(Some(
-        crate::analyzer::semantic::SemanticArtifactSourceSnapshot::new(key, source),
-    ))
+    Ok(
+        crate::analyzer::semantic::SemanticArtifactSourceOutcome::Held(
+            crate::analyzer::semantic::SemanticArtifactSourceSnapshot::new(key, source),
+        ),
+    )
 }
 
 /// Materialize against exactly one prepared syntax snapshot.
@@ -720,7 +735,13 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
             },
         )
     } else {
-        lowerer.lower(file, &prepared, &producer_budget, request.cancellation)
+        lowerer.lower(
+            file,
+            &prepared,
+            &producer_budget,
+            request.cancellation,
+            analyzer.analyzer_store().retention_budget(),
+        )
     };
     let lowerer_ns = u64::try_from(lowerer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     SERVE_COUNTS
@@ -1114,10 +1135,22 @@ fn admitted_stored_child<A: LanguageAdapter, T>(
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
+    static CANDIDATE_SELECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STORED_READ_AFTER_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static STORED_READ_VARIANT_OVERRIDE: std::cell::Cell<Option<brokk_bifrost_core::gitblob::ParseVariant>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Count actual admission-owner invocations, including memo hits, on this
+/// thread. Operator controls use one composition request, not worker totals.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn measure_candidate_selections<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    let before = CANDIDATE_SELECTION_CALLS.with(std::cell::Cell::get);
+    let result = run();
+    let after = CANDIDATE_SELECTION_CALLS.with(std::cell::Cell::get);
+    (result, after - before)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1514,7 +1547,10 @@ impl<'a> ExecutableRuleContext<'a> {
             });
         }
         match judged.reuse {
-            ReuseVerdict::Content => {}
+            // A request-pinned input stops nothing: the rule saw this request's
+            // snapshot, and its replayed reads carry the pinned dependence.
+            ReuseVerdict::Content
+            | ReuseVerdict::ExecutionDependent(ExecutionCause::RequestPinned) => {}
             ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal) => {
                 unreachable!("a scoped refusal was handled with its recorded cause")
             }
@@ -2655,6 +2691,15 @@ pub(crate) fn candidate_procedure_decision(
     request: &mut SemanticRequest<'_>,
 ) -> Result<QuerySelectedProcedure, SemanticProviderError> {
     use crate::analyzer::languages::CandidateMacroDecision;
+    #[cfg(any(test, feature = "test-support"))]
+    CANDIDATE_SELECTION_CALLS.with(|calls| {
+        calls.set(
+            calls
+                .get()
+                .checked_add(1)
+                .expect("selection counter overflow"),
+        );
+    });
     let query = crate::analyzer::i_analyzer::candidate_overlay_query_context();
     // A value key, so a selected alternate handle passed back in finds the
     // selection its base made.
@@ -3306,6 +3351,7 @@ mod executable_rule_tests {
         let call = CallSiteId::new(0);
         let target = CallableTargetResolution::Proven(CallableTarget::Local(parts.id));
         parts.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Callable,
             source,

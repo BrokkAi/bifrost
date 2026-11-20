@@ -1,4 +1,6 @@
-use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
+use brokk_bifrost_analysis::analyzer::usages::get_type::{
+    TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::get_type::candidates_outcome_with_target_kind;
 
@@ -71,5 +73,17 @@ pub(crate) fn resolve_java_type_bounded(
             ),
         ),
     };
-    session.finish(outcome)
+    let mut outcome = outcome;
+    // A type bound past a supertype nothing resolves may be shadowed by a
+    // member type that supertype declares (#14293).
+    if let Some(gap) = session.open_supertype_gap()
+        && outcome.status == TypeLookupStatus::Resolved
+    {
+        outcome.status = TypeLookupStatus::Incomplete;
+        outcome.diagnostics.push(TypeLookupDiagnostic {
+            kind: "open_java_supertype".into(),
+            message: gap,
+        });
+    }
+    session.finish_reported(outcome)
 }

@@ -94,10 +94,16 @@ impl SourceAnchors {
             .any(|key| other.anchors.contains_key(key))
     }
 
+    /// The source-input owner uses the original ranges to distinguish a
+    /// workspace binding from a carried-source fallback's zero range.
+    pub fn authored_anchors(&self) -> impl Iterator<Item = &SemanticModelAuthoredAnchor> {
+        self.anchors.values()
+    }
+
     /// Every authored path these anchors name. Complete: a prefix or
     /// containment question scans all of them, and the caller owns the bound.
     pub fn authored_paths(&self) -> impl Iterator<Item = &str> {
-        self.anchors.values().map(|anchor| anchor.path.as_str())
+        self.authored_anchors().map(|anchor| anchor.path.as_str())
     }
 
     pub fn ids_at_path(&self, path: &str) -> Vec<String> {
@@ -204,6 +210,198 @@ impl RetainedBytes for SearchCandidateKey {
             + self.realm.as_ref().map_or(0, |value| {
                 brokk_bifrost_core::allocation_size::allocation_size(value.capacity())
             })
+    }
+}
+
+/// Analyzer-owned dependency evidence for a composed search fill. The store
+/// retains the opaque receipt; analysis downcasts and replays it before use.
+/// Implementations account for the full retained receipt allocation.
+pub trait SearchInputReceipt: std::any::Any + Send + Sync + RetainedBytes {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Pattern-independent inputs for one frozen overlay and request binding.
+/// They hold symbols only: search reads nothing else, and a relation lookup
+/// reads its owners' rows instead of this fill.
+/// Process-local only: persistence would also require the engine build identity
+/// in SearchCandidateKey.
+pub struct ComposedSearchInputs {
+    pub anchors: SourceAnchors,
+    pub stream: SearchCandidateStream,
+    pub records: Vec<SemanticModelSymbol>,
+    /// The composed symbols of each multi-contributor group.
+    pub groups: Vec<Vec<SemanticModelSymbol>>,
+    pub receipt: Box<dyn SearchInputReceipt>,
+    pub index: SearchSymbolIndex,
+}
+
+/// Slots reference the existing record and group arenas. The sentinel group
+/// selects the standalone records arena; no symbol is duplicated.
+#[derive(Default)]
+pub struct SearchSymbolIndex {
+    slots: Vec<(u32, u32)>,
+    ids: HashMap<String, Vec<u32>>,
+    names: HashMap<String, Vec<u32>>,
+    owners: HashMap<String, Vec<u32>>,
+}
+
+impl SearchSymbolIndex {
+    pub fn build(records: &[SemanticModelSymbol], groups: &[Vec<SemanticModelSymbol>]) -> Self {
+        let mut index = Self::default();
+        for (group, symbols) in std::iter::once((u32::MAX, records)).chain(
+            groups.iter().enumerate().map(|(i, symbols)| {
+                (
+                    u32::try_from(i).expect("group slot fits u32"),
+                    symbols.as_slice(),
+                )
+            }),
+        ) {
+            for (record, symbol) in symbols.iter().enumerate() {
+                let slot = u32::try_from(index.slots.len()).expect("symbol slot fits u32");
+                index
+                    .slots
+                    .push((group, u32::try_from(record).expect("record slot fits u32")));
+                let mut ids = std::iter::once(symbol.id.as_str())
+                    .chain(
+                        symbol
+                            .semantic_contributors
+                            .iter()
+                            .map(|c| c.record_id.as_str()),
+                    )
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids.dedup();
+                for id in ids {
+                    index.ids.entry(id.to_owned()).or_default().push(slot);
+                }
+                let mut names = std::iter::once(&symbol.name)
+                    .chain(std::iter::once(&symbol.qualified_name))
+                    .chain(&symbol.aliases)
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                names.dedup();
+                for name in names {
+                    index.names.entry(name.clone()).or_default().push(slot);
+                }
+                if let Some(owner) = &symbol.owner_id {
+                    index.owners.entry(owner.clone()).or_default().push(slot);
+                }
+            }
+        }
+        // Stable posting order matches the former lookup-time source sort,
+        // including ties in arena insertion order. Compute each key once.
+        let keys = index
+            .slots
+            .iter()
+            .map(|&(group, record)| {
+                let symbol = if group == u32::MAX {
+                    &records[record as usize]
+                } else {
+                    &groups[group as usize][record as usize]
+                };
+                semantic_symbol_source_key(symbol)
+            })
+            .collect::<Vec<_>>();
+        for map in [&mut index.ids, &mut index.names, &mut index.owners] {
+            for slots in map.values_mut() {
+                slots.sort_by_key(|slot| keys[*slot as usize]);
+            }
+        }
+        let mut order = (0..index.slots.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&slot| keys[slot]);
+        let mut remap = vec![0; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            remap[old] = u32::try_from(new).expect("symbol slot fits u32");
+        }
+        for map in [&mut index.ids, &mut index.names, &mut index.owners] {
+            for slots in map.values_mut() {
+                for slot in slots {
+                    *slot = remap[*slot as usize];
+                }
+            }
+        }
+        index.slots = order.into_iter().map(|slot| index.slots[slot]).collect();
+        index
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        let mut heap = RetainedHeap::default();
+        heap.vec(&self.slots);
+        for map in [&self.ids, &self.names, &self.owners] {
+            heap.map(map);
+            for (key, slots) in map {
+                heap.add(key.capacity());
+                heap.vec(slots);
+            }
+        }
+        heap.total()
+    }
+}
+
+impl ComposedSearchInputs {
+    /// Visit the resident arena in stable source order without cloning symbols.
+    pub fn ordered_symbols(&self) -> impl Iterator<Item = &SemanticModelSymbol> {
+        self.index.slots.iter().map(|&(group, record)| {
+            if group == u32::MAX {
+                &self.records[record as usize]
+            } else {
+                &self.groups[group as usize][record as usize]
+            }
+        })
+    }
+
+    pub fn indexed_symbols(&self, lookup: &CompositionLookup) -> Option<Vec<&SemanticModelSymbol>> {
+        let slots = match lookup {
+            CompositionLookup::RecordId(id) => self.index.ids.get(id),
+            CompositionLookup::Name(name) => self.index.names.get(name),
+            CompositionLookup::MembersOf(owner) => self.index.owners.get(owner),
+            _ => return None,
+        };
+        let result = slots
+            .into_iter()
+            .flatten()
+            .map(|slot| {
+                let (group, record) = self.index.slots[*slot as usize];
+                if group == u32::MAX {
+                    &self.records[record as usize]
+                } else {
+                    &self.groups[group as usize][record as usize]
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(result)
+    }
+}
+
+impl RetainedBytes for ComposedSearchInputs {
+    fn retained_bytes(&self) -> usize {
+        let mut heap = RetainedHeap::default();
+        heap.add(std::mem::size_of::<Self>());
+        // The stream's inline storage is already part of Self.
+        heap.add(
+            self.stream
+                .retained_bytes()
+                .saturating_sub(std::mem::size_of::<SearchCandidateStream>()),
+        );
+        heap.vec(&self.records);
+        for record in &self.records {
+            charge_symbol(record, &mut heap);
+        }
+        heap.vec(&self.groups);
+        for group in &self.groups {
+            heap.vec(group);
+            for symbol in group {
+                charge_symbol(symbol, &mut heap);
+            }
+        }
+        heap.add(
+            self.anchors
+                .retained_bytes_lower_bound()
+                .saturating_sub(std::mem::size_of::<SourceAnchors>()),
+        );
+        heap.add(self.receipt.retained_bytes());
+        heap.add(self.index.retained_bytes());
+        heap.total()
     }
 }
 
@@ -612,7 +810,7 @@ impl RetainedBytes for SearchCandidateStream {
         heap.add(std::mem::size_of_val(self));
         heap.vec(&self.candidates);
         for c in &self.candidates {
-            for s in [&c.0, &c.2, &c.3, &c.6, &c.7, &c.8, &c.9] {
+            for s in [&c.0, &c.2, &c.3, &c.6, &c.7, &c.8, &c.9, &c.10] {
                 heap.add(heap.allocation_bytes(s.capacity()));
             }
             heap.add(

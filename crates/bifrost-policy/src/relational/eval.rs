@@ -854,10 +854,17 @@ fn load_rows(
             binding: binding.as_str().to_string(),
         });
     };
-    let schema = &plan
+    let relation = plan
         .relation(id)
-        .expect("relations are evaluated by their own id")
-        .schema;
+        .expect("relations are evaluated by their own id");
+    let schema = &relation.schema;
+    let IrRelationOp::Source {
+        undecided_selections,
+        ..
+    } = &relation.op
+    else {
+        unreachable!("rows load only into binding sources")
+    };
     let layout = schema
         .fields()
         .iter()
@@ -897,7 +904,7 @@ fn load_rows(
                 row,
             }]],
             witness_sound: true,
-            may_reasons: row_may_reasons(item),
+            may_reasons: row_may_reasons(item, undecided_selections),
         });
     }
     if !unknown_inputs.is_empty() {
@@ -1488,7 +1495,18 @@ fn row_field(
 
 /// Explicit modeled certainty is independent of relation coverage. Missing,
 /// unsupported, or truncated input alone never manufactures may evidence.
-fn row_may_reasons(row: &UnitRowItem) -> Vec<CertaintyReason> {
+///
+/// A row is explicit may evidence when it models a `may` or `possible`
+/// relation, or when it carries one of `undecided_selections`: a field holding
+/// an undecided label that the binding's filter named with `eq` or `in`, so the
+/// policy selected the row as an undecided candidate (#14547). An undecided
+/// label the filter did not name, such as an open `region_first` on a proven
+/// unreachable statement, or one that only passed a presence test, leaves the
+/// row decided.
+fn row_may_reasons(
+    row: &UnitRowItem,
+    undecided_selections: &[(String, String)],
+) -> Vec<CertaintyReason> {
     use brokk_bifrost_rql::structural::search::UnitRowScalar;
     let field = |name| {
         row.fields
@@ -1496,26 +1514,43 @@ fn row_may_reasons(row: &UnitRowItem) -> Vec<CertaintyReason> {
             .find(|field| field.name.as_ref() == name)
             .map(|field| &field.value)
     };
-    let Some(UnitRowScalar::ConstrainedEnum(certainty)) = field("certainty") else {
-        return Vec::new();
+    let reason = || {
+        row.evidence
+            .as_ref()
+            .and_then(|evidence| evidence.reason.as_deref())
+            .or_else(|| match field("reason") {
+                Some(UnitRowScalar::String(reason) | UnitRowScalar::ConstrainedEnum(reason)) => {
+                    Some(reason.as_ref())
+                }
+                _ => None,
+            })
     };
-    if !matches!(certainty.as_ref(), "may" | "possible") {
-        return Vec::new();
+    let mut reasons = Vec::new();
+    if let Some(UnitRowScalar::ConstrainedEnum(certainty)) = field("certainty")
+        && matches!(certainty.as_ref(), "may" | "possible")
+    {
+        reasons.push(CertaintyReason::MayEvidence {
+            reason: reason().unwrap_or("explicit may row").to_string(),
+        });
     }
-    let reason = row
-        .evidence
-        .as_ref()
-        .and_then(|evidence| evidence.reason.as_deref())
-        .or_else(|| match field("reason") {
-            Some(UnitRowScalar::String(reason) | UnitRowScalar::ConstrainedEnum(reason)) => {
-                Some(reason.as_ref())
-            }
-            _ => None,
-        })
-        .unwrap_or("explicit may row");
-    vec![CertaintyReason::MayEvidence {
-        reason: reason.to_string(),
-    }]
+    for value in &row.fields {
+        let UnitRowScalar::ConstrainedEnum(label) = &value.value else {
+            continue;
+        };
+        let selected = undecided_selections
+            .iter()
+            .any(|(name, selected)| **name == *value.name && **selected == **label);
+        if selected {
+            let selected = format!("{}={label}", value.name);
+            reasons.push(CertaintyReason::MayEvidence {
+                reason: match reason() {
+                    Some(reason) => format!("{selected}: {reason}"),
+                    None => selected,
+                },
+            });
+        }
+    }
+    reasons
 }
 
 fn merge_may_reasons<'a>(tuples: impl IntoIterator<Item = &'a EvalTuple>) -> Vec<CertaintyReason> {

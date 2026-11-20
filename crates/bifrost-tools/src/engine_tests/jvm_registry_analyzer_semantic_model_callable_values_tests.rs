@@ -78,6 +78,7 @@ mod jvm_registry_tests {
         let active = match resolve_active_semantic_models(
             &catalog,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::new(0, 12, 0),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -91,7 +92,8 @@ mod jvm_registry_tests {
                     toolchain: None,
                     target: Some("jvm".to_owned()),
                     configuration: Some("release".to_owned()),
-                    artifact_sha256: Some("a".repeat(64)),
+                    production_input_digest: None,
+verified_raw_artifacts: (Some("a".repeat(64))).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),
@@ -114,8 +116,9 @@ mod jvm_registry_tests {
             &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
-        let factory = overlay
-            .symbols()
+        let (symbols, complete) = overlay.symbols();
+        assert!(complete, "fixture requires complete symbols");
+        let factory = symbols
             .into_iter()
             .find(|symbol| symbol.provenance.record_id == "member.widget.create")
             .unwrap();

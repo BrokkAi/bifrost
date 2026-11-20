@@ -9,8 +9,7 @@ use brokk_bifrost_analysis::analyzer::languages::language_support;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelCallableKey, SemanticModelCompleteness, SemanticModelOverlay,
     SemanticModelOverlayDisposition, SemanticModelProvenance, SemanticModelSymbol,
-    SemanticModelSymbolKind, semantic_model_callable_family_id,
-    semantic_model_possible_callable_family_id,
+    SemanticModelSymbolKind,
 };
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
@@ -255,6 +254,9 @@ pub(super) fn resolve_policy_definition_locators(
             for subject in &mut spec.subjects.entries {
                 resolve_selector_locators(&mut subject.selector, locators)?;
             }
+            for transfer in &mut spec.automaton.transfers {
+                resolve_selector_locators(&mut transfer.selector, locators)?;
+            }
             for event in &mut spec.automaton.events {
                 if let TypestateEventTrigger::Calls { selector, .. } = &mut event.trigger {
                     resolve_selector_locators(selector, locators)?;
@@ -381,7 +383,14 @@ pub(super) fn resolved_locator_metadata(
 ) -> Vec<&ResolvedPolicyLocator> {
     let mut locators = Vec::new();
     match &definition.analysis {
-        PolicyAnalysis::Match { spec } => collect_selector_locators(&spec.selector, &mut locators),
+        PolicyAnalysis::Match { spec } => {
+            collect_selector_locators(&spec.selector, &mut locators);
+            for guard in &spec.guards.barriers {
+                for (_, selector) in guard.selectors(TAINT_SET_SEGMENTS) {
+                    collect_selector_locators(selector, &mut locators);
+                }
+            }
+        }
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &spec.relational {
                 for binding in &plan.bindings {
@@ -393,6 +402,18 @@ pub(super) fn resolved_locator_metadata(
             }
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
+            for guard in &spec.guards.barriers {
+                for (_, selector) in guard.selectors(TAINT_SET_SEGMENTS) {
+                    collect_selector_locators(selector, &mut locators);
+                }
+            }
+            if let Some(without) = &spec.without_flow {
+                for guard in &without.guards.barriers {
+                    for (_, selector) in guard.selectors(WITHOUT_FLOW_SET_SEGMENTS) {
+                        collect_selector_locators(selector, &mut locators);
+                    }
+                }
+            }
             collect_taint_set_locators(&spec.sources, &mut locators);
             collect_taint_set_locators(&spec.sinks, &mut locators);
             collect_taint_set_locators(&spec.sanitizers, &mut locators);
@@ -410,6 +431,9 @@ pub(super) fn resolved_locator_metadata(
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {
                 collect_selector_locators(&subject.selector, &mut locators);
+            }
+            for transfer in &spec.automaton.transfers {
+                collect_selector_locators(&transfer.selector, &mut locators);
             }
             for event in &spec.automaton.events {
                 if let TypestateEventTrigger::Calls { selector, .. } = &event.trigger {
@@ -654,14 +678,14 @@ fn resolve_qualified_type_family(
             "qualifying type has conflicting source or model declarations",
         ));
     }
-    if matches!(disposition, SemanticModelOverlayDisposition::Open(_))
+    if let SemanticModelOverlayDisposition::Open(open) = disposition
         && (source_identities.is_empty() || !records.is_empty())
     {
         return Err(locator_error(
             locator,
             role,
             LocatorFailure::Partial,
-            "active semantic-model inventory is incomplete",
+            format!("active semantic-model inventory is incomplete: {open:?}"),
         ));
     }
     if records
@@ -1009,14 +1033,14 @@ fn resolve_qualified_locator(
         // declaration answers it or the part it read holds a candidate. One
         // workspace identity with no answered candidate still resolves; the
         // open lookup has already marked the query incomplete.
-        if matches!(disposition, SemanticModelOverlayDisposition::Open(_))
+        if let SemanticModelOverlayDisposition::Open(open) = disposition
             && (source_identities.is_empty() || !records.is_empty())
         {
             return Err(locator_error(
                 locator,
                 role,
                 LocatorFailure::Partial,
-                "active semantic-model inventory is incomplete".to_string(),
+                format!("active semantic-model inventory is incomplete: {open:?}"),
             ));
         }
         if let [source_identity] = source_identities.as_slice()
@@ -1036,7 +1060,10 @@ fn resolve_qualified_locator(
             && records.len() > 1
             && source_identities.is_empty()
         {
-            if let Some(identity) = semantic_model_callable_family_id(&records) {
+            if let Some(identity) = overlay
+                .as_ref()
+                .and_then(|overlay| overlay.callable_family_id_for_locator_records(&records))
+            {
                 let mut provenance = records[0].provenance.clone();
                 provenance.record_id = identity.clone();
                 return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
@@ -1048,7 +1075,9 @@ fn resolve_qualified_locator(
             // model certifies complete: the known members are a possible
             // identity (#10761). Cross-pack, cross-owner and ambiguous
             // records have none and stay ambiguous below.
-            if let Some(identity) = semantic_model_possible_callable_family_id(&records) {
+            if let Some(identity) = overlay.as_ref().and_then(|overlay| {
+                overlay.callable_possible_family_id_for_locator_records(&records)
+            }) {
                 let mut provenance = records[0].provenance.clone();
                 provenance.record_id = identity.clone();
                 return Ok(ResolvedLocatorIdentity::PossibleSemanticModel {
@@ -1159,7 +1188,9 @@ fn resolve_qualified_locator(
             });
         }
     } else if source_identities.is_empty() {
-        let failure = if analyzer.active_semantic_models().is_some() {
+        // Discovery and failure records may be published without a model overlay.
+        // Those records do not make an inactive declaration surface available.
+        let failure = if overlay.is_some() {
             LocatorFailure::Incomplete
         } else {
             LocatorFailure::InactiveModel

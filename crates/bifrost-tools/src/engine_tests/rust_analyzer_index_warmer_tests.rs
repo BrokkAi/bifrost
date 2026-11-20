@@ -26,14 +26,14 @@ mod rust_departing_tests_tests {
         let warmer = IndexWarmer::new();
         warmer.panic_before_next_warm.store(true, Ordering::Release);
         warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(std::time::Duration::from_secs(30));
         assert!(
             !snapshot.query_indexes_warm(),
             "a failed warm must not publish a completed lazy index"
         );
 
         warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(std::time::Duration::from_secs(30));
         assert!(
             snapshot.query_indexes_warm(),
             "the next schedule must retry and publish the lazy index"

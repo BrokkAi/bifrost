@@ -25,6 +25,7 @@ pub const CAPSULE_MEMBERSHIP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM temp.selec
 
 impl SelectedResolutionStage<'_, '_> {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn has_admitted_macro_input(
         &self,
         host: crate::analyzer::resolution::SelectedResolutionMountOrdinal,
@@ -62,6 +63,7 @@ impl SelectedResolutionStage<'_, '_> {
     /// (`rust_crate_macro_items`), whose declaration replay recorded at the
     /// same range, can be found and projected to its `CodeUnit`.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn admit_capsule(
         &self,
         content: PublishedResolutionContent,

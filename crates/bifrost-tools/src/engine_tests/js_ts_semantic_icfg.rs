@@ -943,6 +943,203 @@ mod js_ts_extraction_tests {
         );
     }
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13901: inherited semantic and execution stops published partial ICFG fills"
+    )]
+    fn stopped_multi_gap_icfg_fills_do_not_publish_and_funded_retries_replay() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
+        let fixture = AnalyzerFixture::new_for_language(
+            brokk_bifrost_core::analyzer::model::Language::Rust,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"icfg_stop\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    concat!(
+                        "struct Inert;\n",
+                        "fn helper() {}\n",
+                        "pub fn caller() { let a = Inert; let b = Inert; helper(); }\n",
+                    ),
+                ),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut setup = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut setup, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        assert!(caller.semantics().logical_gaps().count() >= 2);
+        let call = caller.semantics().call_sites().last().unwrap().id;
+        let entry = caller
+            .point_handle(caller.semantics().entry_point())
+            .unwrap();
+        let exit = caller
+            .point_handle(caller.semantics().normal_exit_point())
+            .unwrap();
+        // A distinct provider per stop proves that neither fill can publish a
+        // partial result which a later funded request would mistake for content.
+        for execution_stop in [false, true] {
+            let provider = fixture.analyzer.icfg_provider();
+            let execution = SemanticExecutionBudget::new(0);
+            for exit_fill in [false, true] {
+                let mut budget = SemanticBudget::default();
+                let old = (!execution_stop).then(|| {
+                    budget
+                        .check_admission(SemanticWork {
+                            program_points: budget.limits().program_points + 1,
+                            ..SemanticWork::default()
+                        })
+                        .unwrap_err()
+                });
+                let count = budget.refusal_count();
+                let completion =
+                    AnalyzerQueryScope::capturing_read_incompleteness(fixture.analyzer.analyzer());
+                let evaluation = Arc::new(
+                    brokk_bifrost_core::analyzer::carried_context::EvaluationExecution::default(),
+                );
+                let _evaluation_scope = evaluation.install();
+                let mut request = if execution_stop {
+                    SemanticRequest::with_execution_budget(&mut budget, &cancellation, &execution)
+                } else {
+                    // Deliberately no observation mark: the request inherits
+                    // a semantic stop, but this fill makes no numeric refusal.
+                    SemanticRequest::new(&mut budget, &cancellation)
+                };
+                let (judged, observed) = request.judged_with_refusal(|request| {
+                    if exit_fill {
+                        provider
+                            .exit_profile(&entry, &exit, request)
+                            .map(|outcome| {
+                                assert!(
+                                    matches!(
+                                        outcome,
+                                        SemanticOutcome::Unknown { partial: None, .. }
+                                    ),
+                                    "{outcome:#?}"
+                                );
+                                assert!(outcome.completed_replay().is_none());
+                            })
+                    } else {
+                        provider
+                            .call_transfers(&caller, call, request)
+                            .map(|outcome| {
+                                assert!(
+                                    matches!(
+                                        outcome,
+                                        SemanticOutcome::Unknown { partial: None, .. }
+                                    ),
+                                    "{outcome:#?}"
+                                );
+                                assert!(outcome.completed_replay().is_none());
+                            })
+                    }
+                });
+                judged.value.unwrap();
+                assert_eq!(judged.reuse, ReuseVerdict::Content);
+                assert!(matches!(
+                    evaluation.verdict(),
+                    ReuseVerdict::ExecutionDependent(_)
+                ));
+                assert!(
+                    observed.is_none(),
+                    "no numeric refusal occurred in this fill"
+                );
+                assert_eq!(budget.refusal_count(), count);
+                assert_eq!(budget.first_refusal().map(|refusal| refusal.exceeded), old);
+                assert!(completion.captured_read_incompleteness().iter().any(|reason| matches!(
+                    reason,
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped {
+                        cause: Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Budget),
+                        ..
+                    }
+                )));
+                assert!(
+                    provider
+                        .outcome_cache
+                        .call_transfers
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    provider
+                        .outcome_cache
+                        .exit_profiles
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            // A marked retry can finish both fills despite the old refusal.
+            // Call transfers have a reusable receipt;
+            // the Rust profile's content read admission may require a rescan.
+            let mut funded = SemanticBudget::default();
+            let old = funded
+                .check_admission(SemanticWork {
+                    program_points: funded.limits().program_points + 1,
+                    ..SemanticWork::default()
+                })
+                .unwrap_err();
+            let mark = funded.refusal_mark();
+            let mut request =
+                SemanticRequest::new(&mut funded, &cancellation).observing_refusals_since(mark);
+            let transfers = provider
+                .call_transfers(&caller, call, &mut request)
+                .unwrap();
+            let profile = provider.exit_profile(&entry, &exit, &mut request).unwrap();
+            assert!(transfers.available_value().is_some(), "{transfers:#?}");
+            assert!(profile.available_value().is_some(), "{profile:#?}");
+            assert!(transfers.completed_replay().is_some());
+            assert!(profile.completed_replay().is_some());
+            let mut replay = SemanticBudget::default();
+            let mut replay_request = SemanticRequest::new(&mut replay, &cancellation);
+            let transfers_replay = provider
+                .call_transfers(&caller, call, &mut replay_request)
+                .unwrap();
+            let profile_replay = provider
+                .exit_profile(&entry, &exit, &mut replay_request)
+                .unwrap();
+            assert_eq!(
+                transfers.available_value(),
+                transfers_replay.available_value()
+            );
+            assert_eq!(profile.available_value(), profile_replay.available_value());
+            assert_eq!(transfers_replay.work(), SemanticWork::default());
+            assert_eq!(funded.refusal_count(), 1);
+            assert_eq!(funded.first_refusal().unwrap().exceeded, old);
+            assert_eq!(replay.refusal_count(), 0);
+            assert_eq!(
+                provider.outcome_cache.call_transfers.lock().unwrap().len(),
+                1
+            );
+        }
+    }
+    #[test]
     fn exit_profile_projects_exact_returns_and_owns_one_topology_scan() {
         let fixture = AnalyzerFixture::new_for_language(
             brokk_bifrost_core::analyzer::model::Language::TypeScript,

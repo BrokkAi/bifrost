@@ -724,6 +724,7 @@ fn incomplete_reason_kind(reason: &EdgeIncompleteReason) -> &'static str {
         EdgeIncompleteReason::UsageAnalysisFailed { .. } => "usage_analysis_failed",
         EdgeIncompleteReason::Cancelled => "cancelled",
         EdgeIncompleteReason::TimeBudgetExceeded => "time_budget",
+        EdgeIncompleteReason::ReceiverBudgetExhausted => "receiver_budget",
         EdgeIncompleteReason::OccurrenceRowsIncomplete { .. } => "occurrence_rows_incomplete",
         EdgeIncompleteReason::ReferenceEnumerationIncomplete => "reference_enumeration_incomplete",
         EdgeIncompleteReason::ForwardResolutionIncomplete => "forward_resolution_incomplete",
@@ -735,6 +736,7 @@ fn incomplete_reason_kind(reason: &EdgeIncompleteReason) -> &'static str {
         EdgeIncompleteReason::InverseIndexResolutionIncomplete => {
             "inverse_index_resolution_incomplete"
         }
+        EdgeIncompleteReason::InverseIndexOpenSite(_) => "inverse_index_open_site",
         EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
             "inverse_index_query_obligations_outstanding"
         }
@@ -1268,6 +1270,169 @@ mod tests {
                 ("M", CallerInventoryCoverage::Incomplete),
                 ("Service", CallerInventoryCoverage::Complete),
             ]
+        );
+    }
+
+    fn macro_frontier_fixture(
+        source: &str,
+    ) -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"frontier\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", source)
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        (fixture, rust)
+    }
+
+    fn target_unit(
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+        rust: &RustAnalyzer,
+    ) -> CodeUnit {
+        rust.declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .expect("target declaration")
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13612: prefix bang and standalone env!/concat! in an expression macro kept the reverse inventory open"
+    )]
+    fn prefix_bang_and_standalone_env_do_not_open_the_inventory() {
+        let (fixture, rust) = macro_frontier_fixture(concat!(
+            "pub fn target() {}\n",
+            "pub fn flag() -> bool { true }\n",
+            "pub fn caller_a() { if !flag() { target(); } }\n",
+            "pub fn caller_b() { target(); }\n",
+            "pub fn wait(done: bool) {\n",
+            "    tokio::select! { _ = work(), if !done => { let _ = !done; } }\n",
+            "    let _ = serde_json::json!({\"timed_out\": !done, \"home\": env!(\"HOME\")});\n",
+            "    tracing::info!(\"{}\", concat!(\"a\", \"b\"));\n",
+            "}\n",
+        ));
+        let target = target_unit(&fixture, &rust);
+        let result = RustNativeCallRelations.incoming(&rust, &target, rich_limits(), None);
+        let mut callers = result
+            .sites
+            .iter()
+            .map(|site| site.caller.identifier().to_owned())
+            .collect::<Vec<_>>();
+        callers.sort();
+        assert_eq!(callers, ["caller_a", "caller_b"], "{result:?}");
+        assert_eq!(
+            result.caller_inventory,
+            CallerInventoryCoverage::Complete,
+            "{result:?}"
+        );
+        let selected =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::default(), |queries| {
+                queries.inverse_for(std::slice::from_ref(&target))
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = selected else {
+            panic!("selected reverse rows must be ready: {selected:?}");
+        };
+        assert_eq!(rows[0].completeness, EdgeCompleteness::Complete, "{rows:?}");
+    }
+
+    #[test]
+    fn metavariable_bang_stays_open() {
+        let (fixture, rust) = macro_frontier_fixture(concat!(
+            "pub fn target() {}\n",
+            "pub fn caller() { target(); }\n",
+            // A metavariable names whatever the caller substitutes, so a bang
+            // after one cannot be bounded by the input tokens.
+            "pub fn run() { other::run! { x => $m!() } }\n",
+        ));
+        let target = target_unit(&fixture, &rust);
+        let selected =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::default(), |queries| {
+                queries.inverse_for(std::slice::from_ref(&target))
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = selected else {
+            panic!("selected reverse rows must be ready: {selected:?}");
+        };
+        assert!(!rows[0].completeness.is_complete(), "{rows:?}");
+    }
+
+    #[test]
+    fn include_of_env_names_its_open_site_in_edge_and_call_relation_result() {
+        let source = concat!(
+            "pub fn target() {}\n",
+            "pub fn caller() { target(); }\n",
+            "pub fn generated() {\n",
+            "    let _ = !true;\n",
+            "    wrapper::run! { x => include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\")) }\n",
+            "}\n",
+        );
+        let (fixture, rust) = macro_frontier_fixture(source);
+        let target = target_unit(&fixture, &rust);
+        let selected =
+            with_rust_selected_reverse_queries(&rust, &CancellationToken::default(), |queries| {
+                queries.inverse_for(std::slice::from_ref(&target))
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = selected else {
+            panic!("selected reverse rows must be ready: {selected:?}");
+        };
+        let EdgeCompleteness::Incomplete { reasons } = &rows[0].completeness else {
+            panic!("an include! argument must keep the inventory open: {rows:?}");
+        };
+        let site = reasons
+            .iter()
+            .find_map(|reason| match reason {
+                EdgeIncompleteReason::InverseIndexOpenSite(site) => Some(site),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no typed open site in {reasons:?}"));
+        assert_eq!(site.file, "src/lib.rs");
+        assert_eq!(site.line, 5);
+        assert_eq!(site.macro_name.as_deref(), Some("wrapper::run"));
+        assert_eq!(site.reason_kind, "unsupported_expression");
+        assert!(reasons.contains(&EdgeIncompleteReason::InverseIndexResolutionIncomplete));
+
+        let result = RustNativeCallRelations.incoming(&rust, &target, rich_limits(), None);
+        assert_eq!(result.caller_inventory, CallerInventoryCoverage::Incomplete);
+        let message = result
+            .diagnostics
+            .iter()
+            .map(CallRelationDiagnostic::message)
+            .find(|message| message.contains("InverseIndexOpenSite"))
+            .unwrap_or_else(|| panic!("no open-site diagnostic: {result:?}"));
+        assert!(
+            message.contains("src/lib.rs")
+                && message.contains("line: 5")
+                && message.contains("wrapper::run")
+                && message.contains("unsupported_expression"),
+            "{message}"
+        );
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_kind.as_deref() == Some("inverse_index_open_site")
+        }));
+    }
+
+    #[test]
+    fn item_include_of_env_names_its_open_site() {
+        let (fixture, rust) = macro_frontier_fixture(concat!(
+            "pub fn target() {}\n",
+            "pub fn caller() { target(); }\n",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+        ));
+        let target = target_unit(&fixture, &rust);
+        let result = RustNativeCallRelations.incoming(&rust, &target, rich_limits(), None);
+        assert_eq!(result.caller_inventory, CallerInventoryCoverage::Incomplete);
+        let message = result
+            .diagnostics
+            .iter()
+            .map(CallRelationDiagnostic::message)
+            .find(|message| message.contains("InverseIndexOpenSite"))
+            .unwrap_or_else(|| panic!("no open-site diagnostic: {result:?}"));
+        assert!(
+            message.contains("file: \"src/lib.rs\"")
+                && message.contains("line: 3")
+                && message.contains("macro_name: Some(\"include\")"),
+            "{message}"
         );
     }
 

@@ -325,6 +325,7 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
         Ok(role)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn source_context_is_proven(
         &mut self,
         mount: SelectedResolutionMountOrdinal,
@@ -513,6 +514,7 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
         Ok(answer)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn package_provider_mounts(
         &mut self,
         package: i64,
@@ -1936,6 +1938,7 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         Ok(Read::ready(EndpointAdmission::Discover))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn discovery_scope(
         &mut self,
         endpoint: &EndpointSignature,
@@ -1975,6 +1978,7 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         Ok(SourceScope::Mounts(mounts.into_boxed_slice()))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn describe_source(
         &mut self,
         endpoint: &EndpointSignature,
@@ -2253,6 +2257,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn with_go_forward_operation_inner<T>(
         &self,
         context: GoForwardOperationContext<'_>,

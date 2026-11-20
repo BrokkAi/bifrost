@@ -102,7 +102,7 @@ impl ExecutionInputs<'_, '_> {
         self.analyzer
             .record_read(ReadKey::semantic_artifact(&key.0));
         let file = self.procedures.get(key)?.file.clone();
-        let outcome = self.semantic.materialized_outcome(&file)?;
+        let outcome = self.semantic.materialized_outcome(&file).ok()?;
         // Gaps inside validated IR have an owned procedure and point. A
         // partial artifact outcome is the remaining unattributed uncertainty;
         // never hide it by selecting one available procedure from that value.
@@ -648,7 +648,12 @@ impl ExecutionInputs<'_, '_> {
                         },
                         key,
                     )) => {
-                        let summary_closed = complete && (covers_overrides || !key.has_receiver);
+                        let summary_closed = complete
+                            && (covers_overrides
+                                || !crate::analyzer::semantic_model::target_needs_override_claim(
+                                    key.has_receiver,
+                                    false,
+                                ));
                         let status = if !input.declaration_only || summary_closed {
                             ExecutionEndpointStatus::Complete
                         } else {

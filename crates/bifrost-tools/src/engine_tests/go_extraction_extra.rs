@@ -26,6 +26,7 @@ mod go_extraction_tests_extra {
                 id,
                 name,
                 Some(Signature {
+                    bounds: None,
                     type_parameters: Vec::new(),
                     parameters: Vec::new(),
                     returns: Some(returns),

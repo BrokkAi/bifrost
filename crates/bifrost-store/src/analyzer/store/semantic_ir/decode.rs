@@ -1757,6 +1757,13 @@ impl Decoder<'_> {
                 let static_type_class = static_type_class(cells);
                 let origin_call = cells.opt_id();
                 let origin_ordinal = cells.opt_u32();
+                let actual_borrow = match cells.u32() {
+                    0 => crate::analyzer::semantic::ActualBorrowKind::Unknown,
+                    1 => crate::analyzer::semantic::ActualBorrowKind::Shared,
+                    2 => crate::analyzer::semantic::ActualBorrowKind::Mutable,
+                    3 => crate::analyzer::semantic::ActualBorrowKind::Raw,
+                    _ => cells.fail_at("actual_borrow", "invalid actual borrow kind"),
+                };
                 let static_type_origin = match (origin_call, origin_ordinal) {
                     (None, None) => None,
                     (Some(call), Some(ordinal)) => {
@@ -1840,6 +1847,7 @@ impl Decoder<'_> {
                 self.parts[self.procedure_slots[&procedure]]
                     .values
                     .push(SemanticValue {
+                        actual_borrow,
                         static_type_origin,
                         static_type_class,
                         id: ValueId::new(id),
@@ -2916,6 +2924,16 @@ impl Decoder<'_> {
                     GuardPredicateTag::HasMember => GuardPredicate::HasMember {
                         value: cells.need(operand_a, "operand_a"),
                         member: cells.need(operand_b, "operand_b"),
+                    },
+                    GuardPredicateTag::ValueEquality => GuardPredicate::ValueEquality {
+                        left: cells.need(operand_a, "operand_a"),
+                        right: cells.need(operand_b, "operand_b"),
+                        negated: flag(cells),
+                    },
+                    GuardPredicateTag::ValueOrdering => GuardPredicate::ValueOrdering {
+                        left: cells.need(operand_a, "operand_a"),
+                        right: cells.need(operand_b, "operand_b"),
+                        relation: cells.need(relation, "relation"),
                     },
                     GuardPredicateTag::Truthy => GuardPredicate::Truthy {
                         value: cells.need(operand_a, "operand_a"),

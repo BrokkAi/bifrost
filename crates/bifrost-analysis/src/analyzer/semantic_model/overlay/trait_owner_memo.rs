@@ -1,8 +1,12 @@
 //! Request-root trait discovery; every hit replays its transitive inputs.
 
 use super::{SemanticModelOverlay, SemanticModelSymbol};
+type Owners = Result<
+    Vec<Arc<SemanticModelSymbol>>,
+    brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen,
+>;
 use crate::analyzer::IAnalyzer;
-use crate::analyzer::usages::common::{QueryReadMemo, query_memo_value, query_read_memo};
+use crate::analyzer::usages::common::{QueryReadMemo, query_memo_value};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -31,17 +35,13 @@ struct Key {
     name: String,
 }
 
-/// Its distinct type registers one memo in QueryRequestMemos. That registry
-/// resets at request-root teardown, including cancellation and unwinding.
-#[doc(hidden)]
-pub struct ModeledTraitOwnersMemo {
-    values: QueryReadMemo<Key, Vec<Arc<SemanticModelSymbol>>>,
-}
-impl Default for ModeledTraitOwnersMemo {
-    fn default() -> Self {
-        Self {
-            values: query_read_memo(),
-        }
+brokk_bifrost_core::domain_memo_set! {
+    /// Its distinct type registers one memo in the domain memo registry. That
+    /// registry retires at request-root teardown, including cancellation and
+    /// unwinding.
+    #[doc(hidden)]
+    pub struct ModeledTraitOwnersMemo {
+        values: QueryReadMemo<Key, Owners>,
     }
 }
 impl ModeledTraitOwnersMemo {
@@ -51,14 +51,16 @@ impl ModeledTraitOwnersMemo {
         overlay: &SemanticModelOverlay,
         analyzer: &dyn IAnalyzer,
         name: &str,
-    ) -> Vec<Arc<SemanticModelSymbol>> {
+    ) -> Owners {
         if analyzer
             .active_query_cancellation()
             .is_some_and(|token| token.is_cancelled())
         {
             return overlay.trait_owners_with_callable_member(name);
         }
-        let Ok(reader) = overlay.request_owner_binding(overlay.row_source.is_some()) else {
+        // Rust competition reads only activation-owned Rust rows. Binding an
+        // unrelated JVM request owner here would contaminate its receipt.
+        let Ok(reader) = overlay.request_owner_binding(false) else {
             return overlay.trait_owners_with_callable_member(name);
         };
         let key = Key {
@@ -77,12 +79,7 @@ impl ModeledTraitOwnersMemo {
 }
 
 impl ModeledTraitOwnersMemo {
-    fn get(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        key: &Key,
-        build: impl FnOnce() -> Vec<Arc<SemanticModelSymbol>>,
-    ) -> Vec<Arc<SemanticModelSymbol>> {
+    fn get(&self, analyzer: &dyn IAnalyzer, key: &Key, build: impl FnOnce() -> Owners) -> Owners {
         query_memo_value(&self.values, analyzer, key, || {
             let owners = build();
             if analyzer
@@ -135,7 +132,9 @@ mod tests {
         let cold = (0..12)
             .map(|n| model.trait_owners_with_callable_member(&format!("m{n}")))
             .collect::<Vec<_>>();
-        let memo = ModeledTraitOwnersMemo::default();
+        let memo = <ModeledTraitOwnersMemo as brokk_bifrost_core::domain_memo::DomainMemo>::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1 << 20),
+        );
         let fills = Cell::new(0);
         for n in 0..2271 {
             let name = format!("m{}", n % 12);
@@ -144,7 +143,7 @@ mod tests {
                 model.trait_owners_with_callable_member(&name)
             });
             assert_eq!(answer, cold[n % 12]);
-            assert_eq!(answer.len(), 1);
+            assert_eq!(answer.unwrap().len(), 1);
         }
         assert_eq!(fills.get(), 12);
         let mut changed_reader = key(&model, "m0");
@@ -152,12 +151,14 @@ mod tests {
             [1; 32],
         ));
         assert!(
-            memo.get(&analyzer, &changed_reader, Vec::new).is_empty(),
+            memo.get(&analyzer, &changed_reader, || Ok(Vec::new()))
+                .unwrap()
+                .is_empty(),
             "a different selected reader cannot reuse an owner set"
         );
         let other = overlay(vec![], vec![]);
         assert!(
-            memo.owners(&other, &analyzer, "m0").is_empty(),
+            memo.owners(&other, &analyzer, "m0").unwrap().is_empty(),
             "a new overlay never reuses an old allocation's key"
         );
     }
@@ -166,7 +167,9 @@ mod tests {
     #[hardwon("#11957: a trait-owner hit must replay read keys and typed incomplete evidence")]
     fn trait_owner_memo_replays_reads_and_incomplete_results() {
         let analyzer = MultiAnalyzer::default();
-        let memo = ModeledTraitOwnersMemo::default();
+        let memo = <ModeledTraitOwnersMemo as brokk_bifrost_core::domain_memo::DomainMemo>::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1 << 20),
+        );
         let model = overlay(vec![], vec![]);
         let request = key(&model, "missing");
         let read = ReadKey::index(
@@ -180,9 +183,13 @@ mod tests {
                 memo.get(&analyzer, &request, || {
                     analyzer.record_read(read.clone());
                     analyzer.record_query_incomplete(gap.clone());
-                    vec![]
+                    Err(
+                        brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen::jvm(
+                            "missing trait evidence",
+                        ),
+                    )
                 })
-                .is_empty()
+                .is_err()
             );
         }
         for _ in 0..2 {
@@ -192,7 +199,7 @@ mod tests {
                     panic!("warm incomplete owner set rebuilt")
                 })
             });
-            assert!(owners.is_empty());
+            assert!(owners.is_err());
             assert_eq!(receipt.keys(), vec![read.clone()]);
             assert_eq!(scope.captured_read_incompleteness(), vec![gap.clone()]);
         }
@@ -204,33 +211,40 @@ mod tests {
     )]
     fn trait_owner_memo_refuses_operational_results() {
         let analyzer = MultiAnalyzer::default();
-        let memo = ModeledTraitOwnersMemo::default();
+        let memo = <ModeledTraitOwnersMemo as brokk_bifrost_core::domain_memo::DomainMemo>::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1 << 20),
+        );
         let model = overlay(vec![], vec![]);
         let request = key(&model, "from");
         let fills = Cell::new(0);
         for _ in 0..2 {
             let _scope = AnalyzerQueryScope::for_advisory_read(&analyzer);
-            memo.get(&analyzer, &request, || {
+            let _ = memo.get(&analyzer, &request, || {
                 fills.set(fills.get() + 1);
                 analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
-                vec![]
+                Ok(vec![])
             });
         }
         assert_eq!(fills.get(), 2);
         for _ in 0..2 {
             let _scope = AnalyzerQueryScope::for_advisory_read(&analyzer);
-            memo.get(&analyzer, &request, || {
+            let before = fills.get();
+            let _ = memo.get(&analyzer, &request, || {
                 fills.set(fills.get() + 1);
+                // Budget attribution annotates an execution dependence; it
+                // does not create the operational stop itself (#13430).
+                analyzer.mark_execution_dependent();
                 analyzer.record_budget_dependences(1);
-                vec![]
+                Ok(vec![])
             });
+            assert_eq!(fills.get(), before + 1, "a budget-stopped fill must retry");
         }
         assert_eq!(fills.get(), 4);
-        memo.get(&analyzer, &request, || {
+        let _ = memo.get(&analyzer, &request, || {
             fills.set(fills.get() + 1);
-            vec![]
+            Ok(vec![])
         });
-        memo.get(&analyzer, &request, || {
+        let _ = memo.get(&analyzer, &request, || {
             panic!("complete empty answer was not retained")
         });
         assert_eq!(fills.get(), 5);

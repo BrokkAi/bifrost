@@ -237,6 +237,7 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let source_work = SemanticWork {
             source_bytes: prepared.source().len(),
@@ -3186,7 +3187,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value
             };
             let declared_type = (!slot.receiver)
-                .then(|| node.child_by_field_name("type"))
+                .then(|| brokk_bifrost_csharp::declarations::csharp_parameter_type_node(node))
                 .flatten();
             let type_identity = declared_type
                 .and_then(|type_node| declared_type_spelling(type_node, self.prepared.source()));
@@ -11818,14 +11819,26 @@ mod primary_handoff_tests {
         );
         let cancellation = CancellationToken::new();
         let result = CSharpSemanticLowerer
-            .lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &cancellation,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+            )
             .unwrap();
         assert!(matches!(result, SemanticOutcome::Complete { value, .. } if value.len() == 1));
         let mut limits = SemanticBudget::default().limits();
         limits.source_bytes = source.len() - 1;
         let limited = SemanticBudget::new(limits).unwrap();
         let result = CSharpSemanticLowerer
-            .lower(&file, &prepared, &limited, &cancellation)
+            .lower(
+                &file,
+                &prepared,
+                &limited,
+                &cancellation,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+            )
             .unwrap();
         assert!(matches!(result, SemanticOutcome::ExceededBudget { .. }));
     }
@@ -12199,6 +12212,7 @@ mod tests {
                 &prepared,
                 &SemanticBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
             )
             .unwrap()
         else {

@@ -226,6 +226,7 @@ pub(crate) fn effective_grant(
 #[derive(Debug, Clone, Copy)]
 pub struct PolicyBudget {
     query: CodeQueryExecutionLimits,
+    scan_limits: ScanLimits,
     max_selector_results: usize,
     max_findings: usize,
     max_diagnostics: usize,
@@ -249,6 +250,14 @@ pub struct PolicyBudget {
     max_composition_callers_per_procedure: usize,
 }
 
+// Supplying query limits authors both scan dimensions, including struct-update defaults.
+// Keep that intent separate from their numeric values through scaling and replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanLimits {
+    CensusSized,
+    Explicit,
+}
+
 impl Default for PolicyBudget {
     fn default() -> Self {
         Self {
@@ -266,6 +275,7 @@ impl Default for PolicyBudget {
                 value_flow: Default::default(),
                 taint: Default::default(),
             },
+            scan_limits: ScanLimits::CensusSized,
             max_selector_results: MAX_SELECTOR_RESULTS,
             max_findings: MAX_FINDINGS,
             max_diagnostics: MAX_DIAGNOSTICS,
@@ -352,8 +362,8 @@ impl PolicyBudget {
     /// Raise the scan, pipeline and semantic lanes to fit one whole-workspace analysis.
     ///
     /// The fixed defaults act as floors and the hard caps as ceilings, so a
-    /// workspace smaller than the defaults is returned unchanged and an
-    /// explicitly widened budget is never narrowed. Pipeline rows follow the
+    /// workspace smaller than the defaults is returned unchanged. Explicit
+    /// scan caps pass through unchanged. Pipeline rows follow the
     /// fact-node density because whole-workspace seeds and their projections
     /// grow with source volume (#6420); retention remains per query.
     ///
@@ -392,16 +402,18 @@ impl PolicyBudget {
             .max_fact_nodes
             .max(scaled_fact_nodes)
             .min(MAX_FACT_NODES_HARD_CAP);
-        self.query.max_scanned_source_bytes = self
-            .query
-            .max_scanned_source_bytes
-            .max(scaled_scan_source_bytes)
-            .min(MAX_SCANNED_SOURCE_BYTES_HARD_CAP);
-        self.query.max_scanned_files = self
-            .query
-            .max_scanned_files
-            .max(scaled_files)
-            .min(MAX_SCANNED_FILES_HARD_CAP);
+        if self.scan_limits == ScanLimits::CensusSized {
+            self.query.max_scanned_source_bytes = self
+                .query
+                .max_scanned_source_bytes
+                .max(scaled_scan_source_bytes)
+                .min(MAX_SCANNED_SOURCE_BYTES_HARD_CAP);
+            self.query.max_scanned_files = self
+                .query
+                .max_scanned_files
+                .max(scaled_files)
+                .min(MAX_SCANNED_FILES_HARD_CAP);
+        }
 
         self.query.semantic.max_materialized_files = self
             .query
@@ -603,7 +615,7 @@ impl PolicyBatchBudget {
             max_composition_procedures,
             max_composition_hops,
             max_composition_callers_per_procedure,
-        }; query);
+        }; query, scan_limits);
 
         // Execution canonicalizes the raw semantic row table here.
         let query = self.per_policy.query_limits();
@@ -848,6 +860,9 @@ macro_rules! policy_budget_setter {
 }
 
 impl PolicyBudgetBuilder {
+    /// Supply explicit query limits. The scan-file and scan-byte caps are
+    /// honored as supplied, including fields filled by Rust struct defaults;
+    /// only budgets without this override receive census-sized scan grants.
     pub fn with_query_limits(
         mut self,
         limits: CodeQueryExecutionLimits,
@@ -904,6 +919,7 @@ impl PolicyBudgetBuilder {
         )?;
 
         self.budget.query = limits;
+        self.budget.scan_limits = ScanLimits::Explicit;
         Ok(self)
     }
 

@@ -159,6 +159,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// The batch and its evidence live only for this query; detached placements
     /// cannot prove activity or override positive Cargo inactivity evidence.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_blob_placement_activity(
         &self,
         blobs: &[i64],
@@ -621,6 +622,7 @@ fn placement_rows(
     )
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn access(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     crate_key: [u8; 32],
@@ -732,6 +734,7 @@ pub(crate) fn access(
     )
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn set_access(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     crate_key: [u8; 32],
@@ -1463,6 +1466,7 @@ impl RustAccessDecisionSource for RustCrateSetAccessPolicy {
 /// Qualify only source-owned Rust import choices. The import token marks
 /// the rank it guards in the path trace. It already carries source provenance
 /// in the catalog, so no workspace inventory or answer cache is needed.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn qualify_import_path(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     reference: SemanticId,
@@ -1475,7 +1479,6 @@ pub(crate) fn qualify_import_path(
         SelectedSemanticMount::FragmentLocal(mount) => mount,
         SelectedSemanticMount::Shared(_) => return Ok(Some(true)),
     };
-    let conn = selection.connection();
     let mut groups: Vec<(SelectedResolutionMountOrdinal, Vec<u32>)> = Vec::new();
     for step in path.precedence() {
         if cancellation.is_cancelled() {
@@ -1509,77 +1512,34 @@ pub(crate) fn qualify_import_path(
         if owner.semantic_language() != Language::Rust {
             continue;
         }
-        // Probe the catalog before expanding a token's source route. The
-        // uncorrelated existence check also rules out an unconditional-only
-        // blob once for the entire batch. Use the same cfg projection as
-        // source_rust_import_targets, including its legacy source-less rows.
-        let import_keys = conn
-            .prepare_cached(
-                "SELECT token.local_key
-             FROM resolution_semantic_catalog token
-             WHERE token.blob_id=?1
-               AND token.local_key IN (SELECT value FROM json_each(?2))
-               AND token.import_source_site IS NOT NULL
-               AND EXISTS (
-                SELECT 1 FROM rust_import_targets imported
-                LEFT JOIN source_rust_import_contexts context
-                  ON context.blob_id=imported.blob_id
-                 AND context.declaration_occurrence_id=imported.source_context_occurrence_id
-                WHERE imported.blob_id=?1
-                  AND CASE WHEN imported.source_context_occurrence_id IS NULL
-                       THEN imported.cfg_condition ELSE context.cfg_condition END<>'always')
-             ORDER BY token.local_key",
-            )?
-            .query_map(
-                rusqlite::params![
-                    owner.blob_id(),
-                    serde_json::to_string(&keys).expect("local keys serialize")
-                ],
-                |row| row.get::<_, u32>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        // Preserve path order even though the batched catalog probe is keyed.
+        // One index per owner blob answers every token of the group. Holding
+        // the value across the group means a refusing or evicting budget
+        // costs one build per call and owner, never one per token.
+        let Some(index) =
+            selected_rust_import_provenance(selection, owner.blob_id(), cancellation)?
+        else {
+            return Ok(None);
+        };
+        // Preserve path order.
         for key in keys {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
-            if import_keys.binary_search(&key).is_err() {
-                continue;
-            }
             let token = SemanticId::local(ordinal.get(), key);
-            let condition: Option<(String, u32)> = conn
-                .prepare_cached(
-                    "SELECT imports.cfg_condition, json_extract(route.body, '$[8][2][2]')
-                 FROM resolution_semantic_catalog token
-                 CROSS JOIN source_rust_import_targets imports ON imports.blob_id=token.blob_id
-                 CROSS JOIN source_occurrence_arenas occurrence
-                   ON occurrence.blob_id=imports.blob_id
-                 CROSS JOIN resolution_node_catalog scope
-                   ON scope.blob_id=imports.blob_id AND scope.source_scope=imports.native_scope
-                 CROSS JOIN resolution_paths route
-                   ON route.blob_id=scope.blob_id AND route.start_node=scope.local_key
-                  AND route.end_node=-1 AND route.root_terminal IS NOT NULL
-                  AND json_extract(route.body, '$[4][#-2]')=token.local_key
-                 WHERE token.blob_id=?1 AND token.local_key=?2
-                   AND token.import_source_site IS NOT NULL
-                   AND json_extract(occurrence.spans, '$[' || imports.declaration_occurrence_id || '][0]')<=token.import_start_byte
-                   AND json_extract(occurrence.spans, '$[' || imports.declaration_occurrence_id || '][1]')>=token.import_end_byte
-                 LIMIT 1",
-                )?
-                .query_row(rusqlite::params![owner.blob_id(), token.local_key()], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .optional()?;
-            let Some((condition, choice_key)) = condition else {
-                continue;
-            };
-            let condition =
-                brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition(&condition)
-                    .expect("stored import cfg condition");
-            if condition == brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always {
-                continue;
+            match index.by_token.get(&key) {
+                None => {}
+                Some(ImportProvenanceEntry::Conditional {
+                    condition,
+                    choice_key,
+                }) => conditional.push((token, *choice_key, condition.clone())),
+                Some(ImportProvenanceEntry::Unestablished) => {
+                    // The producer invariants failed for this token, so its
+                    // choice step is unknown. Report it; never pick a row.
+                    path.completion = path.completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(token),
+                    ]));
+                }
             }
-            conditional.push((token, choice_key, condition));
         }
     }
     if conditional.is_empty() {
@@ -1591,6 +1551,7 @@ pub(crate) fn qualify_import_path(
     if record.semantic_language() != Language::Rust {
         return Ok(Some(true));
     }
+    let conn = selection.connection();
     let site: Option<String> = conn
         .prepare_cached(
             "SELECT json(cfg_condition) FROM resolution_rust_reference_contexts
@@ -1674,6 +1635,392 @@ pub(crate) fn qualify_import_path(
         }
     }
     Ok(Some(true))
+}
+
+/// Every non-null-scope import context of one blob, one row per distinct tuple.
+pub(crate) const RUST_IMPORT_CONTEXTS_SQL: &str = "SELECT context.declaration_occurrence_id,
+                context.declaration_start_byte, context.declaration_end_byte,
+                context.native_scope, context.cfg_condition,
+                source.declaration_occurrence_id,
+                source.declaration_start_byte, source.declaration_end_byte
+         FROM rust_import_targets target
+         CROSS JOIN source_rust_import_contexts context
+           ON context.blob_id=target.blob_id
+          AND context.declaration_occurrence_id=target.source_context_occurrence_id
+         LEFT JOIN source_imports source
+           ON source.blob_id=target.blob_id AND source.import_id=target.source_import_id
+         WHERE target.blob_id=?1
+           AND target.source_context_occurrence_id IS NOT NULL
+           AND context.native_scope IS NOT NULL
+         GROUP BY context.declaration_occurrence_id, context.declaration_start_byte,
+                  context.declaration_end_byte, context.native_scope, context.cfg_condition,
+                  source.declaration_occurrence_id, source.declaration_start_byte,
+                  source.declaration_end_byte
+         ORDER BY context.declaration_occurrence_id";
+
+/// Routes ending at an import token, from the scopes of conditional contexts.
+pub(crate) const RUST_IMPORT_ROUTES_SQL: &str =
+    "SELECT scope.source_scope, token.local_key, token.import_start_byte,
+                token.import_end_byte, json_extract(route.body, '$[8][2][2]')
+         FROM resolution_node_catalog scope
+         CROSS JOIN resolution_paths route
+           ON route.blob_id=scope.blob_id AND route.start_node=scope.local_key
+          AND route.end_node=-1 AND route.root_terminal IS NOT NULL
+         CROSS JOIN resolution_semantic_catalog token
+           ON token.blob_id=route.blob_id
+          AND token.local_key=json_extract(route.body, '$[4][#-2]')
+          AND token.import_source_site IS NOT NULL
+         WHERE scope.blob_id=?1
+           AND scope.source_scope IN (
+             SELECT native_scope FROM source_rust_import_contexts
+             WHERE blob_id=?1 AND native_scope IS NOT NULL AND cfg_condition<>'always')";
+
+/// What qualifying one import token needs, for one blob. An absent token is
+/// unconditional: no import context contains it, or its one context is `always`.
+pub(crate) struct RustImportProvenance {
+    by_token: HashMap<u32, ImportProvenanceEntry>,
+}
+
+enum ImportProvenanceEntry {
+    /// The one source import's non-`always` cfg and its route choice key.
+    Conditional {
+        condition: brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+        choice_key: u32,
+    },
+    /// A producer invariant failed for this token (several distinct cfg and
+    /// choice pairs, an inconsistent context, or no integer choice key).
+    Unestablished,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for RustImportProvenance {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + brokk_bifrost_core::hash::allocated_table_slot_bytes::<(u32, ImportProvenanceEntry)>(
+                self.by_token.capacity(),
+            )
+            + self
+                .by_token
+                .values()
+                .map(|entry| match entry {
+                    ImportProvenanceEntry::Conditional { condition, .. } => {
+                        condition.allocated_retained_bytes()
+                    }
+                    ImportProvenanceEntry::Unestablished => 0,
+                })
+                .sum::<usize>()
+    }
+}
+
+/// One selected request's import provenance, keyed by blob. The sealed rows it
+/// summarizes are immutable while the request's selection lives.
+pub(crate) struct SelectedRustImportProvenance(BudgetRegion<i64, RustImportProvenance>);
+
+impl SelectedRustImportProvenance {
+    pub(crate) fn new(budget: &RetentionBudget) -> Self {
+        Self(budget.region("store.selected-rust-import-provenance", None))
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.invalidate_all();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn stats(&self) -> brokk_bifrost_core::retention_budget::RegionStats {
+        self.0.stats()
+    }
+}
+
+impl Drop for SelectedRustImportProvenance {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static IMPORT_PROVENANCE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IMPORT_PROVENANCE_CONTAINMENT_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Import contexts examined for containment on this thread since the last
+/// call; a test-only cost counter.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_rust_import_provenance_containment_checks_for_test() -> usize {
+    IMPORT_PROVENANCE_CONTAINMENT_CHECKS.with(|checks| checks.replace(0))
+}
+
+/// Builds on this thread since the last call; a test-only build counter.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_rust_import_provenance_builds_for_test() -> usize {
+    IMPORT_PROVENANCE_BUILDS.with(|builds| builds.replace(0))
+}
+
+/// A hit, or a build that is retained when the owner budget admits it. A
+/// refused or evicted value is rebuilt by this same builder; nothing falls back
+/// to a per-token read.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+fn selected_rust_import_provenance(
+    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+    blob_id: i64,
+    cancellation: &CancellationToken,
+) -> Result<Option<BudgetedValue<RustImportProvenance>>> {
+    let region = &selection.rust_import_provenance.0;
+    if let Some(hit) = region.get(&blob_id) {
+        return Ok(Some(BudgetedValue::Retained(hit)));
+    }
+    let Some(built) = build_rust_import_provenance(selection.connection(), blob_id, cancellation)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(region.insert(blob_id, built)))
+}
+
+/// Folds the blob's import contexts and conditional-scope routes in Rust,
+/// replacing one arena-scanning statement per candidate token. The sealed
+/// scalar spans equal the arena occurrences (both come from one parse in one
+/// transaction), so the arena is not read. Production seal validation is
+/// sampled, so each producer invariant is checked here and a violation yields
+/// `Unestablished` rather than an arbitrary row. The invariants: one tuple per
+/// context id, a context span equal to its source import row, a non-empty
+/// route span (start < end), and context spans within one scope that may touch
+/// (`use a::x;use a::y;`) but never overlap.
+pub(crate) fn build_rust_import_provenance(
+    conn: &rusqlite::Connection,
+    blob_id: i64,
+    cancellation: &CancellationToken,
+) -> Result<Option<RustImportProvenance>> {
+    use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, decode_rust_cfg_condition};
+    #[cfg(any(test, feature = "test-support"))]
+    IMPORT_PROVENANCE_BUILDS.with(|builds| builds.set(builds.get() + 1));
+    struct Context {
+        start: i64,
+        end: i64,
+        scope: i64,
+        cfg: String,
+        consistent: bool,
+    }
+    let mut contexts: Vec<(i64, Context)> = Vec::new();
+    // A grouped import's leaves share one context, so equal tuples collapse
+    // here. A second distinct tuple for one context id broke a producer
+    // invariant; so does a span that disagrees with the source import row.
+    let mut rows = conn.prepare_cached(RUST_IMPORT_CONTEXTS_SQL)?;
+    let mut query = rows.query([blob_id])?;
+    while let Some(row) = query.next()? {
+        let id: i64 = row.get(0)?;
+        let (start, end): (i64, i64) = (row.get(1)?, row.get(2)?);
+        let source: (Option<i64>, Option<i64>, Option<i64>) =
+            (row.get(5)?, row.get(6)?, row.get(7)?);
+        if let Some((previous, context)) = contexts.last_mut()
+            && *previous == id
+        {
+            context.consistent = false;
+            continue;
+        }
+        contexts.push((
+            id,
+            Context {
+                start,
+                end,
+                scope: row.get(3)?,
+                cfg: row.get(4)?,
+                consistent: source == (Some(id), Some(start), Some(end)),
+            },
+        ));
+    }
+    drop(query);
+    drop(rows);
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let mut decoded: HashMap<&str, RustCfgCondition> = HashMap::default();
+    for (_, context) in &contexts {
+        if !decoded.contains_key(context.cfg.as_str()) {
+            let condition = decode_rust_cfg_condition(&context.cfg).ok_or_else(|| {
+                StoreError::corrupt(format!("stored import cfg condition {:?}", context.cfg))
+            })?;
+            decoded.insert(context.cfg.as_str(), condition);
+        }
+    }
+    // A blob whose imports are all unconditional has nothing to qualify.
+    if decoded
+        .values()
+        .all(|condition| *condition == RustCfgCondition::Always)
+    {
+        return Ok(Some(RustImportProvenance {
+            by_token: HashMap::default(),
+        }));
+    }
+    // Per token: the distinct (cfg text, choice) pairs of its containing
+    // contexts, and whether any contributing context was inconsistent.
+    #[derive(Default)]
+    struct Matches<'a> {
+        pairs: Vec<(&'a str, Option<u32>)>,
+        suspect: bool,
+    }
+    let mut matches: HashMap<u32, Matches<'_>> = HashMap::default();
+    // Contexts by scope, ordered by start. Distinct `use` items never overlap
+    // (they may touch), so a non-empty route is contained in at most the last
+    // context starting at or before it and one binary search finds that
+    // candidate. A scope whose spans overlap broke a producer invariant: its
+    // routes are suspect.
+    struct Group<'a> {
+        contexts: Vec<&'a Context>,
+        disjoint: bool,
+    }
+    let mut groups: HashMap<i64, Group<'_>> = HashMap::default();
+    for (_, context) in &contexts {
+        groups
+            .entry(context.scope)
+            .or_insert_with(|| Group {
+                contexts: Vec::new(),
+                disjoint: true,
+            })
+            .contexts
+            .push(context);
+    }
+    for group in groups.values_mut() {
+        group.contexts.sort_by_key(|context| context.start);
+        let mut max_end = i64::MIN;
+        group.disjoint = group.contexts.iter().all(|context| {
+            let disjoint = context.start >= max_end;
+            max_end = max_end.max(context.end);
+            disjoint
+        });
+    }
+    let mut routes = conn.prepare_cached(RUST_IMPORT_ROUTES_SQL)?;
+    let mut query = routes.query([blob_id])?;
+    while let Some(row) = query.next()? {
+        let scope: i64 = row.get(0)?;
+        let token: u32 = row.get(1)?;
+        let (start, end): (i64, i64) = (row.get(2)?, row.get(3)?);
+        let choice = match row.get::<_, rusqlite::types::Value>(4)? {
+            rusqlite::types::Value::Integer(choice) => u32::try_from(choice).ok(),
+            _ => None,
+        };
+        let Some(group) = groups.get(&scope) else {
+            continue;
+        };
+        if start >= end || !group.disjoint {
+            matches.entry(token).or_default().suspect = true;
+            continue;
+        }
+        let after = group
+            .contexts
+            .partition_point(|context| context.start <= start);
+        let candidates = &group.contexts[after.saturating_sub(1)..after];
+        #[cfg(any(test, feature = "test-support"))]
+        IMPORT_PROVENANCE_CONTAINMENT_CHECKS
+            .with(|checks| checks.set(checks.get() + candidates.len()));
+        for context in candidates {
+            if context.start > start || context.end < end {
+                continue;
+            }
+            let entry = matches.entry(token).or_default();
+            entry.suspect |= !context.consistent;
+            let pair = (context.cfg.as_str(), choice);
+            if !entry.pairs.contains(&pair) {
+                entry.pairs.push(pair);
+            }
+        }
+    }
+    drop(query);
+    drop(routes);
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let mut by_token = HashMap::default();
+    for (token, found) in matches {
+        let entry = match (found.pairs.as_slice(), found.suspect) {
+            ([(cfg, Some(choice_key))], false) => {
+                let condition = &decoded[cfg];
+                if *condition == RustCfgCondition::Always {
+                    continue;
+                }
+                ImportProvenanceEntry::Conditional {
+                    condition: condition.clone(),
+                    choice_key: *choice_key,
+                }
+            }
+            _ => ImportProvenanceEntry::Unestablished,
+        };
+        by_token.insert(token, entry);
+    }
+    Ok(Some(RustImportProvenance { by_token }))
+}
+
+impl RustImportProvenance {
+    /// Sorted `(token, rendering)` rows, for differential tests.
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_for_test(&self) -> Vec<(u32, String)> {
+        let mut rows = self
+            .by_token
+            .iter()
+            .map(|(token, entry)| {
+                let text = match entry {
+                    ImportProvenanceEntry::Conditional {
+                        condition,
+                        choice_key,
+                    } => format!("{condition:?} choice {choice_key}"),
+                    ImportProvenanceEntry::Unestablished => "unestablished".to_owned(),
+                };
+                (*token, text)
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+}
+
+/// The builder's rows for one blob, straight from a connection.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn build_rust_import_provenance_rows_for_test(
+    conn: &rusqlite::Connection,
+    blob_id: i64,
+) -> Result<Vec<(u32, String)>> {
+    Ok(
+        build_rust_import_provenance(conn, blob_id, &CancellationToken::new())?
+            .expect("an uncancelled build returns an index")
+            .render_for_test(),
+    )
+}
+
+/// The index of one blob read through the request's region (so a second call
+/// is a hit), its rows, and how many entries the region then holds.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn selected_rust_import_provenance_probe_for_test(
+    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+    blob_id: i64,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<(u32, String)>, usize)> {
+    let index = selected_rust_import_provenance(selection, blob_id, cancellation)?
+        .expect("an uncancelled read returns an index");
+    Ok((
+        index.render_for_test(),
+        selection.rust_import_provenance.stats().entries,
+    ))
+}
+
+/// Region statistics for refusal and eviction tests.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn selected_rust_import_provenance_stats_for_test(
+    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+) -> brokk_bifrost_core::retention_budget::RegionStats {
+    selection.rust_import_provenance.stats()
+}
+
+/// Empties the request's region, as `Drop` does.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn clear_selected_rust_import_provenance_for_test(
+    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+) {
+    selection.rust_import_provenance.clear();
 }
 
 impl RustSelectedAccessPolicy for RustCrateAccessPolicy {
@@ -1849,5 +2196,83 @@ impl super::declaration_access::SelectedDeclarationAccessRules for RustSetSelect
     ) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
         self.point
             .declaration_activation(facts, definition, cancellation, session)
+    }
+}
+
+#[cfg(test)]
+mod import_provenance_budget_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
+    use brokk_bifrost_core::retention_budget::RetainedBytes;
+
+    fn index(tokens: u32) -> RustImportProvenance {
+        RustImportProvenance {
+            by_token: (0..tokens)
+                .map(|token| {
+                    (
+                        token,
+                        ImportProvenanceEntry::Conditional {
+                            condition: RustCfgCondition::Atom("feature_flag".to_owned()),
+                            choice_key: token,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn retained_bytes_are_physical_and_grow_with_the_entries() {
+        let empty = index(0).retained_bytes();
+        assert_eq!(empty, std::mem::size_of::<RustImportProvenance>());
+        assert!(index(64).retained_bytes() > empty + 64 * std::mem::size_of::<u32>());
+    }
+
+    /// Admission, hit, owner-pressure eviction, refusal and `clear` all go
+    /// through one region; a refused or evicted value is rebuilt by the same
+    /// builder, so the consumer needs no other path.
+    #[test]
+    fn region_hits_evicts_refuses_and_clears() {
+        let one = index(8);
+        let capacity = one.retained_bytes()
+            + 0_i64.retained_bytes()
+            + brokk_bifrost_core::retention_budget::ENTRY_OVERHEAD_BYTES
+            + 1;
+        let budget = RetentionBudget::for_test_capacity(capacity as u64);
+        let region = SelectedRustImportProvenance::new(&budget);
+        assert!(matches!(
+            region.0.insert(1, index(8)),
+            BudgetedValue::Retained(_)
+        ));
+        assert_eq!(region.0.get(&1).expect("a hit").by_token.len(), 8);
+        // A second blob does not fit beside the first: the older one is evicted.
+        drop(region.0.insert(2, index(8)));
+        assert!(region.0.get(&1).is_none(), "owner pressure evicts blob 1");
+        assert!(region.0.get(&2).is_some());
+        assert_eq!(region.stats().entries, 1);
+        // An entry larger than the whole budget is returned uncached.
+        let oversized = region.0.insert(3, index(4096));
+        assert!(matches!(oversized, BudgetedValue::RequestOwned { .. }));
+        assert_eq!(
+            oversized.by_token.len(),
+            4096,
+            "refusal does not refuse the read"
+        );
+        assert!(region.0.get(&3).is_none());
+        // A budget that retains nothing refuses everything.
+        let nothing = RetentionBudget::retain_nothing();
+        let refusing = SelectedRustImportProvenance::new(&nothing);
+        assert!(matches!(
+            refusing.0.insert(1, index(1)),
+            BudgetedValue::RequestOwned { .. }
+        ));
+        assert!(refusing.0.get(&1).is_none());
+        region.clear();
+        assert!(region.0.get(&2).is_none());
+        assert_eq!(region.stats().entries, 0);
+        drop(region.0.insert(4, index(1)));
+        drop(region);
+        budget.run_pending_tasks();
+        assert_eq!(budget.accounted_bytes(), 0, "drop invalidates residents");
     }
 }

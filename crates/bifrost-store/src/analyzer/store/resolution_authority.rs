@@ -87,6 +87,11 @@ pub struct AuthorityRequestMemo {
     /// reused inside the query; cleanup leaves their high-water counters intact.
     pub(super) canonical_digests:
         HashMap<crate::analyzer::resolution::ResolutionIdentityDigestKey, [u8; 32]>,
+    /// Content-only proof identities, bounded to the owning selected request.
+    pub(super) proof_digests: super::selected_read_memo::ExactReadMemo<
+        crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        [u8; 32],
+    >,
     mounts: HashSet<(SelectedResolutionMountOrdinal, i64)>,
     semantic_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
     node_identities: HashMap<(i64, u32), Option<[u8; 32]>>,
@@ -126,6 +131,7 @@ pub struct SelectedResolutionAuthority<'project> {
 
 impl<'project> SelectedResolutionAuthority<'project> {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn from_selection(selection: &'project SelectedResolutionMountInventory<'_>) -> Self {
         Self::new(
             selection.connection(),

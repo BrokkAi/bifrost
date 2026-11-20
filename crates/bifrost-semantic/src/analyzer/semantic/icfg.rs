@@ -917,11 +917,43 @@ fn icfg_boundary_sort_key(boundary: &IcfgBoundary) -> (usize, u32, u8) {
 }
 
 #[doc(hidden)]
-pub fn call_binding_completeness(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallBindingArity {
+    actuals: usize,
+    fixed_formals: usize,
+    required_formals: usize,
+    has_rest_formal: bool,
+}
+
+impl CallBindingArity {
+    pub fn actuals(self) -> usize {
+        self.actuals
+    }
+
+    pub fn fixed_formals(self) -> usize {
+        self.fixed_formals
+    }
+
+    pub fn required_formals(self) -> usize {
+        self.required_formals
+    }
+
+    pub fn has_rest_formal(self) -> bool {
+        self.has_rest_formal
+    }
+
+    pub fn accepts_actuals(self) -> bool {
+        self.actuals >= self.required_formals
+            && (self.has_rest_formal || self.actuals <= self.fixed_formals)
+    }
+}
+
+/// Compute declaration-local arity before runtime selection evidence is joined.
+#[doc(hidden)]
+pub fn call_binding_arity(
     call: &SemanticCallSite,
     callee_values: &[SemanticValue],
-    completeness: EvidenceCompleteness,
-) -> (EvidenceCompleteness, usize) {
+) -> CallBindingArity {
     let mut fixed_formals = 0usize;
     let mut defaulted_formals = 0usize;
     let mut has_rest_formal = false;
@@ -944,23 +976,34 @@ pub fn call_binding_completeness(
             _ => {}
         }
     }
-    let required_formals = fixed_formals.saturating_sub(defaulted_formals);
-    let bindings_complete = call.arguments.len() >= required_formals
-        && (has_rest_formal || call.arguments.len() <= fixed_formals);
-    if bindings_complete {
+    CallBindingArity {
+        actuals: call.arguments.len(),
+        fixed_formals,
+        required_formals: fixed_formals.saturating_sub(defaulted_formals),
+        has_rest_formal,
+    }
+}
+
+#[doc(hidden)]
+pub fn call_binding_completeness(
+    arity: CallBindingArity,
+    completeness: EvidenceCompleteness,
+) -> (EvidenceCompleteness, usize) {
+    if arity.accepts_actuals() {
         return (completeness, 0);
     }
 
+    let fixed_formals = arity.fixed_formals;
     let previous_reason_bytes = completeness_reason_bytes(&completeness);
     let completeness = EvidenceCompleteness::Partial(match completeness {
         EvidenceCompleteness::Complete => format!(
             "caller supplies {} arguments for {fixed_formals} fixed formal parameters; omitted/default or variadic binding effects are incomplete",
-            call.arguments.len()
+            arity.actuals
         )
         .into(),
         EvidenceCompleteness::Partial(existing) => format!(
             "{existing}; caller supplies {} arguments for {fixed_formals} fixed formal parameters; omitted/default or variadic binding effects are incomplete",
-            call.arguments.len()
+            arity.actuals
         )
         .into(),
     });

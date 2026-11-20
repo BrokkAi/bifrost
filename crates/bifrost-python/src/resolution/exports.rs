@@ -208,8 +208,11 @@ pub(super) fn produce(
             readable = false;
         }
         for (index, member) in members.into_iter().enumerate() {
-            if let Some(name) = python_plain_string_literal(member, p.source) {
-                let name = p.facts.intern_name(&mut p.names, name);
+            // An empty literal (`__all__ = ['']`) names no export: the surface
+            // degrades to dynamic like any unreadable member.
+            if let Some(name) = python_plain_string_literal(member, p.source)
+                .and_then(|name| p.facts.intern_name(&mut p.names, name))
+            {
                 let literal_site = p.site(member, module, ResolutionSiteKind::Literal);
                 p.facts
                     .python_export_members

@@ -1277,7 +1277,7 @@ fn a_broad_query_advises_on_the_execution_that_paid_for_it() {
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::BroadQuery)
     };
     assert!(
-        broad(&whole.result.diagnostics),
+        broad(whole.result.diagnostics.semantic()),
         "the whole execution scans past the broad-query hint threshold"
     );
 
@@ -2028,7 +2028,9 @@ fn intersect_continuation_matches_whole_before_and_after_one_seed_edit() {
             )
         })
         .collect();
-    prefixes[0].reads_closed = false;
+    // Reads never observed withhold; a refused prefix (reads_closed false)
+    // keeps its exact rows (#12820).
+    prefixes[0].reads.clear();
     let withheld = crate::structural::search::continue_intersect_prefix(
         base.analyzer(),
         &brokk_bifrost_flow::FlowWorkspaceState::default(),
@@ -2051,6 +2053,78 @@ fn intersect_continuation_matches_whole_before_and_after_one_seed_edit() {
         .expect("edit one seed");
     let head = project.workspace_analyzer(AnalyzerConfig::default());
     run(&head);
+}
+
+#[test]
+#[hardwon(
+    "#12820: a reuse refusal made a complete intersect prefix incomplete and withheld its rows"
+)]
+fn a_refused_intersect_prefix_keeps_its_rows_and_is_unpublishable() {
+    let project = two_file_project();
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "intersect": [
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "function", "name": { "regex": "^(target|caller)" } } }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("intersect query");
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    crate::structural::search::units::REFUSE_INTERSECT_PREFIX.with(|flag| flag.set(true));
+    let prefixes: Vec<_> = files
+        .iter()
+        .map(|seed| {
+            crate::structural::search::execute_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+            )
+        })
+        .collect();
+    crate::structural::search::units::REFUSE_INTERSECT_PREFIX.with(|flag| flag.set(false));
+    for prefix in &prefixes {
+        assert!(
+            !prefix.reads_closed,
+            "the refusal leaves the reads unclosed"
+        );
+        assert_eq!(
+            prefix.completion,
+            CodeQueryCompletion::Complete,
+            "a refusal never changes completion"
+        );
+        assert!(
+            prefix.encode_rows_json(&query.plan).is_err(),
+            "a refused prefix must not be published"
+        );
+    }
+    let continued = crate::structural::search::continue_intersect_prefix(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
+    );
+    let whole = whole_execution(&workspace, &query);
+    let detailed = continued
+        .detailed
+        .expect("refused prefixes keep their rows");
+    assert_eq!(continued.completion, whole.result.completion());
+    assert_eq!(
+        projected(&detailed.result.results),
+        projected(&whole.result.results)
+    );
+    assert!(!whole.result.results.is_empty());
 }
 
 /// A unit's seed enumeration depends on the files it opened, not on the
@@ -3289,7 +3363,7 @@ fn python_format_nested_union_filters_preserve_whole_diagnostic_scope_and_aliase
             expected_rows,
             "{local_relation:?}"
         );
-        let whole_diagnostics = diagnostics(&whole.result.diagnostics);
+        let whole_diagnostics = diagnostics(whole.result.diagnostics.semantic());
         assert_eq!(
             whole_diagnostics.len(),
             expected_diagnostics,
@@ -3300,9 +3374,13 @@ fn python_format_nested_union_filters_preserve_whole_diagnostic_scope_and_aliase
                 .result
                 .diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.source.is_some()),
+                // The step-level no-rows advisory names a step, not a site.
+                .filter(
+                    |diagnostic| diagnostic.code() != CodeQueryDiagnosticCode::StepProducedNoRows
+                )
+                .all(|diagnostic| diagnostic.source().is_some()),
             "{:#?}",
-            whole.result.diagnostics
+            whole.result.diagnostics.semantic()
         );
     }
 }
@@ -4018,9 +4096,9 @@ fn incomplete_seed_selection_cannot_certify_depth_witness() {
                     .result
                     .diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.code
+                    .any(|diagnostic| diagnostic.code()
                         == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
-                        && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+                        && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete)
             );
         }
         let query = CodeQuery::from_sexp(&format!("(callees :depth 1 {seed})")).unwrap();
@@ -5264,5 +5342,120 @@ fn outgoing_call_relation_projection_preserves_cancellation() {
                 &mut None,
             )
         },
+    );
+}
+
+#[test]
+fn a_step_after_an_incomplete_step_reports_its_own_empty_result() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("first.py", "message = \"{0} {}\".format(*values)\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(filter :where ((path eq \"other.py\"))
+            (python-format-issues (language python (call))))",
+    )
+    .expect("format issues followed by a rejecting filter");
+    let whole = whole_execution(&workspace, &query);
+    assert!(whole.result.results.is_empty(), "{whole:#?}");
+    let upstream: Vec<_> = whole
+        .result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::SemanticAnalysisPartial)
+        .collect();
+    assert!(
+        !upstream.is_empty(),
+        "{:#?}",
+        whole.result.diagnostics.semantic()
+    );
+    for diagnostic in upstream {
+        assert_eq!(diagnostic.step_index(), Some(0));
+        assert_eq!(diagnostic.step_op(), Some("python_format_issues"));
+    }
+    let [empty] = whole
+        .result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::StepProducedNoRows)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| {
+            panic!(
+                "one empty-step diagnostic: {:#?}",
+                whole.result.diagnostics.semantic()
+            )
+        });
+    // The filter's own truth, not the upstream step's incompleteness.
+    assert_eq!(empty.step_index(), Some(1));
+    assert_eq!(empty.step_op(), Some("filter"));
+    assert_eq!(
+        empty.no_rows_reason(),
+        Some(CodeQueryStepNoRowsReason::AllInputsFiltered)
+    );
+    assert!(empty.cause_codes().is_empty());
+    assert_eq!(empty.impact(), CodeQueryDiagnosticImpact::Advisory);
+}
+
+#[test]
+fn inherited_suffix_step_diagnostics_rebase_to_the_ancestor_that_owns_the_step() {
+    let leaf = "(project :columns ((name selected)) (language typescript (call)))";
+    let nested = format!("(project :columns ((selected renamed)) (union {leaf} {leaf}))");
+    let query = CodeQuery::from_sexp(&format!(
+        "(project :columns ((renamed final_name))
+           (union {nested} (project :columns ((selected renamed)) {leaf})))"
+    ))
+    .expect("nested union with a suffix step at each level");
+    let leaves =
+        crate::query::PlanPartitioning::union_leaf_plans(&query.plan).expect("eligible union");
+    let (deep_leaf, deep_path, inherited) = &leaves[0];
+    assert_eq!(deep_path, &[0, 0]);
+    assert_eq!(*inherited, 2);
+    let local = deep_leaf.steps.len() - inherited;
+    let at = |index: Option<usize>, branch: &[usize]| CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
+        incompleteness: Incompleteness::Content,
+        code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+        impact: CodeQueryDiagnosticImpact::Advisory,
+        branch: branch.to_vec(),
+        language: "workspace",
+        message: String::new(),
+        source: None,
+        related: Vec::new(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+        step_index: index,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
+    };
+    let mut diagnostics = vec![
+        at(None, deep_path),
+        at(Some(local - 1), deep_path),
+        at(Some(local), deep_path),
+        at(Some(local + 1), deep_path),
+    ];
+    crate::structural::search::units::rebase_inherited_step_diagnostics(
+        &query.plan,
+        deep_path,
+        local,
+        &mut diagnostics,
+    );
+    let rebased: Vec<_> = diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.step_index, diagnostic.branch.clone()))
+        .collect();
+    assert_eq!(
+        rebased,
+        vec![
+            (None, vec![0, 0]),
+            (Some(local - 1), vec![0, 0]),
+            // The nearest ancestor's step runs once after its own union.
+            (Some(0), vec![0]),
+            (Some(0), vec![]),
+        ]
     );
 }

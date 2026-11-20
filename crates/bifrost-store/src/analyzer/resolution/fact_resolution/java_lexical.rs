@@ -1770,7 +1770,15 @@ impl FactEvaluation<'_, '_> {
                 .iter()
                 .map(|row| row.get(self.session).row())
                 .filter(|row| {
-                    row.source_kind() == Some(ResolutionSupertypeKind::ImplicitSuperclass)
+                    matches!(
+                        classify_supertype_kind(
+                            row.source_kind(),
+                            crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified
+                        ),
+                        SupertypeClassification::Classified(Some(
+                            ClassifiedSupertypeKind::ImplicitSuperclass
+                        ))
+                    )
                 })
                 .map(|row| row.reference())
                 .collect::<HashSet<_>>();

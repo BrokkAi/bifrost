@@ -69,7 +69,7 @@ use brokk_bifrost_core::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 
 use crate::analyzer::jvm::external::JvmExternalDeclarations;
-use crate::analyzer::jvm::external::QueryGapRecorder;
+use crate::analyzer::jvm::external::{LadderMisses, QueryGapRecorder};
 
 use crate::analyzer::jvm::retained_external_index_state;
 mod call_applicability;
@@ -937,6 +937,7 @@ fn build_scala_project_types_from_frontier(
 pub struct ScalaAnalyzer {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
     java_config: JvmAnalyzerConfig,
+    selection_authority: Arc<crate::analyzer::jvm::catalog_reader::JvmSelectionAuthority>,
     external_index: crate::analyzer::jvm::authority::JvmExternalIndexSlot,
     memo_budget: u64,
     imported_code_units: crate::analyzer::jvm::hierarchy::DerivedMemo<
@@ -1119,6 +1120,14 @@ fn new_scala_dead_code_authority(memo_budget: u64) -> WorkspaceAuthorityMemo<Usa
 }
 
 impl ScalaAnalyzer {
+    /// The slot of a new generation: it holds this generation's external index
+    /// as a candidate until the first read there finds its inputs unchanged
+    /// (#12745). Called for every generation, including one in which no file of
+    /// this language changed.
+    fn renew_external_index(&mut self) {
+        self.external_index = self.external_index.updated(self.memo_budget);
+    }
+
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn inner(&self) -> &TreeSitterAnalyzer<ScalaAdapter> {
@@ -1404,7 +1413,16 @@ impl ScalaAnalyzer {
         memo_budget: u64,
         java_config: JvmAnalyzerConfig,
     ) -> Self {
+        let selection_authority = Arc::new(
+            crate::analyzer::jvm::catalog_reader::JvmSelectionAuthority {
+                config: java_config.clone(),
+                project: inner.shared_project(),
+                digests: inner.analyzer_store().content_digests(),
+                verifications: inner.analyzer_store().toolchain_verifications(),
+            },
+        );
         Self {
+            selection_authority,
             inner,
             java_config,
             external_index: crate::analyzer::jvm::authority::JvmExternalIndexSlot::new(memo_budget),
@@ -1552,7 +1570,7 @@ impl ScalaAnalyzer {
         ScalaResolvedSeedOutcome::Ready(self.request_seed_from_winner(cached, session))
     }
 
-    fn retained_external_declaration_index(&self) -> Option<&JvmExternalDeclarationIndex> {
+    fn retained_external_declaration_index(&self) -> Option<Arc<JvmExternalDeclarationIndex>> {
         self.external_index.retained(self)
     }
 
@@ -1573,7 +1591,7 @@ impl ScalaAnalyzer {
             &self.java_config,
             self.inner.analyzer_store(),
         );
-        crate::analyzer::jvm::external::QueryGapRecorder::new(self).all(&index);
+        crate::analyzer::jvm::external::QueryGapRecorder::new(self).whole_index(&index);
         index
     }
 
@@ -1708,8 +1726,31 @@ impl ScalaAnalyzer {
         imports: &[brokk_bifrost_core::analyzer::model::ImportInfo],
     ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
         let recorder = QueryGapRecorder::new(self);
+        let misses = LadderMisses::default();
+        let resolved = self.external_type_spelling_ladder(
+            external,
+            &recorder,
+            &misses,
+            package_name,
+            spelling,
+            imports,
+        );
+        external.finish_ladder(&recorder, &misses, resolved.is_some());
+        resolved
+    }
+
+    fn external_type_spelling_ladder(
+        &self,
+        external: &JvmExternalDeclarations<'_>,
+        recorder: &QueryGapRecorder<'_>,
+        misses: &LadderMisses,
+        package_name: &str,
+        spelling: &str,
+        imports: &[brokk_bifrost_core::analyzer::model::ImportInfo],
+    ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
         if spelling.contains('.')
-            && let Some(ty) = external.resolve_qualified_name(&recorder, spelling, package_name)
+            && let Some(ty) =
+                misses.probe(external.resolve_qualified_name(recorder, spelling, package_name))
         {
             return Some(ty);
         }
@@ -1718,43 +1759,48 @@ impl ScalaAnalyzer {
         for import in imports.iter().filter(|import| !import.is_wildcard) {
             if import.local_name() == Some(spelling) {
                 let path = scala_import_path(import)?;
-                return external.resolve_explicit_import(&recorder, &path, package_name);
+                return external.resolve_explicit_import(recorder, &path, package_name);
             }
         }
         for import in imports.iter().filter(|import| import.is_wildcard) {
             let path = scala_import_path(import)?;
-            if let Some(ty) =
-                external.resolve_wildcard_import(&recorder, &path, spelling, package_name)
-            {
+            if let Some(ty) = misses.probe(external.resolve_wildcard_import(
+                recorder,
+                &path,
+                spelling,
+                package_name,
+            )) {
                 return Some(ty);
             }
         }
         if self.declares_package_type(package_name, spelling) {
             return None;
         }
-        external
-            .resolve_same_package(&recorder, package_name, spelling)
+        misses
+            .probe(external.resolve_same_package(recorder, package_name, spelling))
             .or_else(|| {
                 brokk_bifrost_jvm::intrinsics::ordered_implicit_root(
                     Language::Scala,
                     spelling,
                     |root| {
-                        if let Some(target) =
-                            brokk_bifrost_jvm::intrinsics::implicit_root_type_alias(
-                                Language::Scala,
-                                root,
-                                spelling,
-                            )
-                        {
-                            external.resolve_qualified_name(&recorder, target, package_name)
-                        } else {
-                            external.resolve_wildcard_import(
-                                &recorder,
-                                root,
-                                spelling,
-                                package_name,
-                            )
-                        }
+                        misses.probe(
+                            if let Some(target) =
+                                brokk_bifrost_jvm::intrinsics::implicit_root_type_alias(
+                                    Language::Scala,
+                                    root,
+                                    spelling,
+                                )
+                            {
+                                external.resolve_qualified_name(recorder, target, package_name)
+                            } else {
+                                external.resolve_wildcard_import(
+                                    recorder,
+                                    root,
+                                    spelling,
+                                    package_name,
+                                )
+                            },
+                        )
                     },
                 )
                 .into_answer()
@@ -2089,7 +2135,8 @@ impl ScalaSource for ScalaAnalyzer {
 
         let imports = self.inner.import_info_of(token, file);
         let imported = self.imported_code_units_of(file);
-        let retained = self.retained_external_declaration_index();
+        let retained_index = self.retained_external_declaration_index();
+        let retained = retained_index.as_deref();
         let declares_name = |declaration: &CodeUnit| {
             declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
         };
@@ -2217,7 +2264,8 @@ impl ScalaSource for ScalaAnalyzer {
         if self.declares_simple_type(file, &package_name, name) {
             return ScalaNameProof::Workspace;
         }
-        let retained = self.retained_external_declaration_index();
+        let retained_index = self.retained_external_declaration_index();
+        let retained = retained_index.as_deref();
         if retained
             .is_some_and(|external| external.resolve_same_package(&package_name, name).is_some())
         {
@@ -2380,6 +2428,15 @@ impl CodeUnitIndex for ScalaAnalyzer {
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
+    }
+
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
     }
 
     delegate_inner_methods! {
@@ -2584,7 +2641,7 @@ impl IAnalyzer for ScalaAnalyzer {
         &self,
     ) -> Vec<&dyn brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority>
     {
-        vec![self]
+        vec![self.selection_authority.as_ref()]
     }
 
     fn request_row_reader_source(
@@ -2596,13 +2653,8 @@ impl IAnalyzer for ScalaAnalyzer {
         let project = self.inner.shared_project();
         Some(Arc::new(
             crate::analyzer::jvm::catalog_reader::JvmRequestRowReaderSource {
-                authority: Arc::new(
-                    crate::analyzer::jvm::catalog_reader::JvmSelectionAuthority {
-                        config: self.java_config.clone(),
-                        project: Arc::clone(&project),
-                        digests: self.inner.analyzer_store().content_digests(),
-                    },
-                ),
+                questions_digest: Default::default(),
+                authority: self.selection_authority.clone(),
                 project,
                 catalog: catalog.clone(),
                 store: Arc::clone(self.inner.analyzer_store()),
@@ -2658,15 +2710,25 @@ impl IAnalyzer for ScalaAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let external_index = self.external_index.updated(changed_files, self.memo_budget);
-            let mut updated = Self::from_inner(
-                self.inner.update_with_listing(changed_files, listing),
-                self.memo_budget,
-                self.java_config.clone(),
-            );
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
+            let external_index = self.external_index.updated(self.memo_budget);
+            let mut updated = Self::from_inner(inner, self.memo_budget, self.java_config.clone());
             updated.external_index = external_index;
-            updated
+            (updated, effects.no_changes_or_unreported(changed_files))
         })
     }
 
@@ -2971,7 +3033,10 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Scal
         Box::new(ScalaAnalyzer::update_all_with_progress(self, progress))
     }
 
-    brokk_bifrost_analysis::delegate_generation_membership_updates!(ScalaAnalyzer);
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(
+        ScalaAnalyzer,
+        |next: &mut ScalaAnalyzer| next.renew_external_index()
+    );
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -3262,8 +3327,9 @@ impl LanguageSupport for ScalaSupport {
     fn external_inventory_providers(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        models: &brokk_bifrost_analysis::analyzer::semantic_model::ResolvedActiveSemanticModels,
     ) -> Vec<String> {
-        crate::analyzer::jvm::external::scala_inventory_providers(analyzer)
+        crate::analyzer::jvm::external::scala_inventory_providers(analyzer, models)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3533,6 +3599,25 @@ impl LanguageEdgePass for ScalaEdgePass {
         EdgePassId::Scala
     }
 
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<ScalaAnalyzer>(
+            analyzer,
+        )
+        .map_or_else(
+            || Ok(Vec::new()),
+            |scala| {
+                scala
+                    .tree_sitter_analyzer()
+                    .selected_graph_source_exclusions()
+            },
+        )
+    }
+
     fn permits_logical_family_targets(&self) -> bool {
         true
     }
@@ -3612,6 +3697,10 @@ mod overlay_usage_tests {
     /// The producer/SQLite boundary preserves written parent order, including
     /// swapped mixins. Read SQL ordinals as well as rehydrated source facts.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn scala_written_parent_order_survives_source_publication() {
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
             .file("Parents.scala", "class C[A] extends Base[A] with Left[A] with Right[A]\nclass D[A] extends Base[A] with Right[A] with Left[A]\n")
@@ -4332,41 +4421,8 @@ mod external_receipt_budget_tests {
     }
 }
 
-impl brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority
-    for ScalaAnalyzer
-{
-    fn answer(
-        &self,
-        request: &brokk_bifrost_core::analyzer::outer_request::OuterRequest,
-        question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
-        retry: &brokk_bifrost_core::analyzer::external_selection::SelectionRetry,
-        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-    ) -> Result<
-        Arc<brokk_bifrost_core::analyzer::external_selection::VerifiedSelection>,
-        brokk_bifrost_core::analyzer::external_selection::SelectionRefused,
-    > {
-        assert!(
-            self.questions()
-                .iter()
-                .any(|candidate| candidate == question)
-        );
-        let project = self.inner.project();
-        request.external_selection(project, question.digest, || {
-            crate::analyzer::jvm::verified_selection::verify_selection(
-                &self.java_config,
-                project,
-                &self.inner.analyzer_store().content_digests(),
-                question,
-                retry,
-                cancellation,
-            )
-        })
-    }
-    fn questions(
-        &self,
-    ) -> Vec<brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion> {
-        brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion::for_jvm(
-            &self.java_config,
-        )
+impl crate::analyzer::jvm::hierarchy::JvmDerivedAnalyzer for ScalaAnalyzer {
+    fn request_memos(&self) -> Option<Arc<brokk_bifrost_core::domain_memo::DomainMemoRegistry>> {
+        self.inner.active_query_request_registry()
     }
 }

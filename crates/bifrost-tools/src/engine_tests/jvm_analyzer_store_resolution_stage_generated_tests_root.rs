@@ -34,6 +34,10 @@ mod jvm_extraction_tests {
     use brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical_readers;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn macro_pair_preserves_constructor_paths_same_host_and_cross_host_and_repeats() {
         for target in [0, 1] {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
@@ -123,6 +127,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn include_pair_preserves_borrowed_runtime_body_and_allocates_fresh_after_clear() {
         for origin in [0, 1] {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
@@ -237,6 +245,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn include_glob_replays_variables_projects_recipes_and_checks_complete_repeated_body() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let selection = fixture.open_ready(&[]);
@@ -302,6 +314,10 @@ mod jvm_extraction_tests {
         assert_eq!(selection.stage_content_epoch_for_test(), epoch + 1);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cancelled_second_half_rolls_back_both_halves_and_all_counter_reservations() {
         for target in [0, 1] {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
@@ -392,6 +408,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn existing_source_half_still_validates_its_body_and_rebuilds_missing_target_atomically() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
         let selection = fixture.open_ready(&[]);
@@ -503,6 +523,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn existing_target_mismatch_rolls_back_a_new_source_half() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
         let selection = fixture.open_ready(&[]);
@@ -572,6 +596,10 @@ mod jvm_extraction_tests {
         assert_eq!(selection.candidate_coverage_fingerprint(), fingerprint);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn include_glob_cancellation_rolls_back_all_four_coordinate_domains() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let selection = fixture.open_ready(&[]);

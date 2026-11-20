@@ -1609,6 +1609,7 @@ impl AnalyzerStore {
     /// is ever presented as a complete answer.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn relational_definition_values<A, F>(
         &self,
         adapter: &A,
@@ -1752,6 +1753,7 @@ impl AnalyzerStore {
     /// storage language. This is the direct, allocation-free package relation
     /// used by analyzer hot paths that need only the Boolean answer (#2795).
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn workspace_package_exists_for_langs(
         &self,
         storage_languages: &[String],
@@ -1782,6 +1784,7 @@ impl AnalyzerStore {
     /// `unit_ranges`' primary key without hydrating complete file states.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn relational_exact_definition_order_rows<A: StoreLanguageAdapter>(
         &self,
         adapter: &A,
@@ -3041,6 +3044,10 @@ mod batched_query_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn batched_exact_names_match_point_lookups_and_the_fixture() {
         let fixture = fixture();
         let u = &fixture.units;
@@ -3400,6 +3407,10 @@ mod batched_query_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn live_unit_counts_sum_rows_of_live_workspace_files_per_language() {
         let fixture = fixture();
         let languages = ["java", "kotlin", "python"].map(str::to_string);

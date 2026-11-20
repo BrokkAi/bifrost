@@ -2599,7 +2599,8 @@ impl FactEvaluation<'_, '_> {
             complete &= node.indexed
                 && node.hierarchy_inventory_complete
                 && matches!(node.evidence, HierarchyEvidence::Complete);
-            for edge in &node.edges {
+            for nominal in node.edges.nominal() {
+                let edge = &nominal.edge;
                 if self.cancellation.is_cancelled() || !self.session.charge_scope_steps(1) {
                     return Ok(None);
                 }

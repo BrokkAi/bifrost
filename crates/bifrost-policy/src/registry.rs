@@ -331,6 +331,7 @@ pub struct PolicyRegistry {
     endpoint_set_cache: Vec<EndpointSetCacheEntry>,
     endpoint_set_parse_count: usize,
     endpoint_set_cache_hits: usize,
+    guard_vocabularies: brokk_bifrost_rql::GuardRemovalVocabularyRegistry,
 }
 
 impl PolicyRegistry {
@@ -374,7 +375,23 @@ impl PolicyRegistry {
             endpoint_set_cache: Vec::new(),
             endpoint_set_parse_count: 0,
             endpoint_set_cache_hits: 0,
+            guard_vocabularies: brokk_bifrost_rql::GuardRemovalVocabularyRegistry::new(),
         }
+    }
+
+    pub fn register_guard_vocabulary(
+        &mut self,
+        vocabulary: Arc<dyn brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardRemovalVocabulary>,
+    ) {
+        self.guard_vocabularies.register(vocabulary);
+    }
+
+    pub fn with_guard_vocabulary(
+        mut self,
+        vocabulary: Arc<dyn brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardRemovalVocabulary>,
+    ) -> Self {
+        self.register_guard_vocabulary(vocabulary);
+        self
     }
 
     fn read_workspace_source(
@@ -747,6 +764,18 @@ impl PolicyRegistry {
                         locators,
                     )?;
                     insert_selector(&mut fixed_selectors, selector)?;
+                    for guard in &spec.guards.barriers {
+                        for (path, authored) in guard.selectors(TAINT_SET_SEGMENTS) {
+                            let resolved = self.resolve_selector(
+                                parsed,
+                                selector_path(path)?,
+                                authored,
+                                &mut retained_bytes,
+                                locators,
+                            )?;
+                            insert_selector(&mut fixed_selectors, resolved)?;
+                        }
+                    }
                     (
                         None,
                         None,
@@ -953,7 +982,8 @@ impl PolicyRegistry {
                 )?;
             }
         }
-        let resolved_selectors = fixed_selectors.into_values().collect();
+        let resolved_selectors: Vec<ResolvedPolicySelector> =
+            fixed_selectors.into_values().collect();
         let auxiliary_slots = if let Some(spec) = resolved_taint.as_ref() {
             spec.sanitizers
                 .len()
@@ -969,6 +999,76 @@ impl PolicyRegistry {
             .len()
             .checked_add(auxiliary_slots)
             .ok_or(PolicyRegistryError::EndpointCountOverflow)?;
+        let (match_guards, match_guard_load_notes) = if let PolicyAnalysis::Match { spec } =
+            &definition.analysis
+        {
+            if spec.guards.barriers.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let relation_id = resolved_selectors
+                    .iter()
+                    .find(|selector| selector.path.as_str() == "/analysis/selector")
+                    .and_then(|selector| selector.as_query())
+                    .and_then(|(_, query)| query.selected_guard_relation_id());
+                let vocabulary = relation_id.and_then(|id| self.guard_vocabularies.get(id));
+                let mut guards = Vec::with_capacity(spec.guards.barriers.len());
+                let mut notes = Vec::new();
+                for guard in &spec.guards.barriers {
+                    let selector_path =
+                        selector_path(crate::definition::guard_barrier_selector_path(
+                            TAINT_SET_SEGMENTS.guard_barriers,
+                            &guard.id,
+                        ))?;
+                    let resolved = crate::resolved::ResolvedTaintGuardBarrier {
+                        definition: guard.clone(),
+                        selector_path,
+                    };
+                    let tokens = match vocabulary {
+                        None => {
+                            notes.push(crate::resolved::MatchGuardLoadNote {
+                                guard_id: guard.id.clone(),
+                                relation_id,
+                                message: format!(
+                                    "guard `{}` on match relation `{}` has no registered removal vocabulary; guard will produce no kill",
+                                    guard.id.as_str(),
+                                    relation_id.unwrap_or("<none>")
+                                ),
+                            });
+                            Vec::new()
+                        }
+                        Some(vocab) => {
+                            let mut resolved_tokens = Vec::new();
+                            let known_names = vocab.names().join(", ");
+                            for label in &guard.removes {
+                                if let Some(token) = vocab.resolve(label.as_str()) {
+                                    resolved_tokens.push(token);
+                                } else {
+                                    notes.push(crate::resolved::MatchGuardLoadNote {
+                                        guard_id: guard.id.clone(),
+                                        relation_id,
+                                        message: format!(
+                                            "guard `{}` references unknown removal kind `{}` for relation `{}` (known: [{}]); ignoring unknown kind",
+                                            guard.id.as_str(),
+                                            label.as_str(),
+                                            vocab.producer_id(),
+                                            known_names
+                                        ),
+                                    });
+                                }
+                            }
+                            resolved_tokens
+                        }
+                    };
+                    guards.push(crate::resolved::ResolvedMatchGuardBarrier {
+                        definition: resolved,
+                        tokens: tokens.into_boxed_slice(),
+                    });
+                }
+                (guards, notes)
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let loaded = LoadedPolicy::try_new(
             definition,
             parsed.identity().clone(),
@@ -983,7 +1083,8 @@ impl PolicyRegistry {
             resolved_taint,
             resolved_without_flow,
             resolved_typestate,
-        )?;
+        )?
+        .with_match_guards(match_guards, match_guard_load_notes);
         Ok(PolicyBuild {
             loaded,
             retained_bytes,
@@ -1142,6 +1243,19 @@ impl PolicyRegistry {
             )?;
             insert_selector(dependency_selectors, selector)?;
             dependencies.push(dependency);
+        }
+        for guard in &spec.guards.barriers {
+            for (path, authored) in guard.selectors(segments) {
+                let resolved = self.resolve_imported_selector(
+                    parsed,
+                    selector_path(path)?,
+                    authored,
+                    retained_bytes,
+                    locators,
+                    imports,
+                )?;
+                insert_selector(fixed_selectors, resolved)?;
+            }
         }
         for entry in &spec.sanitizers.entries {
             let base = format!(
@@ -1468,6 +1582,12 @@ impl PolicyRegistry {
             )?;
             insert_selector(dependency_selectors, selector)?;
             dependencies.push(dependency);
+        }
+        for transfer in &spec.automaton.transfers {
+            let path = selector_path(typestate_transfer_selector_path(&transfer.id))?;
+            let selector =
+                self.resolve_selector(parsed, path, &transfer.selector, retained_bytes, locators)?;
+            insert_selector(fixed_selectors, selector)?;
         }
         for event in &spec.automaton.events {
             if let TypestateEventTrigger::Calls { selector, .. } = &event.trigger {

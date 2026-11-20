@@ -2222,6 +2222,7 @@ mod value_identity_tests {
 
     fn value(id: u32, source: u32, kind: SemanticValueKind) -> SemanticValue {
         SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(id),
@@ -2727,14 +2728,19 @@ impl SemanticArtifact {
         let mut procedures_by_locator = HashMap::default();
         let mut procedures = Vec::with_capacity(procedure_parts.len());
         for parts in procedure_parts {
-            let boundaries = find_boundaries(&parts)?;
-            procedures_by_locator.insert(parts.locator.clone(), parts.id);
-            procedures.push(ProcedureSemantics::try_from_parts(
-                parts,
-                boundaries.entry,
-                boundaries.normal_exit,
-                boundaries.exceptional_exit,
-            )?);
+            let id = parts.id;
+            let locator = parts.locator.clone();
+            let boundaries = find_boundaries(&parts).map_err(|error| error.at_source(&locator))?;
+            procedures.push(
+                ProcedureSemantics::try_from_parts(
+                    parts,
+                    boundaries.entry,
+                    boundaries.normal_exit,
+                    boundaries.exceptional_exit,
+                )
+                .map_err(|error| error.at_source(&locator))?,
+            );
+            procedures_by_locator.insert(locator, id);
         }
 
         let procedures = procedures.into_boxed_slice();

@@ -73,6 +73,7 @@ pub fn jvm_source_jar_request(
             }],
         },
         activation: vec![ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: package.to_owned(),
                 version: Some(format!("={version}")),
@@ -231,7 +232,8 @@ pub fn discovery_declaring(
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 },
                 provenance: Vec::new(),
                 artifacts: artifacts_for_module(module),
@@ -273,6 +275,8 @@ pub fn activate_semantic_model_fixture(
     };
 
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
         evidence: vec![evidence],
@@ -326,7 +330,8 @@ pub fn activate_rust_declaration_pack(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
         )
     else {
@@ -472,13 +477,20 @@ pub fn write_fixture_files(root: &Path, files: &[(&str, &str)]) {
     }
 }
 
+/// Fixture defaults that exclude JAVA_HOME/PATH JDKs but retain dependency metadata.
+#[cfg(any(test, feature = "test-support"))]
+pub fn no_host_jdk_config() -> AnalyzerConfig {
+    let mut config = AnalyzerConfig::default();
+    config.jvm.standard_library_discovery.discover_java_home = false;
+    config
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn hermetic_jvm_config() -> AnalyzerConfig {
     use crate::analyzer::JvmDependencyDiscoveryMode;
 
-    let mut config = AnalyzerConfig::default();
+    let mut config = no_host_jdk_config();
     config.jvm.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
-    config.jvm.standard_library_discovery.discover_java_home = false;
     config
 }
 
@@ -507,6 +519,7 @@ pub fn artifact_production_request(
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: package_name.to_owned(),
                 version: Some("1.0.0".to_owned()),
@@ -914,6 +927,8 @@ pub fn go_semantic_model_activation_request(
     use semver::Version;
 
     SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
         evidence: vec![SemanticModelActivationEvidence {
@@ -924,7 +939,8 @@ pub fn go_semantic_model_activation_request(
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }],
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),
@@ -1136,7 +1152,8 @@ pub fn unscoped_activation_evidence(
         toolchain: None,
         target: None,
         configuration: None,
-        artifact_sha256: None,
+        production_input_digest: None,
+        verified_raw_artifacts: Vec::new(),
     }
 }
 
@@ -1237,6 +1254,10 @@ pub fn commit_all(repo: &git2::Repository, message: &str) -> git2::Oid {
 
 /// Inspect persisted rows without changing an ephemeral fixture into a disk-backed one.
 #[cfg(any(test, feature = "test-support"))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 pub fn store_read_connection(
     store: &crate::analyzer::store::AnalyzerStore,
 ) -> impl std::ops::Deref<Target = rusqlite::Connection> + '_ {
@@ -1346,9 +1367,8 @@ impl AnalyzerFixture {
         }
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(temp.path().to_path_buf()).expect("project"));
-        let analyzer =
-            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-                .expect("ephemeral workspace should build");
+        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(project, no_host_jdk_config())
+            .expect("ephemeral workspace should build");
         Self {
             _owner: AnalyzerFixtureOwner::Filesystem(temp),
             analyzer,
@@ -1363,7 +1383,7 @@ impl AnalyzerFixture {
         }
         let owner = builder.build();
         let project = owner.project().clone();
-        let analyzer = owner.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = owner.workspace_analyzer(no_host_jdk_config());
         Self {
             _owner: AnalyzerFixtureOwner::Inline(owner),
             analyzer,
@@ -1464,4 +1484,55 @@ pub(crate) fn source_acquisition_refused(
         }
     }
     refused
+}
+
+/// Raw input-slot metadata for synthetic generated-pack catalog fixtures only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn generated_input_slots()
+-> Vec<brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact> {
+    use brokk_bifrost_semantic::analyzer::semantic_model::{
+        ExternalArtifactKind, dependency::DependencyArtifactRole, runtime::VerifiedRawArtifact,
+    };
+    vec![VerifiedRawArtifact::from_sha256(
+        DependencyArtifactRole::Binary,
+        ExternalArtifactKind::JavaClassJar,
+        &"a".repeat(64),
+    )]
+}
+
+/// Convert synthetic declaration fixtures to the trusted generated compiler path.
+#[cfg(any(test, feature = "test-support"))]
+pub fn generated_pack_fixture(
+    pack: &brokk_bifrost_semantic::analyzer::semantic_model::CompiledSemanticModelPack,
+    input_digest: &str,
+    slots: &[brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact],
+) -> brokk_bifrost_semantic::analyzer::semantic_model::CompiledSemanticModelPack {
+    use brokk_bifrost_semantic::analyzer::semantic_model::{
+        ArtifactExtraction, DecodeLimits, SEMANTIC_MODEL_SCHEMA_VERSION,
+        artifact::authored_pack_from_compiled_shard, catalog::validate_pack,
+        compiler::compile_generated_pack,
+    };
+    let validated = validate_pack(pack, &DecodeLimits::default()).unwrap();
+    let mut authored = authored_pack_from_compiled_shard(&validated.shards[0].decoded);
+    authored.shards = validated
+        .shards
+        .iter()
+        .flat_map(|s| authored_pack_from_compiled_shard(&s.decoded).shards)
+        .collect();
+    if !authored.producer.has_current_dependency_revision() {
+        authored.producer = authored.producer.with_dependency_revision();
+    }
+    authored.schema_version = SEMANTIC_MODEL_SCHEMA_VERSION;
+    authored.compatibility.bifrost = None;
+    authored.extraction = Some(ArtifactExtraction::from_verified_slots(
+        slots[0].kind,
+        slots,
+    ));
+    for shard in &mut authored.shards {
+        for selector in &mut shard.activation {
+            selector.artifact_sha256 = None;
+            selector.production_input_digest = Some(input_digest.into());
+        }
+    }
+    compile_generated_pack(&authored, &Default::default()).unwrap()
 }

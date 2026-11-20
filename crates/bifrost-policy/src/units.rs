@@ -51,13 +51,6 @@ use super::projection::{TypestateProjectedFinding, TypestateProjectedFindingSeed
 use super::resolved::LoadedPolicy;
 use super::typestate_policy::TypestateGap;
 
-/// The digest a unit key carries when no semantic models were active.
-///
-/// A fixed value rather than an absent field: "no models were active" is an
-/// input like any other, and a unit produced without models must not match one
-/// produced with them.
-const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
-
 /// This crate's own revision, folded into the engine epoch beside the
 /// analyzer's parser epochs: the policy substrate lever (#11570), one change
 /// name per line in `levers/policy-substrate.tokens`.
@@ -1449,14 +1442,13 @@ impl WorkspaceUnitInputs {
     ) -> Self {
         let configuration = workspace.config().cloned().unwrap_or_default();
         let model_set = models.map_or_else(
-            || StableDigest::sha256(NO_ACTIVE_MODELS),
+            || workspace.analyzer().model_set_digest(None),
             |models| StableDigest::sha256(models.active_models().active_model_set_hash()),
         );
         Self {
-            model_read_digest:
-                brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
-                    models.map(|models| models.active_models().active_model_set_hash()),
-                ),
+            model_read_digest: workspace.analyzer().model_set_digest(
+                models.map(|models| models.active_models().active_model_set_hash()),
+            ),
             configuration: StableDigest::sha256(format!("{configuration:?}")),
             models: match typos {
                 None => model_set,
@@ -3076,7 +3068,7 @@ mod tests {
             let old_epoch =
                 substrate_epoch_before_last_token(StableDigest::sha256("test-lowering"));
             for models in [
-                StableDigest::sha256(NO_ACTIVE_MODELS),
+                brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(None),
                 StableDigest::sha256("same active model set"),
             ] {
                 let current = WorkspaceUnitInputs {

@@ -32,10 +32,8 @@ WITH candidates AS (
  AND NOT EXISTS(SELECT 1 FROM cr_binding_imports named WHERE named.owner=source.owner
  AND named.is_glob=0 AND named.bound_name=target.name
  AND (mask.owner IS NULL OR named.blob_id<>mask.blob_id OR named.import_ordinal<>mask.import_ordinal OR named.module_path<>mask.module_path)
- AND (NOT EXISTS(SELECT 1 FROM cr_binding_import_complete done WHERE done.blob_id=named.blob_id
- AND done.import_ordinal=named.import_ordinal AND done.module_path=named.module_path AND done.namespace=target.namespace)
- OR EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=named.blob_id
- AND present.import_ordinal=named.import_ordinal AND present.module_path=named.module_path AND present.namespace=target.namespace)))
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_import_releases_namespace absent WHERE absent.blob_id=named.blob_id
+ AND absent.import_ordinal=named.import_ordinal AND absent.module_path=named.module_path AND absent.namespace=target.namespace))
  UNION ALL
  SELECT destination.owner,'type',source.bound_name,target.target_crate_key,target.target_module_path,target.target_name,
  0,0,'reexport',source.visibility,source.restricted_module_path,'public',NULL,target.owner

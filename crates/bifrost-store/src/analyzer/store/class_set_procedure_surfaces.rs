@@ -551,7 +551,11 @@ pub(crate) const SURFACE_LEXICAL_CHILDREN_SQL: &str =
      WHERE surface_id=?1 ORDER BY child_ordinal LIMIT ?2";
 pub(crate) const SURFACE_READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,blob_oid,subject,
-            start_byte,end_byte,digest,site_ordinal,NULL AS decl_kind,NULL AS decl_signature,NULL AS workspace_fact_family,NULL AS fact_member,NULL AS fact_names,read_ordinal
+            start_byte,end_byte,digest,site_ordinal,NULL AS decl_kind,NULL AS decl_signature,NULL AS workspace_fact_family,NULL AS fact_member,NULL AS fact_names,read_ordinal,
+            NULL AS copy_target_unit,NULL AS copy_module_path,NULL AS copy_target_identity_digest,
+            NULL AS copy_census_version,NULL AS copy_config_digest,NULL AS copy_producer_digest,
+            NULL AS parse_variant_kind,NULL AS parse_variant_digest,NULL AS structural_role,NULL AS structural_keyword,
+            NULL AS selected_receiver_question,NULL AS selected_resolution_epoch,NULL AS selected_application_digest,NULL AS selected_receiver_digest,NULL AS selected_transfer_rule_digest,NULL AS selected_reference_digest
      FROM class_set_procedure_surface_reads WHERE surface_id=?1 ORDER BY read_ordinal LIMIT ?2";
 
 impl AnalyzerStore {
@@ -598,6 +602,7 @@ impl AnalyzerStore {
     /// Load one bounded compatible family. `None` means more than `max_rows`
     /// candidates exist; callers must not treat the returned prefix as a
     /// complete set from which replay can select a current surface.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_procedure_surface_candidates(
         &self,
         key: &ClassSetProcedureSurfaceKey,
@@ -637,6 +642,7 @@ impl AnalyzerStore {
         Ok(Some(rows))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_procedure_surface_for_digest(
         &self,
         digest: ClassSetSummaryDigest,

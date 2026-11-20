@@ -50,6 +50,10 @@ pub mod go_extraction_support_13 {
             Self::from_project_with_config(project, source_inventory_config())
         }
         #[doc(hidden)]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         pub fn from_project_with_config(
             project: brokk_bifrost_analysis::inline_project::BuiltInlineTestProject,
             config: AnalyzerConfig,

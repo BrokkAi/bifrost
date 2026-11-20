@@ -44,6 +44,14 @@ pub(super) struct BranchRelationTraversalCache {
     pub(super) reuse: ReuseVerdict,
 }
 
+impl BranchRelationTraversalCache {
+    /// Drop the procedure-keyed scalar memo: its `ProcedureHandle` keys retain
+    /// semantic artifacts, so it cannot outlive a released file window.
+    pub(super) fn release_file_window(&mut self) {
+        self.scalar = CaptureScopedMemo::default();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct BranchRelationValue {
     pub(super) row: CodeQueryBranchRelation,
@@ -194,6 +202,10 @@ fn report(
                 exhausted_roots: Vec::new(),
                 // A branch relation row is a row of its seed's file.
                 withheld_rows_path: Some(rel_path_string(&seed.file)),
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,

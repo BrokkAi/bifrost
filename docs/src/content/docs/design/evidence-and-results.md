@@ -118,6 +118,22 @@ Policy and extension surfaces may use wire labels such as `frontier_bounded`,
 the same semantic distinctions. A transport error remains distinct from an
 analysis outcome.
 
+Site presentation can refuse output after semantic selection has completed.
+Optional source text then carries a typed `unrendered` location while preserving
+the structural value. If a required value cannot be admitted in full, the
+response withholds that row and the remaining rows, sets truncation, and
+reports `presentation_rows_refused` as an operational budget cause. Missing
+retention ownership has a distinct provider cause. Neither outcome changes a
+known value to unknown or certifies that omitted rows are absent. Policy
+selectors consume semantic scalars separately, so presentation-only refusal
+does not enter their semantic reuse receipt.
+
+A source limit can stop a read before selected bytes or matching held facts are
+available. When that leaves a required value unresolved, the engine withholds
+the unpublished batch and retains the original source-hydration diagnostic,
+including the exhausted budget entry. Source unavailability, provider failure
+and cancellation retain their own typed causes.
+
 A policy report uses `not_run` when a selected policy cannot start because a
 required workspace capability is unavailable. The record names the missing
 capability and reason, and makes no absence claim. Selection provenance is part
@@ -156,7 +172,12 @@ Public semantic budget failures name a coarse lane: `source`, `rows`,
 `retained_bytes`, or `files`. Source, row and retained-byte lanes bound resident
 admissions; `files` bounds discovery. Scans and traversal visits are work telemetry
 and never cause a semantic budget refusal. Solver step limits remain separate.
-The internal ledger can refine its accounting within these coarse lanes. In
+The internal ledger can refine its accounting within these coarse lanes.
+A refused source read reports its proven minimum byte count, rendered as
+`at least N`; a capped read need not read the remaining file to learn its full
+length. A prepared snapshot may establish the full length, which is also a
+valid minimum. Source admission refusals preserve that evidence and the
+requested limit on the request ledger. In
 dispatch outcome rows,
 `exceeded_limit` is optional: an unavailable lane does not turn budget exhaustion
 into a complete result. Lane projection preserves the typed outcome, candidate

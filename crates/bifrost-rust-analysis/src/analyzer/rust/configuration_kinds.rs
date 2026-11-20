@@ -108,6 +108,7 @@ impl DerivationKind for RustUnitConfiguration {
             target_name: name,
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn compute<R: DerivationRevision, A: DerivationAuthority>(
         &self,
         _: &mut DerivationFrame<'_, R, A>,
@@ -214,6 +215,260 @@ mod tests {
     use brokk_bifrost_core::cancellation::CancellationToken;
     use brokk_bifrost_core::retention_budget::RetentionBudget;
     use brokk_bifrost_test_macros::hardwon;
+
+    fn with_bridge_fixture(run: impl FnOnce(&super::super::RustAnalyzer, &(String, String))) {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+        let source = "mod exports;\nuse crate::exports::*;\npub fn consume(_: &str) {}\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname=\"bridge_failure\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .file("src/lib.rs", source)
+            .file("src/exports.rs", "pub struct Other;\n")
+            .build();
+        let workspace = project.certified_workspace_analyzer(Default::default());
+        let analyzer =
+            resolve_analyzer::<super::super::RustAnalyzer>(workspace.analyzer()).unwrap();
+        let cancellation = CancellationToken::default();
+        let _outer = AnalyzerQueryScope::new(analyzer);
+        let snapshots = analyzer.inner.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+        let input = SelectedResolutionOperationInput::new(
+            analyzer.project(),
+            analyzer.inner.workspace_id(),
+            snapshots.as_ref(),
+            &languages,
+            &[],
+        );
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+            .analyzer_store()
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        else {
+            panic!("operation unavailable");
+        };
+        let keys = operation
+            .rust_crate_keys_for_file(Path::new("src/lib.rs"), &cancellation)
+            .unwrap();
+        let key = (
+            "src/lib.rs".to_owned(),
+            serde_json::to_string(&(
+                source.find("use crate").unwrap(),
+                ["crate", "exports"],
+                "type",
+                "str",
+            ))
+            .unwrap(),
+        );
+        operation
+            .with_rust_forward_crate_scope(
+                &keys,
+                &cancellation,
+                |operation| analyzer.operation_read_frame(operation),
+                || {
+                    run(analyzer, &key);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[hardwon("#12928: cancelled route bridges recorded a provider stop in the read receipt")]
+    fn route_bridges_preserve_cancellation_in_receipts() {
+        use super::super::RustRouteQuestionKey;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        use brokk_bifrost_analysis::analyzer::store::StoreError;
+        use brokk_bifrost_rust::graph_support::RustCargoRouteError;
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause;
+        fn check(
+            analyzer: &super::super::RustAnalyzer,
+            read: impl FnOnce() -> Result<(), RustCargoRouteError>,
+        ) {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            assert!(matches!(read(), Err(RustCargoRouteError::Cancelled)));
+            assert!(scope.store_error().is_none());
+            let reasons = scope.captured_read_incompleteness();
+            assert!(
+                reasons
+                    .iter()
+                    .any(|reason| reason.execution_cause()
+                        == Some(DerivationExecutionCause::Cancelled)),
+                "{reasons:?}"
+            );
+            assert!(
+                !reasons
+                    .iter()
+                    .any(|reason| reason.execution_cause()
+                        == Some(DerivationExecutionCause::Provider)),
+                "{reasons:?}"
+            );
+        }
+        with_bridge_fixture(|analyzer, key| {
+            check(analyzer, || {
+                analyzer.with_selected_route_demands(None, |_| Err(UnavailableCause::Cancelled))
+            });
+            check(analyzer, || {
+                analyzer
+                    .certified_package_question(
+                        |memo| &memo.certified_package_files_of,
+                        "bridge_failure".to_owned(),
+                        None,
+                        |_, _, _| Err(UnavailableCause::Cancelled),
+                    )
+                    .map(|_| ())
+            });
+            check(analyzer, || {
+                super::super::test_support::with_local_glob_demand_fault(
+                    Err(StoreError::cancelled("cancelled glob demand")),
+                    || analyzer.local_glob_name_absence_question(key),
+                )
+                .map(|_| ())
+            });
+            let cancellation = CancellationToken::default();
+            cancellation.cancel();
+            let snapshots = analyzer.inner.selected_workspace_snapshots();
+            let question = RustRouteQuestionKey {
+                nonce: [0; 16],
+                snapshot: snapshots.get("rust").unwrap().clone(),
+                subject: "src/lib.rs".to_owned(),
+            };
+            let file = brokk_bifrost_core::analyzer::model::ProjectFile::new(
+                analyzer.inner.project().root().to_path_buf(),
+                "src/lib.rs",
+            );
+            check(analyzer, || {
+                // File routes report the typed Main-bridge cause (#13196);
+                // cancellation must stay cancellation.
+                match analyzer.compute_main_file_routes(
+                    &question,
+                    &snapshots,
+                    &file,
+                    None,
+                    &cancellation,
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(UnavailableCause::Cancelled) => Err(RustCargoRouteError::Cancelled),
+                    Err(cause) => panic!("file routes lost typed cancellation: {cause:?}"),
+                }
+            });
+        });
+    }
+
+    #[test]
+    #[hardwon("#12928: an incomplete local-glob answer aborted evaluation as a store failure")]
+    fn incomplete_local_glob_answer_is_scoped() {
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::{
+            AnalyzerQueryScope, complete_independent_answer,
+        };
+        with_bridge_fixture(|analyzer, key| {
+            let evaluation = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            let outcome = super::super::test_support::with_local_glob_demand_fault(Ok(()), || {
+                complete_independent_answer(analyzer, || {
+                    analyzer.local_glob_name_absence_question(key)
+                })
+            });
+            let reasons = outcome
+                .expect("evaluation continues")
+                .expect_err("query is incomplete");
+            assert!(reasons.iter().any(|reason| matches!(reason, QueryReadIncomplete::ProofStopped { reason: "RustLocalGlobNameAbsenceBridgeUnavailable", cause: Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider) })));
+            assert!(evaluation.store_error().is_none());
+            assert_eq!(
+                complete_independent_answer(analyzer, || 42)
+                    .unwrap()
+                    .unwrap(),
+                42
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon(
+        "#12928: an incomplete package topology answer aborted evaluation as a store failure"
+    )]
+    fn incomplete_package_topology_answer_is_scoped() {
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::{
+            AnalyzerQueryScope, complete_independent_answer,
+        };
+        with_bridge_fixture(|analyzer, _| {
+            let evaluation = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            let outcome = complete_independent_answer(analyzer, || {
+                analyzer.certified_package_question(
+                    |memo| &memo.certified_package_files_of,
+                    "bridge_failure".to_owned(),
+                    None,
+                    |_, _, _| {
+                        Ok(super::super::RustRoutedAnswer {
+                            value: Vec::new(),
+                            complete: false,
+                        })
+                    },
+                )
+            });
+            let reasons = outcome
+                .expect("evaluation continues")
+                .expect_err("query is incomplete");
+            assert!(reasons.iter().any(|reason| matches!(
+                reason,
+                QueryReadIncomplete::ProofStopped {
+                    reason: "RustPackageTopologyBridgeUnavailable",
+                    ..
+                }
+            )));
+            assert!(evaluation.store_error().is_none());
+            assert_eq!(
+                complete_independent_answer(analyzer, || 42)
+                    .unwrap()
+                    .unwrap(),
+                42
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon(
+        "#12928: keeping incomplete proofs scoped must still propagate a genuine store failure once"
+    )]
+    fn local_glob_store_failure_still_fails_evaluation_once() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::{
+            AnalyzerQueryScope, complete_independent_answer,
+        };
+        use brokk_bifrost_analysis::analyzer::{QueryReadIncomplete, store::StoreError};
+        with_bridge_fixture(|analyzer, key| {
+            let owner = std::sync::Arc::new(
+                brokk_bifrost_analysis::analyzer::i_analyzer::PolicyCompletionOwner::default(),
+            );
+            let _owner = owner.install();
+            let evaluation = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            let original = StoreError::corrupt("broken local-glob publication");
+            let outcome = super::super::test_support::with_local_glob_demand_fault(
+                Err(original.clone()),
+                || {
+                    complete_independent_answer(analyzer, || {
+                        analyzer.local_glob_name_absence_question(key)
+                    })
+                },
+            );
+            assert_eq!(outcome.unwrap_err(), original);
+            assert_eq!(evaluation.store_error(), Some(original.clone()));
+            let policy_errors = owner.errors();
+            assert_eq!(policy_errors.len(), 1);
+            assert_eq!(policy_errors[0].error(), &original);
+            let errors = evaluation
+                .captured_read_incompleteness()
+                .into_iter()
+                .filter(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_)))
+                .count();
+            assert_eq!(
+                errors, 1,
+                "propagation records the original store failure once"
+            );
+        });
+    }
 
     #[test]
     #[hardwon("#12304: local glob proof on a narrowed operation added persistence refusals")]
@@ -906,6 +1161,10 @@ mod tests {
 
     #[test]
     #[hardwon("#13102: an equal reader binding skipped live configuration File verification")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn configuration_current_hits_recheck_live_files_in_one_binding() {
         use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
         use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
@@ -998,6 +1257,10 @@ mod tests {
     }
 
     // Real selected operation, narrowed by the same scope guard as policy consumers.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn scoped_configuration_case(path: &str, reusable: bool) {
         let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
             .file(

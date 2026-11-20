@@ -603,3 +603,125 @@ fn relational_ranking_reports_each_binding_relaxation() {
         ["binding:site/scope", "binding:receiver"]
     );
 }
+
+fn failed_activation_workspace() -> tempfile::TempDir {
+    let temp = disk_workspace();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".bifrost/semantic-models")).unwrap();
+    std::fs::write(
+        root.join(".bifrost/packs.json"),
+        r#"{"schema_version":1,"ecosystems":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".bifrost/semantic-models/broken.json"),
+        "{invalid pack}",
+    )
+    .unwrap();
+    temp
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13182: a failed semantic-model activation was explained as an ordinary answer with no diagnostic"
+)]
+fn a_failed_workspace_model_activation_is_stated_and_makes_the_answer_unknown() {
+    let temp = failed_activation_workspace();
+    let retention = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+    let explanation = explain_policy_inputs(
+        temp.path(),
+        &[input("policies/first.rqlp")],
+        &ExplanationTarget::Candidate(ExplanationCandidate::at_offset("app.ts", 22).unwrap()),
+        None,
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+        &retention,
+    )
+    .expect("the explanation is answered, with its activation stated");
+    let json = serde_json::to_value(&explanation).unwrap();
+    assert_eq!(json["semantic_models"]["state"], "unavailable", "{json:#}");
+    let reason = json["semantic_models"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(".bifrost/semantic-models/broken.json") && reason.contains("Fix or remove"),
+        "{reason}"
+    );
+    assert_eq!(json["outcome"], "unknown", "{json:#}");
+    let obligation = &json["root"]["children"][0];
+    assert_eq!(obligation["kind"], "coverage_obligation", "{json:#}");
+    assert_eq!(obligation["outcome"], "unknown");
+    assert_eq!(obligation["reasons"][0], "partial_discovery");
+
+    let ranking = rank_policy_near_misses(
+        temp.path(),
+        &[input("policies/first.rqlp")],
+        &NearMissCandidates::PolicySeedSearch,
+        None,
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+        &retention,
+    )
+    .expect("the ranking is answered, with its activation stated");
+    let ranking = serde_json::to_value(&ranking).unwrap();
+    assert_eq!(
+        ranking["semantic_models"], json["semantic_models"],
+        "{ranking:#}"
+    );
+    let entries = ranking["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "{ranking:#}");
+    assert!(
+        entries.iter().all(|entry| entry["outcome"] == "unknown"),
+        "{ranking:#}"
+    );
+}
+
+#[test]
+fn an_activation_that_selected_nothing_is_stated_as_no_models() {
+    let temp = disk_workspace();
+    let explanation = explain_policy_inputs(
+        temp.path(),
+        &[input("policies/first.rqlp")],
+        &ExplanationTarget::Candidate(ExplanationCandidate::at_offset("app.ts", 22).unwrap()),
+        None,
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .unwrap();
+    let json = serde_json::to_value(&explanation).unwrap();
+    assert_eq!(
+        json["semantic_models"],
+        serde_json::json!({"state": "no_models"})
+    );
+    assert_ne!(json["outcome"], "unknown", "{json:#}");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13182: near miss rankings retained activation status beyond the byte limit"
+)]
+fn ranking_rejects_an_activation_status_larger_than_the_retained_byte_limit() {
+    let temp = failed_activation_workspace();
+    let result = rank_policy_near_misses(
+        temp.path(),
+        &[input("policies/first.rqlp")],
+        &NearMissCandidates::PolicySeedSearch,
+        None,
+        None,
+        None,
+        None,
+        &ExplanationLimits::default().with_max_retained_bytes(1),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    );
+    assert!(matches!(
+        result,
+        Err(ExplainError::BudgetExhausted {
+            limit: super::model::ExplanationBudgetLimit::RetainedBytes
+        })
+    ));
+}

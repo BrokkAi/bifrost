@@ -25,19 +25,7 @@ pub fn range_at(source: &str, marker: &str, start_byte: usize) -> Range {
     }
 }
 #[doc(hidden)]
-pub fn assert_factory_ranges_limited_and_cancellable(analyzer: &dyn IAnalyzer, factory: &CodeUnit) {
-    let tiny_budget = ReceiverAnalysisBudget {
-        max_scope_nodes: 1,
-        ..ReceiverAnalysisBudget::default()
-    };
-    let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
-    assert!(matches!(
-        code_unit_ranges_bounded(analyzer, factory, None, &mut tiny_ledger)
-            .expect("tiny factory range budget"),
-        CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
-    ));
-    assert_eq!(tiny_ledger.work().scope_nodes, 1);
-
+pub fn assert_factory_ranges_cancellable(analyzer: &dyn IAnalyzer, factory: &CodeUnit) {
     let cancellation = CancellationToken::default();
     cancellation.cancel();
     let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());

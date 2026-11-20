@@ -116,7 +116,12 @@ impl Producer<'_, '_> {
         namespace: ResolutionNamespace,
     ) -> ResolutionSiteId {
         let site = self.site(node, scope, kind);
-        let name = self.semantic_name(node);
+        // A MISSING or zero-width token has no spelling: the site keeps a
+        // malformed-syntax gap instead of an identifier row.
+        let Some(name) = self.semantic_name(node) else {
+            self.facts.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return site;
+        };
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -131,7 +136,7 @@ impl Producer<'_, '_> {
     /// compiler-mangled (`__x` in class `C` is `_C__x`); the independent source
     /// occurrence/declaration bridge retains the original public spelling.
     /// Header expressions execute outside the class body being defined.
-    fn semantic_name(&mut self, node: Node<'_>) -> ResolutionNameId {
+    fn semantic_name(&mut self, node: Node<'_>) -> Option<ResolutionNameId> {
         let text = &self.source[node.byte_range()];
         let lookup = if text.starts_with("__") && !text.ends_with("__") && !text.contains('.') {
             find_ancestor(node, |class| {

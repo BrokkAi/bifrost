@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 fn request() -> SemanticModelActivationRequest {
     SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         approximate_standard_libraries: Vec::new(),
         evidence: Vec::new(),
@@ -362,4 +364,277 @@ fn comment_touching_declaration_remains_a_header_comment() {
         "{}",
         report.report
     );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13901: refused exact source mislabeled an operational admission stop as missing content"
+)]
+fn source_byte_refusal_preserves_admission_evidence_in_gap_proofs() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        DispatchOracle, OracleCallContext, SemanticArtifactSourceOutcome, SemanticBudget,
+        SemanticBudgetDimension, SemanticOutcome, SemanticRequest, SemanticWork, ValueFlowOracle,
+    };
+
+    let app = "mod guard;\nuse guard::Guard;\nimpl Guard { fn helper(&self) {} }\nfn f() { let g = Guard; let _other = Guard; g.helper(); }\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("app.rs", app)
+        .file(
+            "guard.rs",
+            "pub struct Guard;\nimpl Drop for Guard { fn drop(&mut self) { println!(\"x\"); } }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("app.rs");
+    let cancellation = CancellationToken::default();
+    let mut setup = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut setup, &cancellation))
+        .unwrap()
+        .available_value()
+        .cloned()
+        .unwrap();
+    let procedure = artifact
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("f")
+        })
+        .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+        .unwrap();
+    let oracle = workspace.semantic_oracle_provider();
+    let limits = SemanticWork {
+        source_bytes: 1,
+        ..SemanticWork::default_limits()
+    };
+
+    // With no source pinned in a query cache, the capped reader proves only
+    // that the source has at least two bytes. It must not reread it for a count.
+    let cold = SemanticBudget::new(limits).unwrap().unit_ledger();
+    let cold_source = workspace
+        .current_program_semantics_artifact_source(&file, 1)
+        .unwrap();
+    let SemanticArtifactSourceOutcome::Refused(exceeded) = cold_source else {
+        panic!("expected bounded source refusal");
+    };
+    assert_eq!(exceeded.attempted(), 2);
+    assert_eq!(
+        SemanticArtifactSourceOutcome::<()>::Refused(exceeded)
+            .on_budget(&cold)
+            .unwrap()
+            .unwrap_err(),
+        exceeded,
+    );
+    assert_eq!(cold.first_refusal().unwrap().exceeded, exceeded);
+    assert_eq!(cold.refusal_count(), 1);
+    assert!(cold.refusal_origins().resident_only());
+    assert!(exceeded.to_string().contains("at least 2"));
+
+    // Exercise the actual cross-file cleanup proof, first cold and then with
+    // an exact prepared snapshot pinned. Both must stop operationally.
+    let check_query = |budget: &mut SemanticBudget| {
+        let outcome = oracle
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(budget, &cancellation),
+            )
+            .unwrap();
+        let SemanticOutcome::ExceededBudget {
+            exceeded, partial, ..
+        } = outcome
+        else {
+            panic!("source admission must remain an operational incomplete outcome: {outcome:?}");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::SourceBytes);
+        assert_eq!(exceeded.limit(), 1);
+        assert_eq!(budget.first_refusal().unwrap().exceeded, exceeded);
+        assert!(budget.refusal_origins().resident_only());
+        assert!(
+            partial
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.is_execution_dependent())
+        );
+        exceeded
+    };
+    let mut cold_query = SemanticBudget::new(limits).unwrap().unit_ledger();
+    assert_eq!(check_query(&mut cold_query).attempted(), 2);
+
+    let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let source = workspace
+        .current_program_semantics_artifact_source(&file, usize::MAX)
+        .unwrap();
+    let SemanticArtifactSourceOutcome::Held(source) = source else {
+        panic!("expected source");
+    };
+    assert_eq!(source.source(), app);
+    let mut warm = SemanticBudget::new(limits).unwrap().unit_ledger();
+    assert_eq!(check_query(&mut warm).attempted(), app.len());
+
+    let mut held_budget = SemanticBudget::new(limits).unwrap().unit_ledger();
+    let held = workspace
+        .held_program_semantics_artifact_source(
+            &file,
+            &mut SemanticRequest::new(&mut held_budget, &cancellation),
+        )
+        .unwrap();
+    let SemanticArtifactSourceOutcome::Refused(held_refusal) = held else {
+        panic!("expected held-source refusal");
+    };
+    assert_eq!(held_refusal.attempted(), app.len());
+    assert_eq!(held_budget.first_refusal().unwrap().exceeded, held_refusal);
+    assert_eq!(held_budget.refusal_count(), 1);
+    assert!(held_budget.refusal_origins().resident_only());
+
+    // Earlier refusals stay in the ledger, but are outside this request's
+    // observation mark. The source attempt must still run and carry its own
+    // cause through the cleanup proof and the relation projection.
+    let check_mixed = |mut budget: SemanticBudget, old| {
+        use brokk_bifrost_core::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+        let mark = budget.refusal_mark();
+        let (judged, observed) = SemanticRequest::new(&mut budget, &cancellation)
+            .observing_refusals_since(mark)
+            .judged_with_refusal(|request| {
+                oracle.procedure_relations(&procedure, &OracleCallContext::empty(), request)
+            });
+        assert_eq!(
+            judged.reuse,
+            ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal)
+        );
+        let outcome = judged.value.unwrap();
+        let exceeded = outcome
+            .budget_exceeded()
+            .expect("this source attempt refused");
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::SourceBytes);
+        assert_eq!(exceeded.limit(), 1);
+        assert_eq!(exceeded.attempted(), app.len());
+        assert_eq!(observed.unwrap().exceeded, exceeded);
+        assert_eq!(budget.first_refusal().unwrap().exceeded, old);
+        assert_eq!(budget.refusal_count(), 2);
+        assert!(budget.refusal_origins().resident_only());
+    };
+    let old_rows = SemanticBudget::new(limits).unwrap().unit_ledger();
+    let old = old_rows
+        .check_admission(SemanticWork {
+            program_points: limits.program_points + 1,
+            ..SemanticWork::default()
+        })
+        .unwrap_err();
+    check_mixed(old_rows, old);
+    let mut old_source = SemanticBudget::new(limits).unwrap().unit_ledger();
+    let backing = Arc::new(vec![0_u8; 3]);
+    let old = old_source.hold_source(&backing, backing.len()).unwrap_err();
+    check_mixed(old_source, old);
+
+    // Caller cleanup evidence must survive binding projection even when the
+    // borrowed receiver has no callee cleanup or runtime work that could
+    // produce a later stop. The caller owns the receiver's Drop.
+    let mut dispatch_budget = SemanticBudget::default();
+    let provider = workspace.icfg_provider();
+    let (call, candidate) = procedure
+        .semantics()
+        .call_sites()
+        .iter()
+        .find_map(|site| {
+            let call = procedure.call_site_handle(site.id).unwrap();
+            let outcome = provider
+                .resolve_call(
+                    &call,
+                    &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+                )
+                .unwrap();
+            outcome.available_value().and_then(|dispatch| {
+                dispatch.candidates().iter().find_map(|candidate| {
+                    (candidate
+                        .target
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("helper"))
+                    .then(|| (call.clone(), candidate.clone()))
+                })
+            })
+        })
+        .expect("resolved helper call");
+    let call_row = procedure.semantics().call_site(call.id()).unwrap();
+    assert!(procedure.semantics().call_gap_candidates(call_row).iter().any(|gap| {
+        gap.base.discharge == brokk_bifrost_analysis::analyzer::semantic::SemanticGapDischarge::InertDropGlue
+    }), "caller receiver cleanup must be relevant to this binding projection");
+    let callee_proof_gaps = candidate
+        .target
+        .semantics()
+        .logical_gaps()
+        .filter(|gap| {
+            gap.base.impacts.contains(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticGapImpact::CallEvaluation,
+            ) || gap.base.impacts.contains(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticGapImpact::ReturnTransfer,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        callee_proof_gaps.is_empty(),
+        "callee proof gaps: {callee_proof_gaps:#?}"
+    );
+    let mut bindings_budget = SemanticBudget::new(limits).unwrap().unit_ledger();
+    let (bindings, observed) = SemanticRequest::new(&mut bindings_budget, &cancellation)
+        .judged_with_refusal(|request| {
+            oracle.call_bindings(&call, &candidate, &OracleCallContext::empty(), request)
+        });
+    assert_eq!(
+        bindings.reuse,
+        brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+            brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::BudgetRefusal,
+        ),
+    );
+    let bindings = bindings.value.unwrap();
+    let exceeded = bindings
+        .budget_exceeded()
+        .expect("caller source admission stop");
+    assert_eq!(exceeded.dimension(), SemanticBudgetDimension::SourceBytes);
+    assert_eq!(exceeded.limit(), 1);
+    assert_eq!(exceeded.attempted(), app.len());
+    let observed = observed.unwrap();
+    assert_eq!(observed.exceeded, exceeded);
+    eprintln!("caller cleanup admission refusal: {observed:?}");
+    assert_eq!(bindings_budget.first_refusal().unwrap().exceeded, exceeded);
+    assert_eq!(bindings_budget.refusal_count(), 1);
+    assert!(bindings_budget.refusal_origins().resident_only());
+    assert!(bindings.completed_replay().is_none());
+    let mut retry_budget = SemanticBudget::default();
+    let retry = oracle
+        .call_bindings(
+            &call,
+            &candidate,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+        )
+        .unwrap();
+    assert!(retry.available_value().is_some(), "{retry:#?}");
+    assert!(retry.budget_exceeded().is_none());
+    assert_eq!(retry_budget.refusal_count(), 0);
+
+    let mut control = SemanticBudget::default();
+    let outcome = oracle
+        .procedure_relations(
+            &procedure,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut control, &cancellation),
+        )
+        .unwrap();
+    assert!(control.first_refusal().is_none());
+    // The real Drop body retains content gaps; an unrestricted query must not
+    // acquire an operational stop merely because the bounded query ran first.
+    assert!(!outcome.available_value().unwrap().is_execution_dependent());
 }

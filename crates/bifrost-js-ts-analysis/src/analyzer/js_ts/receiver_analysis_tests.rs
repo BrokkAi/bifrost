@@ -42,56 +42,6 @@ mod tests {
 
     use brokk_bifrost_test_macros::hardwon;
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn scope_node_budget_is_per_receiver_query() {
-        let source = r#"
-class Service { run() {} }
-function makeService() { return new Service(); }
-export function first() {
-  const a0 = 0; const a1 = 1; const a2 = 2; const a3 = 3; const a4 = 4;
-  const a5 = 5; const a6 = 6; const a7 = 7; const a8 = 8; const a9 = 9;
-  const service = makeService();
-  // first call
-  service.run();
-}
-export function second() {
-  const b0 = 0; const b1 = 1; const b2 = 2; const b3 = 3; const b4 = 4;
-  const b5 = 5; const b6 = 6; const b7 = 7; const b8 = 8; const b9 = 9;
-  const service = makeService();
-  // second call
-  service.run();
-}
-"#;
-        let (_temp, file, analyzer) = test_project(source);
-        let tree = parse(source);
-        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
-        let provider = JsTsReceiverFactProvider::new(
-            &analyzer,
-            &definitions,
-            Language::TypeScript,
-            &file,
-            source,
-            tree.root_node(),
-            JsTsImportBinder::empty(),
-        );
-        let first = receiver_node(tree.root_node(), source, "first call", "service");
-        let second = receiver_node(tree.root_node(), source, "second call", "service");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 80,
-            ..ReceiverAnalysisBudget::default()
-        };
-
-        for receiver in [first, second] {
-            let outcome =
-                provider.resolve_member_targets(receiver, "run", receiver.start_byte(), budget);
-            assert!(
-                matches!(outcome, ReceiverAnalysisOutcome::Precise(ref targets) if targets.len() == 1),
-                "expected each lookup to stay within its own budget, got {outcome:?}"
-            );
-        }
-    }
-
     #[test]
     fn fanout_over_default_target_cap_is_ambiguous() {
         let source = r#"

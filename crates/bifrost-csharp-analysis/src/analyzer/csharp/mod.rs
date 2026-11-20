@@ -8,9 +8,7 @@
 //! `LanguageSupport` SPI block.
 
 use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
-use brokk_bifrost_analysis::analyzer::workspace_authority::{
-    WorkspaceAuthorityMemo, record_workspace_authority_read,
-};
+use brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read;
 use brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest;
 
 use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
@@ -27,8 +25,9 @@ use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
 #[doc(hidden)]
 pub mod adapter;
 mod attribute_type;
+mod base_receiver_intent;
 mod cache;
-mod call_conversion;
+pub(crate) mod call_conversion;
 mod catch_facts;
 mod clones;
 mod compilation;
@@ -38,7 +37,9 @@ pub(crate) mod diagnostics;
 pub mod external;
 mod hierarchy_provider;
 mod imports;
+mod input_identity;
 mod member_identity;
+mod receiver_seed;
 mod residual_conversion;
 mod semantic;
 mod structural;
@@ -276,14 +277,27 @@ fn project_global_using_rows<T>(
     }
 }
 
-type CSharpExternalIndexMemo = WorkspaceAuthorityMemo<
-    Arc<
-        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
-            brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
-                Arc<CSharpExternalDeclarationIndex>,
-            >,
-        >,
-    >,
+/// A fill retains only its scalar facts, never a discovery census. Reads of
+/// the cell and the carry name these original answers rather than sampling a
+/// new receipt for an old declaration index.
+#[derive(Clone, PartialEq, Eq)]
+struct CSharpExternalInputs {
+    carry: [u8; 32],
+    dependency: StableDigest,
+    artifact: StableDigest,
+    reusable: bool,
+}
+
+type CSharpExternalFill = brokk_bifrost_analysis::analyzer::external_carry::ExternalFill<
+    Arc<CSharpExternalDeclarationIndex>,
+    CSharpExternalInputs,
+>;
+type CSharpExternalCarry = brokk_bifrost_analysis::analyzer::external_carry::ExternalCarry<
+    Arc<CSharpExternalDeclarationIndex>,
+    CSharpExternalInputs,
+>;
+type CSharpExternalIndexMemo = brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+    brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<Arc<CSharpExternalFill>>,
 >;
 
 #[derive(Clone)]
@@ -292,6 +306,7 @@ pub struct CSharpAnalyzer {
     memo_caches: Arc<CSharpMemoCaches>,
     csharp_config: CSharpAnalyzerConfig,
     external_index: Arc<CSharpExternalIndexMemo>,
+    external_carry: CSharpExternalCarry,
 }
 
 impl_forward_query_provider!(CSharpAnalyzer);
@@ -324,11 +339,14 @@ impl CSharpAnalyzer {
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| Self {
-            inner: self.inner.update_all_with_progress(progress),
-            memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
-            csharp_config: self.csharp_config.clone(),
-            external_index: Self::empty_external_index(),
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::assemble(
+                self.inner.update_all_with_progress(progress),
+                Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+                self.csharp_config.clone(),
+                Self::empty_external_index(),
+                CSharpExternalCarry::default(),
+            )
         })
     }
 
@@ -342,10 +360,14 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut clone = self.clone_for_index_warm(project);
-        clone.memo_caches = Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes()));
-        clone.external_index = Self::empty_external_index();
-        clone
+        let clone = self.clone_for_index_warm(project);
+        Self::assemble(
+            clone.inner,
+            Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+            clone.csharp_config,
+            Self::empty_external_index(),
+            CSharpExternalCarry::default(),
+        )
     }
 
     pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
@@ -376,11 +398,36 @@ impl CSharpAnalyzer {
         csharp_config: CSharpAnalyzerConfig,
         memo_budget: u64,
     ) -> Self {
+        Self::assemble(
+            inner,
+            Arc::new(CSharpMemoCaches::new(memo_budget)),
+            csharp_config,
+            Self::empty_external_index(),
+            CSharpExternalCarry::default(),
+        )
+    }
+
+    /// The one place a generation's memo is paired with its inner analyzer: the
+    /// inner analyzer folds the compilation configuration from this same memo
+    /// into the identity of every scope read it records (#13307).
+    fn assemble(
+        inner: TreeSitterAnalyzer<CSharpAdapter>,
+        memo_caches: Arc<CSharpMemoCaches>,
+        csharp_config: CSharpAnalyzerConfig,
+        external_index: Arc<CSharpExternalIndexMemo>,
+        external_carry: CSharpExternalCarry,
+    ) -> Self {
+        let inner = inner.with_workspace_identity_extension(Arc::new(
+            compilation::CSharpIdentityExtension {
+                memo_caches: Arc::clone(&memo_caches),
+            },
+        ));
         Self {
             inner,
-            memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
+            memo_caches,
             csharp_config,
-            external_index: Self::empty_external_index(),
+            external_index,
+            external_carry,
         }
     }
 
@@ -583,44 +630,107 @@ impl CSharpAnalyzer {
         )
     }
 
-    // Installed assemblies and NuGet cache contents have no verifier input
-    // identity yet. Both a build and a retained hit must refuse unit reuse.
-    pub fn external_declaration_index(&self) -> Arc<CSharpExternalDeclarationIndex> {
-        self.external_index.read(
-            &memo_attribution(self),
-            |cell| {
-                brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
-                    self,
-                    cell,
-                    || {
-                        let value = CSharpExternalDeclarationIndex::build_for_project(
-                            &self.csharp_config,
-                            self.inner.project(),
-                        );
-                        for diagnostic in value.production_diagnostics() {
-                            self.record_query_incomplete(brokk_bifrost_analysis::analyzer::common::external_index_incompleteness(diagnostic));
-                        }
-                        Arc::new(value)
-                    },
-                )
-            },
-            |_| AuthorityInputs::Unnamed,
-        )
+    fn record_external_inputs(&self, inputs: &CSharpExternalInputs) {
+        if !inputs.reusable {
+            self.record_unattributed_read();
+            self.refuse_read_reuse();
+            return;
+        }
+        for (family, answer) in [
+            (
+                WorkspaceFactFamily::CSharpDependencyInputs,
+                inputs.dependency,
+            ),
+            (WorkspaceFactFamily::CSharpArtifactInputs, inputs.artifact),
+        ] {
+            record_workspace_authority_read(
+                self,
+                family,
+                AuthorityInputs::Fact {
+                    language: Language::CSharp,
+                    subject: FactSubject::Whole,
+                    answer,
+                },
+            );
+        }
     }
 
-    /// The assembly declaration index *if an earlier pass already built it*.
-    ///
-    /// [`Self::external_declaration_index`] builds on first access, which walks
-    /// the project for `project.assets.json` and decodes assembly metadata.
-    /// #1615 forbids that work inside a diagnostic request, so the proof-gated
-    /// ladder peeks here instead and treats an unbuilt index as an unknown
-    /// boundary rather than a reason to go and build one.
+    /// Every hit names the scalar facts bound to this fill. An unrelated
+    /// source file is not an input of external assembly declarations.
+    pub fn external_declaration_index(&self) -> Arc<CSharpExternalDeclarationIndex> {
+        self.external_declaration_index_with(CSharpExternalDeclarationIndex::build_from_sample)
+    }
+
+    /// The build step is a parameter so the race regression can change an input
+    /// between sampling and decoding (the boundary the JVM race test uses).
+    fn external_declaration_index_with(
+        &self,
+        build: impl FnOnce(&mut input_identity::Sample) -> (CSharpExternalDeclarationIndex, bool),
+    ) -> Arc<CSharpExternalDeclarationIndex> {
+        let fill = brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
+            self,
+            &self.external_index,
+            || {
+                let project = brokk_bifrost_analysis::analyzer::workspace::generation_dependency_discovery_project(self);
+                let mut sample =
+                    brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                        input_identity::sample(self, &self.csharp_config, project.as_ref())
+                    });
+                let inputs = CSharpExternalInputs {
+                    carry: sample.carry,
+                    dependency: sample.dependency,
+                    artifact: sample.artifact,
+                    reusable: sample.reusable,
+                };
+                self.record_external_inputs(&inputs);
+                let fill = self.external_carry.resolve(inputs, sample.reusable, || {
+                    let (index, exact) = build(&mut sample);
+                    let after =
+                        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                            input_identity::fresh_sample(
+                                self,
+                                &self.csharp_config,
+                                project.as_ref(),
+                            )
+                        });
+                    if !exact || !sample.same_inputs(&after) {
+                        self.record_unattributed_read();
+                        self.refuse_read_reuse();
+                    }
+                    Arc::new(index)
+                });
+                for diagnostic in fill.value().production_diagnostics() {
+                    self.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::common::external_index_incompleteness(
+                            diagnostic,
+                        ),
+                    );
+                }
+                fill
+            },
+        );
+        self.record_external_inputs(fill.inputs());
+        if self
+            .external_index
+            .get()
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), &fill))
+        {
+            self.external_carry.settle();
+        }
+        Arc::clone(fill.value())
+    }
+
+    /// The diagnostic ladder peeks without discovering or decoding assemblies.
     pub(crate) fn retained_external_index(&self) -> Option<&CSharpExternalDeclarationIndex> {
-        self.external_index.read(
-            &memo_attribution(self),
-            |cell| cell.get().map(|entry| entry.replay().as_ref()),
-            |_| AuthorityInputs::Unnamed,
-        )
+        let Some(entry) = self.external_index.get() else {
+            // Readiness is operational, not a fact about assembly content.
+            // A diagnostic that consumes the unbuilt state has no certificate.
+            self.record_unattributed_read();
+            return None;
+        };
+        let fill = entry.replay();
+        self.record_external_inputs(fill.inputs());
+        Some(fill.value().as_ref())
     }
 
     pub fn external_type_candidates(
@@ -1022,11 +1132,30 @@ impl CSharpAnalyzer {
         )
     }
 
+    /// The index memo and carry of the next generation: an empty cell, and this
+    /// generation's retained fill (or the candidate it never settled) as the
+    /// candidate that the next generation's first read compares against its
+    /// own discovery sample (#12745).
+    fn successor_external_index(&self) -> (Arc<CSharpExternalIndexMemo>, CSharpExternalCarry) {
+        let filled = self
+            .external_index
+            .get()
+            .map(|entry| Arc::clone(entry.value()));
+        (
+            Self::empty_external_index(),
+            self.external_carry.successor(filled.as_ref()),
+        )
+    }
+
+    /// Give a generation that no update touched an index slot of its own.
+    fn renew_external_index(&mut self) {
+        let (external_index, external_carry) = self.successor_external_index();
+        self.external_index = external_index;
+        self.external_carry = external_carry;
+    }
+
     fn empty_external_index() -> Arc<CSharpExternalIndexMemo> {
-        Arc::new(WorkspaceAuthorityMemo::new(
-            WorkspaceFactFamily::CSharpExternalDeclarations,
-            Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new()),
-        ))
+        Arc::new(CSharpExternalIndexMemo::new())
     }
 
     fn global_alias_inputs(aliases: &HashMap<String, String>) -> AuthorityInputs<'static> {
@@ -1686,6 +1815,15 @@ impl CodeUnitIndex for CSharpAnalyzer {
         self.inner.all_declarations()
     }
 
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
+    }
+
     delegate_inner_methods! {
         fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
@@ -1783,6 +1921,13 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    fn certify_selected_source_file(
+        &self,
+        expected: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedSourceFileCertificate<'_>,
+    ) -> bool {
+        self.inner.certify_selected_source_file(expected)
+    }
+
     fn certify_selected_configuration(
         &self,
         language: Language,
@@ -1808,7 +1953,12 @@ impl IAnalyzer for CSharpAnalyzer {
         }
         let snapshots =
             brokk_bifrost_core::hash::HashMap::from_iter([("csharp".to_owned(), snapshot.clone())]);
-        let overlay = self.record_membership_read(
+        // Certification records the configuration fact and the overlay
+        // membership only. The raw readers record their own dependencies: a
+        // path's selected version for membership, and the compilation's
+        // `CSharpCompilationGlobalUsings` fact for the global-using inventory,
+        // so an edit that adds no global using keeps a receipt (#13276).
+        let overlay = self.record_configuration_read(
             AnalyzerStore::native_configuration_overlay_mismatch_on_connection(
                 connection,
                 self.inner.project(),
@@ -1929,13 +2079,7 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.external_index
-            .read(
-                &memo_attribution(self),
-                |cell| cell.get().map(|entry| entry.replay().as_ref()),
-                |_| AuthorityInputs::Unnamed,
-            )
-            .is_some()
+        self.external_index.get().is_some()
     }
 
     fn semantic_diagnostics(
@@ -2014,31 +2158,10 @@ impl IAnalyzer for CSharpAnalyzer {
         Some(self.inner.snapshot_caches())
     }
 
-    fn workspace_content_identities(
+    delegate_inner_methods! {
+        fn workspace_content_identities(
         &self,
-    ) -> Option<brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentities>
-    {
-        let (_, _, compilation_digest, _, _) = self.compilation_config_identities()?;
-        let mut hasher = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
-            b"bifrost-csharp-content-with-compilation-config:v1",
-        );
-        hasher.field(
-            "sources",
-            self.inner
-                .language_content_identity_with_omissions()
-                .as_bytes(),
-        );
-        hasher.field("compilation_config", compilation_digest.as_bytes());
-        Some(
-            brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentities::new([
-                (
-                    Language::CSharp,
-                    brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest::from_array(
-                        hasher.finish(),
-                    ),
-                ),
-            ]),
-        )
+    ) -> Option<brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentities>;
     }
 
     delegate_inner_methods! {
@@ -2060,27 +2183,33 @@ impl IAnalyzer for CSharpAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let external_index = self.external_index.read(
-                &memo_attribution(self),
-                |cell| {
-                    Arc::new(WorkspaceAuthorityMemo::new(
-                        WorkspaceFactFamily::CSharpExternalDeclarations,
-                        brokk_bifrost_analysis::analyzer::updated_external_index(
-                            cell,
-                            changed_files,
-                            dependency_discovery::is_csharp_dependency_input,
-                        ),
-                    ))
-                },
-                |_| AuthorityInputs::Unnamed,
-            );
-            Self {
-                inner: self.inner.update_with_listing(changed_files, listing),
-                memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
-                csharp_config: self.csharp_config.clone(),
-                external_index,
-            }
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
+            // Dependency bytes invalidate external declarations even when membership is unchanged.
+            let (external_index, external_carry) = self.successor_external_index();
+            (
+                Self::assemble(
+                    inner,
+                    Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+                    self.csharp_config.clone(),
+                    external_index,
+                    external_carry,
+                ),
+                effects.no_changes_or_unreported(changed_files),
+            )
         })
     }
 
@@ -2633,11 +2762,34 @@ impl LanguageSupport for CSharpSupport {
         language: Language,
         subject: &FactSubject,
     ) -> Option<StableDigest> {
-        if language != Language::CSharp || *subject != FactSubject::Whole {
+        if language != Language::CSharp {
             return None;
         }
         let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
+        if let (WorkspaceFactFamily::CSharpCompilationGlobalUsings, FactSubject::Named { name }) =
+            (family, subject)
+        {
+            return csharp.compilation_global_using_answer(name);
+        }
+        if *subject != FactSubject::Whole {
+            return None;
+        }
         match family {
+            WorkspaceFactFamily::CSharpDependencyInputs
+            | WorkspaceFactFamily::CSharpArtifactInputs => {
+                let project = brokk_bifrost_analysis::analyzer::workspace::generation_dependency_discovery_project(analyzer);
+                let sample =
+                    brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                        input_identity::sample(analyzer, &csharp.csharp_config, project.as_ref())
+                    });
+                sample.reusable.then_some(
+                    if family == WorkspaceFactFamily::CSharpDependencyInputs {
+                        sample.dependency
+                    } else {
+                        sample.artifact
+                    },
+                )
+            }
             WorkspaceFactFamily::CSharpGlobalUsingAliases => {
                 let AuthorityInputs::Fact { answer, .. } = csharp.complete_global_alias_inputs()
                 else {
@@ -2860,6 +3012,34 @@ impl LanguageSupport for CSharpSupport {
         crate::analyzer::csharp::is_csharp_dependency_input_path(path)
     }
 
+    fn formal_parameter_syntax<'tree>(
+        &self,
+        list: tree_sitter::Node<'tree>,
+        step: &mut dyn FnMut() -> bool,
+    ) -> Option<
+        Option<Vec<brokk_bifrost_analysis::analyzer::lexical_definitions::ParameterSyntax<'tree>>>,
+    > {
+        if !matches!(list.kind(), "parameter_list" | "bracketed_parameter_list") {
+            return None;
+        }
+        Some(
+            brokk_bifrost_csharp::declarations::csharp_parameter_syntax(list, step).map(
+                |formals| {
+                    formals
+                        .into_iter()
+                        .map(|formal| {
+                            brokk_bifrost_analysis::analyzer::lexical_definitions::ParameterSyntax {
+                                anchor: formal.anchor,
+                                name: formal.name,
+                                variadic: formal.params,
+                            }
+                        })
+                        .collect()
+                },
+            ),
+        )
+    }
+
     fn call_argument_conversion_prover(
         &self,
     ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::usages::call_conversion::CallArgumentConversionProver>
@@ -2951,6 +3131,21 @@ struct CSharpEdgePass;
 impl LanguageEdgePass for CSharpEdgePass {
     fn id(&self) -> EdgePassId {
         EdgePassId::CSharp
+    }
+
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<CSharpAnalyzer>(
+            analyzer,
+        )
+        .map_or_else(
+            || Ok(Vec::new()),
+            |csharp| csharp.inner.selected_graph_source_exclusions(),
+        )
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
@@ -3154,7 +3349,10 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for CSha
         Box::new(CSharpAnalyzer::update_all_with_progress(self, progress))
     }
 
-    brokk_bifrost_analysis::delegate_generation_membership_updates!(CSharpAnalyzer);
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(
+        CSharpAnalyzer,
+        |next: &mut CSharpAnalyzer| next.renew_external_index()
+    );
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -3208,6 +3406,7 @@ mod dependency_packs {
             config: &AnalyzerConfig,
             project: &dyn Project,
             _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -3217,6 +3416,53 @@ mod dependency_packs {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CSharpSupport {
+    fn has_conditional_type_seeds(&self) -> bool {
+        true
+    }
+
+    fn selected_conditional_type_seed(
+        &self,
+        _selection: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        slot: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        context: &brokk_bifrost_analysis::analyzer::resolution::ConditionalTypeSeedContext<'_>,
+        cancellation: &brokk_bifrost_analysis::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::resolution::ConditionalTypeSeedRead,
+    > {
+        receiver_seed::seed(slot, context, cancellation)
+    }
+
+    fn selected_deferred_base_receiver_intent(
+        &self,
+        slot: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        reader: &dyn brokk_bifrost_analysis::analyzer::resolution::fact_source::DeferredBaseReceiverIntentReader,
+        cancellation: &brokk_bifrost_analysis::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::resolution::fact_source::DeferredBaseReceiverIntentRead,
+    > {
+        base_receiver_intent::intent(slot, reader, cancellation)
+    }
+
+    fn requires_selected_nominal_parent_kind(&self) -> bool {
+        true
+    }
+
+    fn selected_implicit_root_rules(
+        &self,
+    ) -> Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers> {
+        // The shared scheduler admits nominal defaults now. Interface lookup
+        // remains explicitly Open until its constrained selected-inventory
+        // view is implemented; it must not synthesize Java declarations.
+        static RULES: brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers =
+            brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers {
+                owner: "System.Object",
+                simple_name: "Object",
+                methods: None,
+                declaration: None,
+            };
+        Some(&RULES)
+    }
+
     fn certifies_reference_inventory(&self, producer_epoch: &str) -> bool {
         // The fail-closed enumeration (#12013) exists only in the native-facts producer.
         // When native C# becomes the production producer (#7314 M11), this follows its epoch.
@@ -3507,12 +3753,15 @@ mod dead_code_cache_tests {
         assert_eq!(deleted, 1);
         let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
         let _answer = analyzer.search_definitions("Only", true);
-        let reason = scope
+        scope
             .read_completion()
             .expect_err("lookup must be incomplete");
+        let entry_error = scope
+            .store_error()
+            .expect("the entry-time decision census records a store error");
         assert!(
-            format!("{reason:?}").contains("1 source versions without decisions"),
-            "{reason:?}"
+            format!("{entry_error:?}").contains("1 source versions without decisions"),
+            "{entry_error:?}"
         );
     }
 
@@ -3853,6 +4102,10 @@ mod package_inventory_gate_tests {
 #[cfg(test)]
 mod native_producer_tests {
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn csharp_trial_cold_index_publishes_resolution_rows() {
         const CHILD: &str = "BIFROST_CSHARP_COLD_INDEX_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -4670,26 +4923,28 @@ mod complete_external_index_tests {
         let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
         let failed = {
             let scope = AnalyzerQueryScope::new(&analyzer);
-            let index = analyzer.external_index.read(
-                &memo_attribution(&analyzer),
-                |cell| {
-                    brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
-                        &analyzer,
-                        cell,
-                        || {
-                            analyzer.record_query_failure(
-                                brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                                    "injected store failure",
-                                ),
-                            );
-                            Arc::new(CSharpExternalDeclarationIndex::build_for_project(
-                                &analyzer.csharp_config,
-                                analyzer.inner.project(),
-                            ))
+            let index = brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
+                &analyzer,
+                &analyzer.external_index,
+                || {
+                    analyzer.record_query_failure(
+                        brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                            "injected store failure",
+                        ),
+                    );
+                    Arc::new(CSharpExternalFill::new(
+                        Arc::new(CSharpExternalDeclarationIndex::build_for_project(
+                            &analyzer.csharp_config,
+                            analyzer.inner.project(),
+                        )),
+                        CSharpExternalInputs {
+                            carry: [0; 32],
+                            dependency: StableDigest::from_array([0; 32]),
+                            artifact: StableDigest::from_array([0; 32]),
+                            reusable: false,
                         },
-                    )
+                    ))
                 },
-                |_| AuthorityInputs::Unnamed,
             );
             assert!(
                 scope.store_error().is_some(),
@@ -4704,7 +4959,7 @@ mod complete_external_index_tests {
         assert!(retry.is_complete());
         assert!(retry.production_diagnostics().is_empty());
         assert!(scope.read_completion().is_ok());
-        assert!(!Arc::ptr_eq(&failed, &retry));
+        assert!(!Arc::ptr_eq(failed.value(), &retry));
         assert!(analyzer.retained_external_index().is_some());
         assert!(Arc::ptr_eq(&retry, &analyzer.external_declaration_index()));
     }
@@ -4859,6 +5114,333 @@ mod complete_external_index_tests {
         ));
         assert!(scope.store_error().is_none());
     }
+
+    // #12745: the next generation keeps the C# external index only when its own
+    // discovery sample equals the one the index was built from.
+    fn carry_fixture(assets: Option<&str>) -> crate::inline_project::BuiltInlineTestProject {
+        let mut builder =
+            InlineTestProject::with_language(Language::CSharp).file("A.cs", "class A {}");
+        if let Some(assets) = assets {
+            builder = builder
+                .file("projects/Referenced/Referenced.csproj", "<Project />")
+                .file("obj/project.assets.json", assets);
+        }
+        let fixture = builder.build();
+        if assets.is_some() {
+            let bin = fixture.root().join("projects/Referenced/bin/Debug/net8.0");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("ExternalLibrary.dll"), "MZ not a CLI assembly").unwrap();
+        }
+        fixture
+    }
+
+    fn project_reference_assets(output: &str) -> String {
+        serde_json::json!({
+            "targets": { "net8.0": {
+                "Referenced/1.0.0": { "compile": { format!("bin/placeholder/{output}"): {} } }
+            } },
+            "libraries": { "Referenced/1.0.0": {
+                "type": "project", "path": "projects/Referenced/Referenced.csproj"
+            } }
+        })
+        .to_string()
+    }
+
+    fn carry_config(explicit: bool) -> AnalyzerConfig {
+        let mut config = AnalyzerConfig::default();
+        if explicit {
+            config.csharp.assembly_paths = vec![std::path::PathBuf::from("broken.dll")];
+        }
+        config
+    }
+
+    fn assert_index_equals_from_scratch(
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+        config: AnalyzerConfig,
+        updated: &CSharpExternalDeclarationIndex,
+    ) {
+        let scratch = CSharpAnalyzer::new_with_config(Arc::new(fixture.project().clone()), config)
+            .external_declaration_index();
+        assert_eq!(updated.is_complete(), scratch.is_complete());
+        assert_eq!(
+            format!("{:?}", updated.production_diagnostics()),
+            format!("{:?}", scratch.production_diagnostics())
+        );
+    }
+
+    fn updated_index_after(
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+        config: AnalyzerConfig,
+        changed: &[&str],
+        edit: impl FnOnce(),
+    ) -> (
+        Arc<CSharpExternalDeclarationIndex>,
+        Arc<CSharpExternalDeclarationIndex>,
+    ) {
+        let base = CSharpAnalyzer::new_with_config(Arc::new(fixture.project().clone()), config);
+        let before = base.external_declaration_index();
+        edit();
+        let changed = changed.iter().map(|path| fixture.file(path)).collect();
+        let updated = IAnalyzer::update(&base, &changed);
+        (before, updated.external_declaration_index())
+    }
+
+    /// The receipt of one first read: its recorded keys and its channels.
+    type CarryReceipt = (
+        Vec<brokk_bifrost_analysis::analyzer::ReadKey>,
+        usize,
+        usize,
+        bool,
+        bool,
+    );
+
+    fn first_read(
+        analyzer: &CSharpAnalyzer,
+    ) -> (Arc<CSharpExternalDeclarationIndex>, CarryReceipt) {
+        let (index, reads) =
+            brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                analyzer.external_declaration_index()
+            });
+        (
+            index,
+            (
+                reads.keys(),
+                reads.unattributed_reads(),
+                reads.execution_dependences(),
+                reads.reuse_refused(),
+                reads.is_bounded(),
+            ),
+        )
+    }
+
+    #[test]
+    fn an_edit_outside_the_discovery_inputs_keeps_the_external_index() {
+        for assets in [None, Some(project_reference_assets("ExternalLibrary.dll"))] {
+            let fixture = carry_fixture(assets.as_deref());
+            if assets.is_none() {
+                std::fs::write(
+                    fixture.file("broken.dll").abs_path(),
+                    "MZ not a CLI assembly",
+                )
+                .unwrap();
+            }
+            let config = || carry_config(assets.is_none());
+            let base =
+                CSharpAnalyzer::new_with_config(Arc::new(fixture.project().clone()), config());
+            let (before, _) = first_read(&base);
+            std::fs::write(fixture.file("A.cs").abs_path(), "class A { int x; }").unwrap();
+            let updated = IAnalyzer::update(&base, &BTreeSet::from([fixture.file("A.cs")]));
+            let (after, warm) = first_read(&updated);
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "an unrelated edit rebuilt the index"
+            );
+            assert_index_equals_from_scratch(&fixture, config(), &after);
+            // The carried generation records what a cold read records.
+            let scratch =
+                CSharpAnalyzer::new_with_config(Arc::new(fixture.project().clone()), config());
+            let (_, cold) = first_read(&scratch);
+            assert_eq!(warm, cold, "the warm receipt differs from the cold one");
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#12834: a C# external index built while its input changed was kept under the old sample and carried after a restore"
+    )]
+    fn an_assembly_changed_during_build_is_not_retained_or_carried_after_restore() {
+        let fixture = carry_fixture(None);
+        let assembly = fixture.file("broken.dll").abs_path();
+        let original = b"MZ not a CLI assembly";
+        std::fs::write(&assembly, original).unwrap();
+        let base = CSharpAnalyzer::new_with_config(
+            Arc::new(fixture.project().clone()),
+            carry_config(true),
+        );
+        let (raced, reads) = brokk_bifrost_analysis::analyzer::capture_query_reads(&base, || {
+            base.external_declaration_index_with(|sample| {
+                // The build closure is the same boundary used by the JVM race
+                // regression: change the input after sampling, before decoding.
+                std::fs::write(&assembly, b"MZ a different and longer invalid assembly").unwrap();
+                CSharpExternalDeclarationIndex::build_from_sample(sample)
+            })
+        });
+        assert!(reads.reuse_refused(), "raced fill was admitted: {reads:?}");
+        assert!(
+            base.external_index.get().is_none(),
+            "raced fill was retained"
+        );
+        std::fs::write(&assembly, original).unwrap();
+        std::fs::write(fixture.file("A.cs").abs_path(), "class A { int x; }").unwrap();
+        let updated = IAnalyzer::update(&base, &BTreeSet::from([fixture.file("A.cs")]));
+        assert!(
+            updated.external_carry.pending().is_none(),
+            "raced fill was carried"
+        );
+        let builds = std::cell::Cell::new(0);
+        let restored = updated.external_declaration_index_with(|sample| {
+            builds.set(builds.get() + 1);
+            CSharpExternalDeclarationIndex::build_from_sample(sample)
+        });
+        assert_eq!(builds.get(), 1, "restored inputs must rebuild");
+        assert!(!Arc::ptr_eq(&raced, &restored));
+        assert_index_equals_from_scratch(&fixture, carry_config(true), &restored);
+        assert!(Arc::ptr_eq(
+            &restored,
+            &updated.external_declaration_index()
+        ));
+    }
+
+    #[test]
+    fn an_incomplete_discovery_refuses_the_carry() {
+        // A malformed assets file leaves discovery incomplete without an
+        // incomplete reason; an unchanged incomplete outcome is not reusable.
+        let fixture = carry_fixture(Some("{ this is not json"));
+        let base = CSharpAnalyzer::new_with_config(
+            Arc::new(fixture.project().clone()),
+            carry_config(false),
+        );
+        let (before, _) = first_read(&base);
+        assert!(
+            !before.production_diagnostics().is_empty() || !before.is_complete(),
+            "the fixture must make discovery incomplete"
+        );
+        // The sample itself refuses: an unchanged incomplete outcome is never a
+        // reusable one. (The cell does not retain this fill, so the refusal is
+        // pinned on the sample and the end result below.)
+        let discovery =
+            CSharpExternalDeclarationIndex::discover(&base.csharp_config, base.inner.project());
+        assert!(!discovery.complete);
+        assert!(!input_identity::sample(&base, &base.csharp_config, base.inner.project()).reusable);
+        let complete = carry_fixture(Some(&project_reference_assets("ExternalLibrary.dll")));
+        assert!(
+            input_identity::sample(&base, &CSharpAnalyzerConfig::default(), complete.project())
+                .reusable
+        );
+        std::fs::write(fixture.file("A.cs").abs_path(), "class A { int x; }").unwrap();
+        let updated = IAnalyzer::update(&base, &BTreeSet::from([fixture.file("A.cs")]));
+        let (after, receipt) = first_read(&updated);
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "an incomplete discovery was carried"
+        );
+        assert!(
+            !receipt.4,
+            "the receipt of an incomplete discovery must be unbounded"
+        );
+        assert_index_equals_from_scratch(&fixture, carry_config(false), &after);
+    }
+
+    #[test]
+    fn adding_and_removing_an_assets_file_is_not_carried() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "class A {}")
+            .file("projects/Referenced/Referenced.csproj", "<Project />")
+            .build();
+        let bin = fixture.root().join("projects/Referenced/bin/Debug/net8.0");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("ExternalLibrary.dll"), "MZ not a CLI assembly").unwrap();
+        let assets = fixture.file("obj/project.assets.json");
+        let base = CSharpAnalyzer::new_with_config(
+            Arc::new(fixture.project().clone()),
+            carry_config(false),
+        );
+        let none = base.external_declaration_index();
+        std::fs::create_dir_all(assets.abs_path().parent().unwrap()).unwrap();
+        std::fs::write(
+            assets.abs_path(),
+            project_reference_assets("ExternalLibrary.dll"),
+        )
+        .unwrap();
+        let added = IAnalyzer::update(&base, &BTreeSet::from([assets.clone()]));
+        let with_assets = added.external_declaration_index();
+        assert!(
+            !Arc::ptr_eq(&none, &with_assets),
+            "an added assets file was carried"
+        );
+        assert_ne!(
+            format!("{:?}", none.production_diagnostics()),
+            format!("{:?}", with_assets.production_diagnostics()),
+            "the assets file must change what the index answers"
+        );
+        assert_index_equals_from_scratch(&fixture, carry_config(false), &with_assets);
+        std::fs::remove_file(assets.abs_path()).unwrap();
+        let removed = IAnalyzer::update(&added, &BTreeSet::from([assets]));
+        let without = removed.external_declaration_index();
+        assert!(
+            !Arc::ptr_eq(&with_assets, &without),
+            "a removed assets file was carried"
+        );
+        assert_index_equals_from_scratch(&fixture, carry_config(false), &without);
+    }
+
+    #[test]
+    fn a_changed_explicit_assembly_is_not_carried() {
+        let fixture = carry_fixture(None);
+        std::fs::write(
+            fixture.file("broken.dll").abs_path(),
+            "MZ not a CLI assembly",
+        )
+        .unwrap();
+        let (before, after) =
+            updated_index_after(&fixture, carry_config(true), &["broken.dll"], || {
+                std::fs::write(
+                    fixture.file("broken.dll").abs_path(),
+                    "MZ a different broken body",
+                )
+                .unwrap();
+            });
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a rewritten assembly was carried"
+        );
+        assert_index_equals_from_scratch(&fixture, carry_config(true), &after);
+    }
+
+    #[test]
+    fn a_changed_assets_file_is_not_carried() {
+        let fixture = carry_fixture(Some(&project_reference_assets("ExternalLibrary.dll")));
+        let (before, after) = updated_index_after(
+            &fixture,
+            carry_config(false),
+            &["obj/project.assets.json"],
+            || {
+                std::fs::write(
+                    fixture.file("obj/project.assets.json").abs_path(),
+                    project_reference_assets("Other.dll"),
+                )
+                .unwrap();
+            },
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a changed assets file was carried"
+        );
+        assert_ne!(
+            format!("{:?}", before.production_diagnostics()),
+            format!("{:?}", after.production_diagnostics()),
+            "the assets change must change what the index answers"
+        );
+        assert_index_equals_from_scratch(&fixture, carry_config(false), &after);
+    }
+
+    #[test]
+    fn a_changed_project_output_found_by_the_bin_walk_is_not_carried() {
+        let fixture = carry_fixture(Some(&project_reference_assets("ExternalLibrary.dll")));
+        let output = "projects/Referenced/bin/Debug/net8.0/ExternalLibrary.dll";
+        let (before, after) = updated_index_after(&fixture, carry_config(false), &[output], || {
+            std::fs::remove_file(fixture.file(output).abs_path()).unwrap();
+        });
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a removed project output was carried"
+        );
+        assert_ne!(
+            format!("{:?}", before.production_diagnostics()),
+            format!("{:?}", after.production_diagnostics())
+        );
+        assert_index_equals_from_scratch(&fixture, carry_config(false), &after);
+    }
 }
 
 #[cfg(test)]
@@ -4875,6 +5457,10 @@ mod trial_epoch_reopen_tests {
 
     #[test]
     #[hardwon("#7314: C# trial rows could be selected after a cross-mode store reopen")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn csharp_trial_reopen_reconciles_to_each_modes_fresh_rows() {
         use crate::inline_project::InlineTestProject;
         let fixture = InlineTestProject::with_language(Language::CSharp)

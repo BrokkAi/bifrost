@@ -7,15 +7,20 @@
 //! These facts are now loaded as bounded, seed-based walks on the analyzer.
 //! The analyzer instance IS the generation: `RustAnalyzer::update` and
 //! `update_all` construct a fresh analyzer with fresh caches, so a cache living
-//! here needs only the query key. Every derivation below consults analyzer
-//! state such as structural parents, visibility, Cargo routes, and the analyzed-
-//! file set. A content-hash key would claim an invariance these values do not
-//! have.
+//! here uses the query key and validates the fill's exact live reader binding.
+//! Every derivation below consults analyzer state such as structural parents,
+//! visibility, Cargo routes, and the analyzed-file set. A content-hash key alone
+//! would claim an invariance these values do not have. Completed Open walks
+//! retain and replay their typed causes; in-flight or aborted work is not kept.
 
+use brokk_bifrost_core::analyzer::internal_memo_partitions;
 use brokk_bifrost_core::analyzer::memo_attribution::{
     CapturedMemoReads, ReplayingMemo, ReplayingMemoEntry,
 };
-use brokk_bifrost_core::analyzer::project_reads::{OpaqueReadReceipt, ReadCapability};
+use brokk_bifrost_core::analyzer::project_reads::{
+    ErasedCapturedReads, OpaqueReadReceipt, ReadCapability,
+};
+use brokk_bifrost_core::analyzer::query_read_incomplete::QueryReadIncomplete;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_core::retention_budget::{
@@ -26,7 +31,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportLookupDependency, ImportResolutionDependencies,
@@ -68,24 +73,114 @@ use crate::usage::{
 use crate::usage_queries::{RustImportBinding, RustUsageQueries};
 use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
 
-// Opt-in measurement of false-to-true route transitions, without changing routing.
-static PARTIAL_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
-
-fn partial_transition_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var_os("BIFROST_11799_WALK_DIAGNOSTICS").is_some();
-        if enabled {
-            eprintln!("11799 partial_transition/walk=0");
-        }
-        enabled
-    })
-}
-
 /// One module's bindings are asked for by `(file, module)`.
 pub type RustModuleBindingKey = (ProjectFile, ModuleKey);
 type ModuleDeclarations = HashMap<String, Vec<ProjectFile>>;
 type OriginRouteMap = HashMap<String, Vec<RustOriginRoute>>;
+
+/// Immutable completion evidence captured by the concrete analyzer. It owns
+/// typed causes, not a query token or a borrowed reader. Named input reads are
+/// retained separately by the existing replaying walk entry.
+#[doc(hidden)]
+pub trait WalkCompletionReceipt: Send + Sync + std::any::Any {
+    fn matches_binding(&self, binding: &dyn std::any::Any) -> bool;
+    fn collect_causes(&self, into: &mut Vec<WalkCauseKey>);
+    fn witness(&self) -> Option<&WalkCauseKey>;
+    fn digest(&self) -> [u8; 32];
+    fn allocated_bytes(&self) -> usize;
+    /// Completion-only replay: the walk entry restores its read channels.
+    fn replay(&self);
+}
+
+/// A completed capture, possibly open. The receipt's owned typed reasons are
+/// the authority for completion; no independent route-completeness bit lives
+/// beside them. An operationally stopped capture produces no such handle.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct WalkCompletion(Arc<dyn WalkCompletionReceipt>);
+
+impl WalkCompletion {
+    pub fn captured(receipt: impl WalkCompletionReceipt) -> Self {
+        Self(Arc::new(receipt))
+    }
+
+    pub fn receipt(&self) -> &dyn WalkCompletionReceipt {
+        self.0.as_ref()
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.0.witness().is_some()
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        self.0.digest()
+    }
+
+    pub fn replay(&self) {
+        self.0.replay();
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.0.allocated_bytes()
+    }
+}
+
+/// The outcome of capturing one leaf route read.
+#[doc(hidden)]
+pub enum LeafCompletion {
+    /// An operational cause stopped the capture; nothing may be retained.
+    Aborted(Vec<QueryReadIncomplete>),
+    /// No typed cause was recorded. Closed reads are never observed.
+    Closed,
+    Open(WalkCompletion),
+}
+
+fn missing_route_failure_cause() -> QueryReadIncomplete {
+    QueryReadIncomplete::InternalInvariant("route_read: failed producer recorded no typed cause")
+}
+
+/// Full canonical typed-cause encoding, ordered by its bytes. This is not a
+/// rendered diagnostic or a lossy hash: the minimum has an unambiguous total
+/// order even when a non-witness cause changes.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WalkCauseKey(Arc<[u8]>);
+impl WalkCauseKey {
+    pub fn from_canonical_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes.into())
+    }
+    /// Share an already interned canonical encoding without copying it.
+    pub fn from_shared(bytes: std::sync::Arc<[u8]>) -> Self {
+        Self(bytes)
+    }
+    pub fn allocated_bytes(&self) -> usize {
+        brokk_bifrost_core::allocation_size::allocation_size(
+            self.0.len() + 2 * std::mem::size_of::<usize>(),
+        )
+    }
+}
+
+/// Canonical identity covers the complete returned typed cause set, not only
+/// the minimum witness used to distinguish Open from Closed.
+#[doc(hidden)]
+pub fn walk_completion_digest(mut causes: Vec<WalkCauseKey>) -> [u8; 32] {
+    causes.sort_unstable();
+    causes.dedup();
+    sorted_walk_completion_digest(&causes)
+}
+
+/// The digest of an already sorted, deduplicated cause set: byte-identical to
+/// `walk_completion_digest` of the same causes, without copying or re-sorting.
+#[doc(hidden)]
+pub fn sorted_walk_completion_digest(causes: &[WalkCauseKey]) -> [u8; 32] {
+    debug_assert!(causes.windows(2).all(|pair| pair[0] < pair[1]));
+    let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+        b"rust-walk-completion:v1",
+    );
+    hash.field("complete", &[u8::from(causes.is_empty())]);
+    hash.sequence("causes", causes, |hash, cause| hash.value(&cause.0));
+    hash.finish()
+}
 
 fn import_module_path_key(module: &ModuleKey) -> String {
     format!("{}::{}", module.crate_root, module.components.join("::"))
@@ -190,7 +285,240 @@ where
 /// the fill made. They are one allocation with one charge: the budget charges
 /// the receipt once however many keys the walk settled, and evicting the fill
 /// frees all of it at once.
-type WalkEntry<K, T> = ReplayingMemoEntry<Vec<(K, T)>, OpaqueReadReceipt>;
+type WalkEntry<K, T> = ReplayingMemoEntry<WalkValues<K, T>, OpaqueReadReceipt>;
+
+struct WalkValues<K, T> {
+    values: Vec<(K, WalkState<T>)>,
+    // The graph is charged once by the fill. Alias projections borrow that
+    // backing through Arcs; caller observations keep the charged fill alive.
+    graph: Option<Arc<CompletionGraph>>,
+}
+impl<K, T> std::ops::Deref for WalkValues<K, T> {
+    type Target = [(K, WalkState<T>)];
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+type ReadPartition = Arc<ErasedCapturedReads>;
+
+fn clone_read_recipe(
+    reads: &CapturedMemoReads<OpaqueReadReceipt>,
+) -> CapturedMemoReads<OpaqueReadReceipt> {
+    CapturedMemoReads {
+        runtime_cache_touched: reads.runtime_cache_touched,
+        keys: Arc::clone(&reads.keys),
+        channels: reads.channels,
+        first_refusal: reads.first_refusal.clone(),
+        first_execution_refusal: reads.first_execution_refusal.clone(),
+    }
+}
+
+pub(crate) struct CycleCompletions<K> {
+    direct: HashMap<K, Option<Vec<WalkCompletion>>>,
+    reads: HashMap<K, Vec<ReadPartition>>,
+    dependencies: HashMap<K, Vec<K>>,
+}
+
+impl<K> CycleCompletions<K> {
+    fn partitions(&self) -> impl Iterator<Item = &ErasedCapturedReads> {
+        self.reads.values().flatten().map(Arc::as_ref)
+    }
+}
+
+struct CapturedCycleStep {
+    completion: Option<WalkCompletion>,
+    reads: Vec<ReadPartition>,
+}
+
+struct CompletionNode {
+    direct: Vec<WalkCompletion>,
+    reads: Vec<ReadPartition>,
+    dependencies: Vec<usize>,
+    // A node whose actual direct causes witness this projection's openness.
+    // None is the closed projection after reverse reachability completes.
+    witness: Option<WalkCauseKey>,
+    // The completion's canonical digest, computed once on first use and owned
+    // here: every alias hit reads it instead of re-collecting the cause set.
+    digest: std::sync::OnceLock<[u8; 32]>,
+}
+
+/// One immutable graph per fill, not one transitive receipt list per alias.
+/// Storage follows the captured work and dependency edges, including cycles.
+struct CompletionGraph {
+    currency: WalkCompletion,
+    common: ReadPartition,
+    nodes: Vec<CompletionNode>,
+}
+impl CompletionGraph {
+    fn new<K: Eq + std::hash::Hash>(
+        keys: &[K],
+        mut captured: CycleCompletions<K>,
+        currency: WalkCompletion,
+        common: ReadPartition,
+        current: &dyn Fn(&WalkCompletion) -> bool,
+    ) -> Option<Self> {
+        let indices: HashMap<_, _> = keys.iter().enumerate().map(|(at, key)| (key, at)).collect();
+        let mut nodes = Vec::with_capacity(keys.len());
+        for key in keys {
+            let direct = captured.direct.remove(key)??;
+            if direct.iter().any(|receipt| !current(receipt)) {
+                return None;
+            }
+            let mut unique = HashSet::default();
+            let direct = direct
+                .into_iter()
+                .filter(|receipt| receipt.is_open() && unique.insert(receipt.digest()))
+                .collect::<Vec<_>>();
+            let dependencies = captured
+                .dependencies
+                .remove(key)
+                .unwrap_or_default()
+                .iter()
+                .map(|key| indices.get(key).copied())
+                .collect::<Option<Vec<_>>>()?;
+            nodes.push(CompletionNode {
+                witness: None,
+                digest: std::sync::OnceLock::new(),
+                direct,
+                reads: captured.reads.remove(key).unwrap_or_default(),
+                dependencies,
+            });
+        }
+        let mut dependents = vec![Vec::new(); nodes.len()];
+        let mut pending = std::collections::BinaryHeap::new();
+        for (at, node) in nodes.iter().enumerate() {
+            if let Some(witness) = node
+                .direct
+                .iter()
+                .filter_map(|receipt| receipt.receipt().witness())
+                .min()
+            {
+                pending.push(std::cmp::Reverse((witness.clone(), at)));
+            }
+            for dependency in &node.dependencies {
+                dependents[*dependency].push(at);
+            }
+        }
+        // Multi-source minimum propagation finalizes each node once. Witness
+        // choice uses the total order of full typed causes, never traversal or
+        // HashMap order. This does not change the value walk's work queue.
+        while let Some(std::cmp::Reverse((witness, at))) = pending.pop() {
+            if nodes[at].witness.is_some() {
+                continue;
+            }
+            nodes[at].witness = Some(witness.clone());
+            for parent in &dependents[at] {
+                if nodes[*parent].witness.is_none() {
+                    pending.push(std::cmp::Reverse((witness.clone(), *parent)));
+                }
+            }
+        }
+        Some(Self {
+            currency,
+            common,
+            nodes,
+        })
+    }
+
+    fn visit(&self, root: usize, mut visit: impl FnMut(&WalkCompletion)) {
+        let mut pending = vec![root];
+        let mut seen = HashSet::default();
+        while let Some(at) = pending.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            let node = &self.nodes[at];
+            // Settlement already proved that this node reaches no Open cause.
+            // Closed alias hits must not re-walk an empty completion closure.
+            if node.witness.is_none() {
+                continue;
+            }
+            for receipt in &node.direct {
+                visit(receipt);
+            }
+            pending.extend(node.dependencies.iter().rev().copied());
+        }
+    }
+
+    fn recipe(&self, root: usize) -> CapturedMemoReads<OpaqueReadReceipt> {
+        let mut pending = vec![root];
+        let mut seen = HashSet::default();
+        let mut parts = vec![self.common.as_ref()];
+        while let Some(at) = pending.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            let node = &self.nodes[at];
+            // Closed completion does not mean no input reads. Every reachable
+            // node contributes its own leaves, including Closed dependencies.
+            parts.extend(node.reads.iter().map(Arc::as_ref));
+            pending.extend(node.dependencies.iter().rev().copied());
+        }
+        internal_memo_partitions::recipe(parts)
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        let read_bytes = internal_memo_partitions::retained_bytes(
+            std::iter::once(&self.common)
+                .chain(self.nodes.iter().flat_map(|node| node.reads.iter())),
+        );
+        let mut seen = HashSet::default();
+        seen.insert(Arc::as_ptr(&self.currency.0) as *const () as usize);
+        self.nodes.iter().fold(
+            allocation_size(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())
+                + crate::cache::vec_buffer_bytes(&self.nodes)
+                + read_bytes,
+            |bytes, node| {
+                bytes
+                    + crate::cache::vec_buffer_bytes(&node.direct)
+                    + crate::cache::vec_buffer_bytes(&node.reads)
+                    + crate::cache::vec_buffer_bytes(&node.dependencies)
+                    + node
+                        .direct
+                        .iter()
+                        .filter(|receipt| {
+                            seen.insert(Arc::as_ptr(&receipt.0) as *const () as usize)
+                        })
+                        .map(WalkCompletion::allocated_bytes)
+                        .sum::<usize>()
+            },
+        )
+    }
+}
+
+struct ProjectedCompletion {
+    graph: Arc<CompletionGraph>,
+    root: usize,
+}
+impl WalkCompletionReceipt for ProjectedCompletion {
+    fn matches_binding(&self, binding: &dyn std::any::Any) -> bool {
+        self.graph.currency.receipt().matches_binding(binding)
+    }
+    fn witness(&self) -> Option<&WalkCauseKey> {
+        self.graph.nodes[self.root].witness.as_ref()
+    }
+    fn collect_causes(&self, into: &mut Vec<WalkCauseKey>) {
+        self.graph
+            .visit(self.root, |receipt| receipt.receipt().collect_causes(into));
+    }
+    fn digest(&self) -> [u8; 32] {
+        *self.graph.nodes[self.root].digest.get_or_init(|| {
+            let mut causes = Vec::new();
+            self.collect_causes(&mut causes);
+            walk_completion_digest(causes)
+        })
+    }
+    fn allocated_bytes(&self) -> usize {
+        brokk_bifrost_core::allocation_size::allocation_size(
+            std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>(),
+        )
+    }
+    fn replay(&self) {
+        self.graph.visit(self.root, WalkCompletion::replay);
+    }
+}
 
 /// A region slot for one key. The asked key's slot owns its fill. Each other
 /// key the walk settled holds the fill weakly, so evicting the owner's slot
@@ -222,46 +550,144 @@ impl<K, T> RetainedBytes for WalkSlot<K, T> {
     }
 }
 
-/// One value of a kept fill, whatever the fill's key type.
-trait FillValue<T>: Send + Sync {
-    fn value_at(&self, index: usize) -> &T;
+/// The one semantic state of a walk value. An unfinished fixed point is
+/// provisional; persistent incompleteness is a settled answer with causes.
+enum WalkState<T> {
+    Provisional(T),
+    SettledClosed {
+        value: T,
+        completion: WalkCompletion,
+    },
+    SettledOpen {
+        value: T,
+        completion: WalkCompletion,
+    },
 }
 
-impl<K: Send + Sync, T: Send + Sync> FillValue<T> for WalkEntry<K, T> {
-    fn value_at(&self, index: usize) -> &T {
-        &self.value()[index].1
+impl<T> WalkState<T> {
+    fn settled(value: T, completion: WalkCompletion) -> Self {
+        if completion.is_open() {
+            Self::SettledOpen { value, completion }
+        } else {
+            Self::SettledClosed { value, completion }
+        }
+    }
+
+    fn value(&self) -> &T {
+        match self {
+            Self::Provisional(value)
+            | Self::SettledClosed { value, .. }
+            | Self::SettledOpen { value, .. } => value,
+        }
+    }
+
+    fn completion(&self) -> Option<&WalkCompletion> {
+        match self {
+            Self::Provisional(_) => None,
+            Self::SettledClosed { completion, .. } | Self::SettledOpen { completion, .. } => {
+                Some(completion)
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        matches!(self, Self::SettledClosed { .. })
     }
 }
 
-/// A walk value held by a caller. It holds the fill itself, so the fill's
-/// charge lasts as long as any holder, whether or not the region has evicted
-/// it since.
+trait CompletionOwner: Send + Sync {
+    fn completion_at(&self, index: usize) -> Option<&WalkCompletion>;
+    fn closed_at(&self, index: usize) -> bool;
+}
+trait FillValue<T>: CompletionOwner {
+    fn value_at(&self, index: usize) -> &T;
+}
+impl<K: Send + Sync, T: Send + Sync> CompletionOwner for WalkEntry<K, T> {
+    fn completion_at(&self, index: usize) -> Option<&WalkCompletion> {
+        self.value()[index].1.completion()
+    }
+    fn closed_at(&self, index: usize) -> bool {
+        self.value()[index].1.is_closed()
+    }
+}
+impl<K: Send + Sync, T: Send + Sync> FillValue<T> for WalkEntry<K, T> {
+    fn value_at(&self, index: usize) -> &T {
+        self.value()[index].1.value()
+    }
+}
+impl<T: Send + Sync> CompletionOwner for WalkState<T> {
+    fn completion_at(&self, _: usize) -> Option<&WalkCompletion> {
+        self.completion()
+    }
+    fn closed_at(&self, _: usize) -> bool {
+        self.is_closed()
+    }
+}
+impl<T: Send + Sync> FillValue<T> for WalkState<T> {
+    fn value_at(&self, _: usize) -> &T {
+        self.value()
+    }
+}
+
+/// Aborted computations have no settled state and no region slot.
+struct UncapturedWalkValue<T>(T);
+impl<T: Send + Sync> CompletionOwner for UncapturedWalkValue<T> {
+    fn completion_at(&self, _: usize) -> Option<&WalkCompletion> {
+        None
+    }
+    fn closed_at(&self, _: usize) -> bool {
+        false
+    }
+}
+impl<T: Send + Sync> FillValue<T> for UncapturedWalkValue<T> {
+    fn value_at(&self, _: usize) -> &T {
+        &self.0
+    }
+}
+
+/// An observation holds the charged fill, not an independently escaping
+/// receipt Arc. Eviction cannot release the charge before this holder drops.
+struct ObservedWalk {
+    owner: Arc<dyn CompletionOwner>,
+    index: usize,
+}
+
+/// A caller-held value. Retained fills remain charged through their last
+/// holder; in-flight and aborted results never have a region slot.
 pub struct Walked<T> {
     fill: Arc<dyn FillValue<T>>,
     index: usize,
 }
 
 impl<T: Send + Sync + 'static> Walked<T> {
-    /// A value that no cache keeps and that made no reads.
     pub(crate) fn request_only(value: T) -> Self {
-        let fill: Arc<WalkEntry<(), T>> = Arc::new(ReplayingMemoEntry::from_parts(
-            vec![((), value)],
-            CapturedMemoReads {
-                runtime_cache_touched: false,
-                keys: Arc::from([]),
-                channels: Default::default(),
-                first_refusal: None,
-                first_execution_refusal: None,
-            },
-        ));
-        Self { fill, index: 0 }
+        Self {
+            fill: Arc::new(UncapturedWalkValue(value)),
+            index: 0,
+        }
+    }
+
+    fn request_state(value: WalkState<T>) -> Self {
+        Self {
+            fill: Arc::new(value),
+            index: 0,
+        }
     }
 }
 
 impl<T> Walked<T> {
-    /// Whether both handles are the one value of the one kept fill.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         Arc::ptr_eq(&this.fill, &other.fill) && this.index == other.index
+    }
+
+    /// Closed-only projections use this after the lookup has observed its
+    /// completion. An empty open value does not establish absence.
+    pub fn is_closed(&self) -> bool {
+        self.fill.closed_at(self.index)
+    }
+
+    fn completion(&self) -> Option<&WalkCompletion> {
+        self.fill.completion_at(self.index)
     }
 }
 
@@ -270,7 +696,6 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Walked<T> {
         (**self).fmt(f)
     }
 }
-
 impl<T> Clone for Walked<T> {
     fn clone(&self) -> Self {
         Self {
@@ -279,7 +704,6 @@ impl<T> Clone for Walked<T> {
         }
     }
 }
-
 impl<T> std::ops::Deref for Walked<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -291,21 +715,17 @@ impl<T> std::ops::Deref for Walked<T> {
 /// walk settled it (and any further keys it settled on the way) or only
 /// produced a provisional value inside a cycle that is still open.
 pub(crate) enum WalkFill<K, T> {
-    /// Returned to this caller and not kept: the cycle that owns it has not
-    /// closed, so the value can still grow.
     Provisional(T),
-    /// Kept under the asked key. `also` are the other keys the same walk
-    /// settled; they share the walk's receipt, which over-approximates theirs,
-    /// and are kept in the same fill.
-    Settled { value: T, also: Vec<(K, T)> },
+    Settled(T),
+    Group {
+        value: T,
+        also: Vec<(K, T)>,
+        completions: CycleCompletions<K>,
+    },
 }
-
 impl<K, T> WalkFill<K, T> {
     pub(crate) fn settled(value: T) -> Self {
-        Self::Settled {
-            value,
-            also: Vec::new(),
-        }
+        Self::Settled(value)
     }
 }
 
@@ -351,83 +771,172 @@ where
         &self,
         reads: &ReadCapability,
         key: &K,
-        compute: impl FnOnce() -> Result<WalkFill<K, T>, E>,
+        current: &dyn Fn(&WalkCompletion) -> bool,
+        compute: impl FnOnce() -> Result<(WalkFill<K, T>, Option<WalkCompletion>), E>,
     ) -> Result<Walked<T>, E> {
-        let mut index = 0;
-        let fill = self
+        let mut uncached = None;
+        let built_here = Cell::new(false);
+        let result = self
             .memo
             .read(&reads.memo_attribution(), |region, capture| {
                 if let Some(slot) = region.get(key) {
-                    match &*slot {
-                        WalkSlot::Owner(fill) => {
-                            self.hits.fetch_add(1, AtomicOrdering::Relaxed);
-                            return Ok(Arc::clone(fill.arc()));
+                    let candidate = match &*slot {
+                        WalkSlot::Owner(fill) => Some((Arc::clone(fill.arc()), 0)),
+                        WalkSlot::Settled { fill, index } => {
+                            fill.upgrade().map(|fill| (fill, *index))
                         }
-                        WalkSlot::Settled { fill, index: at } => {
-                            if let Some(fill) = fill.upgrade() {
-                                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
-                                index = *at;
-                                return Ok(fill);
-                            }
-                        }
+                    };
+                    if let Some((fill, at)) = candidate
+                        && fill.value()[at].1.completion().is_some_and(current)
+                    {
+                        self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                        let recipe = if let Some(graph) = &fill.value().graph {
+                            graph.recipe(at)
+                        } else {
+                            clone_read_recipe(fill.captured_reads())
+                        };
+                        // Only this transient selection entry is presented to
+                        // automatic replay. It drops before the accessor returns.
+                        return Ok(Arc::new(ReplayingMemoEntry::from_parts(
+                            Walked { fill, index: at },
+                            recipe,
+                        )));
                     }
                 }
-                let (fill, filled) = capture.try_build(compute)?.into_parts();
-                Ok(match fill {
-                    WalkFill::Provisional(value) => Arc::new(ReplayingMemoEntry::from_parts(
-                        vec![(key.clone(), value)],
-                        filled,
-                    )),
-                    WalkFill::Settled { value, also } => {
-                        debug_assert!(
-                            also.iter().all(|(other, _)| other != key),
-                            "a settled key would replace the slot that owns its fill"
-                        );
-                        let mut values = Vec::with_capacity(1 + also.len());
-                        values.push((key.clone(), value));
-                        values.extend(also);
-                        let bytes = values.iter().fold(
-                            std::mem::size_of_val(&values)
-                                + crate::cache::vec_buffer_bytes(&values),
-                            |bytes, (key, value)| {
-                                bytes
-                                    .saturating_add((self.weigh)(key, value) as usize)
-                                    .saturating_add(key.retained_bytes())
-                                    .saturating_sub(std::mem::size_of::<(K, T)>())
-                            },
-                        );
-                        let mut fill =
-                            ReplayingMemoEntry::from_parts_weighted(values, filled, bytes);
-                        fill.charge_allocated(&self.budget, OpaqueReadReceipt::retained_bytes);
-                        let fill = Arc::new(fill);
-                        // A fill the budget cannot take stays request-only, and
-                        // so do the keys it settled.
-                        if let BudgetedValue::Retained(_) = region.insert(
-                            key.clone(),
-                            WalkSlot::Owner(SharedAllocation::new(Arc::clone(&fill))),
-                        ) {
-                            for (at, (other, _)) in fill.value().iter().enumerate().skip(1) {
-                                drop(region.insert(
-                                    other.clone(),
-                                    WalkSlot::Settled {
-                                        fill: Arc::downgrade(&fill),
-                                        index: at,
-                                    },
-                                ));
-                            }
+                built_here.set(true);
+                let (((fill, completion), common, retained_recipe), cold_recipe) = capture
+                    .try_build(|| {
+                        // The common partition contains only work outside the direct
+                        // queue steps. Those steps carry their own backend leaves.
+                        let (result, common) = internal_memo_partitions::capture(reads, compute);
+                        let common = Arc::new(common);
+                        let mut parts = vec![common.as_ref()];
+                        if let Ok((WalkFill::Group { completions, .. }, _)) = &result {
+                            parts.extend(completions.partitions());
                         }
-                        fill
+                        let recipe = internal_memo_partitions::recipe(parts);
+                        ReplayingMemoEntry::from_parts((), clone_read_recipe(&recipe))
+                            .replay(&reads.memo_attribution());
+                        // This ordinary outer capture forwards the executed recipe
+                        // once even on error. Its cold selection is recognized by
+                        // MemoReadCapture, so it is not forwarded a second time.
+                        result.map(|result| (result, common, recipe))
+                    })
+                    .map_err(Some)?
+                    .into_parts();
+                let (value, also, captured) = match fill {
+                    WalkFill::Provisional(value) => {
+                        uncached = Some(Walked::request_state(WalkState::Provisional(value)));
+                        return Err(None);
                     }
-                })
-            })?;
-        Ok(Walked {
-            fill: fill.into_entry(),
-            index,
-        })
-    }
-
-    fn invalidate_all(&self) {
-        self.memo.invalidate_all();
+                    WalkFill::Settled(value) => (value, Vec::new(), None),
+                    WalkFill::Group {
+                        value,
+                        also,
+                        completions,
+                    } => (value, also, Some(completions)),
+                };
+                let Some(completion) = completion else {
+                    uncached = Some(Walked::request_only(value));
+                    return Err(None);
+                };
+                let content = cold_recipe.channels.execution_dependences == 0
+                    && !cold_recipe.channels.reuse_refused
+                    && !cold_recipe.channels.store_failed
+                    && cold_recipe.channels.explicit_verdict.is_content()
+                    && cold_recipe.first_execution_refusal.is_none();
+                if !content || !current(&completion) {
+                    uncached = Some(Walked::request_state(WalkState::settled(value, completion)));
+                    return Err(None);
+                }
+                let graph = if let Some(captured) = captured {
+                    let mut keys = Vec::with_capacity(1 + also.len());
+                    keys.push(key.clone());
+                    keys.extend(also.iter().map(|(key, _)| key.clone()));
+                    let Some(graph) =
+                        CompletionGraph::new(&keys, captured, completion.clone(), common, current)
+                    else {
+                        uncached =
+                            Some(Walked::request_state(WalkState::settled(value, completion)));
+                        return Err(None);
+                    };
+                    Some(Arc::new(graph))
+                } else {
+                    None
+                };
+                let root = WalkState::settled(value, completion);
+                let mut values = Vec::with_capacity(1 + also.len());
+                values.push((key.clone(), root));
+                for (at, (key, value)) in also.into_iter().enumerate() {
+                    let graph =
+                        Arc::clone(graph.as_ref().expect("only a settled group has aliases"));
+                    let completion = WalkCompletion::captured(ProjectedCompletion {
+                        graph,
+                        root: at + 1,
+                    });
+                    values.push((key, WalkState::settled(value, completion)));
+                }
+                let bytes = values.iter().fold(
+                    std::mem::size_of::<WalkValues<K, T>>()
+                        + crate::cache::vec_buffer_bytes(&values)
+                        + graph.as_ref().map_or(0, |graph| graph.allocated_bytes()),
+                    |bytes, (key, state)| {
+                        bytes
+                            .saturating_add((self.weigh)(key, state.value()) as usize)
+                            .saturating_add(key.retained_bytes())
+                            .saturating_sub(std::mem::size_of::<(K, T)>())
+                            .saturating_add(
+                                state
+                                    .completion()
+                                    .map_or(0, WalkCompletion::allocated_bytes),
+                            )
+                    },
+                );
+                let mut fill = ReplayingMemoEntry::from_parts_weighted(
+                    WalkValues { values, graph },
+                    retained_recipe,
+                    bytes,
+                );
+                if fill.value().graph.is_some() {
+                    // All opaque leaf payloads are already counted by the shared
+                    // graph. The entry accounts for its recipe's own array only.
+                    fill.charge_allocated(&self.budget, |_| 0);
+                } else {
+                    fill.charge_allocated(&self.budget, OpaqueReadReceipt::retained_bytes);
+                }
+                let fill = Arc::new(fill);
+                if let BudgetedValue::Retained(_) = region.insert(
+                    key.clone(),
+                    WalkSlot::Owner(SharedAllocation::new(Arc::clone(&fill))),
+                ) {
+                    for (at, (other, _)) in fill.value().iter().enumerate().skip(1) {
+                        drop(region.insert(
+                            other.clone(),
+                            WalkSlot::Settled {
+                                fill: Arc::downgrade(&fill),
+                                index: at,
+                            },
+                        ));
+                    }
+                }
+                Ok(Arc::new(ReplayingMemoEntry::from_parts(
+                    Walked { fill, index: 0 },
+                    cold_recipe,
+                )))
+            });
+        match result {
+            Ok(selected) => {
+                let value = (*selected).clone();
+                if !built_here.get()
+                    && let Some(completion) = value.completion()
+                {
+                    completion.replay();
+                }
+                Ok(value)
+            }
+            Err(Some(error)) => Err(error),
+            Err(None) => Ok(uncached.expect("an unretained fill returned its own value")),
+        }
     }
 }
 
@@ -448,7 +957,6 @@ where
 /// which is the correct invalidation for analyzer-derived state and the same
 /// argument the Milestone 2b Decision Log records for `declaration_facts`.
 pub struct RustWalkCaches {
-    budget: RetentionBudget,
     module_files: ReplayingWalkCache<String, Vec<ProjectFile>>,
     /// Module declarations of one short name, grouped by the module package
     /// each names. The store lookup is keyed on this short name.
@@ -484,7 +992,6 @@ pub struct RustWalkCaches {
 impl RustWalkCaches {
     pub fn new(budget: &RetentionBudget) -> Self {
         Self {
-            budget: budget.clone(),
             module_files: ReplayingWalkCache::new(
                 budget,
                 "rust.walk.module_files",
@@ -557,22 +1064,6 @@ impl RustWalkCaches {
         }
     }
 
-    fn invalidate_all(&self) {
-        self.module_files.invalidate_all();
-        self.module_declarations.invalidate_all();
-        self.module_probes.invalidate_all();
-        self.owner_roots.invalidate_all();
-        self.module_domains.invalidate_all();
-        self.alias_routes.invalidate_all();
-        self.forward_import_edges.invalidate_all();
-        self.binding_edges.invalidate_all();
-        self.module_bindings.invalidate_all();
-        self.origin_routes.invalidate_all();
-        self.macro_scope_edges.invalidate_all();
-        self.macro_visible_ranges.invalidate_all();
-        self.include_routes.invalidate_all();
-    }
-
     /// How many times the four-candidate filesystem probe actually ran, for the
     /// memo's regression pin.
     pub fn module_probe_computations(&self) -> u64 {
@@ -625,24 +1116,35 @@ impl RustWalkCaches {
     }
 }
 
-/// Request-private caches used after a walk sees a partial route answer.
-/// Dropping the guard clears every region; caller-held values remain charged
-/// until their final holder drops.
-struct RequestWalkCaches {
-    caches: RustWalkCaches,
+/// Provisional dependencies are request-local cycle keys, never a retained
+/// authority or a second memo. A completed group discharges its own keys.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum WalkDependency {
+    Alias(ModuleKey),
+    Binding(RustModuleBindingKey),
 }
 
-impl RequestWalkCaches {
-    fn new(owner: &RustWalkCaches) -> Self {
-        Self {
-            caches: RustWalkCaches::new(&owner.budget),
-        }
+type DependencyStack = RefCell<Vec<HashSet<WalkDependency>>>;
+struct DependencyCapture<'a>(Option<&'a DependencyStack>);
+impl<'a> DependencyCapture<'a> {
+    fn new(stack: &'a DependencyStack) -> Self {
+        stack.borrow_mut().push(HashSet::default());
+        Self(Some(stack))
+    }
+    fn finish(mut self) -> HashSet<WalkDependency> {
+        self.0
+            .take()
+            .expect("active dependency scope")
+            .borrow_mut()
+            .pop()
+            .expect("dependency scope")
     }
 }
-
-impl Drop for RequestWalkCaches {
+impl Drop for DependencyCapture<'_> {
     fn drop(&mut self) {
-        self.caches.invalidate_all();
+        if let Some(stack) = self.0.take() {
+            stack.borrow_mut().pop().expect("dependency scope");
+        }
     }
 }
 
@@ -659,19 +1161,15 @@ pub struct RustUsageWalks<'a> {
     /// the proof for the syntax reads its walks make (issue #2414 step 3).
     token: QueryToken<'a>,
     queries: RustUsageQueries<'a>,
-    /// The files whose route question failed on this walker, so it is not
-    /// asked again. Answers that succeeded are not kept here: see
-    /// `file_routes`.
-    failed_routes: RefCell<HashSet<ProjectFile>>,
-    /// Set when this walker has seen a route answer that may omit units. A
-    /// value derived after that point could be an answer about a partial crate,
-    /// so it goes to `partial_caches` and not to the caches that outlive the
-    /// request (see `walk_caches`).
-    routes_partial: Cell<bool>,
-    partial_caches: std::cell::OnceCell<RequestWalkCaches>,
-    /// The packages whose member list came from an answer that may omit
-    /// members. An empty list for one of them is unknown, not a proof.
-    partial_packages: RefCell<HashSet<String>>,
+    /// Typed open/aborted route reads observed by this request. Closed reads
+    /// need no retained observer entry. This derives negative-proof coverage,
+    /// not cache admission; each memo value carries its own completion.
+    observed: RefCell<HashMap<Option<[u8; 32]>, Option<ObservedWalk>>>,
+    /// Request-local suppression of failed file-route demands. Each later
+    /// consumer replays the original failure into its own completion owner.
+    /// These causes never enter the generation cache.
+    failed_routes: RefCell<HashMap<ProjectFile, Vec<QueryReadIncomplete>>>,
+    dependencies: DependencyStack,
     files: RustPackageFileIndex<'a>,
     pub caches: Arc<RustWalkCaches>,
     /// Replays a kept walk value's fill reads into this walker's consumer.
@@ -726,6 +1224,9 @@ struct CycleWalk<K, V> {
     /// Reverse dependency edges used to revisit a key when one of its inputs
     /// grows. A key can depend on itself in a one-module re-export cycle.
     dependents: HashMap<K, HashSet<K>>,
+    dependencies: HashMap<K, Vec<K>>,
+    completions: HashMap<K, Option<Vec<WalkCompletion>>>,
+    read_partitions: HashMap<K, Vec<ReadPartition>>,
     /// The key whose compute body is currently running, if any. Nested calls
     /// to `resolve_with_cycles` use this to register a dependency instead of
     /// recursing.
@@ -744,6 +1245,9 @@ impl<K, V> Default for CycleWalk<K, V> {
             queue: VecDeque::new(),
             queued: HashSet::default(),
             dependents: HashMap::default(),
+            dependencies: HashMap::default(),
+            completions: HashMap::default(),
+            read_partitions: HashMap::default(),
             current: None,
             running: false,
         }
@@ -754,7 +1258,11 @@ impl<K, V> Default for CycleWalk<K, V> {
 enum CycleAnswer<K, V> {
     /// The outermost frame closed its walk: `value` is final, and so is every
     /// `(key, value)` in `settled`.
-    Settled { value: V, settled: Vec<(K, V)> },
+    Settled {
+        value: V,
+        settled: Vec<(K, V)>,
+        completions: CycleCompletions<K>,
+    },
     /// A value from a walk that is still running, or one that cancellation cut
     /// short. Correct for the frame that asked; not correct in general, so it
     /// must not reach the analyzer cache.
@@ -768,6 +1276,24 @@ enum CycleAnswer<K, V> {
 /// partial values rather than recursing. `seed` supplies the first partial
 /// value -- for the export chain that is the module's own declarations, which
 /// is what the v1 worklist seeded before it propagated anything.
+fn capture_cycle_step<T, E>(
+    capture: &dyn Fn(&mut dyn FnMut()) -> CapturedCycleStep,
+    forward: &dyn Fn(&[ReadPartition]),
+    compute: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, CapturedCycleStep), E> {
+    let mut compute = Some(compute);
+    let mut result = None;
+    let receipt = capture(&mut || result = Some(compute.take().expect("one cycle step")()));
+    match result.expect("the completion capture ran its cycle step") {
+        Ok(value) => Ok((value, receipt)),
+        Err(error) => {
+            forward(&receipt.reads);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
 fn resolve_with_cycles<K, V, E>(
     walk: &RefCell<CycleWalk<K, Arc<Vec<V>>>>,
     key: &K,
@@ -779,30 +1305,72 @@ where
     K: Clone + Eq + std::hash::Hash,
     V: Eq + std::hash::Hash,
 {
+    resolve_with_cycles_captured(
+        walk,
+        key,
+        cancelled,
+        seed,
+        compute,
+        &|build| {
+            build();
+            CapturedCycleStep {
+                completion: None,
+                reads: Vec::new(),
+            }
+        },
+        &|_| {},
+    )
+}
+
+fn resolve_with_cycles_captured<K, V, E>(
+    walk: &RefCell<CycleWalk<K, Arc<Vec<V>>>>,
+    key: &K,
+    cancelled: &dyn Fn() -> bool,
+    seed: &dyn Fn(&K) -> Result<Vec<V>, E>,
+    compute: &dyn Fn(&K) -> Result<Vec<V>, E>,
+    capture: &dyn Fn(&mut dyn FnMut()) -> CapturedCycleStep,
+    forward: &dyn Fn(&[ReadPartition]),
+) -> Result<CycleAnswer<K, Arc<Vec<V>>>, E>
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Eq + std::hash::Hash,
+{
     // A nested request is a dependency edge, not a recursive call. Return the
     // value currently known for the dependency and queue it for computation.
     if walk.borrow().running {
         let dependency = key.clone();
-        let seeded = {
-            let state = walk.borrow();
-            (!state.partial.contains_key(&dependency))
-                .then(|| seed(&dependency))
-                .transpose()?
-                .map(Arc::new)
-        };
+        let needs_seed = !walk.borrow().partial.contains_key(&dependency);
+        let seeded = needs_seed
+            .then(|| capture_cycle_step(capture, forward, || seed(&dependency)))
+            .transpose()?
+            .map(|(value, completion)| (Arc::new(value), completion));
         let mut state = walk.borrow_mut();
-        if let Some(value) = seeded {
+        if let Some((value, completion)) = seeded {
             state.partial.insert(dependency.clone(), value);
+            state.completions.insert(
+                dependency.clone(),
+                completion.completion.map(|receipt| vec![receipt]),
+            );
+            state
+                .read_partitions
+                .insert(dependency.clone(), completion.reads);
         }
         let parent = state
             .current
             .clone()
             .expect("nested cycle lookup must have an active work item");
-        state
+        if state
             .dependents
             .entry(dependency.clone())
             .or_default()
-            .insert(parent);
+            .insert(parent.clone())
+        {
+            state
+                .dependencies
+                .entry(parent)
+                .or_default()
+                .push(dependency.clone());
+        }
         if !state.resolved.contains(&dependency) && state.queued.insert(dependency.clone()) {
             // Work newly discovered dependencies before older pending work.
             // This keeps an acyclic export ladder linear while retaining the
@@ -812,9 +1380,15 @@ where
         return Ok(CycleAnswer::Provisional(Arc::clone(&state.partial[key])));
     }
 
+    let (initial, completion) = capture_cycle_step(capture, forward, || seed(key))?;
     {
         let mut state = walk.borrow_mut();
-        let initial = Arc::new(seed(key)?);
+        let initial = Arc::new(initial);
+        state.completions.insert(
+            key.clone(),
+            completion.completion.map(|receipt| vec![receipt]),
+        );
+        state.read_partitions.insert(key.clone(), completion.reads);
         state.running = true;
         state.partial.insert(key.clone(), initial);
         state.queue.push_back(key.clone());
@@ -834,17 +1408,25 @@ where
         }
         first_item = false;
         walk.borrow_mut().current = Some(next.clone());
-        let value = match compute(&next) {
+        let (value, completion) = match capture_cycle_step(capture, forward, || compute(&next)) {
             Ok(value) => value,
             Err(error) => {
                 let mut state = walk.borrow_mut();
+                let reads = std::mem::take(&mut state.read_partitions)
+                    .into_values()
+                    .flatten()
+                    .collect::<Vec<_>>();
                 state.partial.clear();
                 state.resolved.clear();
                 state.queue.clear();
                 state.queued.clear();
                 state.dependents.clear();
+                state.dependencies.clear();
+                state.completions.clear();
                 state.current = None;
                 state.running = false;
+                drop(state);
+                forward(&reads);
                 return Err(error);
             }
         };
@@ -852,6 +1434,17 @@ where
             let mut state = walk.borrow_mut();
             state.current = None;
             state.resolved.insert(next.clone());
+            state
+                .read_partitions
+                .entry(next.clone())
+                .or_default()
+                .extend(completion.reads);
+            match (state.completions.get_mut(&next), completion.completion) {
+                (Some(Some(receipts)), Some(receipt)) => receipts.push(receipt),
+                _ => {
+                    state.completions.insert(next.clone(), None);
+                }
+            }
             let value = Arc::new(value);
             // A round rebuilds the value from scratch, so the same elements can
             // come back in another order. Compare the two rounds as sets: equal
@@ -880,26 +1473,50 @@ where
     }
 
     let mut state = walk.borrow_mut();
-    // A cancelled walk stopped with unfinished queue work, so its values are
-    // truncated rather than converged and nothing may be published.
-    let settled = if cancelled() {
-        Vec::new()
-    } else {
+    let stopped = cancelled();
+    let closed = !stopped && state.queue.is_empty();
+    let value = Arc::clone(&state.partial[key]);
+    let settled = if closed {
         state
             .resolved
             .iter()
-            .map(|settled| (settled.clone(), Arc::clone(&state.partial[settled])))
+            .map(|key| (key.clone(), Arc::clone(&state.partial[key])))
             .collect()
+    } else {
+        Vec::new()
     };
-    let value = Arc::clone(&state.partial[key]);
+    let completions = CycleCompletions {
+        direct: std::mem::take(&mut state.completions),
+        reads: std::mem::take(&mut state.read_partitions),
+        dependencies: std::mem::take(&mut state.dependencies),
+    };
     state.partial.clear();
     state.resolved.clear();
     state.queue.clear();
     state.queued.clear();
     state.dependents.clear();
+    state.dependencies.clear();
+    state.completions.clear();
     state.current = None;
     state.running = false;
-    Ok(CycleAnswer::Settled { value, settled })
+    drop(state);
+    if closed {
+        Ok(CycleAnswer::Settled {
+            value,
+            settled,
+            completions,
+        })
+    } else {
+        // No graph is retained for a stop, but all work already executed is
+        // still input to the interrupted caller.
+        let reads = completions
+            .reads
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        forward(&reads);
+        Ok(CycleAnswer::Provisional(value))
+    }
 }
 
 /// One name bound in one module, with the declaration it really names.
@@ -974,16 +1591,14 @@ impl<'a> RustUsageWalks<'a> {
         token: QueryToken<'a>,
         keep_going: Option<&'a dyn Fn() -> bool>,
     ) -> Result<Self, RustCargoRouteError> {
-        partial_transition_diagnostics_enabled();
         let files = RustPackageFileIndex::new(analyzer, token, keep_going);
         Ok(Self {
             analyzer,
             token,
             queries: RustUsageQueries::new(analyzer),
-            failed_routes: RefCell::new(HashSet::default()),
-            routes_partial: Cell::new(false),
-            partial_caches: std::cell::OnceCell::new(),
-            partial_packages: RefCell::new(HashSet::default()),
+            observed: RefCell::new(HashMap::default()),
+            failed_routes: RefCell::new(HashMap::default()),
+            dependencies: RefCell::new(Vec::new()),
             files,
             caches: Arc::clone(analyzer.walk_caches()),
             reads: analyzer.read_capability(),
@@ -994,11 +1609,82 @@ impl<'a> RustUsageWalks<'a> {
         })
     }
 
-    fn observe_partial_transition(&self) {
-        if !self.routes_partial.get() && partial_transition_diagnostics_enabled() {
-            let count = PARTIAL_TRANSITIONS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            eprintln!("11799 partial_transition/walk={count}");
+    fn note_provisional(&self, key: WalkDependency) {
+        for capture in self.dependencies.borrow_mut().iter_mut() {
+            capture.insert(key.clone());
         }
+    }
+
+    fn settle_dependencies(&self, keys: impl IntoIterator<Item = WalkDependency>) {
+        let keys = keys.into_iter().collect::<HashSet<_>>();
+        for capture in self.dependencies.borrow_mut().iter_mut() {
+            capture.retain(|key| !keys.contains(key));
+        }
+    }
+
+    fn observe(&self, completion: LeafCompletion) -> Vec<QueryReadIncomplete> {
+        match completion {
+            LeafCompletion::Open(completion) => {
+                let digest = completion.digest();
+                self.observed
+                    .borrow_mut()
+                    .entry(Some(digest))
+                    .or_insert_with(|| {
+                        Some(ObservedWalk {
+                            owner: Arc::new(WalkState::settled((), completion)),
+                            index: 0,
+                        })
+                    });
+            }
+            LeafCompletion::Aborted(reasons) => {
+                self.observed.borrow_mut().insert(None, None);
+                return reasons;
+            }
+            LeafCompletion::Closed => {}
+        }
+        Vec::new()
+    }
+
+    fn observe_walk<T: 'static>(&self, walked: &Walked<T>) {
+        if let Some(completion) = walked.completion()
+            && completion.is_open()
+        {
+            let digest = completion.digest();
+            self.observed
+                .borrow_mut()
+                .entry(Some(digest))
+                .or_insert_with(|| {
+                    Some(ObservedWalk {
+                        owner: walked.fill.clone(),
+                        index: walked.index,
+                    })
+                });
+        }
+    }
+
+    fn route_read<T>(
+        &self,
+        read: impl FnOnce() -> Result<T, RustCargoRouteError>,
+    ) -> Result<T, (RustCargoRouteError, Vec<QueryReadIncomplete>)> {
+        let mut read = Some(read);
+        let mut result = None;
+        let completion = self.analyzer.capture_leaf_completion(&mut || {
+            result = Some(read.take().expect("one route read")());
+        });
+        let result = result.expect("the completion capture ran its builder");
+        let mut reasons = self.observe(completion);
+        result.map_err(|error| {
+            debug_assert!(
+                !reasons.is_empty(),
+                "a failed route read records its typed cause"
+            );
+            if reasons.is_empty() {
+                reasons.push(missing_route_failure_cause());
+                self.analyzer.replay_route_failure(&reasons);
+                self.observed.borrow_mut().insert(None, None);
+            }
+            (error, reasons)
+        })
     }
 
     pub fn package_files(&self) -> &RustPackageFileIndex<'a> {
@@ -1041,7 +1727,7 @@ impl<'a> RustUsageWalks<'a> {
 
     /// The routes of the units that hold `file`.
     ///
-    /// Every call asks the analyzer. Its request memo answers a repeated
+    /// Every successful question asks the analyzer. Its request memo answers a repeated
     /// question and replays the answer's reads into the consumer asking now,
     /// so a walk-cache fill that asks what another fill already asked still
     /// records the routes it depends on. A walker-local copy would give that
@@ -1051,54 +1737,62 @@ impl<'a> RustUsageWalks<'a> {
     /// A route error leaves the answer empty and incomplete: the producer has
     /// recorded the structured failure on the query scope, which rejects the
     /// enclosing result, and a cancelled walk is stopped by its own polling.
-    /// A failed question is not asked again: the incomplete answer already
-    /// keeps every later value of this walker out of the shared caches.
+    /// An unavailable question is not asked again. Its original typed causes
+    /// are replayed into each later consumer, and the aborted observation
+    /// keeps later values of this walker out of the shared caches.
+    /// Cancellation is retried so each consumer observes its typed cause and
+    /// a progress predicate that resumes can ask the producer again.
     pub fn file_routes(&self, file: &ProjectFile) -> RustFileRoutes {
-        if self.failed_routes.borrow().contains(file) {
+        if let Some(reasons) = self.failed_routes.borrow().get(file) {
+            self.analyzer.replay_route_failure(reasons);
             return RustFileRoutes::with_completeness(Vec::new(), false);
         }
-        let routes = match self.analyzer.file_routes(file, self.keep_going) {
+        match self.route_read(|| self.analyzer.file_routes(file, self.keep_going)) {
             Ok(routes) => routes,
-            Err(error) => {
-                if error != RustCargoRouteError::Cancelled {
-                    self.failed_routes.borrow_mut().insert(file.clone());
-                }
+            Err((RustCargoRouteError::Unavailable, reasons)) => {
+                self.failed_routes
+                    .borrow_mut()
+                    .insert(file.clone(), reasons);
                 RustFileRoutes::with_completeness(Vec::new(), false)
             }
-        };
-        if !routes.is_complete() {
-            self.observe_partial_transition();
-            self.routes_partial.set(true);
+            Err((RustCargoRouteError::Cancelled, _)) => {
+                RustFileRoutes::with_completeness(Vec::new(), false)
+            }
         }
-        routes
     }
 
-    /// Whether every route answer consulted by this walk was complete.
-    /// Callers proving a negative must first ask their subject's routes, then
-    /// check this again after resolution: another consulted route can be partial
-    /// even when the subject has a positive target root (#11527, #12015).
+    /// Coverage is derived from the typed route products this walker observed.
+    /// A hit observes its own completion before returning its value.
     pub fn routes_are_complete(&self) -> bool {
-        !self.routes_partial.get()
+        self.observed.borrow().values().all(|observation| {
+            observation
+                .as_ref()
+                .is_some_and(|observed| observed.owner.closed_at(observed.index))
+        })
     }
 
-    /// The caches this walker reads and writes. The shared caches outlive the
-    /// request, so a walker that has seen a partial route answer must not put
-    /// a value derived from it there: it would be served to a later request
-    /// without the route evidence gap that request must meet again. Such a
-    /// walker uses caches of its own, which still memoize within the walk.
     pub(crate) fn walk_caches(&self) -> &RustWalkCaches {
-        if self.routes_partial.get() {
-            &self
-                .partial_caches
-                .get_or_init(|| RequestWalkCaches::new(&self.caches))
-                .caches
-        } else {
-            &self.caches
+        &self.caches
+    }
+
+    fn capture_cycle(&self, build: &mut dyn FnMut()) -> CapturedCycleStep {
+        let (completion, reads) = internal_memo_partitions::capture(&self.reads, || {
+            self.analyzer.capture_walk_completion(build)
+        });
+        CapturedCycleStep {
+            completion,
+            reads: vec![Arc::new(reads)],
         }
     }
 
-    /// Capture and replay fills, but never retain a shared fill that discovered
-    /// partial routes while computing, including its additional cycle entries.
+    fn forward_partitions(&self, parts: &[ReadPartition]) {
+        ReplayingMemoEntry::from_parts(
+            (),
+            internal_memo_partitions::recipe(parts.iter().map(Arc::as_ref)),
+        )
+        .replay(&self.reads.memo_attribution());
+    }
+
     pub(crate) fn cached_walk<K, T, E>(
         &self,
         cache: impl FnOnce(&RustWalkCaches) -> &ReplayingWalkCache<K, T>,
@@ -1109,19 +1803,43 @@ impl<'a> RustUsageWalks<'a> {
         K: Eq + std::hash::Hash + Clone + Send + Sync + RetainedBytes + 'static,
         T: Send + Sync + 'static,
     {
-        let was_partial = self.routes_partial.get();
-        cache(self.walk_caches()).get_or_try_fill(&self.reads, key, || {
-            let fill = compute()?;
-            if !was_partial && self.routes_partial.get() {
-                Ok(match fill {
-                    WalkFill::Settled { value, .. } | WalkFill::Provisional(value) => {
+        let result = cache(&self.caches).get_or_try_fill(
+            &self.reads,
+            key,
+            &|completion| self.analyzer.walk_completion_is_current(completion),
+            || {
+                let capture = DependencyCapture::new(&self.dependencies);
+                let mut compute = Some(compute);
+                let mut result = None;
+                let completion = self.analyzer.capture_walk_completion(&mut || {
+                    result = Some(compute.take().expect("one walk build")());
+                });
+                let fill = result.expect("the completion capture ran its builder")?;
+                let pending = capture.finish();
+                let fill = match fill {
+                    WalkFill::Group {
+                        value, completions, ..
+                    } if !pending.is_empty() => {
+                        ReplayingMemoEntry::from_parts(
+                            (),
+                            internal_memo_partitions::recipe(completions.partitions()),
+                        )
+                        .replay(&self.reads.memo_attribution());
                         WalkFill::Provisional(value)
                     }
-                })
-            } else {
-                Ok(fill)
-            }
-        })
+                    WalkFill::Settled(value) if !pending.is_empty() => WalkFill::Provisional(value),
+                    other => other,
+                };
+                let completion = if self.observed.borrow().contains_key(&None) {
+                    None
+                } else {
+                    completion
+                };
+                Ok((fill, completion))
+            },
+        )?;
+        self.observe_walk(&result);
+        Ok(result)
     }
 
     fn cached_walk_value<K, T>(
@@ -1200,23 +1918,12 @@ impl<'a> RustUsageWalks<'a> {
     /// The files that can name something in the target roots of `file`. A
     /// partial list may omit files.
     pub fn files_that_can_reference_target_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
-        match self
-            .analyzer
-            .files_that_can_reference_target_of(file, self.keep_going)
-        {
-            Ok(reaching) => {
-                if !reaching.complete {
-                    self.observe_partial_transition();
-                    self.routes_partial.set(true);
-                }
-                reaching.value
-            }
-            Err(_) => {
-                self.observe_partial_transition();
-                self.routes_partial.set(true);
-                Vec::new()
-            }
-        }
+        self.route_read(|| {
+            self.analyzer
+                .files_that_can_reference_target_of(file, self.keep_going)
+        })
+        .map(|answer| answer.value)
+        .unwrap_or_default()
     }
 
     /// Whether one of the file's units declares a dependency under this name
@@ -1253,23 +1960,11 @@ impl<'a> RustUsageWalks<'a> {
     /// The crate-name question for a file that no unit's target holds: the
     /// library roots under a normalized name.
     fn unscoped_libraries(&self, normalized: &str) -> RustUnscopedLibraries {
-        match self
-            .analyzer
-            .unscoped_libraries(normalized, self.keep_going)
-        {
-            Ok(libraries) => {
-                if !libraries.complete {
-                    self.observe_partial_transition();
-                    self.routes_partial.set(true);
-                }
-                libraries
-            }
-            Err(_) => {
-                self.observe_partial_transition();
-                self.routes_partial.set(true);
-                RustUnscopedLibraries::incomplete(Vec::new())
-            }
-        }
+        self.route_read(|| {
+            self.analyzer
+                .unscoped_libraries(normalized, self.keep_going)
+        })
+        .unwrap_or_else(|_| RustUnscopedLibraries::incomplete(Vec::new()))
     }
 
     fn resolve_crate_root_file(&self, file: &ProjectFile, specifier: &str) -> Option<ProjectFile> {
@@ -1323,15 +2018,8 @@ impl<'a> RustUsageWalks<'a> {
         if !self.analyzer.is_selected_source(file) {
             return false;
         }
-        match self.files.contains(file) {
-            Ok(answer) if answer.value => true,
-            Ok(answer) if answer.complete => false,
-            Ok(_) | Err(_) => {
-                self.observe_partial_transition();
-                self.routes_partial.set(true);
-                true
-            }
-        }
+        self.route_read(|| self.files.contains(file))
+            .map_or(true, |answer| answer.value || !answer.complete)
     }
 
     // ---------------------------------------------------------------- layer 1
@@ -1355,20 +2043,10 @@ impl<'a> RustUsageWalks<'a> {
             |c| &c.module_files,
             &package.to_string(),
             || {
-                // Members an incomplete (or failed) listing omits cannot be added, so
-                // the walker stops sharing caches and the package stays unknown.
-                let mut files = match self.files.files_in_package(package) {
-                    Ok(answer) => {
-                        if !answer.complete {
-                            self.mark_package_partial(package);
-                        }
-                        answer.value
-                    }
-                    Err(_) => {
-                        self.mark_package_partial(package);
-                        Vec::new()
-                    }
-                };
+                let mut files = self
+                    .route_read(|| self.files.files_in_package(package))
+                    .map(|answer| answer.value)
+                    .unwrap_or_default();
                 if let Some(short_name) = package.rsplit('.').next().filter(|name| !name.is_empty())
                 {
                     files.extend(
@@ -1387,19 +2065,10 @@ impl<'a> RustUsageWalks<'a> {
         .unwrap_or_else(|never| match never {})
     }
 
-    fn mark_package_partial(&self, package: &str) {
-        self.observe_partial_transition();
-        self.routes_partial.set(true);
-        self.partial_packages
-            .borrow_mut()
-            .insert(package.to_owned());
-    }
-
-    /// Whether `package` has no backing file at all. An empty list from an
-    /// incomplete listing is unknown, so this is false for it.
+    /// An empty open package is unknown, never authoritative absence.
     fn module_package_is_provably_empty(&self, package: &str) -> bool {
-        self.files_in_module_package(package).is_empty()
-            && !self.partial_packages.borrow().contains(package)
+        let files = self.files_in_module_package(package);
+        files.is_closed() && files.is_empty()
     }
 
     fn module_declarations_named(&self, short_name: &str) -> Walked<ModuleDeclarations> {
@@ -1702,25 +2371,43 @@ impl<'a> RustUsageWalks<'a> {
         self.cached_walk(
             |c| &c.alias_routes,
             alias,
-            || match resolve_with_cycles(
+            || match resolve_with_cycles_captured(
                 &self.alias_walk,
                 alias,
                 &|| self.cancelled(),
                 &|_| Ok(Vec::new()),
                 &|key| self.compute_alias_routes(key),
+                &|build| self.capture_cycle(build),
+                &|parts| self.forward_partitions(parts),
             )? {
                 CycleAnswer::Provisional(routes) => {
+                    self.note_provisional(WalkDependency::Alias(alias.clone()));
                     if self.cancelled() {
                         Err(RustCargoRouteError::Cancelled)
                     } else {
                         Ok(WalkFill::Provisional(routes.as_ref().clone()))
                     }
                 }
-                CycleAnswer::Settled { value, settled } => {
+                CycleAnswer::Settled {
+                    value,
+                    settled,
+                    completions,
+                } => {
                     if self.cancelled() {
+                        ReplayingMemoEntry::from_parts(
+                            (),
+                            internal_memo_partitions::recipe(completions.partitions()),
+                        )
+                        .replay(&self.reads.memo_attribution());
                         return Err(RustCargoRouteError::Cancelled);
                     }
-                    Ok(WalkFill::Settled {
+                    self.settle_dependencies(
+                        settled
+                            .iter()
+                            .map(|(key, _)| WalkDependency::Alias(key.clone())),
+                    );
+                    Ok(WalkFill::Group {
+                        completions,
                         value: value.as_ref().clone(),
                         also: settled
                             .into_iter()
@@ -3164,30 +3851,49 @@ impl<'a> RustUsageWalks<'a> {
             |c| &c.module_bindings,
             &key,
             || {
+                brokk_bifrost_core::profile_count!("closure.builds", 1);
                 // The v1 worklist seeded every declaration in the workspace
                 // before it propagated anything, so an import that republishes
                 // a name declared beside it always found that declaration
                 // already present. Seeding the cycle answer with the declared
                 // half reproduces that.
-                match resolve_with_cycles(
+                match resolve_with_cycles_captured(
                     &self.binding_walk,
                     &key,
                     &|| self.cancelled(),
                     &|key| self.declared_bindings_at(&key.0, &key.1),
                     &|key| self.compute_bindings_at(&key.0, &key.1),
+                    &|build| self.capture_cycle(build),
+                    &|parts| self.forward_partitions(parts),
                 )? {
                     CycleAnswer::Provisional(bindings) => {
+                        self.note_provisional(WalkDependency::Binding(key.clone()));
                         if self.cancelled() {
                             Err(RustCargoRouteError::Cancelled)
                         } else {
                             Ok(WalkFill::Provisional(bindings.as_ref().clone()))
                         }
                     }
-                    CycleAnswer::Settled { value, settled } => {
+                    CycleAnswer::Settled {
+                        value,
+                        settled,
+                        completions,
+                    } => {
                         if self.cancelled() {
+                            ReplayingMemoEntry::from_parts(
+                                (),
+                                internal_memo_partitions::recipe(completions.partitions()),
+                            )
+                            .replay(&self.reads.memo_attribution());
                             return Err(RustCargoRouteError::Cancelled);
                         }
-                        Ok(WalkFill::Settled {
+                        self.settle_dependencies(
+                            settled
+                                .iter()
+                                .map(|(key, _)| WalkDependency::Binding(key.clone())),
+                        );
+                        Ok(WalkFill::Group {
+                            completions,
                             value: value.as_ref().clone(),
                             also: settled
                                 .into_iter()
@@ -3367,6 +4073,7 @@ impl<'a> RustUsageWalks<'a> {
         &self,
         file: &ProjectFile,
     ) -> Result<Walked<OriginRouteMap>, RustCargoRouteError> {
+        brokk_bifrost_core::profile_count!("origin_routes_of.calls", 1);
         self.cached_walk(
             |c| &c.origin_routes,
             file,
@@ -4372,6 +5079,308 @@ fn path_parent_candidates(file: &ProjectFile) -> Vec<ProjectFile> {
 }
 
 #[cfg(test)]
+mod completion_graph_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13024: missing producer evidence must remain incomplete outside debug assertions"
+    )]
+    fn missing_route_failure_is_a_nonreusable_internal_invariant() {
+        let cause = missing_route_failure_cause();
+        assert!(
+            matches!(cause, QueryReadIncomplete::InternalInvariant(detail) if detail.contains("route_read"))
+        );
+        assert_eq!(cause.label(), "internal_invariant");
+        assert!(cause.invalidates_positive_evidence());
+        assert!(cause.is_execution_dependent());
+        assert!(cause.canonical_replay_key().is_none());
+        assert!(cause.stable_replay_reason().is_none());
+    }
+
+    struct Causes(Vec<WalkCauseKey>);
+    impl WalkCompletionReceipt for Causes {
+        fn matches_binding(&self, _: &dyn std::any::Any) -> bool {
+            true
+        }
+        fn collect_causes(&self, into: &mut Vec<WalkCauseKey>) {
+            into.extend_from_slice(&self.0);
+        }
+        fn witness(&self) -> Option<&WalkCauseKey> {
+            self.0.iter().min()
+        }
+        fn digest(&self) -> [u8; 32] {
+            walk_completion_digest(self.0.clone())
+        }
+        fn allocated_bytes(&self) -> usize {
+            0
+        }
+        fn replay(&self) {}
+    }
+    fn cause(bytes: &[u8]) -> WalkCauseKey {
+        WalkCauseKey::from_canonical_bytes(bytes.to_vec())
+    }
+    fn projection(order: &[u8], second: &[u8], reverse_edges: bool) -> ProjectedCompletion {
+        let mut dependencies = HashMap::default();
+        dependencies.insert(
+            0,
+            if reverse_edges {
+                vec![2, 1]
+            } else {
+                vec![1, 2]
+            },
+        );
+        dependencies.insert(1, vec![2]);
+        dependencies.insert(2, vec![1]);
+        let direct = order
+            .iter()
+            .map(|key| {
+                let causes = match key {
+                    1 => vec![cause(b"typed-A")],
+                    2 => vec![cause(second)],
+                    3 => vec![cause(b"unreachable")],
+                    _ => vec![],
+                };
+                (*key, Some(vec![WalkCompletion::captured(Causes(causes))]))
+            })
+            .collect();
+        let currency = WalkCompletion::captured(Causes(vec![]));
+        let graph = Arc::new(
+            CompletionGraph::new(
+                order,
+                CycleCompletions {
+                    direct,
+                    reads: HashMap::default(),
+                    dependencies,
+                },
+                currency,
+                Arc::new(ErasedCapturedReads {
+                    receipt: OpaqueReadReceipt::new(Arc::new(()), 0),
+                    channels: Default::default(),
+                    first_refusal: None,
+                    first_execution_refusal: None,
+                    forwarded_to: None,
+                }),
+                &|_| true,
+            )
+            .unwrap(),
+        );
+        ProjectedCompletion {
+            graph,
+            root: order.iter().position(|key| *key == 0).unwrap(),
+        }
+    }
+
+    struct OrderedCauses {
+        causes: Vec<WalkCauseKey>,
+        replayed: Arc<std::sync::Mutex<Vec<WalkCauseKey>>>,
+    }
+    impl WalkCompletionReceipt for OrderedCauses {
+        fn matches_binding(&self, _: &dyn std::any::Any) -> bool {
+            true
+        }
+        fn collect_causes(&self, into: &mut Vec<WalkCauseKey>) {
+            into.extend_from_slice(&self.causes);
+        }
+        fn witness(&self) -> Option<&WalkCauseKey> {
+            self.causes.iter().min()
+        }
+        fn digest(&self) -> [u8; 32] {
+            walk_completion_digest(self.causes.clone())
+        }
+        fn allocated_bytes(&self) -> usize {
+            0
+        }
+        fn replay(&self) {
+            self.replayed
+                .lock()
+                .unwrap()
+                .extend_from_slice(&self.causes);
+        }
+    }
+
+    // Execute the actual queue, recording a stable cause when each producer
+    // computes. One variant discovers D only after B's value becomes available.
+    fn ordered_queue_trace(
+        root: u8,
+        delayed_dependency: bool,
+        replayed: &Arc<std::sync::Mutex<Vec<WalkCauseKey>>>,
+    ) -> (Vec<u8>, CycleCompletions<u8>, Vec<WalkCauseKey>) {
+        let walk = RefCell::new(CycleWalk::<u8, Arc<Vec<u8>>>::default());
+        let observed = RefCell::new(Vec::<WalkCauseKey>::new());
+        let capture = |build: &mut dyn FnMut()| {
+            let start = observed.borrow().len();
+            build();
+            CapturedCycleStep {
+                completion: Some(WalkCompletion::captured(OrderedCauses {
+                    causes: observed.borrow()[start..].to_vec(),
+                    replayed: Arc::clone(replayed),
+                })),
+                reads: Vec::new(),
+            }
+        };
+        let seed = |_: &u8| Ok::<_, std::convert::Infallible>(Vec::<u8>::new());
+        let compute = |key: &u8| {
+            let mut values = vec![*key];
+            if [1, 2, 3].contains(key) {
+                observed.borrow_mut().push(cause(&[b'A' + *key]));
+            }
+            let mut dependencies = match key {
+                7 => vec![0],
+                0 => vec![1, 2],
+                2 if delayed_dependency => vec![1],
+                _ => Vec::new(),
+            };
+            while let Some(dependency) = dependencies.first().copied() {
+                dependencies.remove(0);
+                let answer = resolve_with_cycles_captured(
+                    &walk,
+                    &dependency,
+                    &|| false,
+                    &seed,
+                    &|_| Ok(Vec::new()),
+                    &capture,
+                    &|_| {},
+                )
+                .unwrap();
+                let CycleAnswer::Provisional(value) = answer else {
+                    panic!("a running queue returns its partial value")
+                };
+                if *key == 2 && delayed_dependency && dependency == 1 && value.contains(&1) {
+                    dependencies.push(3);
+                }
+                for value in value.iter() {
+                    if !values.contains(value) {
+                        values.push(*value);
+                    }
+                }
+            }
+            Ok(values)
+        };
+        let answer = resolve_with_cycles_captured(
+            &walk,
+            &root,
+            &|| false,
+            &seed,
+            &compute,
+            &capture,
+            &|_| {},
+        )
+        .unwrap();
+        let CycleAnswer::Settled {
+            settled,
+            completions,
+            ..
+        } = answer
+        else {
+            panic!("the queue must settle")
+        };
+        let keys = std::iter::once(root)
+            .chain(
+                settled
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .filter(|key| *key != root),
+            )
+            .collect();
+        let mut seen = HashSet::default();
+        let cold = observed
+            .into_inner()
+            .into_iter()
+            .filter(|cause| seen.insert(cause.clone()))
+            .collect();
+        (keys, completions, cold)
+    }
+
+    fn ordered_alias_projection_matches_cold(delayed_dependency: bool) {
+        let replayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (keys, captured, _) = ordered_queue_trace(7, delayed_dependency, &replayed);
+        let graph = Arc::new(
+            CompletionGraph::new(
+                &keys,
+                captured,
+                WalkCompletion::captured(Causes(vec![])),
+                Arc::new(ErasedCapturedReads {
+                    receipt: OpaqueReadReceipt::new(Arc::new(()), 0),
+                    channels: Default::default(),
+                    first_refusal: None,
+                    first_execution_refusal: None,
+                    forwarded_to: None,
+                }),
+                &|_| true,
+            )
+            .unwrap(),
+        );
+        ProjectedCompletion {
+            root: keys.iter().position(|key| *key == 0).unwrap(),
+            graph,
+        }
+        .replay();
+        let (_, _, mut cold) = ordered_queue_trace(
+            0,
+            delayed_dependency,
+            &Arc::new(std::sync::Mutex::new(Vec::new())),
+        );
+        let mut seen = HashSet::default();
+        let mut warm = replayed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|cause| seen.insert((*cause).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        // Completion presentation canonicalizes these same typed cause sets;
+        // replay does not reproduce the queue's scheduling history.
+        assert_ne!(
+            warm, cold,
+            "pin the observed cold/warm scheduling difference"
+        );
+        warm.sort();
+        cold.sort();
+        assert_eq!(warm, cold, "the queue and alias must carry the same causes");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13024: alias DFS and cold queue discover Open causes in different orders"
+    )]
+    fn alias_cause_set_matches_cold_branch_queue() {
+        ordered_alias_projection_matches_cold(false);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13024: late dependency discovery cannot be reproduced by reversing alias DFS"
+    )]
+    fn alias_cause_set_matches_cold_late_discovery_queue() {
+        ordered_alias_projection_matches_cold(true);
+    }
+
+    #[test]
+    fn open_cycle_digest_covers_non_witness_causes_and_witness_is_order_independent() {
+        let baseline = projection(&[0, 1, 2, 3], b"typed-B", false);
+        assert_eq!(baseline.witness(), Some(&cause(b"typed-A")));
+        let changed = projection(&[0, 1, 2, 3], b"typed-C", false);
+        assert_eq!(baseline.witness(), changed.witness());
+        assert_ne!(baseline.digest(), changed.digest());
+        let mut full = vec![];
+        baseline.collect_causes(&mut full);
+        full.sort_unstable();
+        full.dedup();
+        assert_eq!(full, vec![cause(b"typed-A"), cause(b"typed-B")]);
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]] {
+            for reverse in [false, true] {
+                for _ in 0..3 {
+                    let repeated = projection(&order, b"typed-B", reverse);
+                    assert_eq!(repeated.witness(), baseline.witness());
+                    assert_eq!(repeated.digest(), baseline.digest());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod replaying_walk_cache_budget {
     use super::*;
     use brokk_bifrost_core::analyzer::memo_attribution::{CaptureIdentity, ReadChannels};
@@ -4386,6 +5395,13 @@ mod replaying_walk_cache_budget {
 
     /// Every fill reads one receipt of `RECEIPT_BYTES`.
     struct LargeReceipt;
+    impl brokk_bifrost_core::analyzer::internal_memo_partitions::DeferredMemoAttribution
+        for LargeReceipt
+    {
+        fn capture_deferred(&self, build: &mut dyn FnMut()) -> ErasedCapturedReads {
+            self.capture(build)
+        }
+    }
     impl ErasedReadAttribution for LargeReceipt {
         fn is_live(&self) -> bool {
             true
@@ -4394,6 +5410,12 @@ mod replaying_walk_cache_budget {
             false
         }
         fn record(&self, _: &dyn Project, _: ProjectRead<'_>, _: ProjectReadReceipt) {
+            unimplemented!()
+        }
+        fn record_inventory(
+            &self,
+            _: &brokk_bifrost_core::analyzer::project_reads::InventoryReadReceipt,
+        ) {
             unimplemented!()
         }
         fn capture_identity(&self) -> Option<CaptureIdentity> {
@@ -4418,6 +5440,24 @@ mod replaying_walk_cache_budget {
         fn replay(&self, _: &[OpaqueReadReceipt], _: ReadChannels) {}
     }
 
+    struct ClosedCompletion;
+    impl WalkCompletionReceipt for ClosedCompletion {
+        fn matches_binding(&self, _: &dyn std::any::Any) -> bool {
+            true
+        }
+        fn collect_causes(&self, _: &mut Vec<WalkCauseKey>) {}
+        fn witness(&self) -> Option<&WalkCauseKey> {
+            None
+        }
+        fn digest(&self) -> [u8; 32] {
+            [0; 32]
+        }
+        fn allocated_bytes(&self) -> usize {
+            32
+        }
+        fn replay(&self) {}
+    }
+
     #[test]
     fn evicting_a_cycle_fill_frees_its_shared_receipt() {
         let budget = RetentionBudget::for_test_capacity(CAPACITY);
@@ -4426,17 +5466,34 @@ mod replaying_walk_cache_budget {
         });
         let reads = ReadCapability::new(LargeReceipt);
         let root = cache
-            .get_or_try_fill(&reads, &0, || {
-                Ok::<_, std::convert::Infallible>(WalkFill::Settled {
-                    value: vec![0; 50],
-                    also: (1..6).map(|key| (key, vec![key; 50])).collect(),
-                })
+            .get_or_try_fill(&reads, &0, &|_| true, || {
+                Ok::<_, std::convert::Infallible>((
+                    WalkFill::Group {
+                        value: vec![0; 50],
+                        also: (1..6).map(|key| (key, vec![key; 50])).collect(),
+                        completions: CycleCompletions {
+                            reads: HashMap::default(),
+                            direct: (0..6)
+                                .map(|key| {
+                                    (key, Some(vec![WalkCompletion::captured(ClosedCompletion)]))
+                                })
+                                .collect(),
+                            dependencies: HashMap::default(),
+                        },
+                    },
+                    Some(WalkCompletion::captured(ClosedCompletion)),
+                ))
             })
             .unwrap();
         let settled = cache
-            .get_or_try_fill(&reads, &3, || -> Result<_, std::convert::Infallible> {
-                panic!("a key the walk settled hits its fill")
-            })
+            .get_or_try_fill(
+                &reads,
+                &3,
+                &|_| true,
+                || -> Result<_, std::convert::Infallible> {
+                    panic!("a key the walk settled hits its fill")
+                },
+            )
             .unwrap();
         assert_eq!(*settled, vec![3; 50]);
         let accounted = budget.accounted_bytes();
@@ -4444,7 +5501,38 @@ mod replaying_walk_cache_budget {
             (RECEIPT_BYTES as u64..2 * RECEIPT_BYTES as u64).contains(&accounted),
             "the fill's receipt is charged once: {accounted}"
         );
+        for _ in 0..16 {
+            let selected = cache
+                .get_or_try_fill(
+                    &reads,
+                    &3,
+                    &|_| true,
+                    || -> Result<_, std::convert::Infallible> {
+                        panic!("the selected alias remains a hit")
+                    },
+                )
+                .unwrap();
+            assert_eq!(*selected, vec![3; 50]);
+            assert_eq!(
+                budget.accounted_bytes(),
+                accounted,
+                "transient selection adds no retained charge"
+            );
+        }
+        let observation = ObservedWalk {
+            owner: root.fill.clone(),
+            index: root.index,
+        };
         drop((root, settled));
+        // Removing every region slot cannot release the charge while a request
+        // still observes this fill through the same strong owner used by Open.
+        let refused = AllocationCharge::acquire(&budget, 60_000);
+        assert!(
+            !refused.is_charged(),
+            "the observer still owns the charged backing"
+        );
+        drop(refused);
+        drop(observation);
         // A charge that fits only once the receipt is freed. Reclaim must see
         // that evicting the fill frees it, instead of refusing at once.
         let fresh = AllocationCharge::acquire(&budget, 60_000);
@@ -4454,175 +5542,111 @@ mod replaying_walk_cache_budget {
             budget.accounted_bytes()
         );
     }
-
-    #[test]
-    fn request_private_walk_caches_are_isolated_and_released_on_exit() {
-        type CheckReply = std::sync::mpsc::Sender<Result<String, &'static str>>;
-
-        struct Worker {
-            commands: Option<std::sync::mpsc::Sender<CheckReply>>,
-            ready: std::sync::mpsc::Receiver<Result<String, &'static str>>,
-            thread: Option<std::thread::JoinHandle<()>>,
-        }
-
-        impl Worker {
-            fn check(&self) -> Result<String, &'static str> {
-                let (reply, result) = std::sync::mpsc::channel();
-                self.commands
-                    .as_ref()
-                    .expect("worker command channel is open")
-                    .send(reply)
-                    .expect("worker accepts cache check");
-                result.recv().expect("worker replies to cache check")
-            }
-
-            fn finish(mut self) {
-                self.commands.take();
-                self.thread
-                    .take()
-                    .expect("worker thread is joined once")
-                    .join()
-                    .expect("worker thread did not panic");
-            }
-        }
-
-        impl Drop for Worker {
-            fn drop(&mut self) {
-                // Closing the channel stops a live worker on every exit path.
-                self.commands.take();
-                if let Some(thread) = self.thread.take()
-                    && let Err(panic) = thread.join()
-                {
-                    if std::thread::panicking() {
-                        eprintln!("request-cache worker also panicked: {panic:?}");
-                    } else {
-                        std::panic::resume_unwind(panic);
-                    }
-                }
-            }
-        }
-
-        fn read_label(
-            request: &RequestWalkCaches,
-            reads: &ReadCapability,
-            label: &'static str,
-        ) -> Result<String, &'static str> {
-            let walked = request
-                .caches
-                .module_declarations
-                .get_or_try_fill(reads, &"same-key".to_owned(), || {
-                    let mut value = HashMap::default();
-                    value.insert(label.to_owned(), Vec::new());
-                    Ok::<_, std::convert::Infallible>(WalkFill::settled(value))
-                })
-                .expect("the fixture cache fill is infallible");
-            walked
-                .keys()
-                .next()
-                .cloned()
-                .ok_or("private cache entry had no label")
-        }
-
-        fn spawn_worker(owner: Arc<RustWalkCaches>, label: &'static str) -> Worker {
-            let (commands, command_receiver) = std::sync::mpsc::channel::<CheckReply>();
-            let (ready_sender, ready) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                let request = RequestWalkCaches::new(&owner);
-                let reads = ReadCapability::new(LargeReceipt);
-                if ready_sender
-                    .send(read_label(&request, &reads, label))
-                    .is_err()
-                {
-                    return;
-                }
-                while let Ok(reply) = command_receiver.recv() {
-                    // A vanished receiver means the test is already unwinding;
-                    // stop this worker and release its private request regions.
-                    if reply.send(read_label(&request, &reads, label)).is_err() {
-                        break;
-                    }
-                }
-            });
-            Worker {
-                commands: Some(commands),
-                ready,
-                thread: Some(thread),
-            }
-        }
-
-        let budget = RetentionBudget::for_tests();
-        let owner = Arc::new(RustWalkCaches::new(&budget));
-        let baseline = budget.accounted_bytes();
-        let first = spawn_worker(Arc::clone(&owner), "first");
-        let second = spawn_worker(Arc::clone(&owner), "second");
-        assert_eq!(
-            first.ready.recv().expect("first worker reached ready"),
-            Ok("first".into())
-        );
-        assert_eq!(
-            second.ready.recv().expect("second worker reached ready"),
-            Ok("second".into())
-        );
-        assert_eq!(first.check(), Ok("first".into()));
-        assert_eq!(second.check(), Ok("second".into()));
-
-        let private_regions = || {
-            budget
-                .snapshot()
-                .regions
-                .into_iter()
-                .filter(|region| {
-                    region.name == "rust.walk.module_declarations" && region.stats.entries > 0
-                })
-                .collect::<Vec<_>>()
-        };
-        let regions = private_regions();
-        assert_eq!(
-            regions.len(),
-            2,
-            "each request owns a separate region: {regions:#?}"
-        );
-        assert_ne!(regions[0].namespace, regions[1].namespace);
-        assert!(regions.iter().all(|region| region.stats.entries == 1));
-        let occupied = budget.accounted_bytes();
-        assert!(occupied > baseline);
-
-        first.finish();
-        assert!(budget.accounted_bytes() < occupied);
-        assert!(budget.accounted_bytes() > baseline);
-        assert_eq!(private_regions().len(), 1);
-        assert_eq!(second.check(), Ok("second".into()));
-
-        // Error and unwind exits use the same request guard cleanup. No returned
-        // cache value escapes these scopes, so all private charges are released.
-        let before_error = budget.accounted_bytes();
-        let cancelled: Result<(), RustCargoRouteError> = {
-            let request = RequestWalkCaches::new(&owner);
-            let reads = ReadCapability::new(LargeReceipt);
-            read_label(&request, &reads, "cancelled").expect("cancelled walk filled cache");
-            Err(RustCargoRouteError::Cancelled)
-        };
-        assert!(matches!(cancelled, Err(RustCargoRouteError::Cancelled)));
-        assert_eq!(budget.accounted_bytes(), before_error);
-
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let request = RequestWalkCaches::new(&owner);
-            let reads = ReadCapability::new(LargeReceipt);
-            read_label(&request, &reads, "unwind").expect("unwinding walk filled cache");
-            panic!("exercise request guard unwind");
-        }));
-        assert!(unwind.is_err());
-        assert_eq!(budget.accounted_bytes(), before_error);
-
-        second.finish();
-        assert_eq!(budget.accounted_bytes(), baseline);
-    }
 }
 
 #[cfg(test)]
 mod cycle_walk_properties {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn failed_or_cancelled_cycles_forward_each_executed_partition_once() {
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            SeedFailure,
+            StepFailure,
+            Cancelled,
+        }
+        for outcome in [
+            Outcome::SeedFailure,
+            Outcome::StepFailure,
+            Outcome::Cancelled,
+        ] {
+            let walk = RefCell::new(CycleWalk::<usize, Arc<Vec<usize>>>::default());
+            let stopped = Cell::new(false);
+            let captured = RefCell::new(Vec::<ReadPartition>::new());
+            let forwarded = RefCell::new(Vec::<ReadPartition>::new());
+            let capture = |build: &mut dyn FnMut()| {
+                build();
+                let partition = Arc::new(ErasedCapturedReads {
+                    receipt: OpaqueReadReceipt::new(Arc::new(()), 0),
+                    channels: Default::default(),
+                    first_refusal: None,
+                    first_execution_refusal: None,
+                    forwarded_to: None,
+                });
+                captured.borrow_mut().push(Arc::clone(&partition));
+                CapturedCycleStep {
+                    completion: None,
+                    reads: vec![partition],
+                }
+            };
+            let forward = |parts: &[ReadPartition]| {
+                // The backend is called after queue borrows are released.
+                let _state = walk.borrow_mut();
+                forwarded.borrow_mut().extend_from_slice(parts);
+            };
+            let seed = |key: &usize| {
+                if matches!(outcome, Outcome::SeedFailure) {
+                    Err("seed failure")
+                } else {
+                    Ok(vec![*key])
+                }
+            };
+            let compute = |key: &usize| {
+                if *key == 1 {
+                    return Err("dependency failure");
+                }
+                let nested = resolve_with_cycles_captured(
+                    &walk,
+                    &1,
+                    &|| stopped.get(),
+                    &seed,
+                    &|_| Ok(Vec::new()),
+                    &capture,
+                    &forward,
+                )?;
+                assert!(matches!(nested, CycleAnswer::Provisional(_)));
+                if matches!(outcome, Outcome::Cancelled) {
+                    stopped.set(true);
+                }
+                Ok(vec![0])
+            };
+            let result = resolve_with_cycles_captured(
+                &walk,
+                &0,
+                &|| stopped.get(),
+                &seed,
+                &compute,
+                &capture,
+                &forward,
+            );
+            if matches!(outcome, Outcome::Cancelled) {
+                assert!(matches!(result, Ok(CycleAnswer::Provisional(_))));
+            } else {
+                assert!(result.is_err());
+            }
+            let identities = |parts: &[ReadPartition]| {
+                let mut ids = parts
+                    .iter()
+                    .map(|part| Arc::as_ptr(part) as usize)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            };
+            let expected = identities(&captured.borrow());
+            let actual = identities(&forwarded.borrow());
+            assert!(!expected.is_empty());
+            assert_eq!(
+                actual, expected,
+                "all executed leaves forwarded once; no failed graph retained"
+            );
+            let state = walk.borrow();
+            assert!(!state.running);
+            assert!(state.partial.is_empty());
+            assert!(state.read_partitions.is_empty());
+        }
+    }
 
     #[test]
     #[hardwon("a48b9658c627: qs3 triage: a failed initial seed left the cycle walk marked running")]
@@ -4638,7 +5662,7 @@ mod cycle_walk_properties {
         };
         assert!(resolve_with_cycles(&walk, &0, &|| false, &seed, &seed).is_err());
         let answer = resolve_with_cycles(&walk, &0, &|| false, &seed, &seed).unwrap();
-        let CycleAnswer::Settled { value, settled } = answer else {
+        let CycleAnswer::Settled { value, settled, .. } = answer else {
             panic!("retry did not settle")
         };
         assert_eq!(*value, vec![0]);
@@ -4778,7 +5802,7 @@ mod reachable_labels_properties {
         root: usize,
         answer: Answer,
     ) -> BTreeMap<usize, BTreeSet<usize>> {
-        let CycleAnswer::Settled { value, settled } = answer else {
+        let CycleAnswer::Settled { value, settled, .. } = answer else {
             panic!("outermost walk must settle")
         };
         assert_eq!(
@@ -4828,8 +5852,7 @@ mod reachable_labels_properties {
                         let cancel_after_compute = || { computes.set(computes.get() + 1); Ok(()) };
                         let answer = evaluate(&walk, &graph, root, &cancelled, &cancel_after_compute, &provisional_edges).unwrap();
                         assert!(computes.get() > 0, "cancelled path must actually compute");
-                        let CycleAnswer::Settled { settled: published, .. } = answer else { panic!("outermost answer") };
-                        assert!(published.is_empty(), "cancelled walk published {published:?}");
+                        assert!(matches!(answer, CycleAnswer::Provisional(_)), "cancelled walk must remain provisional");
                         assert_eq!(settled(&graph, root, evaluate(&walk, &graph, root, &|| false, &|| Ok(()), &provisional_edges).unwrap()), fresh);
 
                         // Fail a later queued compute where the graph reaches another node.

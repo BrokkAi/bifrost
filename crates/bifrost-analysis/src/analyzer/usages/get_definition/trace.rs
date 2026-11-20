@@ -393,6 +393,54 @@ pub(crate) fn native_projection_start() -> usize {
     with_recorder(|recorder| recorder.candidates.len()).unwrap_or(0)
 }
 
+/// Where the current operation's rows start in the request trace. An adapter
+/// that may later reject the answer its operation selected records this
+/// before resolving and passes it to [`reject_selected_answer_since`].
+#[doc(hidden)]
+pub fn operation_start() -> usize {
+    native_projection_start()
+}
+
+/// An adapter rejected the answer its own operation selected, for example a
+/// qualified receiver with no enclosing instance. Turn that operation's
+/// selections of the answer into rejections, so the trace never selects a
+/// target the outcome refuses. Rows before `start`, and selections of other
+/// candidates made by nested lookups, keep their outcome. Call this before the
+/// outcome's answer is cleared.
+#[doc(hidden)]
+pub fn reject_selected_answer_since(
+    start: usize,
+    rejected: &DefinitionLookupOutcome,
+    reason: RejectionReason,
+) {
+    with_recorder(|recorder| {
+        for row in recorder.candidates.iter_mut().skip(start) {
+            let answer = match &row.candidate {
+                TraceCandidateRef::Unit(unit) => rejected.definitions.contains(unit),
+                TraceCandidateRef::Modeled {
+                    provider,
+                    symbol_id,
+                    ..
+                } => rejected.modeled_definitions.iter().any(|symbol| {
+                    symbol.id == *symbol_id
+                        && crate::analyzer::semantic_model::ModelProvider::from(&symbol.provenance)
+                            == *provider
+                }),
+                TraceCandidateRef::Lexical(definition) => {
+                    rejected.lexical_definition.as_ref() == Some(definition)
+                }
+                TraceCandidateRef::Intrinsic { .. }
+                | TraceCandidateRef::Binding { .. }
+                | TraceCandidateRef::ImportBinder { .. }
+                | TraceCandidateRef::ExternalRoute { .. } => false,
+            };
+            if answer && row.is_selected() {
+                row.outcome = CandidateOutcome::Rejected(reason);
+            }
+        }
+    });
+}
+
 /// Shared projection of one native operation. Preserve member and callable
 /// enrichment, then attach the actual winning import tier to its selection.
 pub(crate) fn record_native_provenance(
@@ -1407,7 +1455,7 @@ mod dispatch_quality_tests {
         assert_eq!(
             dispatch_quality_for_status(
                 Some(DefinitionLookupStatus::ExceededBudget(
-                    crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::ScopeNodes,
+                    crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::ResolutionRounds,
                 )),
                 None,
             ),

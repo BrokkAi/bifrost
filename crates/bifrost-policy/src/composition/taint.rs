@@ -190,7 +190,7 @@ pub(crate) fn compose_taint_policy(
     let match_manifests = merge_manifests(sources.manifests.into_iter().chain(sinks.manifests))?;
     resolved_catalogs.sort();
     resolved_catalogs.dedup();
-    let resolved_spec = ResolvedTaintPolicySpec::new(
+    let mut resolved_spec = ResolvedTaintPolicySpec::new(
         spec.mode,
         spec.call_modeling,
         spec.threat_models.clone(),
@@ -207,6 +207,21 @@ pub(crate) fn compose_taint_policy(
         combinations.combinations,
         barriers,
     );
+    resolved_spec.guard_barriers = spec
+        .guards
+        .barriers
+        .iter()
+        .map(|guard| {
+            Ok(ResolvedTaintGuardBarrier {
+                definition: guard.clone(),
+                selector_path: PolicySelectorPath::new(guard_barrier_selector_path(
+                    segments.guard_barriers,
+                    &guard.id,
+                ))
+                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
+            })
+        })
+        .collect::<Result<Vec<_>, CompositionError>>()?;
 
     Ok(ComposedTaintPolicy {
         spec: resolved_spec,
@@ -1071,6 +1086,7 @@ mod tests {
 
         let spec = TaintPolicySpec {
             barriers: TaintEndpointSet::default(),
+            guards: PolicyGuardConfiguration::default(),
             mode: MayMode::May,
             call_modeling: CallModelingSpec::default(),
             threat_models: vec![],
@@ -1167,6 +1183,7 @@ mod tests {
             .unwrap();
         let spec = TaintPolicySpec {
             barriers: TaintEndpointSet::default(),
+            guards: PolicyGuardConfiguration::default(),
             mode: MayMode::May,
             call_modeling: CallModelingSpec::default(),
             threat_models: vec![],
@@ -1246,6 +1263,7 @@ mod tests {
         };
         let base = |combinations| TaintPolicySpec {
             barriers: TaintEndpointSet::default(),
+            guards: PolicyGuardConfiguration::default(),
             mode: MayMode::May,
             call_modeling: CallModelingSpec::default(),
             threat_models: vec![],

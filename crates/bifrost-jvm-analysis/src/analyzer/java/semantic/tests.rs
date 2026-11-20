@@ -626,6 +626,27 @@ fn lambdas_after_header_statements_read_fields_not_expired_binders() {
 }
 
 #[test]
+#[hardwon(
+    "9daed0f91751: a malformed resource recovery node tripped the declared-resource lowering"
+)]
+fn malformed_resource_recovery_keeps_best_effort_lowering() {
+    let source = r#"class Fixture {
+  AutoCloseable open() { return null; }
+
+  void run() {
+    try (AutoCloseable first = open(); AutoCloseable second) {}
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    assert!(
+        !run.points().is_empty(),
+        "the recovered procedure keeps its control flow"
+    );
+}
+
+#[test]
 fn labeled_loop_header_keeps_its_own_source_mapping() {
     let source =
         "class Fixture { void f(boolean again) { outer: while (again) { continue outer; } } }";
@@ -850,10 +871,12 @@ fn primitive_integral_comparisons_publish_typed_integer_guards() {
         guard("boxed < 5"),
         (Shape::Integer(LessThan, UnsignedInteger(5)), Some("boxed"))
     );
-    // Inferred, field and array-length subjects stay open.
-    for condition in ["inferred < 5", "count < 5", "values.length < 5"] {
+    // Field and array-length subjects stay open. A `var` local initialized
+    // with a literal is an effectively final constant (#13763), so it folds.
+    for condition in ["count < 5", "values.length < 5"] {
         assert_eq!(guard(condition), (Shape::Opaque, None), "{condition}");
     }
+    assert_eq!(guard("inferred < 5"), (Shape::Constant(true), None));
     assert_eq!(guard("x < x"), (Shape::Constant(false), None));
     assert_eq!(guard("x <= x"), (Shape::Constant(true), None));
 }
@@ -1619,7 +1642,9 @@ fn implicit_resource_closes_have_distinct_locators_per_completion_route_and_shar
         occurrences.push(mapping.locator.anchor().occurrence());
     }
     occurrences.sort_unstable();
-    assert_eq!(occurrences, [0, 1, 2]);
+    // Occurrence 0 on the resource span is the resource variable's own
+    // assignment point; the three closes follow it.
+    assert_eq!(occurrences, [1, 2, 3]);
 
     let multi = method(&artifact, "multiResourceReverseOrder");
     let first_value = multi
@@ -1682,17 +1707,23 @@ fn implicit_resource_closes_have_distinct_locators_per_completion_route_and_shar
         })
         .collect::<Vec<_>>();
     assert_eq!(second_closes.len(), 2);
-    for head in second_closes {
-        assert_eq!(head.receiver, Some(second_value));
-        let next_point = multi
+    // Each resource owns a nested cleanup region, so on every route a close
+    // resumes the next region's close through a cleanup edge.
+    let next_close = |continuation: ControlContinuation| {
+        let edges = multi
             .control_edges()
             .iter()
-            .find(|edge| {
-                ControlContinuation::Target(edge.source_point) == head.normal_continuation
-                    && edge.kind == ControlEdgeKind::Normal
-            })
-            .expect("normal chain from second close to first close")
-            .target_point;
+            .filter(|edge| ControlContinuation::Target(edge.source_point) == continuation)
+            .collect::<Vec<_>>();
+        let [edge] = edges.as_slice() else {
+            panic!("a close continues to exactly one point: {edges:?}");
+        };
+        (edge.kind, edge.target_point)
+    };
+    for head in second_closes {
+        assert_eq!(head.receiver, Some(second_value));
+        let (kind, next_point) = next_close(head.normal_continuation);
+        assert_eq!(kind, ControlEdgeKind::Cleanup);
         let second_step = by_point
             .get(&next_point)
             .expect("first resource close invoke point");
@@ -1701,19 +1732,52 @@ fn implicit_resource_closes_have_distinct_locators_per_completion_route_and_shar
             "AutoCloseable first = firstOpen()"
         );
         assert_eq!(second_step.receiver, Some(first_value));
-        let third_point = multi
-            .control_edges()
-            .iter()
-            .find(|edge| {
-                ControlContinuation::Target(edge.source_point) == second_step.normal_continuation
-                    && edge.kind == ControlEdgeKind::Normal
-            })
-            .expect("normal chain from first close to existing close")
-            .target_point;
+        let (third_kind, third_point) = next_close(second_step.normal_continuation);
+        assert_eq!(third_kind, ControlEdgeKind::Cleanup);
         let third_step = by_point
             .get(&third_point)
             .expect("existing resource close invoke point");
         assert_eq!(mapping_text(multi, source, third_step.source), "existing");
         assert_eq!(third_step.receiver, Some(existing_value));
     }
+
+    // JLS 14.20.3.1: when a later initializer throws, Java closes the
+    // resources already initialized, in reverse order, and never the resource
+    // whose initializer failed.
+    let reached_closes = |call_text: &str| {
+        let call = multi
+            .call_sites()
+            .iter()
+            .find(|call| mapping_text(multi, source, call.source) == call_text)
+            .expect("resource initializer call");
+        let ControlContinuation::Target(start) = call.exceptional_continuation else {
+            panic!("an initializer call can throw: {call:?}");
+        };
+        let mut reached = Vec::new();
+        let mut seen = HashSet::default();
+        let mut pending = vec![start];
+        while let Some(point) = pending.pop() {
+            if !seen.insert(point) {
+                continue;
+            }
+            if let Some(close) = by_point.get(&point) {
+                reached.push(mapping_text(multi, source, close.source));
+            }
+            pending.extend(
+                multi
+                    .control_edges()
+                    .iter()
+                    .filter(|edge| edge.source_point == point)
+                    .map(|edge| edge.target_point),
+            );
+        }
+        reached.sort_unstable();
+        reached.dedup();
+        reached
+    };
+    assert_eq!(reached_closes("firstOpen()"), ["existing"]);
+    assert_eq!(
+        reached_closes("secondOpen()"),
+        ["AutoCloseable first = firstOpen()", "existing"]
+    );
 }

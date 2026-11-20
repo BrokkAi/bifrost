@@ -10,8 +10,10 @@
 
 pub use brokk_bifrost_semantic::analyzer::semantic_model::*;
 
+pub mod activation_status;
 #[doc(hidden)]
 pub mod artifact;
+pub use activation_status::*;
 pub(crate) mod authoring;
 
 #[doc(hidden)]

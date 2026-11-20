@@ -5684,6 +5684,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     SEMANTIC_ANALYSIS_PARTIAL = "semantic_analysis_partial"
     TYPE_FLOW_WITNESS_TRUNCATED = "type_flow_witness_truncated"
     TYPE_FLOW_WITNESS_UNAVAILABLE = "type_flow_witness_unavailable"
+    DERIVED_CACHE_REBUILT = "derived_cache_rebuilt"
     CALL_BINDING_DISPATCH_PARTIAL = "call_binding_dispatch_partial"
     CALL_BINDING_SELECTOR_REJECTED = "call_binding_selector_rejected"
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
@@ -7945,6 +7946,7 @@ class SymbolSummariesResult:
             "artifact_unavailable": "a required artifact was unavailable",
             "semantic_evidence_gap": "structured semantic evidence was incomplete",
             "store_failure": "indexed reads failed",
+            "internal_invariant": "an internal engine error stopped summary lookup",
             "source_unavailable": "source content was unavailable",
         }
         notice = notices.get(self.incomplete_reason, "summary lookup was incomplete")

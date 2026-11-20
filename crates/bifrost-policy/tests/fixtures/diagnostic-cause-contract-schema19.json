@@ -20,6 +20,7 @@
     "cross_domain_document_incomplete": "semantic",
     "cross_domain_key_unsupported": "semantic",
     "cvss_variant_budget": "execution",
+    "derived_cache_rebuilt": "semantic",
     "duplicate_finding_id": "semantic",
     "dynamic_import_target": "semantic",
     "edge_axis_unsupported": "semantic",
@@ -38,6 +39,7 @@
     "failure_handler_derivation_incomplete": "semantic",
     "flow_state_axis_unsupported": "semantic",
     "flow_state_derivation_incomplete": "semantic",
+    "guard_removal_vocabulary_note": "semantic",
     "hierarchy_incomplete": "semantic",
     "identical_captures_open": "semantic",
     "identity_axis_unsupported": "semantic",
@@ -60,6 +62,8 @@
     "pending_cleanup_flow_derivation_incomplete": "semantic",
     "pipeline_budget_exhausted": "execution",
     "policy_declared_proven_subset": "semantic",
+    "presentation_owner_unavailable": "execution",
+    "presentation_rows_refused": "execution",
     "projection_scenario_membership_budget": "execution",
     "python_hierarchy_derivation_incomplete": "semantic",
     "qualifying_type_unresolved": "semantic",
@@ -92,6 +96,7 @@
     "semantic_workspace_required": "semantic",
     "stable_anchor_unavailable": "semantic",
     "statement_reachability_derivation_incomplete": "semantic",
+    "step_produced_no_rows": "semantic",
     "structural_role_coverage_incomplete": "semantic",
     "taint_finding_truncated": "execution",
     "taint_handle_stale": "execution",
@@ -162,5 +167,23 @@
     "execution_cause": null,
     "classification": "semantic",
     "source": "structural/search/environment.rs:728-732; not in inherent_execution_cause()"
+  },
+  "schema21_extension": {
+    "issue": 11997,
+    "code": "derived_cache_rebuilt",
+    "classification": "semantic",
+    "impact": "advisory",
+    "execution_cause": null,
+    "meaning": "Answer-neutral recovery of invalid persisted derived data; not an input semantic gap",
+    "precedent": "empty_selection: semantic classification with a clean, complete Advisory verdict (finding.rs::PolicyDiagnostic::empty_selection)"
+  },
+  "schema22_extension": {
+    "issue": 13211,
+    "code": "step_produced_no_rows",
+    "classification": "semantic",
+    "impact": "advisory",
+    "execution_cause": null,
+    "meaning": "Whole-query advisory naming an authored step that turned input rows into none; the policy evaluator never forwards it",
+    "precedent": "broad_query: a whole-execution advisory dropped by adapt_query_diagnostics"
   }
 }

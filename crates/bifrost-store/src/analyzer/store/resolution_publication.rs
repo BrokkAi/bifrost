@@ -429,6 +429,81 @@ fn publication_receipt_tx(
     }))
 }
 
+pub(super) fn publish_selected_parsed_content_conn(
+    conn: &mut rusqlite::Connection,
+    owner: WorkspaceSnapshotId,
+    path: String,
+    prepared: PreparedParsedBlob,
+    cancellation: CancellationToken,
+) -> Result<ResolutionContentPublicationOutcome> {
+    let result = super::resolution::with_resolution_progress_handler(conn, &cancellation, |conn| {
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(outcome) =
+            validate_owner_conn(&tx, &owner, prepared.resolution.producer_epoch())?
+        {
+            return Ok(outcome);
+        }
+        if prepared.generation != owner.generation || prepared.key.lang != owner.lang {
+            return Ok(ResolutionContentPublicationOutcome::Stale(
+                SelectedResolutionStale::AnalysisGeneration {
+                    storage_language: owner.lang,
+                },
+            ));
+        }
+        if !prepared.state.parse_complete {
+            return Ok(ResolutionContentPublicationOutcome::Unavailable(
+                SelectedResolutionUnavailable::IncompleteParsedBlob {
+                    storage_language: owner.lang,
+                    persisted_relative_path: path,
+                },
+            ));
+        }
+        let write =
+            super::source_publication::publish_selected_source_tx(&tx, &prepared, &cancellation);
+        if cancellation.is_cancelled() {
+            tx.rollback()?;
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        let blob_id = write?;
+        root_content_tx(&tx, &owner, blob_id)?;
+        let receipt = publication_receipt_tx(
+            &tx,
+            &owner,
+            blob_id,
+            prepared.key.clone(),
+            ResolutionContentInput::Parsed {
+                key: prepared.key.clone(),
+                semantic_language: prepared.resolution.semantic_language(),
+            },
+            &cancellation,
+        )?;
+        let Some(receipt) = receipt else {
+            tx.rollback()?;
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        };
+        if cancellation.is_cancelled() {
+            tx.rollback()?;
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        tx.commit()?;
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        Ok(ResolutionContentPublicationOutcome::Ready(Box::new(
+            receipt,
+        )))
+    });
+    match result {
+        Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
+            Ok(ResolutionContentPublicationOutcome::Cancelled)
+        }
+        result => result,
+    }
+}
+
 impl AnalyzerStore {
     #[doc(hidden)]
     pub fn publish_selected_parsed_content(
@@ -443,109 +518,13 @@ impl AnalyzerStore {
         let path = persisted_relative_path.to_owned();
         let cancellation = cancellation.clone();
         let outcome = self.conn.execute(move |conn| {
-            let result =
-                super::resolution::with_resolution_progress_handler(conn, &cancellation, |conn| {
-                    if cancellation.is_cancelled() {
-                        return Ok(ResolutionContentPublicationOutcome::Cancelled);
-                    }
-                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    if let Some(outcome) =
-                        validate_owner_conn(&tx, &owner, prepared.resolution.producer_epoch())?
-                    {
-                        return Ok(outcome);
-                    }
-                    if prepared.generation != owner.generation || prepared.key.lang != owner.lang {
-                        return Ok(ResolutionContentPublicationOutcome::Stale(
-                            SelectedResolutionStale::AnalysisGeneration {
-                                storage_language: owner.lang,
-                            },
-                        ));
-                    }
-                    if !prepared.state.parse_complete {
-                        return Ok(ResolutionContentPublicationOutcome::Unavailable(
-                            SelectedResolutionUnavailable::IncompleteParsedBlob {
-                                storage_language: owner.lang,
-                                persisted_relative_path: path,
-                            },
-                        ));
-                    }
-                    let oid = prepared.key.oid;
-                    let write = super::write_prepared_blob_rows_tx(
-                        &tx,
-                        &prepared,
-                        owner.generation,
-                        &cancellation,
-                    );
-                    if cancellation.is_cancelled() {
-                        tx.rollback()?;
-                        return Ok(ResolutionContentPublicationOutcome::Cancelled);
-                    }
-                    write?;
-                    let blob_id = tx.query_row(
-                        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
-                        params![oid.to_string(), owner.lang, prepared.key.variant],
-                        |row| row.get(0),
-                    )?;
-                    if let Some(support) =
-                        super::store_language_support(prepared.resolution.semantic_language())
-                    {
-                        support.publish_native_source_rows(
-                            &tx,
-                            blob_id,
-                            &prepared.state.resolution_facts,
-                            &cancellation,
-                        )?;
-                    }
-                    super::surface_relations::ensure_surface_set_tx(&tx, blob_id)?;
-                    root_content_tx(&tx, &owner, blob_id)?;
-                    // The writer-2 contract: the blob's source facts were just
-                    // published, so a projection that waited for them is
-                    // promoted in this transaction.
-                    brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
-                        &tx,
-                        &oid.to_string(),
-                        &owner.lang,
-                        owner.generation.0,
-                    )?;
-                    let receipt = publication_receipt_tx(
-                        &tx,
-                        &owner,
-                        blob_id,
-                        prepared.key.clone(),
-                        ResolutionContentInput::Parsed {
-                            key: prepared.key.clone(),
-                            semantic_language: prepared.resolution.semantic_language(),
-                        },
-                        &cancellation,
-                    )?;
-                    let Some(receipt) = receipt else {
-                        tx.rollback()?;
-                        return Ok(ResolutionContentPublicationOutcome::Cancelled);
-                    };
-                    if cancellation.is_cancelled() {
-                        tx.rollback()?;
-                        return Ok(ResolutionContentPublicationOutcome::Cancelled);
-                    }
-                    tx.commit()?;
-                    if cancellation.is_cancelled() {
-                        return Ok(ResolutionContentPublicationOutcome::Cancelled);
-                    }
-                    Ok(ResolutionContentPublicationOutcome::Ready(Box::new(
-                        receipt,
-                    )))
-                });
-            match result {
-                Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
-                    Ok(ResolutionContentPublicationOutcome::Cancelled)
-                }
-                result => result,
-            }
+            publish_selected_parsed_content_conn(conn, owner, path, prepared, cancellation)
         })?;
-        // The publish withdrew every Rust summary version that listed the
-        // replaced blob (`write_prepared_blob_rows_tx`). Derive those units
+        // A replacement withdraws Rust summary versions that used its old
+        // source or resolution products. Derive those units
         // again now that the transaction has committed: a reconcile opens its
         // own writer transactions, so it cannot run inside the closure above.
-        // Only a Ready publish wrote, so only it can have withdrawn anything.
+        // A Ready publication may have replaced products or reused them.
         if let ResolutionContentPublicationOutcome::Ready(_) = &outcome
             && reconcile_owner.lang == "rust"
         {

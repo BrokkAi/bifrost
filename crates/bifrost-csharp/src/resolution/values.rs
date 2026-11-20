@@ -91,6 +91,14 @@ impl Producer<'_, '_> {
         let mut pending = vec![(root, false)];
         let mut slots = HashMap::default();
         while let Some((node, visited)) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "member_access_expression" | "parenthesized_expression"
+            ) && let Some(output) = self.member_expression(node, ctx)
+            {
+                slots.insert(node.id(), output);
+                continue;
+            }
             let branches = match node.kind() {
                 "conditional_expression" => vec![
                     node.child_by_field_name("consequence"),

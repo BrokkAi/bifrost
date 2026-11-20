@@ -30,6 +30,7 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
     /// Read one certified owner at a time; shared code schedules the lexical
     /// chain. These recursive module-target projections remain temporary
     /// private authorities until the context producer publishes direct rows.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn route_starts(
         &self,
         module: &Module,
@@ -143,6 +144,7 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
     /// not reach: a crate-declared macro item whose invoking file the request
     /// did not stage.
     #[allow(clippy::type_complexity)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn exports(
         &self,
         module: &Module,
@@ -370,6 +372,7 @@ pub(crate) struct RustHalfRows<'a, 'store, 'input> {
     fallback_name: Option<String>,
 }
 impl<'a, 'store, 'input> EndpointRows<'a, 'store, 'input> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn half(
         self,
         source: &'a super::super::demand_closure::SourceHalf,
@@ -545,6 +548,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             members: Vec::new(),
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn root_starts(
         &mut self,
         module: &Module,
@@ -713,6 +717,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             self.rows.cancellation,
         )
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prefix_selection(
         &mut self,
         module: &Module,
@@ -771,6 +776,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             .map_or(module.scope, |(_, scope)| scope);
         Ok(Some(self.rows.route_starts(module, scope, name)?))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prefix_starts(
         &mut self,
         module: &Module,
@@ -845,6 +851,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             })
             .collect())
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn import_targets(
         &mut self,
         module: &Module,
@@ -1036,6 +1043,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             self.rows.cancellation,
         )
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn lexical_tier(
         &self,
         module: &Module,
@@ -1177,6 +1185,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             })
             .collect()
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn observe_targets(
         &mut self,
         module: &Module,
@@ -1305,6 +1314,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
         observation.completion = observation.completion.combine(&facts.completion);
         Ok(())
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn boundary(&mut self, observation: &HalfObservation) -> Result<Option<HalfBoundary>> {
         let conn = self.rows.ready.inventory.connection();
         let rows = RustCrateRows {

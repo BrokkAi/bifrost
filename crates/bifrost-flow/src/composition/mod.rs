@@ -521,34 +521,32 @@ pub trait LocalTransferDiscovery: ValueFlowProvider {
                 let selected = executable.available_value().ok_or_else(|| {
                     self.unavailable("selected executable procedure unavailable".to_owned())
                 })?;
-                let (side, procedure, flows) = if selected.handle.interpretation()
-                    == ProcedureInterpretation::ExecutableAlternate
-                {
-                    // A refined body cannot consume the base body's stored flows.
-                    (selected.side, selected.handle.clone(), None)
-                } else {
-                    match self
-                        .workspace()
-                        .selected_procedure_and_flows(base, request)
-                        .map_err(|error| self.provider_error(error.to_string()))?
-                    {
-                        CandidateProcedureOutcome::Selected(selected) => {
-                            (selected.side, selected.procedure, Some(selected.flows))
-                        }
-                        CandidateProcedureOutcome::Cancelled => {
-                            return Ok(CandidateProcedureOutcome::Cancelled);
-                        }
-                        CandidateProcedureOutcome::ExceededBudget(exceeded) => {
-                            return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
-                        }
-                    }
-                };
+                let side = selected.side;
+                let procedure = selected.handle.clone();
                 let projection = self.payload_projection_identity(&procedure, request)?;
                 self.require_outcome(&projection, "selected payload projection")?;
+                let flows = if procedure.interpretation()
+                    == ProcedureInterpretation::ExecutableAlternate
+                    || projection.available_value().is_some_and(Option::is_some)
+                {
+                    None
+                } else {
+                    let stored = self
+                        .workspace()
+                        .stored_flows_for_selected_procedure(selected, request)
+                        .map_err(|error| self.provider_error(error.to_string()))?;
+                    self.require_outcome(&stored, "stored flows for selected procedure")?;
+                    // The lookup owns this table already. Move it into the
+                    // pair rather than cloning another complete flow graph.
+                    let SemanticOutcome::Complete { value, .. } = stored else {
+                        return Err(self.unavailable(
+                            "stored flows for selected procedure unavailable".to_owned(),
+                        ));
+                    };
+                    value
+                };
                 let flows = match flows {
-                    Some(flows) if !projection.available_value().is_some_and(Option::is_some) => {
-                        flows
-                    }
+                    Some(flows) => flows,
                     _ => {
                         let snapshot = self.procedure_snapshot(
                             &procedure,
@@ -556,12 +554,15 @@ pub trait LocalTransferDiscovery: ValueFlowProvider {
                             request,
                         )?;
                         self.require_outcome(&snapshot, "selected payload relations")?;
-                        let snapshot = snapshot.available_value().ok_or_else(|| {
-                            self.unavailable("selected payload relations unavailable".to_owned())
-                        })?;
-                        crate::analyzer::semantic::partial_flow::compute_partial_flows(
-                            &procedure, snapshot, request,
-                        )
+                        // Preserve the provider's incomplete status as the
+                        // paired file-local path does. An available snapshot
+                        // is not, by itself, a complete relation set.
+                        let Some(flows) = crate::analyzer::semantic::partial_flow::fixpoint::partial_flows_from_projection(
+                            &procedure, Ok(snapshot), request,
+                        ) else {
+                            return Ok(CandidateProcedureOutcome::Cancelled);
+                        };
+                        flows
                     }
                 };
                 Ok(CandidateProcedureOutcome::Selected(
@@ -1279,7 +1280,7 @@ pub struct TypestateCompositionProvider<'a> {
     memo_budget: Rc<CompositionMemoBudget>,
     recursive_pending_used: Rc<Cell<bool>>,
     nested_execution_incomplete: Rc<Cell<bool>>,
-    excluded_callers: RefCell<Vec<(crate::analyzer::ProjectFile, crate::analyzer::Range)>>,
+    excluded_callers: Rc<RefCell<Vec<(crate::analyzer::ProjectFile, crate::analyzer::Range)>>>,
     ordered: CaptureScopedMemo<RefCell<crate::typestate::ordered::TypestateOrderedRelations<'a>>>,
     protocol: &'a crate::typestate::CompiledProtocol,
     subject: &'a crate::typestate::BoundTypestateSubject,
@@ -1373,7 +1374,7 @@ impl<'a> TypestateCompositionProvider<'a> {
             memo_budget: Rc::clone(&memo_budget),
             recursive_pending_used: Rc::new(Cell::new(false)),
             nested_execution_incomplete: Rc::new(Cell::new(false)),
-            excluded_callers: RefCell::new(Vec::new()),
+            excluded_callers: Rc::new(RefCell::new(Vec::new())),
             ordered: CaptureScopedMemo::new(RefCell::new(
                 crate::typestate::ordered::TypestateOrderedRelations::new(
                     workspace,
@@ -1391,6 +1392,40 @@ impl<'a> TypestateCompositionProvider<'a> {
             local: ReplayingMemo::new(RefCell::new(HashMap::new())),
             dispatches: ReplayingMemo::new(RefCell::new(HashMap::new())),
             formal_entry: None,
+            summaries: Rc::new(ReplayingMemo::new(RefCell::new(HashMap::new()))),
+            pending_summaries: Rc::new(RefCell::new(HashSet::new())),
+        }
+    }
+
+    fn transfer_subject(&self, subject: &'a crate::typestate::BoundTypestateSubject) -> Self {
+        Self {
+            discovery: Rc::clone(&self.discovery),
+            execution_budget: self.execution_budget.clone(),
+            composition_budget: self.composition_budget,
+            max_callers: self.max_callers,
+            attribution: self.attribution.clone(),
+            memo_budget: Rc::clone(&self.memo_budget),
+            recursive_pending_used: Rc::clone(&self.recursive_pending_used),
+            nested_execution_incomplete: Rc::clone(&self.nested_execution_incomplete),
+            excluded_callers: Rc::clone(&self.excluded_callers),
+            ordered: CaptureScopedMemo::new(RefCell::new(
+                crate::typestate::ordered::TypestateOrderedRelations::new(
+                    self.discovery.workspace,
+                    Rc::clone(&self.discovery),
+                    self.protocol,
+                    self.bindings,
+                    subject.id(),
+                    Rc::clone(&self.memo_budget),
+                ),
+            )),
+            protocol: self.protocol,
+            subject,
+            bindings: self.bindings,
+            context: self.context.clone(),
+            local: ReplayingMemo::new(RefCell::new(HashMap::new())),
+            dispatches: ReplayingMemo::new(RefCell::new(HashMap::new())),
+            formal_entry: None,
+            // Subject-specific summaries cannot be shared across the copy edge.
             summaries: Rc::new(ReplayingMemo::new(RefCell::new(HashMap::new()))),
             pending_summaries: Rc::new(RefCell::new(HashSet::new())),
         }
@@ -1457,7 +1492,7 @@ impl<'a> TypestateCompositionProvider<'a> {
                         memo_budget: Rc::clone(&self.memo_budget),
                         recursive_pending_used: Rc::clone(&self.recursive_pending_used),
                         nested_execution_incomplete: Rc::clone(&self.nested_execution_incomplete),
-                        excluded_callers: RefCell::new(Vec::new()),
+                        excluded_callers: Rc::new(RefCell::new(Vec::new())),
                         ordered: CaptureScopedMemo::new(RefCell::new(
                             crate::typestate::ordered::TypestateOrderedRelations::new(
                                 self.discovery.workspace,
@@ -2081,6 +2116,7 @@ impl<'a> TypestateCompositionProvider<'a> {
             false,
             retained_bytes,
             WitnessReconstructionWork::new(0, emitted),
+            crate::analyzer::reuse_verdict::ReuseVerdict::Content,
         ))
     }
 
@@ -2368,10 +2404,23 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         request: &mut SemanticRequest<'_>,
     ) -> Result<ObjectRelation<Self::Fact, Self::Function>, Self::Error> {
         let mut relation = ObjectRelation::none();
-        if let crate::taint::compose::Endpoint::Object(anchor) = at
-            && (&anchor.procedure != procedure || &anchor.object != self.subject.object())
-        {
-            return Ok(relation);
+        if let crate::taint::compose::Endpoint::Object(anchor) = at {
+            if &anchor.procedure != procedure {
+                return Ok(relation);
+            }
+            if &anchor.object != self.subject.object() {
+                let Some(subject) = self.bindings.subjects().iter().find(|subject| {
+                    subject.object() == &anchor.object
+                        && subject.key().class() == self.subject.key().class()
+                }) else {
+                    return Ok(relation);
+                };
+                // One delegation, not a graph walk: this provider has exactly
+                // the requested object, so the delegated branch cannot recur.
+                return self
+                    .transfer_subject(subject)
+                    .object_relation(procedure, at, request);
+            }
         }
         if let (
             AccessPathRoot::CallResult(origin),
@@ -2419,6 +2468,74 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
                         &handle,
                         &self.context,
                         self.formal_entry.as_ref().map(|(_, port)| port),
+                        (&predecessor, at),
+                        None,
+                        request,
+                    )
+                })?
+            {
+                relation.predecessors.push(ObjectPredecessor {
+                    from: predecessor,
+                    function,
+                    quality,
+                });
+            }
+        }
+        for transfer in self
+            .bindings
+            .state_transfers_to(self.subject.id())
+            .filter(|transfer| {
+                self.formal_entry.is_none()
+                    && transfer.source.is_some()
+                    && transfer.source != Some(transfer.result)
+                    && transfer.call.procedure().durable_key() == *procedure
+            })
+        {
+            let call = handle
+                .semantics()
+                .call_site(transfer.call.id())
+                .expect("transfer call exists");
+            let Some(point) = call.normal_continuation.target() else {
+                continue;
+            };
+            let predecessor = crate::taint::compose::Endpoint::Object(Box::new(ObjectAnchor {
+                procedure: procedure.clone(),
+                site: ObjectAnchorSite::ProgramPoint(point),
+                role: ObjectAnchorRole::CurrentObject,
+                object: self.subject.object().clone(),
+            }));
+            if &predecessor == at {
+                if let Some(source) = transfer.source {
+                    let source = self
+                        .bindings
+                        .subject(source)
+                        .expect("transfer source exists");
+                    let (function, quality) =
+                        self.ordered.read(&self.attribution.capability(), |memo| {
+                            memo.borrow().transfer_function(
+                                source.id(),
+                                &transfer.call,
+                                &self.context,
+                            )
+                        });
+                    relation.predecessors.push(ObjectPredecessor {
+                        from: crate::taint::compose::Endpoint::Object(Box::new(ObjectAnchor {
+                            procedure: procedure.clone(),
+                            site: ObjectAnchorSite::ProgramPoint(call.point),
+                            role: ObjectAnchorRole::CurrentObject,
+                            object: source.object().clone(),
+                        })),
+                        function,
+                        quality,
+                    });
+                }
+                relation.cross_call = false;
+            } else if let Some((function, quality)) =
+                self.ordered.read(&self.attribution.capability(), |memo| {
+                    memo.borrow_mut().object_segment_after_start(
+                        &handle,
+                        &self.context,
+                        None,
                         (&predecessor, at),
                         None,
                         request,
@@ -3045,7 +3162,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         }
         let mut continuations = Vec::new();
         for (ordinal, argument) in site.arguments.iter().enumerate() {
-            let (exact, _) = crate::typestate::ordered::call_actual_continuity(
+            let continuity = crate::typestate::ordered::call_actual_continuity(
                 self.discovery.workspace(),
                 crate::typestate::ordered::MoveBindingQuery {
                     discovery: self.discovery.as_ref(),
@@ -3058,7 +3175,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
                 },
                 request,
             )?;
-            if exact {
+            if continuity == crate::typestate::ordered::CallActualContinuity::Exact {
                 let port = PartialFlowPort::CallArgument {
                     call: call.1,
                     ordinal: u32::try_from(ordinal).expect("argument ordinal fits u32"),
@@ -5265,6 +5382,76 @@ pub fn project_call_handoffs(
     reference_certified: &HashSet<ValueId>,
     receiver_continuity_certified: CallObjectContinuity,
 ) -> Result<Box<[CallHandoffBinding]>, String> {
+    let CandidateLocalCallHandoffs { mut handoffs } = project_candidate_local_call_handoffs(
+        call,
+        bindings,
+        candidate,
+        reference_certified,
+        receiver_continuity_certified,
+    )?;
+    let selection = HopQuality::new(
+        matches!(bindings.candidate().proof(), ProofStatus::Proven),
+        matches!(
+            bindings.candidate().completeness(),
+            EvidenceCompleteness::Complete
+        ),
+    );
+    for handoff in &mut handoffs {
+        handoff.quality = handoff.quality.conjoin(selection);
+    }
+    Ok(handoffs)
+}
+
+/// Project one arm of a sealed dispatch family whose every arm the caller
+/// composes for the same subject (#11296). The arm keeps its own Unproven
+/// selection proof, so a violation through it stays a possible witness; the
+/// family accounts for the selection-induced incompleteness of the arm.
+pub fn project_family_arm_handoffs(
+    call: &CallSiteHandle,
+    bindings: &CallBindings,
+    candidate: &ComposeCandidate,
+    reference_certified: &HashSet<ValueId>,
+    receiver_continuity_certified: CallObjectContinuity,
+    family: &crate::analyzer::semantic::DispatchFamilyEvidence,
+) -> Result<Box<[CallHandoffBinding]>, String> {
+    assert!(
+        family.inputs().iter().any(|input| matches!(
+            input.body(),
+            crate::analyzer::semantic::DispatchFamilyMemberBody::Materialized(body)
+                if body == bindings.candidate().target()
+        )),
+        "a family arm handoff names a materialized member of its family"
+    );
+    let CandidateLocalCallHandoffs { mut handoffs } = project_candidate_local_call_handoffs(
+        call,
+        bindings,
+        candidate,
+        reference_certified,
+        receiver_continuity_certified,
+    )?;
+    let selection = HopQuality::new(
+        matches!(bindings.candidate().proof(), ProofStatus::Proven),
+        true,
+    );
+    for handoff in &mut handoffs {
+        handoff.quality = handoff.quality.conjoin(selection);
+    }
+    Ok(handoffs)
+}
+
+/// Conditional actual/formal transport, before runtime selection evidence.
+/// This private carrier is not authority that its candidate executes.
+struct CandidateLocalCallHandoffs {
+    handoffs: Box<[CallHandoffBinding]>,
+}
+
+fn project_candidate_local_call_handoffs(
+    call: &CallSiteHandle,
+    bindings: &CallBindings,
+    candidate: &ComposeCandidate,
+    reference_certified: &HashSet<ValueId>,
+    receiver_continuity_certified: CallObjectContinuity,
+) -> Result<CandidateLocalCallHandoffs, String> {
     let row = call
         .procedure()
         .semantics()
@@ -5411,13 +5598,6 @@ pub fn project_call_handoffs(
                         .count()
                         != 1,
             ));
-            let quality = quality.conjoin(HopQuality::new(
-                matches!(bindings.candidate().proof(), ProofStatus::Proven),
-                matches!(
-                    bindings.candidate().completeness(),
-                    EvidenceCompleteness::Complete
-                ),
-            ));
             for (exit, continuation) in [
                 (CallHandoffExit::Normal, row.normal_continuation),
                 (CallHandoffExit::Exceptional, row.exceptional_continuation),
@@ -5437,7 +5617,9 @@ pub fn project_call_handoffs(
     if index != candidate.arguments.len() {
         return Err("handoff binding does not cover candidate arguments".into());
     }
-    Ok(handoffs.into_boxed_slice())
+    Ok(CandidateLocalCallHandoffs {
+        handoffs: handoffs.into_boxed_slice(),
+    })
 }
 
 fn actual_port(
@@ -6323,6 +6505,7 @@ pub fn scoped(password: &str) {
             )
             .unwrap();
         let activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -6333,7 +6516,8 @@ pub fn scoped(password: &str) {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: vec![SemanticModelActivationControl {
                 scope: SemanticModelControlScope::Workspace,
@@ -6358,6 +6542,10 @@ pub fn scoped(password: &str) {
             matches!(activated, SemanticModelRuntimeOutcome::Ready { .. }),
             "{activated:?}"
         );
+        // Product routes read inside a request scope (RQL execution and the
+        // policy evaluator install one); the JVM request source refuses reads
+        // outside one, so the test holds a scope for its reads.
+        let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
         let mut budget = SemanticBudget::default();
         let artifact = workspace
             .materialize_program_semantics(
@@ -6796,6 +6984,9 @@ mod memo_receipt_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4967: composition selected an ordinary Rust candidate twice before pairing its flows"
+    )]
     fn selected_caller_and_callee_keep_executable_identities() {
         use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
         use crate::value_flow::ValueFlowCache;
@@ -6839,6 +7030,38 @@ mod memo_receipt_tests {
             .selected_procedure(&base.durable_key(), &mut request)
             .unwrap();
         assert!(selected.is_candidate_alternate());
+        let (paired, selection_calls) =
+            crate::analyzer::semantic::service::measure_candidate_selections(|| {
+                discovery.selected_procedure_and_flows_handle(&base, &mut request)
+            });
+        let paired = paired.expect("selected composition body and flows");
+        assert_eq!(paired.procedure, selected);
+        assert_eq!(
+            selection_calls, 1,
+            "one composition acquisition must select only once"
+        );
+        let selected_handle = workspace
+            .selected_procedure_handle(&base, &mut request)
+            .unwrap();
+        let selected_handle = selected_handle.available_value().unwrap();
+        let (stored, selection_calls) =
+            crate::analyzer::semantic::service::measure_candidate_selections(|| {
+                workspace.stored_flows_for_selected_procedure(selected_handle, &mut request)
+            });
+        assert_eq!(selection_calls, 0, "flow lookup never reselects");
+        let crate::analyzer::semantic::service::CandidateProcedureOutcome::Selected(reselected) =
+            workspace
+                .selected_procedure_and_flows(&base, &mut request)
+                .unwrap()
+        else {
+            panic!("the selecting path stopped");
+        };
+        assert_eq!(reselected.procedure, selected);
+        assert_eq!(
+            stored.unwrap().available_value().unwrap().as_ref(),
+            Some(&reselected.flows),
+            "the exact selected alternate keeps the selecting path's flows",
+        );
         let base_call = base
             .call_site_handle(base.semantics().call_sites()[0].id)
             .unwrap();
@@ -7298,6 +7521,84 @@ mod memo_receipt_tests {
             .unwrap();
         let selected = outcome.available_value().unwrap();
         assert!(selected.handle.is_candidate_alternate());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4967: composition discarded an incomplete snapshot status when selected flows were not stored"
+    )]
+    fn selected_unstored_flows_preserve_incomplete_snapshot_status() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+        use crate::value_flow::ValueFlowCache;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname=\"unstored-flow\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .file("src/lib.rs", "pub fn subject(input: u8) -> u8 { input }\n")
+            .build();
+        let overlay = crate::analyzer::OverlayProject::new(project.project_dyn());
+        assert!(overlay.set(project.file("src/lib.rs").abs_path(),
+            "pub unsafe fn subject(ptr: *mut u8, input: u8) -> u8 { unsafe { *ptr = input; } input }\n".to_owned()));
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(overlay),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let artifact = workspace
+            .materialize_program_semantics(&project.file("src/lib.rs"), &mut request)
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure.locator().declaration().last_segment_name() == Some("subject")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        assert!(
+            workspace
+                .stored_partial_flows(&procedure)
+                .unwrap()
+                .is_none(),
+            "unsaved source has no stored flow publication"
+        );
+        let discovery = WorkspaceCompositionDiscovery::new(
+            &workspace,
+            WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+        );
+        let snapshot = discovery
+            .procedure_snapshot(&procedure, &OracleCallContext::empty(), &mut request)
+            .unwrap();
+        assert!(
+            !snapshot.is_complete(),
+            "fixture must expose an incomplete provider outcome"
+        );
+        assert!(
+            snapshot.available_value().is_some(),
+            "fixture retains its represented relations"
+        );
+        let expected_label = snapshot.label().to_owned();
+        let selected = discovery
+            .selected_procedure_and_flows_handle(&procedure, &mut request)
+            .unwrap();
+        assert!(
+            selected.flows.has_undischarged_gap(),
+            "{:#?}",
+            selected.flows
+        );
+        assert!(!selected.flows.relations_proven(), "{:#?}", selected.flows);
+        assert_eq!(
+            selected.flows.detail.as_deref(),
+            Some(expected_label.as_str())
+        );
     }
 
     #[test]

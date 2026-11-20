@@ -209,6 +209,15 @@ pub struct IdeSummaryDataflowResult<Fact, Value, EdgeFunction> {
     metrics: IdeMetrics,
 }
 
+impl<Fact, Value, EdgeFunction> crate::analyzer::reuse_verdict::CarriesReuseVerdict
+    for IdeSummaryDataflowResult<Fact, Value, EdgeFunction>
+{
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(&self.fact_result)
+            .join(self.termination.budget_verdict())
+    }
+}
+
 impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFunction> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
@@ -255,6 +264,24 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
         self.end_summary_jump_functions.fill(None);
         self.entry_transfers = Box::default();
         self
+    }
+
+    /// The verdict of a projected solve: facts, coverage, termination and
+    /// work, without solved rows, values or edge functions.
+    pub(crate) fn into_verdict(self) -> Self {
+        Self {
+            fact_result: self.fact_result.into_verdict(),
+            edge_functions: Box::default(),
+            values: Box::default(),
+            reached_jump_functions: Box::default(),
+            end_summary_jump_functions: Box::default(),
+            entry_transfers: Box::default(),
+            point_values: Box::default(),
+            termination: self.termination,
+            work: self.work,
+            semantic_work: self.semantic_work,
+            metrics: self.metrics,
+        }
     }
 
     pub const fn fact_result(&self) -> &SummaryDataflowResult<Fact> {

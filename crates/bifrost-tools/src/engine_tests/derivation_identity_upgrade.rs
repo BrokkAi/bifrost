@@ -10,7 +10,7 @@ use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::cache_db;
 use rusqlite::{Connection, types::Value};
 
-const ROOTS: [&str; 7] = [
+const ROOTS: [&str; 8] = [
     "csharp_compilation_sets",
     "go_context_selections",
     "jvm_context_revisions",
@@ -18,6 +18,9 @@ const ROOTS: [&str; 7] = [
     "rust_source_listing_certificates",
     "jvm_external_provider_publications",
     "rust_crate_reconciliations",
+    // #13400: package route versions carry derivation_identity and own the
+    // unavailable-target and claim rows that cascade from them.
+    "rust_package_route_versions",
 ];
 
 #[derive(Debug)]
@@ -72,9 +75,12 @@ fn foreign_keys(conn: &Connection) -> Vec<ForeignKey> {
     keys.into_values().collect()
 }
 
-fn derived_closure(keys: &[ForeignKey]) -> BTreeSet<String> {
+fn derived_closure(conn: &Connection, keys: &[ForeignKey]) -> BTreeSet<String> {
+    // A root created after the store's schema version has no rows to clear yet.
+    let existing = tables(conn).into_iter().collect::<BTreeSet<_>>();
     let mut closure = ROOTS
         .into_iter()
+        .filter(|root| existing.contains(*root))
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let mut pending = closure.iter().cloned().collect::<VecDeque<_>>();
@@ -251,7 +257,11 @@ fn upgraded_input_snapshot(
 }
 
 fn assert_no_orphans(conn: &Connection, keys: &[ForeignKey]) {
-    assert!(query_rows(conn, "PRAGMA foreign_key_check").is_empty());
+    let violations = query_rows(conn, "PRAGMA foreign_key_check");
+    assert!(
+        violations.is_empty(),
+        "foreign key violations: {violations:?}"
+    );
     // Explicit anti-joins also work when enforcement is disabled, independently
     // of SQLite's FK checker. NULL composite references have SQLite's normal meaning.
     for key in keys {
@@ -279,6 +289,10 @@ fn assert_no_orphans(conn: &Connection, keys: &[ForeignKey]) {
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
     "#12765: a pre-0427 fragment row's default binary-operation count must not read as a complete empty inventory"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
 )]
 fn populated_405_rust_binary_operation_inventory_rejects_old_epoch() {
     use brokk_bifrost_analysis::analyzer::store::resolution_publication::{
@@ -388,6 +402,10 @@ fn populated_405_rust_binary_operation_inventory_rejects_old_epoch() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn non_rust_binary_operation_count_is_inapplicable() {
     use brokk_bifrost_core::{analyzer::model::Language, cancellation::CancellationToken};
     for (storage_language, language) in [("go", Language::Go), ("java", Language::Java)] {
@@ -437,6 +455,10 @@ fn non_rust_binary_operation_count_is_inapplicable() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
     use brokk_bifrost_analysis::CancellationToken;
     use brokk_bifrost_analysis::analyzer::store::{
@@ -504,7 +526,7 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
             405
         );
         let keys = foreign_keys(&old);
-        let derived = derived_closure(&keys);
+        let derived = derived_closure(&old, &keys);
         assert_eq!(derived.len(), 70, "{derived:?}");
         let empty = derived
             .iter()
@@ -539,7 +561,7 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
             cache_db::migrate(&mut upgraded).unwrap();
         }
         let upgraded_keys = foreign_keys(&upgraded);
-        let upgraded_derived = derived_closure(&upgraded_keys);
+        let upgraded_derived = derived_closure(&upgraded, &upgraded_keys);
         let remaining = upgraded_derived
             .iter()
             .filter(|t| !query_rows(&upgraded, &format!("SELECT 1 FROM {t}")).is_empty())
@@ -548,6 +570,14 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
             remaining.is_empty(),
             "uncleared derived rows: {remaining:?}"
         );
+        let mut before = before;
+        for table in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            assert!(before.remove(table).unwrap().rows.is_empty());
+        }
         assert_eq!(
             upgraded_input_snapshot(
                 &upgraded,
@@ -556,16 +586,37 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
                 &BTreeMap::from([
                     // Migration 0427 (#12495) creates it empty.
                     ("resolution_binary_operations".to_owned(), Vec::new()),
+                    // Migration 0468 (#9559) initializes the durable inventory clock.
+                    (
+                        "jvm_external_inventory_generation".to_owned(),
+                        vec![vec![Value::Integer(0), Value::Integer(0)]]
+                    ),
+                    // Migration 0518 (#12159) creates the closure and function
+                    // shape tables empty. They reference fragment interiors, which
+                    // are outside the derived closure.
+                    ("resolution_closure_literals".to_owned(), Vec::new()),
+                    ("resolution_closure_members".to_owned(), Vec::new()),
+                    (
+                        "resolution_function_shape_parameters".to_owned(),
+                        Vec::new()
+                    ),
+                    ("resolution_function_shapes".to_owned(), Vec::new()),
                     // Migration 0447 (#12159) creates the macro type candidate
                     // tables empty.
                     ("resolution_macro_type_candidates".to_owned(), Vec::new()),
                     ("resolution_macro_type_elements".to_owned(), Vec::new()),
                     ("resolution_macro_type_segments".to_owned(), Vec::new()),
+                    // Migration 0490 (#12897) creates the implicit root candidate
+                    // and declaration modifier tables empty.
+                    ("resolution_implicit_root_candidates".to_owned(), Vec::new()),
+                    ("resolution_declaration_modifiers".to_owned(), Vec::new()),
                     // Migration 0460 (#12956) creates it empty.
                     (
                         "resolution_rust_structural_trait_impls".to_owned(),
                         Vec::new(),
                     ),
+                    // #11183 creates the lowerer-owned impl attachment table empty.
+                    ("resolution_rust_impl_declarations".to_owned(), Vec::new()),
                     // Migration 0448 (#12967) creates the Ruby signature tables
                     // empty and seeds the collection epoch at 0.
                     (
@@ -576,11 +627,62 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
                     ("ruby_signature_methods".to_owned(), Vec::new()),
                     ("ruby_signature_positionals".to_owned(), Vec::new()),
                     ("ruby_signature_types".to_owned(), Vec::new()),
+                    // Migration 0466 starts upgrades with no completeness
+                    // certificates.
+                    ("workspace_selected_set_completeness".to_owned(), Vec::new(),),
+                    // Migration 0480 (#13416) seeds one selection epoch for
+                    // every retained workspace revision.
+                    (
+                        "workspace_selection_epochs".to_owned(),
+                        ["csharp", "go", "java", "python", "rust"]
+                            .into_iter()
+                            .map(|lang| {
+                                vec![
+                                    Value::Text(workspace_id.as_str().to_owned()),
+                                    Value::Text(lang.to_owned()),
+                                    Value::Integer(0),
+                                    Value::Integer(1),
+                                    Value::Integer(1),
+                                ]
+                            })
+                            .collect(),
+                    ),
+                    // Migration 0483 (#13389) creates the Rust macro argument
+                    // key tables empty.
+                    ("source_rust_macro_argument_keys".to_owned(), Vec::new()),
+                    ("source_rust_macro_attribute_paths".to_owned(), Vec::new()),
+                    ("source_rust_macro_attributes".to_owned(), Vec::new()),
+                    // Migration 0482 seeds the revision sequence and one
+                    // incarnation for each retained workspace revision.
+                    (
+                        "selected_publication_sequences".to_owned(),
+                        vec![vec![
+                            Value::Text("revision".to_owned()),
+                            Value::Text(String::new()),
+                            Value::Integer(0),
+                        ]],
+                    ),
+                    (
+                        "workspace_revision_incarnations".to_owned(),
+                        ["csharp", "go", "java", "python", "rust"]
+                            .into_iter()
+                            .map(|lang| {
+                                vec![
+                                    Value::Text(workspace_id.as_str().to_owned()),
+                                    Value::Text(lang.to_owned()),
+                                    Value::Integer(0),
+                                    Value::Integer(1),
+                                    Value::Integer(0),
+                                ]
+                            })
+                            .collect(),
+                    ),
                 ]),
             ),
             before,
             "durable row bytes/counts/digests changed (FK={enforced})"
         );
+
         assert_no_orphans(&upgraded, &upgraded_keys);
         drop(upgraded);
 
@@ -670,10 +772,11 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
             store
                 .publish_jvm_external_projection(
                     || Ok(Some(JvmExternalProjection {
-                        provider_id: "item".into(),
+                        semantic_sha256: "item".into(),
+                        provider_id: brokk_bifrost_analysis::analyzer::store::jvm_external_publication::jvm_external_provider_id("item"),
                         source_identity: "item".into(),
                         owners: vec![vec![
-                            Value::Text("item".into()),
+                            Value::Text(brokk_bifrost_analysis::analyzer::store::jvm_external_publication::jvm_external_provider_id("item")),
                             Value::Text("upgrade.Owner".into()),
                             Value::Integer(1),
                             Value::Integer(1),
@@ -753,17 +856,19 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
                     )),
                 ),
             ),
+            // The projection identity composes the lever tokens with the
+            // semantic row index version, so expect the running binary's value.
             (
                 "jvm_external_provider_publications",
                 "projection_identity",
                 "1",
-                identity!("jvm-external-projection"),
+                brokk_bifrost_analysis::analyzer::store::jvm_external_publication::jvm_external_projection_identity(),
             ),
             (
                 "rust_crate_reconciliations",
                 "derivation_identity",
                 "1",
-                identity!("rust-crate-derivation"),
+                brokk_bifrost_analysis::analyzer::store::rust_crates::derivation_identity(),
             ),
         ];
         let conn = store.read_conn().unwrap();
@@ -808,7 +913,184 @@ fn populated_405_upgrade_clears_only_derived_closure_and_rebuilds_identities() {
                 );
             }
         }
-        assert_no_orphans(&conn, &upgraded_keys);
+        assert_no_orphans(&conn, &keys);
         drop(workspace);
+    }
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
+fn lookup_question_shape_upgrade_republishes_jvm_inventory_like_fresh_store() {
+    use brokk_bifrost_analysis::analyzer::store::jvm_external_publication::{
+        JvmExternalProjection, JvmExternalPublication, jvm_external_projection_identity,
+        jvm_external_provider_id,
+    };
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_shared_store;
+
+    const JVM_TABLES: [&str; 4] = [
+        "jvm_external_owners",
+        "jvm_external_owner_members",
+        "jvm_external_owner_supertypes",
+        "jvm_external_provider_publications",
+    ];
+    // As in the schema-405 harness, first use publishes provider `item` through
+    // the real sealed-publication API after constructing the workspace.
+    fn first_use(
+        project: &brokk_bifrost_analysis::inline_project::BuiltInlineTestProject,
+        store: &Arc<AnalyzerStore>,
+    ) {
+        let context = store_context_from_shared_store(project.project(), Arc::clone(store), false);
+        let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+            project.project_dyn(),
+            crate::store_test_support::go_extraction_support_13::source_inventory_config(),
+            context,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .publish_jvm_external_projection(
+                    || Ok(Some(JvmExternalProjection {
+                        semantic_sha256: "item".into(),
+                        provider_id: jvm_external_provider_id("item"),
+                        source_identity: "item".into(),
+                        owners: vec![vec![
+                            Value::Text(jvm_external_provider_id("item")),
+                            Value::Text("upgrade.Owner".into()),
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Text("[]".into())
+                        ]],
+                        members: vec![vec![
+                            Value::Text(jvm_external_provider_id("item")),
+                            Value::Text("upgrade.Owner".into()),
+                            Value::Integer(0),
+                            Value::Text("value".into()),
+                            Value::Text("method".into()),
+                            Value::Text("public".into()),
+                            Value::Integer(0),
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Null,
+                            Value::Text("[]".into()),
+                            Value::Null,
+                            Value::Integer(0),
+                            Value::Text("[]".into())
+                        ]],
+                        supertypes: vec![vec![
+                            Value::Text(jvm_external_provider_id("item")),
+                            Value::Text("upgrade.Owner".into()),
+                            Value::Text("java.lang.Object".into()),
+                            Value::Integer(0),
+                            Value::Text("[]".into())
+                        ]],
+                    })),
+                    || false,
+                )
+                .unwrap(),
+            JvmExternalPublication::Available
+        );
+        drop(workspace);
+    }
+    fn snapshot(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
+        JVM_TABLES
+            .iter()
+            .map(|table| {
+                let columns = conn
+                    .prepare(&format!("SELECT * FROM {table}"))
+                    .unwrap()
+                    .column_count();
+                let order = (1..=columns)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                query_rows(conn, &format!("SELECT * FROM {table} ORDER BY {order}"))
+            })
+            .collect()
+    }
+    // Two stores reach the purge (0467): one from before migration 0425 (rows have no
+    // generic-surface columns, and 0425 already clears them) and one at the last
+    // version before the purge, which master's binary re-projected after 0425
+    // (#12445), whose rows only the purge removes.
+    let pre_generic = cache_db::test_pre_jvm_generic_surfaces_migration_version();
+    let at_generic = cache_db::test_pre_lookup_question_shapes_migration_version();
+    assert!(pre_generic < at_generic, "{pre_generic} < {at_generic}");
+    for (start, enforced) in [
+        (pre_generic, false),
+        (pre_generic, true),
+        (at_generic, false),
+        (at_generic, true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("upgrade.sqlite3");
+        let project = InlineTestProject::new()
+            .file("pom.xml", "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>upgrade</artifactId><version>1</version></project>")
+            .file("src/main/java/upgrade/Main.java", "package upgrade; public class Main { public int value() { return 1; } }\n")
+            .build();
+        let old = cache_db::test_connection_through_migration(start);
+        let mut old_identity = jvm_external_projection_identity();
+        old_identity[0] ^= 1;
+        if start == at_generic {
+            old.execute_batch("INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete,type_parameters_jsonb) VALUES('item','stale.Removed',1,1,1,1,jsonb('[{\"name\":\"T\",\"bounds\":{\"state\":\"unknown\"}}]'));
+                INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,parameters_jsonb,return_type_jsonb,is_abstract,type_parameters_jsonb) VALUES('item','stale.Removed',0,'removed','method','public',0,1,1,NULL,jsonb('[]'),NULL,0,jsonb('[]'));
+                INSERT INTO jvm_external_owner_supertypes(provider_id,owner_fqn,supertype_fqn,ordinal,type_arguments_jsonb) VALUES('item','stale.Removed','java.lang.Object',0,jsonb('[]'));").unwrap();
+        } else {
+            old.execute_batch("INSERT INTO jvm_external_owners VALUES('item','stale.Removed',1,1,1,1);
+                INSERT INTO jvm_external_owner_members VALUES('item','stale.Removed',0,'removed','method','public',0,1,1,NULL,jsonb('[]'),NULL,0);
+                INSERT INTO jvm_external_owner_supertypes VALUES('item','stale.Removed','java.lang.Object',0);").unwrap();
+        }
+        old.execute("INSERT INTO jvm_external_provider_publications(provider_id,source_identity,projection_identity,projected_rows_sha256,owner_count,member_count,supertype_count) VALUES('item','item',?1,zeroblob(32),1,1,1)", [old_identity]).unwrap();
+        assert_no_orphans(&old, &foreign_keys(&old));
+        old.execute("VACUUM INTO ?1", [database.to_str().unwrap()])
+            .unwrap();
+        drop(old);
+        let mut upgraded = Connection::open(&database).unwrap();
+        cache_db::configure_connection(&mut upgraded).unwrap();
+        if enforced {
+            upgraded.pragma_update(None, "foreign_keys", true).unwrap();
+            cache_db::test_migrate_with_foreign_keys_enabled(&mut upgraded);
+        } else {
+            cache_db::migrate(&mut upgraded).unwrap();
+        }
+        for table in JVM_TABLES {
+            assert!(
+                query_rows(&upgraded, &format!("SELECT * FROM {table}")).is_empty(),
+                "{table}, start={start} FK={enforced}"
+            );
+        }
+        // The purge runs before the generation triggers exist, so it leaves the
+        // new singleton at its seed value.
+        assert_eq!(
+            query_rows(
+                &upgraded,
+                "SELECT id, generation FROM jvm_external_inventory_generation"
+            ),
+            vec![vec![Value::Integer(0), Value::Integer(0)]],
+            "start={start} FK={enforced}"
+        );
+        assert_no_orphans(&upgraded, &foreign_keys(&upgraded));
+        drop(upgraded);
+        let upgraded = Arc::new(AnalyzerStore::open_persistent(&database).unwrap());
+        first_use(&project, &upgraded);
+        let fresh = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
+        first_use(&project, &fresh);
+        let actual = snapshot(&upgraded.read_conn().unwrap());
+        assert!(actual.iter().all(|rows| !rows.is_empty()), "{actual:?}");
+        assert_eq!(
+            actual,
+            snapshot(&fresh.read_conn().unwrap()),
+            "start={start} FK={enforced}"
+        );
+        assert!(
+            query_rows(
+                &upgraded.read_conn().unwrap(),
+                "SELECT * FROM jvm_external_owners WHERE owner_fqn='stale.Removed'"
+            )
+            .is_empty()
+        );
     }
 }

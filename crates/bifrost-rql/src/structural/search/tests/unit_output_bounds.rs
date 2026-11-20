@@ -64,7 +64,7 @@ fn budget_telemetry_preserves_legacy_incoming_admission_causes() {
         let roots = result
             .diagnostics
             .iter()
-            .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+            .flat_map(|diagnostic| &semantic_diagnostic(diagnostic).exhausted_roots)
             // Rendering can hit shared caps too; isolate provider admission.
             .filter(|root| root.stage.as_deref() == Some("reference_scan"))
             .collect::<Vec<_>>();

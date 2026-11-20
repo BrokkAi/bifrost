@@ -150,7 +150,28 @@ pub fn compile_pack(
     pack: &AuthoredSemanticModelPack,
     options: &CompilerOptions,
 ) -> Result<CompiledSemanticModelPack, Vec<Diagnostic>> {
-    let diagnostics = validate_pack(pack, validation_limits(options));
+    let selector_errors = crate::analyzer::semantic_model::validate::check_authored_selectors(pack);
+    compile_structural_pack(pack, options, selector_errors)
+}
+
+pub fn compile_generated_pack(
+    pack: &AuthoredSemanticModelPack,
+    options: &CompilerOptions,
+) -> Result<CompiledSemanticModelPack, Vec<Diagnostic>> {
+    let selector_errors =
+        crate::analyzer::semantic_model::validate::check_generated_selectors(pack);
+    compile_structural_pack(pack, options, selector_errors)
+}
+
+fn compile_structural_pack(
+    pack: &AuthoredSemanticModelPack,
+    options: &CompilerOptions,
+    selector_errors: Vec<Diagnostic>,
+) -> Result<CompiledSemanticModelPack, Vec<Diagnostic>> {
+    // Selector provenance is reported beside the structural diagnostics: a
+    // pack with both defects shows both.
+    let mut diagnostics = validate_pack(pack, validation_limits(options));
+    diagnostics.extend(selector_errors);
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }

@@ -13,6 +13,7 @@ use crate::gitblob;
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
+use brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing;
 pub use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
 pub use brokk_bifrost_core::analyzer::query_token::{QueryScope, QueryToken};
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
@@ -140,6 +141,12 @@ macro_rules! forward_relational_definition_batch {
             self.inner.active_query_semantic_model_overlay()
         }
 
+        fn active_query_host_activation_context(
+            &self,
+        ) -> Option<Option<std::sync::Arc<$crate::analyzer::semantic_model::HostActivationContext>>>
+        {
+            self.inner.active_query_host_activation_context()
+        }
         fn active_query_semantic_model_snapshot(
             &self,
         ) -> Option<
@@ -254,8 +261,12 @@ macro_rules! forward_query_read_ledger {
             $crate::analyzer::IAnalyzer::mark_runtime_cache_touched(&self.inner);
         }
 
-        fn record_budget_dependences(&self, count: usize) {
-            $crate::analyzer::IAnalyzer::record_budget_dependences(&self.inner, count);
+        fn record_attributed_dependences(
+            &self,
+            record: $crate::analyzer::i_analyzer::AttributeDependences,
+            count: usize,
+        ) {
+            $crate::analyzer::IAnalyzer::record_attributed_dependences(&self.inner, record, count);
         }
 
         fn join_reuse_verdict(
@@ -269,10 +280,50 @@ macro_rules! forward_query_read_ledger {
             $crate::analyzer::IAnalyzer::records_query_reads(&self.inner)
         }
 
+        fn require_workspace_languages(
+            &self,
+            languages: &[$crate::analyzer::Language],
+        ) -> Result<(), $crate::analyzer::store::StoreError> {
+            $crate::analyzer::IAnalyzer::require_workspace_languages(&self.inner, languages)
+        }
+
         fn selected_workspace_snapshots_for_reads(
             &self,
         ) -> Option<std::sync::Arc<$crate::analyzer::store::WorkspaceSnapshots>> {
             $crate::analyzer::IAnalyzer::selected_workspace_snapshots_for_reads(&self.inner)
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        fn selected_receiver_proofs_after_transfer_batch_for_test(
+            &self,
+            file: &$crate::analyzer::ProjectFile,
+            questions: &[$crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion],
+            cancellation: &$crate::CancellationToken,
+        ) -> $crate::analyzer::store::Result<
+            Vec<Option<$crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>>,
+        > {
+            $crate::analyzer::IAnalyzer::selected_receiver_proofs_after_transfer_batch_for_test(
+                &self.inner,
+                file,
+                questions,
+                cancellation,
+            )
+        }
+
+        fn selected_receiver_proof_read(
+            &self,
+            file: &$crate::analyzer::ProjectFile,
+            question: &$crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+            cancellation: &$crate::CancellationToken,
+        ) -> $crate::analyzer::store::Result<
+            Option<$crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+        > {
+            $crate::analyzer::IAnalyzer::selected_receiver_proof_read(
+                &self.inner,
+                file,
+                question,
+                cancellation,
+            )
         }
 
         fn read_ledger_attached(&self) -> bool {
@@ -811,248 +862,56 @@ fn compile_search_pattern(normalized: &str) -> Option<(String, Regex)> {
     Some((translated, compiled))
 }
 
-/// Plain source provenance for one incomplete lookup (#10984).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryLookupProvenance {
-    pub file: ProjectFile,
-    pub byte_span: std::ops::Range<usize>,
-    pub name: Box<str>,
-    pub tier: &'static str,
-}
+pub use brokk_bifrost_core::analyzer::query_read_incomplete::{
+    AttributedQueryReadIncomplete, DETERMINISTIC_PROOF_STOP_LABELS, LookupOutcome,
+    QueryLookupProvenance, QueryReadIncomplete, SELECTED_PATTERN_ALIAS_LIMIT_REASON,
+};
 
-/// Immutable data only; no query capability is retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttributedQueryReadIncomplete {
-    lookup: QueryLookupProvenance,
-    cause: QueryReadIncomplete,
-}
-
-/// The selected Rust formal alias walk has a fixed code-defined bound.
-pub const SELECTED_PATTERN_ALIAS_LIMIT_REASON: &str = "formal type exceeds the alias budget";
-
-/// Registered deterministic proof-stop labels, shared by producers and receipt replay.
-pub const DETERMINISTIC_PROOF_STOP_LABELS: &[&str] = &[
-    SELECTED_PATTERN_ALIAS_LIMIT_REASON,
-    "resolution_unprojected_definition",
-    "fixed_limit",
-    "resolution_cyclic_expansion",
-    "depth_limit",
-    "unsupported_language",
-    "invalid_location",
-    "not_found",
-    "external_receiver_type_arguments_unknown",
-    "drop_review_scope_admission_pending",
-    "drop_inventory_not_absent",
-    "drop_inventory_unavailable",
-    "overlay_inventory_unavailable",
-    "binding_value_may_be_replaced",
-    "external_receiver_generic_arity_mismatch",
-    "supertrait_hierarchy_open",
-    "lexical_bound_hierarchy_unknown",
-    "model_alias_missing_target",
-    "model_alias_unresolvable_target",
-    "model_alias_cycle",
-    "model_alias_arity_mismatch",
-    "closure_capture_unresolved",
-    "closure_macro_environment",
-];
-
-/// A typed reason a request could not establish a complete read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryReadIncomplete {
-    /// One source provenance layer around the original cause.
-    Attributed(Arc<AttributedQueryReadIncomplete>),
-    /// Cooperative cancellation stopped a read before it could establish a
-    /// complete answer.
-    Cancelled,
-    /// A language proof stopped before establishing its result. The optional
-    /// cause distinguishes operational failure from a deterministic semantic gap.
-    ProofStopped {
-        reason: &'static str,
-        cause: Option<crate::analyzer::read_ledger::DerivationExecutionCause>,
-    },
-    /// The structured source needed by a read was unavailable.
-    StructureUnavailable(ProjectFile),
-    /// Structured semantic evidence required for a complete answer was
-    /// unavailable or incomplete.
-    SemanticEvidenceUnavailable(Box<str>),
-    /// Semantic models were selected but their overlay has not been published.
-    SemanticModelsPending,
-    /// A dependency's content or declared configuration deterministically
-    /// prevents a complete external surface. Retained entries replay this gap.
-    ArtifactUnavailable(Box<str>),
-    /// Snapshot-deterministic unknown or unsupported semantics. The partial
-    /// answer remains incomplete, but its named inputs can be replayed.
-    SemanticEvidenceGap(Box<str>),
-    /// A store failure prevented a read from establishing a complete answer.
-    StoreFailure(StoreError),
-}
-
-impl QueryReadIncomplete {
-    /// Attach one layer, rejecting accidental nested annotations.
-    pub fn attributed(self, lookup: QueryLookupProvenance) -> Self {
-        assert!(
-            !matches!(self, Self::Attributed(_)),
-            "nested lookup provenance"
+/// Own a lookup's read completion, including identity probes and memo replay.
+pub fn capture_lookup_answer<T>(
+    analyzer: &dyn IAnalyzer,
+    run: impl FnOnce() -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<T>,
+) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<T> {
+    use brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome;
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+    // Beginning a request can itself fail to bind the required snapshot.
+    let initial = scope.captured_read_incompleteness();
+    if initial
+        .iter()
+        .any(QueryReadIncomplete::invalidates_positive_evidence)
+    {
+        drop(scope);
+        for reason in &initial {
+            analyzer.record_query_incomplete(reason.clone());
+        }
+        return LookupOutcome::Incomplete(
+            initial
+                .into_iter()
+                .fold(None, |reason, next| {
+                    QueryReadIncomplete::merge_optional(reason, Some(next))
+                })
+                .expect("captured failure"),
         );
-        Self::Attributed(Arc::new(AttributedQueryReadIncomplete {
-            lookup,
-            cause: self,
-        }))
     }
-
-    pub fn lookup_provenance(&self) -> Option<&QueryLookupProvenance> {
-        match self {
-            Self::Attributed(data) => Some(&data.lookup),
-            _ => None,
-        }
-    }
-
-    /// Inspect classification without discarding provenance from receipts.
-    pub fn base_cause(&self) -> &Self {
-        match self {
-            Self::Attributed(data) => &data.cause,
-            _ => self,
-        }
-    }
-
-    /// Requested retained payload layout, excluding this inline enum value.
-    pub fn retained_payload_bytes(&self) -> usize {
-        use brokk_bifrost_core::retention_budget::RetainedBytes;
-        match self {
-            Self::Attributed(data) => {
-                // Follow RetainedBytes for Arc<str>: payload plus both counters.
-                2 * std::mem::size_of::<usize>()
-                    + std::mem::size_of::<AttributedQueryReadIncomplete>()
-                    + data.lookup.file.retained_heap_bytes()
-                    + data.lookup.name.len()
-                    + data.cause.retained_payload_bytes()
-            }
-            Self::ArtifactUnavailable(text)
-            | Self::SemanticEvidenceGap(text)
-            | Self::SemanticEvidenceUnavailable(text) => text.len(),
-            Self::StructureUnavailable(file) => file.retained_heap_bytes(),
-            Self::StoreFailure(error) => error.retained_bytes() - std::mem::size_of::<StoreError>(),
-            Self::Cancelled | Self::SemanticModelsPending | Self::ProofStopped { .. } => 0,
-        }
-    }
-
-    /// [`Self::retained_payload_bytes`] with every owned buffer rounded to its
-    /// allocation, for pure evictable caches. Refusing admission checks keep
-    /// the requested-byte form.
-    pub fn allocated_payload_bytes(&self) -> usize {
-        use brokk_bifrost_core::allocation_size::allocation_size;
-        match self {
-            Self::Attributed(data) => {
-                allocation_size(
-                    2 * std::mem::size_of::<usize>()
-                        + std::mem::size_of::<AttributedQueryReadIncomplete>(),
-                ) + data.lookup.file.allocated_heap_bytes()
-                    + allocation_size(data.lookup.name.len())
-                    + data.cause.allocated_payload_bytes()
-            }
-            Self::ArtifactUnavailable(text)
-            | Self::SemanticEvidenceGap(text)
-            | Self::SemanticEvidenceUnavailable(text) => allocation_size(text.len()),
-            Self::StructureUnavailable(file) => file.allocated_heap_bytes(),
-            Self::StoreFailure(error) => allocation_size(error.retained_message_capacity()),
-            Self::Cancelled | Self::SemanticModelsPending | Self::ProofStopped { .. } => 0,
-        }
-    }
-
-    /// Stable replay representation. Unknown typed stops fail closed.
-    pub fn stable_replay_reason(&self) -> Option<String> {
-        self.replay_reason_parts()
-            .map(|(kind, reason)| format!("{kind}\0{reason}"))
-    }
-
-    /// Inspect registered replay provenance without allocating rendered prose.
-    pub fn has_stable_replay_reason(&self) -> bool {
-        self.replay_reason_parts().is_some()
-    }
-
-    fn replay_reason_parts(&self) -> Option<(&'static str, &str)> {
-        match self.base_cause() {
-            Self::ArtifactUnavailable(value) => Some(("artifact", value)),
-            Self::SemanticEvidenceGap(value) => Some(("gap", value)),
-            Self::ProofStopped {
-                reason,
-                cause: None,
-            } if DETERMINISTIC_PROOF_STOP_LABELS.contains(reason) => Some(("proof", reason)),
-            _ => None,
-        }
-    }
-
-    /// Registered reason label shared by query consumers.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Attributed(data) => data.cause.label(),
-            Self::ProofStopped { .. } => match self.execution_cause() {
-                None => "semantic_evidence_gap",
-                Some(crate::analyzer::read_ledger::DerivationExecutionCause::Cancelled) => {
-                    "cancelled"
-                }
-                Some(_) => "semantic_evidence_unavailable",
-            },
-            Self::SemanticModelsPending => "semantic_models_pending",
-            Self::Cancelled => "cancelled",
-            Self::StructureUnavailable(_) => "structure_unavailable",
-            Self::SemanticEvidenceUnavailable(_) => "semantic_evidence_unavailable",
-            Self::ArtifactUnavailable(_) => "artifact_unavailable",
-            Self::SemanticEvidenceGap(_) => "semantic_evidence_gap",
-            Self::StoreFailure(_) => "store_failure",
-        }
-    }
-
-    /// Combine two reasons observed for one lookup. An execution-dependent
-    /// reason (cancellation, a store failure, or a provider failure) is not
-    /// hidden by an earlier stable content gap.
-    pub fn merge_optional(first: Option<Self>, second: Option<Self>) -> Option<Self> {
-        match (first, second) {
-            (Some(first), Some(second))
-                if !first.is_execution_dependent() && second.is_execution_dependent() =>
-            {
-                Some(second)
-            }
-            (Some(first), Some(_)) => Some(first),
-            (first, second) => first.or(second),
-        }
-    }
-
-    /// Structural admission refusals and typed semantic gaps are properties of
-    /// recorded inputs. Unclassified semantic failures remain conservative;
-    /// typed producers use SemanticEvidenceGap only for deterministic gaps.
-    pub fn is_execution_dependent(&self) -> bool {
-        self.execution_cause().is_some()
-    }
-
-    /// Whether this reason concerns the request that recorded it, not the
-    /// question that request asked (cancellation). Another request sharing the
-    /// answer must not adopt it; it recomputes.
-    pub fn belongs_to_leader_request(&self) -> bool {
-        self.execution_cause()
-            == Some(crate::analyzer::read_ledger::DerivationExecutionCause::Cancelled)
-    }
-
-    /// Operational provenance of an incomplete read, independent of its value.
-    pub fn execution_cause(
-        &self,
-    ) -> Option<crate::analyzer::read_ledger::DerivationExecutionCause> {
-        use crate::analyzer::read_ledger::DerivationExecutionCause;
-        match self {
-            Self::Attributed(data) => data.cause.execution_cause(),
-            Self::ProofStopped { reason, cause } => cause.or_else(|| {
-                (!DETERMINISTIC_PROOF_STOP_LABELS.contains(reason))
-                    .then_some(DerivationExecutionCause::Provider)
-            }),
-            Self::StructureUnavailable(_)
-            | Self::ArtifactUnavailable(_)
-            | Self::SemanticEvidenceGap(_) => None,
-            Self::Cancelled => Some(DerivationExecutionCause::Cancelled),
-            Self::StoreFailure(_)
-            | Self::SemanticEvidenceUnavailable(_)
-            | Self::SemanticModelsPending => Some(DerivationExecutionCause::Provider),
-        }
+    let answer = run();
+    let captured = scope.captured_read_incompleteness();
+    let failed = captured
+        .iter()
+        .any(QueryReadIncomplete::invalidates_positive_evidence);
+    // Content gaps leave positive evidence usable, but cannot establish absence.
+    // Replay after closing our capture so enclosing completion retains each gap.
+    drop(scope);
+    let reason = captured.into_iter().fold(None, |reason, next| {
+        analyzer.record_query_incomplete(next.clone());
+        QueryReadIncomplete::merge_optional(reason, Some(next))
+    });
+    match (answer, reason) {
+        (LookupOutcome::Incomplete(own), reason) => LookupOutcome::Incomplete(
+            QueryReadIncomplete::merge_optional(reason, Some(own)).expect("lookup failure"),
+        ),
+        (_, Some(reason)) if failed => LookupOutcome::Incomplete(reason),
+        (LookupOutcome::NotFound, Some(reason)) => LookupOutcome::Incomplete(reason),
+        (answer, _) => answer,
     }
 }
 
@@ -1230,6 +1089,18 @@ struct RequestWorkspaceSelection {
     snapshots: Arc<crate::analyzer::store::WorkspaceSnapshots>,
 }
 
+// This private owner is the single production binding extractor. Readers use
+// the already registered entry and cannot supply a projection closure.
+impl brokk_bifrost_core::analyzer::outer_request::WorkspaceEntryBinding
+    for RequestWorkspaceSelection
+{
+    type Binding = Arc<crate::analyzer::store::WorkspaceSnapshots>;
+
+    fn binding(&self) -> &Self::Binding {
+        &self.snapshots
+    }
+}
+
 /// Read the eagerly bound request selection, including on transported workers.
 /// No request or binding is a design error; never manufacture a replacement.
 pub(crate) fn request_workspace_snapshots(
@@ -1241,15 +1112,18 @@ pub(crate) fn request_workspace_snapshots(
     if request.is_closed() {
         return Err(RequestWorkspaceSelectionError::ClosedRequest);
     }
-    let selection =
-        request.workspace_selection::<RequestWorkspaceSelection>(Arc::as_ptr(source) as usize);
+    let snapshots = request.with_workspace_selection::<RequestWorkspaceSelection, _>(
+        Arc::as_ptr(source) as usize,
+        |entry| {
+            debug_assert!(Arc::ptr_eq(&entry.value().owner, source));
+            Arc::clone(entry.project().value())
+        },
+    );
     debug_assert!(
-        selection.is_some(),
+        snapshots.is_some(),
         "selected read has no selection bound at query entry"
     );
-    let selection = selection.ok_or(RequestWorkspaceSelectionError::MissingSelection)?;
-    debug_assert!(Arc::ptr_eq(&selection.owner, source));
-    Ok(Arc::clone(&selection.snapshots))
+    snapshots.ok_or(RequestWorkspaceSelectionError::MissingSelection)
 }
 
 /// Refuse reuse when a request row read cannot name certified selection inputs.
@@ -1262,6 +1136,27 @@ pub fn refuse_request_row_read_reuse() {
     );
     let contexts: Vec<_> = current_query_contexts().collect();
     for_each_unshadowed_active_ledger(&contexts, |ledger| ledger.refuse_read_reuse());
+}
+
+/// Record that the current request read an input it pinned but a later request
+/// cannot verify, such as a JVM dependency selection that is not replayable
+/// (#14322). Every enclosing capture becomes request-pinned: no later request
+/// may reuse its answer, while the request that read the input may.
+pub fn record_request_pinned_input() {
+    brokk_bifrost_core::analyzer::carried_context::join_evaluation_verdict(
+        crate::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+            crate::analyzer::reuse_verdict::ExecutionCause::RequestPinned,
+        ),
+    );
+    let contexts: Vec<_> = current_query_contexts().collect();
+    for_each_unshadowed_active_ledger(&contexts, |ledger| {
+        ledger.mark_request_pinned_dependences(1);
+        ledger.join_verdict(
+            crate::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                crate::analyzer::reuse_verdict::ExecutionCause::RequestPinned,
+            ),
+        );
+    });
 }
 
 /// Record request-reader cancellation on every enclosing query context.
@@ -1370,6 +1265,10 @@ pub struct AnalyzerQueryContext {
     semantic_model_overlay_override: Option<(
         std::thread::ThreadId,
         Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    )>,
+    host_activation_override: Option<(
+        std::thread::ThreadId,
+        Option<Arc<crate::analyzer::semantic_model::HostActivationContext>>,
     )>,
     active_semantic_model_snapshot_override: Option<(
         std::thread::ThreadId,
@@ -1544,50 +1443,194 @@ impl PolicyCompletionOwner {
     }
 }
 
+/// One typed read-incompleteness reason with its canonical keys computed at
+/// most once. Receipts, replays and enclosing capture scopes share the `Arc`,
+/// so no reader re-serializes or re-orders a cause it already holds.
+#[doc(hidden)]
+pub struct CapturedCause {
+    reason: QueryReadIncomplete,
+    order_key: std::sync::OnceLock<Box<[u8]>>,
+    replay_key: std::sync::OnceLock<Option<Arc<[u8]>>>,
+    computations: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Debug for CapturedCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+
+impl CapturedCause {
+    #[doc(hidden)]
+    pub fn new(reason: QueryReadIncomplete) -> Arc<Self> {
+        Arc::new(Self {
+            reason,
+            order_key: std::sync::OnceLock::new(),
+            replay_key: std::sync::OnceLock::new(),
+            computations: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn reason(&self) -> &QueryReadIncomplete {
+        &self.reason
+    }
+
+    /// `QueryReadIncomplete::answer_order_key`, computed once.
+    #[doc(hidden)]
+    pub fn order_key(&self) -> &[u8] {
+        self.order_key.get_or_init(|| {
+            self.note_computation();
+            self.reason.answer_order_key().into_boxed_slice()
+        })
+    }
+
+    /// `QueryReadIncomplete::canonical_replay_key`, computed once.
+    #[doc(hidden)]
+    pub fn replay_key(&self) -> Option<&Arc<[u8]>> {
+        self.replay_key
+            .get_or_init(|| {
+                self.note_computation();
+                self.reason.canonical_replay_key().map(Arc::from)
+            })
+            .as_ref()
+    }
+
+    fn note_computation(&self) {
+        self.computations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Finalize both lazy keys before weighing their retained allocations.
+    /// A fixed admission charge must cover later merges as well as singleton
+    /// captures, whose sort never needs the presentation key.
+    #[doc(hidden)]
+    pub fn retained_key_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        let order_key = self.order_key();
+        let replay_key = self.replay_key();
+        allocation_size(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>())
+            + allocation_size(order_key.len())
+            + replay_key.map_or(0, |key| {
+                allocation_size(key.len() + 2 * std::mem::size_of::<usize>())
+            })
+    }
+
+    /// How many canonical keys this cause has computed. Pins (in tests) that
+    /// replay never recomputes.
+    #[doc(hidden)]
+    pub fn key_computations(&self) -> usize {
+        self.computations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The canonical of two causes, as `QueryReadIncomplete::merge_optional`
+    /// chooses between two reasons.
+    fn merge(first: Arc<Self>, second: Arc<Self>) -> Arc<Self> {
+        if !first.reason.is_execution_dependent() && second.reason.is_execution_dependent() {
+            return second;
+        }
+        if Arc::ptr_eq(&first, &second)
+            || first.reason == second.reason
+            || first.order_key() <= second.order_key()
+        {
+            first
+        } else {
+            second
+        }
+    }
+}
+
+/// Distinct causes in first-seen order. Keyed causes are found through a hash
+/// index and confirmed by full equality; causes without a replay key (operational
+/// stops) keep the exact linear comparison, so membership equals `Vec::contains`.
+#[derive(Debug, Default)]
+struct CapturedSet {
+    items: Vec<Arc<CapturedCause>>,
+    keyed: std::collections::HashMap<Arc<[u8]>, Vec<usize>>,
+    unkeyed: Vec<usize>,
+}
+
+impl CapturedSet {
+    fn insert(&mut self, cause: &Arc<CapturedCause>) {
+        let at = self.items.len();
+        match cause.replay_key() {
+            Some(key) => {
+                let bucket = self.keyed.entry(Arc::clone(key)).or_default();
+                if bucket.iter().any(|&seen| {
+                    Arc::ptr_eq(&self.items[seen], cause) || self.items[seen].reason == cause.reason
+                }) {
+                    return;
+                }
+                bucket.push(at);
+            }
+            None => {
+                if self.unkeyed.iter().any(|&seen| {
+                    Arc::ptr_eq(&self.items[seen], cause) || self.items[seen].reason == cause.reason
+                }) {
+                    return;
+                }
+                self.unkeyed.push(at);
+            }
+        }
+        self.items.push(Arc::clone(cause));
+    }
+}
+
 /// The sticky incompleteness of one request. Every slot moves under one lock,
 /// through `record_store_error` and `record`, so the slots cannot be observed
 /// half-updated.
 #[derive(Debug, Default)]
 struct QueryCompletion {
-    /// Kept apart from `first`: `completion` reports a later typed reason in
-    /// preference to an earlier bare store failure.
+    /// Kept apart from `first`: `completion` prefers a typed reason over a
+    /// bare store failure. `first` is the canonical presentation representative,
+    /// independent of recording order.
     store_errors: Vec<RecordedStoreError>,
-    first: Option<QueryReadIncomplete>,
+    first: Option<Arc<CapturedCause>>,
     /// Only file-cache builders capture every reason, so a stable first reason
     /// cannot conceal a later transient failure when deciding cache admission.
-    captured: Option<Vec<QueryReadIncomplete>>,
+    captured: Option<CapturedSet>,
     proof_attempt: bool,
 }
 
 impl QueryCompletion {
     fn capturing() -> Self {
         Self {
-            captured: Some(Vec::new()),
+            captured: Some(CapturedSet::default()),
             ..Self::default()
         }
     }
 
-    fn capture(&mut self, reason: &QueryReadIncomplete) {
-        if let Some(captured) = &mut self.captured
-            && !captured.contains(reason)
-        {
-            captured.push(reason.clone());
+    fn capture(&mut self, cause: &Arc<CapturedCause>) {
+        if let Some(captured) = &mut self.captured {
+            captured.insert(cause);
         }
     }
 
     fn record_store_error(&mut self, error: RecordedStoreError) {
-        self.capture(&QueryReadIncomplete::StoreFailure(error.error().clone()));
+        if self.captured.is_some() {
+            self.capture(&CapturedCause::new(QueryReadIncomplete::StoreFailure(
+                error.error().clone(),
+            )));
+        }
         self.store_errors.push(error);
     }
 
-    fn record(&mut self, reason: QueryReadIncomplete) {
-        self.capture(&reason);
-        self.first.get_or_insert(reason);
+    /// Record an already-interned cause. Its keys were computed when it was
+    /// first created; nothing here recomputes them.
+    fn record_interned(&mut self, cause: Arc<CapturedCause>) {
+        self.capture(&cause);
+        self.first = Some(match self.first.take() {
+            None => cause,
+            Some(first) => CapturedCause::merge(first, cause),
+        });
     }
 
     fn completion(&self) -> Result<(), QueryReadIncomplete> {
-        match (&self.first, self.store_errors.first()) {
-            (Some(reason), _) => Err(reason.clone()),
+        let store_error = self.store_errors.iter().min_by_key(|error| {
+            QueryReadIncomplete::StoreFailure(error.error().clone()).answer_order_key()
+        });
+        match (&self.first, store_error) {
+            (Some(reason), _) => Err(reason.reason().clone()),
             (None, Some(error)) => Err(QueryReadIncomplete::StoreFailure(error.error().clone())),
             (None, None) => Ok(()),
         }
@@ -1667,6 +1710,7 @@ impl Default for AnalyzerQueryContext {
             semantic_models_selected: None,
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
+            host_activation_override: None,
             tier_accesses: Default::default(),
             read_ledger: None,
             shadowed_read_ledger: None,
@@ -1777,6 +1821,7 @@ fn tier_access_count_from(
 #[doc(hidden)]
 pub struct AnalyzerSnapshotCaches {
     retention_budget: brokk_bifrost_core::retention_budget::RetentionBudget,
+    pub artifact_digests: Arc<crate::analyzer::artifact_digest::ArtifactDigestMemo>,
     derivations: Arc<crate::analyzer::derivation_host::AnalyzerDerivations>,
     derived_layers: Arc<crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache>,
     #[doc(hidden)]
@@ -1817,6 +1862,7 @@ impl AnalyzerSnapshotCaches {
     ) -> Self {
         Self {
             retention_budget: budget.clone(),
+            artifact_digests: Arc::new(crate::analyzer::artifact_digest::ArtifactDigestMemo::new(budget)),
             derivations: Arc::new(crate::analyzer::derivation_host::AnalyzerDerivations::new(budget)),
             derived_layers: Arc::new(
                 crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::new(
@@ -1850,13 +1896,14 @@ impl AnalyzerSnapshotCaches {
     pub(crate) fn carry_content_keyed_values_forward(&self) -> Self {
         Self {
             retention_budget: self.retention_budget.clone(),
+            artifact_digests: Arc::clone(&self.artifact_digests),
             derivations: Arc::clone(&self.derivations),
             derived_layers: Arc::clone(&self.derived_layers),
             usage_graphs: Arc::clone(&self.usage_graphs),
             java_usage_evidence: Arc::clone(&self.java_usage_evidence),
-            semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
-                &self.retention_budget,
-            ),
+            semantic_models: self
+                .semantic_models
+                .new_for_updated_snapshot(&self.retention_budget),
             runtime_syntax: self.runtime_syntax.clone(),
         }
     }
@@ -1906,6 +1953,10 @@ impl AnalyzerSnapshotCaches {
         stale: Vec<crate::analyzer::DependencyPackEcosystem>,
         old_request: Option<crate::analyzer::semantic_model::ActivationInputs>,
         activated: Option<Vec<crate::analyzer::DependencyPackEcosystem>>,
+        request_evidence: HashMap<
+            crate::analyzer::DependencyPackEcosystem,
+            crate::analyzer::semantic_model::DependencyRequestEvidence,
+        >,
     ) {
         self.semantic_models.install_carried_dependency_evidence(
             models_selected,
@@ -1913,6 +1964,7 @@ impl AnalyzerSnapshotCaches {
             stale,
             old_request,
             activated,
+            request_evidence,
         );
     }
 
@@ -1934,14 +1986,6 @@ impl AnalyzerSnapshotCaches {
         self.semantic_models.activated_dependency_ecosystems()
     }
 
-    pub(crate) fn record_activated_dependency_ecosystems(
-        &self,
-        ecosystems: &[crate::analyzer::DependencyPackEcosystem],
-    ) {
-        self.semantic_models
-            .record_activated_dependency_ecosystems(ecosystems);
-    }
-
     pub(crate) fn requires_whole_dependency_refresh(&self) -> bool {
         self.semantic_models.requires_whole_dependency_refresh()
     }
@@ -1960,6 +2004,18 @@ impl AnalyzerSnapshotCaches {
                 &self.retention_budget,
             )
         })
+    }
+
+    pub fn bind_host_activation_context(
+        &self,
+        host: Arc<crate::analyzer::semantic_model::HostActivationContext>,
+    ) -> Result<(), String> {
+        self.semantic_models.bind_host_activation(host)
+    }
+    pub fn host_activation_context(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::HostActivationContext>> {
+        self.semantic_models.host_activation()
     }
 
     fn active_semantic_model_snapshot(
@@ -1995,6 +2051,14 @@ impl AnalyzerSnapshotCaches {
             .store_captured_dependency_discovery(ecosystem, discovery);
     }
 
+    pub(crate) fn captured_dependency_discovery_is_complete(
+        &self,
+        ecosystem: crate::analyzer::DependencyPackEcosystem,
+    ) -> bool {
+        self.semantic_models
+            .captured_dependency_discovery_is_complete(ecosystem)
+    }
+
     pub(crate) fn take_captured_dependency_discovery(
         &self,
         ecosystem: crate::analyzer::DependencyPackEcosystem,
@@ -2003,7 +2067,8 @@ impl AnalyzerSnapshotCaches {
             .take_captured_dependency_discovery(ecosystem)
     }
 
-    pub(crate) fn dependency_discovery_evidence(
+    #[doc(hidden)]
+    pub fn dependency_discovery_evidence(
         &self,
         language: crate::analyzer::Language,
     ) -> Option<Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>> {
@@ -2048,7 +2113,152 @@ pub struct WorkspaceFileIndex {
 /// and a check-then-build-then-store `Option` would let every thread that
 /// missed the check redo the same whole-workspace walk.
 #[doc(hidden)]
-pub type WorkspaceFileIndexCell = Arc<OnceLock<Arc<WorkspaceFileIndex>>>;
+pub type WorkspaceFileIndexCell = Arc<WorkspaceFileListingCell>;
+
+/// One request's workspace listing, shared by every consumer that needs the
+/// whole tree: the basename [`WorkspaceFileIndex`] and the C# configuration
+/// digest (#13799). Whichever consumer asks first performs the only walk; the
+/// others reuse its (files, omissions) pair. A failed walk is never stored, so
+/// the next asker walks again and the listing stays current per request.
+///
+/// The listings sit in a slot that every delegate of one multi-language
+/// analyzer shares (`share_listing_with`), so the consumers need not reach the
+/// same delegate's cell. Each listing is keyed by the project view it describes.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct WorkspaceFileListingCell {
+    index: OnceLock<Arc<WorkspaceFileIndex>>,
+    listings: OnceLock<Arc<WorkspaceListings>>,
+}
+
+/// Listings of this request, one per project view. The lock is held across a
+/// walk so concurrent askers wait for it instead of walking again.
+#[derive(Debug, Default)]
+struct WorkspaceListings(Mutex<Vec<WorkspaceListing>>);
+
+#[derive(Debug)]
+struct WorkspaceListing {
+    view: ProjectViewKey,
+    files: SharedWorkspaceFileListing,
+    /// What the walk published, replayed on every reuse so a reader records
+    /// the read its own walk would have recorded.
+    receipt: brokk_bifrost_core::analyzer::project_reads::PublishedInventoryReads,
+}
+
+/// Identity of the project view a listing describes: the view object itself,
+/// and its complete certified listing revisions. Delegates of one workspace
+/// hold the same view object; a different view of the same root (a filtered, overlaid
+/// or captured one) can list different files and must walk its own listing.
+/// The key retains the original read slot, preventing source identity reuse
+/// while an entry survives. Certified revisions identify the listing owner;
+/// a raw view address alone is not a lifetime or identity guarantee.
+#[derive(Clone, Debug)]
+struct ProjectViewKey {
+    view: usize,
+    source: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
+    stamps: Vec<brokk_bifrost_core::analyzer::project::ProjectViewStamp>,
+}
+
+impl PartialEq for ProjectViewKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.source.is_same_source(&other.source)
+            && self.stamps == other.stamps
+    }
+}
+impl Eq for ProjectViewKey {}
+
+impl ProjectViewKey {
+    fn of(project: &dyn Project) -> Option<Self> {
+        let source = project.project_read_slot()?.clone();
+        let stamps = project.file_listing_stamp()?;
+        if stamps.is_empty() {
+            return None;
+        }
+        Some(Self {
+            view: std::ptr::from_ref(project).addr(),
+            source,
+            stamps,
+        })
+    }
+}
+
+impl WorkspaceFileListingCell {
+    pub fn get(&self) -> Option<&Arc<WorkspaceFileIndex>> {
+        self.index.get()
+    }
+
+    pub(crate) fn get_or_init(
+        &self,
+        build: impl FnOnce() -> Arc<WorkspaceFileIndex>,
+    ) -> &Arc<WorkspaceFileIndex> {
+        self.index.get_or_init(build)
+    }
+
+    fn listings(&self) -> &Arc<WorkspaceListings> {
+        self.listings.get_or_init(Arc::default)
+    }
+
+    /// Make this cell use `other`'s listings. A multi-language analyzer calls
+    /// this on every delegate's cell when a request opens, before anything
+    /// lists the workspace, so whichever delegate a consumer reaches serves the
+    /// one listing. A cell that already holds listings keeps them.
+    pub fn share_listing_with(&self, other: &WorkspaceFileListingCell) {
+        self.listings.get_or_init(|| Arc::clone(other.listings()));
+    }
+
+    /// The request's listing of `project`, walked at most once per certified,
+    /// unchanged view. Unknown or concurrently moved views are not retained.
+    ///
+    /// A walk records its own project read through `all_files_with_omissions`.
+    /// A reuse replays the receipt that walk published, so the asker records
+    /// what its own walk would have recorded: a digest fill keeps its inventory
+    /// read, and a caller under `without_project_reads` still records nothing.
+    pub fn listing(&self, project: &dyn Project) -> std::io::Result<SharedWorkspaceFileListing> {
+        let mut listings = self
+            .listings()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(view) = ProjectViewKey::of(project) else {
+            drop(listings);
+            return project.all_files_with_omissions();
+        };
+        if let Some(listing) = listings.iter().find(|listing| listing.view == view) {
+            debug_assert!(
+                listing
+                    .files
+                    .0
+                    .first()
+                    .into_iter()
+                    .chain(listing.files.0.last())
+                    .all(|file| file.root() == project.root()),
+                "a reused listing must describe the project view that asks for it: {:?}",
+                project.root()
+            );
+            brokk_bifrost_core::analyzer::project_reads::replay_published_inventory_reads(
+                &listing.receipt,
+            );
+            return Ok(listing.files.clone());
+        }
+        let (walked, receipt) =
+            brokk_bifrost_core::analyzer::project_reads::capture_published_inventory_reads(|| {
+                project.all_files_with_omissions()
+            });
+        let files = walked?;
+        // Keep the pre-getter key. An invalidation during or after the getter
+        // makes this a miss, never an old answer relabelled with a new stamp.
+        if ProjectViewKey::of(project).as_ref() == Some(&view) {
+            listings.retain(|listing| listing.view.view != view.view);
+            listings.push(WorkspaceListing {
+                view,
+                files: files.clone(),
+                receipt,
+            });
+        }
+        Ok(files)
+    }
+}
 
 /// One scalar getter-owned inventory certificate per request, independent of
 /// the optional basename resolver index. The root prevents cross-view reuse.
@@ -2061,12 +2271,15 @@ pub type WorkspaceFileInventoryCell = Arc<
 >;
 
 impl WorkspaceFileIndex {
-    /// One ignore-aware listing of `project`, bucketed by basename.
-    pub(crate) fn build(project: &dyn Project) -> Self {
+    /// One ignore-aware listing of `project`, bucketed by basename. With a
+    /// request cell the listing is the request's shared one (#13799).
+    pub(crate) fn build(project: &dyn Project, shared: Option<&WorkspaceFileListingCell>) -> Self {
         let listed = brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let files = project.all_files().map_err(|err| {
-                format!("listing workspace files under {:?}: {err}", project.root())
-            })?;
+            let files = match shared {
+                Some(cell) => cell.listing(project).map(|(files, _)| files),
+                None => project.all_files().map(Arc::new),
+            }
+            .map_err(|err| format!("listing workspace files under {:?}: {err}", project.root()))?;
             let receipt =
                 brokk_bifrost_core::analyzer::project_reads::file_set_receipt(project, &files)
                     .map_err(|err| {
@@ -2076,7 +2289,7 @@ impl WorkspaceFileIndex {
                         )
                     })?;
             Ok((
-                Self::bucket_by_basename(files),
+                Self::bucket_by_basename(&files),
                 receipt
                     .inventory
                     .map(super::semantic::ids::StableDigest::from_array),
@@ -2098,14 +2311,17 @@ impl WorkspaceFileIndex {
     }
 
     fn bucket_by_basename(
-        files: std::collections::BTreeSet<ProjectFile>,
+        files: &std::collections::BTreeSet<ProjectFile>,
     ) -> crate::hash::HashMap<String, Vec<ProjectFile>> {
         let mut by_basename: crate::hash::HashMap<String, Vec<ProjectFile>> = Default::default();
         for file in files {
             let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            by_basename.entry(name.to_string()).or_default().push(file);
+            by_basename
+                .entry(name.to_string())
+                .or_default()
+                .push(file.clone());
         }
         for matches in by_basename.values_mut() {
             matches.sort();
@@ -2200,6 +2416,13 @@ impl AnalyzerQueryContext {
         }
         let (owner, overlay) = self.semantic_model_overlay_override.as_ref()?;
         (owner == &std::thread::current().id()).then(|| overlay.clone())
+    }
+
+    pub(crate) fn host_activation_override_for_current_thread(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::HostActivationContext>>> {
+        let (owner, host) = self.host_activation_override.as_ref()?;
+        (owner == &std::thread::current().id()).then(|| host.clone())
     }
 
     pub(crate) fn active_semantic_model_snapshot_override_for_current_thread(
@@ -2357,6 +2580,52 @@ impl AnalyzerQueryContext {
             .map(|record| record.error().clone())
     }
 
+    /// Completion belongs to this evaluation, including its boundary itself.
+    /// Start at the parent when importing shared preparation into a new owner.
+    fn completion_ancestry(&self) -> impl Iterator<Item = &Self> {
+        std::iter::successors(Some(self), |context| {
+            if matches!(
+                context.completion_boundary,
+                Some(
+                    QueryCompletionBoundary::AdvisoryRead
+                        | QueryCompletionBoundary::PolicyEvaluation
+                )
+            ) {
+                return None;
+            }
+            context
+                .enclosing
+                .as_deref()
+                .filter(|parent| Arc::ptr_eq(&parent.outer_request, &self.outer_request))
+        })
+    }
+
+    /// Independent answers isolate answer gaps, while a store failure remains
+    /// an operational fact of their request or policy evaluation. New requests
+    /// and sibling policies are clean; advisory reads keep their own boundary.
+    fn request_store_error(&self) -> Option<StoreError> {
+        for context in self.completion_ancestry() {
+            if let Some(error) = context.store_error() {
+                return Some(error);
+            }
+            if context.completion_boundary == Some(QueryCompletionBoundary::PolicyEvaluation) {
+                // #11701 keeps preparation records on their original scopes.
+                // This evaluation's owner already has their filtered, unique
+                // references. Observe that view only at this boundary; never
+                // copy it into an independent fill's own completion.
+                return PolicyCompletionOwner::current().and_then(|owner| {
+                    owner
+                        .errors
+                        .lock()
+                        .expect("policy completion poisoned")
+                        .first()
+                        .map(|record| record.error().clone())
+                });
+            }
+        }
+        None
+    }
+
     fn lock_completion(&self) -> std::sync::MutexGuard<'_, QueryCompletion> {
         self.completion
             .lock()
@@ -2367,16 +2636,17 @@ impl AnalyzerQueryContext {
     /// complete read. The reason is sticky so an outer scope retains an inner
     /// scope's cancellation after that inner scope closes.
     pub fn record_read_incomplete(&self, reason: QueryReadIncomplete) {
-        self.record_read_incomplete_with_store_error(reason, None);
+        self.record_read_incomplete_with_store_error(&CapturedCause::new(reason), None);
     }
 
     /// Records `reason` and, under the same lock, the store error an attributed
     /// store failure carries, without capturing it as a second reason.
     fn record_read_incomplete_with_store_error(
         &self,
-        reason: QueryReadIncomplete,
+        cause: &Arc<CapturedCause>,
         store_error: Option<&RecordedStoreError>,
     ) {
+        let reason = cause.reason();
         if reason.is_execution_dependent()
             && let Some(ledger) = &self.read_ledger
         {
@@ -2401,25 +2671,25 @@ impl AnalyzerQueryContext {
         {
             ledger.record_store_failure();
         }
-        self.append_read_incomplete(reason, store_error);
+        self.append_read_incomplete(Arc::clone(cause), store_error);
     }
 
     // Captured channels own ledger effects on replay. Completion storage and
     // store-owner propagation still run, without a second channel writer.
     fn append_read_incomplete(
         &self,
-        reason: QueryReadIncomplete,
+        cause: Arc<CapturedCause>,
         store_error: Option<&RecordedStoreError>,
     ) {
         let mut completion = self.lock_completion();
         if let Some(record) = store_error {
             completion.store_errors.push(record.clone());
         }
-        completion.record(reason);
+        completion.record_interned(cause);
     }
 
-    /// Returns the first typed read incompleteness, falling back to the first
-    /// recorded store failure when no more specific reason was recorded.
+    /// Returns the canonical typed read incompleteness, falling back to a
+    /// canonical store failure when no more specific reason was recorded.
     pub fn read_completion(&self) -> Result<(), QueryReadIncomplete> {
         self.lock_completion().completion()
     }
@@ -2474,7 +2744,7 @@ pub(crate) fn current_domain_read_completion() -> Result<(), QueryReadIncomplete
     for context in contexts {
         let completion = context.lock_completion();
         if let Some(reason) = &completion.first {
-            return Err(reason.clone());
+            return Err(reason.reason().clone());
         }
         if let Some(error) = completion
             .store_errors
@@ -2534,7 +2804,9 @@ pub fn current_captured_proof_stop() -> Option<QueryReadIncomplete> {
                     .captured
                     .as_ref()
                     .expect("proof captures completion")
+                    .items
                     .iter()
+                    .map(|cause| cause.reason())
                     .filter(|reason| matches!(reason, QueryReadIncomplete::ProofStopped { .. }))
                     .cloned()
                     .reduce(|first, next| {
@@ -2554,28 +2826,62 @@ pub fn record_proof_incomplete_on_current_contexts(reason: QueryReadIncomplete) 
     }
 }
 
+/// Record `reason` on the query contexts the calling thread is reading under,
+/// for a reader that learns of a gap outside any analyzer handle.
+pub fn record_current_query_incomplete(reason: QueryReadIncomplete) {
+    record_query_incomplete_on_current_contexts(reason)
+}
+
 #[doc(hidden)]
 pub(crate) fn record_query_incomplete_on_current_contexts(reason: QueryReadIncomplete) {
-    visit_query_incomplete_contexts(reason, |context, reason, store_error| {
-        context.record_read_incomplete_with_store_error(reason, store_error);
+    // One interned cause for every enclosing scope: its keys are computed at
+    // most once however deeply captures nest.
+    let cause = CapturedCause::new(reason);
+    visit_query_incomplete_contexts(cause.reason(), |context, _, store_error| {
+        context.record_read_incomplete_with_store_error(&cause, store_error);
     });
 }
 
 pub(crate) fn replay_captured_query_incomplete(reason: QueryReadIncomplete) {
-    visit_query_incomplete_contexts(reason, |context, reason, store_error| {
-        context.append_read_incomplete(reason, store_error);
+    replay_captured_cause(&CapturedCause::new(reason));
+}
+
+/// Replay one interned cause into every enclosing context. The keys it carries
+/// were computed once when the cause was created.
+pub(crate) fn replay_captured_cause(cause: &Arc<CapturedCause>) {
+    visit_query_incomplete_contexts(cause.reason(), |context, _, store_error| {
+        context.append_read_incomplete(Arc::clone(cause), store_error);
     });
 }
 
+/// Inject one completion event into every active capturing scope, stopping at
+/// the same advisory boundary as ordinary completion propagation. This is a
+/// test hook: unlike recording the reason through an analyzer, it does not
+/// install a store-error side channel or mark a read ledger, so it cannot
+/// change the product whose memo receipt it is meant to exercise.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn record_captured_read_incomplete_for_test(reason: QueryReadIncomplete) {
+    let cause = CapturedCause::new(reason);
+    for context in current_query_contexts() {
+        if context.lock_completion().captured.is_some() {
+            context.append_read_incomplete(Arc::clone(&cause), None);
+        }
+        if context.completion_boundary == Some(QueryCompletionBoundary::AdvisoryRead) {
+            break;
+        }
+    }
+}
+
 fn visit_query_incomplete_contexts(
-    reason: QueryReadIncomplete,
-    record: impl Fn(&AnalyzerQueryContext, QueryReadIncomplete, Option<&RecordedStoreError>),
+    reason: &QueryReadIncomplete,
+    record: impl Fn(&AnalyzerQueryContext, &QueryReadIncomplete, Option<&RecordedStoreError>),
 ) {
     // Completion's aggregate verdict is independent of ledger channels:
     // structural incomplete causes can conservatively veto an evaluation
     // without adding a read dependence. Preserve that existing join on both
     // routes; only the fresh-recording callback writes ledger channels.
-    if reason.stable_replay_reason().is_none() {
+    if !reason.has_stable_replay_reason() {
         brokk_bifrost_core::analyzer::carried_context::join_evaluation_verdict(
             brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
                 brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::Other,
@@ -2605,7 +2911,7 @@ fn visit_query_incomplete_contexts(
     };
     let mut stopped_at_advisory_read = false;
     for context in current_query_contexts() {
-        record(&context, reason.clone(), attributed_store_error.as_ref());
+        record(&context, reason, attributed_store_error.as_ref());
         stopped_at_advisory_read =
             context.completion_boundary == Some(QueryCompletionBoundary::AdvisoryRead);
         if stopped_at_advisory_read
@@ -2668,8 +2974,9 @@ pub(crate) fn replay_query_read_receipt_on_current_contexts(
     for_each_unshadowed_active_ledger(&contexts, |ledger| {
         ledger.absorb_receipt(keys);
         ledger.record_unattributed_reads(channels.unattributed_reads);
-        ledger.mark_execution_dependent_reads(channels.execution_dependences);
+        ledger.mark_execution_dependent_reads(channels.unpinned_execution_dependences());
         ledger.record_budget_dependences(channels.budget_dependences);
+        ledger.mark_request_pinned_dependences(channels.request_pinned_dependences);
         ledger.join_verdict(channels.explicit_verdict);
         if channels.reuse_refused {
             ledger.refuse_read_reuse();
@@ -2810,14 +3117,14 @@ pub fn current_model_set_digest(
 pub fn current_model_set_read_digest(
     analyzer: &dyn IAnalyzer,
 ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
-    let overlay = current_model_set_digest(
+    let overlay = analyzer.model_set_digest(
         analyzer
             .semantic_model_overlay_read()
             .published()
             .as_ref()
             .map(|overlay| overlay.active_model_set_hash()),
     );
-    let snapshot = current_model_set_digest(
+    let snapshot = analyzer.model_set_digest(
         analyzer
             .active_semantic_model_snapshot()
             .as_ref()
@@ -2827,7 +3134,7 @@ pub fn current_model_set_read_digest(
 }
 
 pub(crate) fn no_active_model_set_digest() -> crate::analyzer::semantic::ids::StableDigest {
-    crate::analyzer::semantic::ids::StableDigest::sha256(b"no-active-semantic-model-set")
+    crate::analyzer::semantic_model::LIBRARY_NONE_NO_MODEL_DIGEST
 }
 
 pub(crate) fn active_model_digest(hash: &str) -> crate::analyzer::semantic::ids::StableDigest {
@@ -2888,6 +3195,24 @@ pub struct ReferenceNamesInFilesResult {
 }
 
 pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
+    /// Conservative whole-file authority for a selected canonical parser span.
+    /// Implementations must check the expected publication before recording it.
+    fn certify_selected_source_file(
+        &self,
+        _expected: &crate::analyzer::store::resolution_operation::SelectedSourceFileCertificate<'_>,
+    ) -> bool {
+        self.record_unattributed_read();
+        false
+    }
+
+    /// Revalidate the external receipts consumed when acquiring this analyzer's
+    /// configuration. A retained revision must check this before reuse: source
+    /// snapshots and store generations do not track ambient configuration edits.
+    /// Languages without external configuration acquisition have no receipts.
+    fn configuration_external_inputs_unchanged(&self) -> bool {
+        true
+    }
+
     fn certify_selected_configuration(
         &self,
         _language: crate::analyzer::Language,
@@ -3188,7 +3513,17 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// Attribute `count` of the execution dependences already marked to a
     /// refused budget charge, through the same routing as
     /// [`Self::mark_execution_dependent_reads`].
-    fn record_budget_dependences(&self, _count: usize) {}
+    fn record_budget_dependences(&self, count: usize) {
+        self.record_attributed_dependences(
+            crate::analyzer::ReadLedger::record_budget_dependences,
+            count,
+        );
+    }
+
+    /// Record `count` execution dependences of the cause `record` counts (see
+    /// [`AttributeDependences`]), through the same routing as
+    /// [`Self::mark_execution_dependent_reads`].
+    fn record_attributed_dependences(&self, _record: AttributeDependences, _count: usize) {}
 
     /// Join a replayed explicit reuse verdict into the consuming captures,
     /// through the same routing as [`Self::mark_execution_dependent_reads`].
@@ -3221,6 +3556,46 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         &self,
     ) -> Option<Arc<crate::analyzer::store::WorkspaceSnapshots>> {
         None
+    }
+
+    /// Replay one source-owned proof through the selected head's normal session.
+    /// `None` refuses retained reuse; it never certifies an empty proof.
+    #[doc(hidden)]
+    fn selected_receiver_proof_read(
+        &self,
+        _file: &ProjectFile,
+        _question: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+    > {
+        self.refuse_read_reuse();
+        Ok(None)
+    }
+
+    /// Test the ordinary session's exact proof after warming a transfer batch.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    fn selected_receiver_proofs_after_transfer_batch_for_test(
+        &self,
+        _file: &ProjectFile,
+        questions: &[crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion],
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Vec<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>>,
+    > {
+        self.refuse_read_reuse();
+        Ok(vec![None; questions.len()])
+    }
+
+    /// Admit a query's source languages against this workspace's build selection.
+    /// A deliberately unselected language is unavailable, not an empty inventory.
+    #[doc(hidden)]
+    fn require_workspace_languages(
+        &self,
+        _languages: &[crate::analyzer::Language],
+    ) -> Result<(), StoreError> {
+        Ok(())
     }
 
     /// Whether any open request boundary carries a read ledger.
@@ -3294,6 +3669,66 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
         None
+    }
+
+    #[doc(hidden)]
+    fn active_query_host_activation_context(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::HostActivationContext>>> {
+        None
+    }
+
+    /// Immutable host authority in this request, even when no model was active.
+    fn host_activation_context(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::HostActivationContext>> {
+        self.active_query_host_activation_context()
+            .unwrap_or_else(|| {
+                self.snapshot_caches()
+                    .and_then(AnalyzerSnapshotCaches::host_activation_context)
+            })
+    }
+    fn bind_host_activation_context(
+        &self,
+        host: Arc<crate::analyzer::semantic_model::HostActivationContext>,
+    ) -> Result<(), String> {
+        if self
+            .snapshot_caches()
+            .and_then(AnalyzerSnapshotCaches::host_activation_context)
+            .as_ref()
+            .is_some_and(|pinned| Arc::ptr_eq(pinned, &host))
+        {
+            return Ok(());
+        }
+        if host.requires_analyzed_root_validation() {
+            host.validate_analyzed_root(self.project().root())?;
+        }
+        match self.snapshot_caches() {
+            Some(cache) => cache.bind_host_activation_context(host),
+            None if host.identity()
+                == crate::analyzer::semantic_model::LIBRARY_NONE_APPROVAL_IDENTITY =>
+            {
+                Ok(())
+            }
+            None => Err("host activation requires an analyzer activation-context owner".into()),
+        }
+    }
+    fn host_activation_identity(&self) -> crate::analyzer::semantic::StableDigest {
+        self.host_activation_context().map_or(
+            crate::analyzer::semantic_model::LIBRARY_NONE_APPROVAL_IDENTITY,
+            |host| host.identity(),
+        )
+    }
+    fn model_set_digest(&self, hash: Option<&str>) -> crate::analyzer::semantic::StableDigest {
+        hash.map_or_else(
+            || {
+                self.host_activation_context().map_or(
+                    crate::analyzer::semantic_model::LIBRARY_NONE_NO_MODEL_DIGEST,
+                    |host| host.no_model_digest(),
+                )
+            },
+            active_model_digest,
+        )
     }
 
     /// Starts a disposable file-local analyzer read used by broad sequential
@@ -3521,6 +3956,24 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     ) -> Self
     where
         Self: Sized;
+
+    /// Return the producer's effect coverage alongside the new endpoint.
+    /// Existing producers are broad until they explicitly report coverage.
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (Self, crate::analyzer::read_verification::UpdateEffects)
+    where
+        Self: Sized,
+    {
+        (
+            self.update_with_listing(changed_files, listing),
+            crate::analyzer::read_verification::UpdateEffects::AllMayHaveChanged(
+                "delegate did not report update effects",
+            ),
+        )
+    }
 
     /// Re-index `changed_files` for a caller that took no workspace listing.
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
@@ -3825,7 +4278,7 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                 _ => None,
             };
             self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
-                current_model_set_digest(hash),
+                self.model_set_digest(hash),
             ));
         }
         read
@@ -3851,7 +4304,7 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
             });
         if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
-                current_model_set_digest(
+                self.model_set_digest(
                     snapshot
                         .as_ref()
                         .map(|snapshot| snapshot.active_models().active_model_set_hash()),
@@ -4392,6 +4845,15 @@ pub trait AnalyzerTestHooks {
         0
     }
 
+    /// Install the per-analyzer structured batch fake on its actual backend.
+    #[doc(hidden)]
+    fn relational_definition_batch_callback_for_test(
+        &self,
+        _callback: Arc<crate::analyzer::tree_sitter_analyzer::RelationalBatchTestCallback>,
+    ) -> crate::analyzer::tree_sitter_analyzer::RelationalDefinitionBatchTestGuard {
+        unimplemented!("this analyzer has no relational batch test callback")
+    }
+
     /// Records one call to `resolve_definition_batch_with_source`, so a
     /// batching caller can assert it collapsed many per-edge calls into one
     /// call per file rather than re-deriving that from timing (bifrost#15).
@@ -4604,6 +5066,14 @@ struct AnalyzerRequestState {
     context: Option<Arc<AnalyzerQueryContext>>,
 }
 
+impl carried_context::RequestCompletion for AnalyzerRequestState {
+    fn store_failed(&self) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|context| context.request_store_error().is_some())
+    }
+}
+
 #[derive(Clone)]
 enum AttributionFrame {
     Broadcast,
@@ -4695,10 +5165,8 @@ impl ReadAttribution {
             _guard: Some(carried_context::push_with_execution_attribution(Arc::new(
                 self.frame.clone(),
             ))),
-            _request_state: carried_context::push_request_state(
-                self.request_state
-                    .as_ref()
-                    .map(|state| Arc::clone(state) as _),
+            _request_state: carried_context::push_request_state_with_completion(
+                self.request_state.as_ref().map(Arc::clone),
             ),
         }
     }
@@ -4741,10 +5209,12 @@ fn query_attribution(context: &Arc<AnalyzerQueryContext>) -> ReadAttributionGuar
     ReadAttributionGuard {
         _guard: frame
             .map(|frame| carried_context::push_with_execution_attribution(Arc::new(frame))),
-        _request_state: carried_context::push_request_state(Some(Arc::new(AnalyzerRequestState {
-            path_modules,
-            context: Some(Arc::clone(context)),
-        }))),
+        _request_state: carried_context::push_request_state_with_completion(Some(Arc::new(
+            AnalyzerRequestState {
+                path_modules,
+                context: Some(Arc::clone(context)),
+            },
+        ))),
     }
 }
 
@@ -4752,10 +5222,12 @@ fn path_module_request_state() -> Option<carried_context::RequestStateGuard> {
     carried_context::request_state::<AnalyzerRequestState>()
         .is_none()
         .then(|| {
-            carried_context::push_request_state(Some(Arc::new(AnalyzerRequestState {
-                path_modules: Arc::new(PathModuleRequestFailures::default()),
-                context: None,
-            })))
+            carried_context::push_request_state_with_completion(Some(Arc::new(
+                AnalyzerRequestState {
+                    path_modules: Arc::new(PathModuleRequestFailures::default()),
+                    context: None,
+                },
+            )))
         })
 }
 
@@ -4845,6 +5317,15 @@ pub struct IncompatibleSelectedModelSnapshot;
 
 impl<'a> AnalyzerQueryScope<'a> {
     fn with_context(analyzer: &'a dyn IAnalyzer, mut context: AnalyzerQueryContext) -> Self {
+        if context.host_activation_override.is_none() {
+            let host = context
+                .active_semantic_model_snapshot_override
+                .as_ref()
+                .and_then(|(_, snapshot)| snapshot.as_ref())
+                .map(|snapshot| Arc::clone(snapshot.active_models().host_activation()))
+                .or_else(|| analyzer.host_activation_context());
+            context.host_activation_override = Some((std::thread::current().id(), host));
+        }
         if context.semantic_models_selected.is_none()
             && (context.semantic_model_overlay_override.is_some()
                 || context.active_semantic_model_snapshot_override.is_some())
@@ -4974,7 +5455,7 @@ impl<'a> AnalyzerQueryScope<'a> {
     }
 
     /// Capture every distinct incomplete-read reason for a file-derived cache
-    /// admission. Ordinary scopes retain their first-reason behavior.
+    /// admission. Ordinary scopes retain only the canonical representative.
     #[doc(hidden)]
     pub fn capturing_read_incompleteness(analyzer: &'a dyn IAnalyzer) -> Self {
         Self::with_context(
@@ -5067,11 +5548,26 @@ impl<'a> AnalyzerQueryScope<'a> {
     }
 
     pub fn captured_read_incompleteness(&self) -> Vec<QueryReadIncomplete> {
-        self.context
+        self.captured_causes()
+            .iter()
+            .map(|cause| cause.reason().clone())
+            .collect()
+    }
+
+    /// The captured causes in canonical presentation order, sharing each
+    /// cause's interned keys with every receipt and replay that holds it.
+    #[doc(hidden)]
+    pub fn captured_causes(&self) -> Vec<Arc<CapturedCause>> {
+        let mut causes = self
+            .context
             .lock_completion()
             .captured
-            .clone()
+            .as_ref()
             .expect("only a capturing scope can enumerate read incompleteness")
+            .items
+            .clone();
+        causes.sort_by(|left, right| left.order_key().cmp(right.order_key()));
+        causes
     }
 
     /// Open a request boundary that memoizes identifier candidate results
@@ -5096,6 +5592,19 @@ impl<'a> AnalyzerQueryScope<'a> {
             analyzer,
             AnalyzerQueryContext::with_cancellation(cancellation.clone()),
         )
+    }
+
+    /// Own an internal request even when invoked inside a caller's query.
+    #[doc(hidden)]
+    pub fn with_new_outer_request_and_cancellation(
+        analyzer: &'a dyn IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> Self {
+        let mut context = AnalyzerQueryContext::with_cancellation(cancellation.clone());
+        context.outer_request = OuterRequest::new();
+        let mut scope = Self::with_context(analyzer, context);
+        scope.owns_outer_request = true;
+        scope
     }
 
     /// Open a resolver boundary against one exact semantic-model overlay.
@@ -5227,6 +5736,14 @@ impl<'a> AnalyzerQueryScope<'a> {
         self.context.store_error()
     }
 
+    /// The original operational failure under this scope's completion owner.
+    /// Includes independent answers in the same evaluation, without crossing
+    /// policy, advisory-read or outer-request completion boundaries.
+    #[doc(hidden)]
+    pub fn request_store_error(&self) -> Option<StoreError> {
+        self.context.request_store_error()
+    }
+
     pub fn read_completion(&self) -> Result<(), QueryReadIncomplete> {
         self.context.read_completion()
     }
@@ -5339,8 +5856,9 @@ pub fn capture_nested_reads<T>(
     } else {
         captured.first_execution_refusal()
     });
-    enclosing.mark_execution_dependent_reads(captured.execution_dependences());
+    enclosing.mark_execution_dependent_reads(captured.unpinned_execution_dependences());
     enclosing.record_budget_dependences(captured.budget_dependences());
+    enclosing.mark_request_pinned_dependences(captured.request_pinned_dependences());
     enclosing.join_verdict(captured.explicit_verdict());
     if captured.runtime_cache_touched() {
         enclosing.mark_runtime_cache_touched();
@@ -5385,19 +5903,111 @@ pub(super) fn capture_with_read_registration<T, G>(
     query: impl FnOnce() -> T,
 ) -> (T, Arc<crate::analyzer::ReadLedger>) {
     let captured = Arc::new(crate::analyzer::ReadLedger::new());
-    let context = Arc::new(match enclosing {
+    let context = match enclosing {
         Some(enclosing) => AnalyzerQueryContext::with_nested_read_ledger(
             Arc::clone(&captured),
             Arc::clone(enclosing),
         ),
         None => AnalyzerQueryContext::with_read_ledger(Arc::clone(&captured)),
-    });
-    let result = {
-        let _attribution = query_attribution(&context);
-        let _registration = register(Arc::clone(&context));
-        query()
     };
+    let result = capture_registered_reads(Arc::new(context), register, query);
     (result, captured)
+}
+
+/// Internal memo partition: isolate channel writes while preserving completion
+/// observations during the walk. Completion is forwarded without ledger marks
+/// after the private context closes; the memo later forwards its channels once.
+pub(super) fn capture_memo_partition_with_registration<T, G>(
+    enclosing: Option<&Arc<crate::analyzer::ReadLedger>>,
+    register: impl FnOnce(Arc<AnalyzerQueryContext>) -> G,
+    query: impl FnOnce() -> T,
+) -> (T, Arc<crate::analyzer::ReadLedger>) {
+    let captured = Arc::new(crate::analyzer::ReadLedger::new());
+    let mut context = match enclosing {
+        Some(enclosing) => AnalyzerQueryContext::with_nested_read_ledger(
+            Arc::clone(&captured),
+            Arc::clone(enclosing),
+        ),
+        None => AnalyzerQueryContext::with_read_ledger(Arc::clone(&captured)),
+    };
+    context.completion = Mutex::new(QueryCompletion::capturing());
+    context.completion_boundary = Some(QueryCompletionBoundary::AdvisoryRead);
+    let context = Arc::new(context);
+    let result = capture_registered_reads(Arc::clone(&context), register, query);
+    let causes = context
+        .lock_completion()
+        .captured
+        .as_ref()
+        .expect("a memo partition captures completion")
+        .items
+        .clone();
+    crate::analyzer::common::replay_captured_causes(&causes);
+    (result, captured)
+}
+
+pub(super) fn capture_memo_partition<T>(
+    analyzer: &dyn IAnalyzer,
+    query: impl FnOnce() -> T,
+) -> (T, Arc<crate::analyzer::ReadLedger>) {
+    let enclosing = analyzer.current_thread_read_ledger();
+    capture_memo_partition_with_registration(
+        enclosing.as_ref(),
+        |context| {
+            analyzer.begin_query(&context);
+            let owns_outer_request = context.enclosing.is_none();
+            AnalyzerQueryScope {
+                analyzer,
+                context,
+                attribution: None,
+                _request_state: path_module_request_state(),
+                owns_outer_request,
+            }
+        },
+        query,
+    )
+}
+
+fn capture_registered_reads<T, G>(
+    context: Arc<AnalyzerQueryContext>,
+    register: impl FnOnce(Arc<AnalyzerQueryContext>) -> G,
+    query: impl FnOnce() -> T,
+) -> T {
+    let _attribution = query_attribution(&context);
+    let _registration = register(Arc::clone(&context));
+    query()
+}
+
+/// Capture catalog composition without requiring an analyzer handle. The
+/// transported query context remains the owner of completion and attribution.
+pub(crate) fn capture_current_query_reads<T>(
+    query: impl FnOnce() -> T,
+) -> (
+    T,
+    Arc<crate::analyzer::ReadLedger>,
+    Vec<QueryReadIncomplete>,
+) {
+    let enclosing = current_thread_read_ledger();
+    let context = std::cell::OnceCell::new();
+    let (result, reads) = capture_with_read_registration(
+        enclosing.as_ref(),
+        |registered| {
+            *registered.lock_completion() = QueryCompletion::capturing();
+            context.set(registered).expect("one capture registration");
+        },
+        query,
+    );
+    let mut causes = context
+        .get()
+        .expect("registered capture")
+        .lock_completion()
+        .captured
+        .as_ref()
+        .expect("capturing completion")
+        .items
+        .clone();
+    causes.sort_by(|left, right| left.order_key().cmp(right.order_key()));
+    let reasons = causes.iter().map(|cause| cause.reason().clone()).collect();
+    (result, reads, reasons)
 }
 
 /// Replay all dependencies of a completed query into its current caller.
@@ -5458,7 +6068,7 @@ pub fn replay_query_read_receipt(
         |key| analyzer.record_read(key),
         |count| analyzer.record_unattributed_reads(count),
         |count| analyzer.mark_execution_dependent_reads(count),
-        |count| analyzer.record_budget_dependences(count),
+        |record, count| analyzer.record_attributed_dependences(record, count),
         |verdict| analyzer.join_reuse_verdict(verdict),
         || analyzer.refuse_read_reuse(),
         || record_store_failure(analyzer),
@@ -5502,7 +6112,7 @@ pub(super) fn replay_read_channels(
     mut record: impl FnMut(crate::analyzer::ReadKey),
     mut unattributed: impl FnMut(usize),
     mut execution_dependent: impl FnMut(usize),
-    mut budget_dependent: impl FnMut(usize),
+    mut attributed: impl FnMut(AttributeDependences, usize),
     mut join_verdict: impl FnMut(brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict),
     mut refuse: impl FnMut(),
     mut store_failure: impl FnMut(),
@@ -5514,11 +6124,22 @@ pub(super) fn replay_read_channels(
     if channels.unattributed_reads > 0 {
         unattributed(channels.unattributed_reads);
     }
-    if channels.execution_dependences > 0 {
-        execution_dependent(channels.execution_dependences);
+    // Request-pinned dependences are marked with their own cause, so the
+    // carried evaluation verdict does not degrade them to `Other`.
+    if channels.unpinned_execution_dependences() > 0 {
+        execution_dependent(channels.unpinned_execution_dependences());
     }
     if channels.budget_dependences > 0 {
-        budget_dependent(channels.budget_dependences);
+        attributed(
+            crate::analyzer::ReadLedger::record_budget_dependences,
+            channels.budget_dependences,
+        );
+    }
+    if channels.request_pinned_dependences > 0 {
+        attributed(
+            crate::analyzer::ReadLedger::mark_request_pinned_dependences,
+            channels.request_pinned_dependences,
+        );
     }
     if !channels.explicit_verdict.is_content() {
         join_verdict(channels.explicit_verdict);
@@ -5676,6 +6297,7 @@ impl QueryReadReceipt {
                     unreachable!("lookup provenance rejects nested annotations")
                 }
                 QueryReadIncomplete::Cancelled
+                | QueryReadIncomplete::InternalInvariant(_)
                 | QueryReadIncomplete::SemanticModelsPending
                 | QueryReadIncomplete::ProofStopped {
                     reason: _,
@@ -5721,18 +6343,17 @@ impl QueryReadReceipt {
             match reason {
                 QueryReadIncomplete::Attributed(shared) => {
                     heap.arc(shared, |data, heap| {
-                        let AttributedQueryReadIncomplete { lookup, cause } = data;
                         let QueryLookupProvenance {
                             file,
                             byte_span: _,
                             name,
                             tier: _,
-                        } = lookup;
+                        } = data.lookup();
                         retained_file(file, heap);
                         heap.add_allocation(name.len());
                         // The constructor forbids nested annotations. Charge its
                         // one cause while the attribution still owns the census.
-                        retained_plain_reason(cause, heap);
+                        retained_plain_reason(data.cause(), heap);
                     });
                 }
                 _ => retained_plain_reason(reason, heap),
@@ -5790,6 +6411,8 @@ impl QueryReadReceipt {
                 self.incomplete.push(reason.clone());
             }
         }
+        self.incomplete
+            .sort_by_cached_key(QueryReadIncomplete::answer_order_key);
     }
 
     /// Replay the captured read keys and incomplete reasons into the current query.
@@ -5874,7 +6497,7 @@ impl QueryReadReceipt {
         }
     }
 
-    /// Every captured completion reason, in first-observed order. Setup
+    /// Every captured completion reason, in canonical presentation order. Setup
     /// consumers must inspect the whole receipt, including zero-row batches.
     pub fn incomplete_reasons(&self) -> &[QueryReadIncomplete] {
         &self.incomplete
@@ -6013,7 +6636,7 @@ pub fn capture_subsumed_query_read_receipt_judged<T>(
             |key| enclosing.record(key),
             |count| enclosing.record_unattributed_reads(count),
             |count| enclosing.mark_execution_dependent_reads(count),
-            |count| enclosing.record_budget_dependences(count),
+            |record, count| record(&enclosing, count),
             |verdict| enclosing.join_verdict(verdict),
             || enclosing.refuse_read_reuse(),
             || enclosing.record_store_failure(),
@@ -6033,8 +6656,9 @@ pub(crate) fn forward_captured_query_reads(
     );
     enclosing.absorb_capture(captured);
     enclosing.record_unattributed_reads(captured.unattributed_reads());
-    enclosing.mark_execution_dependent_reads(captured.execution_dependences());
+    enclosing.mark_execution_dependent_reads(captured.unpinned_execution_dependences());
     enclosing.record_budget_dependences(captured.budget_dependences());
+    enclosing.mark_request_pinned_dependences(captured.request_pinned_dependences());
     enclosing.join_verdict(captured.explicit_verdict());
     if captured.runtime_cache_touched() {
         enclosing.mark_runtime_cache_touched();
@@ -6272,9 +6896,17 @@ pub(crate) fn record_runtime_cache_touch(
     for_each_unshadowed_active_ledger(&contexts, |ledger| ledger.mark_runtime_cache_touched());
 }
 
-/// Attribute execution dependences to a refused budget charge, with the routing
-/// of [`record_execution_dependence`].
-pub(crate) fn record_budget_dependence(
+/// The ledger method that records one cause's count of execution
+/// dependences: [`crate::analyzer::ReadLedger::record_budget_dependences`],
+/// which attributes dependences already marked, or
+/// [`crate::analyzer::ReadLedger::mark_request_pinned_dependences`], which marks
+/// them with their cause.
+pub type AttributeDependences = fn(&crate::analyzer::ReadLedger, usize);
+
+/// Record one cause's execution dependences, with the routing of
+/// [`record_execution_dependence`].
+pub(crate) fn record_attributed_dependence(
+    record: AttributeDependences,
     count: usize,
     ledger_attached: impl FnOnce() -> bool,
     fallback_contexts: impl FnOnce() -> Vec<Arc<AnalyzerQueryContext>>,
@@ -6290,7 +6922,7 @@ pub(crate) fn record_budget_dependence(
     } else {
         fallback_contexts()
     };
-    record_budget_dependence_on_active_ledgers(&contexts, count);
+    record_attributed_dependence_on_active_ledgers(&contexts, record, count);
 }
 
 /// Join a replayed explicit verdict, with the routing of
@@ -6338,16 +6970,17 @@ pub(crate) fn record_execution_dependence_on_active_ledgers(
     });
 }
 
-/// Budget attribution follows the same frame routing as the execution
+/// Cause attribution follows the same frame routing as the execution
 /// dependence it qualifies.
-pub(crate) fn record_budget_dependence_on_active_ledgers(
+pub(crate) fn record_attributed_dependence_on_active_ledgers(
     contexts: &[Arc<AnalyzerQueryContext>],
+    record: AttributeDependences,
     count: usize,
 ) {
     if count == 0 {
         return;
     }
-    for_each_unshadowed_active_ledger(contexts, |ledger| ledger.record_budget_dependences(count));
+    for_each_unshadowed_active_ledger(contexts, |ledger| record(ledger, count));
 }
 
 /// Record one usage lookup per overload the caller asked about, each carrying
@@ -6614,6 +7247,41 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
         crate::analyzer::CodeUnitType::FileScope => 5,
+    }
+}
+
+#[cfg(test)]
+mod host_activation_context_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{
+        HostActivationContext, VerifiedFirstPartyReleaseInventory,
+    };
+
+    #[test]
+    fn carried_generation_preserves_host_authority_without_carrying_publication() {
+        let before = AnalyzerSnapshotCaches::default();
+        let host = HostActivationContext::from_inventory(
+            VerifiedFirstPartyReleaseInventory::compiled_default().unwrap(),
+            before.retention_budget(),
+        )
+        .unwrap();
+        before
+            .bind_host_activation_context(Arc::clone(&host))
+            .unwrap();
+        let after = before.carry_content_keyed_values_forward();
+        let inherited = after
+            .host_activation_context()
+            .expect("updated snapshot keeps its host");
+        assert!(Arc::ptr_eq(&host, &inherited));
+        assert_eq!(host.no_model_digest(), inherited.no_model_digest());
+        assert_ne!(
+            inherited.no_model_digest(),
+            crate::analyzer::semantic_model::LIBRARY_NONE_NO_MODEL_DIGEST
+        );
+        assert!(
+            after.active_semantic_model_snapshot().is_none(),
+            "host inheritance is independent of a generation's publication"
+        );
     }
 }
 
@@ -7068,13 +7736,13 @@ mod read_ledger_scope_tests {
         let QueryReadIncomplete::Attributed(attribution) = &reason else {
             unreachable!();
         };
-        let QueryReadIncomplete::SemanticEvidenceGap(leaf) = &attribution.cause else {
+        let QueryReadIncomplete::SemanticEvidenceGap(leaf) = attribution.cause() else {
             unreachable!();
         };
         let attribution_id = Arc::as_ptr(attribution) as usize;
         let attribution_bytes = size_of::<AttributedQueryReadIncomplete>()
             + 2 * size_of::<usize>()
-            + attribution.lookup.name.len()
+            + attribution.lookup().name.len()
             + leaf.len();
         let reads = Arc::new(ReadLedger::new());
         let receipts = [0, 1].map(|_| {
@@ -7457,9 +8125,11 @@ mod read_ledger_scope_tests {
             assert!(sibling.captured_read_incompleteness().is_empty());
             // A cache fill under the incomplete chain is still refused: the
             // admission check walks the chain of the request domain.
+            // #13024 chooses the canonical representative; the inherited
+            // chain is still incomplete and the nested scope stays clean.
             assert_eq!(
                 analyzer.current_query_read_completion(),
-                Err(stable.clone())
+                Err(QueryReadIncomplete::Cancelled)
             );
             // A policy unit's scope under that chain keeps a clean ledger, so
             // the inherited stop does not make its receipt execution-dependent.
@@ -7475,7 +8145,7 @@ mod read_ledger_scope_tests {
         }
         assert_eq!(
             outer.captured_read_incompleteness(),
-            vec![stable, operational, QueryReadIncomplete::Cancelled, own]
+            vec![QueryReadIncomplete::Cancelled, operational, stable, own]
         );
     }
 
@@ -8464,23 +9134,94 @@ mod memo_handle_tests {
             analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
             assert!(current_domain_read_completion().is_err());
             assert_eq!(first.errors().len(), 1);
+            assert!(carried_context::request_store_failed());
             first.acknowledge();
+            assert!(
+                carried_context::request_store_failed(),
+                "acknowledgment does not recover this failed evaluation"
+            );
+            let _independent = AnalyzerQueryScope::independent_answer(&analyzer, None);
+            assert!(
+                carried_context::request_store_failed(),
+                "an independent answer still belongs to its failed evaluation"
+            );
         }
         let second = Arc::new(PolicyCompletionOwner::default());
         {
             let _owner = carried_context::push_completion(second.clone());
             let policy = AnalyzerQueryScope::for_policy_evaluation(&analyzer);
             assert!(policy.store_error().is_none());
+            assert!(
+                !carried_context::request_store_failed(),
+                "acknowledged sibling errors do not stop a new policy"
+            );
             assert!(current_domain_read_completion().is_ok());
             // A failed shared reader must report its failure again to its new consumer.
             analyzer.record_query_failure(StoreError::new("aborted reader consumed again"));
             assert!(current_domain_read_completion().is_err());
+            assert!(carried_context::request_store_failed());
             assert_ne!(first.errors()[0].id(), second.errors()[0].id());
             second.acknowledge();
         }
         assert!(outer.context.unacknowledged_store_error().is_none());
         analyzer.record_query_failure(StoreError::new("shared preparation"));
         assert!(outer.context.unacknowledged_store_error().is_some());
+        for _ in 0..2 {
+            let owner = Arc::new(PolicyCompletionOwner::default());
+            let _owner = owner.install();
+            let policy = AnalyzerQueryScope::for_policy_evaluation(&analyzer);
+            assert!(policy.store_error().is_none());
+            assert_eq!(owner.errors().len(), 1);
+            assert_eq!(
+                owner.errors()[0].error(),
+                &StoreError::new("shared preparation")
+            );
+            assert!(carried_context::request_store_failed());
+            // Operation refusal observes preparation through the owner, while
+            // nested derivations keep clean own completion (#11701).
+            assert!(current_domain_read_completion().is_ok());
+        }
+        drop(outer);
+        let _new_request = AnalyzerQueryScope::new(&analyzer);
+        assert!(!carried_context::request_store_failed());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11775: completion inheritance missed a shared failure above its immediate parent"
+    )]
+    fn request_store_failure_observes_shared_ancestors_without_copying_to_fills() {
+        let analyzer = MultiAnalyzer::default();
+        let outer = AnalyzerQueryScope::new(&analyzer);
+        let middle = AnalyzerQueryScope::new(&analyzer);
+        // Inject after opening the middle scope: its completion has no copy.
+        outer
+            .context
+            .record_store_error(StoreError::new("grandparent preparation"));
+        assert!(middle.store_error().is_none());
+        {
+            let owner = Arc::new(PolicyCompletionOwner::default());
+            let _owner = owner.install();
+            let policy = AnalyzerQueryScope::for_policy_evaluation(&analyzer);
+            assert!(policy.context.recorded_store_errors().is_empty());
+            assert_eq!(owner.errors().len(), 1);
+            assert!(carried_context::request_store_failed());
+            let nested = AnalyzerQueryScope::new(&analyzer);
+            assert!(nested.context.recorded_store_errors().is_empty());
+            assert!(nested.read_completion().is_ok());
+            assert!(carried_context::request_store_failed());
+            assert!(current_domain_read_completion().is_ok());
+        }
+        outer.context.acknowledge_store_errors(
+            &outer
+                .context
+                .recorded_store_errors()
+                .iter()
+                .map(|error| error.id())
+                .collect::<Vec<_>>(),
+        );
+        let _sibling = AnalyzerQueryScope::for_policy_evaluation(&analyzer);
+        assert!(!carried_context::request_store_failed());
     }
 
     #[test]
@@ -8503,12 +9244,18 @@ mod memo_handle_tests {
                     let _policy = AnalyzerQueryScope::for_policy_evaluation(&analyzer);
                     analyzer.record_query_failure(StoreError::new("unacknowledged sibling"));
                     let before_ack = current_domain_read_completion().is_err();
+                    let core_before_ack = carried_context::request_store_failed();
                     rendezvous.wait();
                     // Keep the error unacknowledged until the other policy has
                     // entered and inspected both its query and owner completions.
                     rendezvous.wait();
                     owner.acknowledge();
-                    (before_ack, current_domain_read_completion().is_err())
+                    (
+                        before_ack,
+                        current_domain_read_completion().is_err(),
+                        core_before_ack,
+                        carried_context::request_store_failed(),
+                    )
                 })
             });
             let second = threads.spawn(|| {
@@ -8523,11 +9270,16 @@ mod memo_handle_tests {
                         policy.store_error().is_none(),
                         owner.errors().is_empty(),
                         current_domain_read_completion().is_ok(),
+                        !carried_context::request_store_failed(),
                     );
+                    let independent_clean = {
+                        let _independent = AnalyzerQueryScope::independent_answer(&analyzer, None);
+                        !carried_context::request_store_failed()
+                    };
                     // Release the sibling before assertions, including on the
                     // pre-fix failure path, so a failed check cannot strand it.
                     rendezvous.wait();
-                    clean
+                    (clean.0, clean.1, clean.2, clean.3, independent_clean)
                 })
             });
             (
@@ -8537,12 +9289,12 @@ mod memo_handle_tests {
         });
         assert_eq!(
             failed,
-            (true, true),
+            (true, true, true, true),
             "acknowledgment never recovers its own evaluation"
         );
         assert_eq!(
             healthy,
-            (true, true, true),
+            (true, true, true, true, true),
             "a concurrent sibling owns neither failure channel"
         );
         assert!(outer.context.unacknowledged_store_error().is_none());
@@ -8665,7 +9417,13 @@ mod memo_handle_tests {
                 Err(QueryReadIncomplete::Cancelled)
             ));
             assert_eq!(
-                context.lock_completion().captured.as_ref().unwrap().len(),
+                context
+                    .lock_completion()
+                    .captured
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .len(),
                 3
             );
         });
@@ -8777,9 +9535,1377 @@ mod model_absence_digest_test {
         assert_eq!(
             super::no_active_model_set_digest().as_bytes(),
             &[
-                214, 107, 26, 84, 67, 170, 247, 106, 167, 243, 187, 123, 78, 71, 125, 100, 216,
-                203, 244, 165, 107, 17, 196, 233, 76, 18, 52, 194, 136, 162, 194, 102
+                202, 229, 131, 58, 232, 54, 62, 38, 25, 168, 52, 173, 107, 47, 170, 226, 49, 83,
+                29, 160, 9, 153, 238, 150, 6, 242, 178, 46, 164, 182, 31, 124,
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod listing_cell_receipt_tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity;
+    use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
+    use brokk_bifrost_core::analyzer::project::{FilesystemProject, OverlayProject};
+    use brokk_bifrost_core::analyzer::project_reads::{
+        ErasedCapturedReads, ErasedReadAttribution, OpaqueReadReceipt, ProjectRead,
+        ProjectReadReceipt, ReadCapability, without_project_reads,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// Every read a project records, as (was it an inventory read, receipt).
+    type RecordedReads = Vec<(bool, String)>;
+
+    #[derive(Clone, Default)]
+    struct Tape(Arc<Mutex<RecordedReads>>);
+
+    impl Tape {
+        fn take(&self) -> RecordedReads {
+            std::mem::take(&mut self.0.lock().expect("tape"))
+        }
+    }
+
+    impl brokk_bifrost_core::analyzer::internal_memo_partitions::DeferredMemoAttribution for Tape {
+        fn capture_deferred(&self, build: &mut dyn FnMut()) -> ErasedCapturedReads {
+            self.capture(build)
+        }
+    }
+
+    impl ErasedReadAttribution for Tape {
+        fn is_live(&self) -> bool {
+            true
+        }
+        fn is_capturing(&self) -> bool {
+            true
+        }
+        fn record(&self, _: &dyn Project, read: ProjectRead<'_>, receipt: ProjectReadReceipt) {
+            self.0.lock().expect("tape").push((
+                matches!(read, ProjectRead::Inventory),
+                format!("{receipt:?}"),
+            ));
+        }
+        fn record_inventory(
+            &self,
+            receipt: &brokk_bifrost_core::analyzer::project_reads::InventoryReadReceipt,
+        ) {
+            self.0
+                .lock()
+                .expect("tape")
+                .push((true, format!("{receipt:?}")));
+        }
+        fn capture_identity(&self) -> Option<CaptureIdentity> {
+            None
+        }
+        fn record_unattributed(&self) {
+            unimplemented!()
+        }
+        fn capture(&self, _: &mut dyn FnMut()) -> ErasedCapturedReads {
+            unimplemented!()
+        }
+        fn capture_authority(&self, _: &mut dyn FnMut()) -> ErasedCapturedReads {
+            unimplemented!()
+        }
+        fn replay(&self, _: &[OpaqueReadReceipt], _: ReadChannels) {
+            unimplemented!()
+        }
+    }
+
+    fn recorded(project: &dyn Project) -> Tape {
+        let tape = Tape::default();
+        assert!(project.install_read_recorder(ReadCapability::new(tape.clone())));
+        tape
+    }
+
+    /// The reads recorded by a direct walk, a cell fill and a cell hit, each
+    /// over its own fresh view of the same files so that no cached listing
+    /// separates them.
+    fn direct_fill_and_hit(
+        view: impl Fn() -> Arc<dyn Project>,
+    ) -> (RecordedReads, RecordedReads, RecordedReads) {
+        let direct_view = view();
+        let direct_tape = recorded(direct_view.as_ref());
+        direct_view.all_files_with_omissions().expect("direct walk");
+
+        let cell = WorkspaceFileListingCell::default();
+        let cell_view = view();
+        let cell_tape = recorded(cell_view.as_ref());
+        cell.listing(cell_view.as_ref()).expect("fill");
+        let fill = cell_tape.take();
+        cell.listing(cell_view.as_ref()).expect("hit");
+        (direct_tape.take(), fill, cell_tape.take())
+    }
+
+    fn assert_same_recorded_read(
+        (direct, fill, hit): (RecordedReads, RecordedReads, RecordedReads),
+    ) {
+        assert_eq!(direct.len(), 1, "one inventory read: {direct:?}");
+        assert!(direct[0].0, "the walk records an inventory read");
+        assert!(
+            direct[0].1.contains("inventory: Some("),
+            "the walk's receipt certifies the listing: {direct:?}"
+        );
+        assert_eq!(fill, direct, "a fill records what a direct walk records");
+        assert_eq!(hit, direct, "a hit replays what the walk recorded");
+    }
+
+    fn files() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::write(root.path().join("a.cs"), "class A {}").expect("write");
+        std::fs::create_dir(root.path().join("sub")).expect("dir");
+        std::fs::write(root.path().join("sub/b.cs"), "class B {}").expect("write");
+        std::fs::write(root.path().join(".gitignore"), "ignored.cs\n").expect("write");
+        std::fs::write(root.path().join("ignored.cs"), "class I {}").expect("write");
+        root
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: a reused workspace listing replayed a default receipt, not the one its walk published"
+    )]
+    fn reused_listing_records_the_receipt_its_walk_published() {
+        let root = files();
+        assert_same_recorded_read(direct_fill_and_hit(|| {
+            Arc::new(FilesystemProject::new(root.path()).expect("filesystem project"))
+        }));
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: a reused workspace listing replayed a default receipt, not the one its walk published"
+    )]
+    fn reused_overlay_listing_records_the_receipt_its_walk_published() {
+        let root = files();
+        assert_same_recorded_read(direct_fill_and_hit(|| {
+            let delegate: Arc<dyn Project> =
+                Arc::new(FilesystemProject::new(root.path()).expect("filesystem project"));
+            Arc::new(OverlayProject::new(delegate))
+        }));
+    }
+
+    /// Suppression is part of the read semantics: a consumer under
+    /// `without_project_reads` records nothing whether it walks or reuses.
+    #[test]
+    fn suppressed_fill_and_hit_record_nothing() {
+        let root = files();
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(root.path()).expect("filesystem project"));
+        let tape = recorded(project.as_ref());
+        let cell = WorkspaceFileListingCell::default();
+        without_project_reads(|| {
+            cell.listing(project.as_ref()).expect("suppressed fill");
+            cell.listing(project.as_ref()).expect("suppressed hit");
+        });
+        assert!(tape.take().is_empty());
+        cell.listing(project.as_ref()).expect("unsuppressed hit");
+        assert_eq!(
+            tape.take().len(),
+            1,
+            "an unsuppressed asker records the read"
+        );
+    }
+    /// Use the production ProjectReadAttribution, including current-capture
+    /// registration checks, rather than a recorder that merely logs receipts.
+    fn captured_by<T>(
+        registries: &[crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry],
+        read: impl FnOnce() -> T,
+    ) -> (T, Arc<crate::analyzer::ReadLedger>) {
+        struct Registered<'a> {
+            registries: &'a [crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry],
+            context: Arc<AnalyzerQueryContext>,
+        }
+        impl Drop for Registered<'_> {
+            fn drop(&mut self) {
+                for registry in self.registries {
+                    registry.end_query(&self.context);
+                }
+            }
+        }
+        capture_with_read_registration(
+            None,
+            |context| {
+                for registry in registries {
+                    registry.begin_query(&context);
+                }
+                Registered {
+                    registries,
+                    context,
+                }
+            },
+            read,
+        )
+    }
+
+    fn assert_same_dependencies(
+        expected: &crate::analyzer::ReadLedger,
+        actual: &crate::analyzer::ReadLedger,
+    ) {
+        assert_eq!(actual.keys(), expected.keys());
+        assert_eq!(actual.channels(), expected.channels());
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: live-backed file-set listing hits replaced original inventory owners and receipts"
+    )]
+    fn live_file_set_listing_replays_original_inventory_dependencies() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::FileSetProject;
+        use brokk_bifrost_core::analyzer::project_reads::{
+            capture_published_inventory_reads, measure_project_io, replay_published_inventory_reads,
+        };
+
+        for both_sources in [false, true] {
+            let root = files();
+            // .bifrostignore leaves file-tool membership intact but changes
+            // inventory ignore decisions, distinguishing the two authorities.
+            std::fs::write(root.path().join(".bifrostignore"), "a.cs\n").unwrap();
+            let live = Arc::new(FilesystemProject::new(root.path()).unwrap());
+            let inventory = live.all_files_shared().unwrap();
+            let selected = FileSetProject::from_listing(
+                live.root(),
+                inventory.iter().map(|file| file.rel_path().to_path_buf()),
+                vec![],
+            )
+            .with_live_delegate(Arc::clone(&live), inventory);
+            let mut registries = vec![ProjectReadRegistry::try_new(&selected).unwrap()];
+            if both_sources {
+                registries.push(ProjectReadRegistry::try_new(live.as_ref()).unwrap());
+            }
+
+            let (_, direct) =
+                captured_by(&registries, || selected.all_files_with_omissions().unwrap());
+            assert!(direct.is_bounded());
+            assert_eq!(
+                direct.keys().len(),
+                if both_sources { 2 } else { 1 },
+                "the real .bifrostignore must distinguish file-set and live inventory certificates"
+            );
+            let cell = WorkspaceFileListingCell::default();
+            let (_, fill) = captured_by(&registries, || cell.listing(&selected).unwrap());
+            let (_, hit) = captured_by(&registries, || cell.listing(&selected).unwrap());
+            assert_same_dependencies(&direct, &fill);
+            assert_same_dependencies(&direct, &hit);
+
+            // Capture-of-hit and nested captures at the same getter depth must
+            // retain all original owners without replaying the fill twice.
+            let ((inner, outer), captured_hit) = captured_by(&registries, || {
+                capture_published_inventory_reads(|| {
+                    let (_, inner) =
+                        capture_published_inventory_reads(|| cell.listing(&selected).unwrap());
+                    inner
+                })
+            });
+            assert_same_dependencies(&direct, &captured_hit);
+            for captured in [&inner, &outer] {
+                let (_, replay) =
+                    captured_by(&registries, || replay_published_inventory_reads(captured));
+                assert_same_dependencies(&direct, &replay);
+            }
+
+            // A suppressed fill is the WorkspaceFileIndex -> C# digest order.
+            // The ordinary consumer must keep BOTH the walk and its latent
+            // per-source reads, without using the fill's active registrations.
+            let suppressed_cell = WorkspaceFileListingCell::default();
+            live.invalidate_cached_file_listing();
+            let (((), fill_io), suppressed) = captured_by(&registries, || {
+                measure_project_io(|| {
+                    without_project_reads(|| {
+                        suppressed_cell.listing(&selected).unwrap();
+                    })
+                })
+            });
+            assert!(
+                fill_io.walks > 0,
+                "the suppressed fill must perform the real filesystem walk"
+            );
+            assert!(suppressed.keys().is_empty());
+            assert_eq!(suppressed.channels(), ReadChannels::default());
+            let walks = live.workspace_file_listing_count();
+            let ((_, hit_io), hit) = captured_by(&registries, || {
+                measure_project_io(|| {
+                    suppressed_cell.listing(&selected).unwrap();
+                })
+            });
+            assert_same_dependencies(&direct, &hit);
+            assert_eq!(
+                live.workspace_file_listing_count(),
+                walks,
+                "hit must not list the delegate again"
+            );
+            assert_eq!(
+                hit_io.walks, 0,
+                "hit must not physically walk the filesystem"
+            );
+
+            let (_, suppressed_hit) = captured_by(&registries, || {
+                without_project_reads(|| {
+                    suppressed_cell.listing(&selected).unwrap();
+                })
+            });
+            assert!(suppressed_hit.keys().is_empty());
+            assert_eq!(suppressed_hit.channels(), ReadChannels::default());
+
+            // Under a real enclosing getter there is one combined inventory,
+            // not an independent read for each inner source.
+            let (_, nested_direct) = captured_by(&registries, || {
+                let _outer = selected.project_read_slot().unwrap().inventory(&selected);
+                selected.all_files_with_omissions().unwrap();
+            });
+            let nested_cell = WorkspaceFileListingCell::default();
+            let (_, nested_fill) = captured_by(&registries, || {
+                let _outer = selected.project_read_slot().unwrap().inventory(&selected);
+                nested_cell.listing(&selected).unwrap();
+            });
+            let (_, nested_hit) = captured_by(&registries, || {
+                let _outer = selected.project_read_slot().unwrap().inventory(&selected);
+                nested_cell.listing(&selected).unwrap();
+            });
+            assert_same_dependencies(&nested_direct, &nested_fill);
+            assert_same_dependencies(&nested_direct, &nested_hit);
+            let (_, outer_hit) =
+                captured_by(&registries, || nested_cell.listing(&selected).unwrap());
+            assert_same_dependencies(&direct, &outer_hit);
+
+            if !both_sources {
+                // Empty-at-fill original slots must see registrations added
+                // later; retaining only the fill's active recorders loses FS.
+                registries.push(ProjectReadRegistry::try_new(live.as_ref()).unwrap());
+                let (_, now_direct) =
+                    captured_by(&registries, || selected.all_files_with_omissions().unwrap());
+                let (_, now_hit) =
+                    captured_by(&registries, || suppressed_cell.listing(&selected).unwrap());
+                assert_eq!(now_direct.keys().len(), 2);
+                assert_same_dependencies(&now_direct, &now_hit);
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: inventory replay must preserve refusal channels and original source-root checks"
+    )]
+    fn inventory_replay_preserves_incomplete_and_source_root_refusals() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::{
+            FileSetProject, IgnoreObservationError, IgnoreObservationOperation,
+        };
+        use brokk_bifrost_core::analyzer::project_reads::{
+            capture_published_inventory_reads, publish_receipt, replay_published_inventory_reads,
+        };
+
+        let root = files();
+        let other_root = tempfile::tempdir().unwrap();
+        let selected = FileSetProject::from_listing(root.path(), [], vec![]);
+        let registry = ProjectReadRegistry::try_new(&selected).unwrap();
+        // Share its slot with a different source root, as a composite source
+        // can do. The actual source root must survive cached replay.
+        struct ForeignSource<'a> {
+            root: &'a std::path::Path,
+            selected: &'a FileSetProject,
+        }
+        impl Project for ForeignSource<'_> {
+            fn root(&self) -> &std::path::Path {
+                self.root
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                BTreeSet::new()
+            }
+            fn project_read_slot(
+                &self,
+            ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+                self.selected.project_read_slot()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                Ok(BTreeSet::new())
+            }
+            fn analyzable_files(&self, _: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+                Ok(BTreeSet::new())
+            }
+            fn file_by_rel_path(&self, _: &std::path::Path) -> Option<ProjectFile> {
+                None
+            }
+        }
+        let foreign = ForeignSource {
+            root: other_root.path(),
+            selected: &selected,
+        };
+        let registries = [registry];
+        for source in [&selected as &dyn Project, &foreign as &dyn Project] {
+            for incomplete in [false, true] {
+                for inventory in [None, Some([9; 32])] {
+                    let read = || {
+                        let _guard = source.project_read_slot().unwrap().inventory(source);
+                        publish_receipt(ProjectReadReceipt {
+                            inventory,
+                            incomplete: incomplete.then(|| {
+                                IgnoreObservationError::new(
+                                    source.root(),
+                                    IgnoreObservationOperation::Listing,
+                                    std::io::Error::other("injected incomplete inventory"),
+                                )
+                            }),
+                            ..ProjectReadReceipt::default()
+                        });
+                    };
+                    let (_, direct) = captured_by(&registries, read);
+                    let (((), captured), fill) =
+                        captured_by(&registries, || capture_published_inventory_reads(read));
+                    let (_, hit) =
+                        captured_by(&registries, || replay_published_inventory_reads(&captured));
+                    assert_same_dependencies(&direct, &fill);
+                    assert_same_dependencies(&direct, &hit);
+                    assert_eq!(
+                        direct.unattributed_reads(),
+                        usize::from(
+                            incomplete || inventory.is_none() || source.root() != selected.root()
+                        )
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    #[hardwon(
+        "#13799: a partially completed listing capture must not survive a panic or failed fill"
+    )]
+    fn listing_capture_retries_after_partial_failure_and_unwind() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing;
+        use brokk_bifrost_core::analyzer::project_reads::{
+            capture_published_inventory_reads, replay_published_inventory_reads,
+        };
+        struct InterruptedListing {
+            delegate: Arc<dyn Project>,
+            attempts: std::sync::atomic::AtomicUsize,
+        }
+        impl Project for InterruptedListing {
+            fn invalidate_cached_file_listing(&self) {
+                self.delegate.invalidate_cached_file_listing();
+            }
+            fn file_listing_stamp(
+                &self,
+            ) -> Option<Vec<brokk_bifrost_core::analyzer::project::ProjectViewStamp>> {
+                self.delegate.file_listing_stamp()
+            }
+            fn root(&self) -> &std::path::Path {
+                self.delegate.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.delegate.analyzer_languages()
+            }
+            fn project_read_slot(
+                &self,
+            ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+                self.delegate.project_read_slot()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.all_files()
+            }
+            fn analyzable_files(
+                &self,
+                language: Language,
+            ) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &std::path::Path) -> Option<ProjectFile> {
+                self.delegate.file_by_rel_path(path)
+            }
+            fn all_files_with_omissions(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+                // Complete a real source read before failing: the capture has
+                // already collected an effect that must not become an entry.
+                let listing = self.delegate.all_files_with_omissions()?;
+                match self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                {
+                    0 => panic!("injected failure after a completed read"),
+                    1 => Err(std::io::Error::other("injected listing error")),
+                    _ => Ok(listing),
+                }
+            }
+        }
+        let root = files();
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.path()).unwrap());
+        let registries = [ProjectReadRegistry::try_new(delegate.as_ref()).unwrap()];
+        let source = InterruptedListing {
+            delegate,
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let cell = WorkspaceFileListingCell::default();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            captured_by(&registries, || cell.listing(&source))
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            captured_by(&registries, || cell.listing(&source))
+                .0
+                .is_err()
+        );
+        let (_, expected) = captured_by(&registries, || {
+            source.delegate.all_files_with_omissions().unwrap()
+        });
+        let (((), captured), fill) = captured_by(&registries, || {
+            capture_published_inventory_reads(|| {
+                cell.listing(&source).unwrap();
+            })
+        });
+        let (_, hit) = captured_by(&registries, || cell.listing(&source).unwrap());
+        let (_, replay) = captured_by(&registries, || replay_published_inventory_reads(&captured));
+        assert_same_dependencies(&expected, &fill);
+        assert_same_dependencies(&expected, &hit);
+        assert_same_dependencies(&expected, &replay);
+        assert_eq!(
+            source.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "neither partial failure was cached, and successful reuse does not call the getter"
+        );
+    }
+    #[test]
+    #[hardwon(
+        "#13799: cold listing fills retained the pre-getter view stamp and immediately missed on reuse"
+    )]
+    fn cold_listing_fill_retains_the_completed_view_stamp() {
+        use brokk_bifrost_core::analyzer::project::WorkspaceFileListingCache;
+        use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
+        for cached in [false, true] {
+            let root = files();
+            let project = if cached {
+                let cache = Arc::new(WorkspaceFileListingCache::new(
+                    root.path().canonicalize().unwrap(),
+                ));
+                let project =
+                    FilesystemProject::with_cached_listing(root.path(), Arc::clone(&cache))
+                        .unwrap();
+                // Construction eagerly lists this cache. Make the shared
+                // cache cold again before the request's first consumer.
+                cache.invalidate();
+                project
+            } else {
+                // Keep the constructor seed unconsumed until the cell fills.
+                FilesystemProject::new(root.path()).unwrap()
+            };
+            let before = project.view_stamp();
+            let cell = WorkspaceFileListingCell::default();
+            let filled = without_project_reads(|| cell.listing(&project).unwrap());
+            let completed = project.view_stamp();
+            assert_eq!(
+                before, completed,
+                "consuming a seed or warming a cache must not invalidate the listing view"
+            );
+            let getters = project.workspace_file_listing_count();
+            let (hit, io) = measure_project_io(|| cell.listing(&project).unwrap());
+            assert!(Arc::ptr_eq(&filled.0, &hit.0));
+            assert!(Arc::ptr_eq(&filled.1, &hit.1));
+            assert_eq!(
+                project.workspace_file_listing_count(),
+                getters,
+                "the next consumer must reuse the successful cold fill"
+            );
+            assert_eq!(
+                io.walks, 0,
+                "reuse must not physically enumerate the workspace"
+            );
+            assert_eq!(project.view_stamp(), completed);
+        }
+    }
+    #[test]
+    #[hardwon(
+        "#13799: an invalidation after a listing getter relabelled old files with the new revision"
+    )]
+    fn listing_fill_does_not_admit_a_post_getter_invalidation() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::{ProjectViewStamp, WorkspaceFileListingCache};
+        use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        struct AdmissionPause {
+            post_sample: mpsc::Sender<()>,
+            invalidated: mpsc::Receiver<std::io::Result<()>>,
+        }
+        struct PausedListing {
+            delegate: Arc<FilesystemProject>,
+            completed: AtomicBool,
+            getters: AtomicUsize,
+            pause: Mutex<Option<AdmissionPause>>,
+        }
+        impl Project for PausedListing {
+            fn project_read_slot(
+                &self,
+            ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+                self.delegate.project_read_slot()
+            }
+
+            fn invalidate_cached_file_listing(&self) {
+                self.delegate.invalidate_cached_file_listing();
+            }
+            fn root(&self) -> &std::path::Path {
+                self.delegate.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.delegate.analyzer_languages()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.all_files()
+            }
+            fn analyzable_files(
+                &self,
+                language: Language,
+            ) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &std::path::Path) -> Option<ProjectFile> {
+                self.delegate.file_by_rel_path(path)
+            }
+            fn all_files_with_omissions(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+                self.getters.fetch_add(1, Ordering::Relaxed);
+                let answer = self.delegate.all_files_with_omissions()?;
+                self.completed.store(true, Ordering::Release);
+                Ok(answer)
+            }
+            fn file_listing_stamp(&self) -> Option<Vec<ProjectViewStamp>> {
+                if self.completed.load(Ordering::Acquire)
+                    && let Some(pause) = self.pause.lock().unwrap().take()
+                {
+                    // The outer getter has returned. Mutate before the cell's
+                    // post-getter admission sample, without timing sleeps.
+                    pause.post_sample.send(()).unwrap();
+                    pause
+                        .invalidated
+                        .recv()
+                        .expect("watcher stopped")
+                        .expect("watcher update failed");
+                }
+                self.delegate.file_listing_stamp()
+            }
+        }
+
+        for cached in [false, true] {
+            let root = files();
+            let delegate = Arc::new(if cached {
+                let cache = Arc::new(WorkspaceFileListingCache::new(
+                    root.path().canonicalize().unwrap(),
+                ));
+                FilesystemProject::with_cached_listing(root.path(), cache).unwrap()
+            } else {
+                FilesystemProject::new(root.path()).unwrap()
+            });
+            let registries = [ProjectReadRegistry::try_new(delegate.as_ref()).unwrap()];
+            let (direct_a, reads_a) =
+                captured_by(&registries, || delegate.all_files_with_omissions().unwrap());
+            let (post_sample_tx, post_sample_rx) = mpsc::channel();
+            let (invalidated_tx, invalidated_rx) = mpsc::channel();
+            let source = PausedListing {
+                delegate: Arc::clone(&delegate),
+                completed: AtomicBool::new(false),
+                getters: AtomicUsize::new(0),
+                pause: Mutex::new(Some(AdmissionPause {
+                    post_sample: post_sample_tx,
+                    invalidated: invalidated_rx,
+                })),
+            };
+            let watcher = {
+                let delegate = Arc::clone(&delegate);
+                std::thread::spawn(move || {
+                    post_sample_rx.recv().unwrap();
+                    let result = std::fs::write(delegate.root().join("new.cs"), "class New {}\n");
+                    if result.is_ok() {
+                        delegate.invalidate_cached_file_listing();
+                    }
+                    invalidated_tx.send(result).unwrap();
+                })
+            };
+            let cell = WorkspaceFileListingCell::default();
+            let (returned_a, fill_a) = captured_by(&registries, || cell.listing(&source).unwrap());
+            watcher.join().unwrap();
+            assert_eq!(returned_a.0, direct_a.0);
+            assert_same_dependencies(&reads_a, &fill_a);
+            let (returned_b, fill_b) = captured_by(&registries, || cell.listing(&source).unwrap());
+            assert_eq!(
+                returned_b.0.len(),
+                returned_a.0.len() + 1,
+                "the invalidated answer must not fill a slot under the new revision"
+            );
+            assert!(returned_b.0.iter().any(|file| file.rel_path().file_name() == Some(std::ffi::OsStr::new("new.cs"))));
+            let (direct_b, reads_b) =
+                captured_by(&registries, || delegate.all_files_with_omissions().unwrap());
+            assert_eq!(returned_b.0, direct_b.0);
+            assert_same_dependencies(&reads_b, &fill_b);
+            assert_ne!(reads_a.keys(), reads_b.keys());
+            let ((hit_b, io), hit_reads) = captured_by(&registries, || {
+                measure_project_io(|| cell.listing(&source).unwrap())
+            });
+            assert!(Arc::ptr_eq(&returned_b.0, &hit_b.0));
+            assert_same_dependencies(&reads_b, &hit_reads);
+            assert_eq!(source.getters.load(Ordering::Relaxed), 2);
+            assert_eq!(io.walks, 0);
+        }
+    }
+
+    fn cached_listing_fixture() -> (
+        tempfile::TempDir,
+        brokk_bifrost_core::analyzer::project::IgnoreTestEnvironment,
+        Arc<FilesystemProject>,
+        Arc<brokk_bifrost_core::analyzer::project::WorkspaceFileListingCache>,
+    ) {
+        use brokk_bifrost_core::analyzer::project::{
+            IgnoreTestEnvironment, WorkspaceFileListingCache, age_ignore_test_inputs,
+        };
+        let parent = tempfile::tempdir().unwrap();
+        // Global git and ignore inputs must resolve under the aged parent. A
+        // proxy in the real HOME or XDG tree can be touched by other processes
+        // within the racy window, which forces a confirmation walk.
+        let env = IgnoreTestEnvironment::new(&parent.path().join("home"));
+        let root = parent.path().join("repo");
+        let repository = git2::Repository::init(&root).unwrap();
+        repository.index().unwrap().write().unwrap();
+        std::fs::write(root.join("a.cs"), "class A {}\n").unwrap();
+        std::fs::write(root.join(".bifrostignore"), "never-matches-one\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let root = root.canonicalize().unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project =
+            Arc::new(FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap());
+        (parent, env, project, cache)
+    }
+
+    #[test]
+    #[hardwon("#13799: pending equal listings restored a key with an obsolete inventory receipt")]
+    fn pending_listing_events_preserve_equal_storage_but_refresh_read_effects() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::{
+            RetainedIgnoreObservation, age_ignore_test_inputs,
+        };
+        use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
+
+        let (_parent, _env, project, _cache) = cached_listing_fixture();
+        let project = project.as_ref();
+        let registries = [ProjectReadRegistry::try_new(project).unwrap()];
+        let cell = WorkspaceFileListingCell::default();
+        let old = without_project_reads(|| cell.listing(project).unwrap());
+        let generic = project.view_stamp();
+        let initial_stamp = project.file_listing_stamp();
+        let lineage = project.membership_point_observation(&old).unwrap().lineage;
+        let (_, old_reads) =
+            captured_by(&registries, || project.all_files_with_omissions().unwrap());
+        let (((), io), nested) = captured_by(&registries, || {
+            measure_project_io(|| {
+                let (_, inner) = registries[0].capture_judged(|| {
+                    (
+                        cell.listing(project).unwrap(),
+                        crate::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    )
+                });
+                assert_same_dependencies(&old_reads, &inner);
+            })
+        });
+        assert_eq!(io.walks, 0);
+        assert_same_dependencies(&old_reads, &nested);
+        assert_eq!(project.file_listing_stamp(), initial_stamp);
+
+        // Inventory asks only about observed paths/decisions. An enclosing
+        // IgnoreRules question consumes the aggregate rule publication too.
+        let (_, old_rule_reads) = captured_by(&registries, || {
+            let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+            project.all_files_with_omissions().unwrap()
+        });
+
+        let changed = BTreeSet::from([ProjectFile::new(project.root(), ".bifrostignore")]);
+        std::fs::write(
+            project.root().join(".bifrostignore"),
+            "another-nonmatching-pattern\n",
+        )
+        .unwrap();
+        age_ignore_test_inputs(project.root());
+        project.revalidate_symlink_omissions(&changed);
+        let pending = project.file_listing_stamp();
+        // Another invalidating event before materialization must not reuse the
+        // preceding pending certificate, even though the pending bit stays set.
+        project.revalidate_symlink_omissions(&changed);
+        let repeated = project.file_listing_stamp();
+        assert_eq!(project.view_stamp(), generic);
+        let (filled, fill_reads) = captured_by(&registries, || {
+            let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+            cell.listing(project).unwrap()
+        });
+        let (direct, direct_reads) = captured_by(&registries, || {
+            let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+            project.all_files_with_omissions().unwrap()
+        });
+        let ((hit, io), hit_reads) = captured_by(&registries, || {
+            measure_project_io(|| {
+                let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+                cell.listing(project).unwrap()
+            })
+        });
+        assert_same_dependencies(&direct_reads, &fill_reads);
+        assert_same_dependencies(&direct_reads, &hit_reads);
+        assert_ne!(old_rule_reads.keys(), direct_reads.keys());
+
+        let (_, plain_fill) = captured_by(&registries, || cell.listing(project).unwrap());
+        let (_, plain_direct) =
+            captured_by(&registries, || project.all_files_with_omissions().unwrap());
+        let (_, plain_hit) = captured_by(&registries, || cell.listing(project).unwrap());
+        assert_same_dependencies(&plain_direct, &plain_fill);
+        assert_same_dependencies(&plain_direct, &plain_hit);
+        assert_eq!(
+            old_reads.keys(),
+            plain_direct.keys(),
+            "nonmatching rules do not change Inventory"
+        );
+        assert_same_dependencies(&old_reads, &plain_direct);
+        assert_ne!(pending, initial_stamp);
+        assert_ne!(repeated, pending);
+        assert!(direct_reads.is_bounded());
+        assert_eq!(filled.0, direct.0);
+        assert!(Arc::ptr_eq(&old.0, &filled.0));
+        assert!(Arc::ptr_eq(&old.1, &filled.1));
+        assert!(Arc::ptr_eq(&filled.0, &hit.0));
+        assert_eq!(project.view_stamp(), generic);
+        assert_eq!(project.file_listing_stamp(), repeated);
+        assert_eq!(
+            project
+                .membership_point_observation(&filled)
+                .unwrap()
+                .lineage,
+            lineage
+        );
+        assert_eq!(io.walks, 0);
+
+        // A real matcher failure keeps its typed cause and refuses reuse of
+        // the read set; repairing it never restores the old certificate.
+        std::fs::write(project.root().join(".bifrostignore"), "[z-a]\n").unwrap();
+        age_ignore_test_inputs(project.root());
+        project.revalidate_symlink_omissions(&changed);
+        let (_, failed_fill) = captured_by(&registries, || cell.listing(project).unwrap());
+        let (failed_listing, failed_direct) =
+            captured_by(&registries, || project.all_files_with_omissions().unwrap());
+        let (_, failed_hit) = captured_by(&registries, || cell.listing(project).unwrap());
+        assert_same_dependencies(&failed_direct, &failed_fill);
+        assert_same_dependencies(&failed_direct, &failed_hit);
+        assert!(!failed_direct.is_bounded());
+        assert!(
+            project
+                .ignore_observation_for_files(&failed_listing.0)
+                .is_err()
+        );
+        assert!(matches!(
+            project.retained_ignore_observation(),
+            RetainedIgnoreObservation::Failed(_)
+        ));
+        std::fs::write(project.root().join(".bifrostignore"), "never-matches-one\n").unwrap();
+        age_ignore_test_inputs(project.root());
+        project.revalidate_symlink_omissions(&changed);
+        let (_, recovered) = captured_by(&registries, || cell.listing(project).unwrap());
+        let (_, recovered_direct) =
+            captured_by(&registries, || project.all_files_with_omissions().unwrap());
+        let (_, recovered_hit) = captured_by(&registries, || cell.listing(project).unwrap());
+        assert_same_dependencies(&recovered_direct, &recovered);
+        assert_same_dependencies(&recovered_direct, &recovered_hit);
+        assert!(recovered.is_bounded());
+        assert_ne!(project.file_listing_stamp(), initial_stamp);
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: removing cold-fill bumps also removed semantic replacement epochs after pending validation"
+    )]
+    fn pending_changed_membership_advances_semantic_epoch_without_another_walk() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::age_ignore_test_inputs;
+        use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
+        let (_parent, _env, project, _cache) = cached_listing_fixture();
+        let project = project.as_ref();
+        let cell = WorkspaceFileListingCell::default();
+        let old = cell.listing(project).unwrap();
+        let before = project.view_stamp();
+        let registries = [ProjectReadRegistry::try_new(project).unwrap()];
+        std::fs::write(project.root().join("new.cs"), "class New {}\n").unwrap();
+        std::fs::write(
+            project.root().join(".bifrostignore"),
+            "another-absent-pattern\n",
+        )
+        .unwrap();
+        age_ignore_test_inputs(project.root());
+        project.revalidate_symlink_omissions(&BTreeSet::from([ProjectFile::new(
+            project.root(),
+            ".bifrostignore",
+        )]));
+        let ((changed, io), first_reads) = captured_by(&registries, || {
+            measure_project_io(|| cell.listing(project).unwrap())
+        });
+        assert_eq!(changed.0.len(), old.0.len() + 1);
+        assert_ne!(project.view_stamp(), before);
+        assert_eq!(io.walks, 1);
+        let ((cached, io), next_reads) = captured_by(&registries, || {
+            measure_project_io(|| cell.listing(project).unwrap())
+        });
+        assert!(Arc::ptr_eq(&changed.0, &cached.0));
+        assert_same_dependencies(&first_reads, &next_reads);
+        assert_eq!(io.walks, 0);
+        let (_, final_reads) = captured_by(&registries, || cell.listing(project).unwrap());
+        assert_same_dependencies(&next_reads, &final_reads);
+
+        // The same existing owner can be explicitly emptied: warming that
+        // empty slot, unlike replacing published contents, is not semantic.
+        project.invalidate_cached_file_listing();
+        let invalidated = project.view_stamp();
+        project.all_files_with_omissions().unwrap();
+        assert_eq!(project.view_stamp(), invalidated);
+    }
+
+    #[test]
+    #[hardwon("#13799: pending validation between getter return and POST admitted an old receipt")]
+    fn post_getter_pending_validation_refuses_admission_without_promotion() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::{
+            ProjectViewStamp, SharedWorkspaceFileListing, age_ignore_test_inputs,
+        };
+        use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct ValidatedAfterGetter {
+            delegate: Arc<FilesystemProject>,
+            completed: AtomicBool,
+            getters: AtomicUsize,
+            validate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+        impl Project for ValidatedAfterGetter {
+            fn root(&self) -> &std::path::Path {
+                self.delegate.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.delegate.analyzer_languages()
+            }
+            fn project_read_slot(
+                &self,
+            ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+                self.delegate.project_read_slot()
+            }
+            fn file_listing_stamp(&self) -> Option<Vec<ProjectViewStamp>> {
+                if self.completed.load(Ordering::Acquire)
+                    && let Some(validate) = self.validate.lock().unwrap().take()
+                {
+                    validate();
+                }
+                self.delegate.file_listing_stamp()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.all_files()
+            }
+            fn analyzable_files(
+                &self,
+                language: Language,
+            ) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &std::path::Path) -> Option<ProjectFile> {
+                self.delegate.file_by_rel_path(path)
+            }
+            fn all_files_with_omissions(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+                self.getters.fetch_add(1, Ordering::Relaxed);
+                let files = self.delegate.all_files_with_omissions()?;
+                self.completed.store(true, Ordering::Release);
+                Ok(files)
+            }
+        }
+        let (_parent, _env, project, _cache) = cached_listing_fixture();
+        let registries = [ProjectReadRegistry::try_new(project.as_ref()).unwrap()];
+        let generic = project.view_stamp();
+        let validation_project = Arc::clone(&project);
+        let view = ValidatedAfterGetter {
+            delegate: project,
+            completed: AtomicBool::new(false),
+            getters: AtomicUsize::new(0),
+            validate: Mutex::new(Some(Box::new(move || {
+                std::fs::write(
+                    validation_project.root().join(".bifrostignore"),
+                    "post-getter-nonmatching-rule\n",
+                )
+                .unwrap();
+                age_ignore_test_inputs(validation_project.root());
+                validation_project.revalidate_symlink_omissions(&BTreeSet::from([
+                    ProjectFile::new(validation_project.root(), ".bifrostignore"),
+                ]));
+            }))),
+        };
+        let cell = WorkspaceFileListingCell::default();
+        let (_, old_inventory) = captured_by(&registries, || {
+            view.delegate.all_files_with_omissions().unwrap()
+        });
+        let (_, returned_a) = captured_by(&registries, || {
+            let project = view.delegate.as_ref();
+            let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+            cell.listing(&view).unwrap()
+        });
+        assert_eq!(view.delegate.view_stamp(), generic);
+        assert_eq!(view.getters.load(Ordering::Relaxed), 1);
+        let (value_b, returned_b) = captured_by(&registries, || {
+            let project = view.delegate.as_ref();
+            let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+            cell.listing(&view).unwrap()
+        });
+        assert_ne!(returned_a.keys(), returned_b.keys());
+        assert_eq!(
+            view.getters.load(Ordering::Relaxed),
+            2,
+            "raced answer must not have filled the cell"
+        );
+        let (direct_value, direct_reads) = captured_by(&registries, || {
+            let project = view.delegate.as_ref();
+            let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+            project.all_files_with_omissions().unwrap()
+        });
+        let ((hit_value, io), hit) = captured_by(&registries, || {
+            measure_project_io(|| {
+                let project = view.delegate.as_ref();
+                let _rules = project.project_read_slot().unwrap().ignore_rules(project);
+                cell.listing(&view).unwrap()
+            })
+        });
+        assert_same_dependencies(&direct_reads, &returned_b);
+        assert_same_dependencies(&direct_reads, &hit);
+        assert!(direct_reads.is_bounded());
+        assert!(Arc::ptr_eq(&value_b.0, &direct_value.0));
+        assert!(Arc::ptr_eq(&value_b.1, &direct_value.1));
+        assert!(Arc::ptr_eq(&value_b.0, &hit_value.0));
+        assert!(Arc::ptr_eq(&value_b.1, &hit_value.1));
+        assert_eq!(view.getters.load(Ordering::Relaxed), 2);
+        assert_eq!(view.delegate.view_stamp(), generic);
+        assert_eq!(io.walks, 0);
+        let (_, plain_fill) = captured_by(&registries, || cell.listing(&view).unwrap());
+        let (_, plain_direct) = captured_by(&registries, || {
+            view.delegate.all_files_with_omissions().unwrap()
+        });
+        let (_, plain_hit) = captured_by(&registries, || cell.listing(&view).unwrap());
+        assert_same_dependencies(&plain_direct, &plain_fill);
+        assert_same_dependencies(&plain_direct, &plain_hit);
+        assert_eq!(
+            old_inventory.keys(),
+            plain_direct.keys(),
+            "nonmatching rules do not change Inventory"
+        );
+        assert_same_dependencies(&old_inventory, &plain_direct);
+        assert_eq!(view.getters.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[hardwon("#13799: unstamped custom listing sources were silently cached as immutable")]
+    fn uncertified_listings_are_not_admitted_but_explicit_immutable_views_are() {
+        struct UnknownListing<'a>(&'a FilesystemProject);
+        impl Project for UnknownListing<'_> {
+            fn root(&self) -> &std::path::Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(
+                &self,
+                language: Language,
+            ) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &std::path::Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+        }
+        let root = files();
+        let live = FilesystemProject::new(root.path()).unwrap();
+        let unknown = UnknownListing(&live);
+        assert!(unknown.file_listing_stamp().is_none());
+        let cell = WorkspaceFileListingCell::default();
+        let before = live.workspace_file_listing_count();
+        cell.listing(&unknown).unwrap();
+        cell.listing(&unknown).unwrap();
+        assert_eq!(live.workspace_file_listing_count(), before + 2);
+
+        let fixed = brokk_bifrost_core::analyzer::project::FileSetProject::from_listing(
+            live.root(),
+            [std::path::PathBuf::from("a.cs")],
+            vec![],
+        );
+        assert_eq!(fixed.file_listing_stamp().unwrap().len(), 1);
+        let first = cell.listing(&fixed).unwrap();
+        let second = cell.listing(&fixed).unwrap();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+    }
+
+    #[test]
+    #[hardwon("#13799: replacing an immutable file set at the same address reused old membership")]
+    fn listing_identity_survives_file_set_replacement_in_place() {
+        use brokk_bifrost_core::analyzer::project::FileSetProject;
+
+        let root = files();
+        let mut view = Box::new(FileSetProject::from_listing(
+            root.path(),
+            [std::path::PathBuf::from("a.cs")],
+            vec![],
+        ));
+        let address = std::ptr::from_ref(view.as_ref()).addr();
+        let cell = WorkspaceFileListingCell::default();
+        let a = cell.listing(view.as_ref()).unwrap();
+        *view = FileSetProject::from_listing(
+            root.path(),
+            [std::path::PathBuf::from("sub/b.cs")],
+            vec![],
+        );
+        assert_eq!(std::ptr::from_ref(view.as_ref()).addr(), address);
+        let b = cell.listing(view.as_ref()).unwrap();
+        assert_eq!(b.0, view.all_files_shared().unwrap());
+        assert_ne!(a.0, b.0);
+        let hit = cell.listing(view.as_ref()).unwrap();
+        assert!(Arc::ptr_eq(&b.0, &hit.0));
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: equal revisions from a replacement source replayed the previous slot's registrations"
+    )]
+    fn listing_identity_preserves_replacement_source_registrations() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use brokk_bifrost_core::analyzer::project::{ProjectViewStamp, SharedWorkspaceFileListing};
+        use brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot;
+
+        struct Source {
+            delegate: Arc<FilesystemProject>,
+            slot: ProjectReadSlot,
+        }
+        impl Project for Source {
+            fn root(&self) -> &std::path::Path {
+                self.delegate.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.delegate.analyzer_languages()
+            }
+            fn file_listing_stamp(&self) -> Option<Vec<ProjectViewStamp>> {
+                self.delegate.file_listing_stamp()
+            }
+            fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+                Some(&self.slot)
+            }
+            fn install_read_recorder(
+                &self,
+                capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
+            ) -> bool {
+                self.slot.install(capability);
+                true
+            }
+            fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+                self.delegate.ignore_rules_digest()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.all_files_with_omissions()
+                    .map(|(files, _)| (*files).clone())
+            }
+            fn all_files_with_omissions(&self) -> std::io::Result<SharedWorkspaceFileListing> {
+                let _read = self.slot.inventory(self);
+                self.delegate.all_files_with_omissions()
+            }
+            fn analyzable_files(
+                &self,
+                language: Language,
+            ) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &std::path::Path) -> Option<ProjectFile> {
+                self.delegate.file_by_rel_path(path)
+            }
+        }
+
+        let root = files();
+        std::fs::write(root.path().join(".bifrostignore"), "a.cs\n").unwrap();
+        let delegate = Arc::new(FilesystemProject::new(root.path()).unwrap());
+        let mut view = Box::new(Source {
+            delegate: Arc::clone(&delegate),
+            slot: ProjectReadSlot::default(),
+        });
+        let address = std::ptr::from_ref(view.as_ref()).addr();
+        let stamp = view.file_listing_stamp();
+        let first_registry = [ProjectReadRegistry::try_new(view.as_ref()).unwrap()];
+        let cell = WorkspaceFileListingCell::default();
+        let (_, first) = captured_by(&first_registry, || cell.listing(view.as_ref()).unwrap());
+        assert!(!first.keys().is_empty());
+        *view = Source {
+            delegate,
+            slot: ProjectReadSlot::default(),
+        };
+        assert_eq!(std::ptr::from_ref(view.as_ref()).addr(), address);
+        assert_eq!(view.file_listing_stamp(), stamp);
+        let current_registry = [ProjectReadRegistry::try_new(view.as_ref()).unwrap()];
+        let (_, direct) = captured_by(&current_registry, || {
+            view.all_files_with_omissions().unwrap()
+        });
+        let (filled, fill) =
+            captured_by(&current_registry, || cell.listing(view.as_ref()).unwrap());
+        let (hit, reads) = captured_by(&current_registry, || cell.listing(view.as_ref()).unwrap());
+        assert!(!direct.keys().is_empty());
+        assert_same_dependencies(&direct, &fill);
+        assert_same_dependencies(&direct, &reads);
+        assert!(Arc::ptr_eq(&filled.0, &hit.0));
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: mutable multi-root and selected-configuration listings had no currentness stamp"
+    )]
+    fn mutable_listing_wrappers_preserve_their_real_source_invalidations() {
+        use crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry;
+        use crate::analyzer::workspace::SelectedConfigurationProject;
+        use brokk_bifrost_core::analyzer::project::MultiRootProject;
+        use brokk_bifrost_core::analyzer::project_reads::measure_project_io;
+
+        let check = |project: &dyn Project, new_file: &std::path::Path| {
+            assert!(
+                project.view_stamp().is_none(),
+                "listing authority must not widen generic view certification"
+            );
+            let before = project
+                .file_listing_stamp()
+                .expect("all mutable listing owners participate");
+            let registries = [ProjectReadRegistry::try_new(project).unwrap()];
+            let cell = WorkspaceFileListingCell::default();
+            let old = cell.listing(project).unwrap();
+            std::fs::write(new_file, "class New {}\n").unwrap();
+            project.invalidate_cached_file_listing();
+            assert_ne!(project.file_listing_stamp().unwrap(), before);
+            let (updated, fill) = captured_by(&registries, || cell.listing(project).unwrap());
+            let (direct, reads) =
+                captured_by(&registries, || project.all_files_with_omissions().unwrap());
+            assert_eq!(updated.0.len(), old.0.len() + 1);
+            assert_eq!(updated.0, direct.0);
+            assert_same_dependencies(&reads, &fill);
+            let ((hit, io), hit_reads) = captured_by(&registries, || {
+                measure_project_io(|| cell.listing(project).unwrap())
+            });
+            assert!(Arc::ptr_eq(&updated.0, &hit.0));
+            assert_same_dependencies(&reads, &hit_reads);
+            assert_eq!(io.walks, 0);
+        };
+
+        let roots = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            std::fs::create_dir(roots.path().join(name)).unwrap();
+            std::fs::write(roots.path().join(name).join("app.cs"), "class App {}\n").unwrap();
+        }
+        let multi =
+            MultiRootProject::new([roots.path().join("first"), roots.path().join("second")])
+                .unwrap();
+        assert_eq!(multi.file_listing_stamp().unwrap().len(), 2);
+        check(&multi, &roots.path().join("first/new.cs"));
+
+        let root = files();
+        let live: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.path()).unwrap());
+        let selected = SelectedConfigurationProject::captured(
+            live,
+            Language::CSharp,
+            Arc::new(Vec::new()),
+            &[],
+        );
+        check(&selected, &root.path().join("new.cs"));
+
+        // The overlay has a real mutable listing even when its delegate is an
+        // explicitly immutable file set and supplies no generic view stamp.
+        let root = files();
+        let fixed = brokk_bifrost_core::analyzer::project::FileSetProject::from_listing(
+            root.path(),
+            [std::path::PathBuf::from("a.cs")],
+            vec![],
+        );
+        let overlay = OverlayProject::new(Arc::new(fixed));
+        assert!(overlay.view_stamp().is_none());
+        let before = overlay.file_listing_stamp().unwrap();
+        let cell = WorkspaceFileListingCell::default();
+        let old = cell.listing(&overlay).unwrap();
+        assert!(overlay.set(overlay.root().join("new.cs"), "class New {}\n".to_string()));
+        assert_ne!(overlay.file_listing_stamp().unwrap(), before);
+        let updated = cell.listing(&overlay).unwrap();
+        assert_eq!(updated.0.len(), old.0.len() + 1);
+        let (hit, io) = measure_project_io(|| cell.listing(&overlay).unwrap());
+        assert!(Arc::ptr_eq(&updated.0, &hit.0));
+        assert_eq!(io.walks, 0);
+    }
+}
+
+#[cfg(test)]
+mod captured_cause_tests {
+    use super::*;
+
+    fn reasons() -> Vec<QueryReadIncomplete> {
+        let gap = |t: &str| QueryReadIncomplete::SemanticEvidenceGap(t.into());
+        vec![
+            gap("b"),
+            gap("a"),
+            gap("b"),
+            QueryReadIncomplete::ArtifactUnavailable("a".into()),
+            QueryReadIncomplete::Cancelled,
+            QueryReadIncomplete::Cancelled,
+            QueryReadIncomplete::SemanticModelsPending,
+            QueryReadIncomplete::SemanticEvidenceUnavailable("u".into()),
+            gap("Rust route evidence is incomplete for units []"),
+            gap("a"),
+        ]
+    }
+
+    #[test]
+    fn captured_set_membership_equals_vec_contains() {
+        let mut old: Vec<QueryReadIncomplete> = Vec::new();
+        let mut set = CapturedSet::default();
+        for reason in reasons() {
+            if !old.contains(&reason) {
+                old.push(reason.clone());
+            }
+            set.insert(&CapturedCause::new(reason));
+        }
+        let new: Vec<_> = set.items.iter().map(|c| c.reason().clone()).collect();
+        assert_eq!(new, old);
+    }
+
+    #[test]
+    fn merge_chooses_what_merge_optional_chooses() {
+        let all = reasons();
+        for first in &all {
+            for second in &all {
+                let old =
+                    QueryReadIncomplete::merge_optional(Some(first.clone()), Some(second.clone()))
+                        .unwrap();
+                let new = CapturedCause::merge(
+                    CapturedCause::new(first.clone()),
+                    CapturedCause::new(second.clone()),
+                );
+                assert_eq!(new.reason(), &old, "{first:?} vs {second:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_order_equals_the_answer_order_sort() {
+        let mut old = reasons();
+        old.sort_by_cached_key(QueryReadIncomplete::answer_order_key);
+        let mut completion = QueryCompletion::capturing();
+        for reason in reasons() {
+            completion.record_interned(CapturedCause::new(reason));
+        }
+        let mut causes = completion.captured.as_ref().unwrap().items.clone();
+        causes.sort_by(|a, b| a.order_key().cmp(b.order_key()));
+        let mut dedup = Vec::new();
+        for reason in old {
+            if !dedup.contains(&reason) {
+                dedup.push(reason);
+            }
+        }
+        assert_eq!(
+            causes
+                .iter()
+                .map(|c| c.reason().clone())
+                .collect::<Vec<_>>(),
+            dedup
         );
     }
 }

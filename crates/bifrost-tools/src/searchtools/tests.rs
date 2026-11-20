@@ -143,6 +143,7 @@ struct CountingAnalyzer {
     retain_analyzed_candidates: AtomicUsize,
     retain_analyzed_calls: AtomicUsize,
     search_definitions_calls: AtomicUsize,
+    observed_search_request: std::sync::Mutex<Option<u64>>,
     /// Declarations `search_definitions` reports, which the default
     /// `IAnalyzer::search_symbol_candidates` turns into search candidates.
     /// Empty unless a test asks for them, so every other test is unaffected.
@@ -162,6 +163,7 @@ impl CountingAnalyzer {
             retain_analyzed_candidates: AtomicUsize::new(0),
             retain_analyzed_calls: AtomicUsize::new(0),
             search_definitions_calls: AtomicUsize::new(0),
+            observed_search_request: Default::default(),
             search_definition_results: BTreeSet::new(),
         }
     }
@@ -300,6 +302,8 @@ impl CodeUnitIndex for CountingAnalyzer {
     }
 
     fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+        *self.observed_search_request.lock().unwrap() =
+            brokk_bifrost_analysis::analyzer::i_analyzer::current_outer_request().map(|r| r.id());
         self.search_definitions_calls
             .fetch_add(1, Ordering::Relaxed);
         self.search_definition_results.clone()
@@ -323,6 +327,7 @@ impl IAnalyzer for CountingAnalyzer {
             retain_analyzed_candidates: AtomicUsize::new(self.retain_analyzed_candidates()),
             retain_analyzed_calls: AtomicUsize::new(self.retain_analyzed_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            observed_search_request: Default::default(),
             search_definition_results: self.search_definition_results.clone(),
         }
     }
@@ -1436,6 +1441,8 @@ fn terminal_navigation_status_cannot_be_resolved_by_semantic_overlay() {
         )
         .expect("register semantic-model fixture");
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("crate version parses"),
@@ -1450,7 +1457,8 @@ fn terminal_navigation_status_cannot_be_resolved_by_semantic_overlay() {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }],
         controls: vec![SemanticModelActivationControl {
             scope: SemanticModelControlScope::Workspace,
@@ -2213,5 +2221,18 @@ fn module_outline_lists_defining_files_without_a_workspace_declaration_scan() {
         analyzer.test_hooks().full_declaration_scan_count_for_test(),
         0,
         "the module outline must resolve its defining files by name, not by scanning the workspace"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon("#9559: symbol search must inherit the enclosing request")]
+fn search_symbols_inherits_outer_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let analyzer = CountingAnalyzer::new(temp.path().to_path_buf(), &[]);
+    let outer = AnalyzerQueryScope::new(&analyzer);
+    super::navigation::search_symbols(&analyzer, widget_search_params(10));
+    assert_eq!(
+        *analyzer.observed_search_request.lock().unwrap(),
+        Some(outer.outer_request().id())
     );
 }

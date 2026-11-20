@@ -899,6 +899,8 @@ impl IntersectPrefixProduct {
                     | PipelineValue::ReferenceEdge(_)
                     | PipelineValue::StateEvent(_)
                     | PipelineValue::BindingInitializerCall(_)
+                    | PipelineValue::FieldWrite(_)
+                    | PipelineValue::FieldRead(_)
                     | PipelineValue::FlowRelation(_)
                     | PipelineValue::ControlRelation(_)
                     | PipelineValue::BranchRelation(_)
@@ -1404,6 +1406,8 @@ fn encode_trace_value(
         | PipelineTraceValue::ReferenceEdge(_)
         | PipelineTraceValue::StateEvent(_)
         | PipelineTraceValue::BindingInitializerCall(_)
+        | PipelineTraceValue::FieldWrite(_)
+        | PipelineTraceValue::FieldRead(_)
         | PipelineTraceValue::FlowRelation(_)
         | PipelineTraceValue::ControlRelation(_)
         | PipelineTraceValue::BranchRelation(_)
@@ -1472,15 +1476,76 @@ fn resolve_intersect_step_slot<'a>(
 /// A continuation either yields a complete detailed answer or withholds it.
 /// An incomplete prefix never contributes a partial intersect membership.
 #[derive(Debug)]
-pub struct IntersectContinuationResult {
-    pub detailed: Option<DetailedCodeQueryResult>,
+pub struct QueryContinuationResult<T> {
+    pub detailed: Option<T>,
     pub completion: CodeQueryCompletion,
     pub depth_bound_status: Option<DepthBoundStatus>,
-    pub diagnostics: Vec<CodeQueryDiagnostic>,
+    pub diagnostics: QueryDiagnostics,
     pub work: CodeQueryExecutionWork,
     pub budgeted_work: CodeQueryBudgetedWork,
     /// The prefixes' and the suffix execution's joined reuse verdict.
     pub reuse: ReuseVerdict,
+}
+
+pub type IntersectContinuationResult = QueryContinuationResult<DetailedCodeQueryResult>;
+pub type SelectorContinuationResult = QueryContinuationResult<SelectorUnitExecution>;
+
+trait ContinuationRows {
+    type Item;
+    fn detailed_mut(&mut self) -> &mut DetailedQueryResult<Self::Item>;
+}
+impl ContinuationRows for DetailedCodeQueryResult {
+    type Item = CodeQueryResultItem;
+    fn detailed_mut(&mut self) -> &mut DetailedCodeQueryResult {
+        self
+    }
+}
+impl ContinuationRows for SelectorUnitExecution {
+    type Item = SelectorResultItem;
+    fn detailed_mut(&mut self) -> &mut DetailedSelectorResult {
+        &mut self.detailed
+    }
+}
+
+impl SelectorContinuationResult {
+    pub fn into_merged_rows(self, query: &CodeQuery) -> MergedUnitRows {
+        let reuse = self.reuse;
+        match self.detailed {
+            Some(executed) => {
+                let detailed = executed.detailed;
+                let (items, evidence) = executed
+                    .unit
+                    .rows
+                    .into_iter()
+                    .map(|row| (row.item, row.evidence))
+                    .unzip();
+                MergedUnitRows {
+                    items,
+                    evidence,
+                    work: detailed.work,
+                    budgeted_work: detailed.budgeted_work,
+                    diagnostics: detailed.result.diagnostics.into_semantic(),
+                    truncated: detailed.result.truncated,
+                    depth_bound_status: detailed.result.depth_bound_status,
+                    fair_share_divisor: 1,
+                    step_output_caps: unit_step_output_caps(query),
+                    reuse,
+                }
+            }
+            None => MergedUnitRows {
+                items: Vec::new(),
+                evidence: Vec::new(),
+                work: self.work,
+                budgeted_work: self.budgeted_work,
+                diagnostics: self.diagnostics.into_semantic(),
+                truncated: true,
+                depth_bound_status: self.depth_bound_status,
+                fair_share_divisor: 1,
+                step_output_caps: unit_step_output_caps(query),
+                reuse,
+            },
+        }
+    }
 }
 
 impl IntersectContinuationResult {
@@ -1503,7 +1568,7 @@ impl IntersectContinuationResult {
                     .collect(),
                 work: detailed.work,
                 budgeted_work: detailed.budgeted_work,
-                diagnostics: detailed.result.diagnostics,
+                diagnostics: detailed.result.diagnostics.into_semantic(),
                 truncated: detailed.result.truncated,
                 depth_bound_status: detailed.result.depth_bound_status,
                 fair_share_divisor: 1,
@@ -1515,7 +1580,7 @@ impl IntersectContinuationResult {
                 evidence: Vec::new(),
                 work: self.work,
                 budgeted_work: self.budgeted_work,
-                diagnostics: self.diagnostics,
+                diagnostics: self.diagnostics.into_semantic(),
                 truncated: true,
                 depth_bound_status: self.depth_bound_status,
                 fair_share_divisor: 1,
@@ -1548,6 +1613,62 @@ pub fn continue_empty_operand_zero(
     empty: CompleteEmptyFromOperandZero,
     scope: CodeQueryExecutionScope<'_>,
 ) -> IntersectContinuationResult {
+    continue_empty_operand_zero_with_finalizer(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        seeds,
+        empty,
+        scope,
+        PresentQueryRows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continue_selector_empty_operand_zero(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    seeds: &[ProjectFile],
+    empty: CompleteEmptyFromOperandZero,
+    scope: CodeQueryExecutionScope<'_>,
+) -> SelectorContinuationResult {
+    continue_empty_operand_zero_with_finalizer(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        seeds,
+        empty,
+        scope,
+        ProjectSelectorRows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn continue_empty_operand_zero_with_finalizer<F: QueryRowsFinalizer>(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    seeds: &[ProjectFile],
+    empty: CompleteEmptyFromOperandZero,
+    scope: CodeQueryExecutionScope<'_>,
+    finalizer: F,
+) -> QueryContinuationResult<F::Output>
+where
+    F::Output: ContinuationRows,
+{
     let PlanPartitioning::Prefix { cut } = PlanPartitioning::classify_for_prefix(&query.plan)
     else {
         panic!("empty operand continuation requires a prefix cut");
@@ -1638,7 +1759,7 @@ pub fn continue_empty_operand_zero(
             }
         })
         .collect();
-    continue_intersect_prefix(
+    continue_intersect_prefix_with_finalizer(
         analyzer,
         flow_state,
         workspace,
@@ -1648,6 +1769,7 @@ pub fn continue_empty_operand_zero(
         seeds,
         prefixes,
         scope,
+        finalizer,
     )
 }
 
@@ -1665,6 +1787,62 @@ pub fn continue_intersect_prefix(
     prefixes: Vec<IntersectPrefixProduct>,
     scope: CodeQueryExecutionScope<'_>,
 ) -> IntersectContinuationResult {
+    continue_intersect_prefix_with_finalizer(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        seeds,
+        prefixes,
+        scope,
+        PresentQueryRows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continue_selector_intersect_prefix(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    seeds: &[ProjectFile],
+    prefixes: Vec<IntersectPrefixProduct>,
+    scope: CodeQueryExecutionScope<'_>,
+) -> SelectorContinuationResult {
+    continue_intersect_prefix_with_finalizer(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        seeds,
+        prefixes,
+        scope,
+        ProjectSelectorRows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn continue_intersect_prefix_with_finalizer<F: QueryRowsFinalizer>(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    seeds: &[ProjectFile],
+    prefixes: Vec<IntersectPrefixProduct>,
+    scope: CodeQueryExecutionScope<'_>,
+    finalizer: F,
+) -> QueryContinuationResult<F::Output>
+where
+    F::Output: ContinuationRows,
+{
     let crate::query::PlanPartitioning::Prefix { cut } =
         PlanPartitioning::classify_for_prefix(&query.plan)
     else {
@@ -1711,8 +1889,9 @@ pub fn continue_intersect_prefix(
     );
     let complete = prefixes.len() == seeds.len()
         && prefixes.iter().zip(seeds).all(|(prefix, seed)| {
+            // A prefix whose reads were never observed has no read proof at
+            // all; a refused one still has its reads and its exact rows.
             prefix.seed == *seed
-                && prefix.reads_closed
                 && prefix.completion == CodeQueryCompletion::Complete
                 && !prefix.reads.is_empty()
         });
@@ -1721,9 +1900,10 @@ pub fn continue_intersect_prefix(
         // prefix already reported why its rows could not be enumerated. A
         // missing seed or read proof is a separate discovery failure.
         let missing_proof = prefixes.len() != seeds.len()
-            || prefixes.iter().zip(seeds).any(|(prefix, seed)| {
-                prefix.seed != *seed || !prefix.reads_closed || prefix.reads.is_empty()
-            });
+            || prefixes
+                .iter()
+                .zip(seeds)
+                .any(|(prefix, seed)| prefix.seed != *seed || prefix.reads.is_empty());
         let unreported_prefix = prefixes.iter().any(|prefix| {
             prefix.completion != CodeQueryCompletion::Complete
                 && !prefix.diagnostics.iter().any(|diagnostic| {
@@ -1745,7 +1925,11 @@ pub fn continue_intersect_prefix(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            incompleteness: if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+            } else {
+                diagnostics.iter().find_map(|d| d.incompleteness.execution_cause()).map_or(Incompleteness::Content, Incompleteness::Operational)
+            },
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -1757,6 +1941,7 @@ pub fn continue_intersect_prefix(
             related: Vec::new(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }));
         }
         // Unseen seed members can cancel an available local witness. A
@@ -1766,11 +1951,11 @@ pub fn continue_intersect_prefix(
         {
             depth_bound_status = Some(DepthBoundStatus::Unknown);
         }
-        return IntersectContinuationResult {
+        return QueryContinuationResult {
             detailed: None,
             completion: code_query_completion(true, &diagnostics),
             depth_bound_status,
-            diagnostics,
+            diagnostics: diagnostics.into(),
             work: charged_work,
             budgeted_work: charged_budgeted,
             reuse,
@@ -1871,17 +2056,17 @@ pub fn continue_intersect_prefix(
         {
             depth_bound_status = Some(DepthBoundStatus::Unknown);
         }
-        return IntersectContinuationResult {
+        return QueryContinuationResult {
             detailed: None,
             completion: code_query_completion(true, &diagnostics),
             depth_bound_status,
-            diagnostics,
+            diagnostics: diagnostics.into(),
             work: charged_work,
             budgeted_work: charged_budgeted,
             reuse,
         };
     };
-    let mut detailed = execute_detailed_unit(
+    let mut continued = execute_unit_with_finalizer(
         analyzer,
         flow_state,
         workspace,
@@ -1891,7 +2076,9 @@ pub fn continue_intersect_prefix(
         scope.with_intersect_operands(merged_operands),
         &mut row_keys,
         None,
+        finalizer,
     );
+    let detailed = continued.detailed_mut();
     let whole_plan = select_physical_plan(query, UnionExecutionStrategy::Sequential, 1, 0)
         .expect("eligible intersect has a physical plan");
     let mut cut_node = whole_plan.node(whole_plan.root()).dependencies()[0];
@@ -2003,7 +2190,8 @@ pub fn continue_intersect_prefix(
                 .cloned(),
         );
     }
-    diagnostics.extend(detailed.result.diagnostics.iter().cloned());
+    let mut diagnostics: QueryDiagnostics = diagnostics.into();
+    diagnostics.append(std::mem::take(&mut detailed.result.diagnostics));
     detailed.result.diagnostics = diagnostics.clone();
     let suffix_depth_status = if detailed.depth_answers.is_empty() {
         detailed.result.depth_bound_status
@@ -2029,15 +2217,21 @@ pub fn continue_intersect_prefix(
         detailed.result.depth_bound_status = Some(DepthBoundStatus::Unknown);
     }
     reuse.join_in(detailed.reuse);
-    IntersectContinuationResult {
+    QueryContinuationResult {
         reuse,
         depth_bound_status: detailed.result.depth_bound_status,
-        detailed: Some(detailed),
+        detailed: Some(continued),
         completion,
         diagnostics,
         work: charged_work,
         budgeted_work: charged_budgeted,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only refusal source standing in for an unrecorded read in a prefix.
+    pub(crate) static REFUSE_INTERSECT_PREFIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Execute every operand below a root intersect for one narrowed seed. The
@@ -2078,12 +2272,16 @@ pub fn execute_intersect_prefix(
         .and_then(|provider| provider.structural_file_read_key(&seed_file))
         .expect("prefix seed must have a structural file read key");
     analyzer.record_read(seed_read);
+    #[cfg(test)]
+    if REFUSE_INTERSECT_PREFIX.with(std::cell::Cell::get) {
+        analyzer.refuse_read_reuse();
+    }
     let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut prefix_query = query.clone();
     prefix_query.plan.steps.clear();
     prefix_query.limit = usize::MAX;
     let mut row_keys = Vec::new();
-    let detailed = execute_detailed_unit(
+    let detailed = execute_unit_with_finalizer(
         analyzer,
         flow_state,
         workspace,
@@ -2093,7 +2291,9 @@ pub fn execute_intersect_prefix(
         scope.with_intersect_prefix_capture(std::sync::Arc::clone(&capture)),
         &mut row_keys,
         None,
-    );
+        ProjectSelectorRows,
+    )
+    .detailed;
     ledger.join_verdict(detailed.reuse);
     let operands = capture
         .lock()
@@ -2156,7 +2356,10 @@ pub fn execute_intersect_prefix(
         operand_step_outputs,
         work: detailed.work,
         budgeted_work: detailed.budgeted_work,
-        completion: if complete && reads_closed {
+        // #12820: the read proof decides storage and publication only
+        // (`reads_closed`). A reuse refusal leaves this run's operand rows
+        // exact, so completion comes from the query result alone.
+        completion: if complete {
             CodeQueryCompletion::Complete
         } else {
             CodeQueryCompletion::Incomplete {
@@ -2165,7 +2368,7 @@ pub fn execute_intersect_prefix(
         },
         depth_bound_status: detailed.result.depth_bound_status,
         depth_answers: detailed.depth_answers,
-        diagnostics: detailed.result.diagnostics,
+        diagnostics: detailed.result.diagnostics.into_semantic(),
         reads: ledger.keys(),
         reads_closed,
         reuse: detailed.reuse,
@@ -2767,7 +2970,7 @@ pub fn execute_code_query_unit(
     };
     let except_left = scope.capture_except_left(query);
     let mut row_keys = Vec::new();
-    let detailed = execute_detailed_unit(
+    let executed = execute_unit_with_finalizer(
         analyzer,
         flow_state.clone(),
         workspace,
@@ -2777,8 +2980,9 @@ pub fn execute_code_query_unit(
         scope,
         &mut row_keys,
         None,
+        ProjectQueryUnitRows,
     );
-    let mut unit = project_unit_result(&detailed, row_keys);
+    let mut unit = executed.unit;
     unit.except_left_complete_empty = except_left
         .and_then(|capture| *capture.lock().expect("except capture lock is not poisoned"));
     unit
@@ -2943,6 +3147,50 @@ fn leaf_traversal_rewrites(
     rewrites
 }
 
+/// Rewrite the step attribution of diagnostics raised by a step the leaf
+/// inherited from an ancestor union, so a leaf reports the same
+/// `(branch, step_index)` as the whole execution, where that step runs once
+/// after its union at the ancestor's own branch path.
+pub(super) fn rebase_inherited_step_diagnostics(
+    original: &CodeQueryPlan,
+    leaf_path: &[usize],
+    local_step_count: usize,
+    diagnostics: &mut [CodeQueryDiagnostic],
+) {
+    // The leaf's inherited steps are the deepest ancestor's first.
+    let mut ancestors = Vec::new();
+    let mut current = original;
+    for (depth, &branch) in leaf_path.iter().enumerate() {
+        ancestors.push((current.steps.len(), &leaf_path[..depth]));
+        let CodeQueryPlanSource::Set { branches, .. } = &current.source else {
+            unreachable!("union branch path addresses a set")
+        };
+        current = &branches[branch];
+    }
+    ancestors.reverse();
+    for diagnostic in diagnostics {
+        let Some(index) = diagnostic.step_index else {
+            continue;
+        };
+        // A diagnostic of a plan nested in the leaf, such as a branch of a
+        // call-reachability source union, carries a longer branch and
+        // indexes that nested plan's own steps, so it is not inherited.
+        debug_assert!(diagnostic.branch.starts_with(leaf_path));
+        if index < local_step_count || diagnostic.branch.len() != leaf_path.len() {
+            continue;
+        }
+        let mut offset = index - local_step_count;
+        for &(step_count, ancestor_path) in &ancestors {
+            if offset < step_count {
+                diagnostic.step_index = Some(offset);
+                diagnostic.branch = ancestor_path.to_vec();
+                break;
+            }
+            offset -= step_count;
+        }
+    }
+}
+
 /// Execute one eligible union unit leaf by leaf, preserving branch rows until
 /// the global unit merge. A leaf receives no result limit of its own: the
 /// query's limit is a cap on the union after all branches have been composed.
@@ -3018,7 +3266,7 @@ fn execute_seed_union_unit(
             &leaf_query.plan,
             &branch_path,
         )));
-        let detailed = execute_detailed_unit(
+        let executed = execute_unit_with_finalizer(
             analyzer,
             flow_state.clone(),
             workspace,
@@ -3028,8 +3276,10 @@ fn execute_seed_union_unit(
             leaf_scope,
             &mut row_keys,
             None,
+            ProjectQueryUnitRows,
         );
-        let mut leaf_result = project_unit_result(&detailed, row_keys);
+        let detailed = executed.detailed;
+        let mut leaf_result = executed.unit;
         match (
             candidate_sites.as_mut(),
             leaf_result.budgeted_work.candidate_sites,
@@ -3063,6 +3313,12 @@ fn execute_seed_union_unit(
             (Some(counts), Some(leaf_counts)) => counts.extend(leaf_counts),
             _ => budgeted_work.step_outputs = None,
         }
+        rebase_inherited_step_diagnostics(
+            &query.plan,
+            &branch_path,
+            leaf_query.plan.steps.len() - inherited_suffix_steps,
+            &mut leaf_result.diagnostics,
+        );
         diagnostics.append(&mut leaf_result.diagnostics);
         truncated |= leaf_result.truncated;
         reuse.join_in(leaf_result.reuse);
@@ -3107,9 +3363,10 @@ fn execute_seed_union_unit(
 /// selector compiler reads instead because a selected site is derived from a
 /// row's own typed value rather than from the projection's scalars, and it
 /// still carries the one-shot semantic receipt the caller must charge.
+#[derive(Debug)]
 pub struct SelectorUnitExecution {
     pub unit: UnitExecutionResult,
-    pub detailed: DetailedCodeQueryResult,
+    pub detailed: DetailedSelectorResult,
 }
 
 /// Execute one selector unit: `query` over exactly `scope`'s seed files, under
@@ -3136,8 +3393,7 @@ pub fn execute_code_query_selector_unit(
     mut scope: CodeQueryExecutionScope<'_>,
 ) -> SelectorUnitExecution {
     let except_left = scope.capture_except_left(query);
-    let mut row_keys = Vec::new();
-    let detailed = execute_detailed_selector_unit(
+    let mut executed = execute_detailed_selector_unit(
         workspace,
         flow_state.clone(),
         query,
@@ -3148,54 +3404,10 @@ pub fn execute_code_query_selector_unit(
         parent_execution,
         artifact_leases,
         scope,
-        &mut row_keys,
     );
-    let mut unit = project_unit_result(&detailed, row_keys);
-    unit.except_left_complete_empty = except_left
+    executed.unit.except_left_complete_empty = except_left
         .and_then(|capture| *capture.lock().expect("except capture lock is not poisoned"));
-    SelectorUnitExecution { unit, detailed }
-}
-
-/// Project one detailed execution onto the product a unit publishes.
-fn project_unit_result(
-    detailed: &DetailedCodeQueryResult,
-    row_keys: Vec<UnitRowKey>,
-) -> UnitExecutionResult {
-    let completion = detailed.result.completion();
-    assert_eq!(
-        detailed.result.results.len(),
-        row_keys.len(),
-        "one dedup key is rendered for every rendered row"
-    );
-    assert_eq!(
-        detailed.result.results.len(),
-        detailed.evidence.len(),
-        "detailed evidence stays aligned with rendered rows"
-    );
-    let rows = detailed
-        .result
-        .results
-        .iter()
-        .zip(&detailed.evidence)
-        .zip(row_keys)
-        .map(|((item, evidence), key)| UnitRow {
-            item: UnitRowItem::project(item),
-            evidence: UnitRowEvidence::project(evidence),
-            key,
-        })
-        .collect();
-    UnitExecutionResult {
-        except_left_complete_empty: None,
-        rows,
-        work: detailed.work,
-        budgeted_work: detailed.budgeted_work.clone(),
-        completion,
-        depth_bound_status: detailed.result.depth_bound_status,
-        depth_answers: detailed.depth_answers.clone(),
-        diagnostics: detailed.result.diagnostics.clone(),
-        truncated: detailed.result.truncated,
-        reuse: detailed.reuse,
-    }
+    executed
 }
 
 /// The detailed execution one selector unit runs, with its rows' dedup keys.
@@ -3216,15 +3428,14 @@ fn execute_detailed_selector_unit(
     parent_execution: &SemanticExecutionBudget,
     artifact_leases: SemanticArtifactLeaseSnapshot,
     scope: CodeQueryExecutionScope<'_>,
-    row_keys: &mut Vec<UnitRowKey>,
-) -> DetailedCodeQueryResult {
+) -> SelectorUnitExecution {
     let parent_scope = parent_semantic.scope_snapshot();
     let (execution_before, execution_child) =
         parent_execution.fork_with_materialized_file_limit(limits.semantic.max_materialized_files);
     let query_scope = AnalyzerQueryScope::new(workspace.analyzer());
     let token = query_scope.token();
     let access_mode = super::eager_structural_access_mode();
-    execute_internal_with_analysis_strategy(
+    execute_query_rows_with_finalizer(
         workspace.analyzer(),
         token,
         None,
@@ -3241,6 +3452,7 @@ fn execute_detailed_selector_unit(
         CODE_QUERY_SCHEDULER_WORKERS,
         access_mode,
         OccurrenceDerivationOptions::IDENTITY_ONLY,
+        None,
         Some(SemanticQueryContinuation {
             parent_scope,
             child_semantic_limits: parent_semantic.remaining(),
@@ -3251,14 +3463,15 @@ fn execute_detailed_selector_unit(
         }),
         None,
         scope,
-        Some(row_keys),
         None,
+        None,
+        EdgeTraversalCache::default(),
+        ProjectSelectorRows,
     )
 }
 
-/// The detailed execution one unit runs, with its rows' dedup keys.
 #[allow(clippy::too_many_arguments)]
-fn execute_detailed_unit(
+fn execute_unit_with_finalizer<F: QueryRowsFinalizer>(
     analyzer: &dyn IAnalyzer,
     flow_state: impl Into<SemanticFlowResources> + Clone,
     workspace: Option<&WorkspaceAnalyzer>,
@@ -3268,11 +3481,12 @@ fn execute_detailed_unit(
     scope: CodeQueryExecutionScope<'_>,
     row_keys: &mut Vec<UnitRowKey>,
     native_rows: Option<&mut Vec<PipelineRow>>,
-) -> DetailedCodeQueryResult {
+    finalizer: F,
+) -> F::Output {
     let query_scope = AnalyzerQueryScope::new(analyzer);
     let token = query_scope.token();
     let access_mode = super::eager_structural_access_mode();
-    execute_internal_with_analysis_strategy(
+    execute_query_rows_with_finalizer(
         analyzer,
         token,
         None,
@@ -3291,9 +3505,38 @@ fn execute_detailed_unit(
         OccurrenceDerivationOptions::IDENTITY_ONLY,
         None,
         None,
+        None,
         scope,
         Some(row_keys),
         native_rows,
+        EdgeTraversalCache::default(),
+        finalizer,
+    )
+}
+
+/// Execute one whole policy query without applying partition-local cap rules
+/// and without constructing site presentation. Seed scope remains explicit.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_code_query_semantic_unit_in_scope(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    scope: CodeQueryExecutionScope<'_>,
+) -> SelectorUnitExecution {
+    execute_unit_with_finalizer(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        scope,
+        &mut Vec::new(),
+        None,
+        ProjectSelectorRows,
     )
 }
 
@@ -3531,7 +3774,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .range(value.range)
             .text(match &value.input {
                 ExpressionInput::Receiver => "receiver".to_string(),
-                ExpressionInput::Parameter { index, name } => match name {
+                ExpressionInput::Parameter { index, name, .. } => match name {
                     Some(name) => format!("parameter:{index}:{name}"),
                     None => format!("parameter:{index}"),
                 },
@@ -3646,6 +3889,8 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::BindingInitializerCall(id) => {
             key("binding_initializer_call").text(id).finish()
         }
+        PipelineKey::FieldWrite(id) => key("field_write").text(id).finish(),
+        PipelineKey::FieldRead(id) => key("field_read").text(id).finish(),
         PipelineKey::FlowRelation(relation) => key("flow_relation")
             .path(&relation.file)
             .text(&relation.procedure)
@@ -3653,7 +3898,14 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .finish(),
         PipelineKey::ControlRelation(relation) => key("control_relation")
             .text(&relation.procedure)
-            .number(relation.index)
+            .text(relation.relation.label())
+            .number(relation.source.index())
+            .number(relation.target.index())
+            .number(
+                relation
+                    .controlling_edge
+                    .map_or(usize::MAX, |edge| edge.index()),
+            )
             .finish(),
         PipelineKey::BranchRelation(id) => key("branch_relation").text(id).finish(),
         PipelineKey::LoopRelation(id) => key("loop_relation").text(id).finish(),
@@ -4160,6 +4412,121 @@ impl UnitRowItem {
         }
     }
 
+    /// The same persisted surface, projected before optional site presentation.
+    pub(super) fn project_native(
+        analyzer: &dyn IAnalyzer,
+        native: &PipelineRow,
+        detail: CodeQueryResultDetail,
+        provenance: &[CodeQueryProvenance],
+        cache: &mut PipelineRenderCache,
+    ) -> Self {
+        assert!(
+            matches!(
+                &native.value,
+                PipelineValue::CallSite(_)
+                    | PipelineValue::ExpressionSite(_)
+                    | PipelineValue::CallArgument(_)
+                    | PipelineValue::CallBinding(_)
+            ),
+            "only site-bearing rows need native unit projection"
+        );
+        let row = super::scalar_projection::PipelineScalarRow::new(analyzer, native);
+        let domain = row.domain();
+        let mut fields = Vec::new();
+        let mut unknown_fields = Vec::new();
+        let columns = if native.row_projection.is_empty() {
+            domain
+                .row_fields()
+                .iter()
+                .map(|field| (field.name, field.name))
+                .collect::<Vec<_>>()
+        } else {
+            native
+                .row_projection
+                .iter()
+                .map(|column| (column.source.as_str(), column.name.as_str()))
+                .collect()
+        };
+        for (source, name) in columns {
+            // Compact wire declarations omit these optional identities. Test
+            // source names before aliasing so a renamed identity stays absent.
+            // Semantic selectors always request Full and keep every scalar.
+            if detail.is_compact()
+                && matches!(
+                    (&native.value, source),
+                    (PipelineValue::CallSite(_), "caller_id" | "callee_id")
+                        | (PipelineValue::CallBinding(_), "target_id")
+                )
+            {
+                continue;
+            }
+            match row.field(source) {
+                Ok(Some(value)) => fields.push(UnitRowField {
+                    name: boxed(name),
+                    value: UnitRowScalar::project(value),
+                }),
+                Ok(None) => {}
+                Err(error) => unknown_fields.push(UnitRowUnknownField {
+                    name: boxed(name),
+                    reason: error
+                        .unknown_reason()
+                        .expect("registered fields fail only for unavailable evidence"),
+                }),
+            }
+        }
+        let terminal =
+            match &native.value {
+                PipelineValue::CallSite(site) => UnitRowItemTerminal::CallSite {
+                    proof: boxed(usage_proof_label(site.0.proof)),
+                    caller_fq_name: boxed(&site.0.caller.fq_name()),
+                    callee_fq_name: boxed(&if site.6.as_ref().is_some_and(|target| {
+                        target.boundary_kind.is_some() || target.reason.is_some()
+                    }) {
+                        site.6
+                            .as_ref()
+                            .and_then(|target| target.target_fq_name.clone())
+                            .unwrap_or_else(|| "<unresolved>".to_string())
+                    } else {
+                        site.0.callee.fq_name()
+                    }),
+                },
+                PipelineValue::ExpressionSite(site) => {
+                    let (kind, index, name) = expression_input_parts(&site.input);
+                    UnitRowItemTerminal::ExpressionSite {
+                        input_kind: boxed(kind),
+                        parameter_index: index,
+                        parameter_name: name.as_deref().map(boxed),
+                    }
+                }
+                PipelineValue::CallArgument(_) | PipelineValue::CallBinding(_) => {
+                    UnitRowItemTerminal::SourcePosition
+                }
+                _ => unreachable!("other rows use their registered projection"),
+            };
+        Self {
+            domain,
+            path: boxed(&rel_path_string(
+                terminal_source_file(&native.value).expect("call rows have a source file"),
+            )),
+            range: row.display_range(cache),
+            evidence: None,
+            coverage: None,
+            fields,
+            projected_field_names: native
+                .row_projection
+                .iter()
+                .map(|column| boxed(&column.name))
+                .collect(),
+            unknown_fields,
+            terminal: Some(terminal),
+            provenance: provenance
+                .iter()
+                .map(UnitRowItemProvenance::project)
+                .collect(),
+            provenance_truncated: native.provenance_truncated,
+        }
+    }
+
     /// One scalar of this row, by the field name its domain declares.
     ///
     /// The same answer [`CodeQueryRowRef::field`] gives for the row this was
@@ -4632,6 +4999,8 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::ResolutionCandidate { .. }
             | CodeQueryResultValue::StateEvent { .. }
             | CodeQueryResultValue::BindingInitializerCall { .. }
+            | CodeQueryResultValue::FieldWrite { .. }
+            | CodeQueryResultValue::FieldRead { .. }
             | CodeQueryResultValue::RewritePath { .. }
             | CodeQueryResultValue::FlowRelation { .. }
             | CodeQueryResultValue::ControlRelation { .. }
@@ -4780,6 +5149,8 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::GenerationSite { value } => &value.path,
         CodeQueryResultValue::StateEvent { value } => &value.path,
         CodeQueryResultValue::BindingInitializerCall { value } => &value.path,
+        CodeQueryResultValue::FieldWrite { value } => &value.path,
+        CodeQueryResultValue::FieldRead { value } => &value.path,
         CodeQueryResultValue::RewritePath { value } => &value.path,
         CodeQueryResultValue::FlowRelation { value } => &value.path,
         CodeQueryResultValue::ControlRelation { value } => &value.path,
@@ -6347,3 +6718,7 @@ fn reached_semantic_limit(
 fn semantic_row_work(work: &CodeQuerySemanticWork, dimension: SemanticBudgetDimension) -> u64 {
     work.resident_peaks.get(dimension) as u64
 }
+
+#[cfg(test)]
+#[path = "admission_continuation_acceptance.rs"]
+mod admission_continuation_acceptance;

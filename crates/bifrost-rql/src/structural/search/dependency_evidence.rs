@@ -249,6 +249,7 @@ fn version_matches(row: &DependencyEvidence, ranges: &[VersionRange]) -> Result<
 }
 fn dependency_gap_diagnostic(gap: &DependencyEvidenceGap) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        // A dependency-evidence gap has no call-binding refusal site.
         has_non_utf8_refusal: false,
         refusal_sites: Default::default(),
         call_relation_facts: None,
@@ -277,6 +278,10 @@ fn dependency_gap_diagnostic(gap: &DependencyEvidenceGap) -> CodeQueryDiagnostic
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     })
 }
 
@@ -334,6 +339,10 @@ pub(super) fn execute_dependency_evidence_seed(
                     message: format!("static dependency publication is unavailable: {error}"),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }),
                 Some(DerivationExecutionCause::Provider),
             ));
@@ -367,6 +376,10 @@ pub(super) fn execute_dependency_evidence_seed(
                     message: format!("dependency source presentation proof unavailable: {error}"),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }),
                 Some(DerivationExecutionCause::Provider),
             ));
@@ -412,6 +425,10 @@ pub(super) fn execute_dependency_evidence_seed(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }));
                 continue;
             }
@@ -434,6 +451,10 @@ pub(super) fn execute_dependency_evidence_seed(
                 message: "selected dependency rows lack retained source presentation proof".into(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
         }
         if rows.len() >= cap {

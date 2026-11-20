@@ -15,14 +15,15 @@ use crate::analyzer::java::*;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 
 use crate::analyzer::java::unshadowed::{
-    EnclosingMemberType, UnshadowedScope, UseSite, enclosing_member_type,
+    EnclosingMemberType, JavaAnalyzerMemberTypeEnv, MemberTypeStep, UnshadowedScope, UseSite,
+    enclosing_class_units_at, enclosing_member_type, resolve_accessible_member_types_of_owner,
 };
 use crate::analyzer::jvm::external::ExplicitImportHit;
-use crate::analyzer::jvm::external::JvmExternalDeclarations;
+use crate::analyzer::jvm::external::LazyExternal;
 
 use crate::analyzer::jvm::external::JvmExternalMember;
 
-use crate::analyzer::jvm::external::QueryGapRecorder;
+use crate::analyzer::jvm::external::{LadderMisses, QueryGapRecorder};
 
 use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
 
@@ -33,7 +34,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::java::graph_support::{
     JavaTypeName, compute_java_relevant_imports, compute_java_same_package_reference_index,
     java_could_import_file, java_could_import_file_without_source, java_same_package_fqn,
-    java_source_class_by_fqn, java_type_parameter_in_scope, resolve_java_import_infos,
+    java_source_class_by_fqn, resolve_java_import_infos,
 };
 use brokk_bifrost_jvm::java::imports::{non_static_import_path, static_import_path};
 use rayon::prelude::*;
@@ -653,7 +654,7 @@ impl JavaAnalyzer {
                 })
         });
         if open_entry {
-            QueryGapRecorder::new(self).all(&self.external_declaration_index());
+            QueryGapRecorder::new(self).whole_index(&self.external_declaration_index());
         }
         resolved
     }
@@ -829,7 +830,7 @@ impl JavaAnalyzer {
                         self,
                         packs,
                         None,
-                        ladder.external,
+                        ladder.external.get(),
                         file,
                         site,
                         name.first(),
@@ -849,15 +850,9 @@ impl JavaAnalyzer {
         name: &JavaTypeName,
         selected_jdk_artifact_sha256: Option<&str>,
         site: Option<&UseSite<'_>>,
-        read: impl FnOnce(&TypeLadder<'_, '_>) -> R,
+        read: impl FnOnce(&TypeLadder<'_, '_, '_>) -> R,
     ) -> R {
-        let external = match selected_jdk_artifact_sha256 {
-            Some(digest) => self.external_declarations_for_source_jdk(packs.clone(), digest),
-            None => self.external_declarations(packs.clone()),
-        };
         let recorder = QueryGapRecorder::new(self);
-        // An empty surface exits only the external tiers: a source-only project
-        // still resolves its workspace names.
         let surface_recorder = match site {
             Some(site) => recorder.at_type_lookup(
                 file,
@@ -867,18 +862,29 @@ impl JavaAnalyzer {
             ),
             None => recorder,
         };
-        let surface_empty = external.empty_surface(&surface_recorder);
+        let surface_empty = std::cell::Cell::new(false);
+        let external = LazyExternal::deferred(|| {
+            let external = match selected_jdk_artifact_sha256 {
+                Some(digest) => self.external_declarations_for_source_jdk(packs.clone(), digest),
+                None => self.external_declarations(packs.clone()),
+            };
+            // Only an actual external step owns these gaps. Preparing a source
+            // answer must not make an unrelated missing jar its dependency.
+            surface_empty.set(external.empty_surface(&surface_recorder));
+            external
+        });
         let access_package = self.package_name_of(file).unwrap_or_default();
         let ladder = TypeLadder {
             java: self,
             token,
-            packs,
+            packs: packs.clone(),
             selected_jdk_artifact_sha256,
             file,
             external: &external,
             recorder: &recorder,
+            misses: LadderMisses::default(),
             access_package: &access_package,
-            surface_empty,
+            surface_empty: &surface_empty,
             imports: self.inner.import_info_of(token, file),
             site,
         };
@@ -1098,6 +1104,10 @@ impl TypeNameOutcome {
     }
 }
 
+/// Marker returned when projecting a `.Member` segment stopped the type ladder
+/// on an ambiguous or incomplete workspace member-type hierarchy.
+struct MemberTypeStopped;
+
 /// What binding one simple name found.
 enum NameBinding {
     Hit(JavaTypeResolution),
@@ -1118,6 +1128,7 @@ enum LookupTier {
     ExplicitImport,
     SamePackage,
     OnDemand,
+    Outcome,
 }
 impl LookupTier {
     fn label(self) -> &'static str {
@@ -1128,12 +1139,13 @@ impl LookupTier {
             Self::ExplicitImport => "explicit-import",
             Self::SamePackage => "same-package",
             Self::OnDemand => "on-demand",
+            Self::Outcome => "ladder-outcome",
         }
     }
 }
 
 /// One type-name lookup's state: what the ladder reads at every tier.
-struct TypeLadder<'a, 'q> {
+struct TypeLadder<'a, 'q, 'x> {
     java: &'a JavaAnalyzer,
     token: QueryToken<'q>,
     packs: Option<
@@ -1141,10 +1153,12 @@ struct TypeLadder<'a, 'q> {
     >,
     selected_jdk_artifact_sha256: Option<&'a str>,
     file: &'a ProjectFile,
-    external: &'a JvmExternalDeclarations<'a>,
+    external: &'a LazyExternal<'x>,
     recorder: &'a QueryGapRecorder<'a>,
+    /// The external rungs this ladder probed and missed.
+    misses: LadderMisses,
     access_package: &'a str,
-    surface_empty: bool,
+    surface_empty: &'a std::cell::Cell<bool>,
     imports: Vec<ImportInfo>,
     /// Where the name is written, when the caller holds a node. Without it the
     /// ladder cannot read lexical scope, so it never applies the reduced gap
@@ -1159,7 +1173,12 @@ fn resolution_fqn(resolution: &JavaTypeResolution) -> String {
     }
 }
 
-impl TypeLadder<'_, '_> {
+impl TypeLadder<'_, '_, '_> {
+    fn surface_empty(&self) -> bool {
+        self.external.get();
+        self.surface_empty.get()
+    }
+
     fn lookup_recorder<'a>(&'a self, name: &'a str, tier: LookupTier) -> QueryGapRecorder<'a> {
         match self.site {
             Some(site) => {
@@ -1170,7 +1189,42 @@ impl TypeLadder<'_, '_> {
         }
     }
 
+    /// The ladder's final outcome records the gaps its rungs leave open: a
+    /// miss, or a hit some earlier rung missed (see `finish_ladder`). Each gap
+    /// is attributed to the phase of the rung that missed. A bound miss and a
+    /// stop recorded theirs where they were decided, and an empty surface
+    /// already recorded every gap at the surface lookup.
     fn resolve(&self, name: &JavaTypeName) -> TypeNameOutcome {
+        let outcome = self.resolve_name(name);
+        let resolved = match &outcome {
+            TypeNameOutcome::Resolved(_) => true,
+            TypeNameOutcome::Unbound => false,
+            TypeNameOutcome::BoundMiss | TypeNameOutcome::Stopped => return outcome,
+        };
+        let missed = self.misses.missed_tiers();
+        if self.surface_empty.get() || (resolved && missed.is_empty()) {
+            return outcome;
+        }
+        let record = |tier: &'static str| {
+            let recorder = match self.site {
+                Some(site) => {
+                    self.recorder
+                        .at_type_lookup(self.file, site.node.byte_range(), name, tier)
+                }
+                None => *self.recorder,
+            };
+            self.external.get().record_all_gaps(&recorder);
+        };
+        if missed.is_empty() {
+            record(LookupTier::Outcome.label());
+        }
+        for tier in missed {
+            record(tier);
+        }
+        outcome
+    }
+
+    fn resolve_name(&self, name: &JavaTypeName) -> TypeNameOutcome {
         let owner = match self.bind(name.first()) {
             NameBinding::Hit(owner) => owner,
             NameBinding::BoundMiss => return TypeNameOutcome::BoundMiss,
@@ -1180,11 +1234,15 @@ impl TypeLadder<'_, '_> {
             }
             NameBinding::Unbound => return TypeNameOutcome::Unbound,
         };
-        TypeNameOutcome::from_option(
-            name.rest()
-                .iter()
-                .try_fold(owner, |owner, segment| self.member_type(&owner, segment)),
-        )
+        let mut current = owner;
+        for segment in name.rest() {
+            match self.member_type(&current, segment) {
+                Ok(Some(next)) => current = next,
+                Ok(None) => return TypeNameOutcome::Unbound,
+                Err(MemberTypeStopped) => return TypeNameOutcome::Stopped,
+            }
+        }
+        TypeNameOutcome::Resolved(current)
     }
 
     /// The whole name read as `package.Type` (or `package.Type.Member`), which
@@ -1194,43 +1252,101 @@ impl TypeLadder<'_, '_> {
         if let Some(unit) = java_source_class_by_fqn(self.java, self.token, &fqn) {
             return Some(JavaTypeResolution::Source(unit));
         }
-        if self.surface_empty {
+        if self.surface_empty() {
             return None;
         }
 
         let recorder = self.lookup_recorder(&fqn, LookupTier::PackageQualified);
         self.external
+            .get()
             .resolve_qualified_name(&recorder, &fqn, self.access_package)
             .map(|found| JavaTypeResolution::External(found.into()))
     }
 
-    fn member_type(&self, owner: &JavaTypeResolution, name: &str) -> Option<JavaTypeResolution> {
+    fn member_type(
+        &self,
+        owner: &JavaTypeResolution,
+        name: &str,
+    ) -> Result<Option<JavaTypeResolution>, MemberTypeStopped> {
         let recorder = self.lookup_recorder(name, LookupTier::MemberType);
 
         let fqn = format!("{}.{name}", resolution_fqn(owner));
         match owner {
-            JavaTypeResolution::Source(_) => java_source_class_by_fqn(self.java, self.token, &fqn)
-                .map(JavaTypeResolution::Source),
-            JavaTypeResolution::External(_) if self.surface_empty => None,
-            JavaTypeResolution::External(_) => self
-                .external
-                .resolve_qualified_name(&recorder, &fqn, self.access_package)
-                .map(|found| JavaTypeResolution::External(found.into())),
+            JavaTypeResolution::Source(owner_unit) => {
+                let env = JavaAnalyzerMemberTypeEnv {
+                    java: self.java,
+                    token: self.token,
+                    packs: self.packs.clone(),
+                    selected_jdk_artifact_sha256: self.selected_jdk_artifact_sha256,
+                    external: self.external,
+                    site: self.site.map(|site| (self.file, site)),
+                };
+                let site_enclosing = self
+                    .site
+                    .map(|site| {
+                        enclosing_class_units_at(self.java, self.file, site.node.start_byte())
+                    })
+                    .unwrap_or_default();
+                match resolve_accessible_member_types_of_owner(
+                    &env,
+                    owner_unit,
+                    name,
+                    self.file,
+                    &site_enclosing,
+                ) {
+                    MemberTypeStep::Resolved(unit) => Ok(Some(JavaTypeResolution::Source(unit))),
+                    MemberTypeStep::ResolvedExternal(ext) => {
+                        Ok(Some(JavaTypeResolution::External(ext.into())))
+                    }
+                    MemberTypeStep::Missing => Ok(None),
+                    MemberTypeStep::Ambiguous(units) => {
+                        let mut names = units.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
+                        names.sort_unstable();
+                        let candidates = units
+                            .into_iter()
+                            .map(|unit| Some(JavaTypeResolution::Source(unit)))
+                            .collect::<Vec<_>>();
+                        let _ =
+                            self.stop_ambiguous(name, LookupTier::MemberType, &names, &candidates);
+                        Err(MemberTypeStopped)
+                    }
+                    MemberTypeStep::AmbiguousResolutions(resolutions) => {
+                        let mut names = resolutions.iter().map(resolution_fqn).collect::<Vec<_>>();
+                        names.sort_unstable();
+                        let candidates = resolutions.into_iter().map(Some).collect::<Vec<_>>();
+                        let _ =
+                            self.stop_ambiguous(name, LookupTier::MemberType, &names, &candidates);
+                        Err(MemberTypeStopped)
+                    }
+                    MemberTypeStep::Incomplete(blame) => {
+                        self.external.get().record_all_gaps(&recorder);
+                        self.report(format!(
+                            "jvm.member_type.inherited_unresolved: {name} in {}",
+                            blame.fq_name()
+                        ));
+                        Err(MemberTypeStopped)
+                    }
+                }
+            }
+            JavaTypeResolution::External(_) if self.surface_empty() => Ok(None),
+            JavaTypeResolution::External(_) => Ok(self
+                .misses
+                .probe_at(
+                    LookupTier::MemberType.label(),
+                    self.external.get().resolve_qualified_name(
+                        &recorder,
+                        &fqn,
+                        self.access_package,
+                    ),
+                )
+                .map(|found| JavaTypeResolution::External(found.into()))),
         }
     }
 
     fn bind(&self, name: &str) -> NameBinding {
-        // A class or method type parameter in scope is not a class, and it
-        // shadows every import (JLS 6.4.1).
-        if let Some(site) = self.site
-            && java_type_parameter_in_scope(site.node, site.source, name).is_some()
-        {
-            return NameBinding::Stopped;
-        }
-        // The workspace path checks local and declared enclosing types before
-        // reaching this fallback ladder. Read member evidence only here, after
-        // those scope answers, but before any import lookup records a stop or
-        // gaps. Declared and inherited member types shadow every import tier.
+        // Declared and inherited workspace member types, interleaved with
+        // enclosing class and callable type parameters in Java's innermost-outward
+        // order (JLS 6.3, 6.4.1, 8.5), shadow every import tier.
         if let Some(site) = self.site {
             match enclosing_member_type(
                 self.java,
@@ -1242,16 +1358,36 @@ impl TypeLadder<'_, '_> {
                 name,
             ) {
                 EnclosingMemberType::None => {}
-                EnclosingMemberType::Declared(unit) => {
-                    return NameBinding::Hit(JavaTypeResolution::Source(unit));
+                EnclosingMemberType::ShadowedByTypeParameter => {
+                    return NameBinding::Stopped;
                 }
-                EnclosingMemberType::Inherited { enclosing } => {
+                EnclosingMemberType::Resolved(resolution) => {
+                    return NameBinding::Hit(resolution);
+                }
+                EnclosingMemberType::Ambiguous(resolutions) => {
+                    let mut names = resolutions.iter().map(resolution_fqn).collect::<Vec<_>>();
+                    names.sort_unstable();
+                    let candidates = resolutions.into_iter().map(Some).collect::<Vec<_>>();
+                    return self.stop_ambiguous(name, LookupTier::MemberType, &names, &candidates);
+                }
+                EnclosingMemberType::Incomplete { enclosing } => {
                     self.external
+                        .get()
                         .record_all_gaps(&self.lookup_recorder(name, LookupTier::MemberType));
                     self.report(format!(
                         "jvm.member_type.inherited_unresolved: {name} in {enclosing}"
                     ));
                     return NameBinding::Stopped;
+                }
+                // A supertype nothing resolves may declare a member type that
+                // shadows the import tiers. Like an unresolved on-demand
+                // package, the gap lowers certainty and the tiers below still
+                // bind (#14293).
+                EnclosingMemberType::OpenSupertype(open) => {
+                    self.external
+                        .get()
+                        .record_all_gaps(&self.lookup_recorder(name, LookupTier::MemberType));
+                    self.report(open.gap(name));
                 }
             }
         }
@@ -1268,10 +1404,11 @@ impl TypeLadder<'_, '_> {
         if let Some(unit) = java_source_class_by_fqn(self.java, self.token, fqn) {
             return Some(JavaTypeResolution::Source(unit));
         }
-        if self.surface_empty {
+        if self.surface_empty() {
             return None;
         }
         self.external
+            .get()
             .resolve_explicit_import(&recorder, fqn, self.access_package)
             .map(|found| JavaTypeResolution::External(found.into()))
     }
@@ -1288,7 +1425,7 @@ impl TypeLadder<'_, '_> {
         if let Some(unit) = java_source_class_by_fqn(self.java, self.token, canonical) {
             return Some(JavaTypeResolution::Source(unit));
         }
-        if self.surface_empty {
+        if self.surface_empty() {
             return None;
         }
         let scope = self.site.and_then(|site| {
@@ -1296,21 +1433,25 @@ impl TypeLadder<'_, '_> {
                 self.java,
                 self.packs.clone(),
                 self.selected_jdk_artifact_sha256,
-                self.external,
+                self.external.get(),
                 self.file,
                 site,
                 name,
             )
         });
         match scope {
-            Some(scope) => self.external.resolve_explicit_import_in_unshadowed_scope(
-                &recorder,
-                canonical,
-                self.access_package,
-                scope,
-            ),
+            Some(scope) => self
+                .external
+                .get()
+                .resolve_explicit_import_in_unshadowed_scope(
+                    &recorder,
+                    canonical,
+                    self.access_package,
+                    scope,
+                ),
             None => self
                 .external
+                .get()
                 .resolve_explicit_import(&recorder, canonical, self.access_package)
                 .map(ExplicitImportHit::from),
         }
@@ -1394,11 +1535,11 @@ impl TypeLadder<'_, '_> {
                         .first()
                         .is_some_and(|first| first == "java"),
                 )),
-                Some(declaring) => {
-                    if let Some(member_type) = self.member_type(&declaring, name) {
-                        keep(member_type);
-                    }
-                }
+                Some(declaring) => match self.member_type(&declaring, name) {
+                    Ok(Some(member_type)) => keep(member_type),
+                    Ok(None) => {}
+                    Err(MemberTypeStopped) => return Some(NameBinding::Stopped),
+                },
             }
         }
 
@@ -1427,11 +1568,16 @@ impl TypeLadder<'_, '_> {
         if let Some(unit) = java_source_class_by_fqn(self.java, self.token, &fqn) {
             return Some(JavaTypeResolution::Source(unit));
         }
-        if self.surface_empty {
+        if self.surface_empty() {
             return None;
         }
-        self.external
-            .resolve_same_package(&recorder, self.access_package, name)
+        self.misses
+            .probe_at(
+                LookupTier::SamePackage.label(),
+                self.external
+                    .get()
+                    .resolve_same_package(&recorder, self.access_package, name),
+            )
             .map(|found| JavaTypeResolution::External(found.into()))
     }
 
@@ -1459,12 +1605,15 @@ impl TypeLadder<'_, '_> {
                 {
                     keep(JavaTypeResolution::Source(unit));
                 }
-                if !self.surface_empty
-                    && let Some(external_type) = self.external.resolve_wildcard_import(
-                        &recorder,
-                        &package,
-                        name,
-                        self.access_package,
+                if !self.surface_empty()
+                    && let Some(external_type) = self.misses.probe_at(
+                        LookupTier::OnDemand.label(),
+                        self.external.get().resolve_wildcard_import(
+                            &recorder,
+                            &package,
+                            name,
+                            self.access_package,
+                        ),
                     )
                 {
                     keep(JavaTypeResolution::External(external_type.into()));
@@ -1474,17 +1623,25 @@ impl TypeLadder<'_, '_> {
                 if let Some(unit) = java_source_class_by_fqn(self.java, self.token, &fqn) {
                     keep(JavaTypeResolution::Source(unit));
                 }
-                if !self.surface_empty
-                    && let Some(external_type) =
-                        self.external
-                            .resolve_qualified_name(&recorder, &fqn, self.access_package)
+                if !self.surface_empty()
+                    && let Some(external_type) = self.misses.probe_at(
+                        LookupTier::OnDemand.label(),
+                        self.external.get().resolve_qualified_name(
+                            &recorder,
+                            &fqn,
+                            self.access_package,
+                        ),
+                    )
                 {
                     keep(JavaTypeResolution::External(external_type.into()));
                 }
             }
         }
-        if !self.surface_empty
-            && let Some(external_type) = self.external.resolve_java_lang(&recorder, name)
+        if !self.surface_empty()
+            && let Some(external_type) = self.misses.probe_at(
+                LookupTier::OnDemand.label(),
+                self.external.get().resolve_java_lang(&recorder, name),
+            )
         {
             keep(JavaTypeResolution::External(external_type.into()));
         }
@@ -1511,6 +1668,7 @@ impl TypeLadder<'_, '_> {
     /// records the index's gaps and no new reason.
     fn stop_bound_miss(&self, name: &str, unresolved: &[(String, bool)]) -> NameBinding {
         self.external
+            .get()
             .record_all_gaps(&self.lookup_recorder(name, LookupTier::ExplicitImport));
         let jdk_obligation = unresolved.iter().all(|(_, java_package)| *java_package)
             && !self.java.active_semantic_models().is_some_and(|models| {
@@ -1549,6 +1707,7 @@ impl TypeLadder<'_, '_> {
             .all(|candidate| matches!(candidate, Some(JavaTypeResolution::Source(_))));
         if !all_workspace {
             self.external
+                .get()
                 .record_all_gaps(&self.lookup_recorder(name, tier));
             self.report(format!("jvm.import.ambiguous: {}", names.join(", ")));
         }
@@ -1624,4 +1783,104 @@ pub(crate) fn trace_explicit_import_win(
                 )
             }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryScope};
+    use brokk_bifrost_core::analyzer::model::Language;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn ladder_outcome_at(
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        anchor: &str,
+        name: &str,
+    ) -> TypeNameOutcome {
+        let scope = AnalyzerQueryScope::new(java);
+        let token = scope.token();
+        let parsed =
+            brokk_bifrost_jvm::java::declarations::parse_tree(source).expect("parse site source");
+        let start = source.find(anchor).expect("anchor");
+        let site_node = parsed
+            .root_node()
+            .named_descendant_for_byte_range(start, start + name.len())
+            .expect("site node");
+        let site = UseSite {
+            token,
+            source,
+            node: site_node,
+        };
+        let parsed_name = JavaTypeName::from_normalized_spelling(name).expect("type name");
+        java.resolve_type_name_outcome_at(token, None, file, &parsed_name, None, Some(&site))
+    }
+
+    #[test]
+    #[hardwon(
+        "#10858: The type ladder stops on two inherited member types instead of falling through to the single-type import."
+    )]
+    fn ladder_stops_on_ambiguous_inherited_member_types() {
+        let app_source = "package app;\n\
+             import org.acme.Files;\n\
+             class App extends p.Grand implements p.OtherFiles {\n\
+             \x20   Files field;\n\
+             }\n";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "p/Grand.java",
+                "package p;\npublic class Grand { public static class Files {} }\n",
+            )
+            .file(
+                "p/OtherFiles.java",
+                "package p;\npublic interface OtherFiles { class Files {} }\n",
+            )
+            .file(
+                "org/acme/Files.java",
+                "package org.acme;\npublic class Files {}\n",
+            )
+            .file("app/App.java", app_source)
+            .build();
+        let java = JavaAnalyzer::new_with_config(project.project_dyn(), Default::default());
+        let file = project.file("app/App.java");
+        let outcome = ladder_outcome_at(&java, &file, app_source, "Files field", "Files");
+        assert!(
+            matches!(outcome, TypeNameOutcome::Stopped),
+            "two inherited member types must stop the ladder: {outcome:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10858: A private superclass member type is not inherited, so the ladder binds the single-type import instead of stopping."
+    )]
+    fn ladder_binds_import_when_superclass_member_type_is_private() {
+        let app_source = "package app;\n\
+             import org.acme.Files;\n\
+             class App extends p.SecretBase {\n\
+             \x20   Files field;\n\
+             }\n";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "p/SecretBase.java",
+                "package p;\npublic class SecretBase { private static class Files {} }\n",
+            )
+            .file(
+                "org/acme/Files.java",
+                "package org.acme;\npublic class Files {}\n",
+            )
+            .file("app/App.java", app_source)
+            .build();
+        let java = JavaAnalyzer::new_with_config(project.project_dyn(), Default::default());
+        let file = project.file("app/App.java");
+        let outcome = ladder_outcome_at(&java, &file, app_source, "Files field", "Files");
+        match outcome {
+            TypeNameOutcome::Resolved(JavaTypeResolution::Source(unit)) => {
+                assert_eq!(unit.fq_name(), "org.acme.Files");
+            }
+            other => panic!("expected Resolved(org.acme.Files), got {other:?}"),
+        }
+    }
 }

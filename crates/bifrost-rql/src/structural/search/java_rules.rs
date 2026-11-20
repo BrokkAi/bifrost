@@ -10,9 +10,10 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
-    resolve_definition_batch_with_source,
+    DefinitionLookupOutcome, DefinitionLookupRequest, DefinitionLookupStatus,
+    parse_tree_for_language, resolve_definition_batch_with_source,
 };
+use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::query::JavaRule;
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
@@ -122,7 +123,9 @@ pub(super) fn matches_for_file(
         );
     }
     let ranges = match rule {
-        JavaRule::NonFinalImmutableField => non_final_immutable_fields(&tree, source, &fields),
+        JavaRule::NonFinalImmutableField => {
+            non_final_immutable_fields(analyzer, file, &tree, source, &fields, &mut undecided)
+        }
         JavaRule::NonPrivateField => non_private_fields(&tree, source, &fields),
         JavaRule::MisnamedConstant => misnamed_constants(&tree, source, &fields),
         JavaRule::MisnamedVariable => misnamed_variables(&tree, source, &fields),
@@ -279,6 +282,7 @@ fn javadoc_matches(
 
 #[derive(Clone)]
 struct JavaFieldSite<'tree> {
+    unit: CodeUnit,
     name: Node<'tree>,
     owner: Node<'tree>,
     metadata: SignatureMetadata,
@@ -286,6 +290,7 @@ struct JavaFieldSite<'tree> {
 }
 fn java_field_sites<'tree>(
     tree: &'tree Tree,
+    source: &str,
     metadata_sites: &[FieldSite],
 ) -> Vec<JavaFieldSite<'tree>> {
     let mut fields = Vec::new();
@@ -302,15 +307,19 @@ fn java_field_sites<'tree>(
                     let Some(owner) = enclosing_type(declarator) else {
                         continue;
                     };
-                    let Some(metadata) = metadata_for_node(metadata_sites, declarator)
-                        .or_else(|| metadata_for_node(metadata_sites, node))
+                    // `int a, b;` may give both fields the declaration's range,
+                    // so the declarator's name picks between them.
+                    let named = node_text(source, name);
+                    let Some(site) = site_for_node(metadata_sites, declarator, named)
+                        .or_else(|| site_for_node(metadata_sites, node, named))
                     else {
                         continue;
                     };
                     fields.push(JavaFieldSite {
+                        unit: site.unit.clone(),
+                        metadata: site.metadata.clone(),
                         name,
                         owner,
-                        metadata,
                         enum_constant: false,
                     });
                 }
@@ -322,13 +331,15 @@ fn java_field_sites<'tree>(
                 let Some(owner) = enclosing_type(node) else {
                     continue;
                 };
-                let Some(metadata) = metadata_for_node(metadata_sites, node) else {
+                let Some(site) = site_for_node(metadata_sites, node, node_text(source, name))
+                else {
                     continue;
                 };
                 fields.push(JavaFieldSite {
+                    unit: site.unit.clone(),
+                    metadata: site.metadata.clone(),
                     name,
                     owner,
-                    metadata,
                     enum_constant: true,
                 });
             }
@@ -338,32 +349,127 @@ fn java_field_sites<'tree>(
     fields
 }
 
-fn metadata_for_node(metadata_sites: &[FieldSite], node: Node<'_>) -> Option<SignatureMetadata> {
-    metadata_sites
-        .iter()
-        .find(|site| {
-            site.range.start_byte == node.start_byte() && site.range.end_byte == node.end_byte()
-        })
-        .map(|site| site.metadata.clone())
+fn site_for_node<'s>(
+    metadata_sites: &'s [FieldSite],
+    node: Node<'_>,
+    name: Option<&str>,
+) -> Option<&'s FieldSite> {
+    metadata_sites.iter().find(|site| {
+        site.range.start_byte == node.start_byte()
+            && site.range.end_byte == node.end_byte()
+            && name == Some(site.unit.identifier())
+    })
 }
 
 fn non_final_immutable_fields(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
     tree: &Tree,
     source: &str,
     metadata_sites: &[FieldSite],
+    undecided: &mut Vec<UndecidedSite>,
 ) -> Vec<Range> {
-    java_field_sites(tree, metadata_sites)
+    let candidates = java_field_sites(tree, source, metadata_sites)
         .into_iter()
         .filter(|field| !field.enum_constant)
         .filter(|field| !field.metadata.field_is_final())
         .filter(|field| is_immutable_type(&field.metadata))
-        .filter(|field| writes_are_initialization_only(field, tree.root_node(), source))
-        .map(|field| node_range(field.name))
-        .collect()
+        .collect::<Vec<_>>();
+    let writes = later_writes(&candidates, tree.root_node(), source);
+    let outcomes = if writes.is_empty() {
+        Vec::new()
+    } else {
+        resolve_definition_batch_with_source(
+            analyzer,
+            writes
+                .iter()
+                .map(|(_, target)| DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(target.start_byte()),
+                    end_byte: Some(target.end_byte()),
+                })
+                .collect(),
+            file.clone(),
+            Arc::from(source),
+        )
+    };
+    assert_eq!(
+        outcomes.len(),
+        writes.len(),
+        "one definition outcome per written name"
+    );
+    // Per candidate: whether a later write proved it mutable, else every write
+    // that could not be decided, each with its own cause.
+    let mut mutated = vec![false; candidates.len()];
+    let mut unsettled: Vec<Vec<UndecidedSite>> = candidates.iter().map(|_| Vec::new()).collect();
+    for ((candidate, target), outcome) in writes.iter().zip(&outcomes) {
+        let unit = &candidates[*candidate].unit;
+        let resolved = outcome.status == DefinitionLookupStatus::Resolved;
+        if resolved && outcome.definitions.as_slice() == std::slice::from_ref(unit) {
+            mutated[*candidate] = true;
+            continue;
+        }
+        if resolved && !outcome.definitions.contains(unit) {
+            // A shadowing local or parameter, or another object's field.
+            continue;
+        }
+        let reason = if resolved {
+            "a later write names this field among several declarations"
+        } else {
+            "a later write to a field of this name did not resolve"
+        };
+        let range = node_range(*target);
+        let site = match lookup_stop(outcome) {
+            Some(cause) => {
+                analyzer.mark_execution_dependent();
+                UndecidedSite::stopped(range, reason, cause)
+            }
+            None => UndecidedSite::at(range, reason),
+        };
+        unsettled[*candidate].push(site);
+    }
+    let mut ranges = Vec::new();
+    for ((field, mutated), unsettled) in candidates.iter().zip(mutated).zip(unsettled) {
+        if mutated {
+            continue;
+        }
+        if unsettled.is_empty() {
+            ranges.push(node_range(field.name));
+        } else {
+            undecided.extend(unsettled);
+        }
+    }
+    ranges
+}
+
+/// The operational stop behind an unresolved definition lookup, or `None`
+/// when the lookup answered and the gap is in what it models.
+fn lookup_stop(outcome: &DefinitionLookupOutcome) -> Option<DerivationExecutionCause> {
+    match outcome.status {
+        DefinitionLookupStatus::Cancelled => Some(DerivationExecutionCause::Cancelled),
+        DefinitionLookupStatus::ExceededBudget(_) => Some(DerivationExecutionCause::Budget),
+        DefinitionLookupStatus::Unavailable => Some(DerivationExecutionCause::Provider),
+        DefinitionLookupStatus::Incomplete => outcome
+            .incomplete_evidence
+            .as_ref()
+            .map_or(Some(DerivationExecutionCause::Provider), |evidence| {
+                evidence.execution_cause()
+            }),
+        DefinitionLookupStatus::Resolved
+        | DefinitionLookupStatus::NotAReference
+        | DefinitionLookupStatus::NoDefinition
+        | DefinitionLookupStatus::UnresolvableImportBoundary
+        | DefinitionLookupStatus::Ambiguous
+        | DefinitionLookupStatus::UnsupportedLanguage
+        | DefinitionLookupStatus::InvalidLocation
+        | DefinitionLookupStatus::NotFound => None,
+    }
 }
 
 fn non_private_fields(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -> Vec<Range> {
-    java_field_sites(tree, metadata_sites)
+    java_field_sites(tree, source, metadata_sites)
         .into_iter()
         .filter(|field| !field.enum_constant)
         .filter(|field| {
@@ -376,7 +482,7 @@ fn non_private_fields(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -
 }
 
 fn misnamed_constants(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -> Vec<Range> {
-    java_field_sites(tree, metadata_sites)
+    java_field_sites(tree, source, metadata_sites)
         .into_iter()
         .filter(|field| field.metadata.field_is_static() && field.metadata.field_is_final())
         .filter(|field| is_immutable_type(&field.metadata))
@@ -391,7 +497,7 @@ fn misnamed_constants(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -
 
 fn misnamed_variables(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -> Vec<Range> {
     let mut ranges = Vec::new();
-    for field in java_field_sites(tree, metadata_sites) {
+    for field in java_field_sites(tree, source, metadata_sites) {
         if field.metadata.field_is_static() && field.metadata.field_is_final() {
             continue;
         }
@@ -556,32 +662,38 @@ fn is_immutable_type(metadata: &SignatureMetadata) -> bool {
     )
 }
 
-fn writes_are_initialization_only(field: &JavaFieldSite<'_>, root: Node<'_>, source: &str) -> bool {
-    let Some(field_name) = node_text(source, field.name) else {
-        return false;
-    };
+/// The writes outside initialization that name a candidate field: each is
+/// the candidate's index and the written name token. A name match only selects
+/// a write to resolve; it never decides that the write is the field's.
+/// Assignments, compound assignments and `++`/`--` all write their target.
+fn later_writes<'tree>(
+    candidates: &[JavaFieldSite<'_>],
+    root: Node<'tree>,
+    source: &str,
+) -> Vec<(usize, Node<'tree>)> {
+    let mut writes = Vec::new();
+    if candidates.is_empty() {
+        return writes;
+    }
     for node in descendants(root) {
         let target = match node.kind() {
             "assignment_expression" => node.child_by_field_name("left"),
-            "update_expression" => node
-                .child_by_field_name("argument")
-                .or_else(|| node.child_by_field_name("operand")),
+            "update_expression" => sole_operand(node),
             _ => None,
         };
-        let Some(target) = target else {
+        let Some(target_name) = target.and_then(assignment_target_name) else {
             continue;
         };
-        let Some(target_name) = assignment_target_name(target) else {
-            continue;
-        };
-        if node_text(source, target_name) != Some(field_name) {
-            continue;
-        }
-        if !is_initialization_context(node, field.owner) {
-            return false;
+        let written = node_text(source, target_name);
+        for (index, field) in candidates.iter().enumerate() {
+            if written == node_text(source, field.name)
+                && !is_initialization_context(node, field.owner)
+            {
+                writes.push((index, target_name));
+            }
         }
     }
-    true
+    writes
 }
 
 fn is_initialization_context(node: Node<'_>, owner: Node<'_>) -> bool {
@@ -636,11 +748,18 @@ fn assignment_target_name(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" => Some(node),
         "field_access" => node.child_by_field_name("field"),
-        "parenthesized_expression" => node
-            .child_by_field_name("expression")
-            .and_then(assignment_target_name),
+        "parenthesized_expression" => sole_operand(node).and_then(assignment_target_name),
         _ => None,
     }
+}
+
+/// The one expression of an `update_expression` or `parenthesized_expression`.
+/// The grammar gives both a single unlabeled child; any other named child is
+/// a comment.
+fn sole_operand(node: Node<'_>) -> Option<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .find(|child| !child.is_extra())
 }
 
 fn starts_uppercase(source: &str, node: Node<'_>) -> bool {
@@ -1082,17 +1201,52 @@ fn lookup_qualified_type(
     }
     match matched.records.as_slice() {
         [] => TypeResolution::Absent,
-        [matched] => TypeResolution::Known(TypeDeclaration {
-            arity: Some(matched.record.type_parameters.len()),
-            // The Java model's `is_sealed` field is the existing
-            // declaration finality bit: Java artifact producers set
-            // it for final or sealed declarations.  A sealed-only
-            // declaration is conservatively treated as unresolved by
-            // the final-bound rule below unless it is also final in
-            // source; this field remains useful for JDK final types.
-            finality: Some(matched.record.is_sealed),
-        }),
+        [matched] => TypeResolution::Known(model_type_declaration(matched)),
         _ => TypeResolution::Unknown("more than one semantic-model type matches the type"),
+    }
+}
+
+// Interpret the legacy bit only under the selected producer's typed authority.
+// Schema 43 splits JVM sealed (PermittedSubclasses) from class finality.
+// Only older records may interpret a clear legacy bit as producer-read non-final.
+fn model_type_declaration(
+    matched: &crate::analyzer::semantic_model::ActivatedSemanticModelRecord<
+        crate::analyzer::semantic_model::TypeFact,
+    >,
+) -> TypeDeclaration {
+    use crate::analyzer::semantic_model::{ArtifactExtractionKind, Locator, TypeKind};
+
+    let fact = &matched.record;
+    let finality = if fact.is_final.is_some() {
+        fact.is_final
+    } else if matched.shard.manifest.schema_version >= crate::analyzer::semantic_model::CLASS_FINALITY_MIN_SCHEMA_VERSION || fact.is_sealed {
+        None
+    } else {
+        match (
+            matched.shard.extraction().map(|extraction| extraction.kind),
+            &fact.locator,
+            fact.type_kind,
+        ) {
+            (
+                Some(ArtifactExtractionKind::JavaClassJar | ArtifactExtractionKind::JdkJmodSet),
+                Locator::Artifact { .. },
+                TypeKind::Class
+                | TypeKind::Interface
+                | TypeKind::Annotation
+                | TypeKind::Record
+                | TypeKind::Enum,
+            ) => Some(false),
+            (
+                Some(ArtifactExtractionKind::JavaSourceJar | ArtifactExtractionKind::JdkSourceZip),
+                Locator::Source { .. },
+                TypeKind::Class | TypeKind::Interface,
+            ) if matched.shard.manifest.language == "java" => Some(false),
+            _ => None,
+        }
+    };
+    TypeDeclaration {
+        arity: Some(fact.type_parameters.len()),
+        finality,
     }
 }
 

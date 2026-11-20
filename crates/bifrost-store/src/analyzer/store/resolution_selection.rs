@@ -607,11 +607,13 @@ impl SelectedResolutionContentMountRequest {
             unreachable!("ordinary content constructor accepts only parsed witnesses")
         };
         for (index, count) in witness.manifest_counts().values().iter().enumerate() {
-            if super::resolution::resolution_count_applies(*semantic_language, index) {
-                hash.field("count", &count.to_be_bytes());
-            } else {
-                assert_eq!(*count, 0, "inapplicable resolution count");
-            }
+            super::resolution::hash_manifest_count(
+                &mut hash,
+                "count",
+                *semantic_language,
+                index,
+                *count,
+            );
         }
         hash.field(
             "semantic_language",
@@ -937,6 +939,30 @@ impl SelectedResolutionContentMountRequest {
     }
 }
 
+// Native resolution observes more than the materialized Rust unit selection:
+// fragments, mounts and lazy publications still require a database-wide witness.
+// Do not substitute the narrower workspace-selection epoch here (#13416).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MainPublicationStamp {
+    main_data_version: i64,
+    main_schema_version: i64,
+    temp_schema_version: i64,
+}
+
+fn main_publication_stamp(conn: &Connection) -> Result<MainPublicationStamp> {
+    Ok(MainPublicationStamp {
+        main_data_version: conn
+            .prepare_cached("PRAGMA main.data_version")?
+            .query_row([], |row| row.get(0))?,
+        main_schema_version: conn
+            .prepare_cached(super::MAIN_SCHEMA_VERSION_SQL)?
+            .query_row([], |row| row.get(0))?,
+        temp_schema_version: conn
+            .prepare_cached(super::TEMP_SCHEMA_VERSION_SQL)?
+            .query_row([], |row| row.get(0))?,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectedResolutionOverlayIntent {
     Replacement,
@@ -1129,6 +1155,9 @@ pub struct SelectedResolutionMountRecord {
     pub manifest_counts: ResolutionManifestCounts,
     logical_rows: u64,
     payload_bytes: u64,
+    // Request metadata for this blob, never persisted with the mount. Staged
+    // records have not read presence yet; unknown must still query binders.
+    closure_members_present: Option<bool>,
 }
 
 /// Request-owned memo. Only explicit ordinal/path reads add records; warm
@@ -1145,7 +1174,7 @@ pub struct RequestedResolutionMountRows {
 fn selected_mount_record_columns() -> &'static str {
     static COLUMNS: OnceLock<String> = OnceLock::new();
     COLUMNS.get_or_init(|| {
-        let sql = format!("mount_ordinal,fragment_id,workspace_id,revision,generation,file_version_id,storage_language,semantic_language,persisted_relative_path,blob_id,blob_oid,projection_digest,interior_digest,producer_epoch,logical_rows,payload_bytes,{}", RESOLUTION_MANIFEST_COUNT_COLUMNS.join(","));
+        let sql = format!("mount_ordinal,fragment_id,workspace_id,revision,generation,file_version_id,storage_language,semantic_language,persisted_relative_path,blob_id,blob_oid,projection_digest,interior_digest,producer_epoch,logical_rows,payload_bytes,{},EXISTS(SELECT 1 FROM main.resolution_closure_members member WHERE member.blob_id=temp.selected_resolution_mounts.blob_id)", RESOLUTION_MANIFEST_COUNT_COLUMNS.join(","));
         #[cfg(any(test, feature = "test-support"))]
         note_selected_static_sql_capacity(4, sql.capacity());
         sql
@@ -1186,6 +1215,7 @@ fn decode_selected_mount_record(row: &rusqlite::Row<'_>) -> Result<SelectedResol
         logical_rows: nonnegative_u64(row.get(14)?, "selected logical rows")?,
         payload_bytes: nonnegative_u64(row.get(15)?, "selected payload bytes")?,
         manifest_counts: ResolutionManifestCounts::from_array(counts),
+        closure_members_present: Some(row.get(16 + RESOLUTION_MANIFEST_COUNT_COLUMNS.len())?),
     })
 }
 
@@ -1204,6 +1234,13 @@ fn validate_selected_mount_counts(
 }
 
 impl RequestedResolutionMountRows {
+    pub(crate) fn known_record(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+    ) -> Option<std::sync::Arc<SelectedResolutionMountRecord>> {
+        self.records.borrow().get(&ordinal).cloned()
+    }
+
     /// Populate only the current query's explicitly nominated mount rows in
     /// one read. The request-owned memo is shared with ordinary point readers.
     pub(crate) fn prefetch_ordinals(
@@ -1352,6 +1389,10 @@ impl SelectedResolutionMountRecord {
     #[doc(hidden)]
     pub const fn blob_id(&self) -> i64 {
         self.blob_id
+    }
+
+    pub(crate) fn may_have_closure_members(&self) -> bool {
+        self.closure_members_present != Some(false)
     }
 
     #[doc(hidden)]
@@ -1628,6 +1669,10 @@ pub struct SelectedResolutionMountInventory<'store> {
     /// The key includes the namespace classifier's module decisions, which
     /// may depend on the current stage. Persisted declaration rows are fixed.
     pub(super) selected_lexical_read_memo: RefCell<SelectedLexicalReadMemo>,
+    /// Per-blob Rust import cfg and route-choice index. Sealed rows are fixed
+    /// for this request; refusal or eviction rebuilds with the same builder.
+    pub(super) rust_import_provenance:
+        super::resolution_operation::rust_crate_access::SelectedRustImportProvenance,
     /// Raw forward candidate rows only. The source repeats all admission,
     /// visitor, cancellation and budget work on hits. The persisted SQL does
     /// not read stage rows, so stage writes do not invalidate its raw result.
@@ -1686,6 +1731,12 @@ pub struct SelectedResolutionMountInventory<'store> {
     selected_rows_generation: Arc<AtomicU64>,
     binding_transaction_epoch: Cell<u64>,
     read_snapshot_epoch: Cell<u64>,
+    /// The one full schema validation this inventory still stands behind: see
+    /// [`SchemaLoan`]. Cleared, and its epoch advanced, around every schema
+    /// mutation the inventory runs.
+    schema_loan: Cell<Option<SchemaLoan>>,
+    schema_mutation_epoch: Cell<u64>,
+    schema_mutation_depth: Cell<u32>,
     /// Whether this request has ensured the optional generic-formals stage
     /// family exists on its connection.
     generic_formals_schema_ready: Cell<bool>,
@@ -1702,7 +1753,15 @@ pub(in crate::analyzer::store) enum MacroReaderCheckin {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
+    static SELECTION_OPEN_COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static FORCE_MACRO_READER_CLOSE_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+/// Fresh selections and retained selections adopted on this thread.
+#[doc(hidden)]
+pub fn take_selection_open_counts_for_test() -> (usize, usize) {
+    SELECTION_OPEN_COUNTS.with(Cell::take)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1725,7 +1784,7 @@ impl SelectedResolutionMountInventory<'_> {
 struct OperationChangeStamp {
     scope: [u8; 32],
     stage: (u64, u64),
-    stamp: super::WorkspaceSelectionStamp,
+    stamp: MainPublicationStamp,
 }
 
 #[derive(Default)]
@@ -1894,6 +1953,8 @@ pub struct RetainedResolutionSelection {
     // carries this by value and has a compile-time size cap.
     ready: Box<RetainedSelectedMetadata>,
     stamp: SelectedResolutionReadStamp,
+    /// The Rust selection epoch the staged unit tables were filled under.
+    rust_selection_epoch: i64,
     owned_change_baseline: u64,
     #[doc(hidden)]
     pub committed_request_changes: Cell<u64>,
@@ -1914,8 +1975,8 @@ pub(super) struct SelectedInteriorCertificates {
     main_is_readonly: bool,
     // Distinct predicates: typed also requires source_fact_readiness.available.
     // Raw TEMP schema versions witness DDL that can remove the mount guards.
-    pub(super) lexical: Cell<Option<super::WorkspaceSelectionStamp>>,
-    pub(super) typed: Cell<Option<super::WorkspaceSelectionStamp>>,
+    pub(super) lexical: Cell<Option<MainPublicationStamp>>,
+    pub(super) typed: Cell<Option<MainPublicationStamp>>,
 }
 
 impl RetainedResolutionSelection {
@@ -1973,13 +2034,13 @@ impl RetainedResolutionSelection {
     }
 
     fn current_stamp(&self, conn: &Connection) -> Result<SelectedResolutionReadStamp> {
-        Ok(self.stamp_from_workspace(conn, super::workspace_selection_stamp(conn)?))
+        Ok(self.stamp_from_workspace(conn, main_publication_stamp(conn)?))
     }
 
     fn stamp_from_workspace(
         &self,
         conn: &Connection,
-        stamp: super::WorkspaceSelectionStamp,
+        stamp: MainPublicationStamp,
     ) -> SelectedResolutionReadStamp {
         let mut stamp = selected_read_stamp(
             conn,
@@ -1996,6 +2057,82 @@ impl RetainedResolutionSelection {
     pub fn is_current(&self, conn: &Connection) -> Result<bool> {
         Ok(self.current_stamp(conn)? == self.stamp)
     }
+
+    /// Keep a selection that only Main commits moved. A commit that leaves the
+    /// selected mounts unchanged, such as a persisted class-set summary or a lazy
+    /// macro capsule, need not rebuild this reader's TEMP selection: as staging
+    /// does on the same drift (#12171), compare the exact selected inventory in
+    /// one read snapshot and adopt that snapshot's stamp. The mount fingerprint
+    /// does not cover the Rust unit tables staging filled, so the Rust selection
+    /// epoch must not have moved either. TEMP DDL, unowned TEMP writes, a
+    /// rollback and a Main schema change still restage.
+    fn rebaseline_main_drift(
+        &mut self,
+        conn: &mut Connection,
+        snapshots: &WorkspaceSnapshots,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let current = self.current_stamp(conn)?;
+        if current.rolled_back
+            || current.main_schema_version != self.stamp.main_schema_version
+            || current.temp_schema_version != self.stamp.temp_schema_version
+            || current.unowned_changes != self.stamp.unowned_changes
+        {
+            return Ok(false);
+        }
+        let tx = conn.transaction()?;
+        let rust_epoch = super::rust_selection_epoch(&tx, snapshots)?;
+        let inventory = read_selected_inventory(&tx, cancellation)?;
+        let stamp = self.current_stamp(&tx)?;
+        tx.commit()?;
+        match inventory {
+            StagedSelection::Ready(inventory)
+                if rust_epoch == self.rust_selection_epoch
+                    && inventory.fingerprint == self.ready.fingerprint =>
+            {
+                self.stamp = stamp;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+/// One full schema-content validation, and the exact read state it was made in.
+///
+/// A TEMP schema can change inside a pinned transaction without moving any
+/// epoch, and `schema_version` cannot say so (#10199), so a currency check
+/// compares schema content. Content cannot change unobserved while this
+/// inventory is the only code touching its connection's schema, and every
+/// schema or transaction mutation the inventory runs is fenced by
+/// [`SchemaMutation`], which discards the loan and advances
+/// `schema_mutation_epoch` before the mutation and again after it. A loan is
+/// therefore usable only in the schema-stable interval it was validated in:
+/// the same transaction, snapshot, scope, stage and mutation epoch. It is
+/// never stored in a receipt; a receipt keeps only its [`ReaderBinding`].
+#[derive(Clone, Copy)]
+struct SchemaLoan {
+    lease: super::schema_lease::SchemaLease,
+    mutation_epoch: u64,
+    reader_request: u64,
+    transaction_epoch: u64,
+    read_snapshot_epoch: u64,
+    scope: [u8; 32],
+    stage: (u64, u64),
+}
+
+/// The owner's fence around anything that can change the connection's schema.
+/// While one is live no loan is granted, and a loan granted earlier is gone.
+/// Dropping it, on return or unwind, ends the interval again, so the next
+/// check validates the resulting schema in full.
+pub(super) struct SchemaMutation<'a, 'store> {
+    inventory: &'a SelectedResolutionMountInventory<'store>,
+}
+
+impl Drop for SchemaMutation<'_, '_> {
+    fn drop(&mut self) {
+        self.inventory.end_schema_mutation();
+    }
 }
 
 /// A derivation demand's read transaction, when it does not borrow a crate stage.
@@ -2004,6 +2141,10 @@ pub struct DerivationReadLease<'a, 'store> {
 }
 
 impl Drop for DerivationReadLease<'_, '_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn drop(&mut self) {
         if let Err(error) = self.inventory.end_stage_read() {
             eprintln!("analyzer store could not end a derivation read: {error}");
@@ -2029,6 +2170,18 @@ pub fn take_derivation_binding_computes_for_test() -> usize {
     DERIVATION_BINDING_COMPUTES.with(|count| count.replace(0))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static DERIVATION_BINDING_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Make the next `derivation_reader_binding` on this thread fail with a store
+/// error, as a SQLite failure establishing the reader binding would.
+#[cfg(any(test, feature = "test-support"))]
+pub fn inject_derivation_binding_failure_for_test() {
+    DERIVATION_BINDING_FAULT.with(|fault| fault.set(true));
+}
+
 impl SelectedResolutionMountInventory<'_> {
     /// The units in the workspace-dependency closure of `roots`, in key order.
     ///
@@ -2036,6 +2189,7 @@ impl SelectedResolutionMountInventory<'_> {
     /// (`with_rust_forward_crate_scope`), so these are the units whose summary
     /// rows a forward resolution from `roots` can read. One statement, however
     /// many roots: the closure rows are already filled with the selection.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_unit_closure_keys(&self, roots: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         let roots = serde_json::to_string(
             &roots
@@ -2073,6 +2227,10 @@ impl SelectedResolutionMountInventory<'_> {
     /// savepoint rolled back after the lease restores an earlier schema at an
     /// equal version. Its statements run under the classifier guard, so they
     /// are not attributed to the capture frame.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn derivation_read_still_bound(
         &self,
         binding: &super::reader_binding::ReaderBinding,
@@ -2087,7 +2245,92 @@ impl SelectedResolutionMountInventory<'_> {
                 self.scope_identity(),
                 self.staged_read_epoch(),
             )
-            && binding.matches_schema(self.connection(), self.conn.cache_budget)
+            && self.schema_still_bound(binding)
+    }
+
+    /// The binding's schema is the connection's schema now. A full content
+    /// scan validates it once per schema-stable interval and grants a
+    /// [`SchemaLoan`]; later checks in the same interval compare the binding's
+    /// lease with the loan's. Anything else (a fresh binding, another reader,
+    /// a mutation in progress) takes the full scan.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn schema_still_bound(&self, binding: &super::reader_binding::ReaderBinding) -> bool {
+        let Some(lease) = binding.schema_lease() else {
+            return false;
+        };
+        if let Some(loan) = self.schema_loan.get()
+            && loan.lease == *lease
+            && self.schema_loan_is_current(&loan)
+        {
+            return true;
+        }
+        if !binding.matches_schema(self.connection(), self.conn.cache_budget) {
+            return false;
+        }
+        if self.schema_mutation_depth.get() == 0 {
+            self.schema_loan.set(Some(SchemaLoan {
+                lease: *lease,
+                mutation_epoch: self.schema_mutation_epoch.get(),
+                reader_request: self.stage_request_identity,
+                transaction_epoch: self.binding_transaction_epoch.get(),
+                read_snapshot_epoch: self.read_snapshot_epoch.get(),
+                scope: self.scope_identity(),
+                stage: self.staged_read_epoch(),
+            }));
+        }
+        true
+    }
+
+    fn schema_loan_is_current(&self, loan: &SchemaLoan) -> bool {
+        self.schema_mutation_depth.get() == 0
+            && loan.mutation_epoch == self.schema_mutation_epoch.get()
+            && loan.reader_request == self.stage_request_identity
+            && loan.transaction_epoch == self.binding_transaction_epoch.get()
+            && loan.read_snapshot_epoch == self.read_snapshot_epoch.get()
+            && loan.scope == self.scope_identity()
+            && loan.stage == self.staged_read_epoch()
+    }
+
+    /// Fence a schema mutation. Hold the result across the whole mutation,
+    /// including any statement prepared before it.
+    pub(super) fn begin_schema_mutation(&self) -> SchemaMutation<'_, '_> {
+        self.schema_mutation_depth
+            .set(self.schema_mutation_depth.get() + 1);
+        self.discard_schema_loan();
+        SchemaMutation { inventory: self }
+    }
+
+    fn end_schema_mutation(&self) {
+        self.schema_mutation_depth
+            .set(self.schema_mutation_depth.get() - 1);
+        self.discard_schema_loan();
+    }
+
+    fn discard_schema_loan(&self) {
+        self.schema_loan.set(None);
+        self.schema_mutation_epoch.set(
+            self.schema_mutation_epoch
+                .get()
+                .checked_add(1)
+                .expect("schema mutation epoch exhausted"),
+        );
+    }
+
+    /// Run `write` with schema-mutation access to the connection, for the few
+    /// callers that create a TEMP table outside the accounted writers.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    pub(super) fn with_schema_mutation<T>(
+        &self,
+        write: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let _mutation = self.begin_schema_mutation();
+        write(self.connection())
     }
 
     /// Overlay buffers need not have parsed mounts yet (configuration and new
@@ -2168,6 +2411,7 @@ impl SelectedResolutionMountInventory<'_> {
     /// Compare selected source content with Main, independent of producer kind.
     /// Capsule admission OIDs describe generated content; their host mount is
     /// the source whose identity matters here. Unknown hosts fail closed.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_content_comparisons(
         &self,
         recorded: &[SelectedContentComparison],
@@ -2185,6 +2429,7 @@ impl SelectedResolutionMountInventory<'_> {
              WHERE masks.storage_language='rust'
              UNION SELECT persisted_relative_path,blob_oid,0 FROM temp.selected_resolution_content_mounts WHERE storage_language='rust'"
         );
+        brokk_bifrost_core::profile_count!("probe.replay_admission", 1);
         let has_stage: bool = self.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name='selected_resolution_stage_producers' AND type='table')", [], |row| row.get(0))?;
         if has_stage {
@@ -2313,6 +2558,10 @@ impl SelectedResolutionMountInventory<'_> {
     /// Reuse setup only within one continuously live derivation-read lease.
     /// A pause, lost transaction, or stage mutation invalidates the memo.
     pub fn derivation_reader_binding(&self) -> Result<super::reader_binding::ReaderBinding> {
+        #[cfg(any(test, feature = "test-support"))]
+        if DERIVATION_BINDING_FAULT.with(|fault| fault.replace(false)) {
+            return Err(StoreError::new("injected reader binding failure"));
+        }
         let mut memo = self.derivation_binding.borrow_mut();
         if let Some(binding) = memo.as_ref()
             && self.derivation_read_still_bound(binding)
@@ -2342,6 +2591,13 @@ impl SelectedResolutionMountInventory<'_> {
         self.authority_request_memo
             .borrow()
             .reference_spelling_memo_counts_for_test()
+    }
+
+    /// The Rust selection epoch this operation's unit tables were filled under.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn retained_rust_selection_epoch_for_test(&self) -> i64 {
+        self.retained().rust_selection_epoch
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2419,6 +2675,7 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn languages(&self) -> Result<&[SelectedResolutionLanguageState]> {
         if self.requested_languages.get().is_none() {
             let mut statement = self.connection().prepare_cached("SELECT l.storage_language,l.semantic_language,r.workspace_id,r.generation,r.revision,l.expected_base_mount_count,l.masked_base_mount_count,l.expected_unmasked_mount_count FROM temp.selected_resolution_languages l JOIN temp.selected_workspace_revisions r ON r.lang=l.storage_language ORDER BY l.storage_language")?;
@@ -2448,6 +2705,7 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn overlay_masks(&self) -> Result<&[SelectedResolutionOverlayMaskState]> {
         if self.requested_masks.get().is_none() {
             let mut statement = self.connection().prepare_cached("SELECT storage_language,persisted_relative_path,intent,masked_file_version_id,masked_blob_oid,masked_projection_digest,expected_transient_replacement_count FROM temp.selected_resolution_overlay_masks ORDER BY storage_language,persisted_relative_path")?;
@@ -2500,6 +2758,7 @@ impl SelectedResolutionMountInventory<'_> {
     /// Explicit full-inventory consumers own this enumeration for their query.
     /// Keyed point readers must use ordinal/path APIs instead.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn mounts(&self) -> Result<&[SelectedResolutionMountRecord]> {
         if self.enumerated_mounts.get().is_none() {
             let sql = format!(
@@ -2526,6 +2785,7 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn persisted_mount_record(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
@@ -2632,12 +2892,17 @@ impl SelectedResolutionMountInventory<'_> {
     /// of 3 on the 256-mount point fixture, measured when the forward crate
     /// scope reached the production point route.
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn with_owned_temp_write<T>(
         &self,
         write: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         // The closure can write any selected TEMP relation, including Rust
         // summary rows used by the point-gap read. Fence even a failed write.
+        let _mutation = self.begin_schema_mutation();
         self.advance_binding_transaction_epoch();
         // This escape hatch may write the scope relation directly.
         *self.path_endpoint_header_memo.borrow_mut() = Default::default();
@@ -2737,6 +3002,7 @@ impl SelectedResolutionMountInventory<'_> {
         Ok(!self.stage_family_occupancy(family)?.global)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn stage_family_occupancy(
         &self,
         family: super::resolution_stage::StageFamily,
@@ -2827,10 +3093,15 @@ impl SelectedResolutionMountInventory<'_> {
         self.with_accounted_temp_transaction(write)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn with_accounted_temp_transaction<T>(
         &self,
         write: impl FnOnce(&Connection) -> Result<SelectedResolutionTempTransaction<T>>,
     ) -> Result<T> {
+        let _mutation = self.begin_schema_mutation();
         let before = self.connection().total_changes();
         // Declared before the savepoint, so it drops after the savepoint's
         // own rollback, including on unwind.
@@ -2890,6 +3161,10 @@ impl SelectedResolutionMountInventory<'_> {
     /// lives in a temp table and in no Rust value.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn scope_mount_count(&self) -> Result<usize> {
         let count: i64 = self.connection().query_row(
             "SELECT COUNT(*) FROM temp.selected_resolution_scope_mounts",
@@ -2904,6 +3179,7 @@ impl SelectedResolutionMountInventory<'_> {
     ///
     /// The selection indexes this key already, so the answer is one index seek
     /// rather than a walk of the mount table.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn mount_ordinal_for_path(
         &self,
         storage_language: &str,
@@ -2926,6 +3202,7 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn mount_record_for_path(
         &self,
         storage_language: &str,
@@ -3070,6 +3347,10 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     /// The reverse reader's keys are private buffers, not selected authority.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(super) fn ensure_reverse_candidate_keys_schema(&self) -> Result<()> {
         if !self.reverse_candidate_keys_schema_ready.get() {
             self.initialize_owned_temp_schema(
@@ -3103,8 +3384,13 @@ impl SelectedResolutionMountInventory<'_> {
         self.initialize_accounted_temp_schema(connection, sql)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn initialize_accounted_temp_schema(&self, connection: &Connection, sql: &str) -> Result<()> {
         assert!(std::ptr::eq(connection, self.connection()));
+        let _mutation = self.begin_schema_mutation();
         let fixed = sql == super::resolution_stage::generic_formals_schema_sql()
             || sql == super::resolution_stage::generic_formal_defaults_schema_sql();
         // Every reader ensures these fixed families before it selects from them;
@@ -3130,6 +3416,7 @@ impl SelectedResolutionMountInventory<'_> {
 
     /// Where this request's lowerings get a shared name's id.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn shared_names(&self) -> super::resolution::StoreSharedNames<'_> {
         self.shared_names.interner(self.connection())
     }
@@ -3178,6 +3465,7 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     /// Exact ordered answer for the one-bound-parameter Rust point-gap read.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn rust_point_gap_details(
         &self,
         rel_path: &str,
@@ -3284,7 +3572,12 @@ impl SelectedResolutionMountInventory<'_> {
     /// savepoints ([`TempWrite`]), so they nest inside it and lock only the
     /// temp database. The reader writes nothing to main: see
     /// [`Self::end_stage_read`].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(super) fn begin_stage_read(&self) -> Result<()> {
+        let _mutation = self.begin_schema_mutation();
         self.advance_binding_transaction_epoch();
         self.gap_details_stage_stamp.set(None);
         assert!(!self.stage_read.get(), "crate stages do not nest");
@@ -3303,6 +3596,7 @@ impl SelectedResolutionMountInventory<'_> {
     /// pool. An interrupted temp write rolls the whole transaction back, so
     /// COMMIT runs only when one is still open.
     pub(super) fn end_stage_read(&self) -> Result<()> {
+        let _mutation = self.begin_schema_mutation();
         self.advance_binding_transaction_epoch();
         self.gap_details_stage_stamp.set(None);
         assert!(self.stage_read.get(), "no crate stage holds a read");
@@ -3321,6 +3615,7 @@ impl SelectedResolutionMountInventory<'_> {
     #[doc(hidden)]
     pub fn pause_stage_read(&self) -> Result<()> {
         if self.stage_read.get() {
+            let _mutation = self.begin_schema_mutation();
             self.advance_binding_transaction_epoch();
             self.gap_details_stage_stamp.set(None);
             self.clear_operation_change_stamp();
@@ -3332,8 +3627,13 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn resume_stage_read(&self) -> Result<()> {
         if self.stage_read.get() {
+            let _mutation = self.begin_schema_mutation();
             self.advance_binding_transaction_epoch();
             self.gap_details_stage_stamp.set(None);
             assert!(self.connection().is_autocommit());
@@ -3356,6 +3656,10 @@ impl SelectedResolutionMountInventory<'_> {
         committed
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn commit_stage_read(&self) -> Result<()> {
         let conn = self.connection();
         assert_no_statement_in_progress(conn);
@@ -3385,9 +3689,7 @@ impl SelectedResolutionMountInventory<'_> {
 
     // Only SQLite-enforced read-only main connections may reuse a certificate:
     // data_version does not witness commits made by the same connection.
-    pub(super) fn interior_validation_stamp(
-        &self,
-    ) -> Result<Option<super::WorkspaceSelectionStamp>> {
+    pub(super) fn interior_validation_stamp(&self) -> Result<Option<MainPublicationStamp>> {
         if self.retained().interior_certificates.main_is_readonly {
             self.operation_workspace_stamp().map(Some)
         } else {
@@ -3411,9 +3713,10 @@ impl SelectedResolutionMountInventory<'_> {
         }
     }
 
-    fn operation_workspace_stamp(&self) -> Result<super::WorkspaceSelectionStamp> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn operation_workspace_stamp(&self) -> Result<MainPublicationStamp> {
         let Some(memo) = &self.operation_change_stamp else {
-            return super::workspace_selection_stamp(self.connection());
+            return main_publication_stamp(self.connection());
         };
         let scope = self.scope_identity();
         let stage = self.staged_read_epoch();
@@ -3427,7 +3730,7 @@ impl SelectedResolutionMountInventory<'_> {
         // Arbitrary TEMP writes advance the direct epoch before writing, even
         // on failure; publication commits advance the content epoch before
         // another selected read. Private buffers are excluded from authority.
-        let stamp = super::workspace_selection_stamp(self.connection())?;
+        let stamp = main_publication_stamp(self.connection())?;
         memo.set(Some(OperationChangeStamp {
             scope,
             stage,
@@ -3437,6 +3740,7 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_change_stamp(&self) -> Result<SelectedResolutionReadStamp> {
         // Keep the connection's unowned-write accounting fresh even on a
         // pragma memo hit. Successful private buffer writes cancel exactly.
@@ -3445,6 +3749,10 @@ impl SelectedResolutionMountInventory<'_> {
             .stamp_from_workspace(self.connection(), self.operation_workspace_stamp()?))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn observe_lost_read_snapshot(&self) {
         if self.stage_read.get() && self.connection().is_autocommit() {
             self.advance_read_snapshot_epoch();
@@ -3478,6 +3786,10 @@ impl SelectedResolutionMountInventory<'_> {
 
     /// A lease from this inventory's live, pooled, main-read-only stage snapshot.
     /// Catalog, attached-database and model inputs require separate currency proofs.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn reader_binding(&self) -> Result<super::reader_binding::ReaderBinding> {
         use super::reader_binding::ReaderBinding;
         self.observe_lost_read_snapshot();
@@ -3549,11 +3861,19 @@ impl SelectedResolutionMountInventory<'_> {
     /// It cannot witness writes by this connection or commits while a reader
     /// holds an old snapshot, so only an autocommit, read-only main database
     /// may lend this stamp to an operation-local publication memo.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(super) fn publication_data_version(&self) -> Result<Option<i64>> {
         publication_data_version_on(self.connection())
     }
 
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn revalidate(
         &self,
         cancellation: &CancellationToken,
@@ -3832,7 +4152,7 @@ fn read_change_stamp(
         conn,
         owned_change_baseline,
         committed_request_changes,
-        super::workspace_selection_stamp(conn)?,
+        main_publication_stamp(conn)?,
     ))
 }
 
@@ -3840,9 +4160,9 @@ fn selected_read_stamp(
     conn: &Connection,
     owned_change_baseline: u64,
     committed_request_changes: u64,
-    stamp: super::WorkspaceSelectionStamp,
+    stamp: MainPublicationStamp,
 ) -> SelectedResolutionReadStamp {
-    let super::WorkspaceSelectionStamp {
+    let MainPublicationStamp {
         main_data_version,
         main_schema_version,
         temp_schema_version,
@@ -4092,20 +4412,25 @@ impl AnalyzerStore {
             }
         }
 
-        if let Some(retained) = conn.take_retained_resolution_selection()
+        if let Some(mut retained) = conn.take_retained_resolution_selection()
             && retained.routing_digest == validated.routing_digest()
         {
             let current = with_resolution_progress_handler(&mut conn, cancellation, |conn| {
-                validated.equals_selected_rows(conn).and_then(|equal| {
-                    if equal {
-                        retained.is_current(conn)
-                    } else {
-                        Ok(false)
-                    }
-                })
+                if !validated.equals_selected_rows(conn)? {
+                    return Ok(false);
+                }
+                if retained.is_current(conn)? {
+                    return Ok(true);
+                }
+                retained.rebaseline_main_drift(conn, selected_snapshots, cancellation)
             });
             match current {
                 Ok(true) => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    SELECTION_OPEN_COUNTS.with(|cell| {
+                        let (fresh, reused) = cell.get();
+                        cell.set((fresh, reused + 1));
+                    });
                     let selected_rows_generation =
                         Arc::clone(&retained.ready.selected_rows_generation);
                     let mount_rebaser = MountRebaser::for_persisted_mount_count(
@@ -4137,6 +4462,10 @@ impl AnalyzerStore {
                             site_row_memo: RefCell::default(),
                             selected_unit_read_memo: RefCell::default(),
                             selected_lexical_read_memo: RefCell::default(),
+                            rust_import_provenance:
+                                super::resolution_operation::rust_crate_access::SelectedRustImportProvenance::new(
+                                    self.retention_budget(),
+                                ),
                             forward_candidate_rows: RefCell::default(),
                             closed_reason_reads: RefCell::default(),
                             identity_recipe_memo: RefCell::default(),
@@ -4154,6 +4483,9 @@ impl AnalyzerStore {
                             selected_rows_generation,
                             binding_transaction_epoch: Cell::new(0),
                             read_snapshot_epoch: Cell::new(0),
+                            schema_loan: Cell::new(None),
+                            schema_mutation_epoch: Cell::new(0),
+                            schema_mutation_depth: Cell::new(0),
                             generic_formals_schema_ready: Cell::new(false),
                             generic_formal_defaults_schema_ready: Cell::new(false),
                             reverse_candidate_keys_schema_ready: Cell::new(false),
@@ -4179,6 +4511,7 @@ impl AnalyzerStore {
         }
 
         conn.discard_before_checkin();
+        conn.forget_applied_workspace_selection();
         if let Err(error) = ensure_revisioned_workspace_views(&conn) {
             schedule_preoperation_selection_cleanup(&mut conn);
             return Err(error);
@@ -4219,8 +4552,11 @@ impl AnalyzerStore {
                     cancellation,
                 )? {
                     tx.rollback()?;
-                    return Ok(StagedSelection::Cancelled);
+                    return Ok((StagedSelection::Cancelled, 0));
                 }
+                // The Rust unit tables just filled from this snapshot; its scoped
+                // epoch witnesses them when a later reuse sees only Main drift.
+                let rust_epoch = super::rust_selection_epoch(&tx, selected_snapshots)?;
                 let staged = read_selected_inventory(&tx, cancellation)?;
                 if let StagedSelection::Ready(ready) = &staged
                     && !persist_selected_inventory(
@@ -4231,13 +4567,13 @@ impl AnalyzerStore {
                     )?
                 {
                     tx.rollback()?;
-                    return Ok(StagedSelection::Cancelled);
+                    return Ok((StagedSelection::Cancelled, 0));
                 }
                 tx.commit()?;
-                Ok(staged)
+                Ok((staged, rust_epoch))
             });
 
-            let staged = match result {
+            let (staged, rust_epoch) = match result {
                 Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
                     schedule_preoperation_selection_cleanup(&mut conn);
                     return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
@@ -4276,7 +4612,7 @@ impl AnalyzerStore {
             if stamp.main_data_version == selection_start_stamp.main_data_version
                 && stamp.main_schema_version == selection_start_stamp.main_schema_version
             {
-                break (staged, Some((stamp, owned_change_baseline)));
+                break (staged, Some((stamp, owned_change_baseline, rust_epoch)));
             }
             let expected_fingerprint = match &staged {
                 StagedSelection::Ready(ready) => ready.fingerprint,
@@ -4305,7 +4641,7 @@ impl AnalyzerStore {
             };
             match current {
                 StagedSelection::Ready(current) if current.fingerprint == expected_fingerprint => {
-                    break (staged, Some((stamp, owned_change_baseline)));
+                    break (staged, Some((stamp, owned_change_baseline, rust_epoch)));
                 }
                 StagedSelection::Ready(_) => {}
                 other => break (other, None),
@@ -4323,7 +4659,7 @@ impl AnalyzerStore {
         };
         match staged {
             StagedSelection::Ready(staged) => {
-                let (stamp, owned_change_baseline) =
+                let (stamp, owned_change_baseline, rust_selection_epoch) =
                     verified_stamp.expect("a ready selection carries its verified change stamp");
                 let retained = RetainedResolutionSelection {
                     routing_digest: validated.routing_digest(),
@@ -4332,6 +4668,7 @@ impl AnalyzerStore {
                         Arc::clone(&selected_rows_generation),
                     )),
                     stamp,
+                    rust_selection_epoch,
                     owned_change_baseline,
                     committed_request_changes: Cell::new(0),
                     committed_schema_changes: Cell::new(0),
@@ -4345,6 +4682,11 @@ impl AnalyzerStore {
                 let mount_rebaser =
                     MountRebaser::for_persisted_mount_count(retained.ready.persisted_mount_count);
                 conn.retain_before_checkin();
+                #[cfg(any(test, feature = "test-support"))]
+                SELECTION_OPEN_COUNTS.with(|cell| {
+                    let (fresh, reused) = cell.get();
+                    cell.set((fresh + 1, reused));
+                });
                 Ok(SelectedResolutionMountInventoryOutcome::Ready(Box::new(
                     SelectedResolutionMountInventory {
                         store_identity: self as *const _ as usize,
@@ -4371,6 +4713,10 @@ impl AnalyzerStore {
                         site_row_memo: RefCell::default(),
                         selected_unit_read_memo: RefCell::default(),
                         selected_lexical_read_memo: RefCell::default(),
+                        rust_import_provenance:
+                            super::resolution_operation::rust_crate_access::SelectedRustImportProvenance::new(
+                                self.retention_budget(),
+                            ),
                         forward_candidate_rows: RefCell::default(),
                         closed_reason_reads: RefCell::default(),
                         identity_recipe_memo: RefCell::default(),
@@ -4388,6 +4734,9 @@ impl AnalyzerStore {
                         selected_rows_generation,
                         binding_transaction_epoch: Cell::new(0),
                         read_snapshot_epoch: Cell::new(0),
+                        schema_loan: Cell::new(None),
+                        schema_mutation_epoch: Cell::new(0),
+                        schema_mutation_depth: Cell::new(0),
                         generic_formals_schema_ready: Cell::new(false),
                         generic_formal_defaults_schema_ready: Cell::new(false),
                         reverse_candidate_keys_schema_ready: Cell::new(false),
@@ -5131,6 +5480,7 @@ fn read_selected_language_mounts(
                 manifest_counts: ResolutionManifestCounts::from_array(counts),
                 logical_rows,
                 payload_bytes,
+                closure_members_present: None,
             });
         }
         if cancellation.is_cancelled() {
@@ -5310,6 +5660,7 @@ fn read_selected_content_mounts(
             manifest_counts: ResolutionManifestCounts::from_array(counts),
             logical_rows,
             payload_bytes,
+            closure_members_present: None,
         });
     }
     if cancellation.is_cancelled() {
@@ -5549,11 +5900,13 @@ fn selection_fingerprint(
         hasher.field("interior_digest", &mount.interior_digest);
         hasher.field("producer_epoch", mount.producer_epoch.as_bytes());
         for (index, &count) in mount.manifest_counts.values().iter().enumerate() {
-            if super::resolution::resolution_count_applies(mount.semantic_language, index) {
-                hasher.field("manifest_count", &count.to_be_bytes());
-            } else {
-                assert_eq!(count, 0, "inapplicable resolution count");
-            }
+            super::resolution::hash_manifest_count(
+                &mut hasher,
+                "manifest_count",
+                mount.semantic_language,
+                index,
+                count,
+            );
         }
         hasher.field("logical_rows", &mount.logical_rows.to_be_bytes());
         hasher.field("payload_bytes", &mount.payload_bytes.to_be_bytes());
@@ -5715,7 +6068,7 @@ pub mod tests {
         old_content.field("logical_rows", &witness.logical_rows().to_be_bytes());
         old_content.field("payload_bytes", &witness.payload_bytes().to_be_bytes());
         for (index, count) in witness.manifest_counts().values().iter().enumerate() {
-            if super::super::resolution::resolution_count_applies(language, index) {
+            if super::super::resolution::resolution_count_is_encoded(language, index, *count) {
                 old_content.field("count", &count.to_be_bytes());
             }
         }
@@ -5766,7 +6119,7 @@ pub mod tests {
         old.field("interior_digest", &mount.interior_digest);
         old.field("producer_epoch", mount.producer_epoch.as_bytes());
         for (index, count) in mount.manifest_counts.values().iter().enumerate() {
-            if super::super::resolution::resolution_count_applies(language, index) {
+            if super::super::resolution::resolution_count_is_encoded(language, index, *count) {
                 old.field("manifest_count", &count.to_be_bytes());
             }
         }
@@ -5874,6 +6227,10 @@ pub mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn stage_family_occupancy_tracks_scope_epochs_and_transaction_boundaries() {
         use super::super::resolution_stage::StageFamily;
 
@@ -6007,6 +6364,10 @@ pub mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_point_gap_details_reuses_only_complete_stage_epoch_answers() {
         use super::super::resolution_operation::rust_crate_context::GAP_DETAILS;
         use super::super::resolution_operation::selected_sql_trace::{
@@ -6248,6 +6609,10 @@ pub mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_point_gap_details_misses_after_external_main_commit() {
         use super::super::resolution_operation::selected_sql_trace::{
             begin_production_selected_sql_trace_on_connection,
@@ -6453,6 +6818,10 @@ pub mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#10199: TEMP DDL inside a selected transaction left a derivation binding current"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_temp_view_redefined_in_the_operation_ends_binding_currency() {
         use brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationRevision;
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
@@ -6474,10 +6843,12 @@ pub mod tests {
         assert_eq!(read, 1);
         // A compute that read through a TEMP view, then the view changes inside
         // the same transaction: neither epoch moves, the schema did.
-        connection
-            .execute_batch(
-                "DROP VIEW temp.currency_probe; CREATE TEMP VIEW currency_probe AS SELECT 2 AS x",
-            )
+        selection
+            .with_schema_mutation(|connection| {
+                Ok(connection.execute_batch(
+                    "DROP VIEW temp.currency_probe; CREATE TEMP VIEW currency_probe AS SELECT 2 AS x",
+                )?)
+            })
             .unwrap();
         assert!(!selection.derivation_read_still_bound(&bound));
         // The binding memo recomputes and the new binding,
@@ -6488,7 +6859,143 @@ pub mod tests {
         selection.end_stage_read().unwrap();
     }
 
+    fn temp_schema_version(connection: &Connection) -> i64 {
+        connection
+            .pragma_query_value(Some("temp"), "schema_version", |row| row.get(0))
+            .unwrap()
+    }
+
     #[test]
+    fn checks_in_a_schema_stable_interval_share_one_full_scan() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
+        let _ = super::super::schema_lease::take_schema_scans_for_test();
+        let bound = selection.derivation_reader_binding().unwrap();
+        let establishing = super::super::schema_lease::take_schema_scans_for_test();
+        assert!(establishing > 0, "the first validation scans");
+        for _ in 0..50 {
+            assert!(selection.derivation_read_still_bound(&bound));
+            assert_eq!(selection.derivation_reader_binding().unwrap(), bound);
+        }
+        assert_eq!(
+            super::super::schema_lease::take_schema_scans_for_test(),
+            0,
+            "nested checks borrow the owner's validation"
+        );
+        // A fresh, unestablished binding never borrows it.
+        assert!(!selection.derivation_read_still_bound(
+            &super::super::reader_binding::ReaderBinding::unestablished()
+        ));
+        selection.end_stage_read().unwrap();
+    }
+
+    #[test]
+    fn a_mutation_in_progress_grants_no_loan_and_ends_the_interval() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
+        let bound = selection.derivation_reader_binding().unwrap();
+        assert!(selection.derivation_read_still_bound(&bound));
+        let _ = super::super::schema_lease::take_schema_scans_for_test();
+        selection
+            .with_schema_mutation(|_| {
+                assert!(selection.derivation_read_still_bound(&bound));
+                assert!(selection.derivation_read_still_bound(&bound));
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            super::super::schema_lease::take_schema_scans_for_test() >= 2,
+            "inside a mutation every check scans"
+        );
+        assert!(selection.derivation_read_still_bound(&bound));
+        assert!(
+            super::super::schema_lease::take_schema_scans_for_test() > 0,
+            "resuming after a mutation validates in full"
+        );
+        assert!(selection.derivation_read_still_bound(&bound));
+        assert_eq!(super::super::schema_lease::take_schema_scans_for_test(), 0);
+        selection.end_stage_read().unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn ddl_prepared_before_the_interval_and_run_inside_it_ends_currency() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
+        let connection = selection.connection();
+        let mut prepared = connection
+            .prepare_cached("CREATE TEMP VIEW cached_probe AS SELECT 1 AS x")
+            .unwrap();
+        let bound = selection.derivation_reader_binding().unwrap();
+        assert!(selection.derivation_read_still_bound(&bound));
+        selection
+            .with_schema_mutation(|_| Ok(prepared.execute([])?))
+            .unwrap();
+        assert!(!selection.derivation_read_still_bound(&bound));
+        drop(prepared);
+        selection.end_stage_read().unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn a_rolled_back_savepoint_redone_to_an_equal_temp_version_ends_currency() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
+        selection
+            .initialize_owned_temp_schema(
+                selection.connection(),
+                "SAVEPOINT probe; CREATE TEMP VIEW probe_view AS SELECT 1 AS x",
+            )
+            .unwrap();
+        let bound = selection.derivation_reader_binding().unwrap();
+        assert!(selection.derivation_read_still_bound(&bound));
+        let version = temp_schema_version(selection.connection());
+        selection
+            .initialize_owned_temp_schema(
+                selection.connection(),
+                "ROLLBACK TO probe; CREATE TEMP VIEW probe_view AS SELECT 2 AS x",
+            )
+            .unwrap();
+        assert_eq!(
+            temp_schema_version(selection.connection()),
+            version,
+            "the counter alone cannot tell the two schemas apart"
+        );
+        assert!(!selection.derivation_read_still_bound(&bound));
+        selection
+            .with_schema_mutation(|connection| Ok(connection.execute_batch("RELEASE probe")?))
+            .unwrap();
+        selection.end_stage_read().unwrap();
+    }
+
+    #[test]
+    fn a_transaction_boundary_ends_a_loan() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
+        let bound = selection.derivation_reader_binding().unwrap();
+        assert!(selection.derivation_read_still_bound(&bound));
+        selection.pause_stage_read().unwrap();
+        assert!(!selection.derivation_read_still_bound(&bound));
+        selection.resume_stage_read().unwrap();
+        assert!(!selection.derivation_read_still_bound(&bound));
+        let rebound = selection.derivation_reader_binding().unwrap();
+        assert!(selection.derivation_read_still_bound(&rebound));
+        selection.reset_scope_mounts().unwrap();
+        assert!(!selection.derivation_read_still_bound(&rebound));
+        selection.end_stage_read().unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_lazily_created_fixed_temp_table_keeps_the_binding_current() {
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
         let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
@@ -6519,6 +7026,10 @@ pub mod tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#9755: a rolled-back TEMP write kept a vanished fixed table ready and its schema change accounted, offsetting the read stamp"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn a_rolled_back_temp_write_forgets_fixed_table_readiness() {
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
@@ -6567,6 +7078,10 @@ pub mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#9755: a rolled-back stage transaction left its fixed batch in the schema accounting, so matching unowned DDL could make the stamp current"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_lost_stage_transaction_is_never_current() {
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
         let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
@@ -6602,6 +7117,10 @@ pub mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#10199: a rolled-back accounted fixed batch plus unlisted DDL at the same version kept a binding current"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_rolled_back_fixed_batch_then_unlisted_ddl_ends_binding_currency() {
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
         let selection = open_binding_currency_selection(&store, &workspace, &snapshots);
@@ -6613,7 +7132,9 @@ pub mod tests {
         };
         let bound = selection.derivation_reader_binding().unwrap();
         let leased_version = temp_version();
-        connection.execute_batch("SAVEPOINT fixed_batch").unwrap();
+        selection
+            .with_schema_mutation(|c| Ok(c.execute_batch("SAVEPOINT fixed_batch")?))
+            .unwrap();
         selection
             .initialize_owned_temp_schema(
                 connection,
@@ -6622,15 +7143,19 @@ pub mod tests {
             .unwrap();
         let post_batch = temp_version();
         assert!(post_batch > leased_version);
-        connection
-            .execute_batch("ROLLBACK TO fixed_batch; RELEASE fixed_batch")
+        selection
+            .with_schema_mutation(|c| {
+                Ok(c.execute_batch("ROLLBACK TO fixed_batch; RELEASE fixed_batch")?)
+            })
             .unwrap();
         assert_eq!(temp_version(), leased_version);
         assert!(selection.derivation_read_still_bound(&bound));
         let mut ordinal = 0;
         while temp_version() < post_batch {
-            connection
-                .execute_batch(&format!("CREATE TEMP TABLE unlisted_{ordinal}(value)"))
+            selection
+                .with_schema_mutation(|c| {
+                    Ok(c.execute_batch(&format!("CREATE TEMP TABLE unlisted_{ordinal}(value)"))?)
+                })
                 .unwrap();
             ordinal += 1;
         }
@@ -6703,6 +7228,10 @@ pub mod tests {
     /// it selects (resolution_stage/typed.rs), so the readers below answer an
     /// owner the same either way.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn generic_formal_readers_answer_alike_whether_the_family_was_absent_or_empty() {
         use crate::analyzer::resolution::{SemanticId, TypedFactPageVisitor, TypedFactRequest};
         let table_exists = |selection: &SelectedResolutionMountInventory<'_>, name: &str| -> bool {
@@ -6813,6 +7342,10 @@ pub mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn operation_stamp_follows_stage_epochs_and_failed_temp_writes() {
         let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
         let cancellation = CancellationToken::new();

@@ -120,13 +120,28 @@ fn location(
 impl CallPathProjection<'_, '_> {
     pub(super) fn observe_relation(&mut self, result: &CallRelationResult, incoming: bool) {
         if !super::relations::call_relation_result_complete(result, incoming) {
-            self.evidence.add_gap(if result.cancelled {
-                CallPathGap::Cancelled
-            } else if result.truncated {
-                CallPathGap::ExecutionBudget
-            } else {
-                CallPathGap::RelationIncomplete
-            });
+            let mut causes = result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    super::relations::map_call_relation_diagnostic("unknown", diagnostic.clone())
+                        .incompleteness
+                        .execution_cause()
+                })
+                .collect::<Vec<_>>();
+            if result.cancelled {
+                causes.push(DiagnosticExecutionCause::Cancelled);
+            }
+            if !result.budget_refusals.is_empty() {
+                causes.push(DiagnosticExecutionCause::Budget);
+            }
+            if causes.is_empty() {
+                causes.push(DiagnosticExecutionCause::Provider);
+            }
+            for cause in causes {
+                self.evidence
+                    .add_caused_gap(CallPathGap::RelationIncomplete, cause);
+            }
             self.evidence.truncated |= result.truncated || result.cancelled;
         }
     }
@@ -139,7 +154,7 @@ impl CallPathProjection<'_, '_> {
         self.evidence.add_gap(CallPathGap::ExternalBodyUnavailable);
         diagnostics.push(incomplete_diagnostic(
             CodeQueryDiagnosticCode::SemanticResultsOmitted,
-            Incompleteness::Content,
+            Incompleteness::Operational(DiagnosticExecutionCause::Provider),
             language_for_file(self.root.unit.source()).config_label(),
             format!(
                 "call-reachability boundary: body unavailable for {}",
@@ -147,6 +162,11 @@ impl CallPathProjection<'_, '_> {
             ),
             Vec::new(),
         ));
+    }
+
+    pub(super) fn missing_owner_cause(&mut self, cause: DiagnosticExecutionCause) {
+        self.evidence
+            .add_caused_gap(CallPathGap::UnreadableOwner, cause);
     }
 
     pub(super) fn missing_owner(&mut self) {
@@ -168,7 +188,10 @@ impl CallPathProjection<'_, '_> {
         let allowance = limits
             .max_pipeline_rows
             .saturating_sub(budget.pipeline_rows);
-        let (sites, stopped) = super::relations::source_call_site_expansions(
+        let read_scope =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::for_advisory_read(analyzer);
+        let diagnostic_start = diagnostics.len();
+        let (sites, completion) = super::relations::source_call_site_expansions(
             analyzer,
             owner,
             &CallSiteTraversalFilter::default(),
@@ -181,9 +204,29 @@ impl CallPathProjection<'_, '_> {
             self.semantic,
             super::relations::SourceCallInventoryMode::Reachability,
         );
-        if stopped {
+        if let Err(causes) = completion {
             self.evidence.truncated = true;
-            self.evidence.add_gap(CallPathGap::ExecutionBudget);
+            // Keep every producer cause even when its presentation diagnostic
+            // was merged into an earlier operand's diagnostic.
+            for cause in causes {
+                self.evidence
+                    .add_caused_gap(CallPathGap::RelationIncomplete, cause);
+            }
+            let causes = diagnostics[diagnostic_start..]
+                .iter()
+                .filter_map(|d| d.incompleteness.execution_cause())
+                .collect::<Vec<_>>();
+            for cause in causes {
+                self.evidence
+                    .add_caused_gap(CallPathGap::RelationIncomplete, cause);
+            }
+        }
+        for gap in read_scope.captured_read_incompleteness() {
+            self.evidence.add_caused_gap(
+                CallPathGap::RelationIncomplete,
+                gap.execution_cause()
+                    .unwrap_or(DiagnosticExecutionCause::Provider),
+            );
         }
         let mut certified = HashMap::default();
         let mut sites = sites
@@ -223,7 +266,7 @@ impl CallPathProjection<'_, '_> {
                 };
                 diagnostics.push(incomplete_diagnostic(
                     CodeQueryDiagnosticCode::SemanticResultsOmitted,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(DiagnosticExecutionCause::Provider),
                     language_for_file(&site.0.file).config_label(),
                     format!(
                         "call-reachability boundary: external body {target} unavailable at {}:{}..{}",
@@ -297,6 +340,7 @@ impl CallPathProjection<'_, '_> {
                 let certificate = CallPathEvidence {
                     paths: vec![path],
                     coverage: CallPathCoverage::Complete,
+                    operational_causes: Vec::new(),
                     truncated: false,
                 };
                 let bytes = certificate.retained_bytes();
@@ -676,6 +720,44 @@ fn source_root(
     ))
 }
 
+/// Coverage already records the producer's actual stop. Authored depth and
+/// semantic traversal gaps do not imply an execution budget refusal.
+fn coverage_incompleteness(evidence: &CallPathEvidence) -> Incompleteness {
+    let gaps = match &evidence.coverage {
+        CallPathCoverage::Complete => &[][..],
+        CallPathCoverage::Incomplete(gaps) => gaps.as_slice(),
+    };
+    if evidence
+        .operational_causes
+        .contains(&DiagnosticExecutionCause::Cancelled)
+        || gaps.contains(&CallPathGap::Cancelled)
+    {
+        Incompleteness::Operational(DiagnosticExecutionCause::Cancelled)
+    } else if evidence
+        .operational_causes
+        .contains(&DiagnosticExecutionCause::Budget)
+        || gaps.contains(&CallPathGap::ExecutionBudget)
+    {
+        Incompleteness::Operational(DiagnosticExecutionCause::Budget)
+    } else if evidence
+        .operational_causes
+        .contains(&DiagnosticExecutionCause::Provider)
+        || (evidence.operational_causes.is_empty()
+            && gaps
+                .iter()
+                .any(|gap| *gap != CallPathGap::DepthBoundReached))
+    {
+        Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+    } else {
+        assert!(!gaps.is_empty());
+        evidence
+            .operational_causes
+            .first()
+            .copied()
+            .map_or(Incompleteness::Content, Incompleteness::Operational)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute(
     token: QueryToken<'_>,
@@ -707,6 +789,11 @@ pub(super) fn execute(
             diagnostics.push(incomplete_diagnostic(
                 CodeQueryDiagnosticCode::SemanticResultsOmitted,
                 if state
+                    .cancellation
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    Incompleteness::Operational(DiagnosticExecutionCause::Cancelled)
+                } else if state
                     .budget
                     .fact_nodes
                     .saturating_add(state.budget.examined_references)
@@ -777,6 +864,7 @@ pub(super) fn execute(
             evidence: CallPathEvidence {
                 paths: Vec::new(),
                 coverage: CallPathCoverage::Complete,
+                operational_causes: Vec::new(),
                 truncated: false,
             },
         };
@@ -787,6 +875,7 @@ pub(super) fn execute(
         };
         let step = QueryStep::Callees(filter.clone());
         let mut probe = expansions::CallDepthProbeInput::for_consumer(depth.is_some());
+        let diagnostic_start = diagnostics.len();
         let (_, stopped) = expansions::call_declaration_expansions(
             state.analyzer,
             token,
@@ -805,16 +894,24 @@ pub(super) fn execute(
             Some(&mut inventory),
         );
         if stopped {
-            inventory.evidence.add_gap(
-                if state
-                    .cancellation
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
-                    CallPathGap::Cancelled
-                } else {
-                    CallPathGap::RelationIncomplete
-                },
-            );
+            let mut causes = diagnostics[diagnostic_start..]
+                .iter()
+                .filter_map(|d| d.incompleteness.execution_cause())
+                .collect::<Vec<_>>();
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                causes.push(DiagnosticExecutionCause::Cancelled);
+            }
+            if causes.is_empty() {
+                causes.push(DiagnosticExecutionCause::Provider);
+            }
+            for cause in causes {
+                inventory
+                    .evidence
+                    .add_caused_gap(CallPathGap::RelationIncomplete, cause);
+            }
         }
         // An incomplete inventory never certifies absence outside its explored
         // region. Keep the same boundary causes even if the second pass cannot
@@ -826,14 +923,11 @@ pub(super) fn execute(
             truncated = true;
             diagnostics.push(incomplete_diagnostic(
                 CodeQueryDiagnosticCode::SemanticResultsOmitted,
-                if inventory.evidence.truncated {
-                    Incompleteness::Operational(DiagnosticExecutionCause::Budget)
-                } else {
-                    Incompleteness::Content
-                },
+                coverage_incompleteness(&inventory.evidence),
                 language_for_file(root.unit.source()).config_label(),
                 format!(
-                    "call-reachability coverage: {:?}",
+                    "call-reachability coverage (caller depth {:?}): {:?}",
+                    depth.map(std::num::NonZeroUsize::get),
                     inventory.evidence.coverage
                 ),
                 Vec::new(),
@@ -935,6 +1029,7 @@ pub(super) fn execute(
             evidence: CallPathEvidence {
                 paths: Vec::new(),
                 coverage: CallPathCoverage::Complete,
+                operational_causes: Vec::new(),
                 truncated: false,
             },
         };
@@ -945,6 +1040,7 @@ pub(super) fn execute(
         };
         let step = QueryStep::Callees(filter.clone());
         let mut probe = expansions::CallDepthProbeInput::for_consumer(depth.is_some());
+        let diagnostic_start = diagnostics.len();
         let (_, stopped) = expansions::call_declaration_expansions(
             state.analyzer,
             token,
@@ -963,16 +1059,24 @@ pub(super) fn execute(
             Some(&mut projection),
         );
         if stopped {
-            projection.evidence.add_gap(
-                if state
-                    .cancellation
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
-                    CallPathGap::Cancelled
-                } else {
-                    CallPathGap::RelationIncomplete
-                },
-            );
+            let mut causes = diagnostics[diagnostic_start..]
+                .iter()
+                .filter_map(|d| d.incompleteness.execution_cause())
+                .collect::<Vec<_>>();
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                causes.push(DiagnosticExecutionCause::Cancelled);
+            }
+            if causes.is_empty() {
+                causes.push(DiagnosticExecutionCause::Provider);
+            }
+            for cause in causes {
+                projection
+                    .evidence
+                    .add_caused_gap(CallPathGap::RelationIncomplete, cause);
+            }
         }
         let CallPathProjection {
             candidates,
@@ -980,7 +1084,7 @@ pub(super) fn execute(
             candidate_bytes,
             ..
         } = projection;
-        if depth.is_some() {
+        if let Some(caller_depth) = depth {
             let status = expansions::probe_call_depth_bound(
                 state.analyzer,
                 token,
@@ -993,13 +1097,19 @@ pub(super) fn execute(
                 &mut probe,
             );
             join_depth_bound_status(&mut state.depth_bound_status, Some(status));
-            if status != DepthBoundStatus::NotReached {
-                evidence.add_gap(CallPathGap::DepthBoundReached);
-                evidence.truncated = true;
-            }
+            probe.record_coverage(status, caller_depth, &mut evidence);
         }
         if selected_sinks.truncated {
-            evidence.add_gap(CallPathGap::RelationIncomplete);
+            let causes = diagnostics[selected_sinks.diagnostics.clone()]
+                .iter()
+                .filter_map(|d| d.incompleteness.execution_cause())
+                .collect::<Vec<_>>();
+            if causes.is_empty() {
+                evidence.add_gap(CallPathGap::RelationIncomplete);
+            }
+            for cause in causes {
+                evidence.add_caused_gap(CallPathGap::RelationIncomplete, cause);
+            }
         }
         if !candidates.is_empty() {
             let selected = selected_sinks.endpoints();
@@ -1077,16 +1187,21 @@ pub(super) fn execute(
             });
 
         if evidence.coverage != CallPathCoverage::Complete || evidence.truncated {
+            if coverage_incompleteness(&evidence)
+                .execution_cause()
+                .is_some()
+            {
+                state.mark_execution_dependent();
+            }
             diagnostics.push(incomplete_diagnostic(
                 CodeQueryDiagnosticCode::SemanticResultsOmitted,
-                if evidence.truncated {
-                    state.mark_execution_dependent();
-                    Incompleteness::Operational(DiagnosticExecutionCause::Budget)
-                } else {
-                    Incompleteness::Content
-                },
+                coverage_incompleteness(&evidence),
                 language_for_file(root.unit.source()).config_label(),
-                format!("call-reachability coverage: {:?}", evidence.coverage),
+                format!(
+                    "call-reachability coverage (caller depth {:?}): {:?}",
+                    depth.map(std::num::NonZeroUsize::get),
+                    evidence.coverage
+                ),
                 Vec::new(),
             ));
             truncated = true;
@@ -1126,6 +1241,248 @@ pub(super) fn execute(
 mod selector_uncertainty_tests {
     use super::*;
 
+    fn stopped_source_inventory(
+        max_fact_nodes: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> (CallPathEvidence, Vec<CodeQueryDiagnostic>) {
+        use super::super::tests::inline_project::InlineTestProject;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "fn root() { leaf(); }\nfn leaf() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(Default::default());
+        let analyzer = workspace.analyzer();
+        let file = ProjectFile::new(project.root(), "src/lib.rs");
+        let unit = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "root")
+            .unwrap();
+        let root = IndexedDeclarations::default().get(analyzer, &unit).unwrap();
+        let mut coordinates = PipelineRenderCache::default();
+        let root_location = location(analyzer, &file, root.range, &mut coordinates).unwrap();
+        let selection = SinkSelection {
+            endpoints: SelectionEndpoints::Owned(Vec::new()),
+            truncated: false,
+            diagnostics: 0..0,
+            receipt: None,
+            probe: None,
+        };
+        let mut semantic = None;
+        let mut projection = CallPathProjection {
+            sources: Vec::new(),
+            root: root.clone(),
+            root_location,
+            semantic: &mut semantic,
+            selected_sinks: &selection,
+            reached: None,
+            candidates: Vec::new(),
+            candidate_bytes: 0,
+            evidence: CallPathEvidence {
+                paths: Vec::new(),
+                coverage: CallPathCoverage::Complete,
+                operational_causes: Vec::new(),
+                truncated: false,
+            },
+            coordinates: &mut coordinates,
+        };
+        let mut diagnostics = Vec::new();
+        // A previous operand may already have emitted the same stop. Global
+        // diagnostic deduplication must not erase this operand's typed cause.
+        if cancellation.is_some() {
+            push_cancelled_diagnostic(&mut diagnostics);
+        } else {
+            push_spent_budget_diagnostic(
+                &mut diagnostics,
+                &CodeQueryExecutionBudget::default(),
+                CodeQueryExecutionLimits {
+                    max_fact_nodes,
+                    ..Default::default()
+                },
+                2,
+            );
+        }
+        let sites = projection.visit(
+            analyzer,
+            &root,
+            &[],
+            &mut CallTraversalCache::default(),
+            &mut CodeQueryExecutionBudget::default(),
+            CodeQueryExecutionLimits {
+                max_fact_nodes,
+                ..Default::default()
+            },
+            cancellation,
+            &mut diagnostics,
+        );
+        assert!(sites.is_empty());
+        (projection.evidence, diagnostics)
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12472: metered source inventory erased its fact-node budget stop into a parse failure"
+    )]
+    fn source_inventory_budget_stop_preserves_cause() {
+        let (evidence, diagnostics) = stopped_source_inventory(0, None);
+        assert_eq!(
+            coverage_incompleteness(&evidence),
+            Incompleteness::Operational(DiagnosticExecutionCause::Budget)
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.incompleteness.execution_cause()
+                    == Some(DiagnosticExecutionCause::Budget))
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12472: metered source inventory erased cancellation into a parse failure"
+    )]
+    fn source_inventory_cancellation_preserves_cause() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (evidence, diagnostics) = stopped_source_inventory(usize::MAX, Some(&cancellation));
+        assert_eq!(
+            coverage_incompleteness(&evidence),
+            Incompleteness::Operational(DiagnosticExecutionCause::Cancelled)
+        );
+        assert!(diagnostics.iter().any(
+            |d| d.incompleteness.execution_cause() == Some(DiagnosticExecutionCause::Cancelled)
+        ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12410: semantic call-path gaps were relabeled as execution budget refusals"
+    )]
+    fn traversal_gap_preserves_content_and_actual_execution_stops() {
+        use brokk_bifrost_core::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
+        let location = CallPathLocation {
+            rel_path: "app.rs".into(),
+            byte_span: 0..1,
+            display_range: CodeQueryRange {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 2,
+            },
+        };
+        let paths = vec![StaticCallPath {
+            source: CallPathSource {
+                location: location.clone(),
+                identity: "source".into(),
+                expansion_origin: None,
+            },
+            primary_root: location.clone(),
+            root_identity: "root".into(),
+            edges: vec![CallPathEdge {
+                caller: "root".into(),
+                call_site: location,
+                static_target: "sink".into(),
+                proof: StaticCallProof::DirectDeclaration,
+            }],
+        }];
+        let mut evidence = CallPathEvidence {
+            paths: paths.clone(),
+            coverage: CallPathCoverage::Incomplete(vec![CallPathGap::UncertifiedDispatch]),
+            operational_causes: vec![DiagnosticExecutionCause::Provider],
+            truncated: false,
+        };
+        let diagnostic = |evidence: &CallPathEvidence| {
+            incomplete_diagnostic(
+                CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                coverage_incompleteness(evidence),
+                "rust",
+                format!("call-reachability coverage: {:?}", evidence.coverage),
+                Vec::new(),
+            )
+        };
+        for gap in [
+            CallPathGap::UnreadableOwner,
+            CallPathGap::UncertifiedDispatch,
+            CallPathGap::ExternalBodyUnavailable,
+            CallPathGap::MissingExpansionProvenance,
+            CallPathGap::RelationIncomplete,
+        ] {
+            let mut gap_evidence = CallPathEvidence {
+                paths: paths.clone(),
+                coverage: CallPathCoverage::Complete,
+                operational_causes: Vec::new(),
+                truncated: false,
+            };
+            gap_evidence.add_gap(gap);
+            assert_eq!(
+                coverage_incompleteness(&gap_evidence),
+                Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+            );
+            gap_evidence.add_depth_bound(std::num::NonZeroUsize::MIN);
+            assert_eq!(
+                coverage_incompleteness(&gap_evidence),
+                Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+            );
+            let encoded = serde_json::to_string(&gap_evidence).unwrap();
+            assert_eq!(
+                serde_json::from_str::<CallPathEvidence>(&encoded).unwrap(),
+                gap_evidence
+            );
+        }
+        let mut bounded = CallPathEvidence {
+            paths: paths.clone(),
+            coverage: CallPathCoverage::Complete,
+            operational_causes: Vec::new(),
+            truncated: false,
+        };
+        bounded.add_depth_bound(std::num::NonZeroUsize::MIN);
+        assert_eq!(coverage_incompleteness(&bounded), Incompleteness::Content);
+        bounded.add_caused_gap(
+            CallPathGap::UnreadableOwner,
+            DiagnosticExecutionCause::Snapshot,
+        );
+        assert_eq!(
+            coverage_incompleteness(&bounded),
+            Incompleteness::Operational(DiagnosticExecutionCause::Snapshot)
+        );
+        let content = diagnostic(&evidence);
+        assert_eq!(
+            content.incompleteness,
+            Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+        );
+        assert_ne!(content.reuse_verdict(), ReuseVerdict::Content);
+        evidence.add_gap(CallPathGap::ExecutionBudget);
+        let budget = diagnostic(&evidence);
+        assert_eq!(
+            budget.incompleteness.execution_cause(),
+            Some(DiagnosticExecutionCause::Budget)
+        );
+        assert_ne!(budget.reuse_verdict(), ReuseVerdict::Content);
+        evidence.add_gap(CallPathGap::Cancelled);
+        let cancelled = diagnostic(&evidence);
+        assert_eq!(
+            cancelled.incompleteness.execution_cause(),
+            Some(DiagnosticExecutionCause::Cancelled)
+        );
+        assert_ne!(cancelled.reuse_verdict(), ReuseVerdict::Content);
+        evidence.add_operational_cause(DiagnosticExecutionCause::Provider);
+        let mut merged = bounded;
+        merged.merge(evidence.clone());
+        assert_eq!(
+            merged.operational_causes,
+            vec![
+                DiagnosticExecutionCause::Cancelled,
+                DiagnosticExecutionCause::Budget,
+                DiagnosticExecutionCause::Snapshot,
+                DiagnosticExecutionCause::Provider
+            ]
+        );
+        assert_eq!(
+            serde_json::from_str::<CallPathEvidence>(&serde_json::to_string(&merged).unwrap())
+                .unwrap(),
+            merged
+        );
+    }
+
     #[test]
     fn selected_sink_branch_advisories_survive_root_projection() {
         let diagnostic = |branch, impact| {
@@ -1144,6 +1501,10 @@ mod selector_uncertainty_tests {
                 message: "sink predicate uncertainty".into(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             })
         };
         let mut diagnostics = vec![

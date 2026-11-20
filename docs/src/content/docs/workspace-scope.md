@@ -20,7 +20,8 @@ src/bindings/*.rs
 
 Nested `.bifrostignore` files apply relative to their own directories, with the
 same precedence rules as nested `.gitignore` files. Bifrost applies these
-patterns whether matching files are tracked by Git or not.
+patterns whether matching files are tracked by Git or not. Only `.bifrostignore`
+files inside the workspace apply.
 
 Matching files are excluded from analyzer-backed behavior. They contribute no
 declarations or references to symbol search, summaries, navigation, usage
@@ -47,8 +48,13 @@ Bifrost builds the workspace file inventory this way:
   in initialized submodules are included. Bifrost reads the Git index and
   working tree; it does not fetch or initialize submodules.
 - Outside a Git repository, Bifrost walks the directory tree. It honors
-  `.gitignore` files, the global Git ignore file, and `.git/info/exclude`. It
-  does not honor `.ignore` files.
+  `.gitignore` files inside the workspace and the configured global Git ignore
+  file. Ignore files above the workspace do not apply. It does not honor
+  `.ignore` files.
+- Within a repository, `.gitignore` files apply as Git applies them, up to
+  the repository root, including when the workspace is a repository subdirectory.
+  Files above the repository root do not apply. A `.git` file, as used by
+  worktrees and submodules, identifies a repository just like a `.git` directory.
 - Hidden files and directories, such as `.github/`, are included.
 - A `.git` directory is never walked.
 - If the root is inside a Git repository whose ignore rules hide the whole

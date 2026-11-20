@@ -52,11 +52,15 @@ fn semantic_file_refusal_names_the_root_lane_and_charge() {
         .result
         .diagnostics
         .iter()
-        .find(|d| d.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted)
+        .find(|d| d.code() == CodeQueryDiagnosticCode::SemanticBudgetExhausted)
         .expect("typed refusal");
-    assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
-    assert_eq!(diagnostic.exhausted_roots.len(), 1, "{diagnostic:#?}");
-    let root = &diagnostic.exhausted_roots[0];
+    assert_eq!(diagnostic.impact(), CodeQueryDiagnosticImpact::Incomplete);
+    assert_eq!(
+        semantic_diagnostic(diagnostic).exhausted_roots.len(),
+        1,
+        "{diagnostic:#?}"
+    );
+    let root = &semantic_diagnostic(diagnostic).exhausted_roots[0];
     assert_eq!(root.path, "b.py");
     assert_eq!(root.lane, "semantic/files");
     let charge = root.charge.as_ref().expect("admission charge");

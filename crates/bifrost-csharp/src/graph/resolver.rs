@@ -585,7 +585,7 @@ fn seed_variable_declaration_in_session(
                     bindings.declare_shadow(node_text(name_node, source));
                 }
             } else if variable_declarator_initializer(child).is_some() {
-                session.mark_scope_incomplete();
+                session.mark_unavailable("csharp_unseeded_variable_declarator");
                 return;
             } else {
                 bindings.declare_shadow(node_text(name_node, source));
@@ -2671,13 +2671,8 @@ mod bounded_provider_contract_tests {
     fn provider_rows_and_summary_work_obey_independent_budgets_and_cancellation() {
         let rows = ["Root", "Left", "Right"];
         let calls = Cell::new(0);
-        let limited = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 2,
-                ..ReceiverAnalysisBudget::default()
-            },
-            None,
-        );
+        let limited =
+            ResolutionSession::bounded_with_total_work(ReceiverAnalysisBudget::default(), 2, None);
         let result = resolution_query_rows(Some(&limited), || {
             calls.set(calls.get() + 1);
             rows.to_vec()
@@ -2687,7 +2682,7 @@ mod bounded_provider_contract_tests {
         assert!(matches!(
             limited.finish(result),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::TotalWork,
                 ..
             }
         ));

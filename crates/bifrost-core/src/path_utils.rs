@@ -5,6 +5,7 @@
 //! workspace listing off an `IAnalyzer`, which is above this crate.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::analyzer::ProjectFile;
@@ -52,10 +53,30 @@ pub fn is_windows_absolute_path(path: &str) -> bool {
 /// Render a workspace-relative path as a slash-separated key by joining its
 /// path components. A backslash that is part of a Unix filename stays literal.
 pub fn workspace_relative_slash_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    display_workspace_relative_slash_path(path).to_string()
+}
+
+/// Borrow a slash-separated path formatter without allocating lossy strings.
+///
+/// Components and lossy replacement match [`workspace_relative_slash_path`],
+/// including literal Unix backslashes. `OsStr::display` streams replacements
+/// for invalid bytes or unpaired Windows surrogates directly to the writer.
+pub fn display_workspace_relative_slash_path(path: &Path) -> impl fmt::Display + '_ {
+    struct SlashPath<'a>(&'a Path);
+
+    impl fmt::Display for SlashPath<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for (index, component) in self.0.components().enumerate() {
+                if index != 0 {
+                    formatter.write_str("/")?;
+                }
+                write!(formatter, "{}", component.as_os_str().display())?;
+            }
+            Ok(())
+        }
+    }
+
+    SlashPath(path)
 }
 
 /// The path-suffix key `path` denotes: its `Normal` components joined with
@@ -204,8 +225,9 @@ pub fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_glob_syntax, is_windows_absolute_path, normalize_relative_path_from,
-        percent_decode, workspace_rel_path, workspace_relative_slash_path,
+        contains_glob_syntax, display_workspace_relative_slash_path, is_windows_absolute_path,
+        normalize_relative_path_from, percent_decode, workspace_rel_path,
+        workspace_relative_slash_path,
     };
     use std::path::{Path, PathBuf};
 
@@ -289,6 +311,92 @@ mod tests {
             r"literal\backslash.rs",
             workspace_relative_slash_path(Path::new(r"literal\backslash.rs")),
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14068: normalized site paths allocated before owner admission"
+    )]
+    fn workspace_relative_slash_formatter_preserves_component_boundaries() {
+        use crate::admitted_text::AdmittedText;
+        use crate::retention_budget::RetentionBudget;
+
+        let owner = RetentionBudget::for_test_capacity(4096);
+        for spelling in [
+            "",
+            ".",
+            "./a//b/./../c",
+            "/a//b",
+            r"literal\backslash.rs",
+            "a/\u{e9}/file",
+        ] {
+            let path = Path::new(spelling);
+            let expected = path
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let admitted = AdmittedText::try_format(
+                &owner,
+                format_args!("{}", display_workspace_relative_slash_path(path)),
+            )
+            .unwrap();
+            assert_eq!(&*admitted, expected);
+            assert_eq!(workspace_relative_slash_path(path), expected);
+            drop(admitted);
+            assert_eq!(owner.accounted_bytes(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14068: lossy Unix site paths allocated temporary strings before admission"
+    )]
+    fn workspace_relative_slash_formatter_preserves_non_utf8_unix_names() {
+        use crate::admitted_text::AdmittedText;
+        use crate::retention_budget::RetentionBudget;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"./a/\xf0\x9f/..\xff\xf0\x9f\x92\xa9"));
+        let owner = RetentionBudget::for_test_capacity(4096);
+        let admitted = AdmittedText::try_format(
+            &owner,
+            format_args!("{}", display_workspace_relative_slash_path(path)),
+        )
+        .unwrap();
+        assert_eq!(&*admitted, "./a/\u{fffd}/..\u{fffd}\u{1f4a9}");
+        assert_eq!(workspace_relative_slash_path(path), &*admitted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14068: lossy Windows site paths allocated temporary strings before admission"
+    )]
+    fn workspace_relative_slash_formatter_preserves_unpaired_windows_surrogates() {
+        use crate::admitted_text::AdmittedText;
+        use crate::retention_budget::RetentionBudget;
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_wide(&[
+            0x43, 0x3a, 0x5c, 0xd800, 0x5c, 0xdc00,
+        ]));
+        let expected = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let owner = RetentionBudget::for_test_capacity(4096);
+        let admitted = AdmittedText::try_format(
+            &owner,
+            format_args!("{}", display_workspace_relative_slash_path(&path)),
+        )
+        .unwrap();
+        assert_eq!(&*admitted, expected);
+        assert_eq!(workspace_relative_slash_path(&path), expected);
     }
 
     #[test]
@@ -778,4 +886,26 @@ mod path_properties {
             prop_assert_eq!(percent_decode(&encoded), input);
         }
     }
+}
+
+/// Whether this process may run the file at `path`, as `exec` decides. On
+/// Unix this asks `access(X_OK)`, which honours this process's user and
+/// groups, ACLs and `noexec` mounts: an execute bit for some other user is
+/// not enough. Callers check that `path` is a regular file first, because
+/// `X_OK` on a directory means search permission.
+#[cfg(unix)]
+pub fn may_execute(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a Unix path holds no NUL byte");
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// Whether this process may run the file at `path`. Windows decides by the
+/// file's extension, which the caller's file name already fixes, so every
+/// regular file qualifies.
+#[cfg(not(unix))]
+pub fn may_execute(_path: &Path) -> bool {
+    true
 }

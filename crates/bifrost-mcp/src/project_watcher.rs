@@ -22,18 +22,24 @@ fn watcher_config() -> Config {
 pub struct ChangeDelta {
     pub files: HashSet<ProjectFile>,
     pub requires_full_refresh: bool,
+    pub revalidate_listing: bool,
+    /// An ignore-rule input (`.git/info/exclude`) changed, not only the index.
+    pub ignore_input_changed: bool,
 }
 
 #[derive(Default)]
 struct PendingChanges {
     files: HashSet<ProjectFile>,
     requires_full_refresh: bool,
+    revalidate_listing: bool,
+    ignore_input_changed: bool,
     rearm_exclude_watch: bool,
 }
 
 pub struct ProjectChangeWatcher {
     _watcher: WatcherBackend,
     exclude_directory: Option<PathBuf>,
+    index_directory: Option<PathBuf>,
     recursive_exclude_ancestor: Option<PathBuf>,
     pending: Arc<Mutex<PendingChanges>>,
 }
@@ -109,6 +115,8 @@ impl ProjectChangeWatcher {
         });
         Ok(Self {
             _watcher: watcher,
+            index_directory: git_index_path(project.as_ref())
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
             exclude_directory,
             recursive_exclude_ancestor,
             pending,
@@ -130,33 +138,33 @@ impl ProjectChangeWatcher {
         if !rearm {
             return Ok(());
         }
-        let registration = self
-            .exclude_directory
-            .as_deref()
-            .map(existing_exclude_watch_directory)
-            .transpose();
-        let result = registration.and_then(|path| {
-            let Some(path) = path else {
-                return Ok(());
-            };
-            let mode = if self.recursive_exclude_ancestor.as_ref() == Some(&path) {
-                notify::RecursiveMode::Recursive
-            } else {
-                notify::RecursiveMode::NonRecursive
-            };
-            // notify 9.0.0-rc.5 replaces matching explicit watches idempotently
-            // (inotify::add_watch; PollWatcher::watch replaces its map entry).
-            match &mut self._watcher {
-                WatcherBackend::Recommended { _watcher } => _watcher.watch(&path, mode),
-                WatcherBackend::Poll { _watcher } => _watcher.watch(&path, mode),
+        let result = (|| {
+            for directory in [
+                self.exclude_directory.as_deref(),
+                self.index_directory.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let path = existing_exclude_watch_directory(directory)?;
+                let mode = if self.recursive_exclude_ancestor.as_ref() == Some(&path) {
+                    notify::RecursiveMode::Recursive
+                } else {
+                    notify::RecursiveMode::NonRecursive
+                };
+                match &mut self._watcher {
+                    WatcherBackend::Recommended { _watcher } => _watcher.watch(&path, mode),
+                    WatcherBackend::Poll { _watcher } => _watcher.watch(&path, mode),
+                }
+                .map_err(|error| {
+                    format!(
+                        "Failed to re-arm Git input watch at {}: {error}",
+                        path.display()
+                    )
+                })?;
             }
-            .map_err(|error| {
-                format!(
-                    "Failed to re-arm Git exclude watch at {}: {error}",
-                    path.display()
-                )
-            })
-        });
+            Ok(())
+        })();
         if result.is_err() {
             self.pending
                 .lock()
@@ -176,6 +184,8 @@ impl ProjectChangeWatcher {
         ChangeDelta {
             files: mem::take(&mut pending.files),
             requires_full_refresh: mem::take(&mut pending.requires_full_refresh),
+            revalidate_listing: mem::take(&mut pending.revalidate_listing),
+            ignore_input_changed: mem::take(&mut pending.ignore_input_changed),
         }
     }
 
@@ -188,6 +198,14 @@ impl ProjectChangeWatcher {
         !pending.requires_full_refresh && files.iter().all(|file| pending.files.contains(file))
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_pending_listing_revalidation(&self) -> bool {
+        self.pending
+            .lock()
+            .expect("project watcher pending state poisoned")
+            .revalidate_listing
+    }
+
     /// Cheap peek at whether a subsequent `take_changed_files` would return a
     /// non-empty delta, without draining it. Locks only the watcher's own
     /// pending-state mutex, never the caller's session lock, so callers can
@@ -197,7 +215,10 @@ impl ProjectChangeWatcher {
             .pending
             .lock()
             .expect("project watcher pending state poisoned");
-        pending.rearm_exclude_watch || pending.requires_full_refresh || !pending.files.is_empty()
+        pending.rearm_exclude_watch
+            || pending.requires_full_refresh
+            || pending.revalidate_listing
+            || !pending.files.is_empty()
     }
 }
 
@@ -209,6 +230,7 @@ fn event_handler(
     let project_for_callback = Arc::clone(project);
     let owned_paths = watcher_owned_paths(project.as_ref());
     let exclude_directory = git_info_directory(project.as_ref());
+    let index_path = git_index_path(project.as_ref());
     move |result: notify::Result<Event>| {
         brokk_bifrost_analysis::analyzer::without_project_reads(|| match result {
             Ok(event) => handle_event_with_exclude_directory(
@@ -217,6 +239,7 @@ fn event_handler(
                 &pending_for_callback,
                 event,
                 exclude_directory.as_deref(),
+                index_path.as_deref(),
             ),
             Err(_) => {
                 project_for_callback.invalidate_cached_file_listing();
@@ -264,6 +287,7 @@ fn handle_event(
         pending,
         event,
         git_info_directory(project.as_ref()).as_deref(),
+        git_index_path(project.as_ref()).as_deref(),
     );
 }
 
@@ -273,6 +297,7 @@ fn handle_event_with_exclude_directory(
     pending: &Arc<Mutex<PendingChanges>>,
     event: Event,
     exclude_directory: Option<&Path>,
+    index_path: Option<&Path>,
 ) {
     if matches!(event.kind, EventKind::Access(_)) {
         return;
@@ -301,24 +326,51 @@ fn handle_event_with_exclude_directory(
             event.kind,
             EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
         );
-        if let Some(info) = exclude_directory.filter(|info| {
+        if let Some(_info) = exclude_directory.filter(|info| {
             path.to_path_buf().normalize() == info.join("exclude").normalize()
                 || (lifecycle && info.starts_with(path.to_path_buf().normalize()))
         }) {
-            project.invalidate_cached_file_listing();
-            let exclude = info.join("exclude");
-            let mut pending = pending
+            let mut state = pending
                 .lock()
                 .expect("project watcher pending state poisoned");
-            pending.rearm_exclude_watch |= lifecycle;
-            if let Ok(relative) = exclude.strip_prefix(project.root()) {
-                pending
-                    .files
-                    .insert(ProjectFile::new(project.root(), relative));
-            } else {
-                pending.requires_full_refresh = true;
-            }
+            state.rearm_exclude_watch |= lifecycle;
+            state.revalidate_listing = true;
+            state.ignore_input_changed = true;
             continue;
+        }
+        let normalized = path.to_path_buf().normalize();
+        if exclude_directory.is_some_and(|info| normalized.starts_with(info)) {
+            continue;
+        }
+        if let Some(index) = index_path {
+            if normalized == index
+                || (lifecycle
+                    && index
+                        .parent()
+                        .is_some_and(|parent| parent.starts_with(&normalized)))
+            {
+                // Schedule owner-side receipt validation, retaining the listing.
+                let mut state = pending
+                    .lock()
+                    .expect("project watcher pending state poisoned");
+                state.revalidate_listing = true;
+                state.rearm_exclude_watch |= lifecycle;
+                continue;
+            }
+            // An external gitdir watch also reports index.lock and other
+            // bookkeeping. Classify those before the project-root filter.
+            if let Some(relative) = index
+                .parent()
+                .and_then(|parent| normalized.strip_prefix(parent).ok())
+            {
+                if matches!(
+                    git_directory_entry_disposition(relative),
+                    GitInternalPath::RefState
+                ) {
+                    git_ref_state_changed = true;
+                }
+                continue;
+            }
         }
         match git_internal_disposition(project.as_ref(), path) {
             Some(GitInternalPath::RefState) => git_ref_state_changed = true,
@@ -360,14 +412,6 @@ fn handle_event_with_exclude_directory(
         project.invalidate_cached_file_listing();
     }
 
-    if paths
-        .iter()
-        .any(|path| is_bifrost_ignore_path(project.as_ref(), path))
-    {
-        mark_full_refresh(pending);
-        return;
-    }
-
     let mut saw_refresh_fallback_path = false;
     for path in &paths {
         match classify_project_path(project.as_ref(), owned_paths, path) {
@@ -387,10 +431,13 @@ fn handle_event_with_exclude_directory(
     }
 }
 
-/// Whether an event can change the workspace listing's membership. Content
-/// and metadata writes cannot, unless the written file is an ignore file whose
-/// rules decide membership. Every other kind (create, remove, rename, and the
-/// backend's unclassified `Any`/`Other`) can.
+/// Whether an event can change the cached workspace listing. Content and
+/// metadata writes cannot, except to a `.gitignore`, whose rules the listing
+/// walk applies. An in-place content write to `.bifrostignore` is not listed
+/// here: the file is still reported as a changed project file, and the
+/// analyzer revalidates its ignore inputs on the next update (file-tool
+/// membership is unchanged by it). Every other kind (create, remove, rename,
+/// and the backend's unclassified `Any`/`Other`) can change the listing.
 fn listing_may_change(event: &Event, paths: &[&Path]) -> bool {
     let content_write = matches!(
         event.kind,
@@ -417,6 +464,12 @@ fn update_listing_incrementally(project: &dyn Project, event: &Event, paths: &[&
         EventKind::Create(CreateKind::File | CreateKind::Any)
             | EventKind::Remove(RemoveKind::File | RemoveKind::Any)
             | EventKind::Modify(ModifyKind::Name(_))
+            // Windows ReadDirectoryChangesW reports every in-place write as
+            // FILE_ACTION_MODIFIED, which notify maps to Modify(Any), for
+            // content and metadata writes alike (#14347). Decide the named
+            // path alone as for a create: an already-listed regular file keeps
+            // its membership, so the listing and its point lineage survive.
+            | EventKind::Modify(ModifyKind::Any)
     );
     membership_event
         && paths.iter().all(|path| {
@@ -444,7 +497,7 @@ enum GitInternalPath {
     /// blobs are live and which paths are tracked, so the workspace needs a
     /// full refresh even though no working-tree file was reported.
     RefState,
-    /// The index, its lockfile, objects, logs, and the rest: pure VCS churn
+    /// Index lockfiles, objects, logs, and the rest: pure VCS churn
     /// that the analyzer never reads. `git status` -- which every workspace
     /// listing runs -- writes `.git/index.lock` on each invocation, so
     /// treating this churn as a change is a self-sustaining walk loop.
@@ -456,6 +509,12 @@ enum GitInternalPath {
 const GIT_REF_STATE_FILE_NAMES: [&str; 4] = ["HEAD", "packed-refs", "MERGE_HEAD", "ORIG_HEAD"];
 const GIT_REFS_DIR_NAME: &str = "refs";
 const GIT_DIR_NAME: &str = ".git";
+
+fn git_index_path(project: &dyn Project) -> Option<PathBuf> {
+    let repo = brokk_bifrost_core::gitblob::discover(project.root())?;
+    let index = repo.index().ok()?;
+    Some(index.path()?.to_path_buf().normalize())
+}
 
 fn git_info_directory(project: &dyn Project) -> Option<PathBuf> {
     brokk_bifrost_core::gitblob::discover(project.root())
@@ -485,20 +544,23 @@ fn git_internal_disposition(project: &dyn Project, path: &Path) -> Option<GitInt
     let mut components = rel_path.components();
     components.find(|component| component.as_os_str() == GIT_DIR_NAME)?;
 
+    Some(git_directory_entry_disposition(components.as_path()))
+}
+
+fn git_directory_entry_disposition(relative: &Path) -> GitInternalPath {
+    let mut components = relative.components();
     let Some(entry) = components.next() else {
-        // The `.git` entry itself. A repository appearing or disappearing also
-        // creates or removes its `HEAD`, which is ref state below, so this
-        // event carries nothing of its own.
-        return Some(GitInternalPath::Churn);
+        return GitInternalPath::Churn;
     };
     let entry = entry.as_os_str();
-    if entry == GIT_REFS_DIR_NAME {
-        return Some(GitInternalPath::RefState);
+    if entry == GIT_REFS_DIR_NAME
+        || (components.next().is_none()
+            && GIT_REF_STATE_FILE_NAMES.iter().any(|name| entry == *name))
+    {
+        GitInternalPath::RefState
+    } else {
+        GitInternalPath::Churn
     }
-    if components.next().is_none() && GIT_REF_STATE_FILE_NAMES.iter().any(|name| entry == *name) {
-        return Some(GitInternalPath::RefState);
-    }
-    Some(GitInternalPath::Churn)
 }
 
 enum PathDisposition {
@@ -524,6 +586,10 @@ fn classify_project_path(
     }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
+    // Ignore-input delivery precedes filtering; the analyzer owns membership rebuilds.
+    if is_bifrost_ignore_path(project, &path) {
+        return PathDisposition::ProjectFile(file);
+    }
     match project.is_bifrostignored(rel_path) {
         Ok(true) => return PathDisposition::IgnoredInternal,
         Ok(false) => {}
@@ -592,6 +658,11 @@ fn watch_project_paths(
         // Setup never creates watched directories; owner-side re-arming uses
         // this same resolution after directory creation or replacement.
         configuration_directories.insert(existing_exclude_watch_directory(&info)?);
+    }
+    if let Some(index) = git_index_path(project) {
+        configuration_directories.insert(existing_exclude_watch_directory(
+            index.parent().expect("index has a parent"),
+        )?);
     }
     for directory in configuration_directories {
         if !recursive_roots
@@ -930,12 +1001,13 @@ mod tests {
     }
 
     #[test]
-    fn bifrostignore_events_require_a_full_refresh() {
+    fn bifrostignore_events_report_listing_changes() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
         let path = project.root().join(BIFROST_IGNORE_FILE_NAME);
         for kind in [
             EventKind::Create(CreateKind::File),
             EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
             EventKind::Remove(RemoveKind::File),
         ] {
             let pending = Arc::new(Mutex::new(PendingChanges::default()));
@@ -947,8 +1019,12 @@ mod tests {
             );
 
             let state = pending.lock().unwrap();
-            assert!(state.files.is_empty());
-            assert!(state.requires_full_refresh);
+            assert!(
+                state
+                    .files
+                    .contains(&ProjectFile::new(project.root(), BIFROST_IGNORE_FILE_NAME))
+            );
+            assert!(!state.requires_full_refresh);
         }
     }
 
@@ -1043,13 +1119,8 @@ mod tests {
                 .add_path(exclude.clone()),
         );
         let state = pending.lock().unwrap();
-        assert!(
-            state.files.contains(&ProjectFile::new(
-                &root,
-                exclude.strip_prefix(&root).unwrap()
-            )),
-            "exclude event must survive the empty-change return"
-        );
+        assert!(state.revalidate_listing);
+        assert!(state.files.is_empty());
         assert!(!state.requires_full_refresh);
         // This is the maintenance entry used by the next explicit update.
         project.revalidate_symlink_omissions(&state.files.iter().cloned().collect());
@@ -1060,6 +1131,110 @@ mod tests {
                 .contains(&ProjectFile::new(&root, "main.rs"))
         );
         assert_eq!(cache.walk_count(), walks + 1);
+    }
+
+    #[test]
+    #[hardwon("#13071: index-only membership changes never scheduled watcher updates")]
+    #[hardwon("#14279: a raw symlinked TMPDIR root diverged from the canonical listing cache root")]
+    fn ignore_membership_real_index_watch_and_settle() {
+        if !brokk_bifrost_core::analyzer::project::rerun_test_with_symlinked_tempdir(
+            "project_watcher::tests::ignore_membership_real_index_watch_and_settle",
+            "BIFROST_ISSUE_14279_PROJECT_WATCHER_CHILD",
+        ) {
+            return;
+        }
+        use crate::WorkspaceFileListingCache;
+        use brokk_bifrost_core::analyzer::project::{
+            IgnoreTestEnvironment, age_ignore_test_inputs,
+        };
+        let temp = TempDir::new().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap().normalize();
+        git2::Repository::init(&root).unwrap();
+        fs::write(root.join(".gitignore"), "*.rs\n").unwrap();
+        fs::write(root.join("ignored.rs"), "fn f() {}\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::with_cached_listing(&root, cache.clone()).unwrap());
+        cache.files().unwrap();
+        let watcher = ProjectChangeWatcher::start(project.clone()).unwrap();
+        for (args, listed) in [
+            (vec!["add", "-f", "ignored.rs"], true),
+            (vec!["rm", "--cached", "ignored.rs"], false),
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if watcher.take_changed_files().revalidate_listing {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "index event never scheduled update"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Let atomic-replacement notifications coalesce before consuming.
+            std::thread::sleep(Duration::from_millis(200));
+            watcher.take_changed_files();
+            project.revalidate_symlink_omissions(&Default::default());
+            assert_eq!(
+                project
+                    .all_files()
+                    .unwrap()
+                    .contains(&ProjectFile::new(&root, "ignored.rs")),
+                listed
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            let delta = watcher.take_changed_files();
+            assert!(
+                !delta.requires_full_refresh && !delta.revalidate_listing && delta.files.is_empty(),
+                "{delta:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#13071: external index lockfiles must not turn receipt checks into full refreshes")]
+    fn ignore_membership_external_index_lock_is_churn() {
+        let (_temp, repo) = exclude_watch_fixture();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("src/main.rs")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        let linked = repo.workdir().unwrap().parent().unwrap().join("linked");
+        repo.worktree("linked-index", &linked, None).unwrap();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(&linked).unwrap());
+        let index = super::git_index_path(project.as_ref()).unwrap();
+        assert!(!index.starts_with(project.root()));
+        for (name, revalidate, full) in [
+            ("index.lock", false, false),
+            ("index", true, false),
+            ("HEAD", false, true),
+        ] {
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+            handle_event(
+                &project,
+                &AnalyzerOwnedPaths::new(project.root()),
+                &pending,
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(index.with_file_name(name)),
+            );
+            let state = pending.lock().unwrap();
+            assert_eq!(state.revalidate_listing, revalidate, "{name}");
+            assert_eq!(state.requires_full_refresh, full, "{name}");
+            assert!(state.files.is_empty(), "{name}");
+        }
     }
 
     fn exclude_watch_fixture() -> (TempDir, git2::Repository) {
@@ -1078,12 +1253,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let pending = watcher.pending.lock().unwrap();
-            let received = match exclude.strip_prefix(selected) {
-                Ok(relative) => pending
-                    .files
-                    .contains(&ProjectFile::new(selected, relative)),
-                Err(_) => pending.requires_full_refresh,
-            };
+            let received = pending.revalidate_listing;
             if received {
                 break;
             }
@@ -1125,10 +1295,10 @@ mod tests {
     #[test]
     #[hardwon("#12752: a git info directory created after watcher start was never watched")]
     fn ignore_membership_real_info_directory_recreation() {
-        fn drain(watcher: &mut ProjectChangeWatcher, expected: &ProjectFile) {
+        fn drain(watcher: &mut ProjectChangeWatcher, _expected: &ProjectFile) {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
-                if watcher.pending.lock().unwrap().files.contains(expected) {
+                if watcher.pending.lock().unwrap().revalidate_listing {
                     break;
                 }
                 assert!(
@@ -1139,7 +1309,7 @@ mod tests {
             }
             watcher.rearm_exclude_watch().unwrap();
             let delta = watcher.take_changed_files();
-            assert!(delta.files.contains(expected), "{delta:?}");
+            assert!(delta.revalidate_listing, "{delta:?}");
         }
         let (_temp, repo) = exclude_watch_fixture();
         let root = repo.workdir().unwrap();
@@ -1170,10 +1340,17 @@ mod tests {
     #[hardwon(
         "fe0249334d3c: watcher scans could outrun a content edit and leave the request stale"
     )]
+    #[hardwon(
+        "#14347: Windows reports every content write as Modify(Any), which dropped the cached listing"
+    )]
     fn content_writes_keep_the_cached_listing_and_still_report_the_file() {
         use crate::WorkspaceFileListingCache;
         use notify::event::DataChange;
 
+        // Host-global Git input parents can churn while other workers build.
+        let home = TempDir::new().unwrap();
+        let _environment =
+            brokk_bifrost_core::analyzer::project::IgnoreTestEnvironment::new(home.path());
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -1226,6 +1403,9 @@ mod tests {
         for kind in [
             EventKind::Modify(ModifyKind::Data(DataChange::Content)),
             EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            // ReadDirectoryChangesW reports FILE_ACTION_MODIFIED as
+            // Modify(Any) on Windows, for content and metadata writes alike.
+            EventKind::Modify(ModifyKind::Any),
         ] {
             handle_event(
                 &project,
@@ -1358,7 +1538,6 @@ mod tests {
     fn git_churn_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         vec![
             root.join(".git/index.lock"),
-            root.join(".git/index"),
             root.join(".git/objects/ab/cdef"),
             root.join(".git/logs/HEAD"),
             root.join(".git"),
@@ -1599,7 +1778,12 @@ mod tests {
             "Git's index bookkeeping must not make the watcher walk the workspace"
         );
         let delta = watcher.take_changed_files();
-        assert_eq!(delta, super::ChangeDelta::default());
+        assert!(delta.files.is_empty());
+        assert!(
+            delta.revalidate_listing,
+            "staging changed index membership; the owner must validate its receipt"
+        );
+        assert!(!delta.requires_full_refresh);
     }
 
     #[test]
@@ -1859,7 +2043,7 @@ mod tests {
 /// (file set, full-refresh flag): set union on the files, sticky OR on the
 /// flag, and `take_changed_files` is its only drain. Everything the watcher
 /// does between a raw `notify::Event` and that pair -- the `.git` split that
-/// broke the #1848 feedback loop, the `.bifrostignore` short circuit, the
+/// broke the #1848 feedback loop, ignore-input delivery, the
 /// internal-state exemption, the refresh fallback for paths the incremental
 /// update cannot name -- must preserve that algebra no matter what order the
 /// operating system delivers events in, or how often it repeats one.
@@ -1936,9 +2120,8 @@ mod pending_changes_properties {
     /// file name alone, so neither has to exist for the event to be real.
     const BIFROST_IGNORE_RELATIVE_PATHS: [&str; 2] = [".bifrostignore", "src/.bifrostignore"];
     /// Git bookkeeping the analyzer never reads (issue #1848).
-    const GIT_CHURN_RELATIVE_PATHS: [&str; 5] = [
+    const GIT_CHURN_RELATIVE_PATHS: [&str; 4] = [
         ".git",
-        ".git/index",
         ".git/index.lock",
         ".git/objects/ab/cdef",
         ".git/logs/HEAD",
@@ -1979,6 +2162,7 @@ mod pending_changes_properties {
         ProjectChangeWatcher {
             _watcher: WatcherBackend::Poll { _watcher: watcher },
             exclude_directory: None,
+            index_directory: None,
             recursive_exclude_ancestor: None,
             pending: Arc::new(Mutex::new(PendingChanges::default())),
         }
@@ -2027,6 +2211,10 @@ mod pending_changes_properties {
                 Self::Source(index) => Some(ProjectFile::new(
                     root.to_path_buf(),
                     SOURCE_RELATIVE_PATHS[index],
+                )),
+                Self::BifrostIgnore(index) => Some(ProjectFile::new(
+                    root.to_path_buf(),
+                    BIFROST_IGNORE_RELATIVE_PATHS[index],
                 )),
                 Self::Config(index) => Some(ProjectFile::new(
                     root.to_path_buf(),
@@ -2274,20 +2462,10 @@ mod pending_changes_properties {
                 return;
             }
 
-            // A `.bifrostignore` edit changes what the whole workspace
-            // analyzes, whatever else the event named and whatever kind it is.
-            if remaining
-                .iter()
-                .any(|target| matches!(target, Target::BifrostIgnore(_)))
-            {
-                self.requires_full_refresh = true;
-                return;
-            }
-
             let mut saw_unrepresentable_path = false;
             for target in remaining {
                 match target {
-                    Target::Source(_) | Target::Config(_) => {
+                    Target::Source(_) | Target::Config(_) | Target::BifrostIgnore(_) => {
                         self.files.insert(
                             target
                                 .project_file(root)
@@ -2300,7 +2478,7 @@ mod pending_changes_properties {
                     // A directory, the root itself, and anything outside the
                     // root are all paths an incremental update cannot name.
                     Target::Directory(_) | Target::OutsideRoot => saw_unrepresentable_path = true,
-                    Target::GitChurn(_) | Target::GitRefState(_) | Target::BifrostIgnore(_) => {
+                    Target::GitChurn(_) | Target::GitRefState(_) => {
                         unreachable!("handled above: {target:?}")
                     }
                 }

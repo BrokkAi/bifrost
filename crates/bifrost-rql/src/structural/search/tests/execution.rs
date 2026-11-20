@@ -311,7 +311,7 @@ fn python_procedure_inventory_respects_class_body_ownership_holes() {
     assert_eq!(result.results.len(), 2, "{result:#?}");
     assert_eq!(result.diagnostics.len(), 1, "{result:#?}");
     assert_eq!(
-        result.diagnostics[0].code,
+        result.diagnostics.semantic()[0].code,
         CodeQueryDiagnosticCode::NoEnclosingProcedure,
         "{result:#?}"
     );
@@ -550,7 +550,7 @@ fn go_function_value_proof_distinguishes_unsupported_content_from_cancellation()
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| { diagnostic.incompleteness == Incompleteness::Content })
+            .any(|diagnostic| { diagnostic.incompleteness() == Incompleteness::Content })
     );
 
     let start_byte = source.find("f() }").expect("named function-value call");
@@ -696,11 +696,12 @@ func recovered() { fallible( }
     }));
 }
 
-#[test]
-fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
+fn java_result_obligation_workspace() -> (
+    super::inline_project::BuiltInlineTestProject,
+    crate::analyzer::WorkspaceAnalyzer,
+) {
     use crate::analyzer::{
-        DependencyPackEcosystem, DependencyPackWorkspaceContext, JvmAnalyzerConfig,
-        JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
+        JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
         JvmStandardLibraryDiscoveryConfig,
     };
     use std::io::Write;
@@ -822,7 +823,47 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
         },
         ..AnalyzerConfig::default()
     };
-    let workspace = project.workspace_analyzer(config.clone());
+    let workspace = project.workspace_analyzer(config);
+    (project, workspace)
+}
+
+fn activate_java_result_obligation_workspace(
+    workspace: &crate::analyzer::WorkspaceAnalyzer,
+    catalog: &SemanticPackCatalog,
+) {
+    use crate::analyzer::{DependencyPackEcosystem, DependencyPackWorkspaceContext};
+    let activation = workspace.activate_dependency_packs(
+        workspace
+            .config()
+            .expect("immutable workspace configuration"),
+        &[DependencyPackEcosystem::Jvm],
+        DependencyPackWorkspaceContext {
+            catalog,
+            persistence: None,
+            activation: &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+                approximate_standard_libraries: Vec::new(),
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+                evidence: Vec::new(),
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            limits: DependencyPackLimits::default(),
+            cancellation: &CancellationToken::default(),
+        },
+    );
+    assert!(
+        matches!(
+            activation.runtime,
+            Some(SemanticModelRuntimeOutcome::Ready { .. })
+        ),
+        "JDK source binding and pack activation: {activation:#?}"
+    );
+}
+
+#[test]
+fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
+    let (_project, workspace) = java_result_obligation_workspace();
     let pack = compile_source(
         SourceFormat::Json,
         br#"{
@@ -861,32 +902,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
             },
         )
         .expect("register reviewed pack");
-    let activation = workspace.activate_dependency_packs(
-        workspace
-            .config()
-            .expect("immutable workspace configuration"),
-        &[DependencyPackEcosystem::Jvm],
-        DependencyPackWorkspaceContext {
-            catalog: &catalog,
-            persistence: None,
-            activation: &SemanticModelActivationRequest {
-                approximate_standard_libraries: Vec::new(),
-                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
-                evidence: Vec::new(),
-                controls: Vec::new(),
-                limits: SemanticModelRuntimeLimits::default(),
-            },
-            limits: DependencyPackLimits::default(),
-            cancellation: &CancellationToken::default(),
-        },
-    );
-    assert!(
-        matches!(
-            activation.runtime,
-            Some(SemanticModelRuntimeOutcome::Ready { .. })
-        ),
-        "JDK source binding and pack activation: {activation:#?}"
-    );
+    activate_java_result_obligation_workspace(&workspace, &catalog);
 
     let query =
         CodeQuery::from_source(r#"(call-result-obligations (call-shape (call :callee "trim")))"#)
@@ -967,6 +983,105 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
         &filter,
     );
     assert_eq!(filtered.results.len(), 2, "{}", filtered.render_text());
+}
+
+#[test]
+fn java_result_obligation_without_registered_pack_has_no_obligations() {
+    let (_project, workspace) = java_result_obligation_workspace();
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    activate_java_result_obligation_workspace(&workspace, &catalog);
+    let query =
+        CodeQuery::from_source(r#"(call-result-obligations (call-shape (call :callee "trim")))"#)
+            .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let mut table = Vec::new();
+    for item in &result.results {
+        let CodeQueryResultValue::CallResultObligation { value } = &item.value else {
+            panic!("{item:#?}");
+        };
+        assert!(value.obligation_kind.is_none(), "{value:#?}");
+        assert!(value.pack_id.is_none(), "{value:#?}");
+        assert!(value.provenance.is_none(), "{value:#?}");
+        if value.path == "src/Arguments.java" {
+            assert_ne!(value.result_use, "unknown", "{value:#?}");
+        }
+        table.push((
+            value.path.as_str(),
+            value.result_use,
+            value.coverage,
+            value.reason,
+        ));
+    }
+    assert_eq!(
+        table,
+        [
+            (
+                "src/App.java",
+                "discarded",
+                "open",
+                Some("model_unavailable")
+            ),
+            ("src/App.java", "other_context", "exhaustive", None),
+            (
+                "src/App.java",
+                "discarded",
+                "open",
+                Some("model_unavailable")
+            ),
+            (
+                "src/Arguments.java",
+                "discarded",
+                "open",
+                Some("model_unavailable")
+            ),
+            ("src/Arguments.java", "other_context", "exhaustive", None),
+            (
+                "src/Lambdas.java",
+                "discarded",
+                "open",
+                Some("model_unavailable")
+            ),
+            ("src/Lambdas.java", "other_context", "exhaustive", None),
+            (
+                "src/SourceTargets.java",
+                "other_context",
+                "exhaustive",
+                None
+            ),
+            (
+                "src/SourceTargets.java",
+                "discarded",
+                "open",
+                Some("model_unavailable")
+            ),
+            ("src/Streams.java", "other_context", "exhaustive", None),
+            (
+                "src/Streams.java",
+                "discarded",
+                "open",
+                Some("model_unavailable")
+            ),
+            (
+                "src/Virtual.java",
+                "discarded",
+                "open",
+                Some("target_unresolved")
+            ),
+        ]
+    );
+    // These are precisely the six discarded sites with pack obligations in
+    // the guard. Every one loses its model proof when the pack is absent.
+    assert_eq!(
+        table
+            .iter()
+            .filter(|row| row.3 == Some("model_unavailable"))
+            .count(),
+        6
+    );
 }
 
 #[test]
@@ -1148,7 +1263,7 @@ fn rust_binding_access_keeps_macro_and_format_capture_evidence() {
             result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains(path)),
+                .any(|diagnostic| diagnostic.message().contains(path)),
             "{path}: {}",
             result.render_text()
         );
@@ -1687,7 +1802,7 @@ fn rust_single_glob_binder_diagnostic_does_not_claim_disagreeing_alternatives() 
     );
     assert!(
         result.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
+            .message()
             .contains("a binder identity could not be proven")),
         "{}",
         result.render_text()
@@ -2139,8 +2254,8 @@ fn python_binding_difference_is_incomplete_for_unresolved_or_dynamic_scope_reads
         );
         assert!(
             result.diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
-                    && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+                diagnostic.code() == CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
+                    && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete
             }),
             "incomplete scope must retain a typed diagnostic for {read}: {:?}",
             result.diagnostics
@@ -2740,7 +2855,7 @@ fn sequential_union_charges_shared_scan_file_extraction_once() {
         detailed.result.diagnostics
     );
     assert!(!detailed.result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
     }));
     assert_eq!(detailed.result.results.len(), 2);
     assert_eq!(detailed.work.fact_nodes, probe_run.work.fact_nodes);
@@ -3086,7 +3201,7 @@ fn profile_does_not_call_a_terminal_cap_seed_cache_complete() {
             .result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ResultLimitReached)
+            .filter(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::ResultLimitReached)
             .count(),
         1,
         "exactly one truncation diagnostic, no double report: {:?}",
@@ -3762,7 +3877,7 @@ fn sequential_union_retries_a_starved_first_branch() {
     );
     assert!(
         !detailed.result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
         }),
         "{:?}",
         detailed.result.diagnostics
@@ -3808,7 +3923,7 @@ fn sequential_union_retry_keeps_reporting_genuine_exhaustion() {
     assert!(detailed.result.truncated);
     assert!(
         detailed.result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
         }),
         "{:?}",
         detailed.result.diagnostics
@@ -5256,6 +5371,7 @@ fn execute_conditional_result_contract_files_with_operation(
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
@@ -5266,7 +5382,8 @@ fn execute_conditional_result_contract_files_with_operation(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -6256,8 +6373,8 @@ fn c_assignment_relations_report_configuration_and_recovery_as_incomplete() {
         if matches!(name, "configured" | "macro_wrapped") {
             assert!(
                 result.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == CodeQueryDiagnosticCode::EffectDerivationIncomplete
-                        && diagnostic.message.contains("preprocessing_present")
+                    diagnostic.code() == CodeQueryDiagnosticCode::EffectDerivationIncomplete
+                        && diagnostic.message().contains("preprocessing_present")
                 }),
                 "content configuration gaps must retain their diagnostic class: {result:#?}"
             );
@@ -7422,6 +7539,7 @@ func earlyUse() string {
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
@@ -7432,7 +7550,8 @@ func earlyUse() string {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -7577,7 +7696,7 @@ func earlyUse() string {
     assert!(execution.work.semantic.request_cache_hits > 0);
     assert!(
         result.diagnostics.iter().all(|diagnostic| {
-            diagnostic.code != CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            diagnostic.code() != CodeQueryDiagnosticCode::SemanticBudgetExhausted
         }),
         "cached full result-contract dispatch must fit its exact calibrated ledger: {result:#?}"
     );
@@ -7663,7 +7782,7 @@ fn union_query_over_root_limit_reports_exactly_one_truncation_diagnostic() {
             .result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ResultLimitReached)
+            .filter(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::ResultLimitReached)
             .count(),
         1,
         "exactly one truncation diagnostic, no double report: {:?}",
@@ -7709,7 +7828,7 @@ fn a_truncated_query_reports_identical_diagnostics_on_every_run() {
         first
             .diagnostics
             .iter()
-            .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+            .map(|diagnostic| (diagnostic.code(), diagnostic.message()))
             .collect::<Vec<_>>(),
         vec![(
             CodeQueryDiagnosticCode::ResultLimitReached,
@@ -7878,6 +7997,7 @@ fn enclosing_decl_keeps_nested_source_filters_out_of_model_augmentation() {
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
@@ -7888,7 +8008,8 @@ fn enclosing_decl_keeps_nested_source_filters_out_of_model_augmentation() {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -8195,9 +8316,9 @@ fn python_duplicate_dictionary_keys_compare_decoded_literals_and_mark_unknowns_i
     assert_eq!(keys, ["\"s\\x61me\"", "1", "16", "None"]);
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
-                && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
-                && diagnostic.message.contains("unsupported")
+            diagnostic.code() == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+                && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete
+                && diagnostic.message().contains("unsupported")
         }),
         "{}",
         result.render_text()
@@ -8472,6 +8593,7 @@ fn activate_type_flow_builtins(workspace: &WorkspaceAnalyzer) {
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
@@ -8485,7 +8607,8 @@ fn activate_type_flow_builtins(workspace: &WorkspaceAnalyzer) {
                 }),
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -8758,6 +8881,7 @@ func BoxField() (Box[int], bool) { return Box[int]{}, false }
             targets: Vec::new(),
             configurations: Vec::new(),
             artifact_sha256: None,
+            production_input_digest: None,
         }],
         provenance: Provenance {
             rust_artifact_approximation: None,
@@ -8929,6 +9053,7 @@ func BoxField() (Box[int], bool) { return Box[int]{}, false }
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -8939,7 +9064,8 @@ func BoxField() (Box[int], bool) { return Box[int]{}, false }
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),
@@ -9287,7 +9413,7 @@ fn field_slot_profile_reopens_persisted_index_without_rebuild_or_republication()
     for result in [&cold.result, &warm.result] {
         assert!(
             result.diagnostics.iter().all(|diagnostic| !matches!(
-                diagnostic.code,
+                diagnostic.code(),
                 CodeQueryDiagnosticCode::Cancelled
                     | CodeQueryDiagnosticCode::SemanticProviderFailed
             )),
@@ -9831,7 +9957,7 @@ fn root_result_persistence_store_failure_falls_back_without_mutating_durable_row
             .diagnostics
             .iter()
             .all(|diagnostic| !matches!(
-                diagnostic.code,
+                diagnostic.code(),
                 CodeQueryDiagnosticCode::Cancelled
                     | CodeQueryDiagnosticCode::SemanticProviderFailed
             ))
@@ -9966,7 +10092,8 @@ fn root_result_persistence_corrupt_and_overcap_rows_fall_back_and_repair_atomica
 }
 
 #[test]
-fn field_slot_store_failure_falls_back_without_publishing_a_memory_hit() {
+#[hardwon("#11775: a store failure must not leave an authoritative class-set root")]
+fn field_slot_store_failure_refuses_root_without_publishing_a_memory_hit() {
     let project = InlineTestProject::with_language(Language::Python)
         .with_git()
         .file("app.py", TYPE_FLOW_PURPOSE_FIXTURE)
@@ -10014,7 +10141,30 @@ fn field_slot_store_failure_falls_back_without_publishing_a_memory_hit() {
     let CodeQueryResponse::Profile(failed_store) = failed_store else {
         panic!("profile-mode query returns a profile");
     };
+    // Field-slot fallback can recompute locally, but #11775 refuses the failed
+    // root. Only the fresh request after disabling the fault may publish rows.
+    assert!(
+        matches!(
+            failed_store.result.completion(),
+            CodeQueryCompletion::Incomplete { ref codes }
+                if codes.contains(&CodeQueryDiagnosticCode::SemanticProviderFailed)
+        ),
+        "{failed_store:#?}"
+    );
+    assert!(
+        failed_store.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code() == CodeQueryDiagnosticCode::SemanticProviderFailed
+                && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete
+                && matches!(
+                    diagnostic.incompleteness(),
+                    Incompleteness::Operational(DerivationExecutionCause::Provider)
+                )
+        }),
+        "{failed_store:#?}"
+    );
+    assert!(failed_store.result.results.is_empty(), "{failed_store:#?}");
     let failed_work = failed_store.work.semantic.type_flow;
+    assert_eq!(failed_work.root_result_publications, 0, "{failed_work:#?}");
     assert_eq!(failed_work.field_slot_builds, 1, "{failed_work:#?}");
     assert_eq!(failed_work.field_slot_memory_hits, 0, "{failed_work:#?}");
     assert_eq!(
@@ -10035,9 +10185,10 @@ fn field_slot_store_failure_falls_back_without_publishing_a_memory_hit() {
     let CodeQueryResponse::Profile(recovered) = recovered else {
         panic!("profile-mode query returns a profile");
     };
+    assert_eq!(recovered.result.completion(), CodeQueryCompletion::Complete);
     assert_eq!(
-        serde_json::to_value(&failed_store.result.results).expect("fallback rows serialize"),
-        serde_json::to_value(&recovered.result.results).expect("recovered rows serialize")
+        serde_json::to_value(&recovered.result.results).expect("recovered rows serialize"),
+        serde_json::to_value(&cold.result.results).expect("cold rows serialize")
     );
     let recovered = recovered.work.semantic.type_flow;
     assert_eq!(recovered.field_slot_builds, 0, "{recovered:#?}");
@@ -10104,7 +10255,7 @@ fn semantic_scan_work_does_not_exhaust_the_resident_point_grant() {
             .result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted),
+            .any(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::SemanticBudgetExhausted),
         "no false budget diagnostic is raised: {profile:#?}"
     );
     assert!(profile.work.semantic.resident_peaks.program_points <= 30);
@@ -11074,6 +11225,392 @@ fn rust_scope_only_await_reads_follow_lexical_scope_and_move_paths() {
 }
 
 #[test]
+#[hardwon(
+    "#14156: releasing a semantic artifact between sibling flow operands rematerialized its native handle rows"
+)]
+fn sibling_native_flow_operands_keep_their_artifact_registered() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn selected(mut value: i32) { value = 2; consume(value); }\nfn consume(_: i32) {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let events = "(state-events-of (procedure-of (language rust (function :name \"selected\"))))";
+    let relations =
+        "(flow-relations-of (procedure-of (language rust (function :name \"selected\"))))";
+    let execute = |source: &str| {
+        let query = CodeQuery::from_source(source).expect("flow query");
+        super::super::execute_internal(
+            workspace.analyzer(),
+            Some(&workspace),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            false,
+        )
+    };
+    let mut expected = Vec::new();
+    let mut standalone_attempts = [0; 2];
+    for (index, operand) in [events, relations].into_iter().enumerate() {
+        let control = execute(operand);
+        standalone_attempts[index] = control.work.semantic.materialization_attempts;
+        // ProcedureOf first emits handle-free references from a file window.
+        // Its flow consumer then resolves those references just in time. That
+        // second acquisition precedes the native rows this test keeps alive.
+        assert_eq!(
+            control.work.semantic.materialization_attempts, 2,
+            "each independent operand acquires its reference window and native rows"
+        );
+        expected.extend(
+            control.result.results.iter().map(|row| {
+                serde_json::to_string(&row.value).expect("public flow value serializes")
+            }),
+        );
+    }
+    expected.sort();
+
+    for (index, (left, right)) in [(events, relations), (relations, events)]
+        .into_iter()
+        .enumerate()
+    {
+        // The left operand's real native rows must remain a holder while the
+        // other same-file flow consumer resolves its own semantic handles.
+        let execution = execute(&format!("(union {left} {right})"));
+        assert_eq!(
+            execution.work.semantic.materialization_attempts, standalone_attempts[index],
+            "the sibling reuses the allocation retained by native rows: {:#?}",
+            execution.result
+        );
+        assert!(
+            execution.work.semantic.materialization_attempts
+                < standalone_attempts.iter().copied().sum::<u64>(),
+            "the union avoids repeating independent operand acquisition"
+        );
+        assert_eq!(
+            execution.work.semantic.unique_materialized_files, 1,
+            "both operands address the same source file"
+        );
+        assert!(
+            execution
+                .result
+                .results
+                .iter()
+                .any(|row| matches!(&row.value, CodeQueryResultValue::StateEvent { .. })),
+            "state-event native payload is present: {:#?}",
+            execution.result
+        );
+        assert!(
+            execution
+                .result
+                .results
+                .iter()
+                .any(|row| matches!(&row.value, CodeQueryResultValue::FlowRelation { .. })),
+            "flow-relation native payload is present: {:#?}",
+            execution.result
+        );
+        let mut actual = execution
+            .result
+            .results
+            .iter()
+            .map(|row| serde_json::to_string(&row.value).expect("public flow value serializes"))
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "both public operand answers survive reuse"
+        );
+    }
+}
+
+#[test]
+fn cancellation_after_a_scoped_seed_stops_before_duplicate_reuse() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "subject.go",
+            "package subject\nfunc consume(value int) {}\nfunc selected(value int) { value = 2; consume(value) }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig {
+        parallelism: Some(1),
+        ..AnalyzerConfig::default()
+    });
+    let operand = "(state-events-of (procedure-of (language go (function :name \"selected\"))))";
+    let query = CodeQuery::from_source(&format!("(union {operand} {operand})"))
+        .expect("duplicate scoped flow seeds");
+    let execute = |cancellation: Option<&CancellationToken>| {
+        execute_internal(
+            workspace.analyzer(),
+            Some(&workspace),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            cancellation,
+            None,
+            true,
+        )
+    };
+    let baseline = execute(None);
+    assert_eq!(baseline.result.completion(), CodeQueryCompletion::Complete);
+    assert!(
+        baseline
+            .result
+            .results
+            .iter()
+            .any(|row| matches!(&row.value, CodeQueryResultValue::StateEvent { .. }))
+    );
+    let baseline_profile = baseline.profile.as_ref().expect("uncancelled seed profile");
+    let plan = serde_json::to_value(&baseline_profile.plan).expect("physical plan serializes");
+    let flow_nodes = plan["nodes"]
+        .as_array()
+        .expect("physical plan nodes")
+        .iter()
+        .filter(|node| node["logical_operator"]["step"]["op"] == "state_events_of")
+        .map(|node| node["physical_node"].clone())
+        .collect::<Vec<_>>();
+    let is_flow = |observation: &QueryOperatorProfile| {
+        flow_nodes.contains(
+            &serde_json::to_value(observation.node).expect("physical operator id serializes"),
+        )
+    };
+    let completed_seed = |execution: &DetailedCodeQueryResult| {
+        execution.profile.as_ref().is_some_and(|profile| {
+            profile.operators.iter().any(|observation| {
+                is_flow(observation)
+                    && observation.branch.as_slice() == [0]
+                    && observation.disposition == QueryOperatorDisposition::Completed
+                    && observation.input_rows == 1
+                    && observation.rows_visited == 1
+                    && observation.relation_expansions > 0
+                    && observation.output_rows > 0
+                    && !observation.result_cancelled
+                    && !observation.result_truncated
+            })
+        })
+    };
+    assert!(completed_seed(&baseline));
+    let baseline_flows = baseline_profile
+        .operators
+        .iter()
+        .filter(|observation| is_flow(observation))
+        .collect::<Vec<_>>();
+    assert_eq!(baseline_flows.len(), 2, "both duplicate seed operators run");
+    let prefix_rows = baseline_flows
+        .iter()
+        .find(|observation| observation.branch.as_slice() == [0])
+        .expect("the first seed emitted its completed prefix")
+        .output_rows;
+    assert!(baseline_flows.iter().any(|observation| {
+        observation.branch.as_slice() == [1]
+            && observation.disposition == QueryOperatorDisposition::Completed
+            && observation.relation_expansions > 0
+    }));
+
+    // The existing check-count token supplies a deterministic boundary without
+    // timing. Find the first allowance that lets branch 0 finish; its completed
+    // real flow rows mean the query-local paid scope is now cached. The next
+    // cancellation check must stop the duplicate before it can reuse that scope.
+    let probe = |checks| {
+        let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+        let execution = execute(Some(&cancellation));
+        let tripped = cancellation.cancel_after_checks_tripped_for_test();
+        (execution, tripped)
+    };
+    let mut before = 0;
+    let mut after = 1;
+    while !completed_seed(&probe(after).0) {
+        before = after;
+        after *= 2;
+        assert!(
+            after <= 65_536,
+            "the small fixture must finish its first seed"
+        );
+    }
+    while after - before > 1 {
+        let middle = before + (after - before) / 2;
+        if completed_seed(&probe(middle).0) {
+            after = middle;
+        } else {
+            before = middle;
+        }
+    }
+    let (cancelled, tripped) = probe(after);
+    assert!(tripped, "the calibrated token must actually cancel");
+    assert!(
+        completed_seed(&cancelled),
+        "cancellation follows a paid seed"
+    );
+    assert_eq!(
+        cancelled.result.completion(),
+        CodeQueryCompletion::Cancelled
+    );
+    assert!(cancelled.result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code() == CodeQueryDiagnosticCode::Cancelled
+            && diagnostic.incompleteness()
+                == Incompleteness::Operational(DerivationExecutionCause::Cancelled)
+    }));
+    let profile = cancelled.profile.as_ref().expect("cancelled seed profile");
+    let prefix = profile
+        .operators
+        .iter()
+        .find(|observation| is_flow(observation) && observation.branch.as_slice() == [0])
+        .expect("the paid first seed remains in the profile");
+    assert_eq!(prefix.output_rows, prefix_rows);
+    assert!(
+        profile
+            .operators
+            .iter()
+            .filter(|observation| { is_flow(observation) && observation.branch.as_slice() == [1] })
+            .all(|observation| {
+                observation.rows_visited == 0 && observation.relation_expansions == 0
+            }),
+        "the duplicate cannot consume the cached scope after cancellation"
+    );
+    // The completed prefix remains visible in operator observations. Existing
+    // cancellation stops rendering before publishing further public rows, and
+    // the set executor forwards the cancelled child rather than merging an
+    // earlier sibling, so this control does not demand a new prefix contract.
+}
+
+#[test]
+fn guard_sibling_keeps_lazy_control_expansions_in_one_artifact_window() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn selected(mut value: i32) -> i32 { while value < 10 { value += 1; } value }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig {
+        parallelism: Some(1),
+        ..AnalyzerConfig::default()
+    });
+    let procedure = "(procedure-of (language rust (function :name \"selected\")))";
+    let guards = format!("(guards-of {procedure})");
+    let controls = format!("(control-relations :relation [in-loop] {procedure})");
+    let explicit_controls = format!(
+        "(control-relations :relation [in-loop] :exit-partition [normal-and-exceptional] {procedure})"
+    );
+    let execute = |source: &str| {
+        let query = CodeQuery::from_source(source).expect("guard/control lifetime query");
+        super::super::execute_internal(
+            workspace.analyzer(),
+            Some(&workspace),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            true,
+        )
+    };
+    let mut expected = std::collections::BTreeSet::new();
+    let mut standalone_attempts = [0; 3];
+    for (index, operand) in [&guards, &controls, &explicit_controls]
+        .into_iter()
+        .enumerate()
+    {
+        let standalone = execute(operand);
+        assert_eq!(
+            standalone.result.completion(),
+            CodeQueryCompletion::Complete,
+            "standalone operand: {:#?}",
+            standalone.result
+        );
+        assert!(!standalone.result.results.is_empty());
+        standalone_attempts[index] = standalone.work.semantic.materialization_attempts;
+        expected.extend(standalone.result.results.iter().map(|row| {
+            serde_json::to_string(&row.value).expect("public guard/control value serializes")
+        }));
+    }
+
+    // The Guard operand holds the native allocation while two distinct control
+    // operators expand the same compact product. The second expansion can take
+    // its exclusive workspace only after the first iterator has dropped.
+    let execution = execute(&format!("(union {guards} {controls} {explicit_controls})"));
+    assert_eq!(
+        execution.result.completion(),
+        CodeQueryCompletion::Complete,
+        "{:#?}",
+        execution.result
+    );
+    assert_eq!(
+        execution.work.semantic.materialization_attempts, standalone_attempts[0],
+        "control siblings reuse the allocation already acquired for Guard rows"
+    );
+    assert!(
+        execution.work.semantic.materialization_attempts
+            < standalone_attempts.iter().copied().sum::<u64>(),
+        "sibling execution reuses work across independent operand contexts"
+    );
+    assert_eq!(execution.work.semantic.unique_materialized_files, 1);
+    assert!(
+        execution
+            .result
+            .results
+            .iter()
+            .any(|row| matches!(&row.value, CodeQueryResultValue::Guard { .. }))
+    );
+    assert!(
+        execution
+            .result
+            .results
+            .iter()
+            .any(|row| matches!(&row.value, CodeQueryResultValue::ControlRelation { .. }))
+    );
+    let actual = execution
+        .result
+        .results
+        .iter()
+        .map(|row| {
+            serde_json::to_string(&row.value).expect("public guard/control value serializes")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        actual, expected,
+        "all standalone public values survive reuse"
+    );
+
+    // Inspect executed operators, not just the authored union: duplicate public
+    // control rows alone cannot prove that two lazy expansions actually ran.
+    let profile = execution.profile.expect("lifetime execution profile");
+    let plan = serde_json::to_value(&profile.plan).expect("physical plan serializes");
+    let control_nodes = plan["nodes"]
+        .as_array()
+        .expect("physical plan nodes")
+        .iter()
+        .filter(|node| node["logical_operator"]["step"]["op"] == "control_relations")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        control_nodes.len(),
+        2,
+        "distinct authored control operators"
+    );
+    assert_ne!(
+        control_nodes[0]["physical_node"],
+        control_nodes[1]["physical_node"]
+    );
+    for node in control_nodes {
+        let invocations = profile
+            .operators
+            .iter()
+            .filter(|observation| {
+                serde_json::to_value(observation.node).expect("operator id serializes")
+                    == node["physical_node"]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(invocations.len(), 1, "one expansion invocation: {node:#?}");
+        let observation = invocations[0];
+        assert_eq!(observation.disposition, QueryOperatorDisposition::Completed);
+        assert_eq!(observation.input_rows, 1);
+        assert_eq!(observation.rows_visited, 1);
+        assert!(observation.relation_expansions > 0);
+        assert!(observation.output_rows > 0);
+        assert!(!observation.result_truncated);
+        assert!(!observation.result_cancelled);
+    }
+}
+
+#[test]
 fn rust_binding_initializer_call_rows_reuse_call_site_ast_identity() {
     use std::collections::HashSet;
 
@@ -11231,7 +11768,7 @@ fn unsafe_context_selects_rust_calls_and_reports_python_unsupported() {
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("unsafe-context")),
+            .any(|diagnostic| diagnostic.message().contains("unsafe-context")),
         "{result:#?}"
     );
 }
@@ -11272,7 +11809,7 @@ fn dispatch_file_operations_in_memory_multi_file_query_completes() {
 #[test]
 #[hardwon("#9559: cancellation from JVM row reads must reach the RQL diagnostic boundary")]
 fn jvm_reader_cancellation_reaches_query_diagnostics() {
-    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::acquire_eager_semantic_models_with_request_owner_for_test;
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::acquire_active_semantic_models;
     use brokk_bifrost_analysis::analyzer::store::model_catalog::CatalogRowReader;
     let root = tempfile::tempdir().unwrap();
     let analyzer = language_analyzer(
@@ -11281,21 +11818,21 @@ fn jvm_reader_cancellation_reaches_query_diagnostics() {
     );
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         bifrost_version: Version::new(0, 15, 1),
         approximate_standard_libraries: Vec::new(),
         evidence: Vec::new(),
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),
     };
-    let SemanticModelRuntimeOutcome::Ready { active, .. } =
-        acquire_eager_semantic_models_with_request_owner_for_test(
-            analyzer.as_ref(),
-            &catalog,
-            &request,
-            &CancellationToken::new(),
-            true,
-        )
-    else {
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
+        analyzer.as_ref(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::new(),
+    ) else {
         panic!("empty activation is ready")
     };
     let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer.as_ref());
@@ -11343,7 +11880,7 @@ fn jvm_reader_cancellation_reaches_query_diagnostics() {
             .result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled),
+            .any(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::Cancelled),
         "{:?}",
         detailed.result
     );
@@ -11584,7 +12121,7 @@ fn qualifying_type_union_keeps_unrelated_capability_diagnostics() {
             "{result:#?}"
         );
         assert!(
-            result.diagnostics.iter().any(|diagnostic| diagnostic.code
+            result.diagnostics.iter().any(|diagnostic| diagnostic.code()
                 == CodeQueryDiagnosticCode::UnsupportedStructuralFeature),
             "{result:#?}"
         );
@@ -11592,7 +12129,7 @@ fn qualifying_type_union_keeps_unrelated_capability_diagnostics() {
             !result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code
+                .any(|diagnostic| diagnostic.code()
                     == CodeQueryDiagnosticCode::QualifyingTypeUnresolved),
             "{result:#?}"
         );
@@ -11695,7 +12232,7 @@ fn qualifying_type_counts_compose_without_fabricating_role_coverage_gaps() {
             "{pattern}: {result:#?}"
         );
         assert!(
-            !result.diagnostics.iter().any(|diagnostic| diagnostic.code
+            !result.diagnostics.iter().any(|diagnostic| diagnostic.code()
                 == CodeQueryDiagnosticCode::StructuralRoleCoverageIncomplete),
             "{pattern}: {result:#?}"
         );
@@ -11742,12 +12279,12 @@ void MissingDocs(int value) {{ {body} }}
             .diagnostics
             .iter()
             .filter(|diagnostic| {
-                diagnostic.code == CodeQueryDiagnosticCode::QualifyingTypeUnresolved
+                diagnostic.code() == CodeQueryDiagnosticCode::QualifyingTypeUnresolved
             })
             .collect::<Vec<_>>();
         assert_eq!(unknown_sites.len(), usize::from(!complete), "{result:#?}");
         for diagnostic in unknown_sites {
-            let span = diagnostic.source.as_ref().unwrap();
+            let span = diagnostic.source().unwrap();
             assert_eq!(
                 &source[span.start_byte..span.end_byte],
                 "int value",

@@ -56,6 +56,7 @@ pub fn golden_source(path: &str, source: &str) -> String {
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn golden_value(text: String, operation: &SelectedResolutionOperation<'_, '_>) -> String {
     use crate::analyzer::resolution::{SharedNameId, SharedNameInterner};
     let names = operation.ready.shared_names();
@@ -1169,15 +1170,19 @@ impl OrderTrace {
         view: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
     ) -> Result<()> {
         let mut providers = Vec::new();
-        assert!(view.visit(selection.provenance, &mut || false, &mut |row| {
-            providers.push((
-                row.provider.clone(),
-                row.visit,
-                row.completion.clone(),
-                row.inventory_complete,
-            ));
-            Ok(())
-        })?);
+        assert!(view.visit_provenance_for_test(
+            selection.provenance,
+            &mut || false,
+            &mut |row| {
+                providers.push((
+                    row.provider.clone(),
+                    row.visit,
+                    row.completion.clone(),
+                    row.inventory_complete,
+                ));
+                Ok(())
+            }
+        )?);
         self.aggregates.push(OrderAggregate {
             owners: selection.owners.clone(),
             completion: selection.completion.clone(),
@@ -1584,7 +1589,6 @@ pub fn run_order_contract(
             max_targets: usize::MAX,
             max_summary_expansions: usize::MAX,
             max_resolution_rounds: usize::MAX,
-            max_scope_nodes: usize::MAX,
             max_hierarchy_order_steps: 0,
             ..ReceiverAnalysisBudget::default()
         },
@@ -1634,7 +1638,6 @@ pub fn run_order_contract(
             max_targets: usize::MAX,
             max_summary_expansions: usize::MAX,
             max_resolution_rounds: usize::MAX,
-            max_scope_nodes: usize::MAX,
             max_hierarchy_order_steps: 0,
             ..ReceiverAnalysisBudget::default()
         },
@@ -1655,7 +1658,6 @@ pub fn run_order_contract(
             max_targets: usize::MAX,
             max_summary_expansions: usize::MAX,
             max_resolution_rounds: usize::MAX,
-            max_scope_nodes: measured.scope,
             max_hierarchy_order_steps: 0,
             ..ReceiverAnalysisBudget::default()
         },

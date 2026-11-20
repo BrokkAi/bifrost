@@ -150,6 +150,7 @@
 12555-poem-size-limit-diagnostic
 12571-empty-selection-fail-open
 12288-python-generated-continuation
+10143-go-method-value-typestate
 11428-php-cross-file-allocation-lifetime
 11162-scala-external-intermediate-supertypes
 12936-call-binding-refusal-subjects
@@ -196,6 +197,102 @@
 13055-unsuffixed-integer-width
 13016-body-local-macro-inventory
 13087-rust-pattern-binding-captures
-13310-cq11-array-copy-elements
+13024-canonical-open-walk-diagnostics
+12769-typestate-transfers
+13034-ownership-formal-contract
+13098-abstained-event-parity
 13365-rust-array-copy-allocation
+9559-external-selection-read-keys
+11997-class-set-request-store-failure
+10858-inherited-member-type-shadowing
+12640-shared-java-sam
+# Relation rows are admitted by provenance before model composition, changing composed answers (#11884).
+11884-provenance-admission-before-composition
+12410-producer-diagnostic-causes
+12410-coverage-operational-causes
+13145-reverse-batch-round-budget
+13215-endpoint-role-unresolved
+13310-cq11-array-copy-elements
 13312-inferred-integer-literal-facts
+10572-java-model-final-bound-unknown
+# Certified activation replaces provisional JVM inventory under the same identity.
+12744-explicit-scan-limits
+13492-failed-listing-no-previous-heads
+13500-rebind-fallback-locators
+12834-java-lazy-external-acquisition
+13340-evidence-read-key
+11424-java-formal-array-conversions
+12245-certified-replaces-uncertified-publication
+7314-m6a3h-nominal-hierarchy
+# Separate raw consumed evidence from composite production identity.
+11374-raw-artifact-activation-evidence
+13491-inherited-external-member-types
+
+# Require a complete canonical crate identity for a qualified standard Result proof.
+13559-standard-result-root-identity
+
+# Account each typestate event once per call edge and bind events on a snapshot of the subject value definitively.
+13747-typestate-event-accounting
+
+# Drop the uncaught edge of a Java try whose catch clause names java.lang.Throwable from summary tabulation and snapshots.
+13770-java-total-catch-infeasible-edge
+# Assignment relations: a binding read used only as a memory-access base is not the assigned value, and open candidate coverage no longer blocks a binding-to-binding same-evaluation proof.
+11031-assignment-rhs-address-reads
+13276-csharp-precise-global-using-keys
+13212-guards-coverage-incomplete
+13216-no-scope-refusal
+
+# Render typestate and selected-property diagnostics without the workspace mount digest.
+13775-stable-locator-diagnostics
+# Rust usage answers nominate files whose open reference frontier may name the target, so RQL usage completeness can change for unchanged inputs.
+13858-usage-absence-open-frontiers
+13540-expected-result-coercion
+13216-no-scope-allowance
+12964-impl-anonymous-owners
+13216-control-relations-work-telemetry
+13444-holder-call-interference
+13146-pattern-binder-types
+14133-jdk-member-type-absence
+12846-shared-override-claim
+12856-persisted-external-summary-wording
+12856-preserve-partial-external-continuations
+12363-unbounded-nested-entries
+13901-source-byte-admission
+14210-dominated-meeting-witnesses
+12568-exact-authored-continuation
+13259-std-macro-audit-extension
+12681-overlay-membership-hit-replay
+# Root units record the open class-initialization gap of Java static and constructor calls.
+13668-java-class-initialization-gap
+# Taint selects a keyword call-binding actual by its keyword, not its group-local index.
+14211-ruby-keyword-sink-operand
+11269-guard-value-barriers
+11269-guard-comparison-proof-v2
+13916-rust-inherent-member-selection
+14073-global-operational-family-open
+14068-selector-semantic-projection
+14156-procedure-scoped-flow
+11296-java-family-closure
+9431-lifecycle-coverage-covered
+13211-slice-b-struct-literal-property-events
+14120-field-slot-owned-admission
+14297-exact-artifact-selector-proof
+12734-trait-nomination-completeness
+14210-bound-endpoint-dedupe-and-baseline-meeting-skip
+14295-call-binding-selection-call-span
+14259-java-method-result-cast-coverage
+14077-shard-digest-provenance-revision
+13400-target-root-unavailable
+13400-same-package-unavailable-library
+13400-manifest-binding-intervals
+13539-taint-cause-inventory
+# Taint barrier refinement dropped Store-write interior hops, so evaluated findings on Store-mediated paths with barriers were missing.
+14275-store-write-barrier-observation
+12159-closure-signatures
+# A Java constructor's reviewed fresh-allocation summary now makes its typestate subject fresh, so unrelated unmodeled calls no longer abstain it.
+14542-constructor-fresh-result
+# Java ++/-- field writes now count as writes for java/non-final-immutable-field and are located by field_writes_of, so findings and rows change for unchanged source.
+14563-java-update-expression-writes
+14581-python-lock-model-activation
+# A relational assertion row whose filter explicitly selects an undecided label is now may evidence, so treat-may-as-finding publishes it as possible instead of definite.
+14547-undecided-selections-possible

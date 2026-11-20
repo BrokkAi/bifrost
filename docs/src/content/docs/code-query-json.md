@@ -718,6 +718,30 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
 ```
 
 
+#### Site context on call-argument rows
+
+Rows that name a written expression at a call site carry a `site` object, so one row says what is written, where, in which role, and what is known of its value:
+
+- `call_sites_to` and `call_sites_from`: each `arguments[]` entry has `site`; the call row has `receiver_site` exactly when it has `receiver`.
+- `call_input`: `site` for the receiver or the written actual.
+- `call_argument` rows (after `call_shape`, `call_argument_groups`, `call_arguments`): `site`.
+- `call_binding` rows: `site` is present for every row with an `argument_id` and for a written receiver. It is absent only when the row has no written expression at the call site: a terminal row, a defaulted formal, a missing required formal, or an implicit receiver. Absence never means an unknown value; an unknown value is `value.kind: "unknown"`.
+
+A site has three parts:
+
+- `site`, the location, by `kind`: `source` (`path`, `start_byte`, `end_byte`, 1-based `start_line`, `start_column`, `end_line`, `end_column`, and the source `text`); `unrendered` (`path`, `start_byte`, `end_byte`, `reason`: the node exists at this byte range in the request's analysis, but its text and coordinates are withheld from this response; `reason` is `render_budget`, `conflicting_sources` (two different snapshots of the file were held), or `source_unavailable` (the analyzer had no source to give for the file, or could not attribute a read of it)); `external` (`declaration`); `summary` (`procedure`).
+- `role`, by `kind`: `argument` (`index`, optional `name`), `receiver`, `value`, `call`, `binding`, `return`, `field_write` and `field_read` (`member`), `statement`. `argument.index` is the zero-based written position in the call's argument list, counting positional and keyword arguments in source order; a keyword argument keeps its written position and adds `name`. The receiver is never an argument. Arguments with no written argument list, such as macro-admitted candidates, use role `value`.
+- `value`, by `kind`: `known` with `value` of kind `str` (the decoded string) or `int` (normalized decimal: `0x10` is `"16"`); or `unknown` with a `cause` of `kind` `not_constant`, `constant_payload_unavailable`, `no_source_node`, or `not_analyzed` (which carries its own typed `cause`: `unsupported`, `unknown`, `exceeded_budget`, `cancelled`, or `provider_failed`). Integer values appear only for languages whose structural facts record them.
+
+The flat columns are projections of the site, so they agree with it: `text` is the site's source snippet (`""` when the site is `unrendered`), and `literal_value` is the site's known string value (absent otherwise). An `unrendered` site keeps its `value`, because the value comes from the analyzed node and not from the rendered source.
+
+Site payloads use the analyzer's existing retained-memory allowance. Bifrost admits each retained text or decoded value before copying it. A `source` location always contains the complete selected source span. If only that source text cannot fit, the site becomes `unrendered` with reason `render_budget` and retains its exact structural value. A known value is never shortened or changed to `unknown` to fit.
+
+If a required value or site field cannot fit, Bifrost emits the completed row prefix, withholds the current row and remaining rows, and sets `truncated`. `presentation_rows_refused` reports this operational budget refusal, or source text withheld for presentation. Its exhausted root names lane `render/site_output/retained_bytes` and stage `result_presentation`. If the analyzer has no retention owner, `presentation_owner_unavailable` reports a provider refusal. These response-level diagnostics have no authored `step_index` or `step_op` and do not establish semantic absence.
+
+Row predicates and policy selectors read their semantic scalar values before presentation. Withholding presentation does not change those values or policy reuse evidence. This admission uses the existing owner capacity; the separate capture-text allowance remains unchanged. The engine retains admitted site backing through extracted rows and clones, and the CLI borrows it through its final JSON write. MCP and Python adapter-created copies have a separate lifecycle boundary; they are not covered by this engine/CLI retention guarantee.
+
+
 ### Dispatch and method families
 
 `dispatch_outcome` emits exactly one row per input site, so zero target rows never read as a proven-empty target set. The row carries the semantic `outcome` (`resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`, `exceeded_budget`, or `cancelled`), the oracle's candidate `coverage`, the retained `target_count`, and the unsupported capability or exceeded budget lane. `exceeded_limit` is nullable and its domain is exactly `source`, `rows`, `retained_bytes`, and `files`. Scans and traversal visits are non-refusing work telemetry; resident admissions and discovery retain their own bounds.
@@ -765,6 +789,47 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
 The production CFG is the only evidence source. A write that appears above a read in the source but that no CFG path carries there produces no reaching row, and structural containment is never presented as any of the three relations. A reaching row is `exact` when the establishment is the only definition of its subject in the read's IN set **and** dominates the read's program point; anything else is `may`.
 
 Every row carries `completeness` (`complete` or `partial`, for that row's own axis) and, when partial, `uncovered_axes`. A partial derivation also reports `flow_state_axis_unsupported` or `flow_state_derivation_incomplete` with `incomplete` impact -- an exhausted control-flow budget emits no rows for its relation rather than a shortened set, and a file that does not lower reports the gap rather than an empty complete answer.
+
+### Field writes and reads
+
+`field_writes_of` and `field_reads_of` take a `declaration` row that is a field and return one `field_write` or `field_read` row per store or load of that field that the semantic IR models. Neither step has options.
+
+Unexpanded Rust derives make both answers incomplete, even when there are no authored uses of the field. This includes bare and qualified `Copy` derives: these queries do not certify which derive macro the spelling selects (#14100). Authored access rows are still returned. A manual trait implementation without a derive does not introduce this macro limitation.
+
+Static fields currently have no exhaustive field-memory projection: `field_writes_of` and `field_reads_of` return any rows the IR can prove and mark the answer incomplete, including when the static field has no authored accesses. Instance-field results remain subject to the ordinary completeness conditions below.
+
+<!-- code-query-test:json:field-writes -->
+```json
+{
+  "languages": ["rust"],
+  "match": {"kind": "class", "name": "Meta"},
+  "steps": [
+    {"op": "enclosing_decl"},
+    {"op": "members"},
+    {"op": "filter", "where": [{"field": "fq_name", "op": "eq", "value": {"string": "app.Meta.count"}}]},
+    {"op": "field_writes_of"}
+  ]
+}
+```
+
+Candidates are the procedures that enclose any usage of the field, proven or not and whatever its reference facets, because a struct-literal initializer carries no write facet. A store or load is attributed to the field when a usage of it lies in the access (a proven usage gives the record's own proof; an unproven usage gives the row `proof: "unproven"` and makes the answer incomplete): in the left side of an assignment, in the key of a struct-literal initializer, or in the shorthand name. So `A { x: 1 }` and `B { x: 2 }`, or `a.x = 1` and `b.x = 2`, are told apart across files, and the other struct's access is never returned.
+
+Each row carries the whole access in `site` (`m.count = 42`, the initializer `count: 0`, the shorthand `count`, the read `m.count`), whose `role` is `field_write` or `field_read` with the field's `member`, and whose `value` is a `site_context` value: `known` with a string or the normalized decimal of an integer when the stored value is such a literal, otherwise `unknown` with its cause. `field_write` rows also carry `value_site`, the stored expression itself with role `value`. `value_site` is present for `f: expr`, for the shorthand `Foo { f }` and for `m.f = expr`, and absent for a compound assignment (`m.count += 1`) and for a struct functional update (`..base`), where the stored value is not one source node. `procedure_id` and `program_point_id` join the row to the other semantic rows of the same procedure and point. `proof`, `completeness` and `strong_update` are the IR record's own.
+
+The answer is complete only when all of these hold; otherwise the rows found are still returned and a typed incomplete diagnostic names what is open:
+
+- the usage scan is complete and every usage is proven, and every usage lies in a lowered procedure;
+- candidate procedures come from usage analysis, so a procedure whose only occurrence of the field is a member access on a receiver of unresolved type, for which usage analysis returns a complete empty result, is not seen (known limit, #13759);
+- every candidate file has field-memory support (`semantic_capability_unsupported` otherwise);
+- no semantic gap in a candidate procedure can hide an access: for writes, one that impacts heap writes, aliasing, value flow, call evaluation or dispatch coverage; for reads, heap reads in place of heap writes. Implicit drop glue and omitted exceptional exits that never rejoin the body are not counted;
+- the procedure has no unsupported pointer operation (`addr_of_mut!`, `&raw`) or unsupported macro expansion, and no address of the field is taken (`&mut s.f`);
+- no store (or load, for reads) through a pointer is left unresolved to a field;
+- the property relation of the procedure is complete: no truncation, budget or cancellation, and every record has complete proof;
+- no record spelled like the field, that names no member token at its own site (a `..base` field transfer), is left unlocated by a usage.
+
+A declaration that is not a field returns no rows and an advisory `no_enclosing_procedure` diagnostic.
+
+Known limit: on large Rust files, a field with several candidate procedures can reach the request deadline, which is reported as a typed `deadline_exceeded` and never as a complete answer. The cause is the query-time drop-glue proof, which rebuilds each file's macro inventory on every proof (#13871).
 
 ### Bounded rewrite paths
 
@@ -986,6 +1051,16 @@ Every diagnostic has a `code`, an `impact`, a `language`, and a `message`. The i
 - `incomplete`: some work was skipped, unsupported, cut short, or cancelled. Positive rows stay valid, but an empty or short answer does not prove absence.
 - `declared_non_exhaustive`: the query asked for a proven subset, such as `callers` with `completeness: "proven_subset"`. The rows are proven but are not all the answers.
 - `advisory`: guidance only, such as `broad_query`.
+
+Diagnostics that a step emits also carry `step_index` (the 0-based position of the authored step in its `steps` array) and `step_op` (the step's operation name). Request-level diagnostics have neither.
+
+When an authored step turns non-empty input rows into no rows, the query adds one `step_produced_no_rows` diagnostic. Its `no_rows_reason` is one of:
+
+- `no_matching_rows`: the step's relation or lookup produced no rows, including after the step's own inline `where` conditions.
+- `all_inputs_filtered`: a standalone row-selecting step (`filter` and the like) rejected every input row.
+- `incomplete`: this step itself emitted incomplete diagnostics. `cause_codes` lists their codes, deduplicated, in the order they first appeared. `cause_codes` is empty for the other two reasons.
+
+Its impact is always `advisory`, and it never changes the completeness of the answer.
 
 The [diagnostic code table](/reference/code-query/#diagnostic-codes) lists every code with its impact and meaning.
 

@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::io::{self, Read};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::ExternalDiscoveryRead;
@@ -11,49 +13,172 @@ use crate::analyzer::semantic_model::{
     SuppressedDiagnostics, read_exact_artifact_while,
 };
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ExternalDiscoveryReads {
     pub keys: Vec<ExternalDiscoveryRead>,
     pub complete: bool,
     refused: bool,
 }
 
+impl ExternalDiscoveryReads {
+    /// Mark the capture incomplete because the project-read ledger saw reads it
+    /// could not name.
+    pub fn refuse_unbounded_project_reads(&mut self) {
+        self.refused = true;
+        self.complete = false;
+    }
+}
+
 thread_local! {
-    static EXTERNAL_DISCOVERY_READS: RefCell<Option<ExternalDiscoveryReads>> = const { RefCell::new(None) };
+    static EXTERNAL_DISCOVERY_CAPTURE: RefCell<ExternalDiscoveryCapture> = const { RefCell::new(ExternalDiscoveryCapture { reads: None }) };
+}
+
+/// The external reads one discovery records. A capture is request scoped, not
+/// thread scoped: a worker that serves the discovery installs a handle taken
+/// on the capturing thread, as `ReadAttribution::for_request` transports
+/// project reads. Reads reported on a thread with no installed handle belong
+/// to no discovery and are dropped.
+///
+/// Each worker installs its own [`fork`](Self::fork) and the capturing thread
+/// [`merge`](Self::merge)s the forks in a fixed order after joining them, so
+/// the recorded order, and the identity hashed from it, does not depend on
+/// which worker finished first.
+#[derive(Clone, Default)]
+pub struct ExternalDiscoveryCapture {
+    reads: Option<Arc<Mutex<ExternalDiscoveryReads>>>,
+}
+
+/// Restores the previous capture on the installing thread.
+pub struct ExternalDiscoveryCaptureGuard {
+    previous: ExternalDiscoveryCapture,
+    // Like MutexGuard: must drop on the thread that installed it.
+    _thread: PhantomData<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for ExternalDiscoveryCaptureGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.previous);
+        EXTERNAL_DISCOVERY_CAPTURE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+impl ExternalDiscoveryCapture {
+    /// The capture of the discovery running on this thread. Outside a
+    /// capture the handle is inert: installing it and reporting through it
+    /// record nothing, exactly as a report outside a capture records nothing.
+    pub fn current() -> Self {
+        EXTERNAL_DISCOVERY_CAPTURE.with(|slot| slot.borrow().clone())
+    }
+
+    /// An empty capture whose reads join this one at [`merge`](Self::merge).
+    pub fn fork(&self) -> Self {
+        Self {
+            reads: self.reads.as_ref().map(|_| Arc::default()),
+        }
+    }
+
+    /// Append a joined worker's reads, and its refusal, to this capture. A
+    /// worker cannot declare the discovery complete; only the capturing
+    /// thread can.
+    pub fn merge(&self, fork: Self) {
+        let (Some(reads), Some(fork)) = (&self.reads, fork.reads) else {
+            return;
+        };
+        let fork = std::mem::take(&mut *lock(&fork));
+        debug_assert!(
+            !fork.complete,
+            "a worker declared external discovery reads complete"
+        );
+        let mut reads = lock(reads);
+        reads.keys.extend(fork.keys);
+        if fork.refused {
+            reads.refused = true;
+            reads.complete = false;
+        }
+    }
+
+    /// Route this thread's reports to this capture until the guard drops.
+    pub fn install(&self) -> ExternalDiscoveryCaptureGuard {
+        let previous = EXTERNAL_DISCOVERY_CAPTURE
+            .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), self.clone()));
+        ExternalDiscoveryCaptureGuard {
+            previous,
+            _thread: PhantomData,
+        }
+    }
+
+    fn with_reads(&self, f: impl FnOnce(&mut ExternalDiscoveryReads)) {
+        if let Some(reads) = &self.reads {
+            f(&mut lock(reads));
+        }
+    }
+}
+
+fn lock(
+    reads: &Mutex<ExternalDiscoveryReads>,
+) -> std::sync::MutexGuard<'_, ExternalDiscoveryReads> {
+    // Reads are append-only; a panicking worker leaves them consistent.
+    reads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn with_current_reads(f: impl FnOnce(&mut ExternalDiscoveryReads)) {
+    // Clone out of the slot: a report must never hold the slot borrowed while
+    // it takes the reads lock.
+    ExternalDiscoveryCapture::current().with_reads(f);
 }
 
 pub fn capture_external_discovery_reads<T>(f: impl FnOnce() -> T) -> (T, ExternalDiscoveryReads) {
-    EXTERNAL_DISCOVERY_READS.with(|slot| {
-        assert!(slot.borrow().is_none(), "nested external discovery capture");
-        *slot.borrow_mut() = Some(ExternalDiscoveryReads::default());
-    });
-    let result = f();
-    let reads = EXTERNAL_DISCOVERY_READS.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(
+        ExternalDiscoveryCapture::current().reads.is_none(),
+        "nested external discovery capture"
+    );
+    let capture = ExternalDiscoveryCapture {
+        reads: Some(Arc::default()),
+    };
+    let result = {
+        let _installed = capture.install();
+        f()
+    };
+    let reads = std::mem::take(&mut *lock(
+        capture.reads.as_ref().expect("capture was just created"),
+    ));
     (result, reads)
 }
 
 pub fn report_external_discovery_read(read: ExternalDiscoveryRead) {
-    EXTERNAL_DISCOVERY_READS.with(|slot| {
-        if let Some(reads) = slot.borrow_mut().as_mut() {
-            reads.keys.push(read);
-        }
-    });
+    with_current_reads(|reads| reads.keys.push(read));
 }
 
 pub fn declare_external_discovery_reads_complete() {
-    EXTERNAL_DISCOVERY_READS.with(|slot| {
-        if let Some(reads) = slot.borrow_mut().as_mut() {
-            reads.complete = !reads.refused;
+    with_current_reads(|reads| reads.complete = !reads.refused);
+}
+
+/// Records the observation of `path` that `digest` summarizes. An unreadable
+/// observation, or a relative path whose meaning depends on the process
+/// directory, cannot be reproduced from a fixed input and refuses carry.
+pub fn report_path_observation(
+    path: &Path,
+    op: crate::analyzer::semantic_model::PathObservationOp,
+    digest: &io::Result<crate::analyzer::semantic::ids::StableDigest>,
+) {
+    match digest {
+        Ok(digest) if path.is_absolute() => {
+            report_external_discovery_read(ExternalDiscoveryRead::PathObservation {
+                absolute_path: path.to_path_buf(),
+                op,
+                digest: *digest,
+            })
         }
-    });
+        _ => refuse_external_discovery_reads(),
+    }
 }
 
 pub fn refuse_external_discovery_reads() {
-    EXTERNAL_DISCOVERY_READS.with(|slot| {
-        if let Some(reads) = slot.borrow_mut().as_mut() {
-            reads.refused = true;
-            reads.complete = false;
-        }
+    with_current_reads(|reads| {
+        reads.refused = true;
+        reads.complete = false;
     });
 }
 
@@ -407,9 +532,14 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        BoundedReadError, dependency_producer_diagnostic, read_bounded_bytes,
-        read_bounded_declaration_file, require_non_empty_evidence_field,
+        BoundedReadError, ExternalDiscoveryCapture, ExternalDiscoveryReads,
+        capture_external_discovery_reads, declare_external_discovery_reads_complete,
+        dependency_producer_diagnostic, read_bounded_bytes, read_bounded_declaration_file,
+        refuse_external_discovery_reads, report_external_discovery_read,
+        require_non_empty_evidence_field,
     };
+    use crate::analyzer::semantic_model::ExternalDiscoveryRead;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn bounded_reads_accept_exact_and_zero_limits() {
@@ -553,5 +683,81 @@ mod tests {
             Err(BoundedReadError::LimitExceeded)
         ));
         assert_eq!(bytes_read.get(), 4);
+    }
+
+    #[hardwon(
+        "#13517: Go reads reported on a scoped domain worker never reached the discovery capture"
+    )]
+    #[test]
+    fn worker_reads_reach_the_capture_in_fork_order() {
+        let read = |name: &str| ExternalDiscoveryRead::Environment {
+            name: name.into(),
+            value: None,
+            working_directory: None,
+        };
+        let names = |reads: &ExternalDiscoveryReads| {
+            reads
+                .keys
+                .iter()
+                .map(|key| match key {
+                    ExternalDiscoveryRead::Environment { name, .. } => name.to_string(),
+                    other => panic!("unexpected read {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let barrier = std::sync::Barrier::new(2);
+        let ((), reads) = capture_external_discovery_reads(|| {
+            report_external_discovery_read(read("first"));
+            let capture = ExternalDiscoveryCapture::current();
+            let forks = [capture.fork(), capture.fork()];
+            std::thread::scope(|scope| {
+                // The second worker reports before the first can: completion
+                // order must not decide the recorded order.
+                for (index, fork) in forks.iter().enumerate() {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let _installed = fork.install();
+                        if index == 0 {
+                            barrier.wait();
+                        }
+                        report_external_discovery_read(read(["worker0", "worker1"][index]));
+                        if index == 1 {
+                            barrier.wait();
+                            refuse_external_discovery_reads();
+                        }
+                    });
+                }
+                // A worker that installs nothing reports to no discovery.
+                scope.spawn(|| report_external_discovery_read(read("dropped")));
+            });
+            for fork in forks {
+                capture.merge(fork);
+            }
+            declare_external_discovery_reads_complete();
+            report_external_discovery_read(read("last"));
+        });
+        assert_eq!(names(&reads), ["first", "worker0", "worker1", "last"]);
+        assert!(
+            !reads.complete,
+            "a worker refusal must survive the parent's later completion declaration"
+        );
+    }
+
+    #[test]
+    fn capture_handle_is_inert_outside_a_capture_and_restores_the_previous_one() {
+        let outside = ExternalDiscoveryCapture::current();
+        let _installed = outside.install();
+        report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+            absolute_path: "/nowhere".into(),
+        });
+        outside.merge(outside.fork());
+        let ((), reads) = capture_external_discovery_reads(|| {
+            let inner = ExternalDiscoveryCapture::current();
+            drop(inner.install());
+            report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                absolute_path: "/kept".into(),
+            });
+        });
+        assert_eq!(reads.keys.len(), 1);
     }
 }

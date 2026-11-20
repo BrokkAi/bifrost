@@ -23,6 +23,15 @@ const JVM_STORAGE_LANGUAGES: [(Language, &str); 3] = [
     (Language::Scala, "scala"),
 ];
 
+/// Java, Kotlin and Scala sources can name each other's declarations.
+fn jvm_peer_storage_languages(target_storage_language: &str) -> Vec<&'static str> {
+    JVM_STORAGE_LANGUAGES
+        .iter()
+        .map(|(_, storage)| *storage)
+        .filter(|storage| *storage != target_storage_language)
+        .collect()
+}
+
 pub(super) struct JavaReverseTargetRules;
 pub(super) struct KotlinReverseTargetRules;
 pub(super) struct ScalaReverseTargetRules;
@@ -112,12 +121,16 @@ impl NominalReverseTargetRules for JavaReverseTargetRules {
         Ok(families)
     }
 
+    fn peer_storage_languages(&self, target_storage_language: &str) -> Vec<&'static str> {
+        jvm_peer_storage_languages(target_storage_language)
+    }
+
     fn peer_naming(&self, target: &NominalReverseTarget<'_>) -> PeerNaming {
         match target.visibility {
             Some(DeclaredVisibility::Private) => PeerNaming::Closed,
-            Some(DeclaredVisibility::PackagePrivate) => {
-                PeerNaming::WithinPackage(PackageAccessRegion::Exact(target.package.into()))
-            }
+            Some(DeclaredVisibility::PackagePrivate) => PeerNaming::WithinRegion(
+                MountRegion::Package(PackageAccessRegion::Exact(target.package.into())),
+            ),
             Some(DeclaredVisibility::Public | DeclaredVisibility::Protected) => PeerNaming::Open,
             _ => PeerNaming::OpenIncomplete(ResolutionIncompleteReason::UnsupportedSemantic(
                 target.semantic,
@@ -188,6 +201,10 @@ impl NominalReverseTargetRules for KotlinReverseTargetRules {
         cancellation: &CancellationToken,
     ) -> Result<TargetFamilies> {
         jvm_reverse_alias_families(target.semantic, facts, cancellation)
+    }
+
+    fn peer_storage_languages(&self, target_storage_language: &str) -> Vec<&'static str> {
+        jvm_peer_storage_languages(target_storage_language)
     }
 
     fn peer_naming(&self, target: &NominalReverseTarget<'_>) -> PeerNaming {
@@ -278,11 +295,15 @@ impl NominalReverseTargetRules for ScalaReverseTargetRules {
         Ok(families)
     }
 
+    fn peer_storage_languages(&self, target_storage_language: &str) -> Vec<&'static str> {
+        jvm_peer_storage_languages(target_storage_language)
+    }
+
     fn peer_naming(&self, target: &NominalReverseTarget<'_>) -> PeerNaming {
         match &target.boundary {
-            Some(DeclarationAccessBoundary::Package(region)) => {
-                PeerNaming::WithinPackage(PackageAccessRegion::Enclosing(region.clone()))
-            }
+            Some(DeclarationAccessBoundary::Package(region)) => PeerNaming::WithinRegion(
+                MountRegion::Package(PackageAccessRegion::Enclosing(region.clone())),
+            ),
             Some(DeclarationAccessBoundary::Template(_)) => PeerNaming::Closed,
             None => match target.visibility {
                 Some(DeclaredVisibility::Private) => PeerNaming::Closed,
@@ -387,6 +408,7 @@ fn jvm_reverse_family_read(
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn jvm_reverse_import_inventory(
         &self,
         mount_ordinal: u32,

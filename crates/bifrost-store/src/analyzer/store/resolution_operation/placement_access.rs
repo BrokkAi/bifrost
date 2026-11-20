@@ -74,6 +74,7 @@ pub(super) struct PlacementRead<B, F> {
 
 /// The uncached placement read. SQL, binding and decoding belong to the language;
 /// iteration preserves cursor order and multiplicity. Resolve the subject first.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn read_placement_rows<T>(
     selection: &SelectedResolutionMountInventory<'_>,
     sql: &'static str,

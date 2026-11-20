@@ -123,12 +123,32 @@ pub(crate) fn resolved_policy_to_json(
         LoadedModelError::CanonicalProjection("policy projection is not an object".to_string())
     })?;
     let analysis_value = match (&definition.analysis, analysis) {
-        (PolicyAnalysis::Match { .. }, ResolvedPolicyAnalysisRef::Match) => {
+        (PolicyAnalysis::Match { spec }, ResolvedPolicyAnalysisRef::Match) => {
             let selector = selector_at(selectors, "/analysis/selector")?;
-            json!({
+            let mut value = json!({
                 "type": "match",
                 "selector": resolved_selector_to_json(selector),
-            })
+            });
+            if !spec.guards.barriers.is_empty() {
+                let mut guards = spec.guards.barriers.iter().collect::<Vec<_>>();
+                guards.sort_by(|left, right| left.id.cmp(&right.id));
+                value["guard_barriers"] = Value::Array(
+                    guards
+                        .into_iter()
+                        .map(|guard| {
+                            resolved_guard_barrier_to_json(
+                                guard,
+                                &guard_barrier_selector_path(
+                                    TAINT_SET_SEGMENTS.guard_barriers,
+                                    &guard.id,
+                                ),
+                                selectors,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            value
         }
         (PolicyAnalysis::Taint { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
             let mut value = resolved_taint_to_json(spec, selectors)?;
@@ -458,6 +478,22 @@ fn resolved_taint_to_json(
                 "value_type": crate::canonical::value_type_predicate_to_json(entry.value_type),
             })).collect()));
     }
+    if !spec.guard_barriers.is_empty() {
+        let mut guards = spec.guard_barriers.iter().collect::<Vec<_>>();
+        guards.sort_by(|left, right| left.definition.id.cmp(&right.definition.id));
+        value["guard_barriers"] = Value::Array(
+            guards
+                .into_iter()
+                .map(|guard| {
+                    resolved_guard_barrier_to_json(
+                        &guard.definition,
+                        guard.selector_path.as_str(),
+                        selectors,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
     // `stores` is omitted entirely when the policy declares none, which keeps
     // every loaded projection authored before persistence stores existed
     // byte-identical, and therefore keeps its hashes valid.
@@ -476,6 +512,34 @@ fn resolved_taint_to_json(
             .as_object_mut()
             .expect("the resolved taint projection is an object")
             .insert("stores".to_string(), stores);
+    }
+    Ok(value)
+}
+
+fn resolved_guard_barrier_to_json(
+    guard: &TaintGuardBarrierSpec,
+    base: &str,
+    selectors: &[ResolvedPolicySelector],
+) -> Result<Value, LoadedModelError> {
+    let mut value = crate::canonical::guard_barrier_to_json(guard);
+    if let TaintGuardPredicate::Call { requires, .. } = &guard.predicate {
+        value["predicate"]["selector"] = resolved_selector_to_json(selector_at(selectors, base)?);
+        let mut requirements = requires
+            .iter()
+            .enumerate()
+            .map(|(index, requirement)| {
+                let mut value = crate::canonical::sanitizer_requirement_to_json(requirement);
+                if matches!(requirement.condition, TaintSanitizerCondition::ResultOf(_)) {
+                    let path = sanitizer_requirement_selector_path(base, index);
+                    value["result_of"] = resolved_selector_to_json(selector_at(selectors, &path)?);
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>, LoadedModelError>>()?;
+        requirements.sort_by_cached_key(|value| {
+            serde_json_canonicalizer::to_vec(value).expect("guard requirements encode as JSON")
+        });
+        value["predicate"]["requires"] = Value::Array(requirements);
     }
     Ok(value)
 }
@@ -746,6 +810,11 @@ fn resolved_typestate_automaton_to_json(automaton: &ResolvedTypestateAutomatonSp
                 .collect(),
         ),
     );
+    if !automaton.transfers.is_empty() {
+        let mut transfers = automaton.transfers.iter().collect::<Vec<_>>();
+        transfers.sort_by(|left, right| left.id.cmp(&right.id));
+        value["transfers"] = Value::Array(transfers.into_iter().map(|transfer| json!({"id": transfer.id.as_str(), "selector_path": transfer.selector_path.as_str(), "from": typestate_call_binding_to_json(&transfer.from), "to": "return-value"})).collect());
+    }
     if let Some(set) = &automaton.event_set {
         value["event_set"] =
             json!({"name": set.name, "version": set.version, "effects": set.effects});

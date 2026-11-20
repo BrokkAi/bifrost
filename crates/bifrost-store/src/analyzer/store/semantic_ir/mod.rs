@@ -736,6 +736,7 @@ pub type GuardedSemanticIrParts = (Vec<ProcedureSemanticsParts>, Vec<GuardedProc
 
 impl AnalyzerStore {
     /// Test guarded membership without decoding executable rows.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn semantic_ir_candidate_macro_presence(
         &self,
         key: &super::BlobKey,
@@ -759,6 +760,7 @@ impl AnalyzerStore {
     /// Decode guarded candidate-macro alternatives for one published blob.
     /// This is the sole public seam for the semantic owner that selects them.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn semantic_ir_candidate_macro_alternate(
         &self,
         key: &super::BlobKey,
@@ -793,6 +795,7 @@ impl AnalyzerStore {
 
     /// Decode a whole publication under the content observed in this snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_semantic_ir_with_observed_scope(
         &self,
         key: &super::BlobKey,
@@ -816,6 +819,7 @@ impl AnalyzerStore {
 
     /// Decode one procedure's flows under the content observed in this snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_partial_flows_with_observed_scope(
         &self,
         key: &super::BlobKey,
@@ -842,6 +846,7 @@ impl AnalyzerStore {
 
     /// Decode one procedure under the content observed in this snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_semantic_ir_procedure_with_observed_scope(
         &self,
         key: &super::BlobKey,
@@ -869,6 +874,7 @@ impl AnalyzerStore {
     /// Observe an exact head and active epoch in one SQLite snapshot, without
     /// decoding its children. The lookup has no validity filter.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn semantic_ir_head_observation(
         &self,
         key: &super::BlobKey,
@@ -883,6 +889,7 @@ impl AnalyzerStore {
     /// Observe the head and decode its complete child set from one snapshot.
     /// The caller binds its selected file and variant to `key` before use.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_semantic_ir_with_observation(
         &self,
         key: &super::BlobKey,
@@ -906,6 +913,7 @@ impl AnalyzerStore {
 
     /// Observe and decode one procedure's partial flows in the same snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_partial_flows_with_observation(
         &self,
         key: &super::BlobKey,
@@ -927,6 +935,7 @@ impl AnalyzerStore {
 
     /// Observe and decode one procedure's semantic parts in the same snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_semantic_ir_procedure_with_observation(
         &self,
         key: &super::BlobKey,
@@ -948,6 +957,7 @@ impl AnalyzerStore {
 
     /// Read one selected complete publication and its footprint in one snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_footprint_coverage(
         &self,
         key: &super::BlobKey,
@@ -964,6 +974,7 @@ impl AnalyzerStore {
     /// Observe the selected head and read its footprint in the same snapshot.
     /// A replaced or absent head cannot supply coverage for this observation.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_footprint_coverage_with_observation(
         &self,
         key: &super::BlobKey,
@@ -987,6 +998,7 @@ impl AnalyzerStore {
 
     /// Read the independent scoped call/control claim from one complete publication.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_call_control_coverage(
         &self,
         key: &super::BlobKey,
@@ -1040,6 +1052,7 @@ impl AnalyzerStore {
     /// The valid head of one blob, or `None` when there is no head or it was
     /// written under another producer epoch.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn semantic_ir_publication(
         &self,
         key: &super::BlobKey,
@@ -1080,6 +1093,7 @@ impl AnalyzerStore {
     /// the procedure has no head row. `scope` is the mount the locators of the
     /// blob are rebuilt under, as for [`Self::read_semantic_ir`].
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_partial_flows(
         &self,
         blob_id: i64,
@@ -1098,6 +1112,7 @@ impl AnalyzerStore {
     /// [`Self::read_partial_flows`] call per procedure, it decodes the blob's
     /// identities once.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_blob_partial_flows(
         &self,
         blob_id: i64,
@@ -1115,6 +1130,7 @@ impl AnalyzerStore {
 
     /// Decode one procedure from its rows in a single read transaction.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_semantic_ir_procedure(
         &self,
         blob_id: i64,
@@ -1136,6 +1152,7 @@ impl AnalyzerStore {
     /// procedures the lowerer produced. Go builtin assumptions are restored
     /// onto procedure 0.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_semantic_ir(
         &self,
         blob_id: i64,
@@ -1284,7 +1301,7 @@ tables! {
     Values => "semantic_ir_values" [
         "procedure", "value", "kind", "ordinal", "multiplicity", "rest_domain",
         "rest_domain_text", "name", "passing_mode", "flag", "magnitude", "float_bits", "text",
-        "source", "evidence", "static_type_class", "static_origin_call", "static_origin_ordinal",
+        "source", "evidence", "static_type_class", "static_origin_call", "static_origin_ordinal", "actual_borrow",
     ] jsonb [] order "procedure, value";
     Allocations => "semantic_ir_allocations" [
         "procedure", "allocation", "point", "result", "kind", "kind_text", "source", "evidence",

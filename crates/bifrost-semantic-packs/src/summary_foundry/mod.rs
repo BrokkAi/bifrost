@@ -724,6 +724,7 @@ fn round_trip(
             // The language-intrinsic activation form: the corpus names classes
             // and members, never a package coordinate.
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: None,
                 module: None,
                 toolchain: None,

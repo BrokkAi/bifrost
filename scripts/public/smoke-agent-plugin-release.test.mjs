@@ -49,9 +49,41 @@ let rootsSupported = false;
 let workspaceRoot;
 let workspaceSource;
 let pendingSearch;
+let workspaceBound = false;
+let searchAttempts = 0;
 const rootsRequestId = "fake-roots-" + process.pid;
 
+function workspaceNotReady(request) {
+  record({ type: "workspace-not-ready", name: request.params.name });
+  send({
+    jsonrpc: "2.0",
+    id: request.id,
+    result: {
+      isError: true,
+      content: [{
+        type: "text",
+        text: "workspace not ready at workspace_readiness while preparing workspace analyzer; " +
+          "workspace preparation continues; check get_active_workspace or retry",
+      }],
+      _meta: {
+        "io.bifrost/incomplete": {
+          status: "inconclusive",
+          completion: { type: "inconclusive", reasons: ["workspace_not_ready"] },
+          stage: "workspace_readiness",
+          phase: "preparing workspace analyzer",
+          partial: false,
+          workspace_preparation: "continues",
+        },
+      },
+    },
+  });
+}
+
 function respondSearch(request) {
+  if (process.env.BIFROST_FAKE_MODE === "workspace-not-ready-once" && searchAttempts++ === 0) {
+    workspaceNotReady(request);
+    return;
+  }
   const cacheDir = path.join(workspaceRoot, ".bifrost", "cache");
   fs.mkdirSync(cacheDir, { recursive: true });
   fs.writeFileSync(path.join(cacheDir, "bifrost_cache.v1.db"), "fake analyzer cache");
@@ -76,6 +108,7 @@ reader.on("line", (line) => {
   if (message.id === rootsRequestId && message.result) {
     workspaceRoot = fileURLToPath(message.result.roots[0].uri);
     workspaceSource = "roots/list";
+    workspaceBound = true;
     process.stderr.write(
       "workspace_protocol=roots-list\\n" +
       "bound MCP workspace source=roots/list root=" + workspaceRoot + "\\n"
@@ -134,20 +167,27 @@ reader.on("line", (line) => {
 
   if (name === "search_symbols") {
     if (rootsSupported) {
-      pendingSearch = message;
-      send({
-        jsonrpc: "2.0",
-        id: rootsRequestId,
-        method: "roots/list",
-        params: {},
-      });
-    } else {
-      const sandboxState = message.params?._meta?.["codex/sandbox-state-meta"];
-      if (!sandboxState?.sandboxCwd) {
-        throw new Error("Codex search_symbols call is missing sandbox-state metadata");
+      if (!workspaceBound) {
+        pendingSearch = message;
+        send({
+          jsonrpc: "2.0",
+          id: rootsRequestId,
+          method: "roots/list",
+          params: {},
+        });
+        return;
       }
+      respondSearch(message);
+      return;
+    }
+    const sandboxState = message.params?._meta?.["codex/sandbox-state-meta"];
+    if (!sandboxState?.sandboxCwd) {
+      throw new Error("Codex search_symbols call is missing sandbox-state metadata");
+    }
+    if (!workspaceBound) {
       workspaceRoot = fileURLToPath(sandboxState.sandboxCwd);
       workspaceSource = "codex/sandbox-state-meta";
+      workspaceBound = true;
       record({
         type: "codex-sandbox-binding",
         threadId: message.params._meta.threadId,
@@ -159,8 +199,8 @@ reader.on("line", (line) => {
         "bound MCP workspace source=codex/sandbox-state-meta root=" + fs.realpathSync(workspaceRoot) +
         " thread_id=" + message.params._meta.threadId + "\\n"
       );
-      respondSearch(message);
     }
+    respondSearch(message);
     return;
   }
 
@@ -290,6 +330,33 @@ test("release smoke exercises empty-core policy behavior through every packaged 
       event.sandboxCwd.startsWith("file:") &&
       JSON.stringify(event.writableRoots) === JSON.stringify([event.sandboxCwd])
     ));
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("release smoke retries the retryable workspace_not_ready response", async () => {
+  const { stdout, tracePath, tempRoot, error } = await runSmoke("workspace-not-ready-once");
+  try {
+    assert.equal(error, undefined, error?.stderr ?? error?.message);
+    assert.match(stdout, /Claude Code plugin package passed MCP roots and list_policies smoke/u);
+    const events = (await fs.readFile(tracePath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const notReady = events.filter((event) => event.type === "workspace-not-ready");
+    assert.equal(notReady.length, 5, "every cold MCP session must exercise one not-ready search");
+    assert.ok(notReady.every((event) => event.name === "search_symbols"));
+    const bindings = events.filter((event) => event.type === "workspace-bound");
+    assert.equal(bindings.length, 5, "every session must bind once before its retried search succeeds");
+    for (const binding of bindings) {
+      const calls = events.filter((event) => event.type === "tool-call" && event.pid === binding.pid);
+      assert.equal(
+        calls.filter((event) => event.name === "search_symbols").length,
+        2,
+        `session ${binding.pid} must retry search_symbols exactly once`
+      );
+    }
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

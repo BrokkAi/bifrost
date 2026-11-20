@@ -18,7 +18,23 @@ use super::*;
 /// that declares `inconclusive-on [depth_bound_reached]`, and without it for
 /// every other consumer. A product computed without the subproduct must never
 /// satisfy an opt-in consumer, so the opt-in bit is part of the key.
-type QueryKey = (String, bool);
+type QueryKey = (String, bool, Option<String>);
+
+pub(crate) fn match_guard_batch_identity(policy: &LoadedPolicy) -> Option<String> {
+    let PolicyAnalysis::Match { spec } = &policy.definition().analysis else {
+        return None;
+    };
+    if spec.guards.barriers.is_empty() {
+        return None;
+    }
+    let guards = spec
+        .guards
+        .barriers
+        .iter()
+        .map(crate::canonical::guard_barrier_to_json)
+        .collect::<Vec<_>>();
+    Some(serde_json::Value::Array(guards).to_string())
+}
 
 /// Bound to one immutable analyzer and the coordinator's pinned model scope.
 ///
@@ -151,21 +167,26 @@ impl<'a> SubjectQueryBatch<'a> {
             // reuse must neither replace nor preempt that policy-local result.
             // Only a match policy can opt into depth-bound probing; an assertion
             // subject query never does.
-            let (query, depth_opt_in) = match &policy.definition().analysis {
+            let (query, depth_opt_in, guard_identity) = match &policy.definition().analysis {
                 PolicyAnalysis::Assertion { spec } if spec.relational.is_none() => {
-                    (assertion_subject_query(policy, budget).ok(), false)
+                    (assertion_subject_query(policy, budget).ok(), false, None)
                 }
                 PolicyAnalysis::Match { .. } => (
                     match_policy_query(policy)
                         .ok()
                         .and_then(|query| executable_match_query(query, budget).ok()),
                     policy.definition().completion_on_depth_bound_reached,
+                    match_guard_batch_identity(policy),
                 ),
-                _ => (None, false),
+                _ => (None, false, None),
             };
             if let Some(query) = query {
                 *consumers
-                    .entry((query.to_canonical_json().to_string(), depth_opt_in))
+                    .entry((
+                        query.to_canonical_json().to_string(),
+                        depth_opt_in,
+                        guard_identity,
+                    ))
                     .or_default() += 1;
             }
         }
@@ -188,21 +209,42 @@ impl<'a> SubjectQueryBatch<'a> {
         budget: &PolicyBudget,
         depth_opt_in: bool,
     ) -> Arc<ExecutedQueryRows> {
+        self.execute_with_guards(
+            query,
+            context,
+            context.flow_resources(),
+            budget,
+            depth_opt_in,
+            None,
+        )
+    }
+
+    pub(in crate::evaluator) fn execute_with_guards(
+        &self,
+        query: &CodeQuery,
+        context: &PolicyEvaluationContext<'_>,
+        flow_resources: brokk_bifrost_rql::SemanticFlowResources,
+        budget: &PolicyBudget,
+        depth_opt_in: bool,
+        guard_identity: Option<String>,
+    ) -> Arc<ExecutedQueryRows> {
         let execute = || {
             let _timing = brokk_bifrost_analysis::profiling::scope("policy.subject_scan");
-            let detailed = match context.workspace {
-                Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
-                    workspace,
-                    context.flow_resources(),
+            let executed = match context.workspace {
+                Some(workspace) => execute_code_query_semantic_unit_in_scope(
+                    workspace.analyzer(),
+                    flow_resources,
+                    Some(workspace),
                     query,
                     budget.query_limits(),
                     context.cancellation,
                     CodeQueryExecutionScope::whole_workspace()
                         .with_depth_bound_status(depth_opt_in),
                 ),
-                None => execute_code_query_detailed_eager_index_in_scope(
+                None => execute_code_query_semantic_unit_in_scope(
                     context.analyzer,
-                    context.flow_resources(),
+                    flow_resources,
+                    None,
                     query,
                     budget.query_limits(),
                     context.cancellation,
@@ -210,9 +252,15 @@ impl<'a> SubjectQueryBatch<'a> {
                         .with_depth_bound_status(depth_opt_in),
                 ),
             };
-            Arc::new(ExecutedQueryRows::of_detailed(detailed))
+            Arc::new(ExecutedQueryRows::of_semantic(executed.unit))
         };
-        match self.repeated_key(query, context.analyzer, budget.query_limits(), depth_opt_in) {
+        match self.repeated_key(
+            query,
+            context.analyzer,
+            budget.query_limits(),
+            depth_opt_in,
+            guard_identity,
+        ) {
             Some(key) => self.reuse_or_execute(
                 context.analyzer,
                 context.cancellation,
@@ -231,6 +279,8 @@ impl<'a> SubjectQueryBatch<'a> {
     /// Unit products are executed with the workspace oracles, so every caller
     /// must hold them; a unit run without them answers a different question
     /// under the same key.
+    /// The unguarded handle, for tests of the shared-unit contract.
+    #[cfg(test)]
     pub(crate) fn query_units(
         &self,
         query: &CodeQuery,
@@ -239,11 +289,23 @@ impl<'a> SubjectQueryBatch<'a> {
         limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
         depth_opt_in: bool,
     ) -> Option<SharedQueryUnits<'_>> {
+        self.query_units_with_guards(query, analyzer, workspace, limits, depth_opt_in, None)
+    }
+
+    pub(crate) fn query_units_with_guards(
+        &self,
+        query: &CodeQuery,
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
+        depth_opt_in: bool,
+        guard_identity: Option<String>,
+    ) -> Option<SharedQueryUnits<'_>> {
         assert!(
             workspace.is_some(),
             "shared query units are executed with the workspace oracles"
         );
-        self.repeated_key(query, analyzer, limits, depth_opt_in)
+        self.repeated_key(query, analyzer, limits, depth_opt_in, guard_identity)
             .map(|query| SharedQueryUnits { batch: self, query })
     }
 
@@ -256,6 +318,7 @@ impl<'a> SubjectQueryBatch<'a> {
         analyzer: &dyn IAnalyzer,
         limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
         depth_opt_in: bool,
+        guard_identity: Option<String>,
     ) -> Option<QueryKey> {
         assert!(
             std::ptr::addr_eq(self.analyzer, analyzer),
@@ -268,7 +331,11 @@ impl<'a> SubjectQueryBatch<'a> {
         {
             return None;
         }
-        let key = (query.to_canonical_json().to_string(), depth_opt_in);
+        let key = (
+            query.to_canonical_json().to_string(),
+            depth_opt_in,
+            guard_identity,
+        );
         self.repeated.contains(&key).then_some(key)
     }
 
@@ -466,7 +533,7 @@ mod tests {
                 workspace.analyzer(),
                 None,
                 |retained| &mut retained.subjects,
-                (query.to_canonical_json().to_string(), false),
+                (query.to_canonical_json().to_string(), false, None),
                 || {
                     let detailed = brokk_bifrost_rql::structural::search::execute_code_query_detailed_eager_index_workspace(
                         &workspace,

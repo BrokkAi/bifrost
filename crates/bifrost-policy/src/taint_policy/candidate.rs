@@ -174,6 +174,17 @@ pub(crate) struct CandidateBoundary {
     pub(crate) reasons: Vec<PolicyIncompleteReason>,
     pub(crate) location: Option<PolicySourceLocation>,
     pub(crate) detail: String,
+    /// Typed causes behind this boundary, each with its own family and owner
+    /// location. Empty when the boundary has no stored cause records.
+    pub(crate) causes: Vec<CandidateBoundaryCause>,
+}
+
+/// One composition cause record, rendered once from the batch's typed record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidateBoundaryCause {
+    pub(crate) family: String,
+    pub(crate) message: String,
+    pub(crate) location: Option<PolicySourceLocation>,
 }
 
 impl CandidateBoundary {
@@ -194,6 +205,7 @@ impl CandidateBoundary {
             reasons,
             location,
             detail,
+            causes: Vec::new(),
         }
     }
 }
@@ -873,6 +885,19 @@ pub(crate) fn solve_flow_candidate(
             vec![compile_boundary(&failure.error)],
             0,
         ),
+        Ok(TaintPolicyCompilation::StaticGaps {
+            gaps,
+            incomplete_selectors,
+            ..
+        }) => unsolved(
+            origin,
+            observation,
+            gaps.into_iter()
+                .map(|gap| compile_boundary(&TaintPolicyCompileError::UnsupportedBinding(gap)))
+                .chain(selection_gaps(&[], &incomplete_selectors, 0))
+                .collect(),
+            0,
+        ),
         Ok(TaintPolicyCompilation::Clean {
             refusals,
             incomplete_selectors,
@@ -1248,7 +1273,11 @@ fn solve_candidate_regions(
                 if report.is_proven_by_authored_summaries() {
                     proven_by_summary = true;
                 } else {
-                    boundaries.push(composed_boundary(report, composed.status.as_ref()));
+                    boundaries.push(composed_boundary(
+                        report,
+                        composed.status.as_ref(),
+                        &composed.causes,
+                    ));
                 }
             }
             reached |= read_candidate_reaches(
@@ -1428,8 +1457,9 @@ fn solve_candidate_regions(
 fn composed_boundary(
     report: &TaintFindingReport,
     status: Option<&SemanticInputStatus>,
+    causes: &[CandidateBoundaryCause],
 ) -> CandidateBoundary {
-    match report.result().termination() {
+    let mut boundary = match report.result().termination() {
         SolverTermination::Cancelled => CandidateBoundary::new(
             CandidateBoundaryKind::Cancelled,
             vec![PolicyIncompleteReason::Cancelled],
@@ -1468,7 +1498,13 @@ fn composed_boundary(
                 format!("the composed candidate retained an open boundary: {status:?}"),
             )
         }
-    }
+    };
+    // Kind and reasons above come only from the termination and status. The
+    // records name where and why, so they cannot move a verdict; each cause is
+    // rendered as its own child, and the boundary takes the first owner location.
+    boundary.location = causes.iter().find_map(|cause| cause.location.clone());
+    boundary.causes = causes.to_vec();
+    boundary
 }
 
 /// Origin and witness evidence is the common report vocabulary. Each engine

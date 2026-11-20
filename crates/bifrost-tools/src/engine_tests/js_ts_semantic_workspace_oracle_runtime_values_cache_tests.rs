@@ -16,6 +16,8 @@ mod js_ts_extraction_cache_tests {
     use brokk_bifrost_analysis::analyzer::semantic::ir::ProcedureKind;
 
     use brokk_bifrost_analysis::analyzer::semantic::SemanticBudget;
+    use brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension;
+    use brokk_bifrost_analysis::analyzer::semantic::SemanticWork;
 
     use brokk_bifrost_analysis::analyzer::semantic::SemanticExecutionBudget;
 
@@ -370,7 +372,7 @@ mod js_ts_extraction_cache_tests {
     }
     #[test]
     #[hardwon(
-        "#3534: same-file parsing repeated; #5113: resident remainders blocked continuation source reads"
+        "#3534: same-file parsing repeated; #5113: resident remainders blocked continuation source reads; #13901: source admission refusal was mislabeled Unknown"
     )]
     fn same_file_procedures_reuse_one_syntax_census_and_reject_stale_source() {
         let source = "function first() { return process.env.FIRST; }\nfunction second() { return process.env.SECOND; }\n";
@@ -473,19 +475,40 @@ mod js_ts_extraction_cache_tests {
         let mut continuation =
             SemanticBudget::new_child(budget.remaining(), &budget.scope_snapshot());
         assert_eq!(continuation.limits().source_bytes, 1);
-        let continued = oracle
-            .runtime_reads_for_procedure(
-                &first,
-                &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest::new(
-                    &mut continuation,
-                    &cancellation,
-                ),
+        let old = continuation
+            .check_admission(SemanticWork {
+                program_points: continuation.limits().program_points + 1,
+                ..SemanticWork::default()
+            })
+            .expect_err("an earlier operation refused rows");
+        let mark = continuation.refusal_mark();
+        let (continued, observed) =
+            brokk_bifrost_analysis::analyzer::semantic::SemanticRequest::new(
+                &mut continuation,
+                &cancellation,
             )
-            .expect("continuation source inspection");
+            .observing_refusals_since(mark)
+            .judged_with_refusal(|request| oracle.runtime_reads_for_procedure(&first, request));
+        assert_eq!(
+            continued.reuse,
+            brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::BudgetRefusal,
+            )
+        );
+        let continued = continued.value.expect("continuation source inspection");
         assert!(matches!(
             continued,
-            SemanticOutcome::Unknown { partial: None, .. }
+            SemanticOutcome::ExceededBudget { partial: None, .. }
         ));
+        let exceeded = continued
+            .budget_exceeded()
+            .expect("source admission refusal");
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::SourceBytes);
+        assert_eq!(exceeded.limit(), 1);
+        assert!(exceeded.attempted() >= 2);
+        assert_eq!(observed.unwrap().exceeded, exceeded);
+        assert_eq!(continuation.first_refusal().unwrap().exceeded, old);
+        assert_eq!(continuation.refusal_count(), 2);
         assert_eq!(continuation.resident().source_bytes, 0);
         drop(continuation);
         drop(retained_source);

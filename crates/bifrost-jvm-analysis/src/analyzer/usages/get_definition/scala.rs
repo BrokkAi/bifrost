@@ -14769,10 +14769,6 @@ mod bounded_ast_tests {
 
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
-    use brokk_bifrost_analysis::analyzer::usages::test_support::assert_scope_budget_exceeded;
-
     use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
 
     use brokk_bifrost_analysis::analyzer::i_analyzer::InformationTier;
@@ -14801,7 +14797,7 @@ mod bounded_ast_tests {
     }
 
     #[test]
-    fn bounded_lexical_context_scan_stops_at_scope_budget() {
+    fn bounded_lexical_context_scan_stops_on_cancellation() {
         let source = r#"
 package alpha.beta
 
@@ -14815,19 +14811,19 @@ object Demo {
         let reference =
             scala_smallest_named_node_covering(None, root, start, start + "Factory".len())
                 .expect("reference node");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 2,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let session = ResolutionSession::bounded(budget, None);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
 
         assert!(scala_lexical_context_at(Some(&session), root, source, reference, start).is_none());
-        let outcome = session.finish(());
-        assert_scope_budget_exceeded(&outcome, budget);
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Cancelled { .. }
+        ));
     }
 
     #[test]
-    fn bounded_bare_apply_shadow_scan_stops_at_scope_budget() {
+    fn bounded_bare_apply_shadow_scan_stops_on_cancellation() {
         let source = r#"
 object Demo {
   def use(): Unit = {
@@ -14840,11 +14836,9 @@ object Demo {
         let tree = parse_scala(source);
         let root = tree.root_node();
         let cutoff = source.find("Factory").expect("Factory reference");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 3,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let session = ResolutionSession::bounded(budget, None);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(3);
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
 
         assert_eq!(
             scala_active_path_declares_name_before_in_session(
@@ -14858,10 +14852,7 @@ object Demo {
         );
         assert!(matches!(
             session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
+            BoundedResolution::Cancelled { .. }
         ));
     }
 
@@ -15005,28 +14996,6 @@ object Caller {
                 [definition] if definition.fq_name() == "app.Ops$.enhance"
             ),
             "{complete:#?}"
-        );
-
-        let budget = ReceiverAnalysisBudget::tiny();
-        let exhausted = resolve_scala_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            SOURCE,
-            Some(&tree),
-            &site,
-            budget,
-            None,
-        );
-        assert!(
-            matches!(
-                exhausted,
-                BoundedResolution::Exceeded {
-                    limit: ReceiverBudgetLimit::ScopeNodes,
-                    work,
-                } if work.scope_nodes == budget.max_scope_nodes
-            ),
-            "{exhausted:#?}"
         );
 
         let cancellation = CancellationToken::new();
@@ -15355,6 +15324,7 @@ object JdbcCalls {
 
 #[cfg(test)]
 mod batch_context_tests {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::test_support::resolve_definition_requests;
 
     use crate::analyzer::usages::get_definition::scala::*;
 

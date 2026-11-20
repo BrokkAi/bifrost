@@ -5,9 +5,7 @@
 //! evidence. All values are query-local; no call assessment is persisted.
 
 use brokk_bifrost_core::analyzer::Language;
-use brokk_bifrost_core::analyzer::resolution_facts::{
-    IntrinsicTypeKind, ResolutionScopeKind, ResolutionSupertypeKind,
-};
+use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionScopeKind};
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason, FailingArgument, InvocationPhase,
 };
@@ -23,6 +21,7 @@ use super::super::typed_fact_lowering::{
     LoweredCallableParameterApplicability, LoweredCallableParameterProperty,
     LoweredCallableResultTypeProperty, LoweredCallableSignatureProperty,
 };
+use super::super::{ClassifiedSupertypeKind, SupertypeClassification, classify_supertype_kind};
 use super::{
     AnswerMap, CallCandidateApplicability, FactEvaluation, HierarchyOwnerKey, InternedFactRow,
     ResolutionNamespace, ResolutionTypeRef, StateMap, StoreResult, TypedFrontierState,
@@ -929,12 +928,21 @@ impl FactEvaluation<'_, '_> {
                 if base_owner.receiver() != derived_owner.receiver() {
                     continue;
                 }
-                let Some(nearer) = self.method_owner_inherits(
-                    self.method_declaration_owner(derived_owner),
-                    self.method_declaration_owner(base_owner),
-                ) else {
+                let derived_decl = self.method_declaration_owner(derived_owner);
+                let base_decl = self.method_declaration_owner(base_owner);
+                let Some(inherited_nearer) = self.method_owner_inherits(derived_decl, base_decl)
+                else {
                     return Ok(None);
                 };
+                // JLS 9.2: an explicit declaration on an interface suppresses
+                // its own implicit Object member of the same signature.
+                let declares_over_implicit = !inherited_nearer
+                    && self.implicit_member_declaration_rules(base_owner).is_some()
+                    && self
+                        .implicit_member_declaration_rules(derived_owner)
+                        .is_none()
+                    && derived_decl == base_decl;
+                let nearer = inherited_nearer || declares_over_implicit;
                 let language_dominates =
                     additional_dominance(base, derived, base_owner, derived_owner, nearer);
                 if !nearer && language_dominates.is_none() {
@@ -1062,7 +1070,7 @@ impl FactEvaluation<'_, '_> {
         if member.kind() != ResolutionMemberKind::Method {
             return None;
         }
-        if let Some((_, rules)) = self.implicit_interface_member_rules(member) {
+        if let Some((_, rules)) = self.implicit_member_declaration_rules(member) {
             debug_assert_eq!(
                 rules.visibility,
                 brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility::Public
@@ -2105,8 +2113,15 @@ impl FactEvaluation<'_, '_> {
             return Ok(false);
         }
         Ok(supertypes.iter().all(|edge| {
-            edge.get(self.session).row().source_kind()
-                == Some(ResolutionSupertypeKind::ImplicitSuperclass)
+            matches!(
+                classify_supertype_kind(
+                    edge.get(self.session).row().source_kind(),
+                    crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified
+                ),
+                SupertypeClassification::Classified(Some(
+                    ClassifiedSupertypeKind::ImplicitSuperclass
+                ))
+            )
         }))
     }
 }

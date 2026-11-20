@@ -26,22 +26,6 @@
         }],
         "members": [], "relations": []
       }
-    },
-    {
-      "id": "same-fqn-variant",
-      "activation": [{ "configurations": ["variant"] }],
-      "payload": {
-        "kind": "declaration_facts",
-        "types": [{
-          "id": "type.handle", "name": "com.example.res.Handle",
-          "type_kind": "class", "visibility": "public", "is_abstract": false,
-          "is_sealed": false, "has_explicit_type_terms": false,
-          "type_parameters": [], "type_parameter_constraints": [],
-          "embedded_types": [], "hierarchy": [], "aliases": [], "extension_surfaces": [],
-          "locator": { "kind": "artifact", "path": "variant/com/example/res/Handle.class", "symbol": "com.example.res.Handle" }
-        }],
-        "members": [], "relations": []
-      }
     }
   ]
 }

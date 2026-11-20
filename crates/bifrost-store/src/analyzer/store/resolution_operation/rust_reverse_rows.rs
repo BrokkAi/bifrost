@@ -2,7 +2,7 @@
 //! Query-local reverse discovery from persisted crate and reference rows.
 
 use super::super::resolution_prepare::resolution_rows::{
-    gap_origin_code, namespace_code, site_kind_code,
+    gap_origin_code, gap_origin_from_code, namespace_code, site_kind_code,
 };
 use super::reverse_candidates::{
     ReverseCandidateKey, ReverseContextWitness, read_reverse_candidates,
@@ -567,6 +567,7 @@ struct GapCandidateSites {
 /// on the target and the request's admission, not on the references that
 /// confirmation later accounts for, and the gap query is asked twice per
 /// target. The caller releases them when the target is done.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn materialize_gap_candidate_sites(
     selected: &SelectedResolutionOperation<'_, '_>,
     definition: SemanticId,
@@ -944,6 +945,8 @@ fn macro_frontier_cannot_name_target(
     let mut mounts_module = false;
     let mut nested_decisions = std::collections::HashMap::new();
     let mut previous_token: Option<(String, usize, usize)> = None;
+    // Whether the token before `previous_token` is the `$` of a metavariable.
+    let mut previous_is_dollar_named = false;
     {
         let mut statement = connection.prepare_cached(
             "SELECT syntax_kind,start_byte,end_byte
@@ -963,6 +966,11 @@ fn macro_frontier_cannot_name_target(
             };
             if syntax_kind == "!" {
                 match previous_token.as_ref() {
+                    // A token tree outside a `macro_rules!` body spells a
+                    // metavariable as `$` followed by an identifier.
+                    Some((kind, _, _)) if kind == "metavariable" || previous_is_dollar_named => {
+                        nested_name_producer = true
+                    }
                     Some((kind, start, end))
                         if matches!(
                             kind.as_str(),
@@ -989,9 +997,10 @@ fn macro_frontier_cannot_name_target(
                             nested_name_producer = true;
                         }
                     }
-                    // A macro path this token stream does not spell as an
-                    // identifier cannot be bounded here.
-                    Some(_) | None => nested_name_producer = true,
+                    // Any other `!` is the prefix operator (or the never
+                    // type): a macro bang follows the identifier that names
+                    // the macro.
+                    Some(_) | None => {}
                 }
             }
             let Some(spelling) = input_source.get(start..end) else {
@@ -1010,6 +1019,10 @@ fn macro_frontier_cannot_name_target(
                 "mod" => mounts_module = true,
                 _ => {}
             }
+            previous_is_dollar_named = syntax_kind == "identifier"
+                && previous_token
+                    .as_ref()
+                    .is_some_and(|(kind, _, _)| kind == "$");
             previous_token = Some((syntax_kind, start, end));
         }
     }
@@ -1115,21 +1128,23 @@ fn macro_import_synthesizes_identifiers(
 }
 
 /// A nested macro can feed a spelling to an outer expression macro without
-/// writing it as one identifier. Besides identifier synthesizers, string
-/// producers can compose a format string, so they stay open as well.
+/// writing it as one identifier. Besides identifier synthesizers, `stringify!`
+/// and `option_env!` can compose a format string, so they stay open as well.
 fn nested_macro_can_produce_a_name(
     connection: &rusqlite::Connection,
     blob_id: i64,
     terminal: &str,
 ) -> Result<bool> {
+    // `env!` and `concat!` produce a name only as the argument of `include!`,
+    // which is itself reviewed above and keeps every enclosing frontier open.
+    // `include_str!` yields a string, and a standalone `env!` never spells a
+    // callable. An outer macro wrapping one of them is its own frontier.
     const NAME_PRODUCERS: &[&str] = &[
         "paste",
         "concat_idents",
         "format_ident",
         "include",
-        "concat",
         "stringify",
-        "env",
         "option_env",
     ];
     macro_name_is_in_reviewed_family(connection, blob_id, terminal, NAME_PRODUCERS)
@@ -1235,6 +1250,7 @@ fn rust_string_literal_value(literal: &str) -> Option<String> {
 /// target name. Contract evaluation propagates an implementation's file-wide
 /// macro gaps into the target's inventory even when the macro's input and
 /// transcriber cannot produce the target.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn filter_macro_frontier_completion(
     selected: &SelectedResolutionOperation<'_, '_>,
     completion: crate::analyzer::resolution::ResolutionCompletion,
@@ -1293,6 +1309,7 @@ fn filter_macro_frontier_completion(
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn initial_reference_inventory_gap_locators(
     selected: &SelectedResolutionOperation<'_, '_>,
     sites: &GapCandidateSites,
@@ -1365,8 +1382,16 @@ fn initial_reference_inventory_gap_locators(
     Ok(locators)
 }
 
-/// The reference-inventory gaps of the target's candidate sites, as a
-/// completion and the locators of the sites that nominate a reference.
+/// The reference-inventory gaps of a target's candidate sites that remain
+/// open for it.
+struct TargetScopedInventoryGaps {
+    completion: ResolutionCompletion,
+    open_sites: Vec<crate::analyzer::resolution::reference_vocabulary::OpenInventorySite>,
+    /// The relative paths of the files that hold an open gap, sorted.
+    open_paths: Vec<String>,
+}
+
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn target_scoped_reference_inventory_gaps(
     selected: &SelectedResolutionOperation<'_, '_>,
     sites: &GapCandidateSites,
@@ -1374,9 +1399,13 @@ fn target_scoped_reference_inventory_gaps(
     accounted_reference_sites: &[(u32, u32)],
     qualified_reference_sites: &[(u32, u32)],
     cancellation: &CancellationToken,
-) -> Result<(ResolutionCompletion, Vec<SelectedSemanticLocator>)> {
+) -> Result<TargetScopedInventoryGaps> {
     if sites.admits_nothing {
-        return Ok((ResolutionCompletion::Complete, Vec::new()));
+        return Ok(TargetScopedInventoryGaps {
+            completion: ResolutionCompletion::Complete,
+            open_sites: Vec::new(),
+            open_paths: Vec::new(),
+        });
     }
 
     let accounted_reference_sites_json = serde_json::to_string(accounted_reference_sites)
@@ -1389,7 +1418,9 @@ fn target_scoped_reference_inventory_gaps(
         crate::analyzer::store::resolution_stage::codec::encode_semantic(SemanticId::local(0, 0));
     let callable_reference = site_kind_code(ResolutionSiteKind::CallableReference);
     let mut reasons = Vec::new();
-    let mut locators = Vec::new();
+    let mut open_sites = Vec::new();
+    let mut open_paths = Vec::new();
+    let mut sources = HashMap::<u32, Option<(String, Vec<usize>)>>::default();
     let connection = selected.ready.inventory.connection();
     let result = super::super::resolution::with_resolution_read_progress_handler(
         connection,
@@ -1414,21 +1445,14 @@ fn target_scoped_reference_inventory_gaps(
                 )),
             ])?;
             while let Some(row) = rows.next()? {
+                // Column 2, the qualified placeholder's reference site, is
+                // read only by the initial locator query.
                 let host = row.get::<_, u32>(1)?;
-                let site = row.get::<_, Option<u32>>(2)?;
                 let raw_site = row.get::<_, u32>(3)?;
                 let origin = row.get::<_, i64>(4)?;
                 let mount = selected
                     .mount_table()
                     .mount_by_ordinal(SelectedResolutionMountOrdinal::new(host))?;
-                if let Some(site) = site {
-                    locators.push(SelectedSemanticLocator::new(
-                        "rust",
-                        mount.persisted_relative_path(),
-                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(site),
-                        LoweredSemanticRole::Reference,
-                    ));
-                }
                 let semantic =
                     crate::analyzer::store::resolution_stage::codec::decode_semantic(row.get(0)?);
                 if macro_frontier_cannot_name_target(
@@ -1445,6 +1469,50 @@ fn target_scoped_reference_inventory_gaps(
                         semantic,
                     ),
                 );
+                open_paths.push(mount.persisted_relative_path().to_owned());
+                let blob_id = selected
+                    .ready
+                    .inventory
+                    .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(host))?
+                    .blob_id();
+                if let Some((start, macro_name)) =
+                    open_gap_site_position(connection, blob_id, raw_site)?
+                {
+                    // A bystander file may be unreadable while its blob is pinned. The
+                    // reason above already keeps the inventory incomplete, so only the
+                    // line number of the diagnostic is dropped. The read must not
+                    // record a project read onto an enclosing policy unit.
+                    let entry = sources.entry(host).or_insert_with(|| {
+                        let file = ProjectFile::new(
+                            selected.ready.project.root(),
+                            mount.persisted_relative_path(),
+                        );
+                        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                            selected.ready.project.read_source(&file)
+                        })
+                        .ok()
+                        .map(|source| {
+                            let starts =
+                                brokk_bifrost_core::text_utils::compute_line_starts(&source);
+                            (source, starts)
+                        })
+                    });
+                    if let Some((source, starts)) =
+                        entry.as_ref().filter(|(source, _)| start <= source.len())
+                    {
+                        let (line, _) = brokk_bifrost_core::text_utils::line_column_for_offset(
+                            source, starts, start,
+                        );
+                        open_sites.push(
+                            crate::analyzer::resolution::reference_vocabulary::OpenInventorySite {
+                                reason_kind: gap_origin_from_code(origin).kind().label().to_owned(),
+                                file: mount.persisted_relative_path().to_owned(),
+                                line: u32::try_from(line).expect("source line fits u32"),
+                                macro_name,
+                            },
+                        );
+                    }
+                }
                 if cancellation.is_cancelled() {
                     return Ok(());
                 }
@@ -1465,9 +1533,52 @@ fn target_scoped_reference_inventory_gaps(
     } else {
         ResolutionCompletion::incomplete(reasons)
     };
-    locators.sort();
-    locators.dedup();
-    Ok((completion, locators))
+    open_sites.sort();
+    open_sites.dedup();
+    open_paths.sort();
+    open_paths.dedup();
+    Ok(TargetScopedInventoryGaps {
+        completion,
+        open_sites,
+        open_paths,
+    })
+}
+
+/// Where one open gap site is: the start byte of its macro invocation (or of
+/// the site itself when it is no macro input) and the invocation's name.
+/// Rows published before migration 0191 carry no macro name of their own; the
+/// item-macro table still names any unqualified invocation it owns.
+fn open_gap_site_position(
+    connection: &rusqlite::Connection,
+    blob_id: i64,
+    source_site: u32,
+) -> Result<Option<(usize, Option<String>)>> {
+    let macro_input = connection
+        .prepare_cached(
+            "SELECT input.invocation_start_byte,
+                    COALESCE(input.macro_name,
+                             (SELECT invocation.macro_name
+                              FROM source_rust_macro_invocations AS invocation
+                              WHERE invocation.blob_id=input.blob_id
+                                AND invocation.occurrence_id=input.invocation_occurrence_id))
+             FROM source_rust_macro_inputs AS input
+             WHERE input.blob_id=?1 AND input.native_gap_site=?2",
+        )?
+        .query_row(params![blob_id, source_site], |row| {
+            Ok((row.get::<_, usize>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .optional()?;
+    if macro_input.is_some() {
+        return Ok(macro_input);
+    }
+    let site_start = connection
+        .prepare_cached("SELECT start_byte FROM resolution_sites WHERE blob_id=?1 AND site=?2")?
+        .query_row(params![blob_id, source_site], |row| {
+            row.get::<_, Option<usize>>(0)
+        })
+        .optional()?
+        .flatten();
+    Ok(site_start.map(|start| (start, None)))
 }
 
 pub(crate) const MASKED_BLOB_SQL: &str = "SELECT blob.id FROM temp.selected_resolution_overlay_masks AS mask CROSS JOIN workspace_file_versions AS version ON version.file_version_id=mask.masked_file_version_id CROSS JOIN blobs AS blob ON blob.blob_oid=version.blob_oid AND blob.lang=version.lang AND blob.parse_variant=x'' AND blob.generation=version.generation WHERE mask.storage_language='rust' AND mask.persisted_relative_path=?1";
@@ -1511,6 +1622,7 @@ pub(crate) const CALL_ARITY_SQL: &str = include_str!("rust_reverse_call_arity.sq
 pub(crate) const CALL_SHAPE_SQL: &str = include_str!("rust_reverse_call_shape.sql");
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn reverse_target_activation(
         &self,
         definition: SemanticId,
@@ -1619,6 +1731,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(activation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn persisted_reverse_target(
         &self,
         mount: &SelectedResolutionOperationMount,
@@ -1659,6 +1772,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_row_binding_candidates(
         &self,
         target: &SelectedRustBindingDefinition,
@@ -1709,6 +1823,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some((candidates, frontier)))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn overlay_reverse_locators(
         &self,
         mount: &SelectedResolutionOperationMount,
@@ -1774,6 +1889,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(sites)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn rust_reverse_candidate_context(&self, blob: i64) -> Result<Option<ReverseContextWitness>> {
         let ordinal = self
             .ready
@@ -1860,6 +1976,51 @@ impl SelectedResolutionOperation<'_, '_> {
             cancellation,
         )
     }
+
+    /// The relative paths of the files whose reference-inventory gaps may
+    /// name `target`, over every file that can reach it; `None` when
+    /// cancelled.
+    ///
+    /// Name discovery finds only enumerated references. A file whose only
+    /// possible reference sits in a region the producer could not enumerate,
+    /// such as a `tokio::select!` arm that does not parse as an expression
+    /// list, has no name row for the target and is never nominated. An answer
+    /// admitted to the nominated files would then never examine that file's
+    /// gap and would certify absence (#13858). These are the same gap
+    /// predicates the answer applies to its admitted files, so a frontier
+    /// proven unable to name the target nominates nothing. The gap rows live
+    /// in the reverse-query operation's temp table.
+    fn rust_reverse_open_frontier_paths(
+        &self,
+        target: &CodeUnit,
+        target_names: &[(i64, String, String)],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<String>>> {
+        let definition = match self.locate_rust_definition(target, cancellation)? {
+            SelectedRustDefinitionSemanticOutcome::Found(definition) => definition,
+            SelectedRustDefinitionSemanticOutcome::Cancelled => return Ok(None),
+            SelectedRustDefinitionSemanticOutcome::Missing => {
+                panic!("a nominated target keeps its definition within one operation: {target:?}")
+            }
+        };
+        let sites = materialize_gap_candidate_sites(
+            self,
+            definition,
+            target,
+            target_names,
+            &[],
+            false,
+            cancellation,
+        )?;
+        let gaps =
+            target_scoped_reference_inventory_gaps(self, &sites, target, &[], &[], cancellation);
+        release_gap_candidate_sites(self, sites)?;
+        let gaps = gaps?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(gaps.open_paths))
+    }
 }
 
 struct RustReverseNominationHooks<'a, 'store, 'input>(
@@ -1894,6 +2055,7 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
     ) -> Result<Vec<SelectedSemanticLocator>> {
         self.0.overlay_reverse_locators(mount, name, cancellation)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn target_frontier(
         &self,
         target: &CodeUnit,
@@ -1918,6 +2080,7 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
         };
         Ok(ReverseTargetFrontier::Placed(completion))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn exposure_seeds(
         &self,
         target: &CodeUnit,
@@ -1984,6 +2147,7 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
             unbound_spelling: member_of_an_owner.then(|| target.identifier().to_owned()),
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn exposure_successors(
         &self,
         exposure: &ReverseExposure,
@@ -2094,6 +2258,7 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
             successors,
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn source_ranges(
         &self,
         target: &CodeUnit,
@@ -2149,6 +2314,7 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
             keys: lookup_keys,
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn root_lookup(
         &self,
         name: &str,
@@ -2210,6 +2376,7 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
             .lexical_source()
             .type_identity_observation_sites(blob, ResolutionSiteId::new(site), cancellation)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn site_locators(&self, blob: i64, site: u32) -> Result<Vec<SelectedSemanticLocator>> {
         super::reverse_nomination::selected_site_locators(
             self.0.ready.inventory.connection(),
@@ -2257,6 +2424,30 @@ type RustRequiredContext = reverse::ReverseContextId<RustReverseView>;
 type RustConfirmedContextBatch =
     reverse::ReverseContextBatch<RustRequiredContext, SelectedRustReferenceAnswer>;
 
+/// A consumer that needs an answer for every requested site, such as a
+/// recheck or a contract probe, treats one site stopped by its receiver budget
+/// as a budget stop of the whole batch. Only the candidate scan, which
+/// publishes each finished site on its own, keeps the partial batch.
+fn require_every_site_attempted(
+    batch: reverse::ReverseBatch<
+        RustConfirmedContextBatch,
+        brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+    >,
+) -> reverse::ReverseBatch<
+    RustConfirmedContextBatch,
+    brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+> {
+    match batch {
+        reverse::ReverseBatch::Ready(confirmed) => {
+            match confirmed.sites.iter().find_map(|site| site.stopped) {
+                Some(limit) => reverse::ReverseBatch::Bounded(limit),
+                None => reverse::ReverseBatch::Ready(confirmed),
+            }
+        }
+        other => other,
+    }
+}
+
 /// One identity arena and file-domain index for the enclosing target query.
 struct RustReverseDomains {
     proof: reverse::ReverseProofBatch<RustReverseView>,
@@ -2302,6 +2493,7 @@ impl RustReverseDomains {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn required_reverse_domain(
     selected: &SelectedResolutionOperation<'_, '_>,
     path: &str,
@@ -2368,7 +2560,22 @@ enum RustCheapExclusion {
     InactiveCfg,
 }
 
-fn record_cheap_exclusion(locator: &SelectedSemanticLocator, domains: &mut RustReverseDomains) {
+fn record_cheap_exclusion(
+    selected: &SelectedResolutionOperation<'_, '_>,
+    locator: &SelectedSemanticLocator,
+    domains: &mut RustReverseDomains,
+    excluded_sites: &mut Vec<(u32, u32)>,
+) -> Result<()> {
+    let site = locator
+        .source_site()
+        .expect("a structural exclusion has a source site");
+    let mount = selected
+        .mount_table()
+        .mount_for_path("rust", locator.relative_path())?
+        .expect("a selected candidate has a mount");
+    // The shared proof and the final target-scoped gap query must both retain
+    // this exact exclusion. Independent macro and enumeration gaps stay open.
+    excluded_sites.push((mount.ordinal().get(), site.get()));
     reverse::exclude_reverse_site(
         &mut domains.proof,
         locator,
@@ -2378,6 +2585,7 @@ fn record_cheap_exclusion(locator: &SelectedSemanticLocator, domains: &mut RustR
             .expect("admitted file domain"),
         ResolutionCompletion::Complete,
     );
+    Ok(())
 }
 
 /// A diagnostic sink belongs to one target request, including its zero-hit domain.
@@ -2482,33 +2690,30 @@ pub fn confirm_rust_reverse_references(
     locators: &[&crate::analyzer::resolution::SelectedSemanticLocator],
     cancellation: &CancellationToken,
 ) -> Result<crate::analyzer::store::resolution_operation::RustReverseConfirmation> {
-    use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
     let _timing = crate::profiling::scope("rust_selected::reverse_confirm_blob");
     #[cfg(any(test, feature = "test-support"))]
     operation.attach_active_reverse_sql_work_trace();
     let budget =
         brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default();
-    let answer = operation.confirm_rust_references_for_caller_bounded(
+    let confirmed = operation.confirm_rust_references_for_caller_bounded(
         root,
         locators,
         budget,
         cancellation,
         &mut SelectedResolutionContextMetrics,
         &mut crate::analyzer::resolution::ResolutionBatchMetrics::default(),
-    );
-    let answer = answer?;
+    )?;
     #[cfg(any(test, feature = "test-support"))]
     if let Some(output) = std::env::var_os("BIFROST_REVERSE_OBSERVER") {
         // Observe the existing bounded result without finishing or polling the
         // session again. Stopped blobs still leave a charge/outcome receipt.
-        let outcome = match &answer {
-            BoundedResolution::Complete { .. } => "complete",
-            BoundedResolution::Exceeded { .. } => "bounded",
-            BoundedResolution::Unavailable { .. } => "unavailable",
-            BoundedResolution::Cancelled { .. } => "cancelled",
+        let outcome = match &confirmed.session {
+            PartialReverseSession::Resolved(_) => "complete",
+            PartialReverseSession::BudgetStopped { .. } => "bounded",
+            PartialReverseSession::Cancelled => "cancelled",
         };
         let value = serde_json::json!({"stage":"session","root":operation.ready.project.root(),
-            "caller":root,"locators":format!("{locators:?}"),"outcome":outcome,"work":format!("{:?}",answer.work())});
+            "caller":root,"locators":format!("{locators:?}"),"outcome":outcome,"work":format!("{:?}",confirmed.work)});
         let mut bytes = serde_json::to_vec(&value).expect("JSON observation values serialize");
         bytes.push(b'\n');
         use std::io::Write;
@@ -2518,16 +2723,29 @@ pub fn confirm_rust_reverse_references(
             .open(output)?
             .write_all(&bytes)?;
     }
-    let outcome = match answer {
-        BoundedResolution::Cancelled { .. } => reverse::ReverseBatch::Cancelled {
+    let outcome = match confirmed.session {
+        PartialReverseSession::Cancelled => reverse::ReverseBatch::Cancelled {
             stage: reverse::ReverseCancellationStage::Context,
             completion: cancelled_completion(),
         },
-        BoundedResolution::Exceeded { limit, .. } => reverse::ReverseBatch::Bounded(limit),
-        BoundedResolution::Unavailable { reason, .. } => reverse::ReverseBatch::Unavailable(
-            SelectedResolutionUnavailable::CatalogInputUnavailable { reason },
-        ),
-        BoundedResolution::Complete { value, .. } => value.map_limit(|limit| match limit {}),
+        PartialReverseSession::Resolved(batch) => batch,
+        // The locators that finished keep their reports. The in-flight locator
+        // and every later one are unattempted, never absent.
+        PartialReverseSession::BudgetStopped { finished, limit } => {
+            let attempted = finished.len();
+            match operation.finish_budget_stopped_reverse_reports(finished, cancellation)? {
+                reverse::ReverseBatch::Ready(mut reports) => {
+                    reports.extend(locators[attempted..].iter().map(|&locator| {
+                        reverse::ReverseSessionReport::Unattempted {
+                            locator: locator.clone(),
+                            limit,
+                        }
+                    }));
+                    reverse::ReverseBatch::Ready(reports)
+                }
+                stopped => stopped,
+            }
+        }
     };
     // Keep the existing consumer mapping; internal lifecycle outcomes stay typed.
     if let reverse::ReverseBatch::Ready(reports) = &outcome
@@ -2539,7 +2757,7 @@ pub fn confirm_rust_reverse_references(
             "reverse candidate has no forward reference",
         ));
     }
-    Ok(outcome)
+    Ok(outcome.map_limit(|never| match never {}))
 }
 
 fn rust_reverse_preparation_error<T, L>(outcome: reverse::ReverseBatch<T, L>) -> StoreError {
@@ -2696,6 +2914,7 @@ fn retain_owned_reverse_rejection(
 /// the package's library target, and a library may name a build dependency.
 /// The manifest-file version ties sibling targets to the package without
 /// confusing identically named dependencies in other workspace packages.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn wrong_target_workspace_dependency(
     selected: &SelectedResolutionOperation<'_, '_>,
     locator: &SelectedSemanticLocator,
@@ -2783,6 +3002,7 @@ fn wrong_target_workspace_dependency(
 /// scope. A member-owner row can also describe a field or another non-trait
 /// owner, where that rule does not exclude the target and the open surface
 /// must remain.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn member_owner_unnameable_at(
     selected: &SelectedResolutionOperation<'_, '_>,
     definition: SemanticId,
@@ -3011,6 +3231,7 @@ impl RustReverseQueries<'_, '_, '_> {
     /// A concrete implementation is an inverse usage of its trait contract.
     /// Confirm the implementation's declared trait reference through the same
     /// point entry; a matching spelling alone cannot establish this relation.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn contract_completion(
         selected: &mut SelectedResolutionOperation<'_, '_>,
         cancellation: &CancellationToken,
@@ -3106,7 +3327,7 @@ impl RustReverseQueries<'_, '_, '_> {
             // explicit inventory gap instead of treating the missing proof as
             // a negative contract answer.
             let domain = required_reverse_domain(selected, reference.relative_path())?;
-            let confirmation = Self::confirm_locators(
+            let confirmation = require_every_site_attempted(Self::confirm_locators(
                 selected,
                 cancellation,
                 confirm,
@@ -3114,7 +3335,7 @@ impl RustReverseQueries<'_, '_, '_> {
                 &HashSet::default(),
                 evaluations,
                 domain,
-            )?;
+            )?);
             let mut answers = match confirmation {
                 reverse::ReverseBatch::Ready(answers) => answers,
                 reverse::ReverseBatch::TimeStopped => {
@@ -3530,15 +3751,17 @@ impl reverse::ReverseFileHooks<()> for RustRecheckFiles<'_, '_, '_> {
             .domains
             .remove(locators[0].relative_path())
             .expect("recheck domain precedes file confirmation");
-        RustReverseQueries::confirm_locators(
-            self.selected,
-            self.cancellation,
-            self.confirm,
-            &locators,
-            &HashSet::default(),
-            &mut self.evaluations,
-            domain,
-        )
+        Ok(require_every_site_attempted(
+            RustReverseQueries::confirm_locators(
+                self.selected,
+                self.cancellation,
+                self.confirm,
+                &locators,
+                &HashSet::default(),
+                &mut self.evaluations,
+                domain,
+            )?,
+        ))
     }
     fn commit(
         &mut self,
@@ -4051,6 +4274,18 @@ impl RustReverseQueries<'_, '_, '_> {
         }
         let mut contract_time_budget_exceeded = retained.time_budget_exceeded;
         for ((locator, reference), site) in admitted_sites.into_iter().zip(confirmed.sites) {
+            if site.stopped.is_some() {
+                // Its session ran out of receiver budget before it finished
+                // this site. Nothing was proved or refuted, so the site is
+                // neither classified nor accounted, and the inventory says it
+                // is incomplete. Sites the session finished are unaffected.
+                retained
+                    .inventory
+                    .include(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::ReceiverBudgetExhausted(input.definition),
+                    ]));
+                continue;
+            }
             if !site.reports.is_empty() && input.type_terminal_references.contains(&reference) {
                 retained.evaluated_type_terminals.push(reference);
             }
@@ -4195,7 +4430,19 @@ impl RustReverseQueries<'_, '_, '_> {
                     &[],
                     self.cancellation,
                 )? {
-                    Ok(set) => Some(set),
+                    Ok(mut set) => {
+                        match self.selected.rust_reverse_open_frontier_paths(
+                            target,
+                            &set.names,
+                            self.cancellation,
+                        )? {
+                            Some(paths) => {
+                                set.open_frontier_paths = paths;
+                                Some(set)
+                            }
+                            None => None,
+                        }
+                    }
                     Err(reason) => {
                         missing_reason = reason;
                         None
@@ -4212,6 +4459,7 @@ impl RustReverseQueries<'_, '_, '_> {
             }
         }
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn held_references_to(
         &mut self,
         targets: &[CodeUnit],
@@ -4287,6 +4535,7 @@ impl RustReverseQueries<'_, '_, '_> {
             let mut observer = RustReverseObserver::new();
             let lexical = self.selected.ready.lexical_source();
             let mut inventory = ResolutionCompletionAccumulator::default();
+            let mut open_sites = Vec::new();
             let target_activation =
                 self.selected
                     .reverse_target_activation(definition, target, self.cancellation)?;
@@ -4605,13 +4854,12 @@ impl RustReverseQueries<'_, '_, '_> {
                                 brokk_bifrost_rust::selected_context::RustSelectedActivation::Inactive,
                                 _,
                             )) => {
-                                let mount = self
-                                    .selected
-                                    .mount_table()
-                                    .mount_for_path("rust", locator.relative_path())?
-                                    .expect("a selected candidate has a mount");
-                                excluded_sites.push((mount.ordinal().get(), site.get()));
-                                record_cheap_exclusion(locator, &mut domains);
+                                record_cheap_exclusion(
+                                    self.selected,
+                                    locator,
+                                    &mut domains,
+                                    &mut excluded_sites,
+                                )?;
                                 #[cfg(any(test, feature = "test-support"))]
                                 observer.cheap_exclusion(locator, RustCheapExclusion::InactiveCfg);
                                 continue;
@@ -4648,11 +4896,12 @@ impl RustReverseQueries<'_, '_, '_> {
                     // This structural rejection closes only the exact site's
                     // coarse lookup/applicability placeholders for this target.
                     // Macro, binder and enumeration gaps stay independent.
-                    let mount = self.selected.mount_table()
-                        .mount_for_path("rust", locator.relative_path())?
-                        .expect("a selected candidate has a mount");
-                    excluded_sites.push((mount.ordinal().get(), site.get()));
-                    record_cheap_exclusion(locator, &mut domains);
+                    record_cheap_exclusion(
+                        self.selected,
+                        locator,
+                        &mut domains,
+                        &mut excluded_sites,
+                    )?;
                     #[cfg(any(test, feature = "test-support"))]
                     observer.cheap_exclusion(locator, RustCheapExclusion::CallShapeOrArity);
                     continue;
@@ -4683,7 +4932,12 @@ impl RustReverseQueries<'_, '_, '_> {
                     ).optional()?
                 {
                     if primary && well_formed {
-                        record_cheap_exclusion(locator, &mut domains);
+                        record_cheap_exclusion(
+                            self.selected,
+                            locator,
+                            &mut domains,
+                            &mut excluded_sites,
+                        )?;
                         #[cfg(any(test, feature = "test-support"))]
                         observer.cheap_exclusion(locator, RustCheapExclusion::AuthoredField);
                         continue;
@@ -5009,7 +5263,7 @@ impl RustReverseQueries<'_, '_, '_> {
                 // completion
                 // would reintroduce unrelated names from those same blobs.
                 confirmed_enumeration.clear();
-                let (scoped_gaps, _gap_locators) = target_scoped_reference_inventory_gaps(
+                let scoped = target_scoped_reference_inventory_gaps(
                     self.selected,
                     sites,
                     target,
@@ -5017,7 +5271,8 @@ impl RustReverseQueries<'_, '_, '_> {
                     &qualified_reference_sites,
                     self.cancellation,
                 )?;
-                inventory.include(&scoped_gaps);
+                inventory.include(&scoped.completion);
+                open_sites = scoped.open_sites;
             }
             if let Some(sites) = gap_sites {
                 release_gap_candidate_sites(self.selected, sites)?;
@@ -5077,6 +5332,7 @@ impl RustReverseQueries<'_, '_, '_> {
                     source_sites,
                 },
                 bindings: bindings.into_boxed_slice(),
+                open_sites: open_sites.into_boxed_slice(),
             });
         }
         Ok(SelectedRustReverseBatchOutcome::Ready(results))
@@ -5300,6 +5556,10 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn begin_sql_work_trace(&self) {
         REVERSE_SQL_WORK.with(|work| {
             assert!(work.borrow().is_none(), "reverse SQL trace cannot nest");
@@ -5309,6 +5569,10 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn finish_sql_work_trace(&self) -> (usize, usize) {
         detach_reverse_sql_work_trace(self.selected.ready.inventory.connection());
         REVERSE_SQL_WORK.with(|work| {
@@ -5334,10 +5598,9 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
         frame: impl FnOnce(&SelectedResolutionOperation<'store, 'input>) -> Result<Frame>,
         run: impl FnOnce(&mut dyn SelectedRustReverseQueries) -> Result<T>,
     ) -> Result<SelectedResolutionOperationOutcome<T>> {
-        self.ready
-            .inventory
-            .connection()
-            .execute_batch(GAP_CANDIDATE_SITES_SCHEMA_SQL)?;
+        self.ready.inventory.with_schema_mutation(|connection| {
+            Ok(connection.execute_batch(GAP_CANDIDATE_SITES_SCHEMA_SQL)?)
+        })?;
         // Enter only after self has reached its final address. The guard is
         // dropped before cleanup consumes the operation or touches writer loans.
         let frame = frame(&self)?;

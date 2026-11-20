@@ -645,6 +645,15 @@ impl CodeUnitIndex for PhpAnalyzer {
         self.inner.all_declarations()
     }
 
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
+    }
+
     delegate_inner_methods! {
         fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
@@ -857,8 +866,22 @@ impl IAnalyzer for PhpAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let inner = self.inner.update_with_listing(changed_files, listing);
+            // Manifest bytes can change autoload routes without changing workspace membership.
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
             let composer_autoload = if changed_files
                 .iter()
                 .any(PhpComposerAutoload::manifest_changed)
@@ -867,7 +890,10 @@ impl IAnalyzer for PhpAnalyzer {
             } else {
                 self.composer_autoload.clone()
             };
-            Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload)
+            (
+                Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload),
+                effects.no_changes_or_unreported(changed_files),
+            )
         })
     }
 
@@ -1247,6 +1273,19 @@ impl LanguageEdgePass for PhpEdgePass {
         EdgePassId::Php
     }
 
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<PhpAnalyzer>(analyzer)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |php| php.inner.selected_graph_source_exclusions(),
+            )
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         build_rooted_php_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeSites::Fqn)
@@ -1368,6 +1407,7 @@ mod dependency_packs {
             config: &AnalyzerConfig,
             project: &dyn Project,
             _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {

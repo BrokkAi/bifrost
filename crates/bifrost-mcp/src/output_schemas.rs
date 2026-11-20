@@ -22,10 +22,6 @@ type OutputSchemaSource = fn() -> Value;
 
 const OUTPUT_SCHEMAS: &[(&str, OutputSchemaSource)] = &[
     (
-        "relation_brief",
-        generate_output_schema::<brokk_bifrost_tools::relation_brief::RelationBriefResult>,
-    ),
-    (
         "analyze_diff",
         generate_output_schema::<brokk_bifrost_tools::diff_analysis::DiffAnalysisResult>,
     ),

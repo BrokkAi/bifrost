@@ -632,7 +632,7 @@ impl<'source> MemberSelectionFrame<'source> {
             operation.candidate_paths,
             state.root,
         );
-        evaluation.replace_with_checkpoint_state(state);
+        evaluation.replace_with_checkpoint_state(state)?;
         let result = self.poll_selection(&mut evaluation, readiness);
         self.evaluation = Some(evaluation.into_checkpoint_state());
         result
@@ -827,14 +827,14 @@ impl<'source> MemberSelectionFrame<'source> {
     }
 
     fn cancel(mut self, operation: &mut Resources<'_, 'source>) {
-        let state = self
+        let mut state = self
             .evaluation
             .take()
             .expect("member phase is between polls");
         let mut evaluation =
             FactEvaluation::new(operation.session, operation.hierarchy, state.root)
                 .with_candidate_paths(operation.candidate_paths);
-        evaluation.replace_with_checkpoint_state(state);
+        evaluation.swap_checkpoint_state(&mut state);
         if let Some((_, edges)) = self.direct.take() {
             edges.cancel(&mut evaluation);
         }
@@ -846,14 +846,14 @@ impl<'source> MemberSelectionFrame<'source> {
     }
 
     fn abandon(mut self, operation: &mut Resources<'_, 'source>) {
-        let state = self
+        let mut state = self
             .evaluation
             .take()
             .expect("member phase is between polls");
         let mut evaluation =
             FactEvaluation::new(operation.session, operation.hierarchy, state.root)
                 .with_candidate_paths(operation.candidate_paths);
-        evaluation.replace_with_checkpoint_state(state);
+        evaluation.swap_checkpoint_state(&mut state);
         if let Some((_, edges)) = self.direct.take() {
             edges.abandon(&mut evaluation);
         }
@@ -2928,10 +2928,22 @@ fn poll_qualified_member_consumer<'source>(
     active: &mut HashSet<QualifiedMemberId>,
 ) -> StoreResult<bool> {
     use crate::analyzer::store::resolution_operation::demand_closure::Read;
+    let Some(receiver_uses) = scheduler.tasks[task]
+        .frame
+        .as_mut()
+        .expect("held typed task")
+        .reacquire_receiver_uses(operation)?
+    else {
+        return Ok(false);
+    };
     let mut wait = scheduler
         .qualified_members
         .remove(&task)
         .expect("held qualified group");
+    assert!(
+        active.contains(&wait.id),
+        "qualified reply uses the actual live request serial"
+    );
     if let Some(mut frame) = wait.member_selection.take() {
         let polled = poll_member_consumer(
             operation,
@@ -3072,15 +3084,19 @@ fn poll_qualified_member_consumer<'source>(
                         return Ok(complete);
                     }
                     CloseProgress::Ready(MemberSelectionOutcome::QualifierIsNamespace) => {
-                        scheduler.tasks[task]
+                        let complete = scheduler.tasks[task]
                             .frame
                             .as_mut()
                             .expect("held typed task")
                             .resume_qualified_namespace(
-                                operation.session,
+                                operation,
                                 wait.input.reference().reference,
                                 wait.input.member().route_ordinal,
-                            );
+                            )?;
+                        if !complete {
+                            scheduler.qualified_members.insert(task, wait);
+                            return Ok(false);
+                        }
                         hook.cancel_qualified_member(wait.id);
                         active.remove(&wait.id);
                         scheduler.tasks[task].hierarchy_waits.clear();
@@ -3169,7 +3185,12 @@ fn poll_qualified_member_consumer<'source>(
                 .frame
                 .as_mut()
                 .expect("held typed task")
-                .install_constructed_value(input.output, input.binding.targets()[0], value);
+                .install_constructed_value(
+                    input.output,
+                    input.binding.targets()[0],
+                    value,
+                    &receiver_uses,
+                );
             scheduler.tasks[task].hierarchy_waits.clear();
             scheduler.tasks[task].waits_on.clear();
             active.remove(&wait.id);
@@ -4096,6 +4117,14 @@ fn poll_round<'a>(
             environment, CALLER_ENVIRONMENT,
             "G0 does not enable remote task execution"
         );
+        let Some(receiver_uses) = scheduler.tasks[id]
+            .frame
+            .as_mut()
+            .expect("runnable task is live")
+            .reacquire_receiver_uses(operation)?
+        else {
+            return Ok(RoundOutcome::Cancelled);
+        };
         if let Some((reference, dependency)) = scheduler.typed_references.remove(&id) {
             let dependency_answer = scheduler.tasks[dependency]
                 .answer
@@ -4103,27 +4132,16 @@ fn poll_round<'a>(
                 .expect("a resumed typed prerequisite has its selected answer");
             let scope = dependency_answer.query_obligations.clone();
             let answer = dependency_answer.binding().clone();
-            // This path narrows the carrier to a binding; retain its closed scope first.
             scheduler.tasks[id]
                 .frame
                 .as_mut()
                 .expect("held typed task")
-                .evaluation
-                .as_mut()
-                .expect("held typed evaluator")
-                .query_obligations
-                .node(QueryNode::Hierarchy(reference))
-                .union(&scope);
-            assert!(
-                scheduler.tasks[id]
-                    .frame
-                    .as_mut()
-                    .expect("held typed task")
-                    .typed_reference_answers
-                    .insert(reference, Arc::new(answer))
-                    .is_none(),
-                "typed reference answer is inserted only once"
-            );
+                .install_typed_reference_answer(
+                    reference,
+                    Arc::new(answer),
+                    &scope,
+                    &receiver_uses,
+                );
             assert_eq!(scheduler.tasks[id].waiting, 0);
             scheduler.tasks[id].hierarchy_waits.clear();
         }
@@ -4520,6 +4538,7 @@ fn poll_round<'a>(
                                 value: None,
                                 completion: ResolutionCompletion::Complete,
                             },
+                            &receiver_uses,
                         );
                     scheduler.runnable.push_back(Runnable::Task(id));
                     continue;
@@ -6456,10 +6475,10 @@ mod tests {
         ) -> StoreResult<MemberSelectionOutcome> {
             self.reads += 1;
             let request = self.exhaust.map(|session| {
-                assert!(
-                    !session.scope_steps(usize::MAX),
-                    "exhaust only after member read"
+                session.mark_exceeded(
+                    brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
                 );
+                assert!(!session.scope_step(), "exhaust only after member read");
                 MemberSelectionRequest {
                     policy: &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
                     order: None,
@@ -6491,7 +6510,6 @@ mod tests {
         let member = ResolutionCompletion::incomplete([gap]);
         let bounded = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 10000,
                 ..ReceiverAnalysisBudget::default()
             },
             None,
@@ -7144,11 +7162,9 @@ mod tests {
     fn ready_task_claim_release_budget_cutoffs_retire_before_cancellation() {
         let mut release_cutoff = None;
         for cap in 0..128 {
-            let budget = ResolutionSession::bounded(
-                ReceiverAnalysisBudget {
-                    max_scope_nodes: cap,
-                    ..ReceiverAnalysisBudget::default()
-                },
+            let budget = ResolutionSession::bounded_with_total_work(
+                ReceiverAnalysisBudget::default(),
+                cap,
                 None,
             );
             with_resources_in_session(Some(&budget), |resources| {
@@ -7484,6 +7500,85 @@ mod tests {
             assert!(memo.lookup(&nested_stop_key, resources.session).is_none());
         });
     }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13216: the completed-roots memo key bound the remaining budget, so equal questions missed or diverged"
+    )]
+    fn completed_root_memo_key_ignores_the_remaining_budget() {
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        with_resources_in_session(Some(&session), |resources| {
+            let reference = SemanticId::for_test("budget-free-memo-reference");
+            let seed = ReferenceSeed::new_with_site_metadata(
+                BindingFragmentId::for_test("budget-free-memo-fragment"),
+                ResolutionQuery::new(reference),
+                BindingNodeId::for_test("budget-free-memo-node"),
+                Some(FactReferenceSiteMetadata::new(
+                    ResolutionSiteId::new(1),
+                    ResolutionNamespace::Value,
+                    ResolutionSiteKind::ValueReference,
+                    0,
+                    1,
+                    true,
+                    Some(None),
+                    None,
+                )),
+                ResolutionCompletion::Complete,
+            );
+            let key = |resources: &Resources<'_, '_>| {
+                RootMemoKey::new(
+                    resources.session,
+                    ReferenceKey::caller(reference),
+                    &seed,
+                    7,
+                    [0x42; 32],
+                )
+                .unwrap()
+            };
+            let before = key(resources);
+            // Unrelated work moves every remaining allowance of the session.
+            for _ in 0..5 {
+                assert!(session.scope_step());
+            }
+            assert!(session.summary_step());
+            assert!(session.round_step());
+            let after = key(resources);
+            assert_eq!(before, after, "the same question is the same key");
+
+            let memo = SelectedDemandState::default();
+            let answer = empty_fact_resolution_answer(
+                ResolutionCompletion::Complete,
+                resources.session.cancellation,
+            );
+            memo.retain(&before, &answer, resources.session);
+            let warm = memo
+                .lookup(&after, resources.session)
+                .expect("the answer stored under the earlier allowance is found");
+            assert_eq!(warm.completion(), answer.completion());
+            assert_eq!(memo.hits_for_test(), 1);
+
+            // A budget stop that cut the answer short is never stored.
+            let mut stopped = empty_fact_resolution_answer(
+                ResolutionCompletion::Complete,
+                resources.session.cancellation,
+            );
+            stopped.projected_type_shapes = Some(Box::new(FactProjectedTypeShapeSet {
+                shapes: vec![FactProjectedTypeShape {
+                    output_slot: reference,
+                    root_slot: reference,
+                    nodes: Box::new([]),
+                    completion: ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::ReceiverBudgetExhausted(reference),
+                    ]),
+                    supported: true,
+                }]
+                .into_boxed_slice(),
+            }));
+            let other = SelectedDemandState::default();
+            other.retain(&before, &stopped, resources.session);
+            assert!(other.lookup(&before, resources.session).is_none());
+        });
+    }
+
     struct SourceProvider {
         cancel_on_yield: Option<CancellationToken>,
         values: Vec<ResolutionSlotValue>,
@@ -7873,7 +7968,6 @@ mod tests {
     ) -> OrderFixtureResult {
         let session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 1000,
                 max_hierarchy_order_steps: cap,
                 ..ReceiverAnalysisBudget::default()
             },
@@ -8067,7 +8161,6 @@ mod tests {
         for consumers in [[0, 1], [1, 0]] {
             let session = ResolutionSession::bounded(
                 ReceiverAnalysisBudget {
-                    max_scope_nodes: 5,
                     max_hierarchy_order_work: 5,
                     ..ReceiverAnalysisBudget::default()
                 },
@@ -8177,7 +8270,6 @@ mod tests {
         }
         let session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 100_000,
                 ..ReceiverAnalysisBudget::default()
             },
             None,
@@ -8310,7 +8402,6 @@ mod tests {
     fn bounded_session_order_stop_is_execution_dependent_and_unmemoized() {
         let session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
                 max_hierarchy_order_work: 1,
                 max_hierarchy_order_steps: 100,
                 ..ReceiverAnalysisBudget::default()

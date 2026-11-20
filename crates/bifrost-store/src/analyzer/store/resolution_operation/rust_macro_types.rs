@@ -8,6 +8,17 @@ use brokk_bifrost_rust::macro_matcher::{
 };
 use rusqlite::{Transaction, params};
 
+/// The catalog key of one source type slot in a published blob. Every slot has
+/// a catalog row, so a missing one is a publication defect, not an absence.
+pub(super) fn catalog_slot_key(
+    tx: &Transaction<'_>,
+    blob: i64,
+    slot: ResolutionTypeSlotId,
+) -> Result<u32> {
+    let identity = crate::analyzer::resolution::fact_lowering::type_slot_semantic_identity(slot);
+    Ok(tx.prepare_cached("SELECT local_key FROM resolution_semantic_catalog WHERE blob_id=?1 AND identity_digest=?2")?.query_row(params![blob, identity.fragment_local_digest().as_slice()], |row| row.get(0))?)
+}
+
 pub fn publish(
     tx: &Transaction<'_>,
     blob: i64,
@@ -16,11 +27,7 @@ pub fn publish(
 ) -> Result<()> {
     tx.prepare_cached("DELETE FROM resolution_macro_type_candidates WHERE blob_id=?1")?
         .execute([blob])?;
-    let slot_key = |slot| -> Result<u32> {
-        let identity =
-            crate::analyzer::resolution::fact_lowering::type_slot_semantic_identity(slot);
-        Ok(tx.prepare_cached("SELECT local_key FROM resolution_semantic_catalog WHERE blob_id=?1 AND identity_digest=?2")?.query_row(params![blob, identity.fragment_local_digest().as_slice()], |row| row.get(0))?)
-    };
+    let slot_key = |slot| catalog_slot_key(tx, blob, slot);
     for candidate in &facts.macro_type_candidates {
         if cancellation.is_cancelled() {
             return Ok(());
@@ -64,6 +71,7 @@ impl StandardMacroAuthority for Authority {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn productions(
     selection: &SelectedResolutionMountInventory<'_>,
     source: Option<&dyn super::super::language_support::SelectedTypeHeadSource>,
@@ -190,7 +198,7 @@ pub fn productions(
                     for unit in units {
                         source.record_selected_derivation(
                             crate::analyzer::semantic::derivation::DerivationKindId(
-                                "derivation:rust_unit_inputs:v2",
+                                "derivation:rust_unit_inputs:v3",
                             ),
                             &crate::analyzer::semantic::derivation::DerivationQuestion {
                                 language: Some(Language::Rust),
@@ -246,6 +254,10 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn macro_certification_records_empty_file_units_before_new_placement() {
         let (store, workspace, snapshots) =
             crate::analyzer::store::resolution_selection::tests::qualifier_completion_gap_fixture_in_language(
@@ -263,7 +275,7 @@ mod tests {
             conn.execute("INSERT INTO source_rust_item_manifests VALUES(?1,2,4,0,1,1,1)", [blob]).unwrap();
             conn.execute("INSERT INTO source_rust_item_syntax VALUES(?1,0,0)", [blob]).unwrap();
             conn.execute("INSERT INTO source_rust_item_contexts VALUES(?1,0,0,NULL,NULL,0,0,0,0,NULL)", [blob]).unwrap();
-            conn.execute("INSERT INTO source_rust_impl_census_files VALUES(?1,1,0,0)", [blob]).unwrap();
+            conn.execute("INSERT INTO source_rust_impl_census_files VALUES(?1,1,0,0,1)", [blob]).unwrap();
             conn.execute("UPDATE source_fact_manifests SET publication_state='complete' WHERE blob_id=?1", [blob]).unwrap();
             conn.execute("INSERT INTO rust_crate_topologies(topology_id,topology_digest,crate_key,producer_epoch,target_kind,crate_name,edition,prelude,cfg_atoms,inventory_complete,export_surface_digest,publication_state,broad_complete) VALUES(1,zeroblob(32),zeroblob(32),'fixture','lib','fixture','2021','std',jsonb('[]'),1,zeroblob(32),'complete',1)", []).unwrap();
             conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,output_digest,publication_state) VALUES(1,'rust','rust_crate',zeroblob(32),zeroblob(32),(SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='rust'),?1,1,zeroblob(32),'complete')", [crate::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity()]).unwrap();

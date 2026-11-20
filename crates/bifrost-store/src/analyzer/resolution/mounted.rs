@@ -461,6 +461,167 @@ impl SpliceMount for super::ResolutionSlotValue {
     }
 }
 
+impl SpliceMount for super::fact_source::ConditionalOwnerApplication {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            owner: translation.semantic(self.owner),
+            partial: self.partial,
+            complete_positions: self.complete_positions,
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::ConditionalOwnerApplicationInputs {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            outcome: self.outcome.splice(translation),
+            application: self.application.splice(translation),
+            unsupported_implicit_receiver: self.unsupported_implicit_receiver,
+            ambiguous_application: self.ambiguous_application,
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::DeferredBaseReceiverIntentRead {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        match self {
+            Self::NotProvided => Self::NotProvided,
+            Self::Intent {
+                receiver_slot,
+                source_reference,
+            } => Self::Intent {
+                receiver_slot: translation.semantic(*receiver_slot),
+                source_reference: translation.semantic(*source_reference),
+            },
+            Self::Open { slot, completion } => Self::Open {
+                slot: translation.semantic(*slot),
+                completion: completion.splice(translation),
+            },
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::DeferredBaseReceiverCandidate {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            receiver_slot: translation.semantic(self.receiver_slot),
+            source_reference: translation.semantic(self.source_reference),
+            namespace: self.namespace,
+            metadata: self.metadata.splice(translation),
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::DeferredBaseReceiverCandidatesRead {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            candidates: self
+                .candidates
+                .iter()
+                .map(|row| row.splice(translation))
+                .collect(),
+            outcome: self.outcome.splice(translation),
+        }
+    }
+}
+
+struct MountedBaseIntentReader<'a> {
+    reader: &'a dyn super::fact_source::DeferredBaseReceiverIntentReader,
+    ordinal: u32,
+}
+
+impl super::fact_source::DeferredBaseReceiverIntentReader for MountedBaseIntentReader<'_> {
+    fn candidates(
+        &self,
+        slot: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::fact_source::DeferredBaseReceiverCandidatesRead> {
+        self.reader
+            .candidates(
+                slot.splice(&OutOfInterior {
+                    ordinal: self.ordinal,
+                }),
+                cancellation,
+            )
+            .map(|read| {
+                read.splice(&IntoInterior {
+                    ordinal: self.ordinal,
+                })
+            })
+    }
+}
+
+impl SpliceMount for super::fact_resolution::DeferredBaseReceiverRequest {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            receiver_slot: translation.semantic(self.receiver_slot),
+            source_reference: translation.semantic(self.source_reference),
+            owner: translation.semantic(self.owner),
+            owner_application: translation.semantic(self.owner_application),
+            completion: self.completion.splice(translation),
+            provisional_reasons: self
+                .provisional_reasons
+                .iter()
+                .map(|reason| translation.semantic(*reason))
+                .collect(),
+        }
+    }
+}
+
+// An inner hook speaks interior identities, while its borrowed session reader
+// belongs to the outer engine. Translate the callback in the reverse direction
+// of the source call, then translate its answer back before the hook uses it.
+struct MountedConditionalProofReader<'a> {
+    reader: &'a dyn super::fact_source::ConditionalOwnerApplicationReader,
+    ordinal: u32,
+}
+impl super::fact_source::ConditionalOwnerApplicationReader for MountedConditionalProofReader<'_> {
+    fn owner_application(
+        &self,
+        slot: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        super::fact_source::ReceiptUse<super::fact_source::ConditionalOwnerApplicationInputs>,
+    > {
+        let input = slot.splice(&OutOfInterior {
+            ordinal: self.ordinal,
+        });
+        self.reader
+            .owner_application(input, cancellation)
+            .map(|answer| super::fact_source::ReceiptUse {
+                observation: answer.observation.splice(&IntoInterior {
+                    ordinal: self.ordinal,
+                }),
+                receipt: answer.receipt,
+                usable_receipt: answer.usable_receipt,
+            })
+    }
+
+    fn owner_static_authority(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::fact_source::OwnerStaticAuthority> {
+        let owner = owner.splice(&OutOfInterior {
+            ordinal: self.ordinal,
+        });
+        self.reader.owner_static_authority(owner, cancellation)
+    }
+}
+
+impl SpliceMount for super::ConditionalTypeSeedRead {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        match self {
+            Self::Ready(seed) => Self::Ready(seed.splice(translation)),
+            Self::Open { slot, completion } => Self::Open {
+                slot: translation.semantic(*slot),
+                completion: completion.splice(translation),
+            },
+            Self::NotProvided => Self::NotProvided,
+        }
+    }
+}
+
 impl SpliceMount for super::fact_source::ConditionalTypeProduction {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         Self {
@@ -472,6 +633,43 @@ impl SpliceMount for super::fact_source::ConditionalTypeProduction {
                 .collect(),
             head: self.head,
             language: self.language,
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::ClosureBinderContext {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            binder: translation.semantic(self.binder),
+            ordinal: self.ordinal,
+            binder_count: self.binder_count,
+            argument: translation.semantic(self.argument),
+            callee_reference: translation.semantic(self.callee_reference),
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::FormalFunctionShapeType {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            slot: translation.semantic(self.slot),
+            indirection: self.indirection,
+            reference_indirection: self.reference_indirection,
+        }
+    }
+}
+
+impl SpliceMount for super::fact_source::FormalFunctionShape {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            owner: translation.semantic(self.owner),
+            trait_head: translation.semantic(self.trait_head),
+            parameters: self
+                .parameters
+                .iter()
+                .map(|parameter| parameter.splice(translation))
+                .collect(),
+            result: self.result.map(|result| result.splice(translation)),
         }
     }
 }
@@ -855,10 +1053,19 @@ impl SpliceMount for TypeTransferRule {
     }
 }
 
+impl SpliceMount for super::fact_source::TypedFactInventoryEvidence {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        match self {
+            Self::Established(completion) => Self::Established(completion.splice(translation)),
+            Self::Unestablished => Self::Unestablished,
+        }
+    }
+}
+
 impl SpliceMount for TypedFactReadOutcome {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         let evidence = self.evidence().splice(translation);
-        match self.terminal() {
+        let outcome = match self.terminal() {
             super::fact_source::TypedFactReadTerminal::Exhausted => {
                 TypedFactReadOutcome::exhausted(evidence)
             }
@@ -868,7 +1075,8 @@ impl SpliceMount for TypedFactReadOutcome {
             super::fact_source::TypedFactReadTerminal::Cancelled => {
                 TypedFactReadOutcome::cancelled(evidence)
             }
-        }
+        };
+        outcome.with_inventory_evidence(self.inventory_evidence().splice(translation))
     }
 }
 
@@ -1213,6 +1421,15 @@ impl SpliceMount for LoweredDeferredMemberOwner {
     }
 }
 
+impl SpliceMount for super::fact_source::SelectedDeclarationModifier {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            definition: translation.semantic(self.definition),
+            partial: self.partial,
+        }
+    }
+}
+
 impl<R: SpliceMount> SpliceMount for SelectedTypedRow<R> {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         SelectedTypedRow::new(
@@ -1386,6 +1603,21 @@ where
     }
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         self.inner.candidate_admission_session()
+    }
+
+    fn proof_identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<[u8; 32]>> {
+        use super::ResolutionIdentityDigestKey as Key;
+        let key = match key {
+            Key::Semantic(value) => Key::Semantic(self.argument(&value)),
+            Key::Node(value) => Key::Node(self.argument(&value)),
+            Key::Path(value) => Key::Path(self.argument(&value)),
+            Key::Fragment(value) => Key::Fragment(self.argument(&value)),
+        };
+        self.inner.proof_identity_content_digest(key, cancellation)
     }
 
     fn identity_content_digest(
@@ -1892,20 +2124,134 @@ where
                 .conditional_type_productions(&self.arguments(slots), cancellation)?,
         ))
     }
+
+    fn closure_binder_contexts(
+        &self,
+        binders: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<super::fact_source::ClosureBinderContext>> {
+        Ok(self.results(
+            &self
+                .inner
+                .closure_binder_contexts(&self.arguments(binders), cancellation)?,
+        ))
+    }
+
+    fn formal_function_shapes(
+        &self,
+        owners: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<super::fact_source::FormalFunctionShape>> {
+        Ok(self.results(
+            &self
+                .inner
+                .formal_function_shapes(&self.arguments(owners), cancellation)?,
+        ))
+    }
+
     fn supports_conditional_type_seeds(&self) -> bool {
         self.inner.supports_conditional_type_seeds()
+    }
+
+    fn selected_access_reference(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::fact_source::SelectedAccessReference>> {
+        Ok(self
+            .inner
+            .selected_access_reference(
+                self.interior_translation().semantic(reference),
+                cancellation,
+            )?
+            .map(|mut row| {
+                row.owner = row
+                    .owner
+                    .map(|owner| owner.map(|owner| self.result(&owner)));
+                row
+            }))
+    }
+    fn selected_access_declaration(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::fact_source::SelectedAccessDeclaration>> {
+        Ok(self
+            .inner
+            .selected_access_declaration(
+                self.interior_translation().semantic(definition),
+                cancellation,
+            )?
+            .map(|mut row| {
+                row.ordinary_owner = row.ordinary_owner.map(|owner| self.result(&owner));
+                row
+            }))
+    }
+
+    fn records_class_like_staticness(&self, language: crate::analyzer::Language) -> bool {
+        self.inner.records_class_like_staticness(language)
+    }
+
+    fn receiver_proof_services(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::resolution_operation::SelectedAnalyzerServices> {
+        self.inner.receiver_proof_services()
+    }
+
+    fn selected_receiver_proof_question(
+        &self,
+        application: SemanticId,
+        transfer: Option<(SemanticId, SemanticId)>,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        self.inner.selected_receiver_proof_question(
+            self.argument(&application),
+            transfer.map(|(receiver, rule)| (self.argument(&receiver), self.argument(&rule))),
+            cancellation,
+        )
+    }
+
+    fn selected_base_receiver_context_question(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion>>
+    {
+        self.inner
+            .selected_base_receiver_context_question(self.argument(&reference), cancellation)
+    }
+
+    fn deferred_base_receiver_intent(
+        &self,
+        slot: SemanticId,
+        reader: &dyn super::fact_source::DeferredBaseReceiverIntentReader,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::fact_source::DeferredBaseReceiverIntentRead> {
+        Ok(self.result(&self.inner.deferred_base_receiver_intent(
+            self.argument(&slot),
+            &MountedBaseIntentReader {
+                reader,
+                ordinal: self.ordinal,
+            },
+            cancellation,
+        )?))
     }
 
     fn conditional_type_seeds(
         &self,
         slots: &[SemanticId],
+        reader: &dyn crate::analyzer::resolution::fact_source::ConditionalOwnerApplicationReader,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Vec<super::ConditionalTypeSeed>> {
-        Ok(self.results(
-            &self
-                .inner
-                .conditional_type_seeds(&self.arguments(slots), cancellation)?,
-        ))
+    ) -> StoreResult<Vec<super::ConditionalTypeSeedRead>> {
+        Ok(self.results(&self.inner.conditional_type_seeds(
+            &self.arguments(slots),
+            &MountedConditionalProofReader {
+                reader,
+                ordinal: self.ordinal,
+            },
+            cancellation,
+        )?))
     }
 
     fn selected_model_language(
@@ -2375,13 +2721,30 @@ where
             }))
     }
 
+    fn deferred_participation_uses_receiver(&self, language: crate::analyzer::Language) -> bool {
+        self.inner.deferred_participation_uses_receiver(language)
+    }
+
     fn deferred_member_participation(
         &self,
         definitions: &[SemanticId],
+        receivers: Option<&[super::fact_source::DeferredMemberReceiverType]>,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<bool>>> {
-        self.inner
-            .deferred_member_participation(&self.arguments(definitions), cancellation)
+        let receivers = receivers.map(|receivers| {
+            receivers
+                .iter()
+                .map(|receiver| super::fact_source::DeferredMemberReceiverType {
+                    identity: self.argument(&receiver.identity),
+                    intrinsic_kind: receiver.intrinsic_kind,
+                })
+                .collect::<Vec<_>>()
+        });
+        self.inner.deferred_member_participation(
+            &self.arguments(definitions),
+            receivers.as_deref(),
+            cancellation,
+        )
     }
 
     fn go_package_member_sources(
@@ -2514,6 +2877,111 @@ where
             .map(|rows| {
                 rows.into_iter()
                     .map(|(reason, node)| (self.result(&reason), self.result(&node)))
+                    .collect()
+            }))
+    }
+
+    fn admitted_owner_language(&self, owner: SemanticId) -> Option<crate::analyzer::Language> {
+        self.inner.admitted_owner_language(self.argument(&owner))
+    }
+
+    fn implicit_root_rules_for_language(
+        &self,
+        language: crate::analyzer::Language,
+    ) -> Option<&'static brokk_bifrost_core::analyzer::capabilities::ImplicitInterfaceMembers> {
+        self.inner.implicit_root_rules_for_language(language)
+    }
+
+    fn selected_implicit_root_input(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::SelectedImplicitRootInput>> {
+        use super::SelectedImplicitRootInput as Input;
+        Ok(self
+            .inner
+            .selected_implicit_root_input(self.argument(&owner), cancellation)?
+            .map(|input| match input {
+                Input::NotProvided => Input::NotProvided,
+                Input::Open(completion) => Input::Open(self.result(&completion)),
+                Input::Source(mut root) => {
+                    root.context_completion = self.result(&root.context_completion);
+                    root.reference = self.result(&root.reference);
+                    root.frontier = self.result(&root.frontier);
+                    Input::Source(root)
+                }
+            }))
+    }
+
+    fn declaration_method_attributes(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, super::SelectedDeclarationMethodAttributes)>>> {
+        let definitions = definitions
+            .iter()
+            .map(|definition| self.argument(definition))
+            .collect::<Vec<_>>();
+        Ok(self
+            .inner
+            .declaration_method_attributes(&definitions, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(definition, attributes)| (self.result(&definition), attributes))
+                    .collect()
+            }))
+    }
+
+    fn declaration_class_like_metadata(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::fact_source::SelectedDeclarationClassLikeMetadata>>> {
+        let definitions = definitions
+            .iter()
+            .map(|definition| self.argument(definition))
+            .collect::<Vec<_>>();
+        Ok(self
+            .inner
+            .declaration_class_like_metadata(&definitions, cancellation)?
+            .map(|rows| self.results(&rows)))
+    }
+
+    fn requires_selected_nominal_parent_kind(&self, language: crate::analyzer::Language) -> bool {
+        self.inner.requires_selected_nominal_parent_kind(language)
+    }
+
+    fn supertype_kind_evidence(
+        &self,
+        language: crate::analyzer::Language,
+        stored: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind>,
+        targets: &[SemanticId],
+        completion: &ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::SupertypeKindEvidence>> {
+        let targets = targets
+            .iter()
+            .map(|target| self.argument(target))
+            .collect::<Vec<_>>();
+        self.inner
+            .supertype_kind_evidence(language, stored, &targets, completion, cancellation)
+    }
+
+    fn nominal_parent_target_kinds(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(SemanticId, super::NominalParentTargetKind)>>> {
+        let definitions = definitions
+            .iter()
+            .map(|definition| self.argument(definition))
+            .collect::<Vec<_>>();
+        Ok(self
+            .inner
+            .nominal_parent_target_kinds(&definitions, cancellation)?
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(definition, kind)| (self.result(&definition), kind))
                     .collect()
             }))
     }
@@ -2737,6 +3205,11 @@ where
     );
 
     spliced_typed_pages!(
+        visit_declaration_modifier_pages_for_definitions,
+        SemanticId,
+        SelectedTypedRow<super::fact_source::SelectedDeclarationModifier>
+    );
+    spliced_typed_pages!(
         visit_declaration_type_pages_for_definitions,
         SemanticId,
         SelectedTypedRow<LoweredDeclarationTypeProperty>
@@ -2847,6 +3320,227 @@ where
 mod tests {
     use super::*;
 
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn base_intent_callback_splices_candidates_and_open_evidence() {
+        use super::super::fact_source::{
+            DeferredBaseReceiverCandidate, DeferredBaseReceiverCandidatesRead,
+            DeferredBaseReceiverIntentRead, DeferredBaseReceiverIntentReader,
+            TypedFactInventoryEvidence,
+        };
+        struct EngineReader;
+        impl DeferredBaseReceiverIntentReader for EngineReader {
+            fn candidates(
+                &self,
+                slot: SemanticId,
+                _: &CancellationToken,
+            ) -> StoreResult<DeferredBaseReceiverCandidatesRead> {
+                assert_eq!(slot, SemanticId::local(7, 11));
+                Ok(DeferredBaseReceiverCandidatesRead {
+                    candidates: vec![DeferredBaseReceiverCandidate {
+                        receiver_slot: slot, source_reference: SemanticId::local(7, 12),
+                        namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Value,
+                        metadata: None,
+                    }],
+                    outcome: TypedFactReadOutcome::exhausted(ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::local(7, 13)),
+                    ])).with_inventory_evidence(TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete)),
+                })
+            }
+        }
+        let read = MountedBaseIntentReader {
+            reader: &EngineReader,
+            ordinal: 7,
+        }
+        .candidates(
+            SemanticId::local(UNMOUNTED_ORDINAL, 11),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            read.candidates[0].source_reference,
+            SemanticId::local(UNMOUNTED_ORDINAL, 12)
+        );
+        assert_eq!(
+            read.candidates[0].receiver_slot,
+            SemanticId::local(UNMOUNTED_ORDINAL, 11)
+        );
+        let open = read.unique_intent(SemanticId::local(UNMOUNTED_ORDINAL, 11), |_| true);
+        let DeferredBaseReceiverIntentRead::Open { slot, completion } =
+            out_of_interior(&open, SelectedResolutionMountOrdinal::new(7))
+        else {
+            panic!("missing metadata is open")
+        };
+        assert_eq!(slot, SemanticId::local(7, 11));
+        assert_eq!(
+            completion,
+            ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::local(7, 11)),
+                ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::local(7, 13)),
+            ])
+        );
+        let intent = DeferredBaseReceiverIntentRead::Intent {
+            receiver_slot: slot,
+            source_reference: SemanticId::local(7, 12),
+        };
+        let interior = into_interior(&intent, SelectedResolutionMountOrdinal::new(7));
+        assert_eq!(
+            out_of_interior(&interior, SelectedResolutionMountOrdinal::new(7)),
+            intent
+        );
+    }
+
+    #[test]
+    fn deferred_base_request_splices_all_runtime_identities() {
+        let reason = SemanticId::local(7, 19);
+        let request = super::super::fact_resolution::DeferredBaseReceiverRequest {
+            receiver_slot: SemanticId::local(7, 11),
+            source_reference: SemanticId::local(7, 12),
+            owner: SemanticId::local(7, 13),
+            owner_application: SemanticId::local(7, 14),
+            completion: ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(reason),
+            ]),
+            provisional_reasons: [reason].into_iter().collect(),
+        };
+        let interior = into_interior(&request, SelectedResolutionMountOrdinal::new(7));
+        assert_eq!(
+            interior.receiver_slot,
+            SemanticId::local(UNMOUNTED_ORDINAL, 11)
+        );
+        assert_eq!(
+            interior.source_reference,
+            SemanticId::local(UNMOUNTED_ORDINAL, 12)
+        );
+        assert_eq!(interior.owner, SemanticId::local(UNMOUNTED_ORDINAL, 13));
+        assert_eq!(
+            interior.owner_application,
+            SemanticId::local(UNMOUNTED_ORDINAL, 14)
+        );
+        assert_eq!(
+            interior.provisional_reasons,
+            [SemanticId::local(UNMOUNTED_ORDINAL, 19)]
+                .into_iter()
+                .collect()
+        );
+        let remounted = out_of_interior(&interior, SelectedResolutionMountOrdinal::new(7));
+        assert_eq!(remounted.receiver_slot, request.receiver_slot);
+        assert_eq!(remounted.source_reference, request.source_reference);
+        assert_eq!(remounted.owner, request.owner);
+        assert_eq!(remounted.owner_application, request.owner_application);
+        assert_eq!(remounted.completion, request.completion);
+        assert_eq!(remounted.provisional_reasons, request.provisional_reasons);
+    }
+
+    #[test]
+    #[hardwon(
+        "#7314: mounted conditional proof callback crossed engine and interior identity spaces"
+    )]
+    fn conditional_proof_callback_translates_both_directions() {
+        use super::super::fact_source::{
+            ConditionalOwnerApplication, ConditionalOwnerApplicationInputs,
+            ConditionalOwnerApplicationReader, OwnerStaticAuthority,
+        };
+        struct EngineReader {
+            application_slot: std::cell::Cell<Option<SemanticId>>,
+            static_owner: std::cell::Cell<Option<SemanticId>>,
+            static_cancelled: std::cell::Cell<bool>,
+        }
+        impl ConditionalOwnerApplicationReader for EngineReader {
+            fn owner_application(
+                &self,
+                slot: SemanticId,
+                _: &CancellationToken,
+            ) -> StoreResult<super::super::fact_source::ReceiptUse<ConditionalOwnerApplicationInputs>>
+            {
+                self.application_slot.set(Some(slot));
+                Ok(super::super::fact_source::ReceiptUse {
+                    receipt: super::super::fact_source::SelectedReceiverProofReceipt::Unretained,
+                    usable_receipt: None,
+                    observation: ConditionalOwnerApplicationInputs {
+                        outcome: TypedFactReadOutcome::exhausted(ResolutionCompletion::incomplete(
+                            [ResolutionIncompleteReason::UnsupportedSemantic(
+                                SemanticId::local(19, 31),
+                            )],
+                        )),
+                        application: Some(ConditionalOwnerApplication {
+                            owner: SemanticId::local(19, 17),
+                            partial: Some(false),
+                            complete_positions: true,
+                        }),
+                        unsupported_implicit_receiver: true,
+                        ambiguous_application: true,
+                    },
+                })
+            }
+
+            fn owner_static_authority(
+                &self,
+                owner: SemanticId,
+                cancellation: &CancellationToken,
+            ) -> StoreResult<OwnerStaticAuthority> {
+                self.static_owner.set(Some(owner));
+                self.static_cancelled.set(cancellation.is_cancelled());
+                Ok(if cancellation.is_cancelled() {
+                    OwnerStaticAuthority::Unknown
+                } else {
+                    OwnerStaticAuthority::KnownNonStatic
+                })
+            }
+        }
+        let outer = EngineReader {
+            application_slot: std::cell::Cell::new(None),
+            static_owner: std::cell::Cell::new(None),
+            static_cancelled: std::cell::Cell::new(false),
+        };
+        let bridge = MountedConditionalProofReader {
+            reader: &outer,
+            ordinal: 19,
+        };
+        let answer = bridge
+            .owner_application(
+                SemanticId::local(UNMOUNTED_ORDINAL, 7),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(outer.application_slot.get(), Some(SemanticId::local(19, 7)));
+        assert!(answer.usable_receipt.is_none());
+        let answer = answer.observation;
+        let owner = answer.application.unwrap();
+        assert_eq!(owner.owner, SemanticId::local(UNMOUNTED_ORDINAL, 17));
+        assert_eq!(owner.partial, Some(false));
+        assert!(owner.complete_positions);
+        assert!(answer.outcome.is_exhausted());
+        assert_eq!(
+            answer.outcome.evidence(),
+            &ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                SemanticId::local(UNMOUNTED_ORDINAL, 31)
+            ),])
+        );
+        assert!(answer.unsupported_implicit_receiver);
+        assert!(answer.ambiguous_application);
+
+        let owner_answer = bridge
+            .owner_static_authority(
+                SemanticId::local(UNMOUNTED_ORDINAL, 29),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(owner_answer, OwnerStaticAuthority::KnownNonStatic);
+        assert_eq!(outer.static_owner.get(), Some(SemanticId::local(19, 29)));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            bridge
+                .owner_static_authority(SemanticId::local(UNMOUNTED_ORDINAL, 29), &cancelled)
+                .unwrap(),
+            OwnerStaticAuthority::Unknown
+        );
+        assert!(outer.static_cancelled.get());
+    }
+
     /// Method names declared at the top level of one trait body.
     ///
     /// The decorator must forward all sixty-four. A required method that is not
@@ -2945,18 +3639,22 @@ mod tests {
         // #8834: jvm_selected_root_presence is forwarded with the other seam methods.
         // #5671: forward the root-inventory admission session with the other seam methods.
         // #7708: supports_exact_type_argument_links is forwarded with the other seam methods.
-        assert_eq!(batch.len(), 41, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(batch.len(), 42, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
         // #7619 adds two readers; #5671 adds one; #7654 adds
+        // Preserve H receiver/source readers and master hierarchy/operator readers.
+        // selected_jvm_declaration_owner; #5658 adds two Python readers; #7314
+        // adds deferred and selected base receiver readers; selected access
+        // adds its exact reference and declaration source rows.
+        // #13081 adds the receiver-participation capability; #12159 adds closure
+        // binder and function shape readers.
+        assert_eq!(typed.len(), 134, "SelectedTypedFactSource: {typed:?}");
         // selected_jvm_declaration_owner; #5658 adds two Python readers;
         // #11325 adds rust_builtin_derive_member; #5658 2b.1 adds five
         // hierarchy readers; #12241 adds the operator provider, selected type
         // heads and binary-operation page reader; #12159 adds the conditional
         // nominal-constructor reader; #12070 adds the trailing implicit-base
-        // read.
-        assert_eq!(typed.len(), 115, "SelectedTypedFactSource: {typed:?}");
-
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();

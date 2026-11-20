@@ -67,6 +67,7 @@ pub enum SummaryIncompleteReason {
     ArtifactUnavailable,
     SemanticEvidenceGap,
     StoreFailure,
+    InternalInvariant,
     SourceUnavailable,
 }
 
@@ -103,7 +104,10 @@ fn summary_read_reason(
         "artifact_unavailable" => SummaryIncompleteReason::ArtifactUnavailable,
         "semantic_evidence_gap" => SummaryIncompleteReason::SemanticEvidenceGap,
         "store_failure" => SummaryIncompleteReason::StoreFailure,
-        label => unreachable!("unregistered query read reason: {label}"),
+        "internal_invariant" => SummaryIncompleteReason::InternalInvariant,
+        // A future unmapped label is a diagnostic integration bug, not a
+        // reason to panic or report a complete summary.
+        _ => SummaryIncompleteReason::InternalInvariant,
     }
 }
 
@@ -2365,6 +2369,16 @@ mod issue_1304_tests {
     use crate::searchtools::summaries::*;
     use brokk_bifrost_test_macros::hardwon;
     use std::time::Duration;
+
+    #[test]
+    #[hardwon("#13024: missing producer causes must not panic in summary reason rendering")]
+    fn summary_internal_invariant_has_distinct_wire_reason() {
+        let reason = summary_read_reason(
+            QueryReadIncomplete::InternalInvariant("route_read: missing producer cause"),
+            None,
+        );
+        assert_eq!(serde_json::to_value(reason).unwrap(), "internal_invariant");
+    }
 
     #[test]
     #[hardwon("#11145: cancelled proof stops under a timed-out token report time_budget")]

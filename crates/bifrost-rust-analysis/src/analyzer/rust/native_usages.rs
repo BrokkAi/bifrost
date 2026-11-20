@@ -407,9 +407,7 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                 return GraphUsageOutcome::Resolved(with_route_evidence_gaps(
                     result,
                     primary,
-                    &crate::analyzer::rust::route_kinds::route_evidence_gaps(
-                        &read_incompleteness.captured_read_incompleteness(),
-                    ),
+                    &read_incompleteness.captured_read_incompleteness(),
                 ));
             }
             RustSelectedReverseOutcome::Ready(None) => {
@@ -436,21 +434,17 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
 }
 
 /// A result read from partial route evidence is incomplete: positives stay,
-/// and a missing hit cannot prove absence. `gaps` is the text of each route
-/// evidence gap the read recorded, which names the incomplete units.
+/// and a missing hit cannot prove absence. The captured reasons name every
+/// incomplete unit and pass through the canonical route-gap renderer.
 fn with_route_evidence_gaps(
     result: FuzzyResult,
     primary: &CodeUnit,
-    gaps: &[String],
+    reasons: &[brokk_bifrost_analysis::analyzer::QueryReadIncomplete],
 ) -> FuzzyResult {
-    if gaps.is_empty() {
+    let Some(gaps) = super::route_kinds::render_route_evidence_gaps(reasons) else {
         return result;
-    }
-    let diagnostic = DIAGNOSTICS.diagnostic(
-        primary,
-        "rust_route_evidence_incomplete",
-        format!("{gaps:?}"),
-    );
+    };
+    let diagnostic = DIAGNOSTICS.diagnostic(primary, "rust_route_evidence_incomplete", gaps);
     match result {
         FuzzyResult::Success {
             hits_by_overload,

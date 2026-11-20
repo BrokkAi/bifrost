@@ -110,9 +110,16 @@ pub struct CatalogCandidate {
     source_kind: CatalogPackSourceKind,
     source_id: String,
     location: CatalogCandidateLocation,
+    origin: brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin,
 }
 
 impl CatalogCandidate {
+    pub fn origin(
+        &self,
+    ) -> brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin {
+        self.origin
+    }
+
     pub fn manifest_digest(&self) -> &str {
         &self.manifest_digest
     }
@@ -147,6 +154,7 @@ pub struct LoadedCatalogShard {
     pub selectors: Vec<ActivationSelector>,
     pub shard: Option<CompiledShard>,
     pub has_callable_values: bool,
+    pub origin: brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin,
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
 }
@@ -221,12 +229,311 @@ pub enum ReuseDecision<'a> {
     StaleOrUnavailable,
 }
 
+type VerificationCensus =
+    brokk_bifrost_semantic::analyzer::semantic_model::validate::ValidationCensus;
+
+enum ShardVerificationSource<'a> {
+    Durable {
+        location: (String, u64),
+        certificate: Option<(i64, i64)>,
+    },
+    Session {
+        bytes: &'a [u8],
+    },
+}
+
+/// Where the verified bytes live. Durable objects sit in the catalog root's
+/// content-addressed object store (`objects/sha256/<stored digest>`, see
+/// bifrost-semantic catalog/storage.rs), so one durable verification covers every
+/// durable source of the same descriptor in this open; session bytes are held
+/// in memory. A verification of one storage never certifies the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShardStorage {
+    Durable,
+    Session,
+}
+
+struct ShardVerificationInput<'a> {
+    root: &'a Path,
+    stored_in: ShardStorage,
+    object_reads: Option<&'a AtomicU64>,
+    manifest: &'a CompiledPackManifest,
+    descriptor: &'a CompiledShardDescriptor,
+    limits: &'a DecodeLimits,
+    instance: u64,
+}
+
+// Issued only after the exact verifier binding has succeeded in this call.
+struct VerifiedShard {
+    _binding: [u8; 32],
+    manifest_digest: String,
+    descriptor: CompiledShardDescriptor,
+}
+
+struct ShardVerifier(
+    brokk_bifrost_core::content_digest::ContentDigestCache,
+    #[cfg(test)] AtomicU64,
+);
+
+fn validate_stored_python_profile_pack(
+    root: &Path,
+    connection: Option<&Connection>,
+    session_pack: Option<&SessionPack>,
+    manifest: &CompiledPackManifest,
+    limits: &DecodeLimits,
+    counters: Option<(&AtomicU64, &AtomicU64, &AtomicU64)>,
+) -> Result<(), CatalogError> {
+    if manifest.language != "python"
+        || !manifest.shards.iter().any(|descriptor| {
+            descriptor
+                .routing_keys
+                .iter()
+                .any(|key| key.starts_with("package:pkg:pypi/"))
+        })
+    {
+        return Ok(());
+    }
+    let mut decoded = Vec::with_capacity(manifest.shards.len());
+    for descriptor in &manifest.shards {
+        if let Some((_, _, validations)) = counters {
+            validations.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(pack) = session_pack {
+            let shard = pack
+                .shards
+                .iter()
+                .find(|shard| &shard.descriptor == descriptor)
+                .ok_or(CatalogError::Unavailable)?;
+            decoded.push(
+                crate::analyzer::semantic_model::artifact::decode_shard_for_manifest(
+                    manifest,
+                    descriptor,
+                    &shard.bytes,
+                    limits,
+                )
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?,
+            );
+            continue;
+        }
+        let connection = connection.expect("durable profile validation has a connection");
+        if let Some((sql, _, _)) = counters {
+            sql.fetch_add(1, Ordering::Relaxed);
+        }
+        let (relative_path, stored_size) = connection
+            .query_row(
+                "SELECT o.relative_path, o.stored_size
+                     FROM catalog_packs AS p
+                     JOIN catalog_pack_shards AS ps
+                       ON ps.manifest_digest = p.manifest_digest
+                     JOIN catalog_objects AS o
+                       ON o.stored_digest = ps.stored_digest
+                     WHERE p.state = 'verified'
+                       AND p.manifest_digest = ?1
+                       AND ps.shard_id = ?2
+                       AND ps.stored_digest = ?3",
+                params![
+                    &manifest.content_sha256,
+                    &descriptor.shard_id,
+                    &descriptor.stored_sha256
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("load Python profile shard", error))?
+            .ok_or(CatalogError::Unavailable)?;
+        if let Some((_, reads, _)) = counters {
+            reads.fetch_add(1, Ordering::Relaxed);
+        }
+        let bytes = storage::read(root, &relative_path, &descriptor.stored_sha256, stored_size)?;
+        decoded.push(
+            crate::analyzer::semantic_model::artifact::decode_shard_for_manifest(
+                manifest, descriptor, &bytes, limits,
+            )
+            .map_err(|error| CatalogError::Artifact(error.to_string()))?,
+        );
+    }
+    let authored = crate::analyzer::semantic_model::artifact::authored_pack_from_decoded_shards(
+        manifest, &decoded,
+    );
+    let diagnostics =
+        crate::analyzer::semantic_model::validate::validate_csmi_profile_evidence(&authored);
+    if !diagnostics.is_empty() {
+        return Err(CatalogError::Integrity(format!(
+            "stored Python pack has inconsistent full-pack evidence: {diagnostics:?}"
+        )));
+    }
+    Ok(())
+}
+
+impl ShardVerifier {
+    fn new(cache: brokk_bifrost_core::content_digest::ContentDigestCache) -> Self {
+        Self(
+            cache,
+            #[cfg(test)]
+            AtomicU64::new(0),
+        )
+    }
+}
+
+impl ShardVerifier {
+    /// The Python full-pack profile check belongs to every shard's validity
+    /// decision, but it reads every shard of the pack. Run it once per pack,
+    /// storage and catalog open, under the same rules as the shard memo, so N
+    /// shard misses do not reread the pack N times.
+    fn ensure_profile_pack(
+        &self,
+        instance: u64,
+        stored_in: ShardStorage,
+        manifest: &CompiledPackManifest,
+        limits: &DecodeLimits,
+        check: impl FnOnce() -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        let mut binding = CanonicalHasher::new(b"catalog-python-profile-pack-v1");
+        binding.value(&instance.to_be_bytes());
+        binding.value(match stored_in {
+            ShardStorage::Durable => b"durable".as_slice(),
+            ShardStorage::Session => b"session".as_slice(),
+        });
+        binding.value(manifest.content_sha256.as_bytes());
+        binding.value(decode_limits_digest(limits).as_bytes());
+        binding.value(&SHARD_VALIDATION_VERSION.to_be_bytes());
+        self.0
+            .verify_immutable_once(binding.finish(), check)
+            .map(|_| ())
+    }
+
+    fn ensure_valid_shard<'a>(
+        &self,
+        input: ShardVerificationInput<'_>,
+        source: impl FnOnce() -> Result<ShardVerificationSource<'a>, CatalogError>,
+        mut attempted: impl FnMut(),
+        mut decoded: impl FnMut(VerificationCensus) -> Result<(), CatalogError>,
+    ) -> Result<(VerifiedShard, Option<CompiledShard>), CatalogError> {
+        let ShardVerificationInput {
+            root,
+            stored_in,
+            object_reads,
+            manifest,
+            descriptor,
+            limits,
+            instance,
+        } = input;
+        // One lookup by shard id, not a scan comparing whole descriptors.
+        if manifest
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == descriptor.shard_id)
+            != Some(descriptor)
+        {
+            return Err(CatalogError::Integrity(
+                "candidate descriptor differs from manifest".into(),
+            ));
+        }
+        // This key is built on every request for every active shard, so it
+        // hashes only short fixed fields. The manifest digest and the shard id
+        // already determine the descriptor (checked above); the stored digest
+        // and size name the bytes a miss reads.
+        let mut binding = CanonicalHasher::new(b"catalog-shard-verification-v2");
+        binding.value(&instance.to_be_bytes());
+        binding.value(match stored_in {
+            ShardStorage::Durable => b"durable".as_slice(),
+            ShardStorage::Session => b"session".as_slice(),
+        });
+        binding.value(manifest.content_sha256.as_bytes());
+        binding.value(descriptor.shard_id.as_bytes());
+        binding.value(descriptor.stored_sha256.as_bytes());
+        binding.value(&descriptor.stored_size.to_be_bytes());
+        binding.value(decode_limits_digest(limits).as_bytes());
+        binding.value(&SHARD_VALIDATION_VERSION.to_be_bytes());
+        let mut verify = |bytes: &[u8], certificate: Option<(i64, i64)>| {
+            validate_manifest_inventory(manifest)
+                .map_err(|e| CatalogError::Artifact(e.to_string()))?;
+            let certified = certificate.is_some_and(|(text, depth)| {
+                usize::try_from(text).is_ok_and(|n| n <= limits.max_text_bytes)
+                    && usize::try_from(depth).is_ok_and(|n| n <= limits.max_depth)
+            });
+            if certified {
+                crate::analyzer::semantic_model::artifact::hydrate_certified_shard(
+                    manifest, descriptor, bytes, limits,
+                )
+                .map_err(|e| CatalogError::Artifact(e.to_string()))
+            } else {
+                attempted();
+                let (shard, census) = brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_validated_shard_for_manifest_with_census(manifest, descriptor, bytes, limits)
+                    .map_err(|e| CatalogError::Artifact(e.to_string()))?;
+                decoded(census)?;
+                Ok(shard)
+            }
+        };
+        let binding = binding.finish();
+        // #9559 decision D: corruption after successful verification in this
+        // catalog open is observed only at the next open. Both paths serve
+        // answers from rows and read no object bytes after verification.
+        self.0
+            .verify_immutable_once(binding, || match source()? {
+                ShardVerificationSource::Durable {
+                    location,
+                    certificate,
+                } => {
+                    assert_eq!(
+                        stored_in,
+                        ShardStorage::Durable,
+                        "durable bytes under a session key"
+                    );
+                    storage::validate_object_path(root, &location.0, &descriptor.stored_sha256)?;
+                    #[cfg(test)]
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                    if let Some(counter) = object_reads {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let bytes =
+                        storage::read(root, &location.0, &descriptor.stored_sha256, location.1)?;
+                    verify(&bytes, certificate)
+                }
+                ShardVerificationSource::Session { bytes } => {
+                    assert_eq!(
+                        stored_in,
+                        ShardStorage::Session,
+                        "session bytes under a durable key"
+                    );
+                    verify(bytes, None)
+                }
+            })
+            .map(|shard| {
+                (
+                    VerifiedShard {
+                        _binding: binding,
+                        manifest_digest: manifest.content_sha256.clone(),
+                        descriptor: descriptor.clone(),
+                    },
+                    shard,
+                )
+            })
+    }
+}
+
+fn shard_certificate(
+    connection: &Connection,
+    manifest: &CompiledPackManifest,
+    shard: &str,
+) -> Result<Option<(i64, i64)>, CatalogError> {
+    connection
+        .query_row(
+            CERTIFIED_SHARD_SQL,
+            params![manifest.content_sha256, shard, SHARD_VALIDATION_VERSION],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| CatalogError::sqlite("lookup shard validation", e))
+}
+
 pub struct SemanticPackCatalog {
     // Field order is deliberate: all SQLite/session state must drop before an
     // owned ephemeral root is deleted, including on Windows.
     root: PathBuf,
     mode: CatalogOpenMode,
     options: CatalogOptions,
+    verifier: Arc<ShardVerifier>,
     // Session packs and SQLite data-version counters belong to one opened
     // catalog. Equal counters in another catalog do not identify its content.
     instance_identity: u64,
@@ -235,11 +542,12 @@ pub struct SemanticPackCatalog {
     session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
     session_packs: Arc<Mutex<Vec<SessionPack>>>,
     session_activations: Mutex<HashMap<String, SessionActivation>>,
-    rejected_manifests: Mutex<HashSet<String>>,
-    decoded_manifests: Mutex<DecodedManifestMemo>,
+    // Not monotonic: successful installation removes a digest. The request bind
+    // uses two-way membership equality, which makes removal safe.
+    rejected_manifests: Arc<Mutex<HashSet<String>>>,
+    decoded_manifests: Arc<Mutex<DecodedManifestMemo>>,
     verified_manifest_inventories: Mutex<HashSet<String>>,
-    validated_python_profile_packs: Mutex<HashSet<String>>,
-    manifest_decodes: AtomicU64,
+    manifest_decodes: Arc<AtomicU64>,
     manifest_inventory_validations: AtomicU64,
     shard_validations: AtomicU64,
     lookup_hits: AtomicU64,
@@ -257,12 +565,431 @@ pub struct SemanticPackCatalog {
     _ephemeral_root: Option<Arc<TempDir>>,
 }
 
+// One scalar receipt belongs to the synchronous activation on this thread.
+// Other threads never inherit ownership: their mutations invalidate its stamp.
+#[derive(Clone, Copy)]
+struct ActivationPublication {
+    initial: SemanticPackCatalogCacheIdentity,
+    expected: Option<SemanticPackCatalogCacheIdentity>,
+}
+thread_local! {
+    static ACTIVATION_PUBLICATION: std::cell::Cell<Option<ActivationPublication>> = const { std::cell::Cell::new(None) };
+}
+struct PublicationScope(Option<ActivationPublication>);
+impl Drop for PublicationScope {
+    fn drop(&mut self) {
+        ACTIVATION_PUBLICATION.set(self.0);
+    }
+}
+
+/// Read boundary shared by live acquisition and a pinned snapshot. Validation
+/// returns corruption as data; only the acquisition wrapper applies writes.
+trait CandidateValidationReads {
+    fn durable_selector_rows(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+    ) -> Result<Vec<DurableSelectorRow>, CatalogError>;
+    fn recorded_origin(
+        &self,
+        digest: &str,
+    ) -> Result<
+        brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin,
+        CatalogError,
+    >;
+    fn session_packs(&self) -> std::sync::MutexGuard<'_, Vec<SessionPack>>;
+    fn rejected_manifests(&self) -> std::sync::MutexGuard<'_, HashSet<String>>;
+    fn stored_manifest(&self, digest: &str) -> Result<Arc<CompiledPackManifest>, CatalogError>;
+}
+
+impl CandidateValidationReads for SemanticPackCatalog {
+    fn rejected_manifests(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.outside_capture()
+            .rejected_manifests
+            .lock()
+            .expect("semantic-pack rejection mutex poisoned")
+    }
+
+    fn durable_selector_rows(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+    ) -> Result<Vec<DurableSelectorRow>, CatalogError> {
+        SemanticPackCatalog::durable_selector_rows(self, query, max_rows)
+    }
+
+    fn recorded_origin(
+        &self,
+        digest: &str,
+    ) -> Result<
+        brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin,
+        CatalogError,
+    > {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        recorded_pack_origin_on(&connection, digest)
+    }
+
+    fn session_packs(&self) -> std::sync::MutexGuard<'_, Vec<SessionPack>> {
+        self.outside_capture()
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned")
+    }
+
+    fn stored_manifest(&self, digest: &str) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+        SemanticPackCatalog::stored_manifest(self, digest)
+    }
+}
+
+// Borrows the very connection whose main/session transactions the JVM reader
+// pinned. No acquisition API, memo, or catalog write is involved.
+impl CandidateValidationReads for (&PinnedCatalogSource, &Connection) {
+    fn rejected_manifests(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.0
+            .rejected_manifests
+            .lock()
+            .expect("semantic-pack rejection mutex poisoned")
+    }
+
+    fn durable_selector_rows(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+    ) -> Result<Vec<DurableSelectorRow>, CatalogError> {
+        durable_selector_rows_on(self.1, query, max_rows)
+    }
+
+    fn recorded_origin(
+        &self,
+        digest: &str,
+    ) -> Result<
+        brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin,
+        CatalogError,
+    > {
+        recorded_pack_origin_on(self.1, digest)
+    }
+
+    fn session_packs(&self) -> std::sync::MutexGuard<'_, Vec<SessionPack>> {
+        self.0
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned")
+    }
+
+    fn stored_manifest(&self, digest: &str) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+        self.0.stored_manifest_on(self.1, digest)
+    }
+}
+
+impl super::dependency::DependencyProviderReads for SemanticPackCatalog {
+    fn provider_candidates(
+        &self,
+        query: &SemanticPackSelectorQuery,
+    ) -> Result<super::dependency::CandidateSelection<CatalogCandidate>, CatalogError> {
+        select_candidates(self, query, usize::MAX, true)
+    }
+    fn provider_extraction(
+        &self,
+        digest: &str,
+    ) -> Result<Option<PackExtractionAccounting>, CatalogError> {
+        self.extraction_accounting(digest)
+    }
+}
+
+impl super::dependency::DependencyProviderReads for (&PinnedCatalogSource, &Connection) {
+    fn provider_candidates(
+        &self,
+        query: &SemanticPackSelectorQuery,
+    ) -> Result<super::dependency::CandidateSelection<CatalogCandidate>, CatalogError> {
+        select_candidates(self, query, usize::MAX, true)
+    }
+    fn provider_extraction(
+        &self,
+        digest: &str,
+    ) -> Result<Option<PackExtractionAccounting>, CatalogError> {
+        SemanticPackCatalog::extraction_accounting_on(self.1, digest)
+    }
+}
+
+fn select_candidates(
+    reads: &impl CandidateValidationReads,
+    query: &SemanticPackSelectorQuery,
+    max_rows: usize,
+    require_exact_coordinate: bool,
+) -> Result<super::dependency::CandidateSelection<CatalogCandidate>, CatalogError> {
+    let durable_rows = reads.durable_selector_rows(query, max_rows)?;
+    let (mut candidates, mut corrupt) = {
+        let rejected = reads.rejected_manifests();
+        validate_durable_candidates(
+            reads,
+            durable_rows,
+            &rejected,
+            query,
+            require_exact_coordinate,
+        )
+    };
+    if let Some(index) = corrupt
+        .iter()
+        .position(|(_, error)| matches!(error, CatalogError::SelectorOriginMismatch { .. }))
+    {
+        return Err(corrupt.swap_remove(index).1);
+    }
+    let session_packs = reads.session_packs();
+    for (pack_ordinal, pack) in session_packs.iter().enumerate() {
+        if candidates.len() >= max_rows {
+            break;
+        }
+        if pack.manifest.language != query.language
+            || pack.manifest.ecosystem != query.ecosystem
+            || !manifest_compatible(&pack.manifest, query)?
+        {
+            continue;
+        }
+        for (shard_ordinal, shard) in pack.shards.iter().enumerate() {
+            if candidates.len() >= max_rows {
+                break;
+            }
+            let origin = reads.recorded_origin(&pack.manifest.content_sha256)?;
+            check_catalog_selector_origin(
+                origin,
+                pack.manifest.extraction.as_ref(),
+                &shard.selectors,
+            )?;
+            let mut matches = false;
+            for selector in &shard.selectors {
+                if selector_matches(selector, query)?
+                    && (!require_exact_coordinate
+                        || selector_binds_exact_coordinate(selector, query))
+                {
+                    matches = true;
+                    break;
+                }
+            }
+            if !matches {
+                continue;
+            }
+            candidates.push(CatalogCandidate {
+                origin,
+                manifest_digest: pack.manifest.content_sha256.clone(),
+                shard_id: shard.descriptor.shard_id.clone(),
+                descriptor: shard.descriptor.clone(),
+                completeness: pack.manifest.completeness,
+                source_kind: pack.source.kind.into(),
+                source_id: pack.source.source_id.clone(),
+                location: CatalogCandidateLocation::Session {
+                    pack_ordinal,
+                    shard_ordinal,
+                },
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.source_kind
+            .precedence()
+            .cmp(&right.source_kind.precedence())
+            .then_with(|| left.manifest_digest.cmp(&right.manifest_digest))
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    candidates.dedup();
+    Ok((candidates, corrupt))
+}
+
+fn decode_catalog_manifest(
+    digest: &str,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+    let manifest = Arc::new(
+        decode_manifest(bytes, limits)
+            .map_err(|error| CatalogError::Artifact(error.to_string()))?,
+    );
+    if manifest.content_sha256 != digest {
+        return Err(CatalogError::Integrity(
+            "catalog manifest key does not match decoded manifest".to_owned(),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn validate_durable_candidates(
+    reads: &impl CandidateValidationReads,
+    durable_rows: Vec<DurableSelectorRow>,
+    rejected_manifests: &HashSet<String>,
+    query: &SemanticPackSelectorQuery,
+    require_exact_coordinate: bool,
+) -> (Vec<CatalogCandidate>, Vec<(String, CatalogError)>) {
+    let mut candidates = Vec::new();
+    let mut corrupt = Vec::new();
+    let mut corrupt_digests = HashSet::new();
+    for row in durable_rows {
+        let DurableSelectorRow {
+            manifest_digest,
+            shard_id,
+            descriptor_json,
+            selector_json,
+            source_kind,
+            source_id,
+            origin,
+        } = row;
+        if rejected_manifests.contains(&manifest_digest)
+            || corrupt_digests.contains(&manifest_digest)
+        {
+            continue;
+        }
+        let decoded = (|| -> Result<Option<CatalogCandidate>, CatalogError> {
+            let manifest = reads.stored_manifest(&manifest_digest)?;
+            if !manifest_compatible(&manifest, query)? {
+                return Ok(None);
+            }
+            let selector: ActivationSelector = serde_json::from_slice(&selector_json)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            if let Err(stale) = brokk_bifrost_semantic::analyzer::semantic_model::catalog::check_generated_producer_revision(origin, &manifest.producer) {
+                // Old generated selectors used composite artifact pins. Their
+                // revision can be refused only for an otherwise applicable
+                // dependency, independently of the obsolete digest encoding.
+                let mut unpinned = selector.clone();
+                unpinned.artifact_sha256 = None;
+                unpinned.production_input_digest = None;
+                if !selector_matches(&unpinned, query)?
+                    || (!selector.targets.is_empty() && query.target.is_none())
+                    || (!selector.configurations.is_empty() && query.configuration.is_none())
+                    || (require_exact_coordinate && !selector_binds_exact_coordinate(&selector, query))
+                    || [
+                        (selector.package.as_ref(), query.package.as_ref()),
+                        (selector.module.as_ref(), query.module.as_ref()),
+                        (selector.toolchain.as_ref(), query.toolchain.as_ref()),
+                    ].iter().any(|(constraint, actual)| constraint.is_some() && actual.is_none())
+                {
+                    return Ok(None);
+                }
+                return Err(stale);
+            }
+            check_catalog_selector_origin(
+                origin,
+                manifest.extraction.as_ref(),
+                std::slice::from_ref(&selector),
+            )?;
+            if !selector_matches(&selector, query)? {
+                return Ok(None);
+            }
+            if require_exact_coordinate && !selector_binds_exact_coordinate(&selector, query) {
+                return Ok(None);
+            }
+            let descriptor: CompiledShardDescriptor = serde_json::from_slice(&descriptor_json)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            if manifest
+                .shards
+                .iter()
+                .find(|expected| expected.shard_id == shard_id)
+                != Some(&descriptor)
+            {
+                return Err(CatalogError::Integrity(format!(
+                    "catalog descriptor does not match manifest shard {shard_id}"
+                )));
+            }
+            Ok(Some(CatalogCandidate {
+                manifest_digest: manifest_digest.clone(),
+                shard_id,
+                descriptor,
+                completeness: manifest.completeness,
+                source_kind: DurablePackSourceKind::parse(&source_kind)?.into(),
+                source_id,
+                location: CatalogCandidateLocation::Durable,
+                origin,
+            }))
+        })();
+        match decoded {
+            Ok(Some(candidate)) if !candidates.contains(&candidate) => {
+                candidates.push(candidate);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                corrupt_digests.insert(manifest_digest.clone());
+                corrupt.push((manifest_digest, error));
+            }
+        }
+    }
+    candidates.retain(|candidate| !corrupt_digests.contains(&candidate.manifest_digest));
+    (candidates, corrupt)
+}
+
 /// Owned source for request-scoped pinned JVM catalog reads. The catalog remains
 /// writable for pack installation; later reads see the shared session inventory.
+// The shared memo lock covers the entire fill, including integrity verification.
+// Errors return before insertion and remain retryable.
+fn cached_manifest(
+    memo: &mut DecodedManifestMemo,
+    digest: &str,
+    decodes: &AtomicU64,
+    read: impl FnOnce() -> Result<Vec<u8>, CatalogError>,
+    limits: &DecodeLimits,
+) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+    if let Some(manifest) = memo.entries.get(digest) {
+        return Ok(Arc::clone(manifest));
+    }
+    let bytes = read()?;
+    let manifest = decode_catalog_manifest(digest, &bytes, limits)?;
+    decodes.fetch_add(1, Ordering::Relaxed);
+    if memo.bytes.saturating_add(bytes.len()) > DECODED_MANIFEST_MEMO_BYTES {
+        memo.entries.clear();
+        memo.bytes = 0;
+    }
+    memo.bytes = memo.bytes.saturating_add(bytes.len());
+    memo.entries
+        .insert(digest.to_owned(), Arc::clone(&manifest));
+    Ok(manifest)
+}
+
+impl PinnedCatalogSource {
+    fn stored_manifest_on(
+        &self,
+        connection: &Connection,
+        digest: &str,
+    ) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+        let mut memo = self
+            .decoded_manifests
+            .lock()
+            .expect("semantic-pack manifest memo mutex poisoned");
+        cached_manifest(
+            &mut memo,
+            digest,
+            &self.manifest_decodes,
+            || read_manifest_on(&self.root, connection, digest)?.ok_or(CatalogError::Unavailable),
+            &self.decode_limits,
+        )
+    }
+
+    fn available_manifest_on(
+        &self,
+        connection: &Connection,
+        digest: &str,
+    ) -> Result<Option<Arc<CompiledPackManifest>>, CatalogError> {
+        match self.stored_manifest_on(connection, digest) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(
+                CatalogError::Unavailable | CatalogError::Integrity(_) | CatalogError::Artifact(_),
+            ) => Ok(None),
+            Err(CatalogError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PinnedCatalogSource {
+    verifier: Arc<ShardVerifier>,
     pool: Option<Arc<pinned_reader::PinnedReaderPool>>,
     root: PathBuf,
+    decode_limits: DecodeLimits,
+    decoded_manifests: Arc<Mutex<DecodedManifestMemo>>,
+    manifest_decodes: Arc<AtomicU64>,
+    rejected_manifests: Arc<Mutex<HashSet<String>>>,
     session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
     session_packs: Arc<Mutex<Vec<SessionPack>>>,
     instance_identity: u64,
@@ -339,6 +1066,24 @@ impl Drop for CatalogLease<'_> {
 }
 
 impl PinnedCatalogSource {
+    /// Choose dependency providers on the caller's already pinned connection.
+    /// This never applies rejection or quarantine findings. The JVM reader must
+    /// pass its own connection before locking the session inventory.
+    pub fn selected_dependency_provider_on(
+        &self,
+        connection: &Connection,
+        adapter: &dyn super::dependency::DependencyPackAdapter,
+        dependency: &super::dependency::ResolvedDependency,
+        limits: &super::dependency::DependencyPackLimits,
+    ) -> Result<super::dependency::DependencyProviderChoice, CatalogError> {
+        super::dependency::selected_dependency_provider(
+            &(self, connection),
+            adapter,
+            dependency,
+            limits,
+        )
+    }
+
     fn active_reader_connection(&self) -> Result<Connection, CatalogError> {
         debug_assert!(
             self.instance_identity > 0,
@@ -407,23 +1152,34 @@ impl SemanticPackCatalog {
                 current.checked_add(1)
             })
             .expect("semantic-pack catalog instance identity space exhausted");
+        // A verification success is tiny, but this is a total process
+        // allowance: the shared required-memory account counts against it.
+        // A fixed small allowance stops retaining once that account grows,
+        // and then every request re-verifies and re-reads every shard
+        // (#13578). Keep the catalog's own cache: unrelated store-cache
+        // pressure must not evict these successes.
+        let verifier_budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            crate::analyzer::config::AnalyzerConfig::default().retention_budget_bytes(),
+        );
         Ok(Self {
             root,
             mode,
             options,
+            verifier: Arc::new(ShardVerifier::new(
+                brokk_bifrost_core::content_digest::ContentDigestCache::new(&verifier_budget),
+            )),
             instance_identity,
             connection: Arc::new(Mutex::new(connection)),
             session_catalog: Arc::new(Mutex::new(None)),
             session_packs: Arc::new(Mutex::new(Vec::new())),
             session_activations: Mutex::new(HashMap::new()),
-            rejected_manifests: Mutex::new(HashSet::new()),
-            decoded_manifests: Mutex::new(DecodedManifestMemo {
+            rejected_manifests: Arc::new(Mutex::new(HashSet::new())),
+            decoded_manifests: Arc::new(Mutex::new(DecodedManifestMemo {
                 entries: HashMap::new(),
                 bytes: 0,
-            }),
+            })),
             verified_manifest_inventories: Mutex::new(HashSet::new()),
-            validated_python_profile_packs: Mutex::new(HashSet::new()),
-            manifest_decodes: AtomicU64::new(0),
+            manifest_decodes: Arc::new(AtomicU64::new(0)),
             manifest_inventory_validations: AtomicU64::new(0),
             shard_validations: AtomicU64::new(0),
             lookup_hits: AtomicU64::new(0),
@@ -505,6 +1261,7 @@ impl SemanticPackCatalog {
                 .connection
                 .lock()
                 .expect("semantic catalog mutex poisoned");
+            self.begin_publication_mutation(&connection)?;
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| CatalogError::sqlite("begin semantic reindex", error))?;
@@ -548,8 +1305,13 @@ impl SemanticPackCatalog {
 
     fn unpooled_catalog_source(&self) -> PinnedCatalogSource {
         PinnedCatalogSource {
+            verifier: Arc::clone(&self.verifier),
             pool: None,
             root: self.root.clone(),
+            decode_limits: self.options.decode_limits,
+            decoded_manifests: Arc::clone(&self.decoded_manifests),
+            manifest_decodes: Arc::clone(&self.manifest_decodes),
+            rejected_manifests: Arc::clone(&self.rejected_manifests),
             session_catalog: Arc::clone(&self.session_catalog),
             session_packs: Arc::clone(&self.session_packs),
             instance_identity: self.instance_identity,
@@ -594,6 +1356,37 @@ impl SemanticPackCatalog {
                 }
                 _ => "durable",
             };
+            let catalog_source = self.unpooled_catalog_source();
+            let admitted = if source == "session" {
+                let packs = self.session_packs.lock().expect("session mutex poisoned");
+                packs
+                    .iter()
+                    .find(|p| p.manifest.content_sha256 == manifest)
+                    .map(|p| Arc::clone(&p.manifest))
+            } else {
+                catalog_source.available_manifest_on(&connection, manifest)?
+            };
+            let admitted = admitted.ok_or(CatalogError::Unavailable)?;
+            let descriptor = admitted
+                .shards
+                .iter()
+                .find(|d| d.shard_id == shard)
+                .ok_or(CatalogError::Unavailable)?;
+            let packs = self.session_packs.lock().expect("session mutex poisoned");
+            let verified = catalog_source.verify_on(
+                &connection,
+                &admitted,
+                descriptor,
+                if source == "session" {
+                    packs
+                        .iter()
+                        .find(|p| p.manifest.content_sha256 == admitted.content_sha256)
+                } else {
+                    None
+                },
+            );
+            drop(packs);
+            verified?;
             let shard_key = rows::select_active_shard_source(&connection, manifest, shard, source)?
                 .ok_or_else(|| CatalogError::IndexReconciliationRequired {
                     manifest_digest: manifest.to_owned(),
@@ -682,6 +1475,9 @@ impl SemanticPackCatalog {
         &self,
         key: &GeneratedProductionKey,
     ) -> Result<bool, CatalogError> {
+        if self.generated_input_slots(key)?.is_none() {
+            return Ok(false);
+        }
         let connection = self
             .connection
             .lock()
@@ -737,6 +1533,9 @@ impl SemanticPackCatalog {
             manifest_bytes,
             shards,
         };
+        let slots = source
+            .generated_input_slots(&production.key)?
+            .ok_or(CatalogError::Unavailable)?;
         let extraction = source.extraction_accounting(&production.manifest_digest)?;
         if let Some(extraction) = &extraction {
             validate_extraction_accounting(extraction)?;
@@ -750,6 +1549,7 @@ impl SemanticPackCatalog {
             extraction.as_ref(),
             |transaction, manifest, now| {
                 insert_generated_production(transaction, &production.key, manifest, now)?;
+                Self::insert_production_inputs(transaction, &production.key, &slots)?;
                 if let Some(extraction) = &extraction {
                     insert_extraction_accounting(
                         transaction,
@@ -888,84 +1688,6 @@ impl SemanticPackCatalog {
         .map_err(|error| CatalogError::Artifact(error.to_string()))
     }
 
-    /// A verified row may predate the Python profile evidence check. Recheck
-    /// every stored shard once per opened catalog before the first PyPI load;
-    /// the manifest digest and content-addressed objects bind later loads to
-    /// the exact pack that passed this check.
-    fn validate_stored_python_profile_pack(
-        &self,
-        manifest: &CompiledPackManifest,
-    ) -> Result<(), CatalogError> {
-        if manifest.language != "python"
-            || !manifest.shards.iter().any(|descriptor| {
-                descriptor
-                    .routing_keys
-                    .iter()
-                    .any(|key| key.starts_with("package:pkg:pypi/"))
-            })
-        {
-            return Ok(());
-        }
-        let mut checked = self
-            .outside_capture()
-            .validated_python_profile_packs
-            .lock()
-            .expect("Python profile validation mutex poisoned");
-        if checked.contains(&manifest.content_sha256) {
-            return Ok(());
-        }
-        let connection = self
-            .connection
-            .lock()
-            .expect("semantic-pack catalog connection mutex poisoned");
-        let mut decoded = Vec::with_capacity(manifest.shards.len());
-        for descriptor in &manifest.shards {
-            self.sql_statements.fetch_add(1, Ordering::Relaxed);
-            let (relative_path, stored_size) = connection
-                .query_row(
-                    "SELECT o.relative_path, o.stored_size
-                     FROM catalog_packs AS p
-                     JOIN catalog_pack_shards AS ps
-                       ON ps.manifest_digest = p.manifest_digest
-                     JOIN catalog_objects AS o
-                       ON o.stored_digest = ps.stored_digest
-                     WHERE p.state = 'verified'
-                       AND p.manifest_digest = ?1
-                       AND ps.shard_id = ?2
-                       AND ps.stored_digest = ?3",
-                    params![
-                        &manifest.content_sha256,
-                        &descriptor.shard_id,
-                        &descriptor.stored_sha256
-                    ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
-                )
-                .optional()
-                .map_err(|error| CatalogError::sqlite("load Python profile shard", error))?
-                .ok_or(CatalogError::Unavailable)?;
-            self.object_reads.fetch_add(1, Ordering::Relaxed);
-            let bytes = storage::read(
-                &self.root,
-                &relative_path,
-                &descriptor.stored_sha256,
-                stored_size,
-            )?;
-            decoded.push(self.decode_stored_shard(manifest, descriptor, &bytes)?);
-        }
-        let authored = crate::analyzer::semantic_model::artifact::authored_pack_from_decoded_shards(
-            manifest, &decoded,
-        );
-        let diagnostics =
-            crate::analyzer::semantic_model::validate::validate_csmi_profile_evidence(&authored);
-        if !diagnostics.is_empty() {
-            return Err(CatalogError::Integrity(format!(
-                "stored Python pack has inconsistent full-pack evidence: {diagnostics:?}"
-            )));
-        }
-        checked.insert(manifest.content_sha256.clone());
-        Ok(())
-    }
-
     /// Decode one stored manifest, reusing the decode of an equal digest.
     ///
     /// Callers read stored manifests by digest, so the memo is keyed by that
@@ -976,47 +1698,18 @@ impl SemanticPackCatalog {
         manifest_digest: &str,
         manifest_bytes: &[u8],
     ) -> Result<Arc<CompiledPackManifest>, CatalogError> {
-        if let Some(manifest) = self.memoized_manifest(manifest_digest) {
-            return Ok(manifest);
-        }
-        let manifest = Arc::new(
-            decode_manifest(manifest_bytes, &self.options.decode_limits)
-                .map_err(|error| CatalogError::Artifact(error.to_string()))?,
-        );
-        if manifest.content_sha256 != manifest_digest {
-            return Err(CatalogError::Integrity(
-                "catalog manifest key does not match decoded manifest".to_owned(),
-            ));
-        }
-        self.manifest_decodes.fetch_add(1, Ordering::Relaxed);
         let mut memo = self
             .outside_capture()
             .decoded_manifests
             .lock()
             .expect("semantic-pack manifest memo mutex poisoned");
-        if memo.bytes.saturating_add(manifest_bytes.len()) > DECODED_MANIFEST_MEMO_BYTES {
-            memo.entries.clear();
-            memo.bytes = 0;
-        }
-        memo.bytes = memo.bytes.saturating_add(manifest_bytes.len());
-        memo.entries
-            .insert(manifest_digest.to_owned(), Arc::clone(&manifest));
-        Ok(manifest)
-    }
-
-    /// The memoized decode of one stored manifest, when this catalog has it.
-    fn memoized_manifest(&self, manifest_digest: &str) -> Option<Arc<CompiledPackManifest>> {
-        let memo = self
-            .outside_capture()
-            .decoded_manifests
-            .lock()
-            .expect("semantic-pack manifest memo mutex poisoned");
-        let manifest = memo.entries.get(manifest_digest)?;
-        debug_assert_eq!(
-            manifest.content_sha256, manifest_digest,
-            "decoded manifest memo is an immutable content transform"
-        );
-        Some(Arc::clone(manifest))
+        cached_manifest(
+            &mut memo,
+            manifest_digest,
+            &self.manifest_decodes,
+            || Ok(manifest_bytes.to_vec()),
+            &self.options.decode_limits,
+        )
     }
 
     /// Decode one stored manifest, reading its bytes only on a memo miss.
@@ -1029,19 +1722,26 @@ impl SemanticPackCatalog {
         &self,
         manifest_digest: &str,
     ) -> Result<Arc<CompiledPackManifest>, CatalogError> {
-        if let Some(manifest) = self.memoized_manifest(manifest_digest) {
-            return Ok(manifest);
-        }
-        let bytes = {
-            let connection = self
-                .connection
-                .lock()
-                .expect("semantic-pack catalog connection mutex poisoned");
-            self.sql_statements.fetch_add(1, Ordering::Relaxed);
-            read_manifest_on(&self.root, &connection, manifest_digest)?
-                .ok_or(CatalogError::Unavailable)?
-        };
-        self.decoded_manifest(manifest_digest, &bytes)
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let mut memo = self
+            .outside_capture()
+            .decoded_manifests
+            .lock()
+            .expect("semantic-pack manifest memo mutex poisoned");
+        cached_manifest(
+            &mut memo,
+            manifest_digest,
+            &self.manifest_decodes,
+            || {
+                self.sql_statements.fetch_add(1, Ordering::Relaxed);
+                read_manifest_on(&self.root, &connection, manifest_digest)?
+                    .ok_or(CatalogError::Unavailable)
+            },
+            &self.options.decode_limits,
+        )
     }
 
     pub fn inventory_bounded(&self, max_packs: usize) -> Result<CatalogInventory, CatalogError> {
@@ -1534,6 +2234,43 @@ impl SemanticPackCatalog {
         pack: &CompiledSemanticModelPack,
         source: &DurablePackSource,
         extraction: &PackExtractionAccounting,
+        slots: &[brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact],
+    ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        if slots.is_empty() {
+            return Err(CatalogError::Integrity(
+                "generated release installation requires verified input slots".into(),
+            ));
+        }
+        let generated_source = DurablePackSource {
+            kind: DurablePackSourceKind::Generated,
+            source_id: key.source_id(),
+        };
+        self.install_generated_with(
+            key,
+            pack,
+            source,
+            Some(extraction),
+            || validate_extraction_accounting(extraction),
+            |transaction, manifest, now| {
+                insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)?;
+                insert_generated_production(transaction, key, manifest, now)?;
+                Self::insert_production_inputs(transaction, key, slots)?;
+                insert_source(
+                    transaction,
+                    &manifest.content_sha256,
+                    &generated_source,
+                    now,
+                )
+            },
+        )
+    }
+
+    pub fn install_legacy_release_generated(
+        &self,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
     ) -> Result<GeneratedInstallOutcome, CatalogError> {
         let generated_source = DurablePackSource {
             kind: DurablePackSourceKind::Generated,
@@ -1561,6 +2298,81 @@ impl SemanticPackCatalog {
     /// Install a release-generated pack and return opaque proofs for both the
     /// release provenance and canonical generated-production source rows.
     pub fn install_release_generated_for_receipt(
+        &self,
+        release: &AcquisitionReceiptRelease,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+        slots: &[brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact],
+    ) -> Result<(GeneratedInstallOutcome, Vec<AcquisitionReceiptSource>), CatalogError> {
+        if slots.is_empty() {
+            return Err(CatalogError::Integrity(
+                "generated release installation requires verified input slots".into(),
+            ));
+        }
+        let release_digest = release.digest()?;
+        validate_generated_pack_identity(key, &pack.manifest)?;
+        validate_extraction_accounting(extraction)?;
+        let validated = validate_pack(pack, &self.options.decode_limits)?;
+        let generated_source = DurablePackSource {
+            kind: DurablePackSourceKind::Generated,
+            source_id: key.source_id(),
+        };
+        let unchanged =
+            self.unchanged_release_install(&validated, &pack.manifest_bytes, source, extraction)?
+                && self.exact_verified_install_present(
+                    &validated,
+                    &pack.manifest_bytes,
+                    &generated_source,
+                )?
+                && self.generated_production(key)?.is_some_and(|production| {
+                    production.manifest_digest == validated.manifest.content_sha256
+                });
+        let installation = if unchanged {
+            self.reconcile_installed_semantic_rows(&validated)?;
+            GeneratedInstallOutcome {
+                production: GeneratedProduction {
+                    key: key.clone(),
+                    manifest_digest: validated.manifest.content_sha256.clone(),
+                    completeness: validated.manifest.completeness,
+                },
+                install: InstallOutcome {
+                    diagnostics: validated
+                        .shards
+                        .iter()
+                        .flat_map(|shard| shard.diagnostics.iter().cloned())
+                        .collect(),
+                    manifest_digest: validated.manifest.content_sha256,
+                    inserted_manifest: false,
+                    inserted_objects: 0,
+                },
+            }
+        } else {
+            self.install_release_generated(key, pack, source, extraction, slots)?
+        };
+        let manifest_digest = installation.install.manifest_digest.clone();
+        Ok((
+            installation,
+            vec![
+                AcquisitionReceiptSource {
+                    release_digest: release_digest.clone(),
+                    manifest_digest: manifest_digest.clone(),
+                    source: source.clone(),
+                },
+                AcquisitionReceiptSource {
+                    release_digest,
+                    manifest_digest,
+                    source: DurablePackSource {
+                        kind: DurablePackSourceKind::Generated,
+                        source_id: key.source_id(),
+                    },
+                },
+            ],
+        ))
+    }
+
+    pub fn install_legacy_release_generated_for_receipt(
         &self,
         release: &AcquisitionReceiptRelease,
         key: &GeneratedProductionKey,
@@ -1606,7 +2418,7 @@ impl SemanticPackCatalog {
                 },
             }
         } else {
-            self.install_release_generated(key, pack, source, extraction)?
+            self.install_legacy_release_generated(key, pack, source, extraction)?
         };
         let manifest_digest = installation.install.manifest_digest.clone();
         Ok((
@@ -1739,11 +2551,97 @@ impl SemanticPackCatalog {
         }))
     }
 
+    fn insert_production_inputs(
+        transaction: &rusqlite::Transaction<'_>,
+        key: &GeneratedProductionKey,
+        slots: &[brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact],
+    ) -> Result<(), CatalogError> {
+        assert!(slots.windows(2).all(|pair| pair[0] < pair[1]));
+        transaction
+            .execute(
+                "DELETE FROM catalog_production_inputs WHERE production_digest=?1",
+                [key.production_digest()],
+            )
+            .map_err(|e| CatalogError::sqlite("replace production inputs", e))?;
+        for (ordinal, slot) in slots.iter().enumerate() {
+            let role = serde_json::to_value(slot.role)
+                .map_err(|e| CatalogError::Integrity(e.to_string()))?;
+            let kind = serde_json::to_value(slot.kind)
+                .map_err(|e| CatalogError::Integrity(e.to_string()))?;
+            transaction.execute("INSERT INTO catalog_production_inputs(production_digest,ordinal,slot_count,role,kind,module,sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![key.production_digest(),ordinal,slots.len(),role.as_str().expect("role string"),kind.as_str().expect("kind string"),slot.module,slot.sha256.as_slice()])
+                .map_err(|e| CatalogError::sqlite("insert production input", e))?;
+        }
+        Ok(())
+    }
+
+    /// Restore only a complete canonical set; a missing prefix or suffix is a miss.
+    pub fn generated_input_slots(
+        &self,
+        key: &GeneratedProductionKey,
+    ) -> Result<
+        Option<Vec<brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact>>,
+        CatalogError,
+    > {
+        use brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact;
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let mut statement = connection.prepare("SELECT ordinal,slot_count,role,kind,module,sha256 FROM catalog_production_inputs WHERE production_digest=?1 ORDER BY ordinal")
+            .map_err(|e| CatalogError::sqlite("prepare production inputs",e))?;
+        let rows = statement
+            .query_map([key.production_digest()], |r| {
+                Ok((
+                    r.get::<_, usize>(0)?,
+                    r.get::<_, usize>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .map_err(|e| CatalogError::sqlite("read production inputs", e))?;
+        let mut slots = Vec::new();
+        let mut count = None;
+        for row in rows {
+            let (ordinal, total, role, kind, module, sha) =
+                row.map_err(|e| CatalogError::sqlite("decode production input", e))?;
+            if ordinal != slots.len() || count.is_some_and(|n| n != total) {
+                return Ok(None);
+            }
+            count = Some(total);
+            let Ok(role) = serde_json::from_value(serde_json::Value::String(role)) else {
+                return Ok(None);
+            };
+            let Ok(kind) = serde_json::from_value(serde_json::Value::String(kind)) else {
+                return Ok(None);
+            };
+            let Ok(sha256) = sha.try_into() else {
+                return Ok(None);
+            };
+            slots.push(VerifiedRawArtifact {
+                role,
+                kind,
+                module,
+                sha256,
+            });
+        }
+        if count != Some(slots.len()) || slots.is_empty() || !slots.windows(2).all(|p| p[0] < p[1])
+        {
+            return Ok(None);
+        }
+        Ok(Some(slots))
+    }
+
     pub fn install_generated(
         &self,
         key: &GeneratedProductionKey,
         pack: &CompiledSemanticModelPack,
+        slots: &[brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact],
     ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        if slots.is_empty() {
+            return Err(CatalogError::Integrity(
+                "generated installation requires verified input slots".into(),
+            ));
+        }
         let source = DurablePackSource {
             kind: DurablePackSourceKind::Generated,
             source_id: key.source_id(),
@@ -1755,7 +2653,8 @@ impl SemanticPackCatalog {
             None,
             || Ok(()),
             |transaction, manifest, now| {
-                insert_generated_production(transaction, key, manifest, now)
+                insert_generated_production(transaction, key, manifest, now)?;
+                Self::insert_production_inputs(transaction, key, slots)
             },
         )
     }
@@ -1766,7 +2665,13 @@ impl SemanticPackCatalog {
         pack: &CompiledSemanticModelPack,
         artifact: &ExactArtifact,
         packages: &[GoPinnedPackage],
+        slots: &[brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact],
     ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        if slots.is_empty() {
+            return Err(CatalogError::Integrity(
+                "generated installation requires verified input slots".into(),
+            ));
+        }
         let source = DurablePackSource {
             kind: DurablePackSourceKind::Generated,
             source_id: key.source_id(),
@@ -1779,6 +2684,7 @@ impl SemanticPackCatalog {
             || validate_exact_go_source(artifact, packages),
             |transaction, manifest, now| {
                 insert_generated_production(transaction, key, manifest, now)?;
+                Self::insert_production_inputs(transaction, key, slots)?;
                 insert_exact_go_source_rows(
                     transaction,
                     &manifest.content_sha256,
@@ -1829,6 +2735,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| CatalogError::sqlite("begin exact Go source registration", error))?;
@@ -1937,6 +2844,7 @@ impl SemanticPackCatalog {
         &self,
         source_identity: &str,
         producer: &crate::analyzer::semantic_model::Producer,
+        schema_version: u32,
     ) -> Result<Option<GeneratedProduction>, CatalogError> {
         let connection = self
             .connection
@@ -1949,7 +2857,7 @@ impl SemanticPackCatalog {
                     source_identity,
                     &producer.name,
                     &producer.version,
-                    SEMANTIC_MODEL_SCHEMA_VERSION,
+                    schema_version,
                     GENERATED_PRODUCTION_CACHE_VERSION,
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -1961,8 +2869,11 @@ impl SemanticPackCatalog {
             let Some(shared) = self.shared_generated_catalog() else {
                 return Ok(None);
             };
-            let Some(production) =
-                shared.generated_production_by_source_identity(source_identity, producer)?
+            let Some(production) = shared.generated_production_by_source_identity(
+                source_identity,
+                producer,
+                schema_version,
+            )?
             else {
                 return Ok(None);
             };
@@ -1974,7 +2885,7 @@ impl SemanticPackCatalog {
             input_digest,
             &producer.name,
             &producer.version,
-            SEMANTIC_MODEL_SCHEMA_VERSION,
+            schema_version,
         )?;
         debug_assert_eq!(
             key.production_digest(),
@@ -2035,6 +2946,9 @@ impl SemanticPackCatalog {
             self.copy_generated_from(shared, &production)?;
             return Ok(Some(production));
         };
+        if self.generated_input_slots(key)?.is_none() {
+            return Ok(None);
+        }
         let validated = (|| -> Result<GeneratedProduction, CatalogError> {
             let stored_key = GeneratedProductionKey::new(
                 input_digest,
@@ -2062,11 +2976,7 @@ impl SemanticPackCatalog {
                 Ok(Some(production))
             }
             Err(error) => {
-                self.outside_capture()
-                    .rejected_manifests
-                    .lock()
-                    .expect("semantic-pack rejection mutex poisoned")
-                    .insert(manifest_digest.clone());
+                self.reject_manifest(&manifest_digest)?;
                 if self.mode == CatalogOpenMode::ReadWrite {
                     self.quarantine(&manifest_digest, "generated_production_failure", &error)?;
                 }
@@ -2173,24 +3083,16 @@ impl SemanticPackCatalog {
             record_install,
         );
         match install_result {
-            Ok(inserted_manifest) => {
-                self.outside_capture()
-                    .rejected_manifests
-                    .lock()
-                    .expect("semantic-pack rejection mutex poisoned")
-                    .remove(&validated.manifest.content_sha256);
-                self.record_mutation();
-                Ok(InstallOutcome {
-                    diagnostics: validated
-                        .shards
-                        .iter()
-                        .flat_map(|shard| shard.diagnostics.iter().cloned())
-                        .collect(),
-                    manifest_digest: validated.manifest.content_sha256,
-                    inserted_manifest,
-                    inserted_objects,
-                })
-            }
+            Ok(inserted_manifest) => Ok(InstallOutcome {
+                diagnostics: validated
+                    .shards
+                    .iter()
+                    .flat_map(|shard| shard.diagnostics.iter().cloned())
+                    .collect(),
+                manifest_digest: validated.manifest.content_sha256,
+                inserted_manifest,
+                inserted_objects,
+            }),
             Err(error) => Err(self.release_after_install_failure(&installation_id, error)),
         }
     }
@@ -2635,6 +3537,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic catalog mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| {
@@ -2672,10 +3575,16 @@ impl SemanticPackCatalog {
         ) -> Result<(), CatalogError>,
     ) -> Result<bool, CatalogError> {
         assert_eq!(published.len(), validated.shards.len());
+        // Candidate readers take rejection state before the SQL connection.
+        let mut rejected = self
+            .rejected_manifests
+            .lock()
+            .expect("semantic-pack rejection mutex poisoned");
         let mut connection = self
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| CatalogError::sqlite("begin pack install", error))?;
@@ -2696,9 +3605,12 @@ impl SemanticPackCatalog {
                 .map_err(|error| {
                     CatalogError::sqlite("release losing install reservations", error)
                 })?;
+            self.check_install_origin(&transaction, validated)?;
             transaction
                 .commit()
                 .map_err(|error| CatalogError::sqlite("commit losing install", error))?;
+            rejected.remove(&validated.manifest.content_sha256);
+            self.record_mutation();
             return Ok(false);
         }
         if self.exact_verified_install_present_on(
@@ -2721,6 +3633,7 @@ impl SemanticPackCatalog {
                 }
             }
             record_install(&transaction, &validated.manifest, now)?;
+            self.check_install_origin(&transaction, validated)?;
             transaction
                 .execute(
                     "DELETE FROM catalog_install_object_reservations WHERE installation_id=?1",
@@ -2732,6 +3645,8 @@ impl SemanticPackCatalog {
             transaction
                 .commit()
                 .map_err(|error| CatalogError::sqlite("commit reconciled install", error))?;
+            rejected.remove(&validated.manifest.content_sha256);
+            self.record_mutation();
             return Ok(false);
         }
         for (shard, path) in validated.shards.iter().zip(published) {
@@ -2885,6 +3800,7 @@ impl SemanticPackCatalog {
             now,
         )?;
         record_install(&transaction, &validated.manifest, now)?;
+        self.check_install_origin(&transaction, validated)?;
         transaction
             .execute(
                 "UPDATE catalog_packs
@@ -2903,6 +3819,8 @@ impl SemanticPackCatalog {
         transaction
             .commit()
             .map_err(|error| CatalogError::sqlite("commit pack install", error))?;
+        rejected.remove(&validated.manifest.content_sha256);
+        self.record_mutation();
         Ok(inserted_manifest)
     }
 
@@ -3015,6 +3933,17 @@ impl SemanticPackCatalog {
             ));
         }
         let validated = validate_pack(pack, &self.options.decode_limits)?;
+        let origin = {
+            let connection = self
+                .connection
+                .lock()
+                .expect("semantic-pack catalog mutex poisoned");
+            self.sql_statements.fetch_add(1, Ordering::Relaxed);
+            recorded_pack_origin_on(&connection, &validated.manifest.content_sha256)?
+        };
+        for shard in &validated.shards {
+            check_catalog_shard_origin(origin, &shard.decoded)?;
+        }
         let digest = validated.manifest.content_sha256.clone();
         if let Some((artifact, packages)) = exact_source {
             if validated.manifest.language != "go" {
@@ -3024,6 +3953,11 @@ impl SemanticPackCatalog {
             }
             validate_exact_go_source(artifact, packages)?;
         }
+        let identity_connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&identity_connection)?;
         let mut session_packs = self
             .outside_capture()
             .session_packs
@@ -3153,6 +4087,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| CatalogError::sqlite("begin lease release", error))?;
@@ -3229,6 +4164,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
         let removed = connection
             .execute(
                 "DELETE FROM catalog_sources
@@ -3832,150 +4768,72 @@ impl SemanticPackCatalog {
         self.candidates_bounded_inner(query, max_rows, false)
     }
 
+    /// Activation reports obsolete generations without losing valid candidates.
+    pub(crate) fn activation_candidates_bounded(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+    ) -> Result<super::dependency::CandidateSelection<CatalogCandidate>, CatalogError> {
+        let (candidates, findings) = select_candidates(self, query, max_rows, false)?;
+        let refusals = findings
+            .iter()
+            .filter_map(|(digest, error)| match error {
+                CatalogError::StaleGeneratedSelector { producer } => Some((
+                    digest.clone(),
+                    CatalogError::StaleGeneratedSelector {
+                        producer: producer.clone(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        self.apply_candidate_findings(findings)?;
+        Ok((candidates, refusals))
+    }
+
+    fn reject_manifest(&self, manifest_digest: &str) -> Result<(), CatalogError> {
+        let mut rejected = self
+            .rejected_manifests
+            .lock()
+            .expect("semantic-pack rejection mutex poisoned");
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
+        if rejected.insert(manifest_digest.to_owned()) {
+            self.record_mutation();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_candidate_findings(
+        &self,
+        findings: Vec<(String, CatalogError)>,
+    ) -> Result<(), CatalogError> {
+        for (manifest_digest, error) in findings {
+            // Retained obsolete productions must reproduce their refusal on
+            // every lookup, including after a preliminary preparation probe.
+            if matches!(error, CatalogError::StaleGeneratedSelector { .. }) {
+                continue;
+            }
+            self.reject_manifest(&manifest_digest)?;
+            if self.mode == CatalogOpenMode::ReadWrite {
+                self.quarantine(&manifest_digest, "candidate_metadata_failure", &error)?;
+            }
+        }
+        Ok(())
+    }
+
     fn candidates_bounded_inner(
         &self,
         query: &SemanticPackSelectorQuery,
         max_rows: usize,
         require_exact_coordinate: bool,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {
-        let durable_rows = self.durable_selector_rows(query, max_rows)?;
-
-        let mut candidates = Vec::new();
-        let rejected_manifests = self
-            .outside_capture()
-            .rejected_manifests
-            .lock()
-            .expect("semantic-pack rejection mutex poisoned");
-        let mut corrupt = Vec::new();
-        let mut corrupt_digests = HashSet::new();
-        for row in durable_rows {
-            let DurableSelectorRow {
-                manifest_digest,
-                shard_id,
-                descriptor_json,
-                selector_json,
-                source_kind,
-                source_id,
-            } = row;
-            if rejected_manifests.contains(&manifest_digest)
-                || corrupt_digests.contains(&manifest_digest)
-            {
-                continue;
-            }
-            let decoded = (|| -> Result<Option<CatalogCandidate>, CatalogError> {
-                let manifest = self.stored_manifest(&manifest_digest)?;
-                if !manifest_compatible(&manifest, query)? {
-                    return Ok(None);
-                }
-                let selector: ActivationSelector = serde_json::from_slice(&selector_json)
-                    .map_err(|error| CatalogError::Integrity(error.to_string()))?;
-                if !selector_matches(&selector, query)? {
-                    return Ok(None);
-                }
-                if require_exact_coordinate && !selector_binds_exact_coordinate(&selector, query) {
-                    return Ok(None);
-                }
-                let descriptor: CompiledShardDescriptor = serde_json::from_slice(&descriptor_json)
-                    .map_err(|error| CatalogError::Integrity(error.to_string()))?;
-                if manifest
-                    .shards
-                    .iter()
-                    .find(|expected| expected.shard_id == shard_id)
-                    != Some(&descriptor)
-                {
-                    return Err(CatalogError::Integrity(format!(
-                        "catalog descriptor does not match manifest shard {shard_id}"
-                    )));
-                }
-                Ok(Some(CatalogCandidate {
-                    manifest_digest: manifest_digest.clone(),
-                    shard_id,
-                    descriptor,
-                    completeness: manifest.completeness,
-                    source_kind: DurablePackSourceKind::parse(&source_kind)?.into(),
-                    source_id,
-                    location: CatalogCandidateLocation::Durable,
-                }))
-            })();
-            match decoded {
-                Ok(Some(candidate)) if !candidates.contains(&candidate) => {
-                    candidates.push(candidate);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    corrupt_digests.insert(manifest_digest.clone());
-                    corrupt.push((manifest_digest, error));
-                }
-            }
-        }
-        drop(rejected_manifests);
-        for (manifest_digest, error) in corrupt {
-            candidates.retain(|candidate| candidate.manifest_digest != manifest_digest);
-            self.outside_capture()
-                .rejected_manifests
-                .lock()
-                .expect("semantic-pack rejection mutex poisoned")
-                .insert(manifest_digest.clone());
-            if self.mode == CatalogOpenMode::ReadWrite {
-                self.quarantine(&manifest_digest, "candidate_metadata_failure", &error)?;
-            }
-        }
-
-        let session_packs = self
-            .outside_capture()
-            .session_packs
-            .lock()
-            .expect("semantic-pack session mutex poisoned");
-        for (pack_ordinal, pack) in session_packs.iter().enumerate() {
-            if candidates.len() >= max_rows {
-                break;
-            }
-            if pack.manifest.language != query.language
-                || pack.manifest.ecosystem != query.ecosystem
-                || !manifest_compatible(&pack.manifest, query)?
-            {
-                continue;
-            }
-            for (shard_ordinal, shard) in pack.shards.iter().enumerate() {
-                if candidates.len() >= max_rows {
-                    break;
-                }
-                let mut matches = false;
-                for selector in &shard.selectors {
-                    if selector_matches(selector, query)?
-                        && (!require_exact_coordinate
-                            || selector_binds_exact_coordinate(selector, query))
-                    {
-                        matches = true;
-                        break;
-                    }
-                }
-                if !matches {
-                    continue;
-                }
-                candidates.push(CatalogCandidate {
-                    manifest_digest: pack.manifest.content_sha256.clone(),
-                    shard_id: shard.descriptor.shard_id.clone(),
-                    descriptor: shard.descriptor.clone(),
-                    completeness: pack.manifest.completeness,
-                    source_kind: pack.source.kind.into(),
-                    source_id: pack.source.source_id.clone(),
-                    location: CatalogCandidateLocation::Session {
-                        pack_ordinal,
-                        shard_ordinal,
-                    },
-                });
-            }
-        }
-        candidates.sort_by(|left, right| {
-            left.source_kind
-                .precedence()
-                .cmp(&right.source_kind.precedence())
-                .then_with(|| left.manifest_digest.cmp(&right.manifest_digest))
-                .then_with(|| left.shard_id.cmp(&right.shard_id))
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        });
-        candidates.dedup();
+        let (candidates, corrupt) =
+            select_candidates(self, query, max_rows, require_exact_coordinate)?;
+        self.apply_candidate_findings(corrupt)?;
         if candidates.is_empty() {
             self.lookup_misses.fetch_add(1, Ordering::Relaxed);
         }
@@ -4089,16 +4947,27 @@ impl SemanticPackCatalog {
                         shard_id,
                     });
                 }
+                if let CatalogError::StaleGeneratedSelector { producer } = &error {
+                    return Err(CatalogMiss::StaleGeneratedSelector {
+                        producer: producer.clone(),
+                        reason: error.to_string(),
+                    });
+                }
+                if let CatalogError::SelectorOriginMismatch { origin, .. } = &error {
+                    return Err(CatalogMiss::SelectorOriginMismatch {
+                        origin: *origin,
+                        reason: error.to_string(),
+                    });
+                }
                 if matches!(error, CatalogError::Unavailable) {
                     return Err(CatalogMiss::NotFound);
                 }
                 let mut reason = error.to_string();
                 if matches!(candidate.location, CatalogCandidateLocation::Durable) {
-                    self.outside_capture()
-                        .rejected_manifests
-                        .lock()
-                        .expect("semantic-pack rejection mutex poisoned")
-                        .insert(candidate.manifest_digest.clone());
+                    self.reject_manifest(&candidate.manifest_digest)
+                        .map_err(|error| CatalogMiss::Quarantined {
+                            reason: error.to_string(),
+                        })?;
                 }
                 if matches!(candidate.location, CatalogCandidateLocation::Durable)
                     && self.mode == CatalogOpenMode::ReadWrite
@@ -4379,14 +5248,22 @@ impl SemanticPackCatalog {
         &self,
         candidate: &CatalogCandidate,
     ) -> Result<LoadedCatalogShard, CatalogError> {
-        let loaded = match self.load_metadata_only(candidate) {
+        let loaded = match self
+            .ensure_metadata_indexed(candidate)
+            .and_then(|()| self.load_metadata_only(candidate))
+        {
             Err(CatalogError::IndexReconciliationRequired { .. })
                 if self.mode == CatalogOpenMode::ReadWrite =>
             {
                 // Durable loads reconcile under their lease. Session sources
                 // have no durable object and publish into their own database.
-                let decoded = self.load_decoded(candidate)?;
+                let (decoded, verified) = self.load_verified_decoded(candidate)?;
                 if matches!(candidate.location, CatalogCandidateLocation::Session { .. }) {
+                    let identity_connection = self
+                        .connection
+                        .lock()
+                        .expect("semantic-pack catalog connection mutex poisoned");
+                    self.begin_publication_mutation(&identity_connection)?;
                     let mut session = self
                         .outside_capture()
                         .session_catalog
@@ -4414,7 +5291,7 @@ impl SemanticPackCatalog {
                     })?;
                     self.record_mutation();
                 }
-                self.load_metadata_only(candidate)?
+                self.admit_verified_metadata(verified, candidate, decoded.manifest)?
             }
             result => result?,
         };
@@ -4517,14 +5394,207 @@ impl SemanticPackCatalog {
         }
     }
 
+    fn verify_candidate(
+        &self,
+        candidate: &CatalogCandidate,
+        manifest: &Arc<CompiledPackManifest>,
+    ) -> Result<(VerifiedShard, Option<CompiledShard>), CatalogError> {
+        self.validated_manifest_inventory(manifest)?;
+        let record = |census| {
+            if self.mode == CatalogOpenMode::ReadWrite
+                && matches!(candidate.location, CatalogCandidateLocation::Durable)
+            {
+                let connection = self.connection.lock().expect("catalog mutex poisoned");
+                record_shard_validation(
+                    &connection,
+                    &manifest.content_sha256,
+                    &candidate.shard_id,
+                    census,
+                )?;
+            }
+            Ok(())
+        };
+        match candidate.location {
+            CatalogCandidateLocation::Durable => self.verifier.ensure_valid_shard(
+                ShardVerificationInput {
+                    root: &self.root,
+                    stored_in: ShardStorage::Durable,
+                    object_reads: Some(&self.object_reads),
+                    manifest,
+                    descriptor: &candidate.descriptor,
+                    limits: &self.options.decode_limits,
+                    instance: self.instance_identity,
+                },
+                || {
+                    self.verifier.ensure_profile_pack(
+                        self.instance_identity,
+                        ShardStorage::Durable,
+                        manifest,
+                        &self.options.decode_limits,
+                        || {
+                            validate_stored_python_profile_pack(
+                                &self.root,
+                                Some(&self.connection.lock().expect("catalog mutex poisoned")),
+                                None,
+                                manifest,
+                                &self.options.decode_limits,
+                                Some((
+                                    &self.sql_statements,
+                                    &self.object_reads,
+                                    &self.shard_validations,
+                                )),
+                            )
+                        },
+                    )?;
+                    let location = self.valid_shard_location(candidate, manifest)?;
+                    let certificate = shard_certificate(
+                        &self.connection.lock().expect("catalog mutex poisoned"),
+                        manifest,
+                        &candidate.shard_id,
+                    )?;
+                    Ok(ShardVerificationSource::Durable {
+                        location,
+                        certificate,
+                    })
+                },
+                || {
+                    self.shard_validations.fetch_add(1, Ordering::Relaxed);
+                },
+                record,
+            ),
+            CatalogCandidateLocation::Session {
+                pack_ordinal,
+                shard_ordinal,
+            } => {
+                let packs = self.session_packs.lock().expect("session mutex poisoned");
+                let pack = packs.get(pack_ordinal).ok_or(CatalogError::Unavailable)?;
+                let shard = pack
+                    .shards
+                    .get(shard_ordinal)
+                    .ok_or(CatalogError::Unavailable)?;
+                if pack.manifest.content_sha256 != manifest.content_sha256
+                    || shard.descriptor != candidate.descriptor
+                {
+                    return Err(CatalogError::Unavailable);
+                }
+                self.verifier.ensure_valid_shard(
+                    ShardVerificationInput {
+                        root: &self.root,
+                        stored_in: ShardStorage::Session,
+                        object_reads: Some(&self.object_reads),
+                        manifest,
+                        descriptor: &candidate.descriptor,
+                        limits: &self.options.decode_limits,
+                        instance: self.instance_identity,
+                    },
+                    || {
+                        self.verifier.ensure_profile_pack(
+                            self.instance_identity,
+                            ShardStorage::Session,
+                            manifest,
+                            &self.options.decode_limits,
+                            || {
+                                validate_stored_python_profile_pack(
+                                    &self.root,
+                                    None,
+                                    Some(pack),
+                                    manifest,
+                                    &self.options.decode_limits,
+                                    Some((
+                                        &self.sql_statements,
+                                        &self.object_reads,
+                                        &self.shard_validations,
+                                    )),
+                                )
+                            },
+                        )?;
+                        Ok(ShardVerificationSource::Session {
+                            bytes: &shard.bytes,
+                        })
+                    },
+                    || {
+                        self.shard_validations.fetch_add(1, Ordering::Relaxed);
+                    },
+                    record,
+                )
+            }
+        }
+    }
+
+    fn recorded_origin(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<
+        brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin,
+        CatalogError,
+    > {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        recorded_pack_origin_on(&connection, &candidate.manifest_digest)
+    }
+
+    fn check_install_origin(
+        &self,
+        connection: &Connection,
+        validated: &ValidatedPack,
+    ) -> Result<(), CatalogError> {
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        let origin = recorded_pack_origin_on(connection, &validated.manifest.content_sha256)?;
+        if origin == brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+            && !validated.manifest.producer.has_current_dependency_revision() {
+            // Legacy release data may be imported for exact regeneration. All
+            // activation and defensive reads refuse its recorded revision first.
+            return Ok(());
+        }
+        for shard in &validated.shards {
+            check_catalog_shard_origin(origin, &shard.decoded)?;
+        }
+        Ok(())
+    }
+
     fn load_metadata_only(
         &self,
         candidate: &CatalogCandidate,
     ) -> Result<LoadedCatalogShard, CatalogError> {
         let manifest = self.candidate_manifest(candidate)?;
+        let (verified, _) = self.verify_candidate(candidate, &manifest)?;
+        self.admit_verified_metadata(verified, candidate, manifest)
+    }
+
+    fn ensure_metadata_indexed(&self, candidate: &CatalogCandidate) -> Result<(), CatalogError> {
+        match candidate.location {
+            CatalogCandidateLocation::Durable => {
+                let connection = self.connection.lock().expect("catalog mutex poisoned");
+                self.metadata_only_presence(&connection, candidate)?;
+            }
+            CatalogCandidateLocation::Session { .. } => {
+                let session = self
+                    .outside_capture()
+                    .session_catalog
+                    .lock()
+                    .expect("session catalog mutex poisoned");
+                self.metadata_only_presence(
+                    &session
+                        .as_ref()
+                        .expect("registered session catalog exists")
+                        .connection,
+                    candidate,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_verified_metadata(
+        &self,
+        verified: VerifiedShard,
+        candidate: &CatalogCandidate,
+        manifest: Arc<CompiledPackManifest>,
+    ) -> Result<LoadedCatalogShard, CatalogError> {
+        debug_assert_eq!(verified.manifest_digest, candidate.manifest_digest);
+        debug_assert_eq!(verified.descriptor, candidate.descriptor);
         let (selectors, has_callable_values) = match candidate.location {
             CatalogCandidateLocation::Durable => {
-                self.validate_stored_python_profile_pack(&manifest)?;
                 self.validated_manifest_inventory(&manifest)?;
                 let connection = self
                     .connection
@@ -4549,7 +5619,11 @@ impl SemanticPackCatalog {
                 (selectors, presence)
             }
         };
+        let origin = self.recorded_origin(candidate)?;
+        brokk_bifrost_semantic::analyzer::semantic_model::catalog::check_generated_producer_revision(origin, &manifest.producer)?;
+        check_catalog_selector_origin(origin, manifest.extraction.as_ref(), &selectors)?;
         Ok(LoadedCatalogShard {
+            origin,
             manifest,
             descriptor: candidate.descriptor.clone(),
             selectors,
@@ -4614,6 +5688,14 @@ impl SemanticPackCatalog {
         &self,
         candidate: &CatalogCandidate,
     ) -> Result<LoadedCatalogShard, CatalogError> {
+        self.load_verified_decoded(candidate)
+            .map(|(loaded, _)| loaded)
+    }
+
+    fn load_verified_decoded(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<(LoadedCatalogShard, VerifiedShard), CatalogError> {
         match candidate.location {
             CatalogCandidateLocation::Durable if self.mode == CatalogOpenMode::ReadWrite => {
                 let lease = self.lease(
@@ -4621,7 +5703,7 @@ impl SemanticPackCatalog {
                     "verified-load",
                     Duration::from_secs(60),
                 )?;
-                let loaded = self.load_durable(candidate);
+                let loaded = self.load_verified_durable(candidate);
                 let released = lease.release();
                 match (loaded, released) {
                     (Ok(loaded), Ok(())) => Ok(loaded),
@@ -4631,7 +5713,7 @@ impl SemanticPackCatalog {
                     ))),
                 }
             }
-            CatalogCandidateLocation::Durable => self.load_durable(candidate),
+            CatalogCandidateLocation::Durable => self.load_verified_durable(candidate),
             CatalogCandidateLocation::Session {
                 pack_ordinal,
                 shard_ordinal,
@@ -4639,18 +5721,20 @@ impl SemanticPackCatalog {
         }
     }
 
-    fn load_durable(
+    fn valid_shard_location(
         &self,
         candidate: &CatalogCandidate,
-    ) -> Result<LoadedCatalogShard, CatalogError> {
-        // The manifest comes from the memo, not from this statement: a pack
-        // with 44 shards used to ship its multi-megabyte manifest bytes out of
-        // SQLite once per loaded shard (#3101).
-        // The manifest is decoded under this catalog's immutable options on a
-        // memo miss. Memo hits reuse that admission, including manifest text;
-        // the shard certificate only needs to measure shard text and depth.
-        let manifest = self.stored_manifest(&candidate.manifest_digest)?;
-        self.validate_stored_python_profile_pack(&manifest)?;
+        manifest: &Arc<CompiledPackManifest>,
+    ) -> Result<(String, u64), CatalogError> {
+        if !manifest
+            .shards
+            .iter()
+            .any(|descriptor| descriptor == &candidate.descriptor)
+        {
+            return Err(CatalogError::Integrity(
+                "candidate descriptor differs from manifest".to_owned(),
+            ));
+        }
         let connection = self
             .connection
             .lock()
@@ -4678,29 +5762,6 @@ impl SemanticPackCatalog {
             .optional()
             .map_err(|error| CatalogError::sqlite("load candidate location", error))?
             .ok_or(CatalogError::Unavailable)?;
-        self.sql_statements.fetch_add(1, Ordering::Relaxed);
-        let recorded: Option<(i64, i64)> = connection
-            .query_row(
-                CERTIFIED_SHARD_SQL,
-                params![
-                    manifest.content_sha256,
-                    candidate.shard_id,
-                    SHARD_VALIDATION_VERSION,
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| CatalogError::sqlite("lookup shard validation", error))?;
-        let certified = recorded.is_some_and(|(text, depth)| {
-            let Ok(text) = usize::try_from(text) else {
-                return false;
-            };
-            let Ok(depth) = usize::try_from(depth) else {
-                return false;
-            };
-            text <= self.options.decode_limits.max_text_bytes
-                && depth <= self.options.decode_limits.max_depth
-        });
         if self.mode == CatalogOpenMode::ReadOnly {
             let indexed: bool = connection
                 .query_row(
@@ -4719,44 +5780,49 @@ impl SemanticPackCatalog {
             }
         }
         drop(connection);
-        self.object_reads.fetch_add(1, Ordering::Relaxed);
-        let bytes = storage::read(
-            &self.root,
-            &row.0,
-            &candidate.descriptor.stored_sha256,
-            row.1,
-        )?;
-        self.validated_manifest_inventory(&manifest)?;
-        let shard = if certified {
+        Ok(row)
+    }
+
+    #[cfg(test)]
+    fn load_durable(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogError> {
+        self.load_verified_durable(candidate)
+            .map(|(loaded, _)| loaded)
+    }
+
+    fn load_verified_durable(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<(LoadedCatalogShard, VerifiedShard), CatalogError> {
+        let manifest = self.stored_manifest(&candidate.manifest_digest)?;
+        let (verified, shard) = self.verify_candidate(candidate, &manifest)?;
+        let shard = shard.map(Ok).unwrap_or_else(|| {
+            let row = self.valid_shard_location(candidate, &manifest)?;
+            self.object_reads.fetch_add(1, Ordering::Relaxed);
+            let bytes = storage::read(
+                &self.root,
+                &row.0,
+                &candidate.descriptor.stored_sha256,
+                row.1,
+            )?;
             crate::analyzer::semantic_model::artifact::hydrate_certified_shard(
                 &manifest,
                 &candidate.descriptor,
                 &bytes,
                 &self.options.decode_limits,
             )
-            .map_err(|error| CatalogError::Artifact(error.to_string()))?
-        } else {
-            let (shard, census) =
-                self.decode_stored_shard_with_census(&manifest, &candidate.descriptor, &bytes)?;
-            if self.mode == CatalogOpenMode::ReadWrite {
-                let connection = self
-                    .connection
-                    .lock()
-                    .expect("semantic-pack catalog connection mutex poisoned");
-                record_shard_validation(
-                    &connection,
-                    &manifest.content_sha256,
-                    &candidate.shard_id,
-                    census,
-                )?;
-            }
-            shard
-        };
+            .map_err(|error| CatalogError::Artifact(error.to_string()))
+        })?;
+        let origin = self.recorded_origin(candidate)?;
+        check_catalog_shard_origin(origin, &shard)?;
         if self.mode == CatalogOpenMode::ReadWrite {
             let mut connection = self
                 .connection
                 .lock()
                 .expect("semantic-pack catalog connection mutex poisoned");
+            self.begin_publication_mutation(&connection)?;
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
@@ -4791,15 +5857,19 @@ impl SemanticPackCatalog {
                 )
                 .map_err(|error| CatalogError::sqlite("touch loaded pack", error))?;
         }
-        Ok(LoadedCatalogShard {
-            manifest,
-            descriptor: candidate.descriptor.clone(),
-            selectors: Vec::new(),
-            has_callable_values: shard.callable_values().is_some(),
-            shard: Some(shard),
-            source_kind: candidate.source_kind,
-            source_id: candidate.source_id.clone(),
-        })
+        Ok((
+            LoadedCatalogShard {
+                origin,
+                manifest,
+                descriptor: candidate.descriptor.clone(),
+                selectors: Vec::new(),
+                has_callable_values: shard.callable_values().is_some(),
+                shard: Some(shard),
+                source_kind: candidate.source_kind,
+                source_id: candidate.source_id.clone(),
+            },
+            verified,
+        ))
     }
 
     fn load_session(
@@ -4807,7 +5877,9 @@ impl SemanticPackCatalog {
         candidate: &CatalogCandidate,
         pack_ordinal: usize,
         shard_ordinal: usize,
-    ) -> Result<LoadedCatalogShard, CatalogError> {
+    ) -> Result<(LoadedCatalogShard, VerifiedShard), CatalogError> {
+        let manifest = self.candidate_manifest(candidate)?;
+        let (verified, decoded) = self.verify_candidate(candidate, &manifest)?;
         let session_packs = self
             .outside_capture()
             .session_packs
@@ -4825,16 +5897,24 @@ impl SemanticPackCatalog {
         {
             return Err(CatalogError::Unavailable);
         }
-        let decoded = self.decode_stored_shard(&pack.manifest, &shard.descriptor, &shard.bytes)?;
-        Ok(LoadedCatalogShard {
-            manifest: Arc::clone(&pack.manifest),
-            descriptor: candidate.descriptor.clone(),
-            selectors: Vec::new(),
-            has_callable_values: decoded.callable_values().is_some(),
-            shard: Some(decoded),
-            source_kind: candidate.source_kind,
-            source_id: candidate.source_id.clone(),
-        })
+        let decoded = decoded.map(Ok).unwrap_or_else(|| {
+            self.decode_stored_shard(&pack.manifest, &shard.descriptor, &shard.bytes)
+        })?;
+        let origin = self.recorded_origin(candidate)?;
+        check_catalog_shard_origin(origin, &decoded)?;
+        Ok((
+            LoadedCatalogShard {
+                origin,
+                manifest: Arc::clone(&pack.manifest),
+                descriptor: candidate.descriptor.clone(),
+                selectors: Vec::new(),
+                has_callable_values: decoded.callable_values().is_some(),
+                shard: Some(decoded),
+                source_kind: candidate.source_kind,
+                source_id: candidate.source_id.clone(),
+            },
+            verified,
+        ))
     }
 
     pub fn garbage_collect(
@@ -4860,6 +5940,7 @@ impl SemanticPackCatalog {
                 .connection
                 .lock()
                 .expect("semantic-pack catalog connection mutex poisoned");
+            self.begin_publication_mutation(&connection)?;
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| CatalogError::sqlite("begin catalog GC", error))?;
@@ -4959,6 +6040,9 @@ impl SemanticPackCatalog {
             transaction
                 .commit()
                 .map_err(|error| CatalogError::sqlite("commit catalog GC metadata", error))?;
+            if !pack_digests.is_empty() {
+                self.record_mutation();
+            }
             (pack_digests, object_candidates, pruned_expired_leases)
         };
 
@@ -5022,9 +6106,6 @@ impl SemanticPackCatalog {
             reclaimed_bytes,
             pruned_expired_leases,
         };
-        if outcome.pruned_packs != 0 {
-            self.record_mutation();
-        }
         Ok(outcome)
     }
 
@@ -5038,6 +6119,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.begin_publication_mutation(&connection)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| CatalogError::sqlite("begin pack quarantine", source))?;
@@ -5074,22 +6156,104 @@ impl SemanticPackCatalog {
     }
 
     pub(crate) fn cache_identity(&self) -> Result<SemanticPackCatalogCacheIdentity, CatalogError> {
+        self.with_cache_identity(|identity| identity)
+    }
+
+    /// Keep local writers excluded through the caller's identity-dependent write.
+    pub(crate) fn with_cache_identity<T>(
+        &self,
+        apply: impl FnOnce(SemanticPackCatalogCacheIdentity) -> T,
+    ) -> Result<T, CatalogError> {
+        // Candidate readers take rejection state before the connection;
+        // active-member validation takes the connection before session packs.
+        let _rejected = self
+            .rejected_manifests
+            .lock()
+            .expect("semantic-pack rejection mutex poisoned");
         let connection = self
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        let _sessions = self
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned");
         let sqlite_data_version = connection
             .query_row("PRAGMA data_version", [], |row| row.get(0))
             .map_err(|error| CatalogError::sqlite("read catalog data version", error))?;
-        Ok(SemanticPackCatalogCacheIdentity {
+        // Reading identity never advances the local mutation generation.
+        Ok(apply(SemanticPackCatalogCacheIdentity {
             instance_identity: self.instance_identity,
             mutation_generation: self.mutation_generation.load(Ordering::Relaxed),
             sqlite_data_version,
-        })
+        }))
+    }
+
+    pub(crate) fn with_activation_publication<T>(&self, run: impl FnOnce() -> T) -> T {
+        let initial = self.cache_identity().ok();
+        let _scope =
+            PublicationScope(ACTIVATION_PUBLICATION.replace(Some(ActivationPublication {
+                initial: initial.unwrap_or(SemanticPackCatalogCacheIdentity {
+                    instance_identity: self.instance_identity,
+                    mutation_generation: 0,
+                    sqlite_data_version: 0,
+                }),
+                expected: initial,
+            })));
+        run()
+    }
+
+    pub(crate) fn activation_publication_identity(
+        &self,
+    ) -> Option<(
+        SemanticPackCatalogCacheIdentity,
+        Option<SemanticPackCatalogCacheIdentity>,
+    )> {
+        ACTIVATION_PUBLICATION
+            .get()
+            .filter(|receipt| receipt.initial.instance_identity == self.instance_identity)
+            .map(|receipt| (receipt.initial, receipt.expected))
+    }
+
+    // Caller holds the writer lock until record_mutation. Identity reads do not
+    // advance generation; only a successful mutation advances our receipt.
+    fn begin_publication_mutation(&self, connection: &Connection) -> Result<(), CatalogError> {
+        if let Some((_, Some(expected))) = self.activation_publication_identity() {
+            let current = SemanticPackCatalogCacheIdentity {
+                instance_identity: self.instance_identity,
+                mutation_generation: self.mutation_generation.load(Ordering::Relaxed),
+                sqlite_data_version: connection
+                    .query_row("PRAGMA data_version", [], |row| row.get(0))
+                    .map_err(|error| CatalogError::sqlite("identify publication start", error))?,
+            };
+            if expected != current {
+                ACTIVATION_PUBLICATION.update(|receipt| {
+                    receipt.map(|mut receipt| {
+                        receipt.expected = None;
+                        receipt
+                    })
+                });
+            }
+        }
+        Ok(())
     }
 
     fn record_mutation(&self) {
-        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
+        let before = self.mutation_generation.fetch_add(1, Ordering::Relaxed);
+        ACTIVATION_PUBLICATION.update(|receipt| {
+            receipt.map(|mut receipt| {
+                if receipt.initial.instance_identity == self.instance_identity {
+                    receipt.expected = receipt.expected.and_then(|mut expected| {
+                        if expected.mutation_generation != before {
+                            return None;
+                        }
+                        expected.mutation_generation = before + 1;
+                        Some(expected)
+                    });
+                }
+                receipt
+            })
+        });
     }
 
     fn require_writable(&self) -> Result<(), CatalogError> {
@@ -5242,6 +6406,8 @@ pub(crate) fn release_leases(leases: &mut Vec<CatalogLease<'_>>) -> Result<(), C
 
 #[cfg(test)]
 pub(crate) mod python_profile_reopen_tests {
+    use super::{ExpectedCatalogEntry, PinnedCatalogStatus};
+    use crate::CancellationToken;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogCandidate;
 
@@ -5285,6 +6451,9 @@ pub(crate) mod python_profile_reopen_tests {
     use rusqlite::TransactionBehavior;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "dd2e5da0f800: pinned verification bypassed Python full-pack profile evidence"
+    )]
     fn old_verified_python_pack_revalidates_all_shards_before_first_load() {
         let source = include_bytes!("../csmi/fixtures/python-distribution-beautifulsoup4.json");
         let portable =
@@ -5395,6 +6564,12 @@ pub(crate) mod python_profile_reopen_tests {
                     &shard.descriptor,
                 )
                 .unwrap();
+                // Simulate readiness published by the older validator too;
+                // without it pinned membership stops at Missing before verification.
+                transaction.execute(
+                    "INSERT INTO catalog_semantic_rows_indexed_shards(manifest_digest, shard_id, index_version) VALUES (?1, ?2, 4)",
+                    rusqlite::params![old_pack.manifest.content_sha256, shard.descriptor.shard_id],
+                ).unwrap();
             }
             transaction.commit().unwrap();
         }
@@ -5413,6 +6588,7 @@ pub(crate) mod python_profile_reopen_tests {
             .unwrap()
             .clone();
         let valid_candidate = CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: valid_pack.manifest.content_sha256.clone(),
             shard_id: valid_descriptor.shard_id.clone(),
             descriptor: valid_descriptor,
@@ -5421,13 +6597,52 @@ pub(crate) mod python_profile_reopen_tests {
             source_id: "valid-python-distribution".to_owned(),
             location: CatalogCandidateLocation::Durable,
         };
-        reopened.load_durable(&valid_candidate).unwrap();
-        assert!(
+        let pinned = reopened
+            .pinned_jvm_reader(
+                &[ExpectedCatalogEntry::Shard {
+                    kind: valid_candidate.source_kind,
+                    manifest_digest: valid_candidate.manifest_digest.clone(),
+                    shard_id: valid_candidate.shard_id.clone(),
+                }],
+                CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(pinned.membership[0].status, PinnedCatalogStatus::Present);
+        pinned.close().unwrap();
+        let shard_count = valid_pack.manifest.shards.len() as u64;
+        assert!(shard_count > 1);
+        for descriptor in &valid_pack.manifest.shards {
+            let mut next = valid_candidate.clone();
+            next.shard_id = descriptor.shard_id.clone();
+            next.descriptor = descriptor.clone();
+            reopened.load_metadata_only_for_test(&next).unwrap();
+        }
+        // Pinned-first checked the whole profile. Normal loads validate only
+        // certified shards without repeating that pack check.
+        assert_eq!(
             reopened
-                .validated_python_profile_packs
-                .lock()
-                .unwrap()
-                .contains(&valid_candidate.manifest_digest)
+                .shard_validations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let fresh = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        for descriptor in &valid_pack.manifest.shards {
+            let mut next = valid_candidate.clone();
+            next.shard_id = descriptor.shard_id.clone();
+            next.descriptor = descriptor.clone();
+            fresh.load_metadata_only_for_test(&next).unwrap();
+        }
+        // One full-pack pass; installed shards already have validation certificates.
+        assert_eq!(
+            fresh
+                .shard_validations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shard_count
         );
         let descriptor = old_pack
             .manifest
@@ -5437,6 +6652,7 @@ pub(crate) mod python_profile_reopen_tests {
             .unwrap()
             .clone();
         let candidate = CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: old_pack.manifest.content_sha256.clone(),
             shard_id: descriptor.shard_id.clone(),
             descriptor,
@@ -5445,16 +6661,24 @@ pub(crate) mod python_profile_reopen_tests {
             source_id: "old-verified-row".to_owned(),
             location: CatalogCandidateLocation::Durable,
         };
+        let pinned = reopened
+            .pinned_jvm_reader(
+                &[ExpectedCatalogEntry::Shard {
+                    kind: candidate.source_kind,
+                    manifest_digest: candidate.manifest_digest.clone(),
+                    shard_id: candidate.shard_id.clone(),
+                }],
+                CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            pinned.membership[0].status,
+            PinnedCatalogStatus::Quarantined
+        );
+        pinned.close().unwrap();
         for _ in 0..2 {
             let error = reopened.load_durable(&candidate).unwrap_err();
             assert!(format!("{error:?}").contains("python.profile_evidence_count"));
-            assert!(
-                !reopened
-                    .validated_python_profile_packs
-                    .lock()
-                    .unwrap()
-                    .contains(&candidate.manifest_digest)
-            );
         }
     }
 }
@@ -5463,6 +6687,7 @@ pub(crate) mod python_profile_reopen_tests {
 pub(crate) mod callable_value_catalog_tests {
     use crate::analyzer::semantic_model::catalog::go_extraction_support_22::*;
     use crate::analyzer::semantic_model::catalog::{CatalogError, CatalogMiss};
+    use brokk_bifrost_test_macros::hardwon;
 
     use rusqlite::params;
 
@@ -5744,6 +6969,7 @@ pub(crate) mod callable_value_catalog_tests {
             )
             .unwrap();
         let candidate = CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: pack.manifest.content_sha256.clone(),
             shard_id: pack.manifest.shards[0].shard_id.clone(),
             descriptor: pack.manifest.shards[0].clone(),
@@ -5775,11 +7001,23 @@ pub(crate) mod callable_value_catalog_tests {
                 .contains("bifrost-semantic-pack reindex CATALOG")
         );
         assert_eq!(thread_shard_wire_read_count(), before);
-        assert!(catalog.load(&candidate).unwrap().shard.is_none());
-        assert_eq!(thread_shard_wire_read_count(), before + 1);
-        assert!(catalog.load(&candidate).unwrap().shard.is_none());
+        let generation = catalog.mutation_generation.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            let validations = catalog.verifier.1.load(Ordering::Relaxed);
+            assert!(catalog.load(&candidate).unwrap().shard.is_none());
+            assert!(catalog.verifier.1.load(Ordering::Relaxed) - validations <= 1);
+            assert_eq!(
+                catalog.mutation_generation.load(Ordering::Relaxed),
+                generation + 1
+            );
+        }
+        let validations = read_only.verifier.1.load(Ordering::Relaxed);
         assert!(read_only.load(&candidate).unwrap().shard.is_none());
-        assert_eq!(thread_shard_wire_read_count(), before + 1);
+        assert!(read_only.verifier.1.load(Ordering::Relaxed) - validations <= 1);
+        assert_eq!(
+            catalog.mutation_generation.load(Ordering::Relaxed),
+            generation + 1
+        );
         catalog
             .register_compiled_pack(
                 &pack,
@@ -5804,11 +7042,16 @@ pub(crate) mod callable_value_catalog_tests {
             .connection
             .execute("DELETE FROM catalog_semantic_rows_indexed_shards", [])
             .unwrap();
-        let before = thread_shard_wire_read_count();
-        assert!(catalog.load(&candidate).unwrap().shard.is_none());
-        assert_eq!(thread_shard_wire_read_count(), before + 1);
-        assert!(catalog.load(&candidate).unwrap().shard.is_none());
-        assert_eq!(thread_shard_wire_read_count(), before + 1);
+        let generation = catalog.mutation_generation.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            let validations = catalog.verifier.1.load(Ordering::Relaxed);
+            assert!(catalog.load(&candidate).unwrap().shard.is_none());
+            assert!(catalog.verifier.1.load(Ordering::Relaxed) - validations <= 1);
+            assert_eq!(
+                catalog.mutation_generation.load(Ordering::Relaxed),
+                generation + 1
+            );
+        }
     }
 
     #[test]
@@ -5843,6 +7086,37 @@ pub(crate) mod callable_value_catalog_tests {
     }
 
     #[test]
+    #[hardwon(
+        "#12825: read-only metadata rejection kept a retained activation catalog identity valid"
+    )]
+    fn read_only_candidate_rejection_changes_activation_identity() {
+        let (catalog, pack) = install_fixture();
+        let read_only = SemanticPackCatalog::open(
+            catalog.root(),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let before = read_only.cache_identity().unwrap();
+        read_only
+            .apply_candidate_findings(vec![(
+                pack.manifest.content_sha256.clone(),
+                CatalogError::Integrity("corrupt candidate metadata".to_owned()),
+            )])
+            .unwrap();
+        let after = read_only.cache_identity().unwrap();
+        assert_eq!(before.sqlite_data_version, after.sqlite_data_version);
+        assert!(after.mutation_generation > before.mutation_generation);
+        assert!(
+            read_only
+                .rejected_manifests
+                .lock()
+                .unwrap()
+                .contains(&pack.manifest.content_sha256)
+        );
+    }
+
+    #[test]
     fn read_only_activation_requires_reindex_without_quarantining_or_decoding() {
         let (catalog, pack) = install_fixture();
         catalog
@@ -5858,6 +7132,7 @@ pub(crate) mod callable_value_catalog_tests {
         )
         .unwrap();
         let candidate = CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: pack.manifest.content_sha256.clone(),
             shard_id: pack.manifest.shards[0].shard_id.clone(),
             descriptor: pack.manifest.shards[0].clone(),
@@ -6033,6 +7308,7 @@ pub(crate) mod callable_value_catalog_tests {
         );
 
         let candidate = CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: manifest.clone(),
             shard_id: shard.clone(),
             descriptor: pack.manifest.shards[0].clone(),
@@ -6061,7 +7337,51 @@ pub(crate) mod callable_value_catalog_tests {
 }
 
 #[cfg(test)]
+pub(crate) fn generated_test_pack(
+    pack: &CompiledSemanticModelPack,
+    input: &str,
+) -> CompiledSemanticModelPack {
+    let validated = validate_pack(pack, &DecodeLimits::default()).unwrap();
+    let mut authored = brokk_bifrost_semantic::analyzer::semantic_model::artifact::authored_pack_from_compiled_shard(&validated.shards[0].decoded);
+    authored.shards = validated.shards.iter().flat_map(|shard| brokk_bifrost_semantic::analyzer::semantic_model::artifact::authored_pack_from_compiled_shard(&shard.decoded).shards).collect();
+    if !authored.producer.has_current_dependency_revision() {
+        authored.producer = authored.producer.with_dependency_revision();
+    }
+    authored.schema_version = SEMANTIC_MODEL_SCHEMA_VERSION;
+    authored.compatibility.bifrost = None;
+    authored.extraction = Some(
+        brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
+            brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar,
+            &test_input_slots(),
+        ),
+    );
+    for shard in &mut authored.shards {
+        for selector in &mut shard.activation {
+            selector.artifact_sha256 = None;
+            selector.production_input_digest = Some(input.into());
+        }
+    }
+    brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_generated_pack(
+        &authored,
+        &Default::default(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_input_slots()
+-> Vec<brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact> {
+    vec![brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(
+        brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Binary,
+        brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar,&"e".repeat(64))]
+}
+
+#[cfg(test)]
 pub(crate) mod generated_production_cache_version_tests {
+    use super::{
+        CatalogError, DurablePackSource, DurablePackSourceKind, insert_generated_production,
+        insert_source,
+    };
 
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::generated_production_digest_for_cache_version;
 
@@ -6138,10 +7458,40 @@ pub(crate) mod generated_production_cache_version_tests {
             CatalogOptions::default(),
         )
         .unwrap();
-        catalog.install_generated(&old_key, &old_pack).unwrap();
+        catalog
+            .install(
+                &old_pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Generated,
+                    source_id: old_key.source_id(),
+                },
+            )
+            .unwrap();
+        {
+            let mut connection = catalog.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            insert_generated_production(&transaction, &old_key, &old_pack.manifest, 1).unwrap();
+            transaction.commit().unwrap();
+        }
         let retained_key =
             GeneratedProductionKey::new("b".repeat(64), "fixture-producer", "1.0.0", 2).unwrap();
-        catalog.install_generated(&retained_key, &old_pack).unwrap();
+        {
+            let mut connection = catalog.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            insert_generated_production(&transaction, &retained_key, &old_pack.manifest, 1)
+                .unwrap();
+            insert_source(
+                &transaction,
+                &old_pack.manifest.content_sha256,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Generated,
+                    source_id: retained_key.source_id(),
+                },
+                1,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
         let source_rows = |catalog: &SemanticPackCatalog| {
             catalog
                 .connection
@@ -6222,6 +7572,8 @@ pub(crate) mod generated_production_cache_version_tests {
         .unwrap();
         assert_eq!(source_rows(&catalog), original_sources);
         let query = SemanticPackSelectorQuery {
+            verified_raw_artifacts: Vec::new(),
+            production_input_digest: None,
             language: "java".to_owned(),
             ecosystem: "jvm".to_owned(),
             package: Some(CatalogCoordinate {
@@ -6239,20 +7591,40 @@ pub(crate) mod generated_production_cache_version_tests {
             catalog
                 .generated_production(&retained_key)
                 .unwrap()
-                .is_some()
+                .is_none(),
+            "historical productions have no verified inputs"
         );
-        let candidates = catalog.candidates_bounded(&query, 1).unwrap();
-        assert_eq!(candidates.len(), 1, "{candidates:?}");
-        assert_eq!(candidates[0].source_id(), retained_key.source_id());
+        let (historical, refusals) = catalog.activation_candidates_bounded(&query, 1).unwrap();
+        assert!(historical.is_empty());
+        assert!(
+            refusals
+                .iter()
+                .any(|(_, reason)| matches!(reason, CatalogError::StaleGeneratedSelector { .. }))
+        );
+
+        let new_pack = super::generated_test_pack(&new_pack, key.input_digest());
+        let key = GeneratedProductionKey::new(
+            key.input_digest(),
+            &new_pack.manifest.producer.name,
+            &new_pack.manifest.producer.version,
+            new_pack.manifest.schema_version,
+        )
+        .unwrap();
         let installed = catalog
-            .install_generated(&key, &new_pack)
+            .install_generated(&key, &new_pack, &super::test_input_slots())
             .expect("new epoch coexists after migration");
         assert_eq!(
             catalog.generated_production(&key).unwrap().unwrap(),
             installed.production
         );
         assert!(
-            catalog.install_generated(&key, &old_pack).is_err(),
+            catalog
+                .install_generated(
+                    &key,
+                    &old_pack,
+                    &brokk_bifrost_analysis::test_support::generated_input_slots()
+                )
+                .is_err(),
             "one exact production key cannot change its output"
         );
         let historical_manifest: String = catalog.connection.lock().unwrap().query_row(
@@ -6260,18 +7632,6 @@ pub(crate) mod generated_production_cache_version_tests {
             [old_key.production_digest()], |row| row.get(0),
         ).unwrap();
         assert_eq!(historical_manifest, old_pack.manifest.content_sha256);
-        let sources: std::collections::BTreeSet<_> = catalog
-            .candidates(&query)
-            .unwrap()
-            .iter()
-            .map(|candidate| candidate.source_id().to_owned())
-            .collect();
-        assert_eq!(
-            sources,
-            [key.source_id(), retained_key.source_id()]
-                .into_iter()
-                .collect()
-        );
         drop(catalog);
         let reopened = SemanticPackCatalog::open(
             root.path(),
@@ -6447,6 +7807,8 @@ pub(crate) mod native_compatibility_catalog_tests {
 
     fn query(engine_version: &str, toolchain_version: &str) -> SemanticPackSelectorQuery {
         SemanticPackSelectorQuery {
+            verified_raw_artifacts: Vec::new(),
+            production_input_digest: None,
             language: "java".to_owned(),
             ecosystem: "jvm".to_owned(),
             package: Some(CatalogCoordinate {
@@ -6463,6 +7825,284 @@ pub(crate) mod native_compatibility_catalog_tests {
             artifact_sha256: None,
             bifrost_version: Version::parse(engine_version).unwrap(),
         }
+    }
+
+    #[test]
+    fn catalog_record_controls_origin_and_defensive_decode() {
+        use super::{CatalogMiss, GeneratedProductionKey, insert_generated_production};
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::SemanticPackOrigin;
+        let pack = compiled_pack(22);
+        let validated = super::validate_pack(&pack, &DecodeLimits::default()).unwrap();
+        let mut authored = brokk_bifrost_semantic::analyzer::semantic_model::artifact::authored_pack_from_compiled_shard(&validated.shards[0].decoded);
+        authored.producer = authored.producer.with_dependency_revision();
+        let pack = brokk_bifrost_semantic::analyzer::semantic_model::compile_pack(
+            &authored,
+            &Default::default(),
+        )
+        .unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "test.recorded-origin".into(),
+                },
+            )
+            .unwrap();
+        let request = query(env!("CARGO_PKG_VERSION"), "21.0.8");
+        let candidates = catalog.candidates(&request).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].origin(), SemanticPackOrigin::Authored);
+        catalog.load(&candidates[0]).unwrap();
+        // Seed an inconsistent recorded origin to exercise the external SQLite boundary.
+        let key = GeneratedProductionKey::new(
+            "a".repeat(64),
+            pack.manifest.producer.name.clone(),
+            pack.manifest.producer.version.clone(),
+            pack.manifest.schema_version,
+        )
+        .unwrap();
+        {
+            let mut connection = catalog.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            insert_generated_production(&transaction, &key, &pack.manifest, 1).unwrap();
+            transaction.commit().unwrap();
+        }
+        let rows = catalog.durable_selector_rows(&request, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, SemanticPackOrigin::Generated);
+        assert!(matches!(
+            catalog.candidates(&request),
+            Err(super::CatalogError::SelectorOriginMismatch {
+                origin: SemanticPackOrigin::Generated,
+                ..
+            })
+        ));
+        assert!(matches!(
+            catalog.load(&candidates[0]),
+            Err(CatalogMiss::SelectorOriginMismatch {
+                origin: SemanticPackOrigin::Generated,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: pinned binds repeatedly verified and decoded unchanged JVM manifests"
+    )]
+    fn dependency_provider_choice_live_and_pinned_skip_corruption_without_pinned_writes() {
+        use crate::analyzer::semantic_model::dependency::*;
+        use crate::analyzer::semantic_model::{Producer, runtime::SemanticModelActivationEvidence};
+        struct Adapter;
+        impl DependencyPackAdapter for Adapter {
+            fn adapter_name(&self) -> &str {
+                "fixture"
+            }
+            fn producer(&self) -> Producer {
+                Producer {
+                    name: "fixture".into(),
+                    version: "1".into(),
+                }
+            }
+            fn produce(
+                &self,
+                _: &ResolvedDependency,
+                _: &[ExactDependencyArtifact],
+                _: &crate::analyzer::semantic_model::producer::ArtifactProducerLimits,
+                _: Option<&crate::CancellationToken>,
+            ) -> DependencyPackProduction {
+                unimplemented!()
+            }
+        }
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let packs = [compiled_pack(8), compiled_pack(9), compiled_pack(10)];
+        for pack in &packs {
+            catalog
+                .install(
+                    pack,
+                    &DurablePackSource {
+                        kind: DurablePackSourceKind::Installed,
+                        source_id: "parity".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let corrupt = &packs[2].manifest.content_sha256;
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE catalog_selectors SET selector_json=?1 WHERE manifest_digest=?2",
+                params![b"invalid JSON".as_slice(), corrupt],
+            )
+            .unwrap();
+        let dependency = ResolvedDependency {
+            id: "fixture".into(),
+            evidence: SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "jvm".into(),
+                package: query("9.0.0", "21.0.2").package,
+                module: None,
+                toolchain: query("9.0.0", "21.0.2").toolchain,
+                target: None,
+                configuration: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
+            },
+            provenance: Vec::new(),
+            artifacts: Vec::new(),
+            scope: crate::analyzer::semantic::topology::DependencyScope::Unknown,
+            declared_by: None,
+        };
+        let source = catalog.pinned_catalog_source(
+            &crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            ),
+        );
+        let connection = source.active_reader_connection().unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        {
+            let mut memo = catalog.decoded_manifests.lock().unwrap();
+            memo.entries.clear();
+            memo.bytes = 0;
+        }
+        let before = catalog.manifest_decode_count();
+        let pinned = source
+            .selected_dependency_provider_on(
+                &connection,
+                &Adapter,
+                &dependency,
+                &DependencyPackLimits::default(),
+            )
+            .unwrap();
+        let after_first = catalog.manifest_decode_count();
+        assert!(after_first > before);
+        let again = source
+            .selected_dependency_provider_on(
+                &connection,
+                &Adapter,
+                &dependency,
+                &DependencyPackLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            pinned.installed.as_ref().map(|p| &p.manifest_digests),
+            again.installed.as_ref().map(|p| &p.manifest_digests)
+        );
+        assert_eq!(
+            catalog.manifest_decode_count(),
+            after_first,
+            "an unchanged second bind must verify and decode no manifest bytes"
+        );
+        assert!(catalog.rejected_manifests.lock().unwrap().is_empty());
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM catalog_packs WHERE manifest_digest=?1",
+                [corrupt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "verified");
+        let live = selected_dependency_provider(
+            &catalog,
+            &Adapter,
+            &dependency,
+            &DependencyPackLimits::default(),
+        )
+        .unwrap();
+        let mut expected = packs[..2]
+            .iter()
+            .map(|pack| pack.manifest.content_sha256.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            pinned.installed.as_ref().unwrap().manifest_digests,
+            expected
+        );
+        assert_eq!(live.installed.as_ref().unwrap().manifest_digests, expected);
+        assert_eq!(pinned.settled, live.settled);
+        assert!(pinned.production.is_none());
+        assert_eq!(pinned.findings.len(), 1);
+        assert_eq!(live.findings.len(), 1);
+        drop(connection);
+        catalog.apply_candidate_findings(live.findings).unwrap();
+        assert!(catalog.rejected_manifests.lock().unwrap().contains(corrupt));
+        let state: String = catalog
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM catalog_packs WHERE manifest_digest=?1",
+                [corrupt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "quarantined");
+    }
+
+    #[test]
+    fn candidate_validation_reports_corruption_without_applying_acquisition_writes() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let pack = compiled_pack(8);
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "validation-fixture".into(),
+                },
+            )
+            .unwrap();
+        let query = query("9.0.0", "21.0.2");
+        // A corrupt later row withdraws even an earlier healthy shard of the
+        // same manifest. The selector rule itself must not quarantine it.
+        let mut rows = catalog.durable_selector_rows(&query, usize::MAX).unwrap();
+        let mut corrupt_rows = catalog.durable_selector_rows(&query, usize::MAX).unwrap();
+        corrupt_rows[0].selector_json = b"invalid JSON".to_vec();
+        rows.extend(corrupt_rows);
+        let (selected, findings) = super::validate_durable_candidates(
+            &catalog,
+            rows,
+            &std::collections::HashSet::new(),
+            &query,
+            false,
+        );
+        assert!(selected.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0, pack.manifest.content_sha256);
+        assert!(catalog.rejected_manifests.lock().unwrap().is_empty());
+        assert!(!catalog.candidates(&query).unwrap().is_empty());
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE catalog_selectors SET selector_json=?1 WHERE manifest_digest=?2",
+                params![b"invalid JSON".as_slice(), &pack.manifest.content_sha256],
+            )
+            .unwrap();
+        assert!(catalog.candidates(&query).unwrap().is_empty());
+        assert!(
+            catalog
+                .rejected_manifests
+                .lock()
+                .unwrap()
+                .contains(&pack.manifest.content_sha256)
+        );
+        let state: String = catalog
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM catalog_packs WHERE manifest_digest=?1",
+                [&pack.manifest.content_sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "quarantined");
     }
 
     #[test]
@@ -6568,6 +8208,7 @@ pub(crate) mod native_compatibility_catalog_tests {
         );
         assert_eq!(pack.shards.len(), 1);
         let candidate = super::CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: pack.manifest.content_sha256.clone(),
             shard_id: pack.shards[0].descriptor.shard_id.clone(),
             descriptor: pack.shards[0].descriptor.clone(),
@@ -6702,6 +8343,7 @@ pub(crate) mod native_compatibility_catalog_tests {
         assert!(text > i64::try_from(manifest_census.max_text_bytes).unwrap());
         assert!(depth > 0);
         let candidate = super::CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
             manifest_digest: pack.manifest.content_sha256.clone(),
             shard_id: pack.shards[0].descriptor.shard_id.clone(),
             descriptor: pack.shards[0].descriptor.clone(),
@@ -6797,6 +8439,172 @@ pub(crate) mod native_compatibility_catalog_tests {
             reader.shard_validation_count(),
             1,
             "wrong-version certificate must miss"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13500: a pack certified before the stricter locator path rule was reused without revalidation"
+    )]
+    fn version_13_certificate_is_not_reused_for_noncanonical_locator_path() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::artifact::{
+            canonical_json, content_digest, manifest_content_digest, manifest_semantic_digest,
+            semantic_digest,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::{
+            ValidatedPack, ValidatedShard, validate_pack,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::Locator;
+        use brokk_bifrost_semantic::analyzer::semantic_model::{
+            CompiledPayload, CompiledSemanticModelPack, CompressionPolicy,
+        };
+
+        let source =
+            include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json");
+        let base_options = CompilerOptions {
+            compression: CompressionPolicy::AlwaysRaw,
+            ..CompilerOptions::default()
+        };
+        let base_pack = compile_source(SourceFormat::Json, source, &base_options).unwrap();
+        let base_validated = validate_pack(&base_pack, &DecodeLimits::default()).unwrap();
+        let selectors = base_validated.shards[0].selectors.clone();
+
+        let mut shard = brokk_bifrost_semantic::analyzer::semantic_model::decode_shard(
+            &base_pack.shards[0].descriptor,
+            &base_pack.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let CompiledPayload::DeclarationFacts { types, .. } = &mut shard.payload else {
+            panic!("fixture has declaration facts");
+        };
+        std::sync::Arc::make_mut(&mut types[0]).locator = Locator::Artifact {
+            path: "src/./a.rs".to_owned(),
+            symbol: "com.acme.Widget".to_owned(),
+        };
+
+        let raw = canonical_json(&shard).unwrap();
+        let mut descriptor = base_pack.shards[0].descriptor.clone();
+        descriptor.raw_size = raw.len() as u64;
+        descriptor.stored_size = raw.len() as u64;
+        descriptor.semantic_sha256 = semantic_digest(&shard).unwrap();
+        descriptor.content_sha256 = content_digest(&raw);
+        descriptor.stored_sha256 = content_digest(&raw);
+
+        let mut manifest = base_pack.manifest.clone();
+        manifest.shards[0] = descriptor.clone();
+        manifest.semantic_sha256 = manifest_semantic_digest(&manifest).unwrap();
+        manifest.content_sha256 = manifest_content_digest(&manifest).unwrap();
+        let manifest_bytes = canonical_json(&manifest).unwrap();
+
+        let shard_census = base_validated.shards[0].census;
+        let pack = CompiledSemanticModelPack {
+            manifest: manifest.clone(),
+            manifest_bytes: manifest_bytes.clone(),
+            shards: vec![
+                brokk_bifrost_semantic::analyzer::semantic_model::CompiledShardArtifact {
+                    descriptor: descriptor.clone(),
+                    bytes: raw.clone(),
+                },
+            ],
+        };
+        let validated = ValidatedPack {
+            manifest: manifest.clone(),
+            shards: vec![ValidatedShard {
+                diagnostics: Vec::new(),
+                descriptor: descriptor.clone(),
+                bytes: raw.clone(),
+                selectors,
+                decoded: shard,
+                census: shard_census,
+            }],
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let catalog =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadWrite, CatalogOptions::default())
+                .unwrap();
+        let installation_id = uuid::Uuid::new_v4().to_string();
+        let manifest_object_digest =
+            crate::analyzer::semantic_model::csmi::sha256_hex(&manifest_bytes);
+        catalog
+            .reserve_install_objects(&installation_id, &validated.shards, &manifest_object_digest)
+            .unwrap();
+        let (shard_path, _) =
+            super::storage::publish(&root, &descriptor.stored_sha256, &raw).unwrap();
+        let (manifest_path, _) =
+            super::storage::publish(&root, &manifest_object_digest, &manifest_bytes).unwrap();
+        let source_meta = DurablePackSource {
+            kind: DurablePackSourceKind::Installed,
+            source_id: "version-13-noncanonical-locator".into(),
+        };
+        catalog
+            .commit_install(
+                &pack,
+                &source_meta,
+                None,
+                &validated,
+                &[shard_path],
+                &manifest_path,
+                &installation_id,
+                crate::cache_db::now_unix_seconds(),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+
+        {
+            let connection = catalog.connection.lock().unwrap();
+            connection
+                .execute(
+                    "DELETE FROM catalog_shard_validations WHERE manifest_digest = ?1 AND shard_id = ?2",
+                    params![manifest.content_sha256, descriptor.shard_id],
+                )
+                .unwrap();
+            // 13 was master's SHARD_VALIDATION_VERSION before #13500.
+            connection
+                .execute(
+                    "INSERT INTO catalog_shard_validations(manifest_digest, shard_id, validation_version, max_text_bytes, max_depth) VALUES (?1, ?2, 13, ?3, ?4)",
+                    params![
+                        manifest.content_sha256,
+                        descriptor.shard_id,
+                        i64::try_from(shard_census.max_text_bytes).unwrap(),
+                        i64::try_from(shard_census.max_depth).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        drop(catalog);
+
+        let candidate = super::CatalogCandidate {
+            origin:
+                brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
+            manifest_digest: manifest.content_sha256.clone(),
+            shard_id: descriptor.shard_id.clone(),
+            descriptor,
+            completeness: manifest.completeness,
+            source_kind: super::CatalogPackSourceKind::Installed,
+            source_id: "version-13-noncanonical-locator".into(),
+            location: super::CatalogCandidateLocation::Durable,
+        };
+        let reader =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadOnly, CatalogOptions::default())
+                .unwrap();
+        let err = reader
+            .load_decoded_for_test(&candidate)
+            .expect_err("version-13 certificate must not be reused for non-canonical locator path");
+        assert_eq!(
+            reader.shard_validation_count(),
+            1,
+            "version-13 certificate must miss and trigger revalidation"
+        );
+        assert!(
+            matches!(
+                err,
+                super::CatalogMiss::Quarantined { ref reason }
+                    if reason.contains("artifact failed semantic validation")
+            ),
+            "expected quarantined semantic-validation rejection, got {err:?}"
         );
     }
 
@@ -6932,14 +8740,211 @@ pub(crate) mod generated_sharing_tests {
             &brokk_bifrost_analysis::analyzer::semantic_model::compiler::CompilerOptions::default(),
         )
         .unwrap();
+        let validated = brokk_bifrost_semantic::analyzer::semantic_model::catalog::validate_pack(
+            &pack,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let mut authored = brokk_bifrost_semantic::analyzer::semantic_model::artifact::authored_pack_from_compiled_shard(&validated.shards[0].decoded);
+        authored.producer = authored.producer.with_dependency_revision();
         let key = GeneratedProductionKey::new(
-            pack.manifest.content_sha256.clone(),
-            &pack.manifest.producer.name,
-            &pack.manifest.producer.version,
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(version.as_bytes()),
+            ),
+            &authored.producer.name,
+            &authored.producer.version,
             pack.manifest.schema_version,
         )
         .unwrap();
+        authored.extraction = Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
+            brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &input_slots()));
+        for shard in &mut authored.shards {
+            for selector in &mut shard.activation {
+                selector.production_input_digest = Some(key.input_digest().to_owned());
+            }
+        }
+        let pack =
+            brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_generated_pack(
+                &authored,
+                &Default::default(),
+            )
+            .unwrap();
         (pack, key)
+    }
+
+    fn input_slots()
+    -> Vec<brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact> {
+        use brokk_bifrost_semantic::analyzer::semantic_model::{
+            ExternalArtifactKind, dependency::DependencyArtifactRole, runtime::VerifiedRawArtifact,
+        };
+        vec![
+            VerifiedRawArtifact::from_sha256(
+                DependencyArtifactRole::Binary,
+                ExternalArtifactKind::JavaClassJar,
+                &"a".repeat(64),
+            ),
+            VerifiedRawArtifact::from_sha256(
+                DependencyArtifactRole::Sources,
+                ExternalArtifactKind::JavaSourceJar,
+                &"b".repeat(64),
+            ),
+        ]
+    }
+
+    #[test]
+    fn version_30_productions_without_inputs_are_cache_misses_after_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let (pack, key) = generated_fixture("1.4.0");
+        {
+            let catalog = SemanticPackCatalog::open(
+                root.path(),
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            catalog
+                .install_generated(&key, &pack, &input_slots())
+                .unwrap();
+            catalog.connection.lock().unwrap().execute_batch("DROP TABLE catalog_production_inputs; DROP INDEX catalog_selectors_production_input; ALTER TABLE catalog_selectors DROP COLUMN production_input_digest; PRAGMA user_version=30;").unwrap();
+        }
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        assert!(catalog.generated_production(&key).unwrap().is_none());
+        catalog
+            .install_generated(&key, &pack, &input_slots())
+            .unwrap();
+        assert_eq!(
+            catalog.generated_input_slots(&key).unwrap().unwrap(),
+            input_slots()
+        );
+    }
+
+    #[test]
+    fn production_inputs_reopen_and_missing_tail_force_regeneration() {
+        let root = tempfile::tempdir().unwrap();
+        let (pack, key) = generated_fixture("1.3.0");
+        {
+            let catalog = SemanticPackCatalog::open(
+                root.path(),
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            catalog
+                .install_generated(&key, &pack, &input_slots())
+                .unwrap();
+            catalog
+                .install_generated_source_identity(&"d".repeat(64), &key)
+                .unwrap();
+        }
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        use crate::analyzer::semantic_model::dependency::{
+            DependencySourceIdentity, ResolvedDependency,
+            reusable_generated_pack_by_source_identity,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::runtime::SemanticModelActivationEvidence;
+        let identity = DependencySourceIdentity::from_digest("d".repeat(64));
+        let dependency = ResolvedDependency::undeclared_scope(
+            "fixture".into(),
+            SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "maven".into(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                verified_raw_artifacts: Vec::new(),
+                production_input_digest: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        let prepared = reusable_generated_pack_by_source_identity(
+            &catalog,
+            &pack.manifest.producer,
+            pack.manifest.schema_version,
+            &identity,
+            &dependency,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(prepared.evidence.verified_raw_artifacts, input_slots());
+        assert_eq!(
+            prepared.evidence.production_input_digest.as_deref(),
+            Some(key.input_digest())
+        );
+        let restored = catalog.generated_input_slots(&key).unwrap().unwrap();
+        assert_eq!(restored, input_slots());
+        assert!(catalog.generated_production(&key).unwrap().is_some());
+        let selector =
+            serde_json::from_value(serde_json::json!({"artifact_sha256": "b".repeat(64)})).unwrap();
+        assert!(brokk_bifrost_semantic::analyzer::semantic_model::runtime::selector_digest_constraints_match(&selector,&restored,Some(key.input_digest())));
+        let validated = brokk_bifrost_semantic::analyzer::semantic_model::catalog::validate_pack(
+            &pack,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let mut authored = brokk_bifrost_semantic::analyzer::semantic_model::artifact::authored_pack_from_compiled_shard(&validated.shards[0].decoded);
+        authored.pack_id = "raw.fixture".into();
+        for shard in &mut authored.shards {
+            for activation in &mut shard.activation {
+                activation.production_input_digest = None;
+                activation.artifact_sha256 = Some("b".repeat(64));
+            }
+        }
+        let authored = brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_pack(
+            &authored,
+            &Default::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &authored,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::WorkspaceProduced,
+                    source_id: "test-only-raw-pin".into(),
+                },
+            )
+            .unwrap();
+        let query = brokk_bifrost_semantic::analyzer::semantic_model::runtime::evidence_query(
+            &prepared.evidence,
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        );
+        assert!(
+            catalog
+                .candidates(&query)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.manifest_digest() == authored.manifest.content_sha256)
+        );
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM catalog_production_inputs WHERE production_digest=?1 AND ordinal=1",
+                [key.production_digest()],
+            )
+            .unwrap();
+        assert!(catalog.generated_input_slots(&key).unwrap().is_none());
+        assert!(catalog.generated_production(&key).unwrap().is_none());
+        catalog
+            .install_generated(&key, &pack, &input_slots())
+            .unwrap();
+        assert_eq!(
+            catalog.generated_input_slots(&key).unwrap().unwrap(),
+            input_slots()
+        );
     }
 
     #[test]
@@ -6955,14 +8960,20 @@ pub(crate) mod generated_sharing_tests {
         .unwrap();
         local.shared_generated_root = Some(unavailable);
         let (pack, key) = generated_fixture("1.2.0");
-        local.install_generated(&key, &pack).unwrap();
+        local
+            .install_generated(&key, &pack, &input_slots())
+            .unwrap();
         let identity = "b".repeat(64);
         local
             .install_generated_source_identity(&identity, &key)
             .unwrap();
         assert_eq!(
             local
-                .generated_production_by_source_identity(&identity, &pack.manifest.producer)
+                .generated_production_by_source_identity(
+                    &identity,
+                    &pack.manifest.producer,
+                    pack.manifest.schema_version,
+                )
                 .unwrap()
                 .unwrap()
                 .key,
@@ -6989,7 +9000,9 @@ pub(crate) mod generated_sharing_tests {
         .unwrap();
         local.shared_generated_root = Some(shared_root.clone());
         let (old, old_key) = generated_fixture("1.2.0");
-        local.install_generated(&old_key, &old).unwrap();
+        local
+            .install_generated(&old_key, &old, &input_slots())
+            .unwrap();
         let shared = SemanticPackCatalog::open(
             &shared_root,
             CatalogOpenMode::ReadWrite,
@@ -7010,11 +9023,15 @@ pub(crate) mod generated_sharing_tests {
         age_old();
         assert!(local.generated_production(&old_key).unwrap().is_some());
         let (new, new_key) = generated_fixture("1.3.0");
-        local.install_generated(&new_key, &new).unwrap();
+        local
+            .install_generated(&new_key, &new, &input_slots())
+            .unwrap();
         assert!(shared.has_verified_generated_production(&old_key).unwrap());
         age_old();
         let (newest, newest_key) = generated_fixture("1.4.0");
-        local.install_generated(&newest_key, &newest).unwrap();
+        local
+            .install_generated(&newest_key, &newest, &input_slots())
+            .unwrap();
         assert!(!shared.has_verified_generated_production(&old_key).unwrap());
         assert!(local.generated_production(&old_key).unwrap().is_some());
         assert!(shared.has_verified_generated_production(&old_key).unwrap());
@@ -7045,6 +9062,9 @@ pub(crate) mod generated_sharing_tests {
         first.shared_generated_root = Some(shared_root.clone());
         let (pack, key) = generated_fixture("1.2.0");
         first
+            .install_generated(&key, &pack, &input_slots())
+            .unwrap();
+        first
             .install(
                 &pack,
                 &DurablePackSource {
@@ -7053,7 +9073,9 @@ pub(crate) mod generated_sharing_tests {
                 },
             )
             .unwrap();
-        first.install_generated(&key, &pack).unwrap();
+        first
+            .install_generated(&key, &pack, &input_slots())
+            .unwrap();
         let identity = "b".repeat(64);
         first
             .install_generated_source_identity(&identity, &key)
@@ -7074,7 +9096,11 @@ pub(crate) mod generated_sharing_tests {
         drop(second_lock);
         drop(first);
         let production = second
-            .generated_production_by_source_identity(&identity, &pack.manifest.producer)
+            .generated_production_by_source_identity(
+                &identity,
+                &pack.manifest.producer,
+                pack.manifest.schema_version,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(production.key, key);
@@ -7105,6 +9131,9 @@ pub(crate) mod generated_sharing_tests {
             let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
             let (pack, key) = generated_fixture("1.2.0");
             catalog
+                .install_generated(&key, &pack, &input_slots())
+                .unwrap();
+            catalog
                 .install(
                     &pack,
                     &DurablePackSource {
@@ -7113,7 +9142,9 @@ pub(crate) mod generated_sharing_tests {
                     },
                 )
                 .unwrap();
-            catalog.install_generated(&key, &pack).unwrap();
+            catalog
+                .install_generated(&key, &pack, &input_slots())
+                .unwrap();
             let connection = catalog.connection.lock().unwrap();
             for version in (1..)
                 .filter(|version| *version != SHARD_VALIDATION_VERSION)
@@ -7382,5 +9413,219 @@ mod connection_read_tests {
         capture_query_reads(&analyzer, || {
             catalog.runtime_source_reader(std::iter::empty()).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod shard_admission_tests {
+    use super::pinned_reader::{ExpectedCatalogEntry, PinnedCatalogStatus};
+    use super::*;
+    use std::fs;
+
+    fn candidate(pack: &CompiledSemanticModelPack) -> CatalogCandidate {
+        CatalogCandidate {
+origin: brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
+            manifest_digest: pack.manifest.content_sha256.clone(),
+            shard_id: pack.manifest.shards[0].shard_id.clone(),
+            descriptor: pack.manifest.shards[0].clone(),
+            completeness: pack.manifest.completeness,
+            source_kind: CatalogPackSourceKind::Installed,
+            source_id: "callable-values-fixture".to_owned(),
+            location: CatalogCandidateLocation::Durable,
+        }
+    }
+
+    fn pinned(catalog: &SemanticPackCatalog, candidate: &CatalogCandidate, present: bool) {
+        let reader = catalog
+            .pinned_jvm_reader(
+                &[ExpectedCatalogEntry::Shard {
+                    kind: candidate.source_kind,
+                    manifest_digest: candidate.manifest_digest.clone(),
+                    shard_id: candidate.shard_id.clone(),
+                }],
+                CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            reader.membership[0].status == PinnedCatalogStatus::Present,
+            present
+        );
+        assert_eq!(reader.membership[0].shard_key.is_some(), present);
+        reader.close().unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "aecfe70e503c: row metadata admitted a corrupt shard payload"
+    )]
+    fn intact_rows_reject_corrupt_shard_bytes() {
+        for truncate in [false, true] {
+            for mode in [CatalogOpenMode::ReadOnly, CatalogOpenMode::ReadWrite] {
+                let (installed, pack) = super::go_extraction_support_22::install_fixture();
+                let root_owner = tempfile::tempdir().unwrap();
+                let root = root_owner.path().to_path_buf();
+                let writer = SemanticPackCatalog::open(
+                    &root,
+                    CatalogOpenMode::ReadWrite,
+                    CatalogOptions::default(),
+                )
+                .unwrap();
+                writer
+                    .install(
+                        &pack,
+                        &DurablePackSource {
+                            kind: DurablePackSourceKind::Installed,
+                            source_id: "callable-values-fixture".to_owned(),
+                        },
+                    )
+                    .unwrap();
+                drop(writer);
+                drop(installed);
+                let candidate = candidate(&pack);
+                let rows = || {
+                    let connection = Connection::open(root.join("catalog.db")).unwrap();
+                    [
+                        "catalog_semantic_rows_indexed_shards",
+                        "catalog_declaration_members",
+                    ]
+                    .map(|table| {
+                        connection
+                            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .unwrap()
+                    })
+                };
+                let before = rows();
+                assert!(before.into_iter().all(|count| count > 0));
+                let digest = &candidate.descriptor.stored_sha256;
+                let path = root
+                    .join("objects/sha256")
+                    .join(&digest[..2])
+                    .join(&digest[2..]);
+                let catalog =
+                    SemanticPackCatalog::open(&root, mode, CatalogOptions::default()).unwrap();
+                drop(catalog);
+                let mut bytes = fs::read(&path).unwrap();
+                if truncate {
+                    bytes.pop();
+                } else {
+                    bytes[0] ^= 1;
+                }
+                fs::write(&path, bytes).unwrap();
+                assert_eq!(rows(), before);
+                let catalog =
+                    SemanticPackCatalog::open(&root, mode, CatalogOptions::default()).unwrap();
+                pinned(&catalog, &candidate, false);
+                let miss = catalog.load_metadata_only_for_test(&candidate).unwrap_err();
+                let CatalogMiss::Quarantined { reason } = miss else {
+                    panic!("{miss:?}")
+                };
+                let expected = if truncate {
+                    "size mismatch"
+                } else {
+                    "digest mismatch"
+                };
+                assert!(reason.contains(expected), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "dd2e5da0f800: session shard verification could certify durable bytes"
+    )]
+    fn session_shard_verification_does_not_certify_durable_bytes() {
+        let (installed, pack) = super::go_extraction_support_22::install_fixture();
+        let catalog = SemanticPackCatalog::open(
+            installed.root(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::EphemeralWorkspace,
+                    source_id: "session-isolation".to_owned(),
+                },
+            )
+            .unwrap();
+        let durable = candidate(&pack);
+        let mut session = durable.clone();
+        session.source_kind = CatalogPackSourceKind::EphemeralWorkspace;
+        session.source_id = "session-isolation".to_owned();
+        session.location = CatalogCandidateLocation::Session {
+            pack_ordinal: 0,
+            shard_ordinal: 0,
+        };
+        catalog.load_metadata_only_for_test(&session).unwrap();
+        let before = catalog.verifier.1.load(Ordering::Relaxed);
+        let digest = &durable.descriptor.stored_sha256;
+        let path = catalog
+            .root()
+            .join("objects/sha256")
+            .join(&digest[..2])
+            .join(&digest[2..]);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(path, bytes).unwrap();
+        assert!(catalog.load_metadata_only_for_test(&durable).is_err());
+        assert_eq!(catalog.verifier.1.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn shard_verification_memo_tracks_replacement_and_repair() {
+        let (catalog, pack) = super::go_extraction_support_22::install_fixture();
+        let candidate = candidate(&pack);
+        let before = catalog.verifier.1.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            catalog.load_metadata_only_for_test(&candidate).unwrap();
+            pinned(&catalog, &candidate, true);
+            catalog.load_decoded_for_test(&candidate).unwrap();
+        }
+        assert_eq!(catalog.verifier.1.load(Ordering::Relaxed), before + 1);
+        let reopened = SemanticPackCatalog::open(
+            catalog.root(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            reopened.load_metadata_only_for_test(&candidate).unwrap();
+            pinned(&reopened, &candidate, true);
+            reopened.load_decoded_for_test(&candidate).unwrap();
+        }
+        assert_eq!(reopened.verifier.1.load(Ordering::Relaxed), 1);
+        let mut authored: crate::analyzer::semantic_model::model::AuthoredSemanticModelPack =
+            serde_json::from_slice(super::go_extraction_support_22::DECLARATIONS).unwrap();
+        authored.version = "1.3.0".to_owned();
+        let replacement = crate::analyzer::semantic_model::compiler::compile_pack(
+            &authored,
+            &crate::analyzer::semantic_model::compiler::CompilerOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &replacement,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "replacement-fixture".to_owned(),
+                },
+            )
+            .unwrap();
+        let replacement_candidate = self::candidate(&replacement);
+        let before = catalog.verifier.1.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            catalog
+                .load_metadata_only_for_test(&replacement_candidate)
+                .unwrap();
+            pinned(&catalog, &replacement_candidate, true);
+            catalog
+                .load_decoded_for_test(&replacement_candidate)
+                .unwrap();
+        }
+        assert_eq!(catalog.verifier.1.load(Ordering::Relaxed), before + 1);
     }
 }

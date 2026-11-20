@@ -27,6 +27,12 @@ pub struct ReadChannels {
     /// repeat. A merge that cannot keep the two counts together leaves this at
     /// zero, which reads as "not a budget refusal".
     pub budget_dependences: usize,
+    /// How many of the execution dependences were request-pinned inputs
+    /// ([`super::reuse_verdict::ExecutionCause::RequestPinned`]). Never more
+    /// than `execution_dependences` less `budget_dependences`; a merge that
+    /// cannot keep it with its count leaves it at zero, which reads as another
+    /// cause.
+    pub request_pinned_dependences: usize,
     pub reuse_refused: bool,
     /// A store read failed under the capture (#11534). Implies `reuse_refused`;
     /// carried apart because a publisher with no read receipt of its own asks
@@ -42,6 +48,25 @@ impl ReadChannels {
     /// The one definition of whether captured read channels are bounded.
     pub fn is_bounded(&self) -> bool {
         self.unattributed_reads == 0 && self.execution_dependences == 0 && !self.reuse_refused
+    }
+
+    /// Whether the capture depended on its execution in a way that makes its
+    /// answer wrong even for its own request: an execution dependence other
+    /// than a request-pinned input, or a store failure. A reuse refusal or a
+    /// request-pinned input says only that a later request cannot verify the
+    /// inputs, so the request that computed the answer may still use it.
+    pub fn bound_to_execution(&self) -> bool {
+        self.unpinned_execution_dependences() > 0 || self.store_failed
+    }
+
+    /// The execution dependences of every cause but a request-pinned input.
+    pub fn unpinned_execution_dependences(&self) -> usize {
+        debug_assert!(
+            self.request_pinned_dependences <= self.execution_dependences,
+            "{self:?}"
+        );
+        self.execution_dependences
+            .saturating_sub(self.request_pinned_dependences)
     }
 }
 
@@ -112,6 +137,7 @@ pub trait MemoAttribution {
             .debug_assert_not_stricter_than(super::reuse_verdict::ReuseVerdict::from_counts(
                 reads.channels.execution_dependences,
                 reads.channels.budget_dependences,
+                reads.channels.request_pinned_dependences,
             ));
         (value, reads, forwarded_to)
     }
@@ -224,6 +250,11 @@ impl<M, F> WorkspaceAuthorityMemo<M, F> {
     /// Byte/weight accounting only; this projection cannot return an answer.
     pub fn account(&self, account: impl FnOnce(&M) -> usize) -> usize {
         account(&self.memo)
+    }
+
+    /// Retirement only: `retire` empties the store and returns nothing.
+    pub fn retire_with(&self, retire: impl FnOnce(&M)) {
+        retire(&self.memo);
     }
 }
 
@@ -428,6 +459,11 @@ impl<T, K> ReplayingMemoEntry<T, K> {
         self.reads.channels.execution_dependences > 0
             || self.reads.channels.reuse_refused
             || self.reads.first_execution_refusal.is_some()
+    }
+
+    /// [`ReadChannels::bound_to_execution`] for the build of this entry.
+    pub fn bound_to_execution(&self) -> bool {
+        self.reads.channels.bound_to_execution()
     }
 
     pub fn named_read_count(&self) -> usize {
@@ -668,6 +704,11 @@ impl<M> ReplayingMemo<M> {
     /// Byte/weight accounting only; this projection cannot return an answer.
     pub fn account(&self, account: impl FnOnce(&M) -> usize) -> usize {
         account(&self.memo)
+    }
+
+    /// Retirement only: `retire` empties the store and returns nothing.
+    pub fn retire_with(&self, retire: impl FnOnce(&M)) {
+        retire(&self.memo);
     }
 }
 

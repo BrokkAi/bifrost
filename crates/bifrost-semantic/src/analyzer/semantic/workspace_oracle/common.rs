@@ -49,6 +49,7 @@ pub struct WorkStager {
     pub work: SemanticWork,
     execution: Option<SemanticExecutionBudget>,
     artifact_collector: Option<SemanticArtifactCollector>,
+    refusal_mark: Option<crate::analyzer::semantic::SemanticBudgetRefusalMark>,
 }
 
 impl WorkStager {
@@ -59,6 +60,7 @@ impl WorkStager {
             work: SemanticWork::default(),
             execution: request.execution_budget().cloned(),
             artifact_collector: request.artifact_collector().cloned(),
+            refusal_mark: request.refusal_mark().cloned(),
         }
     }
 
@@ -72,6 +74,10 @@ impl WorkStager {
                 SemanticRequest::with_execution_budget(&mut self.budget, cancellation, execution)
             }
             None => SemanticRequest::new(&mut self.budget, cancellation),
+        };
+        let request = match &self.refusal_mark {
+            Some(mark) => request.observing_refusals_since(mark.clone()),
+            None => request,
         };
         match &self.artifact_collector {
             Some(collector) => request.with_artifact_collector(collector),

@@ -791,6 +791,7 @@ pub(super) fn push_unanalyzed_embedding_diagnostics(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }),
                 Some(DerivationExecutionCause::Provider),
             ));
@@ -834,6 +835,10 @@ pub(super) fn push_unanalyzed_embedding_diagnostics(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: Some(path),
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
 }
@@ -967,7 +972,7 @@ pub(super) fn execute_occurrence_seed(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted,
@@ -979,6 +984,7 @@ pub(super) fn execute_occurrence_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
                 break;
             }
@@ -1089,7 +1095,7 @@ pub(super) fn execute_environment_seed(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -1101,6 +1107,7 @@ pub(super) fn execute_environment_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
                 break;
             }
@@ -1202,7 +1209,7 @@ pub(super) fn execute_materialization_seed(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted,
@@ -1214,6 +1221,7 @@ pub(super) fn execute_materialization_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
                 break;
             }
@@ -1302,7 +1310,7 @@ pub(super) fn execute_path_seed(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -1314,6 +1322,7 @@ pub(super) fn execute_path_seed(
                     ),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
                 break;
             }
@@ -1403,6 +1412,10 @@ fn push_recovered_syntax_diagnostic(
         // A node recovery removed lies in this file, so every row the
         // diagnostic withholds is a row of it (#11673).
         withheld_rows_path: Some(rel_path_string(file)),
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 
@@ -1694,6 +1707,7 @@ fn push_comparison_chain_roles_diagnostic(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
     }));
     SeedFileScanStatus::Scanned
 }
@@ -1836,6 +1850,10 @@ pub(super) fn execute_seed(
                         message: diagnostic.message(),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+                        step_index: None,
+                        step_op: None,
+                        no_rows_reason: None,
+                        cause_codes: Vec::new(),
                     })
                 })
         };
@@ -1964,6 +1982,10 @@ pub(super) fn execute_seed(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
         }
     }
@@ -2733,7 +2755,7 @@ pub(super) fn execute_seed(
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(), language: language.config_label(),
                 message: "qualifying-type could not prove this site's associated qualifier and every deciding type component".to_owned(),
-                exhausted_roots: Vec::new(), withheld_rows_path: (site.reported_range.is_none() && seed.positive_capture_names().is_empty()).then(|| crate::path_utils::workspace_relative_slash_path(file.rel_path())),
+                exhausted_roots: Vec::new(), withheld_rows_path: (site.reported_range.is_none() && seed.positive_capture_names().is_empty()).then(|| crate::path_utils::workspace_relative_slash_path(file.rel_path())), step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }));
         }
         for (owner, role, coverage) in signature_incomplete
@@ -2769,6 +2791,7 @@ pub(super) fn execute_seed(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }));
         }
         for count_gap in signature_incomplete.count_gaps.borrow_mut().drain(..) {
@@ -2811,6 +2834,7 @@ pub(super) fn execute_seed(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }));
         }
         if let Some(lease) = &parallel_budget {
@@ -2864,6 +2888,7 @@ pub(super) fn execute_seed(
             message: "callable visibility is unrecorded or recorded as unknown for at least one declaration; results that depend on it are incomplete rather than a clean miss".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.parameter_types_unrecorded.get() {
@@ -2882,6 +2907,7 @@ pub(super) fn execute_seed(
             message: "callable parameter types are unrecorded for at least one declaration; results that depend on them are incomplete rather than a clean miss".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete
@@ -2903,6 +2929,7 @@ pub(super) fn execute_seed(
             message: "duplicate dictionary-key equality is incomplete because at least one Python key form is unsupported".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.string_literal_value_unrecorded.get() {
@@ -2921,6 +2948,7 @@ pub(super) fn execute_seed(
             message: "decoded string-value comparison is incomplete because at least one selected value is non-literal or uses an unsupported literal form".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.selection_application_undecided.get() {
@@ -2939,6 +2967,7 @@ pub(super) fn execute_seed(
             message: "call matching is incomplete because resolution did not decide whether at least one member selection applies a parameterless method or reads a field".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.role_target_unrecorded.get() {
@@ -2957,6 +2986,7 @@ pub(super) fn execute_seed(
             message: "structural role-target matching is incomplete because a selected target has no normalized fact for the requested predicate".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.role_absence_uncertified.get() {
@@ -2983,6 +3013,7 @@ pub(super) fn execute_seed(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.each_incomplete.get() {
@@ -3002,6 +3033,10 @@ pub(super) fn execute_seed(
                 .to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.argument_mode_unrecorded.get() {
@@ -3022,6 +3057,10 @@ pub(super) fn execute_seed(
                     .to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
     if signature_incomplete.fact_budget_exhausted.get() {
@@ -3043,6 +3082,7 @@ pub(super) fn execute_seed(
             message: "Python local-value matching could not prove a unique direct assignment guaranteed before the read and exact normalized RHS for at least one selected variable read".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if selected_index_content
@@ -3070,6 +3110,7 @@ pub(super) fn execute_seed(
             message: "workspace content changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }), Some(DerivationExecutionCause::Snapshot)));
     }
     if pending.len() > desired_rows {

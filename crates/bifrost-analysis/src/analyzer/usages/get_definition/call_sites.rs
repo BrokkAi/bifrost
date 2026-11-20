@@ -215,21 +215,6 @@ pub fn resolution_decided_application(node: Node<'_>, language: Language) -> Opt
     crate::analyzer::languages::language_knowledge(language)?.resolution_decided_application(node)
 }
 
-pub(crate) fn is_call_reference_range_in_tree(
-    tree: &Tree,
-    language: Language,
-    start_byte: usize,
-    end_byte: usize,
-) -> bool {
-    let Some(node) = tree
-        .root_node()
-        .named_descendant_for_byte_range(start_byte, end_byte)
-    else {
-        return false;
-    };
-    is_call_reference_candidate(node, language)
-}
-
 /// Some C++ callable names are composite grammar nodes beginning with the
 /// identifier token `operator`. The general definition-location contract
 /// rejects a byte range extending beyond that first token, so dispatch uses a

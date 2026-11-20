@@ -596,6 +596,7 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_root_import_segments WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_root_import_demands WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_rust_reference_contexts WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_rust_impl_declarations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_rust_declaration_authorities WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_semantic_catalog WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_node_catalog WHERE blob_id = ?1),
@@ -668,7 +669,9 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_capsule_inputs WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_declarations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_reference_contexts WHERE blob_id = ?1),
-       (SELECT COUNT(*) FROM resolution_reference_execution_contexts WHERE blob_id = ?1)";
+       (SELECT COUNT(*) FROM resolution_reference_execution_contexts WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_implicit_root_candidates WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_declaration_modifiers WHERE blob_id = ?1)";
 
 // This byte sum always runs, even when consistency validation is sampled.
 pub(super) const COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL: &str = "SELECT (SELECT COALESCE(SUM(length(CAST(anchor AS BLOB)) + length(CAST(kind AS BLOB)) + coalesce(length(CAST(bound_name AS BLOB)),0)),0) FROM resolution_root_imports WHERE blob_id=?1)
@@ -830,6 +833,108 @@ pub(super) fn estimated_body_payload_bytes(
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#7314: the C# visibility view counted stale-epoch interior rows for raw manifest accounting"
+    )]
+    fn raw_visibility_accounting_retires_old_producer_before_and_after_reopen() {
+        use crate::analyzer::store::AnalyzerStore;
+        use crate::analyzer::store::resolution::{
+            csharp_trial_bundle_epoch, resolution_bundle_epoch,
+        };
+        use brokk_bifrost_core::analyzer::Language;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("visibility.sqlite3");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        store
+            .ensure_resolution_producer_epoch_value(
+                "csharp",
+                Language::CSharp,
+                csharp_trial_bundle_epoch(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(|conn| {
+                conn.execute_batch(
+                    r#"
+            INSERT INTO blobs(id, blob_oid, lang, generation)
+            VALUES(1, '1111111111111111111111111111111111111111', 'csharp', 0);
+            INSERT INTO blob_meta(blob_id, lang, contains_tests, content_package,
+              stored_unit_count, range_count, signature_count, signature_metadata_count,
+              supertype_count, child_count, import_statement_count, type_identifier_count,
+              is_complete, declaration_visibility_version)
+            VALUES(1, 'csharp', 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1, 1);
+            INSERT INTO source_fact_manifests(blob_id, facts_version, source_bytes,
+              occurrence_count, declaration_count, declaration_unit_count, node_count,
+              role_count, occurrence_role_count, logical_rows, payload_bytes, publication_state)
+            VALUES(1, 1, 1, 1, 1, 0, 0, 0, 0, 6, 6, 'building');
+            INSERT INTO source_occurrence_arenas(blob_id, spans)
+            VALUES(1, jsonb('[[0,1,1,1,0]]'));
+            INSERT INTO source_declarations(blob_id, declaration_id, occurrence_id,
+              start_byte, end_byte, start_line, end_line, provenance)
+            VALUES(1, 0, 0, 0, 1, 1, 1, 0);
+            INSERT INTO source_declaration_visibilities VALUES(1, 0, 'public');
+            INSERT INTO source_native_declaration_bridges VALUES(1, 9, 0);
+            INSERT INTO source_declaration_visibility_manifests VALUES(1, 1, 1, 1, 0);
+            UPDATE source_fact_manifests SET publication_state='complete' WHERE blob_id=1;
+        "#,
+                )
+            })
+            .unwrap();
+        let publish = |store: &AnalyzerStore, epoch: &'static str| {
+            store.conn.execute(move |conn| {
+                let tx = conn.transaction().unwrap();
+                let _owner = crate::analyzer::store::sealed_families::Scope::new(&tx, crate::analyzer::store::sealed_families::Owner::Resolution);
+                let cascade = crate::analyzer::store::sealed_families::CascadeDelete::new(&tx);
+                tx.execute("DELETE FROM resolution_fragment_interiors WHERE blob_id=1", []).unwrap();
+                drop(cascade);
+                tx.execute("INSERT INTO resolution_fragment_interiors(blob_id, lang, semantic_language,
+                  producer_epoch, interior_digest, expected_semantic_site_count,
+                  expected_declaration_visibility_property_count, logical_rows, payload_bytes, publication_state)
+                  VALUES(1, 'csharp', 'csharp', ?1, zeroblob(32), 1, 1, 3, 0, 'building')", [epoch]).unwrap();
+                tx.execute("INSERT INTO resolution_semantic_sites VALUES(1, 9, 'type', 'definition', 0)", []).unwrap();
+                // Accounting must work while the new interior is still building.
+                let count: i64 = tx.query_row(COMPLETE_PUBLICATION_COUNTS_SQL, [1], |row| row.get(20)).unwrap();
+                assert_eq!(count, 1);
+                tx.execute("UPDATE resolution_fragment_interiors SET publication_state='complete' WHERE blob_id=1", []).unwrap();
+                drop(_owner);
+                tx.commit()
+            }).unwrap();
+        };
+        let accounting = |store: &AnalyzerStore| {
+            store
+                .conn
+                .execute(|conn| {
+                    let count: i64 = conn
+                        .query_row(COMPLETE_PUBLICATION_COUNTS_SQL, [1], |row| row.get(20))
+                        .unwrap();
+                    let bytes: i64 = conn
+                        .query_row(COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL, [1], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    Ok::<_, rusqlite::Error>((count, bytes))
+                })
+                .unwrap()
+        };
+        publish(&store, csharp_trial_bundle_epoch());
+        let active_a = accounting(&store);
+        assert_eq!(active_a.0, 1);
+        store
+            .ensure_resolution_producer_epoch("csharp", Language::CSharp)
+            .unwrap();
+        assert_eq!(accounting(&store), (0, active_a.1 - 6));
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        assert_eq!(accounting(&store), (0, active_a.1 - 6));
+        publish(&store, resolution_bundle_epoch(Language::CSharp));
+        let epoch_bytes_delta = resolution_bundle_epoch(Language::CSharp).len() as i64
+            - csharp_trial_bundle_epoch().len() as i64;
+        assert_eq!(accounting(&store), (1, active_a.1 + epoch_bytes_delta));
+    }
 
     #[test]
     #[hardwon(

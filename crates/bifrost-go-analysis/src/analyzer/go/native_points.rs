@@ -9,6 +9,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units:
 use brokk_bifrost_core::analyzer::model::{CodeUnit, Language};
 
 use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
+use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionSlotValue;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
@@ -25,7 +26,10 @@ use brokk_bifrost_analysis::analyzer::native_points::unavailable_type;
 
 use brokk_bifrost_analysis::analyzer::resolution::batch::ForwardCandidateArtifactCache;
 
-use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::GoReceiverSlotTypeOverlay;
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::{
+    GoReceiverOverrideSidecar, ReceiverOverrideLanguage, SelectedReceiverSlotOverride,
+    SelectedSlotEvidence,
+};
 
 use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
 
@@ -1420,7 +1424,7 @@ pub struct GoNativePointRequest<'a> {
     >,
     files: HashMap<String, GoPointFileContext>,
     file_context_reads:
-        HashMap<String, brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
+        HashMap<String, brokk_bifrost_analysis::analyzer::usages::common::RequestReadState>,
     forward_candidate_artifacts: HashMap<String, ForwardCandidateArtifactCache>,
     point_metrics: ResolutionBatchMetrics,
     record_work: bool,
@@ -1863,6 +1867,14 @@ impl<'a> GoNativePointRequest<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn forward_candidate_cache_hits_for_test(&self) -> usize {
+        self.forward_candidate_artifacts
+            .values()
+            .map(ForwardCandidateArtifactCache::cache_hit_count)
+            .sum()
+    }
+
     pub(crate) fn begin_receiver_query(
         &mut self,
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
@@ -2053,7 +2065,7 @@ impl<'a> GoNativePointRequest<'a> {
         query: BoundedReceiverQuery<'_>,
         tree: &tree_sitter::Tree,
         cancellation: &CancellationToken,
-    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<GoReceiverSlotTypeOverlay>> {
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<SelectedReceiverSlotOverride>> {
         let Some(anchor) = go_point_receiver_anchor(query.site, tree, query.source) else {
             return Ok(None);
         };
@@ -2308,14 +2320,36 @@ impl<'a> GoNativePointRequest<'a> {
         chain_slots.extend(typed_slots.into_vec());
         chain_slots.sort_unstable();
         chain_slots.dedup();
-        let overlay = GoReceiverSlotTypeOverlay::new(
-            slot,
-            receiver_type,
-            canonical.into_boxed_slice(),
-            chain_slots.into_boxed_slice(),
-            (query_reference, member),
-            query_result_slot,
-        );
+        // All three paths previously seeded Complete at initial installation
+        // and late reapplication, after the keyed builder proved the chain.
+        let mut supporting_slots = chain_slots
+            .into_iter()
+            .map(|(slot, value)| SelectedSlotEvidence {
+                slot,
+                value,
+                completion: ResolutionCompletion::Complete,
+            })
+            .collect::<Vec<_>>();
+        if let Some((slot, ty)) = query_result_slot {
+            supporting_slots.push(SelectedSlotEvidence {
+                slot,
+                value: ResolutionSlotValue::runtime(ty, false),
+                completion: ResolutionCompletion::Complete,
+            });
+        }
+        let overlay = SelectedReceiverSlotOverride {
+            receiver: SelectedSlotEvidence {
+                slot,
+                value: ResolutionSlotValue::runtime(receiver_type, true),
+                completion: ResolutionCompletion::Complete,
+            },
+            supporting_slots: supporting_slots.into_boxed_slice(),
+            language: ReceiverOverrideLanguage::Go(GoReceiverOverrideSidecar {
+                reference_bindings: canonical.into_boxed_slice(),
+                query_binding: (query_reference, member),
+                query_result_slot,
+            }),
+        };
         Ok(Some(overlay))
     }
 
@@ -2407,6 +2441,8 @@ impl<'a> GoNativePointRequest<'a> {
                 let context = request
                     .prepare_file_context(path, &CancellationToken::new())
                     .unwrap();
+                // Model an operational budget stop, not its annotation alone.
+                analyzer.mark_execution_dependent();
                 analyzer.record_budget_dependences(1);
                 context
             },
@@ -2437,10 +2473,7 @@ impl<'a> GoNativePointRequest<'a> {
                 .file_context_reads
                 .get(path)
                 .expect("an admitted Go file context has a completion receipt");
-            brokk_bifrost_analysis::analyzer::usages::common::replay_memo_reads(
-                reads,
-                &self.go.inner,
-            );
+            reads.replay(&self.go.inner);
             return Ok(Some(context.clone()));
         }
         let (result, reads) =
@@ -5706,13 +5739,14 @@ pub fn activate_receiver_models_for_test(
     let declarations = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
     let mut types = Vec::new();
     let mut members = Vec::new();
+    let (declarations, complete) = declarations.symbols();
+    assert!(complete, "receiver fixture requires complete symbols");
     let ids = declarations
-        .symbols()
         .iter()
         .enumerate()
         .map(|(index, declaration)| (declaration.id.clone(), format!("symbol-{index}")))
         .collect::<std::collections::HashMap<_, _>>();
-    for declaration in declarations.symbols() {
+    for declaration in declarations {
         let locator = json!({"kind":"artifact", "path":"synthetic/receiver.go", "symbol":declaration.qualified_name});
         if let Some(owner) = &declaration.owner_id {
             members.push(json!({"id":ids[declaration.id.as_str()], "owner":ids[owner.as_str()], "name":declaration.name,
@@ -5750,6 +5784,8 @@ pub fn activate_receiver_models_for_test(
         )
         .unwrap();
     let activation = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: vec![
@@ -5761,7 +5797,8 @@ pub fn activate_receiver_models_for_test(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
         ],
         controls: Vec::new(),

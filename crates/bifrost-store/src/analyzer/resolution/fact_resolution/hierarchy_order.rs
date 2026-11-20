@@ -18,7 +18,7 @@ pub(crate) struct HierarchySequenceId {
 pub(super) struct HierarchyOrderedBase {
     pub(super) expression: HierarchyOrderExprId,
     pub(super) reference: SemanticId,
-    pub(super) kind: Option<ResolutionSupertypeKind>,
+    pub(super) kind: Option<ClassifiedSupertypeKind>,
     pub(super) ordinal: u32,
 }
 #[derive(Debug)]
@@ -61,7 +61,7 @@ pub(crate) struct HierarchyOrderRequest {
 pub(crate) enum HierarchySequenceRole {
     Base {
         reference: SemanticId,
-        kind: Option<ResolutionSupertypeKind>,
+        kind: Option<ClassifiedSupertypeKind>,
         ordinal: u32,
     },
     DeclaredBases,

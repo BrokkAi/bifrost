@@ -1909,9 +1909,11 @@ impl Decoder {
             .map(|value| self.decode_completion(value, kind))
             .transpose()?
             .unwrap_or(false);
+        let guards = self.decode_guard_configuration(&fields, path, kind)?;
         let analysis = match kind {
             PolicyAnalysisKind::Match => PolicyAnalysis::Match {
                 spec: MatchPolicySpec {
+                    guards,
                     selector: self.decode_selector(
                         fields.required("selector"),
                         DecodeContext::policy(kind),
@@ -1920,7 +1922,7 @@ impl Decoder {
                 },
             },
             PolicyAnalysisKind::Taint => PolicyAnalysis::Taint {
-                spec: self.decode_taint_analysis(&fields, path)?,
+                spec: self.decode_taint_analysis(&fields, path, guards)?,
             },
             PolicyAnalysisKind::Typestate => PolicyAnalysis::Typestate {
                 spec: self.decode_typestate_analysis(&fields, path)?,
@@ -2159,6 +2161,7 @@ impl Decoder {
             sinks: observations,
             sanitizers: kills,
             barriers: TaintEndpointSet::default(),
+            guards: PolicyGuardConfiguration::default(),
             entry_points: TaintEndpointSet::default(),
             transforms,
             external_models: TaintEndpointSet::default(),
@@ -2396,6 +2399,7 @@ impl Decoder {
         &mut self,
         fields: &RecordCursor<'_>,
         path: &str,
+        guards: PolicyGuardConfiguration,
     ) -> Result<TaintPolicySpec, PolicySourceError> {
         match expect_atom(fields.required("mode"), AtomDomain::TaintMode, "taint mode")? {
             PolicyAtomValue::ModeMay => {}
@@ -2467,6 +2471,7 @@ impl Decoder {
             sinks,
             sanitizers,
             barriers,
+            guards,
             entry_points,
             transforms,
             external_models,
@@ -2489,6 +2494,7 @@ impl Decoder {
             DecodeContext::policy(PolicyAnalysisKind::Taint),
         )?;
         let clause = TaintWithoutFlowSpec {
+            guards: self.decode_guard_configuration(&fields, path, PolicyAnalysisKind::Taint)?,
             sources: self
                 .decode_source_set(fields.required("sources"), &format!("{path}/sources"))?,
             sanitizers: fields
@@ -2577,6 +2583,112 @@ impl Decoder {
             |value: &TaintSinkSpec| value.id.as_str(),
             |value| format!("duplicate sink ID `{}`", value.id),
         )
+    }
+
+    fn decode_guard_configuration(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        path: &str,
+        kind: PolicyAnalysisKind,
+    ) -> Result<PolicyGuardConfiguration, PolicySourceError> {
+        Ok(PolicyGuardConfiguration {
+            barriers: fields
+                .get("guard-barriers")
+                .map(|value| {
+                    self.decode_guard_barriers(value, &format!("{path}/guard_barriers"), kind)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+
+    fn decode_guard_barriers(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+        kind: PolicyAnalysisKind,
+    ) -> Result<Vec<TaintGuardBarrierSpec>, PolicySourceError> {
+        let context = DecodeContext::policy(kind);
+        let mut guards = Vec::new();
+        for entry in expect_vector(expr, "guard barriers", 0, 256)? {
+            let fields = RecordCursor::parse(entry, PolicyRecord::GuardBarrier, context)?;
+            let id: TaintEntryId = parse_identifier(fields.required("id"), "guard barrier ID")?;
+            self.register_local_taint_entry(&id, fields.required("id"))?;
+            let selector_path = format!(
+                "{path}/{}/predicate/selector",
+                json_pointer_segment(id.as_str())
+            );
+            let expr = fields.required("predicate");
+            let record = select_record(
+                expr,
+                &[PolicyRecord::CallGuard, PolicyRecord::ComparisonGuard],
+                "guard predicate",
+            )?;
+            let predicate = RecordCursor::parse(expr, record, context)?;
+            let predicate = match record {
+                PolicyRecord::CallGuard => TaintGuardPredicate::Call {
+                    selector: self.decode_selector(
+                        predicate.required("selector"),
+                        context,
+                        &selector_path,
+                    )?,
+                    operand: decode_sanitizer_operand(
+                        self.schema_version,
+                        predicate.required("operand"),
+                        context,
+                    )?,
+                    requires: self.decode_guard_requirements(
+                        predicate.get("requires"),
+                        context,
+                        &selector_path,
+                    )?,
+                },
+                PolicyRecord::ComparisonGuard => {
+                    let relation = match expect_atom(
+                        predicate.required("relation"),
+                        AtomDomain::GuardRelation,
+                        "comparison relation",
+                    )? {
+                        PolicyAtomValue::GuardEquality => TaintGuardRelation::Equality,
+                        PolicyAtomValue::GuardInequality => TaintGuardRelation::Inequality,
+                        PolicyAtomValue::GuardOrdering => TaintGuardRelation::Ordering,
+                        value => unreachable!("GuardRelation registry returned {value:?}"),
+                    };
+                    let operand = match expect_atom(
+                        predicate.required("operand"),
+                        AtomDomain::GuardOperand,
+                        "comparison operand",
+                    )? {
+                        PolicyAtomValue::GuardEither => TaintGuardOperand::Either,
+                        PolicyAtomValue::GuardLesser => TaintGuardOperand::Lesser,
+                        PolicyAtomValue::GuardGreater => TaintGuardOperand::Greater,
+                        value => unreachable!("GuardOperand registry returned {value:?}"),
+                    };
+                    if (relation == TaintGuardRelation::Ordering)
+                        == (operand == TaintGuardOperand::Either)
+                    {
+                        return Err(source_error(
+                            "invalid-guard-operand",
+                            expr.range.clone(),
+                            "ordering selects lesser or greater; equality and inequality select either",
+                        ));
+                    }
+                    TaintGuardPredicate::Comparison(TaintComparisonGuardSpec { relation, operand })
+                }
+                _ => unreachable!("selected a registered guard predicate"),
+            };
+            guards.push(TaintGuardBarrierSpec {
+                id,
+                predicate,
+                clean_when: decode_boolean(
+                    fields.required("clean-when"),
+                    "accepting guard Boolean",
+                )?,
+                removes: decode_id_set(fields.required("removes"), "removed guard labels", 1, 64)?,
+            });
+        }
+        guards.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(guards)
     }
 
     fn decode_barrier_set(
@@ -3344,90 +3456,7 @@ impl Decoder {
                         .transpose()?,
                 };
                 let sanitizes = decode_sanitizer_operand(self.schema_version, sanitizes, context)?;
-                let mut decoded_requires = Vec::new();
-                if let Some(requires) = requires {
-                    for (index, requirement) in
-                        expect_vector(requires, "sanitizer requirements", 1, 64)?
-                            .iter()
-                            .enumerate()
-                    {
-                        let record = select_record(
-                            requirement,
-                            &[PolicyRecord::ReceiverRequirement, PolicyRecord::Argument],
-                            "sanitizer requirement",
-                        )?;
-                        let item = RecordCursor::parse(requirement, record, context)?;
-                        let operand = if record == PolicyRecord::ReceiverRequirement {
-                            TaintSanitizerOperand::Receiver
-                        } else {
-                            if item.get("name").is_some() {
-                                return Err(source_error(
-                                    "binding-not-allowed",
-                                    requirement.range.clone(),
-                                    "sanitizer arguments require an index",
-                                ));
-                            }
-                            TaintSanitizerOperand::Argument {
-                                index: expect_u32(
-                                    item.get("index").ok_or_else(|| {
-                                        source_error(
-                                            "missing-field",
-                                            requirement.range.clone(),
-                                            "argument requires :index",
-                                        )
-                                    })?,
-                                    "argument index",
-                                    true,
-                                )?,
-                            }
-                        };
-                        let condition = match (
-                            item.get("constant"),
-                            item.get("equals"),
-                            item.get("result-of"),
-                        ) {
-                            (Some(value), None, None) => {
-                                if !decode_boolean(value, "constant requirement")? {
-                                    return Err(source_error(
-                                        "invalid-requirement",
-                                        value.range.clone(),
-                                        ":constant requires true",
-                                    ));
-                                }
-                                TaintSanitizerCondition::Constant
-                            }
-                            (None, Some(value), None) => {
-                                TaintSanitizerCondition::Equals(decode_sanitizer_literal(value)?)
-                            }
-                            (None, None, Some(value)) => {
-                                TaintSanitizerCondition::ResultOf(self.decode_selector(
-                                    value,
-                                    context,
-                                    &format!("{path}/requires/{index}/result_of"),
-                                )?)
-                            }
-                            _ => {
-                                return Err(source_error(
-                                    "invalid-requirement",
-                                    requirement.range.clone(),
-                                    "requires items need exactly one of :constant, :equals or :result-of",
-                                ));
-                            }
-                        };
-                        let decoded = TaintSanitizerRequirement { operand, condition };
-                        let key = crate::canonical::sanitizer_requirement_to_json(&decoded);
-                        if decoded_requires.iter().any(|previous| {
-                            crate::canonical::sanitizer_requirement_to_json(previous) == key
-                        }) {
-                            return Err(source_error(
-                                "duplicate-requirement",
-                                requirement.range.clone(),
-                                "duplicate sanitizer requirement",
-                            ));
-                        }
-                        decoded_requires.push(decoded);
-                    }
-                }
+                let decoded_requires = self.decode_guard_requirements(requires, context, path)?;
                 Ok(TaintSanitizerKind::Conditional {
                     when,
                     sanitizes,
@@ -3440,6 +3469,98 @@ impl Decoder {
                 "use exactly one sanitizer shape: :input and :output, or :when and :sanitizes with optional :requires",
             )),
         }
+    }
+
+    fn decode_guard_requirements(
+        &mut self,
+        requires: Option<&Expr>,
+        context: DecodeContext,
+        path: &str,
+    ) -> Result<Vec<TaintSanitizerRequirement>, PolicySourceError> {
+        let mut decoded_requires = Vec::new();
+        if let Some(requires) = requires {
+            for (index, requirement) in expect_vector(requires, "sanitizer requirements", 1, 64)?
+                .iter()
+                .enumerate()
+            {
+                let record = select_record(
+                    requirement,
+                    &[PolicyRecord::ReceiverRequirement, PolicyRecord::Argument],
+                    "sanitizer requirement",
+                )?;
+                let item = RecordCursor::parse(requirement, record, context)?;
+                let operand = if record == PolicyRecord::ReceiverRequirement {
+                    TaintSanitizerOperand::Receiver
+                } else {
+                    if item.get("name").is_some() {
+                        return Err(source_error(
+                            "binding-not-allowed",
+                            requirement.range.clone(),
+                            "sanitizer arguments require an index",
+                        ));
+                    }
+                    TaintSanitizerOperand::Argument {
+                        index: expect_u32(
+                            item.get("index").ok_or_else(|| {
+                                source_error(
+                                    "missing-field",
+                                    requirement.range.clone(),
+                                    "argument requires :index",
+                                )
+                            })?,
+                            "argument index",
+                            true,
+                        )?,
+                    }
+                };
+                let condition = match (
+                    item.get("constant"),
+                    item.get("equals"),
+                    item.get("result-of"),
+                ) {
+                    (Some(value), None, None) => {
+                        if !decode_boolean(value, "constant requirement")? {
+                            return Err(source_error(
+                                "invalid-requirement",
+                                value.range.clone(),
+                                ":constant requires true",
+                            ));
+                        }
+                        TaintSanitizerCondition::Constant
+                    }
+                    (None, Some(value), None) => {
+                        TaintSanitizerCondition::Equals(decode_sanitizer_literal(value)?)
+                    }
+                    (None, None, Some(value)) => {
+                        TaintSanitizerCondition::ResultOf(self.decode_selector(
+                            value,
+                            context,
+                            &format!("{path}/requires/{index}/result_of"),
+                        )?)
+                    }
+                    _ => {
+                        return Err(source_error(
+                            "invalid-requirement",
+                            requirement.range.clone(),
+                            "requires items need exactly one of :constant, :equals or :result-of",
+                        ));
+                    }
+                };
+                let decoded = TaintSanitizerRequirement { operand, condition };
+                let key = crate::canonical::sanitizer_requirement_to_json(&decoded);
+                if decoded_requires.iter().any(|previous| {
+                    crate::canonical::sanitizer_requirement_to_json(previous) == key
+                }) {
+                    return Err(source_error(
+                        "duplicate-requirement",
+                        requirement.range.clone(),
+                        "duplicate sanitizer requirement",
+                    ));
+                }
+                decoded_requires.push(decoded);
+            }
+        }
+        Ok(decoded_requires)
     }
 
     fn decode_entry_point(
@@ -4097,7 +4218,62 @@ impl Decoder {
             ))
         });
         terminal_expectations.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        // Older engines reject :transfers as unknown-field in RecordCursor::parse
+        // (source.rs:5795-5799 before this addition); no capability gate is needed.
+        let mut transfers = Vec::new();
+        let mut transfer_ids = HashSet::new();
+        if let Some(value) = fields.get("transfers") {
+            for value in expect_vector(value, "typestate transfers", 0, 256)? {
+                let record = RecordCursor::parse(value, PolicyRecord::TypestateTransfer, context)?;
+                let id: TypestateEventId = parse_identifier(record.required("id"), "transfer ID")?;
+                if !transfer_ids.insert(id.clone()) {
+                    return Err(source_error(
+                        "duplicate-transfer-id",
+                        value.range.clone(),
+                        "duplicate transfer ID",
+                    ));
+                }
+                let calls = RecordCursor::parse(
+                    record.required("calls"),
+                    PolicyRecord::TypestateTransferCalls,
+                    context,
+                )?;
+                let from_expr = calls.required("from");
+                let from = decoded_binding_to_call(
+                    decode_binding(
+                        self.schema_version,
+                        from_expr,
+                        context,
+                        PolicyValueShape::TypestateCallBinding,
+                    )?,
+                    from_expr.range.clone(),
+                )?;
+                if !matches!(
+                    from,
+                    TypestateCallBinding::Receiver | TypestateCallBinding::ArgumentIndex { .. }
+                ) {
+                    return Err(source_error(
+                        "invalid-transfer-source",
+                        from_expr.range.clone(),
+                        "transfer source must be receiver or an indexed argument",
+                    ));
+                }
+                if calls.required("to").as_symbol() != Some("return-value") {
+                    return Err(source_error(
+                        "invalid-transfer-destination",
+                        calls.required("to").range.clone(),
+                        "transfer destination must be return-value",
+                    ));
+                }
+                let selector_path = typestate_transfer_selector_path(&id);
+                let selector =
+                    self.decode_selector(calls.required("selector"), context, &selector_path)?;
+                transfers.push(TypestateTransferSpec { id, selector, from });
+            }
+        }
+        transfers.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(TypestateAutomatonSpec {
+            transfers,
             event_set,
             states,
             initial,
@@ -5671,6 +5847,7 @@ fn empty_taint_policy_spec() -> TaintPolicySpec {
         sinks: TaintEndpointSet::default(),
         sanitizers: TaintEndpointSet::default(),
         barriers: TaintEndpointSet::default(),
+        guards: PolicyGuardConfiguration::default(),
         entry_points: TaintEndpointSet::default(),
         transforms: TaintEndpointSet::default(),
         external_models: TaintEndpointSet::default(),
@@ -8758,6 +8935,88 @@ mod tests {
     }
 
     #[test]
+    fn guard_barriers_decode_for_both_match_and_taint() {
+        for predicate in [
+            "(call-guard :selector (rql (call)) :operand receiver)",
+            "(call-guard :selector (rql (call)) :operand (argument :index 0) :requires [(argument :index 1 :equals \"..\")])",
+            "(comparison-guard :relation equality :operand either)",
+            "(comparison-guard :relation inequality :operand either)",
+            "(comparison-guard :relation ordering :operand lesser)",
+            "(comparison-guard :relation ordering :operand greater)",
+        ] {
+            let extra = format!(
+                ":guard-barriers [(guard-barrier :id checked :predicate {predicate} :clean-when false :removes [secret])]"
+            );
+            for source in [
+                taint_policy(&extra),
+                format!(
+                    r#"(policy :id "test.match" :name "Match" :message "M" :severity warning :analysis (analysis :type match :selector (rql (call)) {extra}))"#
+                ),
+            ] {
+                let parsed = parse(&source).unwrap();
+                let RqlpDocument::Policy { definition } = parsed.document() else {
+                    panic!("expected policy")
+                };
+                let guards = match &definition.analysis {
+                    PolicyAnalysis::Match { spec } => &spec.guards,
+                    PolicyAnalysis::Taint { spec } => &spec.guards,
+                    _ => panic!("expected match or taint"),
+                };
+                assert_eq!(guards.barriers.len(), 1);
+                assert!(!guards.barriers[0].clean_when);
+                parsed.to_inline_local_canonical_semantic_json().unwrap();
+                if matches!(definition.analysis, PolicyAnalysis::Match { .. }) {
+                    let registry = crate::test_support::registry_with_policy(
+                        "test",
+                        &source,
+                        "a match guard loads with its selector closure",
+                    );
+                    assert_eq!(registry.policies().count(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn match_guard_inline_projection_requires_closed_selectors() {
+        for (selector, requirement) in [
+            (r#"(rql-file :path "guard.rql")"#, ""),
+            (
+                "(rql (call))",
+                r#":requires [(receiver :result-of (rql-file :path "origin.rql"))]"#,
+            ),
+        ] {
+            let source = format!(
+                r#"(policy :id "test.match" :name "Match" :message "M" :severity warning
+              :analysis (analysis :type match :selector (rql (call))
+                :guard-barriers [(guard-barrier :id checked
+                  :predicate (call-guard :selector {selector} :operand receiver {requirement})
+                  :clean-when true :removes [secret])]))"#
+            );
+            let parsed = parse(&source).unwrap();
+            assert!(matches!(
+                parsed.to_inline_local_canonical_semantic_json(),
+                Err(crate::canonical::InlineLocalSemanticProjectionError::FileSelector { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn guard_barriers_reject_ambiguous_comparison_operand() {
+        for predicate in [
+            "(comparison-guard :relation ordering :operand either)",
+            "(comparison-guard :relation equality :operand lesser)",
+            "(comparison-guard :relation inequality :operand greater)",
+        ] {
+            let source = taint_policy(&format!(
+                ":guard-barriers [(guard-barrier :id checked :predicate {predicate} :clean-when true :removes [secret])]"
+            ));
+            let error = parse(&source).unwrap_err();
+            assert_eq!(error.diagnostic.code, "invalid-guard-operand");
+        }
+    }
+
+    #[test]
     fn conditional_sanitizers_decode_both_analysis_forms_and_offer_hover() {
         for (when, operand, requires) in [
             ("(result true)", "receiver", ""),
@@ -9618,6 +9877,34 @@ mod tests {
         assert_eq!(spec.sources.include_matches.len(), 1);
         assert_eq!(spec.sinks.entries.len(), 1);
         assert_eq!(spec.finding_combinations.len(), 1);
+    }
+
+    #[test]
+    fn rejects_malformed_typestate_transfers() {
+        let policy = r#"(policy :schema-version 1 :id "test.cookie.typestate" :name "Cookie state" :message "insecure cookie" :severity warning
+ :analysis (analysis :type typestate :mode may
+ :subjects (subject-set :entries [(subject :id create :selector (rql :schema-version 1 (language rust (call :callee (name "new")))) :subject return-value) (subject :id builder :selector (rql :schema-version 1 (language rust (call :callee (name "build")))) :subject return-value)])
+ :uncertainty (uncertainty :escape inconclusive)
+ :automaton (automaton :states [insecure secure violated] :initial insecure :accepting-states [insecure secure] :error-states [violated]
+ :transfers [(transfer :id clone :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "clone")))) :from receiver :to return-value)) (transfer :id build :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "build")))) :from receiver :to return-value))]
+ :events [(event :id set_secure_any :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "set_secure")))) :subject receiver :phase after-normal-return)) (event :id set_secure_true :supersedes [set_secure_any] :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "set_secure")))) :subject receiver :phase after-normal-return :condition (argument-condition :argument (argument :index 0) :equals true))) (event :id secure_any :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "secure")))) :subject receiver :phase after-normal-return)) (event :id secure_true :supersedes [secure_any] :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "secure")))) :subject receiver :phase after-normal-return :condition (argument-condition :argument (argument :index 0) :equals true))) (event :id add :calls (calls :selector (rql :schema-version 1 (language rust (call :callee (name "add")))) :subject (argument :index 0) :phase before-call))] :transitions [(transition :from insecure :on set_secure_any :to insecure) (transition :from secure :on set_secure_any :to insecure) (transition :from insecure :on set_secure_true :to secure) (transition :from secure :on set_secure_true :to secure) (transition :from insecure :on secure_any :to insecure) (transition :from secure :on secure_any :to insecure) (transition :from insecure :on secure_true :to secure) (transition :from secure :on secure_true :to secure) (transition :from insecure :on add :to violated) (transition :from secure :on add :to secure)])))
+"#;
+        assert!(parse(policy).is_ok());
+        for (source, code) in [
+            (
+                policy.replace(":to return-value", ":to receiver"),
+                "invalid-transfer-destination",
+            ),
+            (
+                policy.replace(":from receiver", ":from unknown-source"),
+                "invalid-binding",
+            ),
+        ] {
+            let error = parse(&source).expect_err("malformed transfer must be a source error");
+            if code == "invalid-transfer-destination" {
+                assert_eq!(error.diagnostic.code, code);
+            }
+        }
     }
 
     #[test]

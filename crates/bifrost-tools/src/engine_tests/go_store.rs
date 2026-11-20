@@ -275,9 +275,7 @@ mod tests {
                 .unwrap()
         );
 
-        let current_generation = store
-            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
-            .unwrap();
+        let current_generation = store.ensure_language_epoch(&GoAdapter).unwrap();
 
         assert_ne!(current_generation, prior_generation);
         assert!(
@@ -346,9 +344,7 @@ mod tests {
                 rust_state.as_ref(),
             )
             .unwrap();
-        let go_generation = store
-            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
-            .unwrap();
+        let go_generation = store.ensure_language_epoch(&GoAdapter).unwrap();
         store
             .write_parsed_blob_at_generation(
                 &crate::analyzer::store::test_blob_file(),
@@ -374,7 +370,7 @@ mod tests {
         );
 
         let current_rust_generation = store
-            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
+            .ensure_language_epoch(&RustAdapter::for_tests())
             .unwrap();
 
         assert_ne!(current_rust_generation, prior_rust_generation);
@@ -386,9 +382,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            store
-                .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
-                .unwrap(),
+            store.ensure_language_epoch(&GoAdapter).unwrap(),
             go_generation,
             "the Rust salt bump must not move Go's epoch"
         );

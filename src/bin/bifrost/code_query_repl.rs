@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext;
 use brokk_bifrost_policy::is_bidi_control;
 
 const COMMANDS: &[MetadataEntry] = &[
@@ -373,48 +374,54 @@ impl Default for ReplSession {
     }
 }
 
-pub fn run_code_query_repl(root: PathBuf) -> Result<(), String> {
+pub fn run_code_query_repl(root: PathBuf, host: Arc<HostActivationContext>) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     if io::stdin().is_terminal() {
-        let mut service = LazySearchService::watching(canonical_root);
+        let mut service = LazySearchService::watching(canonical_root, host);
         run_interactive(&mut service)
     } else {
-        let mut service = LazySearchService::scripted(canonical_root);
+        let mut service = LazySearchService::scripted(canonical_root, host);
         run_scripted(&mut service)
     }
 }
 
 struct LazySearchService {
     root: PathBuf,
-    initialize: fn(PathBuf) -> Result<SearchToolsService, String>,
+    initialize: fn(PathBuf, Arc<HostActivationContext>) -> Result<SearchToolsService, String>,
+    host: Arc<HostActivationContext>,
     service: Option<SearchToolsService>,
 }
 
 impl LazySearchService {
-    fn watching(root: PathBuf) -> Self {
+    fn watching(root: PathBuf, host: Arc<HostActivationContext>) -> Self {
         Self {
             root,
+            host,
             service: None,
-            initialize: SearchToolsService::new,
+            initialize: SearchToolsService::new_with_host_activation_context,
         }
     }
 
-    fn scripted(root: PathBuf) -> Self {
+    fn scripted(root: PathBuf, host: Arc<HostActivationContext>) -> Self {
         Self {
             root,
+            host,
             // Piped input defines the complete lifetime of this process. There
             // is no later edit for a filesystem watcher to observe, and native
             // watcher teardown can otherwise delay process exit after :quit.
-            initialize: SearchToolsService::new_manual_persisted,
+            initialize: SearchToolsService::new_manual_persisted_with_host_activation_context,
             service: None,
         }
     }
 
     fn get_or_init(&mut self) -> Result<&SearchToolsService, String> {
         if self.service.is_none() {
-            self.service = Some((self.initialize)(self.root.clone())?);
+            self.service = Some((self.initialize)(
+                self.root.clone(),
+                Arc::clone(&self.host),
+            )?);
         }
         Ok(self.service.as_ref().expect("service initialized"))
     }
@@ -2580,6 +2587,35 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         sanitize_terminal_text(&value.site_ast_id),
                     ));
                 }
+                CodeQueryResultValue::FieldWrite { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}, {})\n  in {}, strong update {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "field write:", use_color),
+                        sanitize_terminal_text(&value.member_fq_name),
+                        value.proof,
+                        value.completeness,
+                        sanitize_terminal_text(&value.enclosing),
+                        value.strong_update,
+                    ));
+                }
+                CodeQueryResultValue::FieldRead { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}, {})\n  in {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "field read:", use_color),
+                        sanitize_terminal_text(&value.member_fq_name),
+                        value.proof,
+                        value.completeness,
+                        sanitize_terminal_text(&value.enclosing),
+                    ));
+                }
                 CodeQueryResultValue::RewritePath { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(
@@ -2849,7 +2885,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
         out.push_str(&format!(
             "{} {}\n",
             paint(Style::new().fg(Color::Yellow), &label, use_color),
-            sanitize_terminal_text(&diagnostic.message)
+            sanitize_terminal_text(diagnostic.message())
         ));
     }
     out
@@ -3438,7 +3474,10 @@ mod tests {
     #[test]
     fn rune_ir_capture_does_not_initialize_lazy_search_service() {
         let mut session = ReplSession::new();
-        let mut service = LazySearchService::scripted(PathBuf::from("unused"));
+        let mut service = LazySearchService::scripted(
+            PathBuf::from("unused"),
+            HostActivationContext::library_none(),
+        );
         process_line_with_lazy_service(&mut session, ":ir rust", &mut service).unwrap();
         process_line_with_lazy_service(&mut session, "fn demo() {}", &mut service).unwrap();
         let (_, output) =
@@ -3542,7 +3581,7 @@ mod tests {
                     row_projection: Vec::new(),
                 }],
                 truncated: false,
-                diagnostics: Vec::new(),
+                diagnostics: Vec::new().into(),
             },
             false,
         );

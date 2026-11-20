@@ -429,47 +429,71 @@ struct ReadSnapshot {
     canonical: OnceLock<Arc<[ReadKey]>>,
 }
 
+/// Visit every key `inputs` reach, with its hash, walking each nested snapshot
+/// and each receipt once. Keys shared between inputs may be visited more than
+/// once. Returns the work done, for the callers' accounting.
+fn visit_input_keys<'a>(
+    inputs: impl IntoIterator<Item = &'a ReadInput>,
+    mut visit: impl FnMut(u64, &'a ReadKey),
+) -> usize {
+    let mut work = 0usize;
+    let mut stack: Vec<&ReadSnapshot> = Vec::new();
+    let mut visited = HashSet::default();
+    let mut receipts = HashSet::default();
+    let mut enqueue = |input: &'a ReadInput,
+                       stack: &mut Vec<&'a ReadSnapshot>,
+                       work: &mut usize,
+                       visit: &mut dyn FnMut(u64, &'a ReadKey)| {
+        *work = work.saturating_add(1);
+        match input {
+            ReadInput::Capture(child) => stack.push(child),
+            ReadInput::Receipt(keys) => {
+                if receipts.insert(keys.as_ptr()) {
+                    for key in keys.iter() {
+                        *work = work.saturating_add(1);
+                        visit(read_key_hash(key), key);
+                    }
+                }
+            }
+        }
+    };
+    for input in inputs {
+        enqueue(input, &mut stack, &mut work, &mut visit);
+    }
+    while let Some(snapshot) = stack.pop() {
+        work = work.saturating_add(1);
+        if !visited.insert(std::ptr::from_ref(snapshot)) {
+            continue;
+        }
+        for (hash, key) in &snapshot.local.table {
+            work = work.saturating_add(1);
+            visit(*hash, key);
+        }
+        for input in &snapshot.inputs {
+            enqueue(input, &mut stack, &mut work, &mut visit);
+        }
+    }
+    work
+}
+
 impl ReadSnapshot {
     fn unique_keys(&self) -> hashbrown::HashTable<(u64, &ReadKey)> {
         self.unique_keys_with_work().0
     }
 
     fn unique_keys_with_work(&self) -> (hashbrown::HashTable<(u64, &ReadKey)>, usize) {
-        let mut work = 0usize;
         let mut unique = hashbrown::HashTable::new();
-        let mut stack = vec![self];
-        let mut visited = HashSet::default();
-        let mut receipts = HashSet::default();
-        while let Some(snapshot) = stack.pop() {
+        let mut add = |hash: u64, key| {
+            unique
+                .entry(hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
+                .or_insert((hash, key));
+        };
+        let mut work = 1usize;
+        for (hash, key) in &self.local.table {
             work = work.saturating_add(1);
-            if !visited.insert(std::ptr::from_ref(snapshot)) {
-                continue;
-            }
-            for (hash, key) in &snapshot.local.table {
-                work = work.saturating_add(1);
-                unique
-                    .entry(*hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
-                    .or_insert((*hash, key));
-            }
-            for input in &snapshot.inputs {
-                work = work.saturating_add(1);
-                match input {
-                    ReadInput::Capture(child) => stack.push(child),
-                    ReadInput::Receipt(keys) => {
-                        if !receipts.insert(keys.as_ptr()) {
-                            continue;
-                        }
-                        for key in keys.iter() {
-                            work = work.saturating_add(1);
-                            let hash = read_key_hash(key);
-                            unique
-                                .entry(hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
-                                .or_insert((hash, key));
-                        }
-                    }
-                }
-            }
+            add(*hash, key);
         }
+        work = work.saturating_add(visit_input_keys(&self.inputs, add));
         (unique, work)
     }
 
@@ -541,6 +565,8 @@ pub struct ReadLedger {
     execution_dependences: AtomicUsize,
     // The part of `execution_dependences` caused by a refused budget charge.
     budget_dependences: AtomicUsize,
+    // The part of `execution_dependences` caused by a request-pinned input.
+    request_pinned_dependences: AtomicUsize,
     reuse_refused: std::sync::atomic::AtomicBool,
     // A store read failed while this capture was open. Unlike the execution
     // dependences above, no replay may stand in for the failed read: a product
@@ -566,7 +592,8 @@ const fn verdict_rank(verdict: ReuseVerdict) -> u8 {
         ReuseVerdict::Content => 0,
         ReuseVerdict::ExecutionDependent(ExecutionCause::ConfiguredCap) => 1,
         ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal) => 2,
-        ReuseVerdict::ExecutionDependent(ExecutionCause::Other) => 3,
+        ReuseVerdict::ExecutionDependent(ExecutionCause::RequestPinned) => 3,
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other) => 4,
     }
 }
 
@@ -582,6 +609,7 @@ impl Default for ReadLedger {
             unattributed_reads: AtomicUsize::default(),
             execution_dependences: AtomicUsize::default(),
             budget_dependences: AtomicUsize::default(),
+            request_pinned_dependences: AtomicUsize::default(),
             reuse_refused: std::sync::atomic::AtomicBool::default(),
             store_failed: std::sync::atomic::AtomicBool::default(),
             persistence_refusals: AtomicUsize::default(),
@@ -823,23 +851,20 @@ impl ReadLedger {
         if 1 + keys.nodes > MAX_READ_SNAPSHOT_NODES
             || keys.referenced_keys > MAX_REFERENCED_READ_KEYS
         {
-            let snapshot = ReadSnapshot {
-                capture: self.identity.0,
-                generation: keys.generation,
-                local: Arc::clone(&keys.local),
-                inputs: keys.inputs.values().cloned().collect(),
-                nodes: 1 + keys.nodes,
-                key_entries: keys.local.table.len().saturating_add(keys.referenced_keys),
-                canonical: OnceLock::new(),
-            };
-            let mut local = LocalReadKeys::default();
-            for (hash, key) in snapshot.unique_keys() {
-                local
-                    .table
-                    .insert_unique(hash, (hash, key.clone()), |(hash, _)| *hash);
-            }
-            keys.local = Arc::new(local);
-            keys.inputs.clear();
+            // Fold only the inputs into the owned table. Rebuilding the table
+            // with its existing keys made each compaction cost the whole
+            // ledger, so a capture that absorbs many small inputs paid
+            // quadratically in its size. The table is copied only while a
+            // snapshot still shares it.
+            let inputs = std::mem::take(&mut keys.inputs);
+            let local = &mut Arc::make_mut(&mut keys.local).table;
+            visit_input_keys(inputs.values(), |hash, key| {
+                if let hashbrown::hash_table::Entry::Vacant(vacant) =
+                    local.entry(hash, |(_, previous)| previous == key, |(hash, _)| *hash)
+                {
+                    vacant.insert((hash, key.clone()));
+                }
+            });
             keys.nodes = 0;
             keys.referenced_keys = 0;
             keys.last = None;
@@ -928,6 +953,25 @@ impl ReadLedger {
         self.budget_dependences.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Mark `count` execution dependences on inputs this request pinned but a
+    /// later request cannot verify (#14322). Unlike
+    /// [`Self::mark_execution_dependent_reads`], the carried evaluation verdict
+    /// joins `RequestPinned`, not `Other`: a forwarded or replayed capture
+    /// keeps its cause on both channels. Forwarders mark the other execution
+    /// dependences with `mark_execution_dependent_reads` and these with this.
+    pub fn mark_request_pinned_dependences(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        brokk_bifrost_core::analyzer::carried_context::join_evaluation_verdict(
+            ReuseVerdict::ExecutionDependent(ExecutionCause::RequestPinned),
+        );
+        self.execution_dependences
+            .fetch_add(count, Ordering::Relaxed);
+        self.request_pinned_dependences
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     pub(crate) fn first_execution_refusal(
         &self,
     ) -> Option<brokk_bifrost_core::profiling::ReadRefusal> {
@@ -956,6 +1000,17 @@ impl ReadLedger {
     /// The execution dependences caused by a refused budget charge.
     pub fn budget_dependences(&self) -> usize {
         self.budget_dependences.load(Ordering::Relaxed)
+    }
+
+    /// The execution dependences caused by a request-pinned input.
+    pub fn request_pinned_dependences(&self) -> usize {
+        self.request_pinned_dependences.load(Ordering::Relaxed)
+    }
+
+    /// The execution dependences of every cause but a request-pinned input,
+    /// which a forwarder marks with [`Self::mark_execution_dependent_reads`].
+    pub fn unpinned_execution_dependences(&self) -> usize {
+        self.channels().unpinned_execution_dependences()
     }
 
     pub fn reuse_refused(&self) -> bool {
@@ -1005,14 +1060,19 @@ impl ReadLedger {
             0 => ReuseVerdict::Content,
             1 => ReuseVerdict::ExecutionDependent(ExecutionCause::ConfiguredCap),
             2 => ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal),
-            3 => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            3 => ReuseVerdict::ExecutionDependent(ExecutionCause::RequestPinned),
+            4 => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
             rank => unreachable!("reuse verdict rank {rank} was never encoded"),
         }
     }
 
     /// The verdict today's execution-dependence counts imply.
     pub fn ambient_verdict(&self) -> ReuseVerdict {
-        ReuseVerdict::from_counts(self.execution_dependences(), self.budget_dependences())
+        ReuseVerdict::from_counts(
+            self.execution_dependences(),
+            self.budget_dependences(),
+            self.request_pinned_dependences(),
+        )
     }
 
     #[track_caller]
@@ -1029,6 +1089,7 @@ impl ReadLedger {
             unattributed_reads: self.unattributed_reads(),
             execution_dependences: self.execution_dependences(),
             budget_dependences: self.budget_dependences(),
+            request_pinned_dependences: self.request_pinned_dependences(),
             reuse_refused: self.reuse_refused(),
             store_failed: self.store_failed(),
             persistence_refusals: self.persistence_refusals(),
@@ -1395,6 +1456,33 @@ mod tests {
     }
 
     #[test]
+    fn compaction_folds_inputs_without_changing_an_outstanding_snapshot() {
+        // Compaction folds inputs into the owned table in place; a snapshot
+        // taken earlier shares that table and must keep its own key set.
+        let ledger = ReadLedger::new();
+        let own = ReadKey::index(IndexFamily::DefinitionExact, "own");
+        ledger.record(own.clone());
+        let before = ledger.snapshot();
+        let mut expected = vec![own.clone()];
+        for index in 0..MAX_READ_SNAPSHOT_NODES {
+            let child = ReadLedger::new();
+            let key = ReadKey::index(IndexFamily::DefinitionExact, format!("child{index}"));
+            child.record(key.clone());
+            // A key the table already holds folds in once.
+            child.record(own.clone());
+            ledger.absorb_capture(&child);
+            expected.push(key);
+        }
+        assert!(ledger.keys.lock().unwrap().inputs.is_empty());
+        expected.sort();
+        assert_eq!(ledger.keys(), expected);
+        assert_eq!(before.unordered_keys(), vec![own.clone()]);
+        // The repeat shortcut must not point into the pre-compaction table.
+        ledger.record(own);
+        assert_eq!(ledger.len(), expected.len());
+    }
+
+    #[test]
     fn wide_receipts_compact_instead_of_retaining_duplicate_payloads() {
         let receipt: Arc<[ReadKey]> = (0..=MAX_REFERENCED_READ_KEYS)
             .map(|index| ReadKey::index(IndexFamily::DefinitionExact, format!("wide{index}")))
@@ -1653,6 +1741,16 @@ mod tests {
     #[test]
     fn a_lookup_question_round_trips_through_serde() {
         let questions = [
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::CSharpDependencyInputs,
+                language: Language::CSharp,
+                subject: FactSubject::Whole,
+            },
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::CSharpArtifactInputs,
+                language: Language::CSharp,
+                subject: FactSubject::Whole,
+            },
             LookupQuestion::WorkspaceFact {
                 family: WorkspaceFactFamily::CSharpCompilationMembershipCompleteness,
                 language: Language::CSharp,

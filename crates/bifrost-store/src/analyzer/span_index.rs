@@ -1,10 +1,31 @@
 //! Temporary, blob-local source span queries. No persisted or retained state.
 
+use std::cell::Cell;
+
+/// Deterministic work count for blob-local span indexing and queries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpanScanWork {
+    pub(crate) indexed_entries: usize,
+    pub(crate) query_steps: usize,
+}
+
+impl SpanScanWork {
+    pub(crate) fn record_index<T>(&mut self, index: &SpanIndex<T>) {
+        self.indexed_entries += index.indexed_entries();
+        self.query_steps += index.query_steps();
+    }
+
+    pub(crate) fn total(self) -> usize {
+        self.indexed_entries + self.query_steps
+    }
+}
+
 /// Starts are sorted for contained queries. A balanced max-end tree prunes
 /// overlap queries, including long intervals starting far before the query.
 pub(crate) struct SpanIndex<T> {
     entries: Vec<(usize, usize, T)>,
     max_end: Vec<usize>,
+    query_steps: Cell<usize>,
 }
 
 impl<T> SpanIndex<T> {
@@ -15,11 +36,24 @@ impl<T> SpanIndex<T> {
         let mut result = Self {
             max_end: vec![0; entries.len() * 4],
             entries,
+            query_steps: Cell::new(0),
         };
         if !result.entries.is_empty() {
             result.build(0, 0, result.entries.len());
         }
         result
+    }
+
+    pub(crate) fn indexed_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn query_steps(&self) -> usize {
+        self.query_steps.get()
+    }
+
+    fn record_step(&self) {
+        self.query_steps.set(self.query_steps.get() + 1);
     }
 
     fn build(&mut self, node: usize, first: usize, last: usize) -> usize {
@@ -35,10 +69,17 @@ impl<T> SpanIndex<T> {
     }
 
     pub(crate) fn contained(&self, start: usize, end: usize) -> impl Iterator<Item = &T> {
-        let first = self.entries.partition_point(|entry| entry.0 < start);
-        let last = self.entries.partition_point(|entry| entry.0 <= end);
+        let first = self.entries.partition_point(|entry| {
+            self.record_step();
+            entry.0 < start
+        });
+        let last = self.entries.partition_point(|entry| {
+            self.record_step();
+            entry.0 <= end
+        });
         self.entries[first..last]
             .iter()
+            .inspect(|_| self.record_step())
             .filter(move |entry| entry.1 <= end)
             .map(|entry| &entry.2)
     }
@@ -58,6 +99,7 @@ impl<T> SpanIndex<T> {
         query: (usize, usize),
         closed: bool,
     ) -> bool {
+        self.record_step();
         let (start, end) = query;
         if self.max_end[node] < start || self.entries[first].0 > end {
             return false;

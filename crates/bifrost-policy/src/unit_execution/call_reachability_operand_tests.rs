@@ -176,6 +176,7 @@ fn try_evaluate_with(
         depth_opt_in: false,
         workspace_files: &files,
         subject_batch: None,
+        guard_identity: None,
     };
     let mut reuse = UnitReuse::new(policy, &context, &budget, &flow);
     let mut attempt = UnitAttempt::default();

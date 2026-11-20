@@ -13,6 +13,7 @@ use crate::value_flow::{
 };
 
 use crate::analyzer::store::cache_budget::RetainedHeap;
+use crate::hash::HashMap;
 
 use super::{
     SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintSummaryResult, TaintUniverseHash,
@@ -582,6 +583,17 @@ impl TaintFindingReport {
         site_report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
         site_report.attribution = self.attribution;
         site_report
+    }
+
+    /// Release what projection no longer needs once the findings, with their
+    /// reconstructed witnesses, are final. Retained readers (policy and
+    /// CodeQuery projection, candidate certification, per-root completion)
+    /// read the findings, facts, coverage and termination; the solved rows,
+    /// IDE values and proof graph would otherwise stay live for every batch
+    /// until the request's outcome is dropped.
+    pub fn into_projected(mut self) -> Self {
+        self.result = self.result.into_verdict();
+        self
     }
 
     pub(super) fn take_findings(&mut self) -> Box<[TaintFinding]> {
@@ -1204,13 +1216,24 @@ fn collect_taint_findings_internal(
         attribution_start,
     };
     let mut omitted_findings_lower_bound = 0usize;
-    for point_value in result.point_values() {
+    // Several meeting states of one sink can reach it along the same steps,
+    // for example once through each dispatch arm of a call on the path.
+    // Reconstructing a witness for each spends the retained-witness budget on
+    // paths that add nothing to the finding (#14210). Visit each (sink,
+    // meeting uncertainty)'s nondominated meetings in a first pass, so a
+    // dominated meeting in the second pass usually finds a stronger finding
+    // already collected and can skip its witness walk below. The order only
+    // saves work; the skip itself checks the collected finding. The frontier
+    // map is bounded by the plan's sink bindings, not by the solve.
+    // The meeting a point value reports, if it reaches an accepted sink.
+    let meeting = |index: usize| -> Result<_, TaintFindingError> {
+        let point_value = &result.point_values()[index];
         let fact = *result
             .fact_result()
             .fact(point_value.fact())
             .ok_or(TaintFindingError::InvalidResult)?;
         let Some(sink) = fact.sink() else {
-            continue;
+            return Ok(None);
         };
         let Some(binding) = plan.sink(sink) else {
             return Err(TaintFindingError::InvalidResult);
@@ -1220,6 +1243,49 @@ fn collect_taint_findings_internal(
             .ok_or(TaintFindingError::InvalidResult)?;
         let classes = value.intersection(binding.accepted());
         if classes.is_empty() {
+            return Ok(None);
+        }
+        // The solver's frontier describes retained transfers. Source/meeting
+        // uncertainty is independent of those native steps and must also be
+        // visible in the observed finding, as in source-qualified replay.
+        let observation_quality = if fact.is_uncertain() {
+            crate::dataflow::PathQuality::UNPROVEN_PARTIAL
+        } else {
+            crate::dataflow::PathQuality::PROVEN_COMPLETE
+        };
+        let mut path_qualities = PathQualityFrontier::default();
+        for quality in point_value.path_qualities().iter() {
+            path_qualities.insert(quality.conjoin(observation_quality));
+        }
+        Ok(Some((point_value, fact, sink, classes, path_qualities)))
+    };
+    let mut sink_frontiers: HashMap<(ValueFlowSinkId, bool), PathQualityFrontier> =
+        HashMap::default();
+    for index in 0..result.point_values().len() {
+        if let Some((_, fact, sink, _, path_qualities)) = meeting(index)? {
+            let frontier = sink_frontiers
+                .entry((sink, fact.is_uncertain()))
+                .or_default();
+            for quality in path_qualities.iter() {
+                frontier.insert(quality);
+            }
+        }
+    }
+    let on_frontier = |uncertain: bool, sink, path_qualities: &PathQualityFrontier| {
+        let frontier = &sink_frontiers[&(sink, uncertain)];
+        path_qualities
+            .iter()
+            .any(|quality| frontier.contains(quality))
+    };
+    for (pass, index) in [false, true]
+        .into_iter()
+        .flat_map(|pass| (0..result.point_values().len()).map(move |index| (pass, index)))
+    {
+        let Some((point_value, fact, sink, classes, path_qualities)) = meeting(index)? else {
+            continue;
+        };
+        // The first pass visits frontier meetings, the second the rest.
+        if on_frontier(fact.is_uncertain(), sink, &path_qualities) == pass {
             continue;
         }
         let mut model_receipt = result
@@ -1273,6 +1339,41 @@ fn collect_taint_findings_internal(
             meeting_site: sink_spec.key().site().clone(),
             meeting_uncertain: fact.is_uncertain(),
         };
+        // A certain finding for this key whose evidence already names every
+        // source of the plan with all of that source's classes and all of the
+        // classes reached here, and which holds a path at least as strong, is
+        // all this meeting could add: baseline origins are plan sources (taint
+        // classes are labels, which several sources may share), so the walk
+        // could name no new origin or class, and its paths are dominated. Keep
+        // its receipt without walking a witness.
+        if let Some(existing) = findings.iter_mut().find(|existing: &&mut TaintFinding| {
+            existing.key == key
+                && existing.origins.is_complete()
+                && !existing.origins.evidence().is_empty()
+                && plan.sources().iter().all(|source| {
+                    existing.origins.evidence().iter().any(|evidence| {
+                        evidence.origin() == source.origin()
+                            && evidence.classes().intersection(source.classes())
+                                == *source.classes()
+                            && evidence.reached_classes().intersection(&classes) == classes
+                    })
+                })
+                && existing
+                    .origins
+                    .evidence()
+                    .iter()
+                    .all(TaintOriginFindingEvidence::has_certain_path)
+                && classes.intersection(&existing.classes) == classes
+                && path_qualities.iter().all(|quality| {
+                    existing
+                        .path_qualities
+                        .iter()
+                        .any(|stronger| stronger.dominates(quality))
+                })
+        }) {
+            existing.merge_model_receipt(&model_receipt);
+            continue;
+        }
         if findings.len() == budget.limits.max_findings {
             if let Some(existing) = findings
                 .iter_mut()
@@ -1294,18 +1395,6 @@ fn collect_taint_findings_internal(
             witness_limits,
             &mut budget,
         )?;
-        // The solver's frontier describes retained transfers. Source/meeting
-        // uncertainty is independent of those native steps and must also be
-        // visible in the observed finding, as in source-qualified replay.
-        let mut path_qualities = PathQualityFrontier::default();
-        let observation_quality = if fact.is_uncertain() {
-            crate::dataflow::PathQuality::UNPROVEN_PARTIAL
-        } else {
-            crate::dataflow::PathQuality::PROVEN_COMPLETE
-        };
-        for quality in point_value.path_qualities().iter() {
-            path_qualities.insert(quality.conjoin(observation_quality));
-        }
         let certain_path = !fact.is_uncertain()
             && result.termination().is_fixed_point()
             && origins.is_complete()

@@ -133,6 +133,10 @@ mod tests {
         SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
     };
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn unit_access_same_language_path_shortcut_skips_the_relation() {
         use super::super::placement_access::PlacementSubject;
         use super::super::selected_sql_trace::{

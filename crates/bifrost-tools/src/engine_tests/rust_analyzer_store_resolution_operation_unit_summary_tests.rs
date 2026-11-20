@@ -12,6 +12,10 @@ mod rust_departing_root_tests {
     /// names a Rust repository copy.
     #[test]
     #[ignore = "operator measurement: needs BIFROST_UNIT_SUMMARY_RUST_CORPUS, a Rust repository"]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn measure_rust_crate_reconcile_on_a_corpus() {
         let root = std::path::PathBuf::from(
             std::env::var("BIFROST_UNIT_SUMMARY_RUST_CORPUS")

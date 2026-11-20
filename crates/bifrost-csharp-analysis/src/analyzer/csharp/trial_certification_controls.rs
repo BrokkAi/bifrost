@@ -17,6 +17,10 @@ fn fixture() -> (BuiltInlineTestProject, CSharpAnalyzer) {
 #[test]
 #[cfg(unix)]
 #[hardwon("#12280: omitted projects and compile roots certified stale compilation membership")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn omitted_configuration_and_compile_roots_refuse_certification() {
     for (sdk, body, props, omitted, file, expected) in [
         (
@@ -128,6 +132,10 @@ fn omitted_configuration_and_compile_roots_refuse_certification() {
 
 #[test]
 #[hardwon("#8837: native C# readers used selected membership without the configuration fact")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn selected_configuration_certifies_cold_and_hot() {
     let (_fixture, analyzer) = fixture();
     let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
@@ -155,6 +163,10 @@ fn selected_configuration_certifies_cold_and_hot() {
 #[test]
 #[cfg(any(unix, windows))]
 #[hardwon("#12280: an omitted configuration symlink still certified persisted C# membership")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn configuration_symlink_refuses_certification_with_identical_inputs() {
     let (fixture, _) = fixture();
     let contents = "<Project />";
@@ -213,6 +225,10 @@ fn configuration_symlink_refuses_certification_with_identical_inputs() {
 #[hardwon(
     "#12280: an omitted symlink at an explicit non-.cs Compile item left the compilation certified complete"
 )]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn omitted_explicit_non_cs_compile_item_refuses_certification() {
     // (certificate, workspace content key before, workspace content key after)
     let observe = |link: &str| {
@@ -268,6 +284,10 @@ fn omitted_explicit_non_cs_compile_item_refuses_certification() {
 
 #[test]
 #[hardwon("#8837: native C# readers used selected membership without the configuration fact")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn stale_selected_configuration_is_uncertified() {
     let (_fixture, analyzer) = fixture();
     let snapshot = analyzer.inner.selected_workspace_snapshots()["csharp"].clone();
@@ -288,6 +308,10 @@ fn stale_selected_configuration_is_uncertified() {
 
 #[test]
 #[hardwon("#8837: native C# readers used selected membership without the configuration fact")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn oversized_configuration_cannot_certify() {
     let (fixture, initial) = fixture();
     let snapshot = initial.inner.selected_workspace_snapshots()["csharp"].clone();
@@ -313,6 +337,10 @@ fn oversized_configuration_cannot_certify() {
 
 #[test]
 #[hardwon("#8837: native C# readers used selected membership without the configuration fact")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn unsaved_configuration_overlay_refuses_reuse() {
     use brokk_bifrost_core::analyzer::project::OverlayProject;
     let (fixture, initial) = fixture();
@@ -351,6 +379,10 @@ fn unsaved_configuration_overlay_refuses_reuse() {
 
 #[test]
 #[hardwon("#8837: native C# readers used selected membership without the configuration fact")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn absent_configuration_becoming_present_changes_identity() {
     let (fixture, initial) = fixture();
     let old_identity = *initial.compilation_input_digest().unwrap().as_bytes();
@@ -385,6 +417,10 @@ fn absent_configuration_becoming_present_changes_identity() {
 #[test]
 #[cfg(unix)]
 #[hardwon("#12546: open membership still proved Visible")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn hidden_directory_opens_membership_without_changing_configuration() {
     use brokk_bifrost_analysis::analyzer::capture_query_reads;
     use brokk_bifrost_analysis::analyzer::usages::get_definition::{

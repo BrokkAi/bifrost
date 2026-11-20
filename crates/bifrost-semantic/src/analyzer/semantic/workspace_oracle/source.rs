@@ -173,13 +173,15 @@ pub fn call_row_has_exact_bytes(
 pub fn procedure_dispatch_components_digest(
     coverage: CandidateCoverage,
     complete_receiver_hint_refinable: bool,
+    family: StableDigest,
     candidates: &mut [StableDigest],
     boundaries: &mut [StableDigest],
 ) -> StableDigest {
     let mut digest =
-        LengthDelimitedDigest::new(b"bifrost-read-ledger:procedure-dispatch-observation:v2");
+        LengthDelimitedDigest::new(b"bifrost-read-ledger:procedure-dispatch-observation:v3");
     digest.push(coverage.label().as_bytes());
     digest.push(&[u8::from(complete_receiver_hint_refinable)]);
+    digest.push(family.as_bytes());
 
     candidates.sort_unstable();
     digest.push(

@@ -5304,6 +5304,9 @@ impl RustTypeContext<'_, '_> {
             start_line: invocation.start_position().row + 1,
             end_line: invocation.end_position().row + 1,
         };
+        let mut special_dispatch_memos =
+            brokk_bifrost_analysis::analyzer::usages::call_relations::SpecialDispatchMemos::default(
+            );
         let Some(answer) = super::format_macro_dispatch::dispatch(
             brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLanguageRequest {
                 analyzer: self.analyzer,
@@ -5316,6 +5319,7 @@ impl RustTypeContext<'_, '_> {
                 member_selection: None,
                 cancellation: None,
                 work: Default::default(),
+                special_dispatch_memos: &mut special_dispatch_memos,
             },
             self.selected,
         ) else {
@@ -8177,7 +8181,10 @@ mod tests {
     )]
     fn residual_conversion_compares_external_errors_by_canonical_model_identity() {
         use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
-        let source = "pub struct Local;\nfn external() -> std::result::Result<String, std::io::Error> {\n    let _ = std::fs::read_to_string(\"x\")?;\n    Ok(String::new())\n}\nfn mixed() -> std::result::Result<String, Local> {\n    let _ = std::fs::read_to_string(\"x\")?;\n    Ok(String::new())\n}\n";
+        // This test owns model-error identity and pack-only invalidation.
+        // Use the admitted prelude carrier; #13559 separately pins refusal
+        // of qualified roots without a complete canonical crate receipt.
+        let source = "pub struct Local;\nfn external() -> Result<String, std::io::Error> {\n    let _ = std::fs::read_to_string(\"x\")?;\n    Ok(String::new())\n}\nfn mixed() -> Result<String, Local> {\n    let _ = std::fs::read_to_string(\"x\")?;\n    Ok(String::new())\n}\n";
         let (_fixture, analyzer) = super::super::test_support::certified_project(&[
             (
                 "Cargo.toml",
@@ -8321,6 +8328,7 @@ mod tests {
             });
         }
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: vec![],
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -8334,7 +8342,8 @@ mod tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls,
             limits: SemanticModelRuntimeLimits::default(),
@@ -9190,6 +9199,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13575: product reuse refusal dropped the request-local expression memo"
+    )]
     fn external_nominal_pack_only_change_matches_cold_and_keeps_ambiguity_partial() {
         use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
         let pack = external_nominal_pack();

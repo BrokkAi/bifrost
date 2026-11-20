@@ -6,8 +6,8 @@ use crate::analyzer::semantic::{
 use brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict;
 
 #[derive(Debug)]
-pub struct DetailedCodeQueryResult {
-    pub result: CodeQueryResult,
+pub struct DetailedQueryResult<I> {
+    pub result: QueryResult<I>,
     pub work: CodeQueryExecutionWork,
     /// The budgeted lanes `work` does not publish, for a caller that merges
     /// several executions and must see every cumulative cap.
@@ -28,7 +28,19 @@ pub struct DetailedCodeQueryResult {
     pub reuse: ReuseVerdict,
 }
 
-impl CarriesReuseVerdict for DetailedCodeQueryResult {
+pub type DetailedCodeQueryResult = DetailedQueryResult<CodeQueryResultItem>;
+
+impl<I> DetailedQueryResult<I> {
+    /// Drop per-step no-rows advisories and clear step attribution on the
+    /// remaining diagnostics. A policy run reports on the meaning of its rows,
+    /// not on how an interactive query behaved, and step attribution differs
+    /// between whole and unit-sliced executions of the same query.
+    pub fn strip_step_attribution(&mut self) {
+        CodeQueryDiagnostic::strip_step_attribution(self.result.diagnostics.semantic_mut());
+    }
+}
+
+impl<I> CarriesReuseVerdict for DetailedQueryResult<I> {
     fn reuse_verdict(&self) -> ReuseVerdict {
         self.reuse
     }
@@ -2132,6 +2144,45 @@ detailed_row_domains! {
                     ),
         ],
     },
+    FieldWrite => "field_write" {
+        display_range: |value| Some(value.range),
+        // A field write is identified by its own content-scoped digest;
+        // it is not artifact-backed, so it carries no semantic identity.
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required("field_id", Scalar::StableId),
+                    CodeQueryRowField::required("member_fq_name", Scalar::String),
+                    CodeQueryRowField::required("enclosing", Scalar::String),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required("program_point_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::EVIDENCE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required("strong_update", Scalar::Boolean),
+        ],
+    },
+    FieldRead => "field_read" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required("field_id", Scalar::StableId),
+                    CodeQueryRowField::required("member_fq_name", Scalar::String),
+                    CodeQueryRowField::required("enclosing", Scalar::String),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required("program_point_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::EVIDENCE_COMPLETENESS
+                    ),
+        ],
+    },
     RuntimeKeyedReadValue => "keyed_read_value" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -3666,6 +3717,8 @@ detailed_row_domains! {
                         &["less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal"]
                     ),
                     CodeQueryRowField::optional("constant_value", Scalar::Integer),
+                    CodeQueryRowField::optional("left_value", Scalar::Integer),
+                    CodeQueryRowField::optional("right_value", Scalar::Integer),
                     CodeQueryRowField::optional("guarded_value", Scalar::Integer),
                     CodeQueryRowField::optional("classes_value", Scalar::Integer),
                     CodeQueryRowField::optional("member_value", Scalar::Integer),
@@ -3850,38 +3903,48 @@ impl<'a> CodeQueryRowRef<'a> {
         self,
         name: &str,
     ) -> Result<Option<CodeQueryRowScalarRef<'a>>, CodeQueryRowFieldError> {
-        let Some(schema) = self.fields().iter().find(|field| field.name == name) else {
-            return Err(CodeQueryRowFieldError::unregistered(self.domain(), name));
-        };
-        if name == "conversion"
-            && let CodeQueryResultValue::CallBinding { value } = self.value
-            && let Some(reason) = value.conversion_reason
-        {
-            return Err(CodeQueryRowFieldError::unknown(
-                self.domain(),
-                name,
-                CodeQueryRowFieldUnknownReason::CallConversion(reason),
-            ));
-        }
-        let value = project_code_query_row_field(self.value, name);
-        debug_assert!(
-            value.is_none() || value.is_some_and(|value| value.scalar_type() == schema.scalar_type),
-            "registered CodeQuery row field projector returned the wrong scalar type"
-        );
-        debug_assert!(
-            schema.nullable || value.is_some(),
-            "required CodeQuery row field `{}.{}` projected no value",
-            self.domain().label(),
-            schema.name
-        );
-        debug_assert!(
-            field_value_is_in_domain(*schema, value),
-            "CodeQuery row field `{}.{}` projected a value outside its registered domain: {value:?}",
-            self.domain().label(),
-            schema.name
-        );
-        Ok(value)
+        checked_row_scalar(self.domain(), name, || {
+            if name == "conversion"
+                && let CodeQueryResultValue::CallBinding { value } = self.value
+                && let Some(reason) = value.conversion_reason
+            {
+                return Err(CodeQueryRowFieldUnknownReason::CallConversion(reason));
+            }
+            Ok(project_code_query_row_field(self.value, name))
+        })
     }
+}
+
+/// Validate every scalar producer against the one registered row surface.
+/// Native execution and already presented rows preserve the same distinction
+/// between absent optional data and evidence that is unavailable.
+pub(in crate::structural::search) fn checked_row_scalar<'a>(
+    domain: DetailedCodeQueryDomain,
+    name: &str,
+    project: impl FnOnce() -> Result<Option<CodeQueryRowScalarRef<'a>>, CodeQueryRowFieldUnknownReason>,
+) -> Result<Option<CodeQueryRowScalarRef<'a>>, CodeQueryRowFieldError> {
+    let Some(schema) = domain.row_fields().iter().find(|field| field.name == name) else {
+        return Err(CodeQueryRowFieldError::unregistered(domain, name));
+    };
+    let value =
+        project().map_err(|reason| CodeQueryRowFieldError::unknown(domain, name, reason))?;
+    debug_assert!(
+        value.is_none() || value.is_some_and(|value| value.scalar_type() == schema.scalar_type),
+        "registered CodeQuery row field projector returned the wrong scalar type"
+    );
+    debug_assert!(
+        schema.nullable || value.is_some(),
+        "required CodeQuery row field `{}.{}` projected no value",
+        domain.label(),
+        schema.name
+    );
+    debug_assert!(
+        field_value_is_in_domain(*schema, value),
+        "CodeQuery row field `{}.{}` projected a value outside its registered domain: {value:?}",
+        domain.label(),
+        schema.name
+    );
+    Ok(value)
 }
 
 /// Whether one projected scalar respects the value domain its field declares.
@@ -4487,6 +4550,59 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::FieldWriteValue { value }, "coverage") => {
             Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::FieldWrite { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "field_id") => {
+            Some(Scalar::StableId(&value.field_id))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "member_fq_name") => {
+            Some(Scalar::String(&value.member_fq_name))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "enclosing") => {
+            Some(Scalar::String(&value.enclosing))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "program_point_id") => {
+            Some(Scalar::StableId(&value.program_point_id))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::FieldWrite { value }, "strong_update") => {
+            Some(Scalar::Boolean(value.strong_update))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::FieldRead { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "field_id") => {
+            Some(Scalar::StableId(&value.field_id))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "member_fq_name") => {
+            Some(Scalar::String(&value.member_fq_name))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "enclosing") => {
+            Some(Scalar::String(&value.enclosing))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "program_point_id") => {
+            Some(Scalar::StableId(&value.program_point_id))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::FieldRead { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
         }
         (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -7205,6 +7321,12 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::Guard { value }, "constant_value") => {
             value.constant_value.map(Scalar::Integer)
         }
+        (CodeQueryResultValue::Guard { value }, "left_value") => {
+            value.left_value.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::Guard { value }, "right_value") => {
+            value.right_value.map(Scalar::Integer)
+        }
         (CodeQueryResultValue::Guard { value }, "guarded_value") => {
             value.guarded_value.map(Scalar::Integer)
         }
@@ -7588,6 +7710,16 @@ pub enum DetailedCodeQueryKey {
         receiver_identity_id: String,
         member_target_id: String,
     },
+    FieldWrite {
+        id: String,
+        procedure_id: String,
+        program_point_id: String,
+    },
+    FieldRead {
+        id: String,
+        procedure_id: String,
+        program_point_id: String,
+    },
     RuntimeKeyedReadValue {
         id: String,
     },
@@ -7884,11 +8016,13 @@ pub enum DetailedCodeQueryExportLocalDefinition {
     Unknown,
 }
 
-impl DetailedCodeQueryResult {
+impl<I> DetailedQueryResult<I> {
     pub fn take_semantic_receipt(&mut self) -> Option<CodeQuerySemanticReceipt> {
         self.semantic_receipt.take()
     }
+}
 
+impl DetailedCodeQueryResult {
     pub(in super::super) fn assert_invariants(&self) {
         if let Some(profile) = &self.profile {
             assert!(
@@ -8323,6 +8457,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReferenceEdge { .. }
         | CodeQueryResultValue::StateEvent { .. }
         | CodeQueryResultValue::BindingInitializerCall { .. }
+        | CodeQueryResultValue::FieldWrite { .. }
+        | CodeQueryResultValue::FieldRead { .. }
         | CodeQueryResultValue::FlowRelation { .. }
         | CodeQueryResultValue::ControlRelation { .. }
         | CodeQueryResultValue::BranchRelation { .. }
@@ -8450,6 +8586,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReferenceEdge { .. }
         | DetailedCodeQueryKey::StateEvent { .. }
         | DetailedCodeQueryKey::BindingInitializerCall { .. }
+        | DetailedCodeQueryKey::FieldWrite { .. }
+        | DetailedCodeQueryKey::FieldRead { .. }
         | DetailedCodeQueryKey::FlowRelation { .. }
         | DetailedCodeQueryKey::ControlRelation { .. }
         | DetailedCodeQueryKey::BranchRelation { .. }

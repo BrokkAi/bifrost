@@ -25,7 +25,7 @@ fn publish<A: LanguageAdapter>(
     file: &ProjectFile,
     adapter: &A,
 ) -> DumpResult<Option<String>> {
-    let generation = store.ensure_language_epoch(adapter.language(), &adapter.parser_language())?;
+    let generation = store.ensure_language_epoch(adapter)?;
     let source = file.read_to_string()?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&adapter.parser_language_for_file(file))?;
@@ -66,6 +66,10 @@ fn publish<A: LanguageAdapter>(
 
 #[test]
 #[ignore = "before/after developer tool; requires explicit source tree and output"]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn dump_stored_structural_rows() -> DumpResult<()> {
     let root = PathBuf::from(std::env::var("BIFROST_STRUCTURAL_DUMP_ROOT")?);
     assert!(root.is_absolute(), "dump input root must be absolute");

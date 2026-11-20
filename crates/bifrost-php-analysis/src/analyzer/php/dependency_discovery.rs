@@ -321,7 +321,8 @@ fn resolve_evidence(
                 toolchain: None,
                 target: None,
                 configuration: Some(evidence.php_version.clone()),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: package_provenance(package, evidence, &install_dir),
             artifacts,
@@ -1094,7 +1095,8 @@ pub(crate) fn declared_php_runtime_dependency(
             // configuration, so both stay unpinned.
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
         provenance: vec![
             provenance_entry("php.toolchain_declaration", source_file),

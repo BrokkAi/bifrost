@@ -582,6 +582,7 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.extend([
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(0),
@@ -590,6 +591,7 @@ pub mod tests {
                     evidence,
                 },
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(1),
@@ -716,6 +718,7 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.extend([
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(0),
@@ -724,6 +727,7 @@ pub mod tests {
                     evidence,
                 },
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(1),
@@ -771,6 +775,7 @@ pub mod tests {
         });
         parts.values.extend([
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(0),
@@ -779,6 +784,7 @@ pub mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(1),
@@ -928,6 +934,18 @@ pub mod tests {
         )
         .expect_err("a broad point gap cannot legitimize an unbound capture slot");
         assert_eq!(error.kind(), SemanticIrErrorKind::CaptureContract);
+        // #13027: artifact-local IDs alone cannot be traced back to source.
+        let source = error
+            .source_locator()
+            .expect("the capture error names its source construct");
+        assert_eq!(source.path().as_str(), "src/Test.java");
+        assert_eq!(source.declaration().last_segment_name(), Some("child"));
+        assert!(
+            error.to_string().starts_with(
+                "semantic IR capture_contract error in procedure 1 at src/Test.java:1:"
+            ),
+            "{error}"
+        );
 
         child.gaps[0].subject = SemanticGapSubject::MemoryLocation(MemoryLocationId::new(0));
         SemanticArtifact::try_new(
@@ -1040,6 +1058,7 @@ pub mod tests {
         });
         outer.values.extend([
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(0),
@@ -1048,6 +1067,7 @@ pub mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(1),
@@ -1262,6 +1282,7 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.extend([
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(0),
@@ -1270,6 +1291,7 @@ pub mod tests {
                     evidence,
                 },
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(1),
@@ -1278,6 +1300,7 @@ pub mod tests {
                     evidence,
                 },
                 SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(2),
@@ -1418,6 +1441,7 @@ pub mod tests {
             let source = SourceMappingId::new(0);
             let evidence = EvidenceId::new(0);
             parts.values.push(SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(0),
@@ -1479,6 +1503,7 @@ pub mod tests {
         let key = key();
         let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);
         outer.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(0),
@@ -1623,6 +1648,7 @@ pub mod tests {
         let mut child = minimal_procedure(&key, ProcedureId::new(1), "lambda", 3);
         child.lexical_parent = Some(ProcedureId::new(0));
         parts.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(0),
@@ -1687,6 +1713,7 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             if matches!(subject, SemanticGapSubject::Value(_)) {
                 parts.values.push(SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(0),
@@ -1818,6 +1845,7 @@ pub mod tests {
             Some((source_locator.path(), source_locator.anchor()))
         );
         parts.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(0),
@@ -1882,6 +1910,7 @@ pub mod tests {
         let source = SourceMappingId::new(0);
         let evidence = EvidenceId::new(0);
         parts.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(0),
@@ -1964,6 +1993,7 @@ pub mod tests {
         ]);
         let mut invalid_keyword = parts.clone();
         invalid_keyword.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(1),
@@ -2017,6 +2047,7 @@ pub mod tests {
 
         let mut singular_result = valid_detached.clone();
         singular_result.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(1),
@@ -2029,6 +2060,7 @@ pub mod tests {
         let mut indexed_results = valid_detached.clone();
         indexed_results.values.extend([
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(1),
@@ -2037,6 +2069,7 @@ pub mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(2),
@@ -2049,6 +2082,7 @@ pub mod tests {
 
         let mut thrown = valid_detached.clone();
         thrown.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(1),
@@ -2321,6 +2355,7 @@ pub mod tests {
         let source = SourceMappingId::new(0);
         let evidence = EvidenceId::new(0);
         parts.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(0),
@@ -2571,6 +2606,7 @@ pub mod tests {
     #[cfg(test)]
     fn parameter_value(id: u32, ordinal: u32, multiplicity: FormalMultiplicity) -> SemanticValue {
         SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(id),
@@ -2588,6 +2624,7 @@ pub mod tests {
     #[cfg(test)]
     fn default_argument_value(id: u32, ordinal: u32) -> SemanticValue {
         SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(id),
@@ -2806,6 +2843,7 @@ pub mod tests {
         let evidence = EvidenceId::new(0);
         parts.values.extend([
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(0),
@@ -2814,6 +2852,7 @@ pub mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(1),
@@ -2822,6 +2861,7 @@ pub mod tests {
                 evidence,
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(2),
@@ -2962,6 +3002,7 @@ pub mod tests {
             let key = key();
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.push(SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(0),
@@ -3031,6 +3072,7 @@ pub mod tests {
         let evidence = EvidenceId::new(0);
         for id in [ValueId::new(0), ValueId::new(1)] {
             parts.values.push(SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id,
@@ -3292,7 +3334,7 @@ pub mod tests {
         let error = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
             .expect_err("one scoped fact cannot have two gap rows");
         assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
-        assert!(error.detail().contains("src/Test.java"), "{error}");
+        assert!(error.to_string().contains(" at src/Test.java:"), "{error}");
         assert!(
             error.detail().contains("gap 1 (second assignment gap)"),
             "{error}"
@@ -3310,6 +3352,7 @@ pub mod tests {
         let omitted = procedure_locator(&key, "omitted", 7);
         let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
         parts.values.push(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id: ValueId::new(0),
@@ -3710,6 +3753,7 @@ mod unbounded_production_regression {
         let build = || {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "large", 1);
             parts.values.push(SemanticValue {
+                actual_borrow: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::ConstantString(
                     "x".repeat(33 * 1024 * 1024).into_boxed_str(),

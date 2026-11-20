@@ -45,8 +45,81 @@ fn digest(bytes: Vec<u8>) -> Result<StableDigest> {
     )?))
 }
 
+/// One census macro boundary as the answer queries emit it (columns 6 to 9 of a
+/// kind 2 row). `None` for any column means the file was extracted before the
+/// path was recorded, and nothing about it can be certified.
+pub(super) struct RustCensusMacroBoundary {
+    absolute: Option<bool>,
+    shadow_possible: Option<bool>,
+    path: Option<Vec<String>>,
+    environment_open: Option<bool>,
+}
+
+impl RustCensusMacroBoundary {
+    pub(super) fn from_row(row: &rusqlite::Row<'_>) -> Result<Self> {
+        Ok(Self {
+            absolute: row.get(6)?,
+            shadow_possible: row.get(7)?,
+            path: row
+                .get::<_, Option<String>>(8)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|error| {
+                    StoreError::corrupt(format!("invalid Rust census macro path: {error}"))
+                })?,
+            environment_open: row.get(9)?,
+        })
+    }
+
+    /// Whether this invocation is a standard macro that the shared owner
+    /// certifies as introducing no items, so it need not keep the crate's
+    /// census open. Without a selected standard library the audit does not
+    /// apply, and every other shape (absolute path, possible import shadow,
+    /// open crate environment, unknown path) fails closed.
+    pub(super) fn is_item_free(&self, selected_stdlib_revision: Option<&str>) -> bool {
+        use brokk_bifrost_rust::macro_matcher::{
+            StandardMacroAuthority, StandardMacroIdentity, StandardMacroResolution,
+            certify_standard_macro,
+        };
+        /// The structured census queries already exclude source shadows, open
+        /// environments and qualified roots owned by selected Cargo dependencies,
+        /// so the syntactic path decides.
+        struct ClosedCrate;
+        impl StandardMacroAuthority for ClosedCrate {
+            fn resolution(&self) -> StandardMacroResolution<'_> {
+                StandardMacroResolution::Unresolved
+            }
+            fn exact_is_locally_bound(&self) -> bool {
+                false
+            }
+            fn lexical_shadow(&self, _: &str) -> Option<StandardMacroIdentity> {
+                None
+            }
+            fn prelude_shadow(&self, _: &str) -> Option<StandardMacroIdentity> {
+                None
+            }
+            fn root_shadow(&self, _: &str) -> Option<StandardMacroIdentity> {
+                None
+            }
+        }
+        let (Some(revision), Some(false), Some(false), Some(path), Some(false)) = (
+            selected_stdlib_revision,
+            self.absolute,
+            self.shadow_possible,
+            self.path.as_ref(),
+            self.environment_open,
+        ) else {
+            return false;
+        };
+        let names = path.iter().map(String::as_str).collect::<Vec<_>>();
+        let identity = certify_standard_macro(&names, &ClosedCrate);
+        brokk_bifrost_rust::format_args::rust_std_macro_expands_to_no_items(&identity, revision)
+    }
+}
+
 impl AnalyzerStore {
     /// Whether one changed overlay path is an input to this canonical crate.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_drop_inventory_overlay_affects(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -94,6 +167,7 @@ impl AnalyzerStore {
 
     /// Select one owning unit and nominal placement. The configuration digest
     /// hashes scalar selection context, never topology or summary content.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_drop_inventory_subject(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -163,6 +237,12 @@ pub struct RustDropCrateInventory {
     witnesses: std::collections::HashMap<(StableDigest, Box<str>, StableDigest), StableDigest>,
     unverified_subjects: std::collections::HashSet<(StableDigest, Box<str>, StableDigest)>,
     stopped: bool,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for RustDropCrateInventory {
+    fn retained_bytes(&self) -> usize {
+        RustDropCrateInventory::retained_bytes(self)
+    }
 }
 
 impl RustDropCrateInventory {
@@ -251,6 +331,7 @@ impl AnalyzerStore {
         &self,
         snapshots: &WorkspaceSnapshots,
         subject: &RustDropInventorySubject,
+        selected_stdlib_revision: Option<&str>,
         cancellation: &CancellationToken,
         charge_row: impl FnMut(),
     ) -> Result<Option<(RustDropInventory, usize)>> {
@@ -258,6 +339,7 @@ impl AnalyzerStore {
             snapshots,
             subject.owning_unit,
             subject.config_digest,
+            selected_stdlib_revision,
             cancellation,
             charge_row,
         )?
@@ -275,11 +357,13 @@ impl AnalyzerStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_drop_inventory_crate(
         &self,
         snapshots: &WorkspaceSnapshots,
         owning_unit: StableDigest,
         config_digest: StableDigest,
+        selected_stdlib_revision: Option<&str>,
         cancellation: &CancellationToken,
         mut charge_row: impl FnMut(),
     ) -> Result<Option<(RustDropCrateInventory, usize)>> {
@@ -329,7 +413,7 @@ impl AnalyzerStore {
                 let columns: &[usize] = match row_kind {
                     0 => &[],
                     1 => &[1, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-                    2 => &[1, 4],
+                    2 => &[1, 4, 6, 7, 8, 9],
                     3 => &[1, 4, 5, 8],
                     4 => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
                     5 => &[1, 2],
@@ -434,10 +518,16 @@ impl AnalyzerStore {
                             put(3, RustDropInventoryReason::ModuleUniverseOpen);
                         }
                     }
-                    2 => put(
-                        2,
-                        RustDropInventoryReason::Boundary(row.get::<_, i64>(4)? as u8),
-                    ),
+                    2 => {
+                        let kind = row.get::<_, i64>(4)?;
+                        // Only a macro boundary (kind 0) can be certified item-free.
+                        if kind != 0
+                            || !RustCensusMacroBoundary::from_row(row)?
+                                .is_item_free(selected_stdlib_revision)
+                        {
+                            put(2, RustDropInventoryReason::Boundary(kind as u8));
+                        }
+                    }
                     3 => {
                         if row.get::<_, i64>(8)? != 0 {
                             put(0, RustDropInventoryReason::NegatedImpl);
@@ -538,6 +628,12 @@ impl AnalyzerStore {
             Ok(Some(row_count))
         });
         let mut crate_hash = CanonicalHasher::new(b"bifrost:rust-drop-crate-inventory:v1");
+        // The certification depends on the audited standard library, so the
+        // answer's identity binds the revision it was computed under.
+        crate_hash.field(
+            "selected_stdlib_revision",
+            selected_stdlib_revision.unwrap_or_default().as_bytes(),
+        );
         for digest in placement_digests {
             crate_hash.value(&digest);
         }
@@ -555,6 +651,67 @@ impl AnalyzerStore {
                 Ok(Some((inventory, charged)))
             }
             other => other.map(|result| result.map(|rows| (inventory, rows))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod macro_boundary_tests {
+    use super::RustCensusMacroBoundary;
+    use brokk_bifrost_rust::macro_matcher::ITEM_FREE_MACRO_STDLIB_REVISION as AUDITED;
+
+    fn boundary(path: &[&str]) -> RustCensusMacroBoundary {
+        RustCensusMacroBoundary {
+            absolute: Some(false),
+            shadow_possible: Some(false),
+            path: Some(path.iter().map(|segment| (*segment).to_owned()).collect()),
+            environment_open: Some(false),
+        }
+    }
+
+    /// One table for the decision both census readers share: only a syntactic
+    /// standard macro path, with no possible shadow and an open-free crate
+    /// environment, under the audited standard library, leaves the census.
+    #[test]
+    fn only_certified_standard_macros_leave_the_census() {
+        for path in [
+            &["format"][..],
+            &["vec"],
+            &["println"],
+            &["std", "format"],
+            &["alloc", "vec"],
+            &["core", "write"],
+        ] {
+            assert!(boundary(path).is_item_free(Some(AUDITED)), "{path:?}");
+        }
+        for path in [
+            &["log", "warn"][..],
+            &["include"],
+            &["matches"],
+            &["concat"],
+            &["cfg_if"],
+            &["v"],
+            &["crate", "format"],
+            &["std", "collections", "format"],
+            &[],
+        ] {
+            assert!(!boundary(path).is_item_free(Some(AUDITED)), "{path:?}");
+        }
+        let std_format = &["std", "format"][..];
+        assert!(!boundary(std_format).is_item_free(None));
+        assert!(!boundary(std_format).is_item_free(Some("another-revision")));
+        let mut open = boundary(std_format);
+        open.absolute = Some(true);
+        assert!(!open.is_item_free(Some(AUDITED)));
+        for field in 0..4 {
+            let mut open = boundary(std_format);
+            match field {
+                0 => open.absolute = None,
+                1 => open.shadow_possible = Some(true),
+                2 => open.path = None,
+                _ => open.environment_open = Some(true),
+            }
+            assert!(!open.is_item_free(Some(AUDITED)), "field {field}");
         }
     }
 }

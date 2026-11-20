@@ -368,6 +368,8 @@ pub fn materialize(case: &FixtureCase, root: &Path) -> Result<(), FixtureRunErro
 /// cannot drift into an activation that silently selects nothing.
 fn activation_request(language: &dyn FixtureLanguage) -> SemanticModelActivationRequest {
     SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the package version is semver"),
@@ -385,7 +387,8 @@ fn activation_request(language: &dyn FixtureLanguage) -> SemanticModelActivation
             toolchain: None,
             target: Some(FIXTURE_TARGET.to_owned()),
             configuration: Some(FIXTURE_CONFIGURATION.to_owned()),
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }],
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),

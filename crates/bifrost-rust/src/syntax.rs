@@ -352,6 +352,73 @@ pub(crate) fn rust_identifier_kind_like(kind: &str) -> bool {
     )
 }
 
+/// Rust token-tree identifiers include keyword tokens. Inspect the value only
+/// after the grammar selected one token; literals keep their quoted spelling.
+pub(crate) fn rust_token_is_identifier(kind: &str, spelling: &str) -> bool {
+    spelling != "_"
+        && ((rust_identifier_kind_like(kind)
+            || matches!(kind, "type_identifier" | "primitive_type" | "_"))
+            || matches!(
+                spelling,
+                "abstract"
+                    | "as"
+                    | "async"
+                    | "await"
+                    | "become"
+                    | "box"
+                    | "break"
+                    | "const"
+                    | "continue"
+                    | "crate"
+                    | "default"
+                    | "do"
+                    | "dyn"
+                    | "else"
+                    | "enum"
+                    | "extern"
+                    | "false"
+                    | "final"
+                    | "fn"
+                    | "for"
+                    | "gen"
+                    | "if"
+                    | "impl"
+                    | "in"
+                    | "let"
+                    | "loop"
+                    | "macro"
+                    | "match"
+                    | "mod"
+                    | "move"
+                    | "mut"
+                    | "override"
+                    | "priv"
+                    | "pub"
+                    | "raw"
+                    | "ref"
+                    | "return"
+                    | "safe"
+                    | "Self"
+                    | "self"
+                    | "static"
+                    | "struct"
+                    | "super"
+                    | "trait"
+                    | "true"
+                    | "try"
+                    | "type"
+                    | "typeof"
+                    | "union"
+                    | "unsafe"
+                    | "unsized"
+                    | "use"
+                    | "virtual"
+                    | "where"
+                    | "while"
+                    | "yield"
+            ))
+}
+
 /// Whether `node` has an attached attribute whose path is exactly `expected`.
 pub fn item_has_path_attribute(node: Node<'_>, source: &str, expected: &str) -> bool {
     outer_attributes(node)
@@ -393,6 +460,98 @@ mod tests {
                 source[path.start_byte()..path.end_byte()].to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn attribute_meta_token_tree_grammar_boundary() {
+        let source = "#[fixture::test(flavor = \"x\", start, nested(key), path::key, \"lit\", crate = \"c\", default)] fn run() {}";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut pending = vec![tree.root_node()];
+        let attribute = loop {
+            let node = pending.pop().unwrap();
+            if node.kind() == "attribute" {
+                break node;
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        };
+        assert_eq!(
+            attribute.named_child(0).unwrap().kind(),
+            "scoped_identifier"
+        );
+        let arguments = attribute.child_by_field_name("arguments").unwrap();
+        let groups = crate::resolution::rust_attribute_argument_groups(arguments).unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group
+                    .iter()
+                    .map(tree_sitter::Node::kind)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["identifier", "=", "string_literal"],
+                vec!["identifier"],
+                vec!["identifier", "token_tree"],
+                vec!["identifier", "::", "identifier"],
+                vec!["string_literal"],
+                vec!["crate", "=", "string_literal"],
+                vec!["default"]
+            ]
+        );
+        for (shape, source, body_kind) in [
+            (
+                "named struct field",
+                "struct Named { #[fx(skip)] value: String }",
+                "field_declaration_list",
+            ),
+            (
+                "tuple struct field",
+                "struct Tuple(#[fx(skip)] String);",
+                "ordered_field_declaration_list",
+            ),
+            (
+                "enum variant named field",
+                "enum Choice { Variant { #[fx(skip)] value: String } }",
+                "field_declaration_list",
+            ),
+        ] {
+            let tree = parse(source);
+            println!("{shape}: {}", tree.root_node().to_sexp());
+            let body = named_descendant(tree.root_node(), body_kind);
+            let attributes = body.named_child(0).unwrap();
+            assert_eq!(attributes.kind(), "attributes", "{shape}");
+            assert_eq!(
+                attributes.named_child(0).unwrap().kind(),
+                "attribute_item",
+                "{shape}"
+            );
+        }
+        let tree = parse("#[fixture::test()] fn empty() {}");
+        let attribute = named_descendant(tree.root_node(), "attribute");
+        let arguments = attribute.child_by_field_name("arguments").unwrap();
+        assert!(
+            crate::resolution::rust_attribute_argument_groups(arguments)
+                .unwrap()
+                .is_empty()
+        );
+        let tree = parse("#[cfg_attr()] struct Invalid;");
+        let attribute = named_descendant(tree.root_node(), "attribute_item");
+        assert!(
+            crate::resolution::rust_effective_attributes(
+                std::iter::once(attribute),
+                "#[cfg_attr()] struct Invalid;"
+            )
+            .is_none()
+        );
     }
 
     #[test]

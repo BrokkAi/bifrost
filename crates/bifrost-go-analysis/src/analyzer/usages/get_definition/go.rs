@@ -274,6 +274,7 @@ impl AnalyzerGoDefinitionProvider<'_> {
                     proof.and_then(|proof| proof.external_member_identity()),
                     &SemanticModelCallApplication::positional(u32::try_from(argument_count).ok()?),
                 )?;
+            let matched = matched.matched;
             // Go has one declaration per function name; a partial pack still
             // proves the arity of its single positive record.
             if !matches!(
@@ -393,6 +394,7 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
                     RelationalBatchOutcome::Failed(error) => {
                         self.analyzer
                             .record_query_failure(StoreError::new(error.message()));
+                        session.mark_store_failure();
                         GoWorkspacePackageStatus::Unknown
                     }
                 }
@@ -4181,6 +4183,17 @@ pub(crate) fn go_selected_receiver_argument_shape(
     callable: Node<'_>,
 ) -> Option<(usize, bool)> {
     let call = go_call_for_callable(support, callable)?;
+    go_selected_receiver_argument_shape_for_call(support, token, go, file, source, call)
+}
+
+pub(crate) fn go_selected_receiver_argument_shape_for_call(
+    support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
+    go: &GoAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    call: Node<'_>,
+) -> Option<(usize, bool)> {
     let arguments = go_call_arguments(support, call)?;
     let count = match arguments.possible_multi_result_call {
         Some(inner) if !arguments.has_spread => {
@@ -4219,22 +4232,17 @@ fn go_call_result_count<'tree>(
     let mut pending = vec![call];
     let mut active = HashSet::default();
     active.insert(call.id());
-    // Also bound ordinary unbounded navigation requests. A stopped query may
-    // retain no guessed result shape; its caller emits an incomplete binding.
-    const MAX_RESULT_SHAPE_STEPS: usize = 4096;
-    let mut steps = 0;
+    // Termination does not need a step cap: `active` holds the calls on the
+    // current dependency path (a repeat is a cycle and ends in
+    // `go_nested_arity_miss`) and `counts` memoizes every finished call, so each
+    // call node is expanded once and re-read once per dependency it waits on.
+    // A stopped query may retain no guessed result shape; its caller emits an
+    // incomplete binding.
+    // An unbounded session never polls in `scope_step`, so the loop observes
+    // the request's own token: a deadline must stop a long chain.
+    let request_cancellation = go_request_cancellation(support, go);
     while let Some(current) = pending.last().copied() {
-        steps += 1;
-        if steps > MAX_RESULT_SHAPE_STEPS {
-            if let Some(session) = support.session() {
-                session.mark_scope_incomplete();
-            }
-            go.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-                "Go call result-shape work limit exceeded".into(),
-            ));
-            return None;
-        }
-        if !support.scope_step() {
+        if request_cancellation.is_cancelled() || !support.scope_step() {
             return None;
         }
         let dependencies = std::cell::RefCell::new(Vec::new());
@@ -4700,6 +4708,22 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     })
 }
 
+pub(crate) fn resolve_go_definition_for_special_dispatch(
+    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+) -> brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution {
+    let mut evidence = CallEvidence {
+        authority: DefinitionResolutionAuthority::NativeGoSelected,
+        ..CallEvidence::default()
+    };
+    let native = resolve_native_definition(None, query);
+    let outcome = finish_native_definition(native, query.site, &mut evidence);
+    DefinitionResolution {
+        outcome,
+        evidence,
+        call_binding_discharge_digests: Vec::new(),
+    }
+}
+
 /// The native answer rides in a box through the dispatch and memo-capture
 /// frames. A debug frame holds every by-value copy of the large resolution, and
 /// this call chain nests deep enough (#11691) that each copy counts.
@@ -4766,7 +4790,7 @@ pub(crate) struct GoDefinitionBatchOperation<'a> {
     >,
     request: Option<Box<crate::analyzer::go::native_points::GoNativePointRequest<'a>>>,
     file: Option<ProjectFile>,
-    open_reads: Option<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
+    open_reads: Option<brokk_bifrost_analysis::analyzer::usages::common::RequestReadState>,
     disabled: bool,
     #[cfg(test)]
     opened_operations: usize,
@@ -5579,6 +5603,7 @@ mod bounded_tests {
         }))
         .expect("serialize Go selector fixture");
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
@@ -5593,7 +5618,8 @@ mod bounded_tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: vec![SemanticModelActivationControl {
                 scope: SemanticModelControlScope::Workspace,
@@ -5986,9 +6012,17 @@ import (
             required.workspace_content_identity(),
             updated.workspace_content_identity()
         );
+        // The workspace content identity folds the analyzer configuration, so
+        // the fresh build must use the configuration the fixture was built
+        // with rather than a default that may differ (#13813).
+        let fresh_config = fixture
+            .analyzer
+            .config()
+            .expect("fixture workspace has a build configuration")
+            .clone();
         let fresh_workspace = brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
             std::sync::Arc::new(fixture.test_project().clone()),
-            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            fresh_config,
         )
         .expect("fresh workspace");
         let fresh =
@@ -6749,6 +6783,7 @@ func NewWorker() Worker { return Worker{} }
             "shards":[{"id":"fixture.native","activation":[{"configurations":["fixture.native"]}],"payload":{"kind":"declaration_facts","types":types,"members":members,"relations":[]}}]
         })).unwrap();
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("crate version"),
@@ -6763,7 +6798,8 @@ func NewWorker() Worker { return Worker{} }
                     toolchain: None,
                     target: None,
                     configuration: Some("fixture.native".to_owned()),
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: vec![SemanticModelActivationControl {
                     scope: SemanticModelControlScope::Workspace,
@@ -6854,11 +6890,9 @@ func NewWorker() Worker { return Worker{} }
                 ))
             );
 
-            let budget = ReceiverAnalysisBudget {
-                max_scope_nodes: 16,
-                ..ReceiverAnalysisBudget::default()
-            };
-            let session = ResolutionSession::bounded(budget, None);
+            let cancellation = CancellationToken::cancel_after_checks_for_test(16);
+            let session =
+                ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
             let provider = AnalyzerGoDefinitionProvider::bounded(
                 go,
                 &session,
@@ -6875,7 +6909,7 @@ func NewWorker() Worker { return Worker{} }
             );
             assert!(matches!(
                 session.finish(()),
-                BoundedResolution::Exceeded { .. }
+                BoundedResolution::Cancelled { .. }
             ));
             assert!(
                 provider
@@ -6894,7 +6928,7 @@ func NewWorker() Worker { return Worker{} }
                     .published(),
             );
             provider.native_budget = ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
+                max_resolution_rounds: 0,
                 ..ReceiverAnalysisBudget::default()
             };
             let scope = AnalyzerQueryScope::capturing_read_incompleteness(go);
@@ -7799,7 +7833,6 @@ func use(table *CacheTable) {
                         context_depth: 8,
                         max_targets: 16,
                         max_summary_expansions: 4_096,
-                        max_scope_nodes: 100_000,
                         max_hierarchy_order_work: 100_000,
                         max_resolution_rounds: ReceiverAnalysisBudget::default()
                             .max_resolution_rounds,
@@ -7823,5 +7856,639 @@ func use(table *CacheTable) {
                 "{value:#?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_store_failure_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::definition_lookup::RelationalBatchError;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture(source: &str) -> (crate::inline_project::BuiltInlineTestProject, GoAnalyzer) {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/stop\n\ngo 1.22\n")
+            .file("helper/helper.go", "package helper\nfunc Target() {}\n")
+            .file("main.go", source)
+            .build();
+        let analyzer = GoAnalyzer::new(fixture.project_dyn());
+        (fixture, analyzer)
+    }
+
+    fn point(file: &ProjectFile, start: usize, end: usize) -> DefinitionLookupRequest {
+        DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(end),
+        }
+    }
+
+    fn assert_unavailable(outcome: &DefinitionLookupOutcome) {
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Unavailable,
+            "{outcome:?}"
+        );
+        assert!(outcome.definitions.is_empty(), "{outcome:?}");
+        assert!(outcome.lexical_definition.is_none(), "{outcome:?}");
+        assert!(outcome.modeled_definitions.is_empty(), "{outcome:?}");
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "native_store_error"),
+            "{outcome:?}"
+        );
+    }
+
+    fn assert_no_evidence(resolution: &DefinitionResolution) {
+        assert_unavailable(&resolution.outcome);
+        assert_eq!(
+            format!("{:?}", resolution.evidence),
+            format!("{:?}", CallEvidence::default())
+        );
+        assert!(resolution.call_binding_discharge_digests.is_empty());
+    }
+
+    fn fail_workspace_status_once(
+        analyzer: &GoAnalyzer,
+    ) -> (
+        Arc<AtomicUsize>,
+        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::RelationalDefinitionBatchTestGuard,
+    ) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let guard = analyzer
+            .test_hooks()
+            .relational_definition_batch_callback_for_test(Arc::new(move |requests, _| {
+                if !requests.iter().any(|request| {
+                    matches!(
+                        (&request.language_scope, &request.query),
+                        (
+                            DefinitionLanguageScope::Language(Language::Go),
+                            RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists)
+                        )
+                    )
+                }) {
+                    return None;
+                }
+                (observed.fetch_add(1, Ordering::Relaxed) == 0).then(|| {
+                    RelationalBatchOutcome::Failed(RelationalBatchError::new(
+                        "#11775 one failing workspace-status read",
+                    ))
+                })
+            }));
+        (attempts, guard)
+    }
+
+    #[test]
+    #[hardwon(
+        "#11775: a failed workspace-status read recovered inside a raw two-point definition request"
+    )]
+    fn raw_definition_store_failure_stops_repeated_points_and_early_returns() {
+        // Fixed ranges select Open and the local reference in this literal fixture.
+        let source: Arc<str> = Arc::from(
+            "package p\nimport files \"os\"\nfunc use() { local := 1; _ = local; _, _ = files.Open(\"x\") }\n",
+        );
+        let (fixture, analyzer) = fixture(&source);
+        let file = fixture.file("main.go");
+        let query = || {
+            resolve_definition_batch_with_source(
+                &analyzer,
+                vec![point(&file, 77, 81)],
+                file.clone(),
+                Arc::clone(&source),
+            )
+        };
+        let baseline = query();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(
+            baseline[0].status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "{baseline:?}"
+        );
+        let (attempts, fake) = fail_workspace_status_once(&analyzer);
+        let failed = resolve_definition_batch_with_source(
+            &analyzer,
+            vec![point(&file, 77, 81), point(&file, 77, 81)],
+            file.clone(),
+            Arc::clone(&source),
+        );
+        assert_eq!(failed.len(), 2);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "the raw batch must reach the real fake before its outcome is assessed"
+        );
+        for outcome in &failed {
+            assert_unavailable(outcome);
+        }
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "the second point must not retry the store"
+        );
+        assert_eq!(
+            format!("{:?}", query()),
+            format!("{baseline:?}"),
+            "a new request recovers normally"
+        );
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "the fake would recover on its next read"
+        );
+        drop(fake);
+
+        let lexical = resolve_definition_batch_with_source(
+            &analyzer,
+            vec![point(&file, 57, 62)],
+            file.clone(),
+            Arc::clone(&source),
+        );
+        assert_eq!(
+            lexical[0].status,
+            DefinitionLookupStatus::Resolved,
+            "{lexical:?}"
+        );
+        {
+            let failed_scope = AnalyzerQueryScope::new(&analyzer);
+            failed_scope.record_store_error_for_test(StoreError::new(
+                "#11775 failed lexical/source context",
+            ));
+            let outcomes = resolve_definition_batch_with_source(
+                &analyzer,
+                vec![
+                    point(&file, 57, 62),
+                    point(&fixture.file("missing.go"), 0, 1),
+                ],
+                file.clone(),
+                Arc::clone(&source),
+            );
+            assert_eq!(outcomes.len(), 2);
+            for outcome in &outcomes {
+                assert_unavailable(outcome);
+            }
+            let mut context = DefinitionBatchContext::new(&analyzer, failed_scope.token());
+            context
+                .sources
+                .insert(file.clone(), Ok(Arc::clone(&source)));
+            let resolution = resolve_one_with_evidence(
+                &analyzer,
+                failed_scope.token(),
+                &mut context,
+                point(&file, 57, 62),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_no_evidence(&resolution);
+        }
+        assert_eq!(format!("{:?}", query()), format!("{baseline:?}"));
+    }
+
+    #[test]
+    #[hardwon("#11775: public dispatch and ICFG must not recover after a raw store failure")]
+    fn public_dispatch_and_snapshot_keep_the_go_store_failure() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause;
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            CandidateCoverage, DispatchOracle, DispatchResult, IcfgProvider, IcfgSnapshot,
+            IcfgSnapshotLimits, SemanticBudget, SemanticOutcome, SemanticProviderError,
+            SemanticRequest,
+        };
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, capture_memo_reads,
+        };
+        use brokk_bifrost_core::analyzer::carried_context::request_store_failed;
+        use brokk_bifrost_core::analyzer::outer_request::OuterRequest;
+        use brokk_bifrost_core::analyzer::reuse_verdict::{
+            CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+        };
+
+        fn assert_stopped<T: std::fmt::Debug>(
+            result: &Result<SemanticOutcome<T>, SemanticProviderError>,
+        ) {
+            match result {
+                Ok(outcome) => assert!(!outcome.is_complete(), "{outcome:?}"),
+                Err(error) => assert_eq!(
+                    error.reuse_verdict(),
+                    ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+                    "{error:?}",
+                ),
+            }
+        }
+
+        fn assert_dispatch_stopped(
+            result: &Result<SemanticOutcome<DispatchResult>, SemanticProviderError>,
+        ) {
+            assert_stopped(result);
+            if let Ok(outcome) = result
+                && let Some(value) = outcome.available_value()
+            {
+                assert_ne!(
+                    value.coverage(),
+                    CandidateCoverage::Exhaustive,
+                    "{outcome:?}"
+                );
+                assert!(!value.resolver_proved_no_callee(), "{outcome:?}");
+            }
+        }
+
+        fn refused_memo<T>(
+            analyzer: &dyn IAnalyzer,
+            owner: QueryMemoOwner,
+            attempts: &AtomicUsize,
+            query: impl FnOnce() -> T,
+        ) -> (T, Option<DerivationExecutionCause>) {
+            let ((result, admission), channel_cause) =
+                capture_read_execution_cause(analyzer, || {
+                    capture_memo_reads(owner, analyzer, query)
+                });
+            assert_eq!(
+                attempts.load(Ordering::Relaxed),
+                1,
+                "the real store fake must fire once, without a retry"
+            );
+            assert!(
+                admission.admitted().is_none(),
+                "store failure admitted a public memo fill"
+            );
+            // The admission owns reuse. This channel describes this call's
+            // reads, not a prior failure that stopped a later call (#11701).
+            (result, channel_cause)
+        }
+
+        fn provenance_contents(value: &DispatchResult) -> Vec<(String, Vec<String>)> {
+            use brokk_bifrost_semantic::analyzer::semantic::oracle::relation::OracleRelationOwner;
+            value
+                .candidates()
+                .iter()
+                .flat_map(|candidate| candidate.provenance.iter())
+                .chain(
+                    value
+                        .boundaries()
+                        .iter()
+                        .flat_map(|boundary| boundary.provenance.iter()),
+                )
+                .map(|handle| {
+                    // Durable identity includes the interpretation omitted by
+                    // ProcedureHandle::Debug, without comparing arena addresses.
+                    let owner = match handle.owner() {
+                        OracleRelationOwner::Dispatch(call) => call.durable_key(),
+                        other => panic!("dispatch provenance has another owner: {other:?}"),
+                    };
+                    let record = handle.record();
+                    let evidence = record
+                        .evidence()
+                        .iter()
+                        .map(|evidence| {
+                            format!(
+                                "{:?}",
+                                (
+                                    evidence.durable_key(),
+                                    evidence
+                                        .procedure()
+                                        .semantics()
+                                        .evidence_row(evidence.id())
+                                        .expect("relation evidence is validated at construction")
+                                )
+                            )
+                        })
+                        .collect();
+                    (format!("{owner:?}: {record:?}"), evidence)
+                })
+                .collect()
+        }
+
+        fn snapshot_procedure_keys(snapshot: &IcfgSnapshot) -> Vec<String> {
+            snapshot
+                .nodes()
+                .iter()
+                .flat_map(|node| {
+                    assert!(
+                        node.argument_callable().is_none(),
+                        "this fixture has no argument closure"
+                    );
+                    std::iter::once(format!("{:?}", node.point().durable_key())).chain(
+                        node.call_context()
+                            .iter()
+                            .map(|call| format!("{:?}", call.durable_key())),
+                    )
+                })
+                .chain(
+                    snapshot
+                        .edges()
+                        .iter()
+                        .filter_map(|edge| edge.origin.as_ref())
+                        .map(|call| format!("{:?}", call.durable_key())),
+                )
+                .chain(
+                    snapshot
+                        .boundaries()
+                        .iter()
+                        .filter_map(|boundary| boundary.origin.as_ref())
+                        .map(|call| format!("{:?}", call.durable_key())),
+                )
+                .collect()
+        }
+
+        let source: Arc<str> = Arc::from(
+            "package p\nimport files \"os\"\nfunc use() { local := 1; _ = local; _, _ = files.Open(\"x\") }\n",
+        );
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/stop\n\ngo 1.22\n")
+            .file("helper/helper.go", "package helper\nfunc Target() {}\n")
+            .file("main.go", source.as_ref())
+            .build();
+        let mut config = brokk_bifrost_analysis::analyzer::AnalyzerConfig::default();
+        config.go.dependency_discovery.mode =
+            brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::Disabled;
+        let workspace = fixture.workspace_analyzer(config);
+        let go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()).unwrap();
+        let file = fixture.file("main.go");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .expect("the fixture caller has a semantic artifact");
+        let call = artifact
+            .procedures()
+            .iter()
+            .find_map(|procedure| {
+                let call = procedure.call_sites().first()?;
+                artifact
+                    .procedure_handle(procedure.id())?
+                    .call_site_handle(call.id)
+            })
+            .expect("the fixture has one package call");
+        let dispatch = || {
+            let mut budget = SemanticBudget::default();
+            workspace
+                .semantic_oracle_provider()
+                .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+        };
+        let snapshot = || {
+            let mut budget = SemanticBudget::default();
+            workspace.icfg_provider().snapshot(
+                call.procedure(),
+                IcfgSnapshotLimits::default(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+        };
+        let (baseline, baseline_cause) = {
+            let _scope =
+                AnalyzerQueryScope::with_outer_request(workspace.analyzer(), OuterRequest::new());
+            capture_read_execution_cause(workspace.analyzer(), || {
+                let baseline = (dispatch().unwrap(), snapshot().unwrap());
+                assert!(!request_store_failed());
+                assert!(baseline.0.available_value().is_some(), "{:?}", baseline.0);
+                assert!(
+                    !baseline.1.available_value().unwrap().nodes().is_empty(),
+                    "{:?}",
+                    baseline.1
+                );
+                baseline
+            })
+        };
+        assert_eq!(
+            baseline_cause, None,
+            "the fault baseline must be operationally clean"
+        );
+        {
+            let (attempts, _fake) = fail_workspace_status_once(go);
+            let _scope =
+                AnalyzerQueryScope::with_outer_request(workspace.analyzer(), OuterRequest::new());
+            let (failed, channel_cause) = refused_memo(
+                workspace.analyzer(),
+                QueryMemoOwner::DispatchSession,
+                &attempts,
+                dispatch,
+            );
+            assert_eq!(channel_cause, Some(DerivationExecutionCause::Provider));
+            assert_eq!(
+                attempts.load(Ordering::Relaxed),
+                1,
+                "public dispatch reached the fake"
+            );
+            assert!(request_store_failed());
+            assert_dispatch_stopped(&failed);
+            let stopped = ResolutionSession::unbounded().finish(());
+            assert!(matches!(
+                stopped,
+                BoundedResolution::Unavailable {
+                    reason: "native_store_error",
+                    ..
+                }
+            ));
+            assert_eq!(
+                stopped.reuse_verdict(),
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+            );
+            let (repeated, repeated_cause) = refused_memo(
+                workspace.analyzer(),
+                QueryMemoOwner::DispatchSession,
+                &attempts,
+                dispatch,
+            );
+            assert_eq!(repeated_cause, None, "a stopped call made no new read");
+            assert_dispatch_stopped(&repeated);
+            let (failed_snapshot, _) = refused_memo(
+                workspace.analyzer(),
+                QueryMemoOwner::CallTransfer,
+                &attempts,
+                snapshot,
+            );
+            assert_stopped(&failed_snapshot);
+            assert_eq!(
+                attempts.load(Ordering::Relaxed),
+                1,
+                "the failed request never retries the read"
+            );
+        }
+        {
+            let (attempts, _fake) = fail_workspace_status_once(go);
+            let _scope =
+                AnalyzerQueryScope::with_outer_request(workspace.analyzer(), OuterRequest::new());
+            let (failed, cause) = capture_read_execution_cause(workspace.analyzer(), || {
+                resolve_definition_batch_with_source(
+                    workspace.analyzer(),
+                    vec![point(&file, 77, 81)],
+                    file.clone(),
+                    Arc::clone(&source),
+                )
+            });
+            assert_eq!(
+                attempts.load(Ordering::Relaxed),
+                1,
+                "the raw call must reach the real fake before its cause is assessed"
+            );
+            assert_eq!(cause, Some(DerivationExecutionCause::Provider));
+            assert_eq!(failed.len(), 1);
+            assert_unavailable(&failed[0]);
+            assert!(request_store_failed());
+            let (after_raw, _) = refused_memo(
+                workspace.analyzer(),
+                QueryMemoOwner::DispatchSession,
+                &attempts,
+                dispatch,
+            );
+            assert_dispatch_stopped(&after_raw);
+            let (after_raw_snapshot, _) = refused_memo(
+                workspace.analyzer(),
+                QueryMemoOwner::CallTransfer,
+                &attempts,
+                snapshot,
+            );
+            assert_stopped(&after_raw_snapshot);
+            assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        }
+        {
+            let _scope =
+                AnalyzerQueryScope::with_outer_request(workspace.analyzer(), OuterRequest::new());
+            let (recovered, cause) = capture_read_execution_cause(workspace.analyzer(), || {
+                (dispatch().unwrap(), snapshot().unwrap())
+            });
+            assert_eq!(cause, baseline_cause);
+            assert!(!request_store_failed());
+            assert_eq!(recovered.0.label(), baseline.0.label());
+            // Relation-handle equality includes query-local arena identity. A
+            // fresh provider owns a new arena; compare all rendered fields and
+            // the already-loaded relation/evidence contents across requests.
+            assert_eq!(
+                format!("{:?}", recovered.0.available_value()),
+                format!("{:?}", baseline.0.available_value())
+            );
+            assert_eq!(
+                provenance_contents(recovered.0.available_value().unwrap()),
+                provenance_contents(baseline.0.available_value().unwrap())
+            );
+            // ProcedureHandle::Debug omits its interpretation. Durable keys
+            // include it for candidate targets and every retained ICFG handle.
+            assert_eq!(
+                recovered
+                    .0
+                    .available_value()
+                    .unwrap()
+                    .candidates()
+                    .iter()
+                    .map(|candidate| candidate.target.durable_key())
+                    .collect::<Vec<_>>(),
+                baseline
+                    .0
+                    .available_value()
+                    .unwrap()
+                    .candidates()
+                    .iter()
+                    .map(|candidate| candidate.target.durable_key())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                snapshot_procedure_keys(recovered.1.available_value().unwrap()),
+                snapshot_procedure_keys(baseline.1.available_value().unwrap())
+            );
+            assert_eq!(recovered.1.label(), baseline.1.label());
+            assert_eq!(
+                format!("{:?}", recovered.1.available_value()),
+                format!("{:?}", baseline.1.available_value())
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11775: a failed raw request must refuse an existing warm native answer before its memo lookup"
+    )]
+    fn raw_definition_failed_context_refuses_a_real_native_memo_hit() {
+        let source: Arc<str> = Arc::from(
+            "package p\nimport \"example.test/stop/helper\"\nfunc use() { helper.Target() }\n",
+        );
+        let (fixture, analyzer) = fixture(&source);
+        let file = fixture.file("main.go");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let mut context = DefinitionBatchContext::new(&analyzer, scope.token());
+        context
+            .sources
+            .insert(file.clone(), Ok(Arc::clone(&source)));
+        let mut batch = GoDefinitionBatchOperation {
+            analyzer: &analyzer,
+            selected_snapshot: None,
+            request: None,
+            file: None,
+            open_reads: None,
+            disabled: false,
+            opened_operations: 0,
+        };
+        let first = resolve_one_with_evidence(
+            &analyzer,
+            scope.token(),
+            &mut context,
+            point(&file, 64, 70),
+            None,
+            None,
+            None,
+            Some(&mut batch),
+        );
+        assert_eq!(
+            first.outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{first:?}"
+        );
+        let before = batch
+            .request
+            .as_ref()
+            .expect("complete native owner retained")
+            .forward_candidate_cache_hits_for_test();
+        let second = resolve_one_with_evidence(
+            &analyzer,
+            scope.token(),
+            &mut context,
+            point(&file, 64, 70),
+            None,
+            None,
+            None,
+            Some(&mut batch),
+        );
+        assert_eq!(
+            format!("{:?}", second.outcome),
+            format!("{:?}", first.outcome)
+        );
+        let native = batch.request.as_ref().expect("warm native owner retained");
+        let hits = native.forward_candidate_cache_hits_for_test();
+        assert!(
+            hits > before,
+            "the repeated normal answer must actually hit its candidate cache"
+        );
+        let native_pointer = std::ptr::from_ref(native.as_ref());
+        assert_eq!(batch.opened_operations, 1);
+        scope.record_store_error_for_test(StoreError::new("#11775 failure after the warm answer"));
+        let refused = resolve_one_with_evidence(
+            &analyzer,
+            scope.token(),
+            &mut context,
+            point(&file, 64, 70),
+            None,
+            None,
+            None,
+            Some(&mut batch),
+        );
+        assert_no_evidence(&refused);
+        let native = batch
+            .request
+            .as_ref()
+            .expect("pre-body refusal never entered or discarded the memo");
+        assert_eq!(std::ptr::from_ref(native.as_ref()), native_pointer);
+        assert_eq!(native.forward_candidate_cache_hits_for_test(), hits);
+        assert_eq!(batch.opened_operations, 1);
     }
 }

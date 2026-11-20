@@ -33,8 +33,50 @@ use brokk_bifrost_core::analyzer::tree_walk::node_range;
 pub use brokk_bifrost_semantic::analyzer::semantic::statement_entries::*;
 use tree_sitter::Node;
 
+/// The control edges of `procedure` that its language proves no execution
+/// takes once workspace declarations are read, in ascending order; see
+/// [`crate::analyzer::languages::LanguageSupport::infeasible_control_edges`].
+///
+/// The answer depends on the workspace, so only a query that records its
+/// reads may consume it. The ICFG provider does; statement assessments, which
+/// are kept by content, must not. Unavailable syntax excludes none.
+pub fn language_infeasible_control_edges(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    cancellation: &CancellationToken,
+) -> Vec<ControlEdgeId> {
+    let semantics = procedure.semantics();
+    let Some(support) = language_support_for_hook(
+        procedure.artifact().key().language().language(),
+        "infeasible_control_edges",
+    ) else {
+        return Vec::new();
+    };
+    if !support.has_infeasible_control_edge_candidate(semantics) {
+        return Vec::new();
+    }
+    let prepared = match ProcedureSyntax::prepare(workspace, procedure, Some(cancellation)) {
+        Ok(prepared) => prepared,
+        Err(open) => {
+            workspace
+                .analyzer()
+                .join_reuse_verdict(open.reuse_verdict());
+            return Vec::new();
+        }
+    };
+    support.infeasible_control_edges(
+        workspace.analyzer(),
+        &prepared.file,
+        &prepared.syntax,
+        semantics,
+    )
+}
+
 /// Rust's literal guard and bare wildcard pattern edges proven infeasible by
 /// exact prepared syntax. Other languages and unavailable syntax exclude none.
+///
+/// This proof reads the procedure's own artifact and syntax, so a product kept
+/// by content may consume it.
 pub fn rust_infeasible_control_edges(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -1026,7 +1068,7 @@ fn execution_open_reason(
     error: crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError<ProgramPointId>,
     reuse: &mut ReuseVerdict,
 ) -> &'static str {
-    let cause = crate::analyzer::read_ledger::DerivationExecutionCause::from_cfg_error(&error);
+    let cause = crate::analyzer::semantic::derivation_cause::from_cfg_error(&error);
     brokk_bifrost_core::profiling::note_with(|| {
         format!(
             "policy.units unbounded origin={}:{} cause=cfg:{cause:?} detail={error:?}",

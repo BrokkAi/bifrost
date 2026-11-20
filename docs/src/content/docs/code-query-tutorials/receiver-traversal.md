@@ -162,7 +162,7 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
 
 ## Compose From A Call Input
 
-`call_input` preserves the exact expression written for a resolved formal parameter. `points_to` then analyzes that expression without pretending it followed assignments or general interprocedural data flow. Here the exact allocation is retained, while an omitted unresolved call candidate keeps the receiver row `ambiguous` instead of silently claiming whole-program precision.
+`call_input` preserves the exact expression written for a resolved formal parameter; its `text` is a projection of the row's `site` (see [Site context](/code-query-json/#site-context-on-call-argument-rows)). `points_to` then analyzes that expression without pretending it followed assignments or general interprocedural data flow. Here the exact allocation is retained, while an omitted unresolved call candidate keeps the receiver row `ambiguous` instead of silently claiming whole-program precision.
 
 <!-- code-query-case:call-input:rql -->
 ```lisp
@@ -185,11 +185,13 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
     {
       "code": "call_relation_candidates_omitted",
       "impact": "incomplete",
-      "language": "typescript",
-      "message": "omitted 1 unresolved call candidate for consume",
       "incompleteness": {
         "operational": "provider"
-      }
+      },
+      "language": "typescript",
+      "message": "omitted 1 unresolved call candidate for consume",
+      "step_index": 1,
+      "step_op": "call_sites_to"
     }
   ],
   "results": [

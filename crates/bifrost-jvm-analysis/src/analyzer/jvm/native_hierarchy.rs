@@ -1,65 +1,25 @@
-//! Query-local JVM parent conversion and selected hierarchy session.
+//! Query-local selected JVM hierarchy session.
 use brokk_bifrost_analysis::analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::native_hierarchy::{HierarchyConversionRules, convert};
+pub(crate) use brokk_bifrost_analysis::analyzer::native_hierarchy::{MappedParent, stopped};
 use brokk_bifrost_analysis::analyzer::resolution::{
     ResolutionCompletion, SelectedFactOperationBlueprintConstruction,
     SelectedResolutionContextValidationOutcome,
 };
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmDirectSupertypeAnswer;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
 use brokk_bifrost_analysis::analyzer::store::{Result, StoreError};
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use brokk_bifrost_core::analyzer::capabilities::{
     HierarchyAnswer, HierarchyOpenReason, HierarchyQuery, MemberFamilyAncestors,
-    UnreadMemberFamilyAncestor,
 };
 use brokk_bifrost_core::analyzer::model::{CodeUnit, Language};
-use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind;
 use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::cancellation::CancellationToken;
-use brokk_bifrost_jvm::intrinsics::{intrinsic_root_owner, overridable_method_inventory};
 use std::collections::HashMap;
 
-struct HierarchyReadCapture<'a, A: LanguageAdapter>(&'a TreeSitterAnalyzer<A>, &'a dyn Fn());
-
-impl<A: LanguageAdapter>
-    brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmHierarchyReadReceipts
-    for HierarchyReadCapture<'_, A>
-{
-    type Receipt = brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
-
-    fn capture<T>(&mut self, read: impl FnOnce() -> T) -> (T, Self::Receipt) {
-        brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture(self.0, || {
-            let result = read();
-            (self.1)();
-            result
-        })
-    }
-
-    fn replay(&mut self, receipt: &Self::Receipt) {
-        receipt.replay(self.0);
-    }
-}
-
-pub(crate) struct MappedParent {
-    pub kind: Option<ResolutionSupertypeKind>,
-    pub ordinal: u32,
-    pub targets: Vec<CodeUnit>,
-    pub unread: Vec<UnreadMemberFamilyAncestor>,
-    pub intrinsic_root: Option<brokk_bifrost_analysis::analyzer::resolution::ExternalOwnerIdentity>,
-    pub alternatives: usize,
-    pub complete: bool,
-}
-
-pub(crate) fn stopped() -> HierarchyAnswer {
-    HierarchyAnswer {
-        open: vec![HierarchyOpenReason::MemberFamily(
-            MemberFamilyReason::HierarchyTruncated,
-        )],
-        ..HierarchyAnswer::complete(Vec::new())
-    }
-}
+use super::selected_operation::HierarchyReadCapture;
 
 fn unavailable() -> HierarchyAnswer {
     let mut answer = stopped();
@@ -67,159 +27,6 @@ fn unavailable() -> HierarchyAnswer {
         .open
         .push(HierarchyOpenReason::DescendantIndexUnavailable);
     answer
-}
-
-fn convert(
-    operation: &SelectedResolutionOperation<'_, '_>,
-    raw: JvmDirectSupertypeAnswer,
-    cancellation: &CancellationToken,
-    session: &ResolutionSession,
-    normalize: impl FnOnce(&mut Vec<MappedParent>),
-) -> Result<HierarchyAnswer> {
-    let mut answer = HierarchyAnswer::complete(Vec::new());
-    if raw.completion != ResolutionCompletion::Complete {
-        answer.open.extend(stopped().open);
-    }
-    let mut external = HashMap::new();
-    let mut source = Vec::new();
-    for target in raw.parents.iter().flat_map(|parent| &parent.targets) {
-        if let Some(owner) = operation.jvm_hierarchy_external_owner(*target) {
-            external.insert(*target, owner);
-        } else {
-            source.push(*target);
-        }
-    }
-    source.sort_unstable();
-    source.dedup();
-    let mut units = HashMap::new();
-    if !source.is_empty() {
-        match operation.selected_hierarchy_definition_units(&source, cancellation, session)? {
-            SelectedNativeDefinitions::Ready(definitions) => {
-                for (id, definition) in definitions {
-                    match definition {
-                        SelectedNativeDefinition::Unit(unit) => {
-                            units.insert(id, unit);
-                        }
-                        SelectedNativeDefinition::Intrinsic { canonical_name, .. } => {
-                            external.insert(
-                                id,
-                                brokk_bifrost_analysis::analyzer::resolution::ExternalOwnerIdentity {
-                                    provider_id: std::sync::Arc::from("jvm-intrinsic"),
-                                    owner_fqn: std::sync::Arc::from(canonical_name),
-                                },
-                            );
-                        }
-                        SelectedNativeDefinition::ExternalOwner { owner, .. } => {
-                            external.insert(id, owner);
-                        }
-                        SelectedNativeDefinition::Lexical(_) => {
-                            answer.open.extend(stopped().open);
-                        }
-                    }
-                }
-            }
-            SelectedNativeDefinitions::Cancelled | SelectedNativeDefinitions::Unavailable => {
-                answer.open.extend(stopped().open);
-            }
-        }
-    }
-    let mut parents = Vec::new();
-    for parent in raw.parents {
-        let selected_owner = (parent.targets.is_empty()
-            && parent.kind != Some(ResolutionSupertypeKind::ImplicitSuperclass))
-        .then(|| operation.jvm_hierarchy_reference_owner(parent.reference))
-        .flatten();
-        let mut mapped = MappedParent {
-            kind: parent.kind,
-            ordinal: parent.parent_ordinal,
-            targets: Vec::new(),
-            unread: Vec::new(),
-            intrinsic_root: None,
-            alternatives: parent.targets.len(),
-            complete: parent.completion == ResolutionCompletion::Complete,
-        };
-        for target in parent.targets {
-            if let Some(unit) = units.get(&target) {
-                mapped.targets.push(unit.clone());
-            } else if let Some(owner) = external.get(&target) {
-                if let Some(root) = intrinsic_root_owner(&owner.owner_fqn)
-                    && owner.provider_id.as_ref() == "jvm-intrinsic"
-                    && mapped.alternatives == 1
-                    && mapped.complete
-                {
-                    mapped.intrinsic_root = Some(
-                        brokk_bifrost_analysis::analyzer::resolution::ExternalOwnerIdentity {
-                            provider_id: std::sync::Arc::from("jvm-intrinsic"),
-                            owner_fqn: std::sync::Arc::from(root),
-                        },
-                    );
-                } else {
-                    // External coordinates do not carry interface metadata.
-                    // Keep the unread edge open rather than inventing a root.
-                    mapped.unread.push(UnreadMemberFamilyAncestor {
-                        name: owner.owner_fqn.to_string(),
-                        inventory: overridable_method_inventory(&owner.owner_fqn),
-                    });
-                }
-            } else {
-                mapped.complete = false;
-            }
-        }
-        if let Some(owner) = selected_owner {
-            mapped.unread.push(UnreadMemberFamilyAncestor {
-                name: owner.owner_fqn.to_string(),
-                inventory: overridable_method_inventory(&owner.owner_fqn),
-            });
-        }
-        parents.push(mapped);
-    }
-    normalize(&mut parents);
-    parents.sort_by_key(|parent| {
-        (
-            match parent.kind {
-                Some(
-                    ResolutionSupertypeKind::Superclass
-                    | ResolutionSupertypeKind::ImplicitSuperclass,
-                ) => 0,
-                _ => 1,
-            },
-            parent.ordinal,
-        )
-    });
-    for parent in parents {
-        if let Some(root) = parent.intrinsic_root {
-            assert_eq!(root.provider_id.as_ref(), "jvm-intrinsic");
-            assert!(parent.complete && parent.alternatives == 1);
-            assert!(parent.targets.is_empty());
-            // The Java member-family query can nominate an intrinsic root as
-            // unread. Ordinary direct-ancestor queries leave this empty.
-            answer.open.extend(
-                parent
-                    .unread
-                    .into_iter()
-                    .map(HierarchyOpenReason::UnreadAncestor),
-            );
-            continue;
-        }
-        if parent.alternatives > 1 {
-            answer.ambiguous.push(parent.targets);
-            answer.open.push(HierarchyOpenReason::MemberFamily(
-                MemberFamilyReason::HierarchyAmbiguous,
-            ));
-        } else if parent.complete {
-            answer.edges.extend(parent.targets);
-        }
-        if parent.alternatives == 0 || !parent.complete {
-            answer.open.extend(stopped().open);
-        }
-        answer.open.extend(
-            parent
-                .unread
-                .into_iter()
-                .map(HierarchyOpenReason::UnreadAncestor),
-        );
-    }
-    Ok(answer)
 }
 
 struct NativeQuery<'a> {
@@ -385,7 +192,7 @@ fn open_native_query<A: LanguageAdapter>(
                         )));
                     };
                     let raw = query.borrow_mut().jvm_direct_supertype_answer(definition)?;
-                    convert(&operation, raw, &cancellation, &session, |parents| {
+                    convert(&operation, raw, &cancellation, &session, &HierarchyConversionRules { intrinsic_provider: "jvm-intrinsic", intrinsic_root: brokk_bifrost_jvm::intrinsics::intrinsic_root_owner, unread_inventory: brokk_bifrost_jvm::intrinsics::overridable_method_inventory }, |parents| {
                         normalize(unit, parents)
                     })
                 };

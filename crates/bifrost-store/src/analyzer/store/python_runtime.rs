@@ -1031,6 +1031,7 @@ impl AnalyzerStore {
     /// semantic reader for its indexed SQL. The transaction pins both the
     /// generation check and every result row to one SQLite snapshot.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn with_python_runtime_acquisition<T>(
         &self,
         acquisition_id: PythonRuntimeAcquisitionId,

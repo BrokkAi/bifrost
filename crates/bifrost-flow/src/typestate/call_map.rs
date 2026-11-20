@@ -208,6 +208,57 @@ pub fn call_subject_map(
     from: &PartialFlowPort,
     to: &PartialFlowPort,
 ) -> CallSubjectMapping {
+    let Some(dispatch) = answer.available_value() else {
+        return CallSubjectMapping::Incomplete;
+    };
+    if !answer.is_complete()
+        || dispatch.coverage() != CandidateCoverage::Exhaustive
+        || !dispatch.boundaries().is_empty()
+        || dispatch.candidates().len() != 1
+        || dispatch.candidates()[0] != *bindings.candidate()
+        || !matches!(bindings.candidate().proof(), ProofStatus::Proven)
+        || !matches!(
+            bindings.candidate().completeness(),
+            EvidenceCompleteness::Complete
+        )
+    {
+        return CallSubjectMapping::Incomplete;
+    }
+    map_selected_arm(bindings, selection, subject, from, to)
+}
+
+/// Map one arm of a sealed dispatch family whose every arm the caller
+/// analyzes for the same subject (#11296). The family accounts for runtime
+/// selection; this arm's own port, binding and continuity checks are the
+/// singleton map's. A violating arm stays a possible witness because the
+/// caller still conjoins the arm's Unproven candidate proof.
+pub fn call_family_subject_map(
+    answer: &SemanticOutcome<DispatchResult>,
+    bindings: &CallBindings,
+    selection: CallSubjectMapSelection<'_>,
+    subject: &BoundTypestateSubject,
+    from: &PartialFlowPort,
+    to: &PartialFlowPort,
+) -> CallSubjectMapping {
+    let dispatch = match answer {
+        SemanticOutcome::Complete { value, .. }
+        | SemanticOutcome::Unproven { partial: value, .. } => value,
+        _ => return CallSubjectMapping::Incomplete,
+    };
+    if dispatch.analyzed_family().is_none() || !dispatch.candidates().contains(bindings.candidate())
+    {
+        return CallSubjectMapping::Incomplete;
+    }
+    map_selected_arm(bindings, selection, subject, from, to)
+}
+
+fn map_selected_arm(
+    bindings: &CallBindings,
+    selection: CallSubjectMapSelection<'_>,
+    subject: &BoundTypestateSubject,
+    from: &PartialFlowPort,
+    to: &PartialFlowPort,
+) -> CallSubjectMapping {
     let CallSubjectMapSelection {
         call,
         callee,
@@ -219,9 +270,6 @@ pub fn call_subject_map(
         exact_owned_origin,
     } = selection;
     let incomplete = || CallSubjectMapping::Incomplete;
-    let Some(dispatch) = answer.available_value() else {
-        return incomplete();
-    };
     let Some(port_query) = port_query else {
         return incomplete();
     };
@@ -269,12 +317,7 @@ pub fn call_subject_map(
         PartialFlowPort::ExceptionalReturn => call_row.exceptional_continuation.target(),
         _ => None,
     };
-    if !answer.is_complete()
-        || dispatch.coverage() != CandidateCoverage::Exhaustive
-        || !dispatch.boundaries().is_empty()
-        || dispatch.candidates().len() != 1
-        || dispatch.candidates()[0] != *bindings.candidate()
-        || bindings.call().id() != call.1
+    if bindings.call().id() != call.1
         || bindings.call().procedure().durable_key() != call.0
         || bindings.callee().durable_key() != *callee
         || bindings.context() != context
@@ -285,11 +328,6 @@ pub fn call_subject_map(
         || port_query.context() != context
         || port_query.phase() != ObservationPhase::BeforeEffects
         || boundary_point != Some(port_query.point().id())
-        || !matches!(bindings.candidate().proof(), ProofStatus::Proven)
-        || !matches!(
-            bindings.candidate().completeness(),
-            EvidenceCompleteness::Complete
-        )
     {
         return incomplete();
     }

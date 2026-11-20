@@ -407,6 +407,37 @@ fn structural_role_name_migration_preserves_read_ids_on_upgrade_and_downgrade_re
         .split_once("-- #10879: ImplicitDropExecution is discharge code 14.")
         .unwrap();
     reopened.execute_batch(drop_ledger_rebuild).unwrap();
+    // The lookup-shape migration relaxes the summary ledger rebuilt by 0285. Restore that current
+    // shape before asking migrate to validate a database at the current version.
+    let lookup_shapes = POST_BASELINE_MIGRATIONS
+        .iter()
+        .find(|migration| {
+            migration
+                .sql
+                .contains("CREATE TABLE jvm_external_inventory_generation(")
+        })
+        .expect("summary lookup question shapes migration");
+    // Only replay the ledger rebuild: the additive generation table and its
+    // triggers already exist in this current-version store. Skip the preceding
+    // JVM purge as well, so the populated fixture rows survive.
+    let (ledger_rebuild, _) = lookup_shapes
+        .sql
+        .split_once("-- Persistent cross-process invalidation")
+        .unwrap();
+    let (_, ledger_rebuild) = ledger_rebuild.split_once("CREATE TABLE").unwrap();
+    let ledger_rebuild = format!("CREATE TABLE{ledger_rebuild}");
+    reopened.execute_batch(&ledger_rebuild).unwrap();
+    // 0285 and 0420 also predate 0491's selected-receiver receipt columns.
+    // Restore that ledger shape too: user_version is still current, so leaving
+    // those columns absent would make migrate() recreate an invalid schema
+    // instead of testing whether 0285 preserved the populated read IDs.
+    let selected_receiver_receipts = POST_BASELINE_MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 491)
+        .expect("selected receiver proof read keys migration 0491");
+    reopened
+        .execute_batch(selected_receiver_receipts.sql)
+        .unwrap();
     migrate(&mut reopened).unwrap();
     check_rows(&reopened);
 }

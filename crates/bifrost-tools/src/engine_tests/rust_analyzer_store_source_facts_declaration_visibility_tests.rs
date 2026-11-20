@@ -17,6 +17,10 @@ mod rust_departing_root_tests {
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
     use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_native_declaration_sources_publish_exact_ids_and_visibility_facts() {
         const RUST_SOURCE: &str = r#"
 mod first { fn repeated() {} }
@@ -197,6 +201,10 @@ mod second { fn repeated() {} }
 
     #[test]
     #[hardwon("1051035c2ed9: an empty Rust source family was not published as ready")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn empty_rust_native_declaration_publication_is_ready_with_zero_count() {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file("src/lib.rs", "")

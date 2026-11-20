@@ -12,6 +12,10 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn raw_exclusion_keeps_closed_identity_while_effective_gaps_remove_it() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);
         let selection = fixture.open_ready(&[]);

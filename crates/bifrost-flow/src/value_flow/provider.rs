@@ -936,8 +936,45 @@ impl fmt::Debug for ValueFlowCache {
     }
 }
 
+/// Fills whose only shortfall is a reuse refusal (#12820). Such a fill is exact
+/// for this request but must never be shared, so it lives in the provider that
+/// built it: a provider is created for one request, is not `Clone`, and no
+/// workspace-lived owner stores one. Within the request, repeated queries must
+/// get the first fill back, because callers compare memoized values by identity
+/// (a dispatch candidate's provenance arena). Every hit replays the refusal into
+/// the reader's capture. Operational failures are stored nowhere.
+#[derive(Default)]
+struct RefusedFills {
+    snapshots: Mutex<crate::hash::HashMap<SnapshotKey, Arc<MemoizedSnapshot>>>,
+    dispatch: Mutex<crate::hash::HashMap<DispatchKey, Arc<MemoizedDispatch>>>,
+    bindings: Mutex<crate::hash::HashMap<BindingsKey, Arc<MemoizedBindings>>>,
+}
+
+impl RefusedFills {
+    fn get<K: Eq + std::hash::Hash, V>(
+        memo: &Mutex<crate::hash::HashMap<K, Arc<V>>>,
+        key: &K,
+    ) -> Option<Arc<V>> {
+        memo.lock().expect("refused fills lock").get(key).cloned()
+    }
+
+    /// Keep the first fill of a key; a racing second fill adopts it.
+    fn keep<K: Eq + std::hash::Hash, V>(
+        memo: &Mutex<crate::hash::HashMap<K, Arc<V>>>,
+        key: K,
+        entry: V,
+    ) -> Arc<V> {
+        Arc::clone(
+            memo.lock()
+                .expect("refused fills lock")
+                .entry(key)
+                .or_insert_with(|| Arc::new(entry)),
+        )
+    }
+}
+
 /// A [`ValueFlowProvider`] bound to one immutable analyzer generation and one
-/// shared [`ValueFlowCache`].
+/// shared [`ValueFlowCache`]. It is the request-local tier above that cache.
 pub struct WorkspaceValueFlowProvider<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
     provider_behavior: IcfgProviderBehaviorIdentity,
@@ -945,6 +982,7 @@ pub struct WorkspaceValueFlowProvider<'a> {
     dispatch_sessions: Arc<PreparedWorkspaceDispatchPool<'a>>,
     dispatch_reads: Option<DispatchReadCollector>,
     retained_writes: Arc<AtomicBool>,
+    refused: Arc<RefusedFills>,
 }
 
 impl<'a> WorkspaceValueFlowProvider<'a> {
@@ -979,6 +1017,7 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
             dispatch_sessions,
             dispatch_reads: None,
             retained_writes: Arc::new(AtomicBool::new(false)),
+            refused: Arc::default(),
         }
     }
 
@@ -1020,7 +1059,17 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
             dispatch_sessions: Arc::clone(&self.dispatch_sessions),
             dispatch_reads: Some(collector),
             retained_writes: Arc::clone(&self.retained_writes),
+            refused: Arc::clone(&self.refused),
         }
+    }
+
+    /// A truncated call context keys the answer, so the answer depends on the
+    /// truncation. The answer cannot carry that verdict, so it joins the
+    /// current captures, where `was_truncated` marked the ambient one.
+    fn join_context_verdict(&self, context: &OracleCallContext) {
+        self.oracle.workspace().analyzer().join_reuse_verdict(
+            crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(context),
+        );
     }
 
     /// The workspace semantic oracle this provider delegates to.
@@ -1059,25 +1108,36 @@ impl fmt::Debug for WorkspaceValueFlowProvider<'_> {
     }
 }
 
-// A finished partial outcome can still hide a lower operational stop. Never
-// retain that attempt across requests: its mark belongs to this request only.
+#[cfg(test)]
+thread_local! {
+    /// Test-only refusal source standing in for an unrecorded read inside a fill.
+    static REFUSE_PROVIDER_FILLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// A finished partial outcome can still hide a lower operational stop. The
+// flag is true when no operational stop happened: cancellation, budget, a
+// generation change, an execution dependence or a content gap. A reuse refusal
+// is not one: it denies sharing but leaves the answer exact (#12820), so the
+// caller keeps such a fill request-locally.
 fn complete_provider_fill<T>(
     analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
     request: &mut SemanticRequest<'_>,
     build: impl FnOnce(&mut SemanticRequest<'_>) -> Judged<T>,
 ) -> Judged<(T, bool)> {
-    let filled =
-        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
-            let judged = build(request);
-            if !judged.reuse.is_content() {
-                analyzer.mark_execution_dependent();
-            }
-            judged
-        });
-    let retainable = filled.is_ok();
-    let (Ok(Judged { value, reuse }) | Err(Judged { value, reuse })) = filled;
+    let fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(analyzer);
+    let Judged { value, reuse } = build(request);
+    #[cfg(test)]
+    if REFUSE_PROVIDER_FILLS.with(std::cell::Cell::get) {
+        analyzer.refuse_read_reuse();
+    }
+    if !reuse.is_content() {
+        analyzer.mark_execution_dependent();
+        analyzer.join_reuse_verdict(reuse);
+    }
+    let operationally_complete = fill.is_operationally_complete();
+    drop(fill);
     Judged {
-        value: (value, retainable),
+        value: (value, operationally_complete),
         reuse,
     }
 }
@@ -1120,7 +1180,12 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
             return self.oracle.procedure_relations(procedure, context, request);
         }
         let identity = projection.available_value().copied().flatten();
+        self.join_context_verdict(context);
         let key = SnapshotKey::for_query(procedure, context, *self.oracle.limits(), identity);
+        if let Some(value) = RefusedFills::get(&self.refused.snapshots, &key) {
+            value.replay(&memo_attribution(self.oracle.workspace().analyzer()));
+            return Ok(value.value().clone());
+        }
         let (acquisition, _wait) = self.cache.snapshots.acquire(&key, request.cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -1139,7 +1204,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .snapshot_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture_judged(
+                let ((outcome, operational), reads) = ReplayingMemoEntry::capture_judged(
                     &memo_attribution(self.oracle.workspace().analyzer()),
                     || {
                         complete_provider_fill(
@@ -1158,16 +1223,18 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 // (#2284). Dropping the permit on a budget-exhausted or
                 // cancelled outcome wakes followers to retry, so a shortfall of
                 // this request never enters the ready cache.
-                if retainable
+                if operational
                     && !outcome
                         .available_value()
                         .is_some_and(|snapshot| snapshot.is_execution_dependent())
-                    && !reads.channels.reuse_refused
                     && let Some(memoized) = outcome.completed_replay()
                 {
-                    permit.publish_complete(Arc::new(ReplayingMemoEntry::from_parts(
-                        memoized, reads,
-                    )));
+                    let entry = ReplayingMemoEntry::from_parts(memoized, reads);
+                    if entry.reuse_refused() {
+                        let kept = RefusedFills::keep(&self.refused.snapshots, key, entry);
+                        return Ok(kept.value().clone());
+                    }
+                    permit.publish_complete(Arc::new(entry));
                     self.retained_writes.store(true, Ordering::Release);
                 }
                 Ok(outcome)
@@ -1188,6 +1255,12 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
         let key = DispatchKey::for_query(call, self.provider_behavior, *self.oracle.limits());
+        if let Some(value) = RefusedFills::get(&self.refused.dispatch, &key) {
+            value.replay(&memo_attribution(self.oracle.workspace().analyzer()));
+            let outcome = value.value().clone();
+            self.record_dispatch_read(call, &outcome);
+            return Ok(outcome);
+        }
         let (acquisition, _wait) = self.cache.dispatch.acquire(&key, request.cancellation);
         let outcome = match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -1203,7 +1276,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .dispatch_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture_judged(
+                let ((outcome, operational), reads) = ReplayingMemoEntry::capture_judged(
                     &memo_attribution(self.oracle.workspace().analyzer()),
                     || {
                         complete_provider_fill(
@@ -1215,16 +1288,21 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 )
                 .into_parts();
                 let outcome = outcome?;
-                if retainable
-                    && !reads.channels.reuse_refused
-                    && let Some(memoized) = outcome.completed_replay()
-                {
-                    permit.publish_complete(Arc::new(ReplayingMemoEntry::from_parts(
-                        memoized, reads,
-                    )));
-                    self.retained_writes.store(true, Ordering::Release);
+                match outcome.completed_replay() {
+                    Some(memoized) if operational => {
+                        let entry = ReplayingMemoEntry::from_parts(memoized, reads);
+                        if entry.reuse_refused() {
+                            RefusedFills::keep(&self.refused.dispatch, key, entry)
+                                .value()
+                                .clone()
+                        } else {
+                            permit.publish_complete(Arc::new(entry));
+                            self.retained_writes.store(true, Ordering::Release);
+                            outcome
+                        }
+                    }
+                    _ => outcome,
                 }
-                outcome
             }
             CompleteValueAcquisition::Rejected => {
                 unreachable!("value-flow dispatch cache never publishes rejected flights")
@@ -1246,6 +1324,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        self.join_context_verdict(context);
         if context.calls().is_empty() && !context.was_truncated() {
             return self.resolve_call(call, request);
         }
@@ -1276,6 +1355,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError> {
+        self.join_context_verdict(context);
         let key = BindingsKey::for_query(
             call,
             candidate,
@@ -1283,6 +1363,10 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
             *self.oracle.limits(),
             self.provider_behavior,
         );
+        if let Some(value) = RefusedFills::get(&self.refused.bindings, &key) {
+            value.replay(&memo_attribution(self.oracle.workspace().analyzer()));
+            return Ok(value.value().clone());
+        }
         let (acquisition, _wait) = self.cache.bindings.acquire(&key, request.cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -1301,7 +1385,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .binding_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture_judged(
+                let ((outcome, operational), reads) = ReplayingMemoEntry::capture_judged(
                     &memo_attribution(self.oracle.workspace().analyzer()),
                     || {
                         complete_provider_fill(
@@ -1318,13 +1402,13 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 let outcome = outcome?;
                 // A finished binding verdict is retained whether or not it is
                 // complete, on the same terms as a snapshot (#2289).
-                if retainable
-                    && !reads.channels.reuse_refused
-                    && let Some(memoized) = outcome.completed_replay()
-                {
-                    permit.publish_complete(Arc::new(ReplayingMemoEntry::from_parts(
-                        memoized, reads,
-                    )));
+                if operational && let Some(memoized) = outcome.completed_replay() {
+                    let entry = ReplayingMemoEntry::from_parts(memoized, reads);
+                    if entry.reuse_refused() {
+                        let kept = RefusedFills::keep(&self.refused.bindings, key, entry);
+                        return Ok(kept.value().clone());
+                    }
+                    permit.publish_complete(Arc::new(entry));
                     self.retained_writes.store(true, Ordering::Release);
                 }
                 Ok(outcome)
@@ -2271,6 +2355,94 @@ mod tests {
             assert_eq!(reads.keys(), vec![key]);
             assert_eq!(reads.unattributed_reads(), 1);
         });
+    }
+
+    #[test]
+    #[hardwon("#12820: a refused dispatch fill was rebuilt in a fresh arena within one request")]
+    fn a_refused_dispatch_fill_is_reused_within_its_request_and_never_shared() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "flow.ts",
+                concat!(
+                    "function leaf(value: number): number { return value; }\n",
+                    "export function caller(): number { return leaf(1); }\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.ts"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("fixture semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("fixture artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture caller");
+        let call = caller
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| caller.call_site_handle(call.id))
+            .expect("fixture call");
+        let cache = ValueFlowCache::default();
+        let provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+        let resolve = || {
+            capture_query_reads(workspace.analyzer(), || {
+                provider
+                    .resolve_call(
+                        &call,
+                        &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                    )
+                    .expect("dispatch")
+            })
+        };
+        REFUSE_PROVIDER_FILLS.with(|flag| flag.set(true));
+        let (first, first_reads) = resolve();
+        let (second, second_reads) = resolve();
+        REFUSE_PROVIDER_FILLS.with(|flag| flag.set(false));
+        assert!(first.available_value().is_some(), "{first:?}");
+        assert!(first_reads.reuse_refused());
+        assert!(
+            second_reads.reuse_refused(),
+            "a hit on a refused fill replays the refusal into its reader"
+        );
+        assert_eq!(
+            first.available_value(),
+            second.available_value(),
+            "the refused fill is kept for the request, so the candidates are identical"
+        );
+        assert_eq!(cache.dispatch_hits(), 0, "a refused fill is never shared");
+        assert!(!provider.take_retained_writes());
+        let fresh = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+        let (_, fresh_reads) = capture_query_reads(workspace.analyzer(), || {
+            fresh
+                .resolve_call(
+                    &call,
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                )
+                .expect("dispatch")
+        });
+        assert!(
+            !fresh_reads.reuse_refused(),
+            "another request does not see the refused fill"
+        );
     }
 
     #[test]

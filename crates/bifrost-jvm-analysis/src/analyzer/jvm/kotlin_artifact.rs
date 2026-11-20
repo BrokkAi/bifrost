@@ -521,6 +521,7 @@ fn entry_facts(
             signature_limit_hit,
         );
         types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -536,6 +537,7 @@ fn entry_facts(
             type_kind: kind,
             visibility,
             is_abstract: kind == TypeKind::Interface || modifier_present(node, "abstract"),
+            is_final: None,
             is_sealed: modifier_present(node, "sealed"),
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -733,6 +735,8 @@ fn entry_facts(
                 return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
             });
             members.push(MemberFact {
+                target_independent: None,
+                inherent_impl_self_arguments: None,
                 implemented_trait: None,
                 self_form: None,
                 non_overridable: None,
@@ -771,6 +775,7 @@ fn entry_facts(
 
 fn package_fact(entry: &str, name: &str) -> TypeFact {
     TypeFact {
+        type_parameter_kinds: Vec::new(),
         alias_target: None,
         tuple_fields: None,
         implemented_traits_complete: false,
@@ -789,6 +794,7 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
         type_kind: TypeKind::Module,
         visibility: Visibility::Public,
         is_abstract: false,
+        is_final: None,
         is_sealed: false,
         callable_surface_complete: false,
         has_explicit_type_terms: false,
@@ -934,6 +940,7 @@ fn signature(
         })
         .collect();
     Some(Signature {
+        bounds: None,
         type_parameters: type_parameters.clone(),
         parameters,
         returns: direct_return_type(node).map(|value| {

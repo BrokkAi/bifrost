@@ -1,0 +1,8 @@
+{
+  "channel": "public-semantic-packs",
+  "repository": "BrokkAi/bifrost-packs",
+  "releaseTag": "packs/v0.14.0",
+  "assetName": "bifrost.public.packs-0.14.0-native.tar.gz",
+  "archiveSha256": "f0f9bb7467aa30ee2d6940d6232094b938f030753f48f2307fb19f98b427794a",
+  "inventoryPath": "crates/bifrost-semantic/pack-approval/default-inventory.json"
+}

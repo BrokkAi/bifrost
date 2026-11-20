@@ -237,7 +237,9 @@ impl BoundedDefinitionLookup for RubyDefinitionProvider<'_> {
         if language == Language::Ruby {
             self.fqn(fqn)
         } else {
-            self.session.mark_scope_incomplete();
+            if self.session.observe_cancellation() {
+                self.session.mark_unavailable("ruby_cross_language_lookup");
+            }
             Vec::new()
         }
     }
@@ -282,8 +284,8 @@ impl BoundedDefinitionLookup for RubyDefinitionProvider<'_> {
     }
 
     fn package_exists_in_language(&self, _package: &str, language: Language) -> bool {
-        if language != Language::Ruby {
-            self.session.mark_scope_incomplete();
+        if language != Language::Ruby && self.session.observe_cancellation() {
+            self.session.mark_unavailable("ruby_cross_language_lookup");
         }
         false
     }
@@ -4871,8 +4873,6 @@ mod bounded_tests {
 
     use brokk_bifrost_ruby::declarations::parse_ruby_tree;
 
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
     use brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer;
 
     use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
@@ -5024,23 +5024,19 @@ mod bounded_tests {
         let file = ProjectFile::new(fixture.project_root(), "bounded_join.rb");
         let tree = parse_ruby_tree(&source).expect("Ruby tree");
         let site = ruby_site(&source, &file, "service.run", "run");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 128,
-            ..ReceiverAnalysisBudget::default()
-        };
+        // Scope work never refuses (#13216); a cancellation is the stop.
+        let cancellation = CancellationToken::cancel_after_checks_for_test(128);
         let outcome = resolve_ruby_bounded(
             fixture.analyzer.analyzer(),
             &file,
             &source,
             Some(&tree),
             &site,
-            budget,
-            None,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
         );
         assert!(
-            matches!(outcome, BoundedResolution::Exceeded {
-            limit: ReceiverBudgetLimit::ScopeNodes, work,
-        } if work.scope_nodes == budget.max_scope_nodes),
+            matches!(outcome, BoundedResolution::Cancelled { .. }),
             "{outcome:#?}"
         );
     }
@@ -5201,18 +5197,6 @@ mod bounded_tests {
             "each parenthesis transition must be charged: shallow={shallow_work:?}, deep={deep_work:?}"
         );
 
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: deep_work.scope_nodes.saturating_sub(1),
-            ..ReceiverAnalysisBudget::default()
-        };
-        assert!(matches!(
-            parenthesized_receiver_outcome(256, budget, None),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
-
         let cancellation =
             CancellationToken::cancel_after_checks_for_test(shallow_work.scope_nodes + 16);
         assert!(matches!(
@@ -5257,21 +5241,16 @@ mod bounded_tests {
             BoundedResolution::Complete { .. }
         ));
 
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 32,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let session = ResolutionSession::bounded(budget, None);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(32);
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
         let support = RubyDefinitionProvider::new(ruby, &session);
         let context =
             BoundedRubyLookupContext::build(&support, &file, &source, tree.root_node(), 0);
         assert!(context.constant_name_path(path_node).is_none());
         assert!(matches!(
             session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
+            BoundedResolution::Cancelled { .. }
         ));
     }
 }

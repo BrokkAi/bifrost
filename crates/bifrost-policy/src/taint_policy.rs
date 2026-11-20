@@ -4,6 +4,7 @@
 //! closed [`ResolvedTaintPolicySpec`] boundary and lowers only structured,
 //! source-backed selector results into the diagnostic-neutral taint engine.
 
+pub(crate) mod guard_barriers;
 pub(super) mod output_diagnostic;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
@@ -87,6 +88,7 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::{
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
 use brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict;
+use brokk_bifrost_analysis::analyzer::semantic::partial_flow::GuardProjectionMode;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     GapOpenness, PreparedWorkspaceDispatchSession, ProcedureRangeLookupStatus,
     abort_paths_run_user_code, classify_gap_openness, procedures_in_artifact,
@@ -212,8 +214,8 @@ use brokk_bifrost_rql::structural::{
 mod candidate;
 
 pub(crate) use candidate::{
-    CandidateBinding, CandidateBoundary, CandidatePass, CandidateSite, CandidateSolve,
-    project_candidate_witness, solve_flow_candidate,
+    CandidateBinding, CandidateBoundary, CandidateBoundaryCause, CandidatePass, CandidateSite,
+    CandidateSolve, project_candidate_witness, solve_flow_candidate,
 };
 
 #[derive(Debug, Clone)]
@@ -425,7 +427,7 @@ pub(crate) struct CompiledTaintPolicyPlan {
     pub(crate) sinks: Box<[CompiledTaintEndpoint]>,
     store_writes: Box<[CompiledStoreEnd]>,
     store_reads: Box<[CompiledStoreEnd]>,
-    call_resolution_evidence: Option<TaintCallResolutionEvidence>,
+    call_resolution_evidence: Vec<TaintCallResolutionEvidence>,
     sanitizer_declines: Vec<SanitizerDecline>,
     /// The kills bound in this region. Ordinary evaluation drops them unread;
     /// a flow candidate (#3686) names the ones a counterfactual path passes.
@@ -472,6 +474,14 @@ enum TaintPolicyCompilation {
         authored_selector_summary: bool,
         skipped_region_roots: usize,
     },
+    /// A compile whose binding is statically unsupported (#13175). Nothing
+    /// binds; `gaps` are the unsupported-binding messages and
+    /// `incomplete_selectors` the discovery gaps observed beside them.
+    StaticGaps {
+        work: PolicyWorkReport,
+        gaps: Vec<String>,
+        incomplete_selectors: Vec<IncompleteTaintSelector>,
+    },
     /// A compile whose endpoint selection was empty, so there is nothing to
     /// solve. `empty_endpoints` names the sets that matched nothing; an
     /// incomplete selector still prevents a complete negative verdict.
@@ -483,6 +493,7 @@ enum TaintPolicyCompilation {
         /// do not make the run incomplete, and the report still lists them.
         advisory_selector_gaps: Vec<IncompleteTaintSelector>,
         empty_endpoints: EmptyEndpointSets,
+        endpoint_role_unresolved: bool,
         /// Set only for a changed-range answer with no sink in the range
         /// An empty selection leaves both absent.
         engine: Option<TaintEngine>,
@@ -495,6 +506,9 @@ enum TaintPolicyCompilation {
 /// is the empty result, and it still records the engine that gave it.
 enum CompiledPolicy {
     Plans(Vec<CompiledTaintPolicyPlan>),
+    /// The policy's port shapes are unsupported regardless of any selected
+    /// row (see `static_binding_gaps`); one message per gap.
+    StaticGaps(Vec<String>),
     NoSinkInRange {
         engine: TaintEngine,
         scope: PolicyRunScope,
@@ -517,7 +531,7 @@ struct PreparedTaintPlan {
     sinks: Box<[CompiledTaintEndpoint]>,
     store_writes: Box<[CompiledStoreEnd]>,
     store_reads: Box<[CompiledStoreEnd]>,
-    call_resolution_evidence: Option<TaintCallResolutionEvidence>,
+    call_resolution_evidence: Vec<TaintCallResolutionEvidence>,
     sanitizer_declines: Vec<SanitizerDecline>,
     external_models: Arc<[BoundExternalModel]>,
     secondary: Option<SecondaryPlan>,
@@ -1712,6 +1726,7 @@ impl ProductionTaintPolicyEvaluator {
                     incomplete_selectors,
                     advisory_selector_gaps,
                     empty_endpoints,
+                    endpoint_role_unresolved,
                     engine,
                     scope,
                 }) => {
@@ -1726,8 +1741,29 @@ impl ProductionTaintPolicyEvaluator {
                         |path| selector_endpoint_label(spec, path),
                         budget.max_related_locations_per_finding(),
                     );
+                    if endpoint_role_unresolved {
+                        payload.completion = PolicyRunCompletion::failed(vec![
+                            PolicyFailureReason::EndpointRoleUnresolved,
+                        ])
+                        .expect("one typed failure reason is canonical");
+                    }
                     payload.engine = engine;
                     payload.scope = scope;
+                    payloads.insert(policy_id, payload);
+                }
+                Ok(TaintPolicyCompilation::StaticGaps {
+                    work,
+                    gaps,
+                    incomplete_selectors,
+                }) => {
+                    let payload = static_gaps_payload(
+                        &policy_id,
+                        work,
+                        gaps,
+                        incomplete_selectors,
+                        |path| selector_endpoint_label(spec, path),
+                        budget.max_related_locations_per_finding(),
+                    );
                     payloads.insert(policy_id, payload);
                 }
                 Err(failure) => {
@@ -1737,7 +1773,10 @@ impl ProductionTaintPolicyEvaluator {
         }
 
         let batch_planning_started = Instant::now();
-        let batches = partition_taint_batches(plans);
+        let batches = {
+            let _phase = cancellation.enter_phase("planning flow batches");
+            partition_taint_batches(plans)
+        };
         let batch_planning_elapsed = batch_planning_started.elapsed();
         let mut merge = BatchMerge::default();
         match batches {
@@ -1751,6 +1790,7 @@ impl ProductionTaintPolicyEvaluator {
                 let seeding_attribution_before = execution_budget.attribution.work();
                 let (seeding_result, seeding_receipt) =
                     capture_query_reads(workspace.analyzer(), || {
+                        let _phase = cancellation.enter_phase("seeding flow store channels");
                         seed_store_channels(
                             &batches,
                             &metadata,
@@ -1807,7 +1847,13 @@ impl ProductionTaintPolicyEvaluator {
                 // The file inventory determines which anchors exist. Frontier
                 // selectors still record their reads in files search visits.
                 let composition_files = workspace.analyzer().analyzed_files();
+                let batch_count = batches.len();
                 for (batch_index, batch) in batches.into_iter().enumerate() {
+                    let _phase = cancellation.enter_phase(format!(
+                        "solving flow batch {} of {batch_count} ({} policies)",
+                        batch_index + 1,
+                        batch.policy_ids().count()
+                    ));
                     let seeds = seeding.seeds[batch_index]
                         .iter()
                         .map(|seed| (seed.source, seed.classes.clone()))
@@ -2295,7 +2341,7 @@ thread_local! {
 fn approximation_active(active: Option<&ResolvedActiveSemanticModels>) -> bool {
     active.is_some_and(|active| {
         active.shards.iter().any(|shard| {
-            shard.approximate && shard.manifest.provenance.is_close_match_approximation()
+            shard.approximate() && shard.manifest.provenance.is_close_match_approximation()
         })
     })
 }
@@ -2846,8 +2892,15 @@ impl BoundEndpoint {
     /// Content correspondence only. Each endpoint keeps the admission and
     /// selected-view capability from its own executed question.
     pub(crate) fn has_same_inputs(&self, other: &Self) -> bool {
-        self.evidence_site == other.evidence_site
-            && self.endpoint == other.endpoint
+        self.evidence_site == other.evidence_site && self.binds_same_event(other)
+    }
+
+    /// Whether the two endpoints bind the same event: everything but the
+    /// selected evidence site, which is never part of event or finding
+    /// identity. Several selector rows of one call (a `call-bindings` row per
+    /// actual, plus the receiver's) bind its return value this way.
+    fn binds_same_event(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
             && self.kind == other.kind
             && self.point == other.point
             && self.source_site == other.source_site
@@ -3440,14 +3493,19 @@ fn value_flow_cause_text(
         ValueFlowIncompleteCause::CallResolution { call, .. } => {
             let key = call.durable_key();
             plan.call_resolution_evidence
-                .as_ref()
-                .filter(|evidence| evidence.call == key)
+                .iter()
+                .find(|evidence| evidence.call == key)
                 .or_else(|| {
-                    metadata.values().find_map(|candidate| {
-                        candidate
+                    // A batch projects several prepared policies. Keep the
+                    // search deterministic: the same call can be recorded by
+                    // more than one root.
+                    let mut policy_ids: Vec<_> = metadata.keys().collect();
+                    policy_ids.sort_unstable();
+                    policy_ids.into_iter().find_map(|policy_id| {
+                        metadata[policy_id]
                             .call_resolution_evidence
-                            .as_ref()
-                            .filter(|evidence| evidence.call == key)
+                            .iter()
+                            .find(|evidence| evidence.call == key)
                     })
                 })
         }
@@ -4232,19 +4290,29 @@ fn taint_call_resolution_evidence(
             })
         })
         .map(|boundary| {
-            format!(
-                "{:?} proof={:?} completeness={:?}",
-                boundary.kind, boundary.proof, boundary.completeness
-            )
+            let target = boundary
+                .kind
+                .target_locator()
+                .map(|target| super::semantic_identity::locator_label(workspace, target))
+                .transpose()
+                .map_err(TaintPolicyCompileError::SemanticProvider)?;
+            Ok(format!(
+                "{}{} proof={:?} completeness={:?}",
+                boundary.kind.label(),
+                target.map_or_else(String::new, |target| format!(" {target}")),
+                boundary.proof,
+                boundary.completeness
+            ))
         })
-        .collect::<Vec<_>>();
-    let entered_targets = coverage.map_or_else(Vec::new, |coverage| {
-        coverage
-            .entered
-            .iter()
-            .map(|target| target.semantics().locator().declaration().clone())
-            .collect::<Vec<_>>()
-    });
+        .collect::<Result<Vec<_>, TaintPolicyCompileError>>()?;
+    let entered_targets = coverage
+        .map_or(&[][..], |coverage| coverage.entered.as_slice())
+        .iter()
+        .map(|target| {
+            super::semantic_identity::locator_label(workspace, target.semantics().locator())
+                .map_err(TaintPolicyCompileError::SemanticProvider)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let binding_coverage = coverage.map(|coverage| &coverage.bindings);
     let (boundary_status, resolver_complete) = match coverage {
         Some(CallSiteCoverage {
@@ -6131,7 +6199,7 @@ impl<'a> TaintPolicyCompiler<'a> {
     /// declarations are separately fixed by the policy unit's semantic key.
     fn record_model_content_read(&self) -> ReadKey {
         let key = ReadKey::Models(
-            brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            self.selectors.workspace().analyzer().model_set_digest(
                 self.active_semantic_models
                     .as_ref()
                     .map(|models| models.active_model_set_hash()),
@@ -6355,6 +6423,10 @@ impl<'a> TaintPolicyCompiler<'a> {
         spec: &ResolvedTaintPolicySpec,
         incremental: Option<&PolicyIncrementalContext<'_>>,
     ) -> Result<TaintPolicyCompilation, Box<TaintPolicyCompileFailure>> {
+        let _phase = self.selectors.cancellation().enter_phase(format!(
+            "compiling flow policy {}",
+            policy.definition().metadata.id
+        ));
         let compiled = self.compile_inner(policy, spec).and_then(|compiled| {
             self.selectors
                 .record_taint_binding_gaps(policy)
@@ -6420,6 +6492,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                     skipped_region_roots: self.skipped_region_roots,
                 })
             }
+            Ok(CompiledPolicy::StaticGaps(gaps)) => Ok(TaintPolicyCompilation::StaticGaps {
+                work,
+                gaps,
+                incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
+            }),
             Ok(CompiledPolicy::NoSinkInRange { engine, scope }) => {
                 Ok(TaintPolicyCompilation::Clean {
                     work,
@@ -6433,6 +6510,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     },
                     incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
                     advisory_selector_gaps: Vec::new(),
+                    endpoint_role_unresolved: false,
                     engine: Some(engine),
                     scope: Some(scope),
                 })
@@ -6449,24 +6527,63 @@ impl<'a> TaintPolicyCompiler<'a> {
                         .chain(spec.sinks.iter().map(|sink| &sink.definition.selector_path)),
                 );
                 let mut incomplete_selectors = self.selectors.take_incomplete_taint_selectors();
-                let advisory_selector_gaps =
-                    if empty_endpoints.proves_no_flow(spec, &incomplete_selectors) {
-                        std::mem::take(&mut incomplete_selectors)
-                    } else {
-                        Vec::new()
-                    };
+                let endpoint_role_unresolved =
+                    !empty_endpoints.proves_no_flow(spec, &incomplete_selectors);
+                let advisory_selector_gaps = if !endpoint_role_unresolved {
+                    std::mem::take(&mut incomplete_selectors)
+                } else {
+                    Vec::new()
+                };
                 Ok(TaintPolicyCompilation::Clean {
                     work,
                     refusals: refusal_messages(&self.refused_sites),
                     empty_endpoints,
                     incomplete_selectors,
                     advisory_selector_gaps,
+                    endpoint_role_unresolved,
                     engine: None,
                     scope: None,
                 })
             }
             Err(error) => Err(Box::new(TaintPolicyCompileFailure { error, work })),
         }
+    }
+
+    /// Run every selector of `spec` once and drop its rows, so the discovery
+    /// gaps a statically unsupported policy would have met are still recorded.
+    fn discover_selector_gaps(
+        &mut self,
+        spec: &ResolvedTaintPolicySpec,
+        selectors: &HashMap<&PolicySelectorPath, &ResolvedPolicySelector>,
+    ) -> Result<(), TaintPolicyCompileError> {
+        let paths = spec
+            .sources
+            .iter()
+            .chain(&spec.entry_points)
+            .map(|source| &source.definition.selector_path)
+            .chain(spec.sinks.iter().map(|sink| &sink.definition.selector_path))
+            .chain(spec.sanitizers.iter().map(|item| &item.selector_path))
+            .chain(spec.transforms.iter().map(|item| &item.selector_path))
+            .chain(spec.store_writes.iter().map(|item| &item.selector_path))
+            .chain(spec.store_reads.iter().map(|item| &item.selector_path))
+            .collect::<std::collections::BTreeSet<_>>();
+        for path in paths {
+            let selector = required_selector(selectors, path)?;
+            let analyzer = self.selectors.workspace().analyzer();
+            let outer_reuse = self.selectors.take_execution_reuse();
+            let (selected, reads) = capture_query_reads_deferred(analyzer, || {
+                self.select(selector, &PolicyPort::ReturnValue { path: None })
+            });
+            self.join_selection_reuse(outer_reuse, &reads);
+            if let Some(receipts) = self.partition_reads {
+                receipts
+                    .lock()
+                    .expect("partition receipts mutex poisoned")
+                    .push(reads);
+            }
+            selected?;
+        }
+        Ok(())
     }
 
     /// Bind every sink selector of `spec`, in the changed files `range` when it
@@ -6670,15 +6787,43 @@ impl<'a> TaintPolicyCompiler<'a> {
         spec: &ResolvedTaintPolicySpec,
     ) -> Result<CompiledPolicy, TaintPolicyCompileError> {
         validate_external_model_entries(&spec.external_models)?;
+        // The one authored guard decision for every plan built from this analysis.
+        let guard_mode = if spec.guard_barriers.is_empty() {
+            GuardProjectionMode::LegacyAutomatic
+        } else {
+            GuardProjectionMode::PolicyProvedOnly
+        };
 
         let selectors = policy
             .resolved_selectors()
             .iter()
             .map(|selector| (&selector.path, selector))
             .collect::<HashMap<_, _>>();
+        // Hard-won: #13175: partial discovery masked static capability_incomplete binding gaps
+        let mut gaps = static_binding_gaps(spec, &selectors);
+        if let Some(secondary) = policy.resolved_without_flow() {
+            for gap in static_binding_gaps(secondary, &selectors) {
+                if !gaps.contains(&gap) {
+                    gaps.push(gap);
+                }
+            }
+        }
+        if !gaps.is_empty() {
+            // Discovery still runs so a selector that cannot finish records its
+            // gap, but no endpoint binds: the binding is unsupported whatever
+            // rows the selectors return.
+            self.discover_selector_gaps(spec, &selectors)?;
+            return Ok(CompiledPolicy::StaticGaps(gaps));
+        }
         let mut all_sources = Vec::new();
         // A changed-range run binds sinks in edited procedures only.
-        let mut all_sinks = self.bind_sinks(spec, &selectors, self.changed_files)?;
+        let mut all_sinks = {
+            let _phase = self.selectors.cancellation().enter_phase(format!(
+                "binding observation endpoints of {}",
+                policy.definition().metadata.id
+            ));
+            self.bind_sinks(spec, &selectors, self.changed_files)?
+        };
         // The engine uses one rule over the specification and bound sinks.
         // Candidate mode rechecks it after adding store-write observations.
         // The composition
@@ -6722,7 +6867,13 @@ impl<'a> TaintPolicyCompiler<'a> {
                     self.refused_sites.clear();
                     self.selectors.truncate_incomplete_taint_selectors(0);
                     self.range_widened.clear();
-                    all_sinks = self.bind_sinks(spec, &selectors, None)?;
+                    all_sinks = {
+                        let _phase = self.selectors.cancellation().enter_phase(format!(
+                            "binding observation endpoints of {}",
+                            policy.definition().metadata.id
+                        ));
+                        self.bind_sinks(spec, &selectors, None)?
+                    };
                 }
             }
         }
@@ -6751,6 +6902,10 @@ impl<'a> TaintPolicyCompiler<'a> {
             let analyzer = self.selectors.workspace().analyzer();
             let outer_reuse = self.selectors.take_execution_reuse();
             let (bound, receipt) = capture_query_reads_deferred(analyzer, || {
+                let _phase = self.selectors.cancellation().enter_phase(format!(
+                    "binding origin endpoints of {}",
+                    policy.definition().metadata.id
+                ));
                 self.bind_policy_sources(spec, &selectors)
             });
             self.join_selection_reuse(outer_reuse, &receipt);
@@ -6837,7 +6992,13 @@ impl<'a> TaintPolicyCompiler<'a> {
             // order binding has always reported them.
             let sink_refusals = std::mem::take(&mut self.refused_sites);
             let sink_incomplete = self.selectors.take_incomplete_taint_selectors();
-            all_sources.extend(self.bind_policy_sources(spec, &selectors)?);
+            all_sources.extend({
+                let _phase = self.selectors.cancellation().enter_phase(format!(
+                    "binding origin endpoints of {}",
+                    policy.definition().metadata.id
+                ));
+                self.bind_policy_sources(spec, &selectors)?
+            });
             self.refused_sites.extend(sink_refusals);
             self.selectors
                 .extend_incomplete_taint_selectors(sink_incomplete);
@@ -6883,7 +7044,13 @@ impl<'a> TaintPolicyCompiler<'a> {
             // including sources in files outside the sink frontier. Keep its
             // reads in the shared compilation capture replayed by every
             // Output unit; partition receipts only feed non-Output consumers.
-            self.bind_policy_sources(secondary, &selectors)?;
+            {
+                let _phase = self.selectors.cancellation().enter_phase(format!(
+                    "binding secondary origin endpoints of {}",
+                    policy.definition().metadata.id
+                ));
+                self.bind_policy_sources(secondary, &selectors)?;
+            }
             for model in &secondary.external_models {
                 let selector = required_selector(&selectors, &model.selector_path)?;
                 for selected in self.select(selector, &PolicyPort::ReturnValue { path: None })? {
@@ -6981,11 +7148,6 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut all_store_writes = Vec::new();
         for write in &spec.store_writes {
             let selector = required_selector(&selectors, &write.selector_path)?;
-            if matches!(write.definition.input, PolicyPort::MatchedValue) {
-                return Err(TaintPolicyCompileError::UnsupportedBinding(
-                    "store-write input must be a call port".to_owned(),
-                ));
-            }
             let analyzer = self.selectors.workspace().analyzer();
             let outer_reuse = self.selectors.take_execution_reuse();
             let (bound, receipt) = capture_query_reads_deferred(analyzer, || {
@@ -7077,11 +7239,6 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut all_store_reads = Vec::new();
         for read in &spec.store_reads {
             let selector = required_selector(&selectors, &read.selector_path)?;
-            if matches!(read.definition.output, PolicyPort::MatchedValue) {
-                return Err(TaintPolicyCompileError::UnsupportedBinding(
-                    "store-read output must be a call port".to_owned(),
-                ));
-            }
             let analyzer = self.selectors.workspace().analyzer();
             let outer_reuse = self.selectors.take_execution_reuse();
             let (bound, receipt) = capture_query_reads_deferred(analyzer, || {
@@ -7279,6 +7436,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .iter()
                     .flat_map(|sanitizer| sanitizer.definition.removes.iter()),
             )
+            .chain(
+                spec.guard_barriers
+                    .iter()
+                    .flat_map(|guard| guard.definition.removes.iter()),
+            )
             .chain(spec.transforms.iter().flat_map(|transform| {
                 transform
                     .definition
@@ -7332,6 +7494,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 secondary_models,
                 &universe,
                 scope,
+                guard_mode,
             );
         }
 
@@ -7389,81 +7552,6 @@ impl<'a> TaintPolicyCompiler<'a> {
         // re-materialized the file in between, and handle equality would then
         // root the same region twice (#2289).
         roots.dedup_by(|left, right| left.durable_key() == right.durable_key());
-        let mut discoveries = Vec::with_capacity(roots.len());
-        // Calls covered by a bound external model are opaque: their declared
-        // transfers are the semantics, so discovery must not bind their callee
-        // bodies (#2691).
-        let modeled_calls = all_models
-            .iter()
-            .map(|model| model.call.durable_key())
-            .collect::<HashSet<_>>();
-        // One cache serves every root in this compile. Reuse requires the
-        // current region to retain the fill's dependencies and have room for
-        // its transient peak; otherwise the region recomputes cold.
-        let materialization =
-            DiscoveryMaterializationCache::new(self.selectors.workspace().retention_budget());
-        for root in roots {
-            // Each region is an independent source-to-sink analysis, so budget
-            // it independently rather than accumulating every region's
-            // materialization into one shared cap (which makes a corpus abstain
-            // by accumulation). The shared `materialization` cache amortizes
-            // eligible hits; a fresh region still admits its own dependencies.
-            self.selectors.reset_region_semantic_budget();
-            match self.discover_value_flow(&root, &modeled_calls, &materialization) {
-                Ok(discovery) => discoveries.push(discovery),
-                Err(error) if is_region_budget_exhausted(&error) => {
-                    // This root's forward closure did not fit its own per-region
-                    // budget. `discover_value_flow` errors on exhaustion instead
-                    // of truncating, so the region is complete-or-absent: there
-                    // is no partial region to solve. Skipping it is honest -- the
-                    // root's file simply has no covering region, so any source or
-                    // sink it holds reports `not_analyzed`, never a false clean
-                    // (the scoreboard already treats an uncovered file as an
-                    // abstain). Regions that fit their budget are unaffected, so
-                    // one oversized root -- typically a high call-graph entry
-                    // whose closure spans the workspace -- no longer aborts the
-                    // whole compile and drops every later region (#1936).
-                    self.skipped_region_roots = self.skipped_region_roots.saturating_add(1);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.selectors
-            .record_semantic_handle_identity_reuses(materialization.handle_identity_reuses.get());
-        // Drop every region that could contain a refused selector row (#2308).
-        // A refused row bound no endpoint, so a region holding it is missing an
-        // endpoint the policy asked for; solving it anyway could report a clean
-        // verdict for a site that was never analyzed. Regions that contain none
-        // of the refused row's candidate procedures cannot hold the site, so
-        // they keep their verdicts: the refusal costs the sites it affects
-        // rather than the whole run.
-        if !self.refused_sites.is_empty() {
-            let refused = self
-                .refused_sites
-                .iter()
-                .filter(|refusal| refusal.impact == PolicyDiagnosticImpact::RunIncomplete)
-                .flat_map(|refusal| refusal.procedures.iter().cloned())
-                .collect::<HashSet<_>>();
-            discoveries.retain(|discovery| {
-                !discovery
-                    .procedures
-                    .iter()
-                    .any(|procedure| refused.contains(procedure))
-            });
-        }
-        // Keep only regions that contain both a selected source and a selected
-        // sink: those are the regions where a flow can exist, and each becomes
-        // one independent analysis plan below. Binding proceeds per region on
-        // purpose (#1935). Workspace-wide name selection spans many files, so
-        // requiring every selected source AND sink to land in one shared region
-        // aborted the whole compile by construction and abstained with zero
-        // findings. A source in one region and a sink in another simply cannot
-        // flow, so an endpoint with no co-located partner contributes no
-        // finding; it must not suppress a fully-discovered region's verdicts.
-        // Within-region incompleteness still degrades honestly: a region whose
-        // discovery is partial carries that status into its value-flow plan and
-        // reports `Inconclusive`, and require-model still fails closed on a
-        // genuinely unmodeled call inside a region.
         // Region membership is tested by durable procedure identity. Building
         // the endpoints' keys once keeps the per-region tests below from
         // cloning one `SemanticArtifactKey` for every endpoint of every region.
@@ -7491,14 +7579,141 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|end| end.endpoint.point.procedure().durable_key())
             .collect::<Vec<_>>();
+        // Drop every region that could contain a refused selector row (#2308).
+        // A refused row bound no endpoint, so a region holding it is missing an
+        // endpoint the policy asked for; solving it anyway could report a clean
+        // verdict for a site that was never analyzed. Regions that contain none
+        // of the refused row's candidate procedures cannot hold the site, so
+        // they keep their verdicts: the refusal costs the sites it affects
+        // rather than the whole run.
+        let refused = self
+            .refused_sites
+            .iter()
+            .filter(|refusal| refusal.impact == PolicyDiagnosticImpact::RunIncomplete)
+            .flat_map(|refusal| refusal.procedures.iter().cloned())
+            .collect::<HashSet<_>>();
+        // Keep only regions that contain both a selected source and a selected
+        // sink: those are the regions where a flow can exist, and each becomes
+        // one independent analysis plan below. Binding proceeds per region on
+        // purpose (#1935). Workspace-wide name selection spans many files, so
+        // requiring every selected source AND sink to land in one shared region
+        // aborted the whole compile by construction and abstained with zero
+        // findings. A source in one region and a sink in another simply cannot
+        // flow, so an endpoint with no co-located partner contributes no
+        // finding; it must not suppress a fully-discovered region's verdicts.
+        // Within-region incompleteness still degrades honestly: a region whose
+        // discovery is partial carries that status into its value-flow plan and
+        // reports `Inconclusive`, and require-model still fails closed on a
+        // genuinely unmodeled call inside a region.
         // A region can host a flow when it contains something that establishes
         // taint (a source, or a store read fed across the boundary) and
         // something that consumes it (a sink, or a store write feeding the
         // boundary). Without stores this is exactly the source-and-sink test;
         // with them, the write region and the read region each stay viable on
         // their own and the evaluation driver links them through the channel.
-        // Validate selector endpoint interpretations before filtering regions:
-        // an alternate region cannot contain a retained base endpoint locator.
+        //
+        // Both filters run as each root is discovered, so a region that cannot
+        // host a flow is released at once instead of every root's snapshots
+        // and bindings staying live until the last root is discovered. Their
+        // inputs are bound before the loop and discovery adds no refusal.
+        let mut covering_discoveries = Vec::new();
+        // While no region covers a flow, keep what the disconnected-endpoint
+        // fallback below mounts: the first disconnected region holding the
+        // first selected source, and, for each other endpoint procedure, the
+        // first finished snapshot another disconnected region holds of it.
+        let mut fallback_region = None;
+        let mut fallback_snapshots = HashMap::new();
+        // Calls covered by a bound external model are opaque: their declared
+        // transfers are the semantics, so discovery must not bind their callee
+        // bodies (#2691).
+        let modeled_calls = all_models
+            .iter()
+            .map(|model| model.call.durable_key())
+            .collect::<HashSet<_>>();
+        // One cache serves every root in this compile. Reuse requires the
+        // current region to retain the fill's dependencies and have room for
+        // its transient peak; otherwise the region recomputes cold.
+        let materialization =
+            DiscoveryMaterializationCache::new(self.selectors.workspace().retention_budget());
+        // Discovery is one policy phase, regardless of how many roots it
+        // visits. Per-root enter/restore pairs flood client progress.
+        let discovery_phase = self.selectors.cancellation().enter_phase(format!(
+            "discovering value flow for {}",
+            policy.definition().metadata.id
+        ));
+        for root in roots {
+            // Each region is an independent source-to-sink analysis, so budget
+            // it independently rather than accumulating every region's
+            // materialization into one shared cap (which makes a corpus abstain
+            // by accumulation). The shared `materialization` cache amortizes
+            // eligible hits; a fresh region still admits its own dependencies.
+            self.selectors.reset_region_semantic_budget();
+            let discovery = match self.discover_value_flow(&root, &modeled_calls, &materialization)
+            {
+                Ok(discovery) => discovery,
+                Err(error) if is_region_budget_exhausted(&error) => {
+                    // This root's forward closure did not fit its own per-region
+                    // budget. `discover_value_flow` errors on exhaustion instead
+                    // of truncating, so the region is complete-or-absent: there
+                    // is no partial region to solve. Skipping it is honest -- the
+                    // root's file simply has no covering region, so any source or
+                    // sink it holds reports `not_analyzed`, never a false clean
+                    // (the scoreboard already treats an uncovered file as an
+                    // abstain). Regions that fit their budget are unaffected, so
+                    // one oversized root -- typically a high call-graph entry
+                    // whose closure spans the workspace -- no longer aborts the
+                    // whole compile and drops every later region (#1936).
+                    self.skipped_region_roots = self.skipped_region_roots.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if discovery
+                .procedures
+                .iter()
+                .any(|procedure| refused.contains(procedure))
+            {
+                continue;
+            }
+            let establishes = source_procedures
+                .iter()
+                .chain(&store_read_procedures)
+                .any(|procedure| discovery.procedures.contains(procedure));
+            let consumes = sink_procedures
+                .iter()
+                .chain(&store_write_procedures)
+                .any(|procedure| discovery.procedures.contains(procedure));
+            if establishes && consumes {
+                covering_discoveries.push(discovery);
+                fallback_region = None;
+                fallback_snapshots = HashMap::new();
+            } else if covering_discoveries.is_empty() {
+                if fallback_region.is_none()
+                    && source_procedures
+                        .first()
+                        .is_some_and(|first_source| discovery.procedures.contains(first_source))
+                {
+                    fallback_region = Some(discovery);
+                } else {
+                    for snapshot in discovery.snapshots {
+                        let procedure = snapshot.value().procedure().durable_key();
+                        if source_procedures
+                            .iter()
+                            .chain(&sink_procedures)
+                            .any(|endpoint| *endpoint == procedure)
+                        {
+                            fallback_snapshots.entry(procedure).or_insert(snapshot);
+                        }
+                    }
+                }
+            }
+        }
+        drop(discovery_phase);
+        self.selectors
+            .record_semantic_handle_identity_reuses(materialization.handle_identity_reuses.get());
+        // Validate selector endpoint interpretations before any region is
+        // planned: an alternate region cannot contain a retained base endpoint
+        // locator.
         for endpoint in source_procedures.iter().chain(&sink_procedures) {
             let base = materialization
                 .artifacts
@@ -7525,24 +7740,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|model| model.call.procedure().durable_key())
             .collect::<Vec<_>>();
-        let (mut covering_discoveries, mut disconnected_discoveries): (Vec<_>, Vec<_>) =
-            discoveries.into_iter().partition(|discovery| {
-                let establishes = source_procedures
-                    .iter()
-                    .chain(&store_read_procedures)
-                    .any(|procedure| discovery.procedures.contains(procedure));
-                let consumes = sink_procedures
-                    .iter()
-                    .chain(&store_write_procedures)
-                    .any(|procedure| discovery.procedures.contains(procedure));
-                establishes && consumes
-            });
         if covering_discoveries.is_empty()
-            && let Some(first_source) = source_procedures.first()
-            && let Some(mut discovery) = disconnected_discoveries
-                .iter()
-                .position(|discovery| discovery.procedures.contains(first_source))
-                .map(|index| disconnected_discoveries.swap_remove(index))
+            && let Some(mut discovery) = fallback_region
         {
             // The selectors bound real endpoints, but no discovered call region
             // connects them. This is an unresolved-dispatch boundary, not a
@@ -7557,12 +7756,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     // Use the finished region's selected snapshot, including its
                     // payload identity, rather than selecting an arbitrary raw
                     // or projected interpretation from the materialization memo.
-                    let snapshot = disconnected_discoveries
-                        .iter()
-                        .flat_map(|region| &region.snapshots)
-                        .find(|snapshot| snapshot.value().procedure().durable_key() == *endpoint)
-                        .cloned();
-                    let Some(snapshot) = snapshot else {
+                    let Some(snapshot) = fallback_snapshots.get(endpoint).cloned() else {
                         // A skipped budget-exhausted root has no finished
                         // snapshot. Do not turn that absence into a fabricated
                         // mounted procedure; preserve the existing compile
@@ -7758,6 +7952,9 @@ impl<'a> TaintPolicyCompiler<'a> {
                     spec.call_modeling.unmodeled,
                     &conditional_sanitizers,
                     &universe,
+                    spec,
+                    &selectors,
+                    guard_mode,
                 )?;
             let value_flow = self.install_bound_external_models(
                 value_flow,
@@ -7927,16 +8124,30 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .map(|barrier| (barrier.id.as_str().into(), barrier.value_type))
                     .collect(),
             );
-            let call_resolution_evidence = match analysis.value_flow().first_incomplete_cause() {
-                Some(ValueFlowIncompleteCause::CallResolution { call, .. }) => {
-                    Some(taint_call_resolution_evidence(
-                        self.selectors.workspace(),
-                        call,
-                        &call_resolution_discovery,
-                    )?)
+            // Report-time discharge can leave a residual `CallResolution`
+            // cause that was not the plan's first cause, so build the
+            // call-site evidence for every retained call-resolution cause
+            // (#14555). The projected inventory is a subset of this one.
+            let mut call_resolution_evidence = Vec::new();
+            let mut evidenced_calls = HashSet::new();
+            for cause in analysis
+                .value_flow()
+                .first_incomplete_cause()
+                .into_iter()
+                .chain(analysis.value_flow().incomplete_causes())
+            {
+                let ValueFlowIncompleteCause::CallResolution { call, .. } = cause else {
+                    continue;
+                };
+                if !evidenced_calls.insert(call.durable_key()) {
+                    continue;
                 }
-                _ => None,
-            };
+                call_resolution_evidence.push(taint_call_resolution_evidence(
+                    self.selectors.workspace(),
+                    call,
+                    &call_resolution_discovery,
+                )?);
+            }
             let internal_policy_id = format!(
                 "{}#root-{root_index}",
                 policy.definition().metadata.id.as_str()
@@ -8050,6 +8261,11 @@ impl<'a> TaintPolicyCompiler<'a> {
         spec: &ResolvedTaintPolicySpec,
         models: Arc<[BoundExternalModel]>,
     ) -> Result<SecondaryPlan, TaintPolicyCompileError> {
+        let guard_mode = if spec.guard_barriers.is_empty() {
+            GuardProjectionMode::LegacyAutomatic
+        } else {
+            GuardProjectionMode::PolicyProvedOnly
+        };
         let mut accepted = spec
             .sources
             .iter()
@@ -8073,6 +8289,11 @@ impl<'a> TaintPolicyCompiler<'a> {
         accepted.sort();
         accepted.dedup();
         let mut labels = accepted.clone();
+        labels.extend(
+            spec.guard_barriers
+                .iter()
+                .flat_map(|guard| guard.definition.removes.iter().cloned()),
+        );
         labels.extend(
             spec.sanitizers
                 .iter()
@@ -8126,7 +8347,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             sink_specs.iter().map(|(_, spec)| spec.clone()).collect(),
             spec.call_modeling.unmodeled,
         )
-        .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+        .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
+        .with_guard_projection_mode(guard_mode);
         let bound_sinks = bind_taint_sinks(&value_flow, &universe, &sinks, &sink_specs)?;
         let analysis = TaintAnalysisPlan::new(
             value_flow,
@@ -8180,6 +8402,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         secondary_models: Vec<BoundExternalModel>,
         universe: &TaintUniverse,
         scope: Option<PolicyRunScope>,
+        guard_mode: GuardProjectionMode,
     ) -> Result<CompiledPolicy, TaintPolicyCompileError> {
         assert!(
             !sinks.is_empty(),
@@ -8296,7 +8519,8 @@ impl<'a> TaintPolicyCompiler<'a> {
                 sink_specs.iter().map(|(_, spec)| spec.clone()).collect(),
                 behavior,
             )
-            .map_err(|error| plan_error(&error))?;
+            .map_err(|error| plan_error(&error))?
+            .with_guard_projection_mode(guard_mode);
             let taint_sinks = bind_taint_sinks(&value_flow, universe, sinks, &sink_specs)?;
             let taint_sources =
                 bind_taint_sources(&value_flow, universe, eager_sources, &source_specs)?;
@@ -8392,7 +8616,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 sinks: endpoint_metadata(sinks, &sink_specs).into_boxed_slice(),
                 store_writes: store_writes.clone(),
                 store_reads: store_reads.clone(),
-                call_resolution_evidence: None,
+                call_resolution_evidence: Vec::new(),
                 sanitizer_declines: Vec::new(),
                 kills: kills
                     .iter()
@@ -9228,21 +9452,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
             return (self.matched_values)(self, selection);
         }
-        // A field-write row's span is the assigned value, not a call. A call
-        // port would bind whatever call sits at that span, such as the
-        // right-hand call itself, and refuse the site only as advisory, so a
-        // setter-only workspace would answer complete and clean (#8305).
-        if selector.as_query().is_some_and(|(_, query)| {
-            query
-                .validate_row_kinds()
-                .expect("a compiled selector has a valid plan")
-                .contains(&brokk_bifrost_rql::structural::QueryValueKind::FieldWriteValue)
-        }) {
-            return Err(TaintPolicyCompileError::UnsupportedBinding(format!(
-                "selector `{}` selects field-write values, which have no call port: bind the assigned value with matched-value",
-                selector.path
-            )));
-        }
+        // A field-write selector with a call port is refused before binding by
+        // `static_binding_gaps` (#8305).
         let calls = self.selected_semantic_calls(&selection)?;
         if matches!(calls, SelectedCallSites::Missing)
             && matches!(binding, PolicyPort::ReturnValue { path: None })
@@ -9317,6 +9528,44 @@ impl<'a> TaintPolicyCompiler<'a> {
         // them; binding one would silently drop the others' paths (#2308).
         let mut resolved = Vec::with_capacity(sites.len());
         for (procedure, call) in &sites {
+            let bound_operand = match selection.call_binding.as_ref() {
+                Some(row) => match call_binding_operand_index(call, row) {
+                    Some(operand) => Some(operand),
+                    None => {
+                        // The binding row names an actual the semantic call
+                        // does not carry exactly once. Which operand it means
+                        // is unknown, so the site is refused, never bound to
+                        // a neighbouring operand.
+                        let semantic_call = procedure
+                            .semantics()
+                            .call_site(call.id())
+                            .expect("validated call handle resolves");
+                        self.refused_sites.push(RefusedCallSite {
+                            file: selection.file.clone(),
+                            span: selection.span.clone(),
+                            reason: RefusalReason::MissingOperand {
+                                port: match row.actual_name.as_deref() {
+                                    Some(name) => format!("call-binding actual `{name}:`"),
+                                    None => format!(
+                                        "call-binding positional actual {}",
+                                        row.actual_index
+                                    ),
+                                },
+                                arguments: semantic_call.arguments.len(),
+                                lowering_gap: missing_operand_has_lowering_gap(
+                                    procedure,
+                                    semantic_call,
+                                ),
+                            },
+                            impact: PolicyDiagnosticImpact::RunIncomplete,
+                            cause: UNCERTIFIED_REFUSAL_CAUSE,
+                            procedures: vec![procedure.durable_key()],
+                        });
+                        continue;
+                    }
+                },
+                None => None,
+            };
             // A formal-name port names the callee's parameter list, which the
             // semantic call row does not carry. Resolve it to this call's own
             // actual first, then bind exactly as an index port does, so every
@@ -9346,11 +9595,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                             )));
                         }
                         named = PolicyPort::ArgumentIndex {
-                            index: u32::try_from(row.actual_index).map_err(|_| {
-                                TaintPolicyCompileError::UnsupportedBinding(
-                                    "selected actual index does not fit the policy port".to_owned(),
-                                )
-                            })?,
+                            index: bound_operand.expect("selected call binding has an operand"),
                         };
                         Some((
                             &named,
@@ -9417,17 +9662,9 @@ impl<'a> TaintPolicyCompiler<'a> {
                         row.formal_index
                     )));
                 }
-                PolicyPort::ArgumentIndex { .. } if selection.call_binding.as_ref().is_some() => {
-                    let row = selection
-                        .call_binding
-                        .as_ref()
-                        .expect("guard established relational call binding");
+                PolicyPort::ArgumentIndex { .. } if bound_operand.is_some() => {
                     named = PolicyPort::ArgumentIndex {
-                        index: u32::try_from(row.actual_index).map_err(|_| {
-                            TaintPolicyCompileError::UnsupportedBinding(
-                                "selected actual index does not fit the policy port".to_owned(),
-                            )
-                        })?,
+                        index: bound_operand.expect("guard established relational call binding"),
                     };
                     Some((
                         &named,
@@ -9470,18 +9707,9 @@ impl<'a> TaintPolicyCompiler<'a> {
                 continue;
             };
             let evidence_site = match port {
-                PolicyPort::ArgumentIndex { index }
-                    if selection
-                        .call_binding
-                        .as_ref()
-                        .is_some_and(|row| row.actual_index == *index as usize) =>
-                {
-                    Some(selected_evidence_site(
-                        self.selectors.workspace(),
-                        &selection,
-                        &point,
-                    )?)
-                }
+                PolicyPort::ArgumentIndex { index } if bound_operand == Some(*index) => Some(
+                    selected_evidence_site(self.selectors.workspace(), &selection, &point)?,
+                ),
                 PolicyPort::ArgumentIndex { .. }
                 | PolicyPort::Receiver
                 | PolicyPort::MatchedValue => Some(value_evidence_site(&value)),
@@ -9741,11 +9969,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         input: &PolicyPort,
         output: &PolicyPort,
     ) -> Result<Vec<ResolvedTransferValues>, TaintPolicyCompileError> {
-        if matches!(input, PolicyPort::MatchedValue) || matches!(output, PolicyPort::MatchedValue) {
-            return Err(TaintPolicyCompileError::UnsupportedBinding(
-                "transform input and output must be call ports".to_owned(),
-            ));
-        }
+        // Transform ports are call ports: `static_binding_gaps` refuses others.
         self.resolve_selected_sanitizer_values(selection, selector, input, output)
     }
 
@@ -9756,17 +9980,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         input: &PolicyPort,
         output: &PolicyPort,
     ) -> Result<Vec<ResolvedTransferValues>, TaintPolicyCompileError> {
-        let matched_value_transfer =
-            matches!(input, PolicyPort::MatchedValue) || matches!(output, PolicyPort::MatchedValue);
-        if matched_value_transfer
-            && !(matches!(input, PolicyPort::MatchedValue)
-                && matches!(output, PolicyPort::MatchedValue))
-        {
-            return Err(TaintPolicyCompileError::UnsupportedBinding(
-                "transform or sanitizer must use matched-value for both ports or call ports for both ports"
-                    .to_owned(),
-            ));
-        }
+        // Both ports match the value or both are call ports, by
+        // `static_binding_gaps`.
+        let matched_value_transfer = matches!(input, PolicyPort::MatchedValue);
         let refusals_before = self.refused_sites.len();
         let inputs = self.resolve_selected_values(selection.clone(), selector, input)?;
         let outputs = self.resolve_selected_values(selection, selector, output)?;
@@ -9848,14 +10064,10 @@ impl<'a> TaintPolicyCompiler<'a> {
         resolved: &ResolvedTaintValue,
         port: &PolicyPort,
     ) -> Result<Option<ValueHandle>, TaintPolicyCompileError> {
-        if !matches!(
-            port,
-            PolicyPort::ArgumentIndex { .. } | PolicyPort::Receiver
-        ) {
-            return Err(TaintPolicyCompileError::UnsupportedBinding(
-                "a store dimension port must be (argument :index N) or receiver".to_owned(),
-            ));
-        }
+        debug_assert!(
+            is_store_dimension_port(port),
+            "static_binding_gaps admits only index and receiver store dimension ports"
+        );
         let Some(call) = resolved.call.as_ref() else {
             return Ok(None);
         };
@@ -11345,6 +11557,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_value_flow_plan(
         &mut self,
         discovery: DiscoveredValueFlow,
@@ -11353,6 +11566,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         call_behavior: brokk_bifrost_flow::dataflow::UnmodeledCallBehavior,
         conditional_sanitizers: &[BoundConditionalSanitizer],
         universe: &TaintUniverse,
+        spec: &ResolvedTaintPolicySpec,
+        selectors: &HashMap<&PolicySelectorPath, &ResolvedPolicySelector>,
+        guard_mode: GuardProjectionMode,
     ) -> Result<
         (
             ValueFlowPlan,
@@ -11379,7 +11595,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             call_behavior,
         )?;
         let mut source_specs = ValueFlowSources::from(source_specs);
-        let mut edge_kills = automatic_comparison_guard_edge_kills(&snapshots, &mut source_specs);
+        let mut edge_kills = match guard_mode {
+            GuardProjectionMode::LegacyAutomatic => {
+                automatic_comparison_guard_edge_kills(&snapshots, &mut source_specs)
+            }
+            GuardProjectionMode::PolicyProvedOnly => Vec::new(),
+        };
         let (conditional_kills, sanitizer_declines) = policy_conditioned_guard_edge_kills(
             &snapshots,
             &mut source_specs,
@@ -11387,6 +11608,27 @@ impl<'a> TaintPolicyCompiler<'a> {
             universe,
         )?;
         edge_kills.extend(conditional_kills);
+        if !spec.guard_barriers.is_empty() {
+            let sources = source_specs.intern_list(source_specs.ids().collect());
+            for snapshot in &snapshots {
+                let procedure = snapshot.value().procedure();
+                let observations = sink_specs
+                    .iter()
+                    .filter(|sink| {
+                        sink.point().procedure().durable_key() == procedure.durable_key()
+                    })
+                    .map(|sink| sink.point().id())
+                    .collect::<Vec<_>>();
+                let guards = self.bind_guard_barriers_in(
+                    &spec.guard_barriers,
+                    selectors,
+                    procedure,
+                    &observations,
+                )?;
+                self.record_guard_declines(&guards);
+                edge_kills.extend(guard_barriers::edge_kills(&guards, sources, universe)?);
+            }
+        }
         let mut resolved_external_calls = exact_python_external_resolution_calls(
             &call_coverage,
             &dispatch_boundaries,
@@ -11410,6 +11652,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         )
         .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
         let plan = plan
+            .with_guard_projection_mode(guard_mode)
             .with_returned_callable_captures(returned_callables)
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
 
@@ -15161,6 +15404,9 @@ impl UnitSlice for OutputUnitSlice<'_> {
 pub(super) struct ComposedCandidateReport {
     pub(super) report: TaintFindingReport,
     pub(super) status: Option<SemanticInputStatus>,
+    /// The typed cause records composition computed for this batch, in rank
+    /// order. Kind and reasons still come from `status` and the termination.
+    pub(super) causes: Vec<CandidateBoundaryCause>,
     pub(super) store_crossings: Vec<compose::ComposedStoreCrossing>,
     pub(super) inputs: Option<CandidateComposedInputs>,
     pub(super) batch_index: usize,
@@ -15650,6 +15896,29 @@ impl<'a> FrontierEndpointBinder<'a> {
             .iter()
             .map(|barrier| (barrier.id.as_str().into(), barrier.value_type))
             .collect()
+    }
+
+    pub(crate) fn has_guard_barriers(&self) -> bool {
+        !self.spec.guard_barriers.is_empty()
+    }
+
+    pub(crate) fn guards_in(
+        &mut self,
+        procedure: &ProcedureHandle,
+        observations: &[ProgramPointId],
+    ) -> Result<brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::CompiledGuardBindings, TaintPolicyCompileError>{
+        let selectors = self
+            .policy
+            .resolved_selectors()
+            .iter()
+            .map(|selector| (&selector.path, selector))
+            .collect::<HashMap<_, _>>();
+        self.compiler.bind_guard_barriers_in(
+            &self.spec.guard_barriers,
+            &selectors,
+            procedure,
+            observations,
+        )
     }
 
     pub(crate) fn conditional_in(
@@ -16569,6 +16838,7 @@ fn solve_and_project_batch(
             let anchor = StableDigest::sha256(super::semantic_identity::semantic_site_key(
                 workspace, &site,
             ));
+            brokk_bifrost_core::profile_count!("sinks.keyed", 1);
             keys.push(incremental.inputs().unit_key(
                 policy,
                 UnitPartition::Output {
@@ -17111,6 +17381,7 @@ fn solve_and_project_batch(
     }
     let candidate_inputs = batch_report.candidate_inputs.take();
     let candidate_mode = candidate_composed_reports.is_some();
+    let _projection_phase = cancellation.enter_phase("projecting flow witnesses and findings");
     let composed = project_batch_report(
         batch,
         store_seeds,
@@ -17130,7 +17401,7 @@ fn solve_and_project_batch(
         batch_report,
         candidate_mode,
     )?;
-    if let Some((report, status, store_crossings)) = composed
+    if let Some((report, status, store_crossings, causes)) = composed
         && let Some(candidate) = candidate_composed_reports.as_mut()
     {
         assert!(
@@ -17140,6 +17411,7 @@ fn solve_and_project_batch(
         candidate.reports[candidate.batch_index] = Some(ComposedCandidateReport {
             report,
             status,
+            causes,
             store_crossings,
             inputs: candidate_inputs,
             batch_index: candidate.batch_index,
@@ -17297,6 +17569,7 @@ fn project_output_units(
     composition_memo: &CompositionMemo,
     products: Vec<OutputUnitProduct>,
 ) -> Result<(), TaintBatchError> {
+    let _phase = cancellation.enter_phase("projecting flow witnesses and findings");
     let provenance =
         super::witness_projection::PatternProvenance::new(cancellation, semantic_budget);
     let [internal] = batch.policy_ids().collect::<Vec<_>>()[..] else {
@@ -17608,6 +17881,7 @@ type ProjectedComposition = (
     TaintFindingReport,
     Option<SemanticInputStatus>,
     Vec<compose::ComposedStoreCrossing>,
+    Vec<CandidateBoundaryCause>,
 );
 
 /// Project a merged composed report once, after all output sites are known.
@@ -17818,9 +18092,11 @@ fn project_batch_report(
             identities.insert(identity);
             payload.projections.push(projection);
         }
-        if let Some(cause) = source_coverage.as_ref() {
-            record_source_coverage_incomplete(payload, cause);
-        }
+        // Keep the current source stop even if its presentation was already
+        // emitted for another root. Deduplication does not erase the evidence.
+        let mut discovery_explanation = source_coverage
+            .as_ref()
+            .map(|cause| record_source_coverage_incomplete(payload, cause));
         project_selector_gap_causes(payload, selector_gap_causes);
         project_output_records(
             payload,
@@ -17882,12 +18158,13 @@ fn project_batch_report(
                 // A composed plan holds only its sinks. Its diagnostic names
                 // a located cause, while its status retains any unsupported
                 // open procedure in the same composed search.
-                let (cause, status) = match engine {
-                    TaintEngine::Composition => (None, composition_status),
-                    TaintEngine::Icfg { .. } => {
-                        let cause = batch.analysis().value_flow().first_incomplete_cause();
-                        (cause, cause.and_then(ValueFlowIncompleteCause::status))
-                    }
+                let status = match engine {
+                    TaintEngine::Composition => composition_status,
+                    TaintEngine::Icfg { .. } => batch
+                        .analysis()
+                        .value_flow()
+                        .first_incomplete_cause()
+                        .and_then(ValueFlowIncompleteCause::status),
                 };
                 let reason = output_incomplete_reason(
                     composition_cancelled
@@ -17905,7 +18182,16 @@ fn project_batch_report(
                 payload.completion = PolicyRunCompletion::inconclusive_in(reasons, scope)
                     .map_err(|error| error.to_string())?;
                 payload.authored_arm_closures.clear();
-                if let Some(cause) = cause {
+                // Resolve the raw discovery inventory against this execution's
+                // installed models before presenting causes as remaining blockers.
+                let causes = match engine {
+                    TaintEngine::Icfg { .. } => batch
+                        .analysis()
+                        .value_flow()
+                        .remaining_incomplete_causes(report.result().fact_result()),
+                    TaintEngine::Composition => Vec::new(),
+                };
+                for cause in causes {
                     let (family, detail, primary) =
                         value_flow_cause_text(cause, plan, metadata, workspace)?;
                     // The family names only the repeating cause. A corpus
@@ -17922,10 +18208,35 @@ fn project_batch_report(
                         Vec::new(),
                         crate::RelatedLocationOmissions::Known(0),
                     ) {
+                        discovery_explanation.get_or_insert_with(|| diagnostic.clone());
                         payload.diagnostics.push(diagnostic);
                     }
                 }
-                ensure_taint_incomplete_diagnostic(payload, &report, workspace);
+                let discovery_explanation = match engine {
+                    TaintEngine::Icfg { .. } => discovery_explanation,
+                    // Composition retains its composed-search explanation scope.
+                    TaintEngine::Composition => payload
+                        .diagnostics
+                        .iter()
+                        .find(|diagnostic| {
+                            diagnostic.impact() == PolicyDiagnosticImpact::RunIncomplete
+                        })
+                        .cloned(),
+                };
+                ensure_taint_incomplete_diagnostic(
+                    payload,
+                    &report,
+                    workspace,
+                    discovery_explanation,
+                );
+                debug_assert!(
+                    payload
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.impact()
+                            == PolicyDiagnosticImpact::RunIncomplete),
+                    "an incomplete taint run must retain a discovery or execution explanation"
+                );
             }
         }
         if has_partial_finding
@@ -17945,6 +18256,8 @@ fn project_batch_report(
                     }
                 }
                 TaintEngine::Icfg { .. } => {
+                    // Discovery provenance is run-scoped. Only the existing first
+                    // cause is available here; do not attach the run inventory.
                     if let Some(cause) = batch.analysis().value_flow().first_incomplete_cause() {
                         let (family, message, primary) =
                             value_flow_cause_text(cause, plan, metadata, workspace)?;
@@ -17990,7 +18303,7 @@ fn project_batch_report(
     let (retained_analysis, composed_report) = if matches!(engine, TaintEngine::Icfg { .. }) {
         let mut retained = ProductionTaintAnalysisResult::new(
             Arc::new(batch.analysis().clone()),
-            Arc::new(report),
+            Arc::new(report.into_projected()),
             *batch.compatibility(),
             retained_limits,
         );
@@ -18058,7 +18371,26 @@ fn project_batch_report(
     } else {
         retained_analyses.push(retained_analysis.expect("ICFG retains its analysis"));
     }
-    Ok(composed_report.map(|report| (report, composition_status, composed_store_crossings)))
+    // The batch already holds the typed cause records; a candidate keeps their
+    // rendering so its boundary names the same family, text and owner as the run.
+    Ok(composed_report.map(|report| {
+        let causes = if candidate_mode {
+            composition_diagnostics
+                .iter()
+                .map(|record| {
+                    let diagnostic = output_diagnostic::render(record);
+                    CandidateBoundaryCause {
+                        family: diagnostic.family().to_owned(),
+                        message: diagnostic.message().to_owned(),
+                        location: diagnostic.primary().cloned(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (report, composition_status, composed_store_crossings, causes)
+    }))
 }
 
 /// Preserve a machine-readable reason when solver-derived incompleteness has no
@@ -18071,10 +18403,13 @@ fn project_batch_report(
 /// each coverage category with their locations and proof or completeness
 /// reasons (#3644). Rows are projected lazily, so a cancelled or
 /// budget-exhausted solve resolves no locations.
+/// The ICFG caller supplies only this root's discovery explanation, so a
+/// previous root cannot suppress the current root's coverage diagnostic.
 fn ensure_taint_incomplete_diagnostic(
     payload: &mut TaintProjectionPayload,
     report: &TaintFindingReport,
     workspace: &WorkspaceAnalyzer,
+    discovery_explanation: Option<PolicyDiagnostic>,
 ) {
     if report
         .result()
@@ -18092,7 +18427,8 @@ fn ensure_taint_incomplete_diagnostic(
                 "reused summaries do not retain a complete coverage origin inventory",
             ));
     }
-    append_solver_termination_diagnostic(payload, report.result().termination());
+    let termination_explanation =
+        append_solver_termination_diagnostic(payload, report.result().termination());
     let PolicyRunCompletion::Inconclusive { reasons, .. } = &payload.completion else {
         return;
     };
@@ -18101,14 +18437,9 @@ fn ensure_taint_incomplete_diagnostic(
         .copied()
         .expect("validated inconclusive completion has a reason");
     let coverage = report.result().coverage();
-    if let Some(existing) = payload
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.impact() == PolicyDiagnosticImpact::RunIncomplete)
-        .cloned()
-    {
-        // Keep the existing plan-time presentation while recording every
-        // coverage-boundary origin before report retention.
+    if let Some(existing) = discovery_explanation.or(termination_explanation) {
+        // Keep this root's explanation while recording every coverage-boundary
+        // origin. An earlier root cannot suppress this root's coverage warning.
         for boundary in coverage.boundaries() {
             payload.diagnostics.record_diagnostic(
                 &existing
@@ -18184,18 +18515,19 @@ fn summary_boundary_execution_cause(
 fn append_solver_termination_diagnostic(
     payload: &mut TaintProjectionPayload,
     termination: SolverTermination,
-) -> bool {
+) -> Option<PolicyDiagnostic> {
     if termination.is_fixed_point() {
-        return false;
+        return None;
     }
-    payload.diagnostics.push(taint_incomplete_diagnostic(
+    let diagnostic = taint_incomplete_diagnostic(
         termination,
         PolicyIncompleteReason::PartialDiscovery,
         std::iter::empty(),
         std::iter::empty(),
         std::iter::empty(),
-    ));
-    true
+    );
+    payload.diagnostics.push(diagnostic.clone());
+    Some(diagnostic)
 }
 
 /// Coverage rows a fixed-point warning names from each category, taken in
@@ -21452,13 +21784,19 @@ fn record_exhausted_lane(payload: &mut TaintProjectionPayload, lane: ExhaustedTa
 fn record_source_coverage_incomplete(
     payload: &mut TaintProjectionPayload,
     cause: &brokk_bifrost_flow::taint::IcfgTaintIncomplete,
-) {
+) -> PolicyDiagnostic {
     use brokk_bifrost_flow::dataflow::WitnessTruncationCause;
     use brokk_bifrost_flow::taint::{IcfgTaintIncomplete, TaintWitnessTruncationCause};
 
     if let IcfgTaintIncomplete::Terminated(termination) = cause {
-        record_refinement_termination(payload, *termination);
-        return;
+        let reason = record_refinement_termination(payload, *termination);
+        return taint_incomplete_diagnostic(
+            *termination,
+            reason,
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+        );
     }
     let (reason, code, detail) = match cause {
         IcfgTaintIncomplete::RetentionBudget { limit, attempted } => (
@@ -21512,10 +21850,6 @@ fn record_source_coverage_incomplete(
         ),
         IcfgTaintIncomplete::Terminated(_) => unreachable!("terminations are recorded above"),
     };
-    if !payload.completion.mark_inconclusive(reason) {
-        return;
-    }
-    payload.authored_arm_closures.clear();
     let diagnostic = PolicyDiagnostic::try_new(
         code,
         PolicyDiagnosticSeverity::Warning,
@@ -21533,9 +21867,13 @@ fn record_source_coverage_incomplete(
     } else {
         diagnostic
     };
-    if !payload.diagnostics.contains(&diagnostic) {
-        payload.diagnostics.push(diagnostic);
+    if payload.completion.mark_inconclusive(reason) {
+        payload.authored_arm_closures.clear();
+        if !payload.diagnostics.contains(&diagnostic) {
+            payload.diagnostics.push(diagnostic.clone());
+        }
     }
+    diagnostic
 }
 
 /// Keep cancellation and replay budget boundaries honest on both evaluation
@@ -21968,6 +22306,56 @@ fn retain_other_sink_operands(
     Ok(())
 }
 
+/// The ordinal, in the semantic call's operand list, of the actual a selected
+/// call-binding row binds.
+///
+/// The row numbers an actual inside its own argument group, so a keyword
+/// actual counts from zero again after the positional ones, while the semantic
+/// call lists every written actual in one sequence (#14211). A keyword actual
+/// is therefore found by the keyword the lowering labelled it with, and a
+/// positional actual by its ordinal among the operands that are not keyword
+/// arguments. `None` when the semantic call does not carry that actual
+/// exactly once.
+fn call_binding_operand_index(
+    call: &CallSiteHandle,
+    row: &crate::selector_compiler::PolicySelectedCallBinding,
+) -> Option<u32> {
+    use brokk_bifrost_analysis::analyzer::semantic::{ArgumentDomain, CallArgumentExpansion};
+    let arguments = &call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("validated semantic call handle resolves")
+        .arguments;
+    let operand = match row.actual_name.as_deref() {
+        Some(name) => {
+            let mut labelled = arguments
+                .iter()
+                .enumerate()
+                .filter(|(_, argument)| argument.keyword.as_deref() == Some(name))
+                .map(|(index, _)| index);
+            match (labelled.next(), labelled.next()) {
+                (Some(index), None) => Some(index),
+                _ => None,
+            }
+        }
+        None => arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| {
+                argument.keyword.is_none()
+                    && !matches!(
+                        argument.expansion,
+                        CallArgumentExpansion::Direct(ArgumentDomain::Keyword)
+                            | CallArgumentExpansion::Spread(ArgumentDomain::Keyword)
+                    )
+            })
+            .nth(row.actual_index)
+            .map(|(index, _)| index),
+    };
+    operand.map(|index| u32::try_from(index).expect("a call's operand count fits in u32"))
+}
+
 fn select_value(
     procedure: &ProcedureHandle,
     call_handle: &brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
@@ -22197,17 +22585,40 @@ fn validate_external_model_entries(
                 PolicyPort::ReturnValue { .. }
                 | PolicyPort::ResultIndex { .. }
                 | PolicyPort::MatchedValue
-                | PolicyPort::FieldOf { .. } => {
-                    return Err(TaintPolicyCompileError::UnsupportedBinding(
-                        "external-model transfer :from must be a call input port (argument or receiver)"
-                            .to_owned(),
-                    ));
-                }
+                | PolicyPort::FieldOf { .. } => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The row-independent `UnsupportedBinding` messages of one external-model
+/// declaration set, for [`static_binding_gaps`].
+fn external_model_binding_gaps(
+    models: &[ResolvedTaintAuxiliary<ResolvedTaintExternalModelDefinition>],
+    gaps: &mut Vec<String>,
+) {
+    for model in models {
+        for transfer in &model.definition.transfers {
+            if matches!(transfer.from, PolicyPort::ReturnValue { path: Some(_) })
+                || matches!(transfer.to, PolicyPort::ReturnValue { path: Some(_) })
+                || matches!(transfer.effect, TaintTransferEffect::Transform { .. })
+            {
+                continue;
+            }
+            if !matches!(
+                transfer.from,
+                PolicyPort::ArgumentIndex { .. }
+                    | PolicyPort::ArgumentName { .. }
+                    | PolicyPort::Receiver
+            ) {
+                gaps.push(
+                    "external-model transfer :from must be a call input port (argument or receiver)"
+                        .to_owned(),
+                );
             }
             if matches!(transfer.to, PolicyPort::MatchedValue) {
-                return Err(TaintPolicyCompileError::UnsupportedBinding(
-                    "external-model transfer ports must be call ports".to_owned(),
-                ));
+                gaps.push("external-model transfer ports must be call ports".to_owned());
             }
             if let PolicyPort::FieldOf { base, .. } = &transfer.to
                 && !matches!(
@@ -22217,13 +22628,185 @@ fn validate_external_model_entries(
                         | PolicyPort::ArgumentName { .. }
                 )
             {
-                return Err(TaintPolicyCompileError::UnsupportedBinding(
-                    "a field base must be an argument or the receiver".to_owned(),
-                ));
+                gaps.push("a field base must be an argument or the receiver".to_owned());
             }
         }
     }
-    Ok(())
+}
+
+fn is_store_dimension_port(port: &PolicyPort) -> bool {
+    matches!(
+        port,
+        PolicyPort::ArgumentIndex { .. } | PolicyPort::Receiver
+    )
+}
+
+/// Every `UnsupportedBinding` that port shapes and selector plans decide,
+/// whatever rows the selectors return (#13175). The single owner of those
+/// checks: the `bind_*` loops assume them, and the per-row checks stay only
+/// for what depends on a selected site (call sites, formal indexes, result
+/// indexes, carrier field ports).
+fn static_binding_gaps(
+    spec: &ResolvedTaintPolicySpec,
+    selectors: &HashMap<&PolicySelectorPath, &ResolvedPolicySelector>,
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    external_model_binding_gaps(&spec.external_models, &mut gaps);
+    // A field-write row's span is the assigned value, not a call. A call port
+    // would bind whatever call sits at that span, such as the right-hand call
+    // itself, and refuse the site only as advisory, so a setter-only workspace
+    // would answer complete and clean (#8305).
+    let mut field_write_call_port = |path: &PolicySelectorPath, ports: &[&PolicyPort]| {
+        if ports
+            .iter()
+            .all(|port| matches!(port, PolicyPort::MatchedValue))
+        {
+            return;
+        }
+        let Some(selector) = super::selector_compiler::find_resolved_selector(selectors, path)
+        else {
+            return;
+        };
+        if selector.as_query().is_some_and(|(_, query)| {
+            query
+                .validate_row_kinds()
+                .expect("a compiled selector has a valid plan")
+                .contains(&brokk_bifrost_rql::structural::QueryValueKind::FieldWriteValue)
+        }) {
+            let gap = format!(
+                "selector `{}` selects field-write values, which have no call port: bind the assigned value with matched-value",
+                selector.path
+            );
+            if !gaps.contains(&gap) {
+                gaps.push(gap);
+            }
+        }
+    };
+    for source in spec
+        .sources
+        .iter()
+        .filter(|source| threat_model_source_is_active(source, &spec.threat_models))
+    {
+        field_write_call_port(&source.definition.selector_path, &[&source.definition.bind]);
+    }
+    for sink in &spec.sinks {
+        field_write_call_port(
+            &sink.definition.selector_path,
+            &[&sink.definition.dangerous_operand],
+        );
+    }
+    for write in &spec.store_writes {
+        field_write_call_port(&write.selector_path, &[&write.definition.input]);
+    }
+    for read in &spec.store_reads {
+        field_write_call_port(&read.selector_path, &[&read.definition.output]);
+    }
+    for transform in &spec.transforms {
+        field_write_call_port(
+            &transform.selector_path,
+            &[&transform.definition.input, &transform.definition.output],
+        );
+    }
+    for sanitizer in &spec.sanitizers {
+        if let Some((input, output)) = sanitizer.definition.kind.transfer_ports() {
+            field_write_call_port(&sanitizer.selector_path, &[input, output]);
+        }
+    }
+    for transform in &spec.transforms {
+        if matches!(transform.definition.input, PolicyPort::MatchedValue)
+            || matches!(transform.definition.output, PolicyPort::MatchedValue)
+        {
+            gaps.push("transform input and output must be call ports".to_owned());
+        }
+    }
+    for sanitizer in &spec.sanitizers {
+        if let Some((input, output)) = sanitizer.definition.kind.transfer_ports()
+            && matches!(input, PolicyPort::MatchedValue)
+                != matches!(output, PolicyPort::MatchedValue)
+        {
+            gaps.push(
+                "transform or sanitizer must use matched-value for both ports or call ports for both ports"
+                    .to_owned(),
+            );
+        }
+    }
+    for write in &spec.store_writes {
+        if matches!(write.definition.input, PolicyPort::MatchedValue) {
+            gaps.push("store-write input must be a call port".to_owned());
+        }
+    }
+    for read in &spec.store_reads {
+        if matches!(read.definition.output, PolicyPort::MatchedValue) {
+            gaps.push("store-read output must be a call port".to_owned());
+        }
+    }
+    let dimensions = spec
+        .store_writes
+        .iter()
+        .map(|write| (&write.definition.key, &write.definition.instance))
+        .chain(
+            spec.store_reads
+                .iter()
+                .map(|read| (&read.definition.key, &read.definition.instance)),
+        );
+    for (key, instance) in dimensions {
+        if key
+            .iter()
+            .chain(instance)
+            .any(|port| !is_store_dimension_port(port))
+        {
+            gaps.push("a store dimension port must be (argument :index N) or receiver".to_owned());
+        }
+    }
+    gaps.sort();
+    gaps.dedup();
+    gaps
+}
+
+/// The payload of a policy whose binding is statically unsupported: one
+/// `capability_incomplete` diagnostic per gap beside the discovery gaps the
+/// selectors still reported, so a partial discovery never hides the gap
+/// (#13175).
+fn static_gaps_payload(
+    policy_id: &PolicyId,
+    work: PolicyWorkReport,
+    gaps: Vec<String>,
+    incomplete_selectors: Vec<IncompleteTaintSelector>,
+    endpoint_label: impl Fn(&PolicySelectorPath) -> String,
+    max_related: usize,
+) -> TaintProjectionPayload {
+    let mut reasons = vec![PolicyIncompleteReason::CapabilityIncomplete];
+    if !incomplete_selectors.is_empty() {
+        reasons.push(PolicyIncompleteReason::PartialDiscovery);
+    }
+    let mut payload = compiled_payload(
+        policy_id,
+        work,
+        Vec::new(),
+        None,
+        false,
+        incomplete_selectors,
+        Vec::new(),
+        endpoint_label,
+        max_related,
+    );
+    payload.completion = PolicyRunCompletion::inconclusive(reasons)
+        .expect("static binding gaps have canonical reasons");
+    let mut diagnostics = gaps
+        .into_iter()
+        .map(|gap| {
+            PolicyDiagnostic::new_bounded(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                TaintPolicyCompileError::UnsupportedBinding(gap).to_string(),
+            )
+            .with_execution_cause(None)
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(payload.diagnostics.iter().cloned());
+    payload.diagnostics = diagnostics.into();
+    payload
 }
 
 /// The curated-model identity string for one declaring entry. Deterministic
@@ -22909,6 +23492,26 @@ fn reduce_bound_endpoints(
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
         for &index in indices {
             keep[index] = live.contains(&endpoints[index].endpoint);
+        }
+        // Rows that bind the same event mint one event, not one per row: a
+        // duplicate would become a second origin with its own witnesses and
+        // attribution replay (#14210). Keep the least evidence site so the
+        // choice does not depend on selector row order.
+        let mut kept = indices
+            .iter()
+            .copied()
+            .filter(|&index| keep[index])
+            .collect::<Vec<_>>();
+        kept.sort_by(|&left, &right| {
+            endpoints[left]
+                .evidence_site
+                .cmp(&endpoints[right].evidence_site)
+                .then(left.cmp(&right))
+        });
+        for (position, &index) in kept.iter().enumerate() {
+            keep[index] = !kept[..position]
+                .iter()
+                .any(|&earlier| endpoints[earlier].binds_same_event(&endpoints[index]));
         }
     }
     let mut index = 0;
@@ -23701,6 +24304,45 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#13539: presentation deduplication erased the current root's source-stop explanation"
+    )]
+    fn source_stop_explanations_survive_presentation_deduplication() {
+        let mut payload = super::compiled_payload(
+            &crate::PolicyId::new("test.source-stops").unwrap(),
+            Default::default(),
+            Vec::new(),
+            None,
+            false,
+            Vec::new(),
+            Vec::new(),
+            |path| path.to_string(),
+            PolicyBudget::default().max_related_locations_per_finding(),
+        );
+        let stop = brokk_bifrost_flow::taint::IcfgTaintIncomplete::OriginLimit { limit: 1 };
+        let first = super::record_source_coverage_incomplete(&mut payload, &stop);
+        let second = super::record_source_coverage_incomplete(&mut payload, &stop);
+        assert_eq!(first, second);
+        assert_eq!(
+            payload.diagnostics.len(),
+            1,
+            "presentation stays deduplicated: {:?}",
+            payload.diagnostics
+        );
+        // The second root still owns a typed explanation, even though it did
+        // not append another displayed warning to the global payload.
+        let returned: crate::finding::PolicyDiagnostics = vec![second].into();
+        let causes = returned.causes().iter().collect::<Vec<_>>();
+        assert_eq!(causes.len(), 1, "{causes:?}");
+        assert_eq!(
+            causes[0].execution_cause(),
+            crate::finding::PolicyDiagnosticExecutionCause::Known(Some(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Budget
+            ))
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#12105: plan content gaps hid a subsequent solver cancellation"
     )]
     fn solver_termination_survives_existing_content_gap() {
@@ -23725,10 +24367,13 @@ mod tests {
             |path| path.to_string(),
             PolicyBudget::default().max_related_locations_per_finding(),
         );
-        assert!(super::append_solver_termination_diagnostic(
-            &mut payload,
-            super::SolverTermination::Cancelled
-        ));
+        assert!(
+            super::append_solver_termination_diagnostic(
+                &mut payload,
+                super::SolverTermination::Cancelled
+            )
+            .is_some()
+        );
         let values = serde_json::to_value(payload.diagnostics.causes()).unwrap();
         let causes: Vec<_> = values
             .as_array()
@@ -23988,7 +24633,8 @@ mod tests {
                 toolchain: None,
                 target: Some("x86_64-unknown-linux-gnu".into()),
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             };
         let other = brokk_bifrost_analysis::analyzer::semantic_model::test_snapshot_from_compiled_pack_with_evidences(
             crate::test_support::exact_other_callable_pack(),
@@ -23997,7 +24643,9 @@ mod tests {
         );
         let mut other_metadata = (*other.active_models().shards[0].metadata).clone();
         other_metadata.manifest = Arc::clone(&callable.active_models().shards[0].manifest);
-        other_metadata.approximate = true;
+        other_metadata.approximation = Some(brokk_bifrost_analysis::analyzer::semantic_model::ApproximationReasons::only(
+            brokk_bifrost_analysis::analyzer::semantic_model::ApproximationReason::DependencyVersionApproximate,
+        ));
         other_metadata.matched_evidence = other_evidence.clone();
         other_metadata.matching_evidence = vec![other_evidence];
         let other_shard = Arc::new(
@@ -24088,7 +24736,8 @@ mod tests {
             toolchain: None,
             target: Some("x86_64-unknown-linux-gnu".into()),
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         };
         let in_range = evidence("0.4.25");
         let excluded = evidence("0.5.0");
@@ -24097,6 +24746,7 @@ mod tests {
             shard.activation(),
             &[in_range.clone(), excluded.clone()],
             &env!("CARGO_PKG_VERSION").parse().unwrap(),
+            brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,
         )
         .expect("in-range Y matches");
         assert_eq!(matched.matching_evidence, vec![in_range.clone()]);
@@ -24107,7 +24757,7 @@ mod tests {
                 shard.activation(),
                 std::slice::from_ref(&excluded),
                 &env!("CARGO_PKG_VERSION").parse().unwrap(),
-            )
+            brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,)
             .is_none()
         );
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -24124,6 +24774,7 @@ mod tests {
             resolve_active_semantic_models(
                 &catalog,
                 &SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                     evidence: evidences,
@@ -24192,6 +24843,7 @@ mod tests {
                 &catalog,
                 None,
                 &SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                     evidence: evidences,
@@ -24277,7 +24929,8 @@ mod tests {
                 toolchain: None,
                 target: Some("x86_64-unknown-linux-gnu".into()),
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             })
             .collect::<Vec<_>>();
         if packageless_evidence {
@@ -24289,10 +24942,12 @@ mod tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             });
         }
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence,
@@ -26186,9 +26841,10 @@ pub fn input() -> &'static str { query_value() }
     use brokk_bifrost_test_macros::hardwon;
 
     use super::{
-        DiscoveryMaterializationCache, ProductionTaintPolicyEvaluator, TaintEngine,
-        TaintExecutionBudget, TaintPolicyCompilation, TaintPolicyCompiler, compiled_payload,
-        matched_source_observation_or_refuse, refusal_messages, sanitizer_constant_equals,
+        CALL_SITE_EVIDENCE_FAMILY, DiscoveryMaterializationCache, ProductionTaintPolicyEvaluator,
+        TaintEngine, TaintExecutionBudget, TaintPolicyCompilation, TaintPolicyCompiler,
+        compiled_payload, matched_source_observation_or_refuse, refusal_messages,
+        sanitizer_constant_equals,
     };
     use crate::budget::PolicyBudget;
     use crate::coordinator::{
@@ -29003,6 +29659,7 @@ fn run(input: String) {
                 .expect("register receiver sanitizer pack");
         }
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION")
                 .parse()
@@ -29015,7 +29672,8 @@ fn run(input: String) {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: Default::default(),
@@ -30273,9 +30931,24 @@ pub fn run() {
     /// `base` with `:unmodeled behavior` over `source`, evaluated once on each
     /// engine as `engine_runs` does.
     fn engine_runs_of(base: &str, source: &str, behavior: &str) -> [EngineRun; 2] {
-        let project = InlineTestProject::with_language(Language::Rust)
-            .file("src/lib.rs", source)
-            .build();
+        engine_runs_in_context(base, source, behavior, false)
+    }
+
+    fn engine_runs_in_context(
+        base: &str,
+        source: &str,
+        behavior: &str,
+        crate_context: bool,
+    ) -> [EngineRun; 2] {
+        let mut project =
+            InlineTestProject::with_language(Language::Rust).file("src/lib.rs", source);
+        if crate_context {
+            project = project.file(
+                "Cargo.toml",
+                "[package]\nname=\"guard_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            );
+        }
+        let project = project.build();
         let workspace = project.workspace_analyzer(AnalyzerConfig {
             parallelism: Some(1),
             ..AnalyzerConfig::default()
@@ -30352,6 +31025,1329 @@ pub fn run() {
                 diagnostics,
             )
         })
+    }
+
+    fn authored_guard_policy(predicate: &str, accepts: bool) -> String {
+        COMPOSED_POLICY.replacen(
+            ":mode may",
+            &format!(
+                r#":mode may
+            :guard-barriers [(guard-barrier :id checked :predicate {predicate}
+              :clean-when {accepts} :removes [attacker-controlled])]"#
+            ),
+            1,
+        )
+    }
+
+    #[test]
+    #[hardwon("#13672: a stored guard result outlived a mutable-borrow mutation of its operand")]
+    fn stored_guard_binding_checks_mutation_before_the_branch() {
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::{
+            GuardBindingCandidate, GuardBindingProof, GuardBindingReason, GuardInteriorMutability,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            CancellationToken, SemanticBudget, SemanticRequest,
+        };
+        for (before, mutation) in [("", ""), ("let alias = &mut n;", "mutate(alias);")] {
+            let source = format!(
+                "fn source() -> usize {{ 42 }}\nfn allowed(_: usize) -> bool {{ true }}\nfn mutate(value: &mut usize) {{ *value = source(); }}\nfn sink(_: usize) {{}}\npub fn run() {{ let mut n: usize = source(); {before} let ok: bool = allowed(n); {mutation} if ok {{ sink(n); }} }}\n"
+            );
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("src/lib.rs", &source)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let mut request = SemanticRequest::new(&mut budget, &cancellation);
+            let artifact = workspace
+                .materialize_program_semantics(&project.file("src/lib.rs"), &mut request)
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            let root = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("run")
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap();
+            let proof = GuardBindingProof::new(&root, &mut request).unwrap();
+            let call = root
+                .semantics()
+                .call_sites()
+                .iter()
+                .find(|call| call.arguments.len() == 1)
+                .unwrap();
+            let guard = &root.semantics().guard_facts()[0];
+            let observations = root
+                .semantics()
+                .call_sites()
+                .last()
+                .map(|call| vec![call.point])
+                .unwrap();
+            let result = proof.prove(
+                GuardBindingCandidate {
+                    guard: guard.id,
+                    operand: call.arguments[0].value,
+                    read_point: call.point,
+                    accepts: true,
+                },
+                &observations,
+                &mut request,
+                |_, _| Ok(GuardInteriorMutability::Absent),
+                |_, _, _| Ok(()),
+            );
+            if mutation.is_empty() {
+                assert!(result.is_ok(), "unchanged operand: {result:?}");
+            } else {
+                assert_eq!(result.unwrap_err(), GuardBindingReason::StorageNotExclusive);
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#13672: existing mutable references bypassed explicit-address argument checks")]
+    fn guard_argument_capability_reads_the_selected_formal_type() {
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason;
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardStorageExclusivity as Storage;
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            BarrierObservation, CancellationToken, ObservationPhase, SemanticBudget,
+            SemanticRequest, SemanticValueKind, open_value_type_barrier_context,
+        };
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"guard_arguments\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+            .file("src/lib.rs", "type Alias<'a> = &'a mut usize; struct Data { value: usize } fn owned(n: usize) {} fn aggregate(n: Data) {} fn shared(n: &usize) {} fn mutable(n: &mut usize) {} fn raw(n: *mut usize) {} fn alias(n: Alias<'_>) {} fn tuple(n: (usize,)) {} fn array(n: [usize; 1]) {} fn mutable_tuple(n: (&mut usize,)) {} fn mutable_array(n: [&mut usize; 1]) {} struct RefData { value: &'static mut usize } fn mutable_aggregate(n: RefData) {} struct RawData { value: *mut usize } fn shared_raw(n: &RawData) {} fn heap(n: Box<usize>) {} fn cell(n: core::cell::Cell<usize>) {}")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let artifact = workspace
+            .materialize_program_semantics(&project.file("src/lib.rs"), &mut request)
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let context =
+            open_value_type_barrier_context(Language::Rust, workspace.analyzer(), &cancellation)
+                .unwrap()
+                .unwrap();
+        for (name, expected, storage) in [
+            ("owned", Ok(()), Storage::Exclusive),
+            ("aggregate", Ok(()), Storage::Exclusive),
+            ("tuple", Ok(()), Storage::Exclusive),
+            ("array", Ok(()), Storage::Exclusive),
+            (
+                "mutable_tuple",
+                Err(GuardBindingReason::MutableBorrow),
+                Storage::NotExclusive,
+            ),
+            (
+                "mutable_array",
+                Err(GuardBindingReason::MutableBorrow),
+                Storage::NotExclusive,
+            ),
+            (
+                "mutable_aggregate",
+                Err(GuardBindingReason::MutableBorrow),
+                Storage::NotExclusive,
+            ),
+            (
+                "shared_raw",
+                Err(GuardBindingReason::InteriorMutabilityUnknown),
+                Storage::NotExclusive,
+            ),
+            ("shared", Ok(()), Storage::NotExclusive),
+            (
+                "mutable",
+                Err(GuardBindingReason::MutableBorrow),
+                Storage::NotExclusive,
+            ),
+            (
+                "raw",
+                Err(GuardBindingReason::RawAlias),
+                Storage::NotExclusive,
+            ),
+            (
+                "alias",
+                Err(GuardBindingReason::UnknownBorrow),
+                Storage::Unknown,
+            ),
+            (
+                "heap",
+                Err(GuardBindingReason::UnknownBorrow),
+                Storage::Unknown,
+            ),
+            (
+                "cell",
+                Err(GuardBindingReason::UnknownBorrow),
+                Storage::Unknown,
+            ),
+        ] {
+            let root = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap();
+            let formal = root
+                .semantics()
+                .values()
+                .iter()
+                .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
+                .unwrap();
+            let observation = BarrierObservation::new(
+                root.point_handle(root.semantics().entry_point()).unwrap(),
+                formal.id,
+                ObservationPhase::BeforeEffects,
+            );
+            assert_eq!(
+                context.guard_argument_nonmutating(&observation, &mut request),
+                expected,
+                "{name}"
+            );
+            assert_eq!(
+                context.guard_storage_exclusivity(&observation, &mut request),
+                storage,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#13672: a by-value mutable reference still allows a callee to mutate guarded data")]
+    fn existing_reference_arguments_require_a_nonmutating_formal_on_both_engines() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (ty, initializer, touch, expected) in [
+            ("usize", "42", "let _ = n;", 0),
+            ("&'static usize", "unsafe { &VALUE }", "let _ = *n;", 1),
+            ("&'static mut usize", "unsafe { &mut VALUE }", "*n = 0;", 1),
+        ] {
+            let source = format!(
+                "static mut VALUE: usize = 42;\nfn source() -> {ty} {{ {initializer} }}\nfn allowed(_: {ty}) -> bool {{ true }}\nfn touch(n: {ty}) {{ {touch} }}\nfn sink(_: {ty}) {{}}\npub fn run() {{ let n: {ty} = source(); if allowed(n) {{ touch(n); sink(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{ty} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageNotExclusive")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: the selected guard method could mutate its implicit receiver after checking it"
+    )]
+    fn selected_guard_method_requires_a_nonmutating_receiver() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand receiver)"#,
+            true,
+        );
+        // #14037: the terminal nominal sink currently makes both receiver
+        // modes conservatively decline through the full accepting slice.
+        for (receiver, body, expected) in [
+            ("&self", "self.value == 42", 1),
+            (
+                "&mut self",
+                "let ok = self.value == 42; self.value = 0; ok",
+                1,
+            ),
+        ] {
+            let source = format!(
+                "struct Check {{ value: usize }}\nfn source() -> Check {{ Check {{ value: 42 }} }}\nimpl Check {{ fn allowed({receiver}) -> bool {{ {body} }} }}\nfn sink(_: Check) {{}}\npub fn run() {{ let mut n: Check = source(); if n.allowed() {{ sink(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{receiver} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageExclusivityUnknown")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: stores through an existing reference or its alias bypassed the Address-value sweep"
+    )]
+    fn existing_reference_stores_decline_the_guard_on_both_engines() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (body, expected) in [
+            ("sink(n);", 1),
+            ("*n = 100; sink(n);", 1),
+            ("let alias = n; *alias = 100; sink(alias);", 1),
+            ("let alias = n; touch(alias); sink(alias);", 1),
+            (
+                "let alias = n; let alias2 = alias; touch(alias2); sink(alias2);",
+                1,
+            ),
+            ("let alias = n; inspect(alias); sink(alias);", 1),
+            (
+                "let mut other = 0usize; let p = &mut other; *p = 100; sink(n);",
+                1,
+            ),
+        ] {
+            let source = format!(
+                "static mut VALUE: usize = 42;\nfn source() -> &'static mut usize {{ unsafe {{ &mut VALUE }} }}\nfn allowed(n: &usize) -> bool {{ *n == 42 }}\nfn touch(n: &mut usize) {{ *n = 100; }}\nfn inspect(n: &usize) {{ let _ = *n; }}\nfn sink(_: &usize) {{}}\npub fn run() {{ let n: &mut usize = source(); if allowed(n) {{ {body} }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{body} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageNotExclusive")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: by-value aggregates hid mutable-reference payloads from call capability checks"
+    )]
+    fn guard_arguments_reject_mutable_aggregate_payloads_on_both_engines() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (declaration, ty, initializer, mutation) in [
+            (
+                "",
+                "(&'static mut usize,)",
+                "(unsafe { &mut VALUE },)",
+                "*n.0 = 100;",
+            ),
+            (
+                "",
+                "[&'static mut usize; 1]",
+                "[unsafe { &mut VALUE }]",
+                "*n[0] = 100;",
+            ),
+            (
+                "struct Data { value: &'static mut usize }",
+                "Data",
+                "Data { value: unsafe { &mut VALUE } }",
+                "*n.value = 100;",
+            ),
+        ] {
+            // #14037: the nominal Data sink has an incomplete effect boundary.
+            for (body, expected) in [("sink(&n);", 1), ("let m = touch(n); sink(&m);", 1)] {
+                let source = format!(
+                    "static mut VALUE: usize = 42;\n{declaration}\nfn source() -> {ty} {{ {initializer} }}\nfn allowed(_: &{ty}) -> bool {{ true }}\nfn touch(mut n: {ty}) -> {ty} {{ {mutation} n }}\nfn sink(_: &{ty}) {{}}\npub fn run() {{ let n: {ty} = source(); if allowed(&n) {{ {body} }} }}\n"
+                );
+                for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                    assert_eq!(run.2.len(), expected, "{ty} {body} {run:#?}");
+                    if expected != 0 {
+                        assert!(
+                            run.4
+                                .iter()
+                                .any(|message| message.contains("StorageNotExclusive")),
+                            "{run:#?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#13672: shared receivers and arguments could mutate through raw pointer payloads")]
+    fn guard_shared_access_to_raw_payloads_declines_on_both_engines() {
+        for (operand, declaration, invocation) in [
+            (
+                "receiver",
+                "impl Data { fn allowed(&self) -> bool { unsafe { let ok = *self.p == 42; *self.p = 100; ok } } }",
+                "n.allowed()",
+            ),
+            (
+                "(argument :index 0)",
+                "fn allowed(n: &Data) -> bool { unsafe { let ok = *n.p == 42; *n.p = 100; ok } }",
+                "allowed(&n)",
+            ),
+        ] {
+            let policy = authored_guard_policy(
+                &format!(
+                    r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand {operand})"#
+                ),
+                true,
+            );
+            let source = format!(
+                "static mut VALUE: usize = 42;\nstruct Data {{ p: *mut usize }}\nfn source() -> Data {{ Data {{ p: &raw mut VALUE }} }}\n{declaration}\nfn sink(_: Data) {{}}\npub fn run() {{ let n: Data = source(); if {invocation} {{ sink(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), 1, "{operand} {run:#?}");
+                assert!(
+                    run.4
+                        .iter()
+                        .any(|message| message.contains("StorageNotExclusive")),
+                    "{operand} {run:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: a shared alias receiver could hold a raw capability created before the guard"
+    )]
+    fn guard_alias_receivers_require_a_stable_payload_on_both_engines() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        let raw_holder = "struct Holder { p: *mut usize } fn hold(p: *mut usize) -> Holder { Holder { p } } impl Holder { fn overwrite(&self) { unsafe { *self.p = 100; } } fn allowed(&self, _: &usize) -> bool { true } }";
+        let owned_holder = "struct Holder { value: usize } impl Holder { fn allowed(&self, n: &usize) -> bool { *n == self.value } }";
+        for (holder, body, expected, decline) in [
+            (
+                raw_holder,
+                "let holder = hold(n); if allowed(n) { holder.overwrite(); sink(n); }",
+                1,
+                "StorageNotExclusive",
+            ),
+            (
+                raw_holder,
+                "let holder: Holder = hold(n); if allowed(n) { holder.overwrite(); sink(n); }",
+                1,
+                "StorageNotExclusive",
+            ),
+            (
+                raw_holder,
+                "let holder: Holder = Holder { p: n }; if holder.allowed(n) { sink(n); }",
+                1,
+                "StorageNotExclusive",
+            ),
+            (
+                owned_holder,
+                "let holder: Holder = Holder { value: *n }; if holder.allowed(n) { sink(n); }",
+                1,
+                "StorageNotExclusive",
+            ),
+        ] {
+            let source = format!(
+                "static mut VALUE: usize = 42;\nfn source() -> &'static mut usize {{ unsafe {{ &mut VALUE }} }}\n{holder}\nfn allowed(n: &usize) -> bool {{ *n == 42 }}\nfn sink(_: &usize) {{}}\npub fn run() {{ let n: &mut usize = source(); {body} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{body} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4.iter().any(|message| message.contains(decline)),
+                        "{body} {run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: an explicit shared alias argument bypassed the receiver payload capability check"
+    )]
+    fn guard_explicit_shared_alias_arguments_require_stable_payloads() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (declaration, initialization, expected) in [
+            ("struct Holder { p: *mut usize }", "Holder { p: n }", 1),
+            ("struct Holder { value: usize }", "Holder { value: *n }", 1),
+        ] {
+            let source = format!(
+                "static mut VALUE: usize = 42;\nfn source() -> &'static mut usize {{ unsafe {{ &mut VALUE }} }}\n{declaration}\nfn allowed(n: &usize) -> bool {{ *n == 42 }}\nfn inspect(_: &Holder) {{}}\nfn sink(_: &usize) {{}}\npub fn run() {{ let n: &mut usize = source(); let holder: Holder = {initialization}; if allowed(n) {{ inspect(&holder); sink(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{declaration} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageNotExclusive")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: closure captures through related local aggregates bypassed guard capture rejection"
+    )]
+    fn guard_captures_follow_aliases_and_containers_on_both_engines() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (capture, expected) in [
+            (
+                "let holder: Holder = Holder { value: n }; let overwrite = || holder.overwrite();",
+                1,
+            ),
+            (
+                "let holder: Holder = Holder { value: n }; let overwrite = move || holder.overwrite();",
+                1,
+            ),
+            ("let other = 0usize; let unrelated = || other;", 0),
+        ] {
+            let source = format!(
+                "static mut VALUE: usize = 42;\nfn source() -> usize {{ 42 }}\nstruct Holder {{ value: usize }}\nimpl Holder {{ fn overwrite(&self) {{ let _ = self.value; }} }}\nfn allowed(n: usize) -> bool {{ n == 42 }}\nfn sink(_: usize) {{}}\npub fn run() {{ let n: usize = source(); {capture} if allowed(n) {{ sink(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{capture} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4.iter().any(|message| message.contains("Capture")
+                            || message.contains("StorageExclusivityUnknown")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: a later argument reassigned a binding after the guarded operand was evaluated"
+    )]
+    fn guard_call_argument_order_preserves_the_operand_version() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (before, argument, expected) in [
+            ("", "0", 0),
+            ("n = source();", "0", 0),
+            ("", "{ n = source(); 0 }", 1),
+        ] {
+            let source = format!(
+                "fn source() -> usize {{ 42 }}\nfn allowed(_: usize, _: usize) -> bool {{ true }}\nfn sink(_: usize) {{}}\npub fn run() {{ let mut n: usize = source(); {before} if allowed(n, {argument}) {{ sink(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{before} {argument} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("ChangedDefinition")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: a local sink bounded stability before mutation reaching an interprocedural sink"
+    )]
+    fn guard_stability_includes_observations_after_local_sinks() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (mutation, expected) in [("", 2), ("touch(n);", 2)] {
+            let source = format!(
+                "static mut VALUE: usize = 42;\nfn source() -> &'static mut usize {{ unsafe {{ &mut VALUE }} }}\nfn allowed(n: &usize) -> bool {{ *n == 42 }}\nfn touch(n: &mut usize) {{ *n = 100; }}\nfn sink(_: &usize) {{}}\nfn relay(n: &usize) {{ sink(n); }}\npub fn run() {{ let n: &mut usize = source(); if allowed(n) {{ sink(n); {mutation} relay(n); }} }}\n"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{mutation} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageNotExclusive")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#13672: a zero-argument call can mutate globally reachable guarded storage")]
+    fn guard_globally_reachable_storage_requires_nonmutation_evidence() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        let source = "static mut VALUE: usize = 42;\nfn source() -> &'static mut usize { unsafe { &mut VALUE } }\nfn allowed(n: &usize) -> bool { *n == 42 }\nfn overwrite_global() { unsafe { VALUE = 100; } }\nfn sink(_: &usize) {}\npub fn run() { let n: &mut usize = source(); if allowed(n) { overwrite_global(); sink(n); } }\n";
+        let unguarded = source.replace("if allowed(n)", "if true");
+        let unchanged = source.replace("overwrite_global(); ", "");
+        let owned = "fn source() -> usize { 42 } fn allowed(_: usize) -> bool { true } fn sink(_: usize) {} pub fn run() { let n: usize = source(); if allowed(n) { sink(n); } }";
+        let cases = [
+            (
+                "unguarded write",
+                1,
+                engine_runs_in_context(&policy, &unguarded, "optimistic", true),
+            ),
+            (
+                "guard without write",
+                1,
+                engine_runs_in_context(&policy, &unchanged, "optimistic", true),
+            ),
+            (
+                "guard with write",
+                1,
+                engine_runs_in_context(&policy, source, "optimistic", true),
+            ),
+            (
+                "owned guard without write",
+                0,
+                engine_runs_in_context(&policy, owned, "optimistic", true),
+            ),
+        ];
+        for (name, _, runs) in &cases {
+            if name.starts_with("guard ") {
+                assert!(
+                    runs.iter().all(|run| run
+                        .4
+                        .iter()
+                        .any(|message| message.contains("StorageNotExclusive"))),
+                    "{cases:#?}"
+                );
+            }
+        }
+        assert!(
+            cases
+                .iter()
+                .all(|(_, expected, runs)| runs.iter().all(|run| run.2.len() == *expected)),
+            "{cases:#?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: an owned binding's borrow could escape after the guard without an exclusivity proof"
+    )]
+    fn guard_owned_borrows_must_not_escape_to_calls() {
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "allowed")))) :operand (argument :index 0))"#,
+            true,
+        );
+        for (body, expected) in [
+            ("sink(n);", 0),
+            ("touch(&mut n); sink(n);", 1),
+            ("inspect(&n); sink(n);", 1),
+        ] {
+            let source = format!(
+                "fn source() -> usize {{ 42 }} fn allowed(_: usize) -> bool {{ true }} fn touch(n: &mut usize) {{ *n = 100; }} fn inspect(_: &usize) {{}} fn sink(_: usize) {{}} pub fn run() {{ let mut n: usize = source(); if allowed(n) {{ {body} }} }}"
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), expected, "{body} {run:#?}");
+                if expected != 0 {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageNotExclusive")
+                                || message.contains("UnknownBorrow")),
+                        "{run:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_noncopy_guard_requires_an_affirmative_test_only_claim() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CompilerOptions, SourceFormat, compile_source,
+        };
+        let source = r#"struct Allow;
+impl Allow { fn contains(&self, _: &widget::Data) -> bool { true } }
+fn source() -> widget::Data { widget::build() }
+fn sink(_: widget::Data) {}
+pub fn run(allow: &Allow) {
+ let cmd: widget::Data = source();
+ if allow.contains(&cmd) { sink(cmd); } else { sink(cmd); }
+}
+"#;
+        for claim in [None, Some("absent"), Some("present")] {
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", "[package]\nname=\"guard_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nwidget=\"0.4.25\"\n")
+                .file("src/lib.rs", source).build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig {
+                parallelism: Some(1),
+                ..Default::default()
+            });
+            let mut data = serde_json::json!({"id":"type.fixture.widget-data","name":"widget.Data","type_kind":"struct","visibility":"public",
+                "locator":{"kind":"artifact","path":"widget.rs","symbol":"widget.Data"}});
+            if let Some(kind) = claim {
+                data["value_semantics"]["interior_mutability"] = serde_json::json!({"kind":kind});
+            }
+            let pack = serde_json::json!({
+                "schema_version":45,"pack_id":"fixture.guard-interior","version":"1.0.0",
+                "producer":{"name":"test","version":"1.0.0"},"language":"rust","ecosystem":"cargo",
+                "compatibility":{"toolchains":[]},"provenance":{"source":"TEST ONLY synthetic guarded non-Copy type; no production claims"},
+                "license":"NOASSERTION","completeness":"complete","safety":{"generated_code_only":false,"review_required":false},
+                "shards":[{"id":"fixture.guard-types","activation":[{}],"payload":{"kind":"declaration_facts",
+                    "types":[{"id":"type.fixture.widget","name":"widget","type_kind":"module","visibility":"public","locator":{"kind":"artifact","path":"widget.rs","symbol":"widget"}},data],
+                    "members":[{"id":"member.fixture.build","owner":"type.fixture.widget","name":"build","member_kind":"function","visibility":"public","is_static":true,"callable_family_complete":true,
+                        "signature":{"parameters":[],"returns":{"kind":"declared","id":"type.fixture.widget-data","arguments":[]}},"locator":{"kind":"artifact","path":"widget.rs","symbol":"widget.build"}}],"relations":[]}}]
+            });
+            let pack = compile_source(
+                SourceFormat::Json,
+                &serde_json::to_vec(&pack).unwrap(),
+                &CompilerOptions::default(),
+            )
+            .unwrap();
+            let policy = authored_guard_policy(
+                r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "contains")))) :operand (argument :index 0))"#,
+                true,
+            );
+            let (outcome, _) = evaluate_with_packs(
+                &project,
+                &workspace,
+                &policy,
+                vec![(pack, "fixture.guard-interior")],
+                false,
+            );
+            let [run] = outcome.report().runs() else {
+                panic!("one run")
+            };
+            assert_eq!(run.findings().len(), 2, "claim={claim:?} {run:#?}");
+            // #14037: even an Absent claim cannot discharge the terminal
+            // native sink's incomplete effect boundary under the full slice.
+            assert_ne!(run.completion(), &PolicyRunCompletion::Complete, "{run:#?}");
+            let reason = "StorageExclusivityUnknown";
+            assert!(
+                run.diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.message().contains(reason)),
+                "{run:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#13672: overloaded Rust comparisons do not establish clean equality or ordering")]
+    fn authored_comparison_guards_require_builtin_semantics_on_both_operands() {
+        for (declaration, ty, bound, operator, relation) in [
+            (
+                "struct Data { x: usize } impl PartialEq for Data { fn eq(&self, _: &Self) -> bool { true } }",
+                "Data",
+                "Data",
+                "==",
+                "equality",
+            ),
+            (
+                "#[derive(PartialEq)] struct Data { x: usize }",
+                "Data",
+                "Data",
+                "==",
+                "equality",
+            ),
+            (
+                "struct Bound { x: usize } impl PartialEq<Bound> for i32 { fn eq(&self, _: &Bound) -> bool { true } }",
+                "i32",
+                "Bound",
+                "==",
+                "equality",
+            ),
+            (
+                "struct Data { x: usize } impl PartialEq for Data { fn eq(&self, _: &Self) -> bool { true } } impl PartialOrd for Data { fn partial_cmp(&self, _: &Self) -> Option<std::cmp::Ordering> { Some(std::cmp::Ordering::Less) } }",
+                "Data",
+                "Data",
+                "<",
+                "ordering",
+            ),
+            ("", "Unknown", "Unknown", "==", "equality"),
+        ] {
+            let initializer = if ty == "i32" {
+                "42"
+            } else if ty == "Unknown" {
+                "missing()"
+            } else {
+                "Data { x: 42 }"
+            };
+            let source = format!(
+                "{declaration}\nfn source() -> {ty} {{ {initializer} }}\nfn sink(_: {ty}) {{}}\npub fn run(bound: {bound}) {{ let n: {ty} = source(); if n {operator} bound {{ sink(n); }} }}\n"
+            );
+            let operand = if relation == "ordering" {
+                "lesser"
+            } else {
+                "either"
+            };
+            let guarded = authored_guard_policy(
+                &format!("(comparison-guard :relation {relation} :operand {operand})"),
+                true,
+            );
+            for policy in [COMPOSED_POLICY, guarded.as_str()] {
+                for run in engine_runs_in_context(policy, &source, "optimistic", true) {
+                    assert_eq!(run.2.len(), 1, "{ty} {bound} {operator}: {run:#?}");
+                    if policy == guarded {
+                        assert!(
+                            run.5.iter().any(|diagnostic| diagnostic
+                                .2
+                                .contains("UnprovenComparisonSemantics")),
+                            "{run:#?}"
+                        );
+                    }
+                }
+            }
+        }
+        for operator in ["==", "<"] {
+            let source = format!(
+                "fn source() -> i32 {{ 42 }} fn sink(_: i32) {{}} pub fn run(bound: i32) {{ let n: i32 = source(); if n {operator} bound {{ sink(n); }} }}"
+            );
+            let predicate = if operator == "==" {
+                "(comparison-guard :relation equality :operand either)"
+            } else {
+                "(comparison-guard :relation ordering :operand lesser)"
+            };
+            for run in engine_runs_in_context(
+                &authored_guard_policy(predicate, true),
+                &source,
+                "optimistic",
+                true,
+            ) {
+                assert!(run.2.is_empty(), "builtin {operator}: {run:#?}");
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#13672: unsuffixed numeric guard bounds need the native peer's comparison type")]
+    fn authored_comparison_guards_infer_unsuffixed_numeric_bounds() {
+        for (ty, initial, condition, relation, operand) in [
+            ("u8", "1", "n == 16", "equality", "either"),
+            ("u8", "1", "16 == n", "equality", "either"),
+            ("usize", "1", "n < 16", "ordering", "lesser"),
+            ("usize", "1", "16 > n", "ordering", "lesser"),
+            ("usize", "1", "n == 16", "equality", "either"),
+            ("i32", "1", "n < 16", "ordering", "lesser"),
+            ("i32", "1", "n < (-16)", "ordering", "lesser"),
+            ("i32", "1", "n < -16", "ordering", "lesser"),
+            ("i32", "1", "n < 0x10", "ordering", "lesser"),
+            ("f64", "1.0", "n < 16.0", "ordering", "lesser"),
+            ("f64", "1.0", "n < 1.5", "ordering", "lesser"),
+        ] {
+            let source = format!(
+                "fn source() -> {ty} {{ {initial} }} fn sink(_: {ty}) {{}} pub fn run() {{ let n: {ty} = source(); if {condition} {{ sink(n); }} else {{ sink(n); }} }}"
+            );
+            let policy = authored_guard_policy(
+                &format!("(comparison-guard :relation {relation} :operand {operand})"),
+                true,
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                // #14132: Rust certifies exclusive storage for both twins,
+                // but these existing lowerer operator gaps leave the shared
+                // whole-procedure nonescape inventory incomplete.
+                let has_lowerer_gap = condition.contains("-16") || ty == "f64";
+                let expected = if has_lowerer_gap { 2 } else { 1 };
+                if has_lowerer_gap {
+                    assert!(
+                        run.4
+                            .iter()
+                            .any(|message| message.contains("StorageExclusivityUnknown")),
+                        "{condition}: {run:#?}"
+                    );
+                }
+                assert_eq!(run.2.len(), expected, "{condition}: {run:#?}");
+                assert!(
+                    !run.4
+                        .iter()
+                        .any(|message| message.contains("UnprovenComparisonSemantics")),
+                    "{condition}: {run:#?}"
+                );
+            }
+        }
+        for condition in ["n == 16", "16 == n"] {
+            let source = format!(
+                "struct User {{ x: usize }} impl PartialEq<i32> for User {{ fn eq(&self, _: &i32) -> bool {{ true }} }} impl PartialEq<User> for i32 {{ fn eq(&self, _: &User) -> bool {{ true }} }} fn source() -> User {{ User {{ x: 1 }} }} fn sink(_: User) {{}} pub fn run() {{ let n: User = source(); if {condition} {{ sink(n); }} else {{ sink(n); }} }}"
+            );
+            let policy = authored_guard_policy(
+                "(comparison-guard :relation equality :operand either)",
+                true,
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), 2, "{condition}: {run:#?}");
+                assert!(
+                    run.4
+                        .iter()
+                        .any(|message| message.contains("UnprovenComparisonSemantics")),
+                    "{condition}: {run:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13672: operand conversion inference has operational limits outside the semantic ledger"
+    )]
+    fn authored_comparison_guard_type_inference_budget_is_operational() {
+        use crate::finding::PolicyDiagnosticExecutionCause;
+        let mut source = String::from(
+            "fn source() -> usize { 42 } fn sink(_: usize) {} pub fn run(bound: usize) { let v0: usize = source();",
+        );
+        for index in 1..=64 {
+            source.push_str(&format!("let v{index} = v{};", index - 1));
+        }
+        source.push_str("if v64 < bound { sink(v64); } }");
+        let policy = authored_guard_policy(
+            "(comparison-guard :relation ordering :operand lesser)",
+            true,
+        );
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname=\"guard_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .file("src/lib.rs", &source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..Default::default()
+        });
+        let options =
+            PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 10, 1).unwrap());
+        for icfg in [false, true] {
+            let evaluate = || {
+                evaluate_policy_source(
+                    project.root(),
+                    PolicySourceIdentity::new(format!("test:guard-inference-budget-{icfg}.rqlp")),
+                    &policy,
+                    &workspace,
+                    &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                    &options,
+                    None,
+                    &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+                )
+            };
+            let outcome = if icfg {
+                super::with_icfg_taint_engine_for_test(evaluate)
+            } else {
+                evaluate()
+            }
+            .unwrap();
+            let [run] = outcome.report().runs() else {
+                panic!("one policy run");
+            };
+            assert_eq!(run.findings().len(), 1, "{run:#?}");
+            assert!(
+                run.diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.message().contains("BudgetExceeded")),
+                "{run:#?}"
+            );
+            assert!(
+                !run.diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.message().contains("UnprovenComparisonSemantics")),
+                "{run:#?}"
+            );
+            assert!(
+                run.diagnostic_causes()
+                    .iter()
+                    .any(|cause| cause.execution_cause()
+                        == PolicyDiagnosticExecutionCause::Known(Some(
+                            brokk_bifrost_rql::DiagnosticExecutionCause::Budget
+                        ))),
+                "{run:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_comparison_guards_clean_only_the_accepting_branch_on_both_engines() {
+        for (operator, relation, operand, accepts) in [
+            ("==", "equality", "either", true),
+            ("!=", "inequality", "either", false),
+            ("<", "ordering", "lesser", true),
+            (">", "ordering", "greater", false),
+        ] {
+            let source = format!(
+                "fn source() -> usize {{ 42 }}\nfn sink(_: usize) {{}}\npub fn run(bound: usize) {{\n let n: usize = source();\n if n {operator} bound {{\n  sink(n); // true arm\n }} else {{\n  sink(n); // false arm\n }}\n}}\n"
+            );
+            let policy = authored_guard_policy(
+                &format!("(comparison-guard :relation {relation} :operand {operand})"),
+                accepts,
+            );
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                assert_eq!(run.2.len(), 1, "{operator} {run:#?}");
+                assert_eq!(
+                    run.2[0].0.region().unwrap().start_line(),
+                    if accepts { 8 } else { 6 },
+                    "{operator} {run:#?}"
+                );
+            }
+        }
+    }
+
+    /// Milestone 1 solver matrix (#11269). Each source marks the sink calls the
+    /// authored `n < bound` guard (clean when true) must still report with
+    /// `// finding`; every other sink call must be clean. Both engines agree.
+    #[test]
+    fn authored_comparison_guard_control_flow_matrix() {
+        let cases: [(&str, &str); 12] = [
+            (
+                "true and false arms",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n if n < bound {\n  sink(n); // clean\n } else {\n  sink(n); // finding\n }\n}\n",
+            ),
+            (
+                "reversed operands",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n if bound > n {\n  sink(n); // clean\n } else {\n  sink(n); // finding\n }\n}\n",
+            ),
+            (
+                "negation",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n if !(n < bound) {\n  sink(n); // finding\n } else {\n  sink(n); // clean\n }\n}\n",
+            ),
+            (
+                "short-circuit and keeps the other path to the false arm",
+                "pub fn run(bound: usize, flag: bool) {\n let n: usize = source();\n if n < bound && flag {\n  sink(n); // clean\n } else {\n  sink(n); // finding\n }\n}\n",
+            ),
+            (
+                "short-circuit or keeps both arms reachable without the guard",
+                "pub fn run(bound: usize, flag: bool) {\n let n: usize = source();\n if n < bound || flag {\n  sink(n); // finding\n } else {\n  sink(n); // finding\n }\n}\n",
+            ),
+            (
+                "early return leaves only the accepting path",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n if !(n < bound) {\n  return;\n }\n sink(n); // clean\n}\n",
+            ),
+            (
+                "early return on the accepting arm leaves the tainted path",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n if n < bound {\n  return;\n }\n sink(n); // finding\n}\n",
+            ),
+            (
+                "continue leaves only the accepting path",
+                "pub fn run(bound: usize, again: bool) {\n while again {\n  let n: usize = source();\n  if !(n < bound) {\n   continue;\n  }\n  sink(n); // clean\n }\n}\n",
+            ),
+            (
+                "clean and tainted paths join",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n if n < bound {\n  let _ = 1;\n }\n sink(n); // finding\n}\n",
+            ),
+            (
+                "tainted redefinition inside the accepting arm reports",
+                "pub fn run(bound: usize) {\n let mut n: usize = source();\n if n < bound {\n  n = source();\n  sink(n); // finding\n }\n}\n",
+            ),
+            (
+                "unproven derivative alias inventory keeps both values tainted",
+                "pub fn run(bound: usize) {\n let n: usize = source();\n let d: usize = n + 1;\n if n < bound {\n  sink(n); // finding\n  sink(d); // finding\n }\n}\n",
+            ),
+            (
+                "write through a mutable borrow inside the arm reports",
+                "pub fn run(bound: usize) {\n let mut n: usize = source();\n let r = &mut n;\n if n < bound {\n  *r = source();\n  sink(n); // finding\n }\n}\n",
+            ),
+        ];
+        let policy = authored_guard_policy(
+            "(comparison-guard :relation ordering :operand lesser)",
+            true,
+        );
+        for (name, body) in cases {
+            let source = format!("fn source() -> usize {{ 42 }}\nfn sink(_: usize) {{}}\n{body}");
+            let expected = source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("// finding"))
+                .map(|(index, _)| u32::try_from(index + 1).unwrap())
+                .collect::<Vec<_>>();
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                let mut lines = run
+                    .2
+                    .iter()
+                    .map(|finding| finding.0.region().unwrap().start_line() as u32)
+                    .collect::<Vec<_>>();
+                lines.sort_unstable();
+                lines.dedup();
+                assert_eq!(lines, expected, "{name}: {run:#?}");
+            }
+        }
+    }
+
+    /// Milestone 1 named-constant bound (#11269). Before value guards,
+    /// `n < LIMIT` was an opaque comparison and killed nothing. A configured
+    /// guard now kills the accepting arm only when `GuardBindingProof` proves
+    /// the operand binding; an operand that escapes through a raw pointer is
+    /// not proved, so both arms keep the finding.
+    #[test]
+    fn named_constant_bound_guard_kills_only_with_a_proved_operand() {
+        let cases: [(&str, &str); 5] = [
+            (
+                "proved operand: accepting arm is clean",
+                "const LIMIT: usize = 16;\npub fn run() {\n let n: usize = source();\n if n < LIMIT {\n  sink(n); // clean\n } else {\n  sink(n); // finding\n }\n}\n",
+            ),
+            (
+                "proved operand: negated guard with early return",
+                "const LIMIT: usize = 16;\npub fn run() {\n let n: usize = source();\n if !(n < LIMIT) {\n  return;\n }\n sink(n); // clean\n}\n",
+            ),
+            (
+                "unproved operand: a raw pointer alias keeps both arms",
+                "const LIMIT: usize = 16;\npub fn run() {\n let mut n: usize = source();\n let p = &mut n as *mut usize;\n if n < LIMIT {\n  sink(n); // finding\n } else {\n  sink(n); // finding\n }\n unsafe { *p = 0; }\n}\n",
+            ),
+            (
+                "unproved operand: a field borrow rewrites the guarded field",
+                "struct S { f: usize }\nconst LIMIT: usize = 16;\npub fn run() {\n let mut n = S { f: source() };\n if n.f < LIMIT {\n  let r = &mut n.f;\n  *r = source();\n  sink(n.f); // finding\n }\n}\n",
+            ),
+            (
+                "unproved operand: a mutating call in the sink's own point",
+                "fn bump(x: &mut usize) -> usize { *x = source(); 0 }\nconst LIMIT: usize = 16;\npub fn run() {\n let mut n: usize = source();\n if n < LIMIT {\n  sink(bump(&mut n) + n); // finding\n }\n}\n",
+            ),
+        ];
+        let policy = authored_guard_policy(
+            "(comparison-guard :relation ordering :operand lesser)",
+            true,
+        );
+        for (name, body) in cases {
+            let source = format!("fn source() -> usize {{ 42 }}\nfn sink(_: usize) {{}}\n{body}");
+            let expected = source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("// finding"))
+                .map(|(index, _)| u32::try_from(index + 1).unwrap())
+                .collect::<Vec<_>>();
+            for run in engine_runs_in_context(&policy, &source, "optimistic", true) {
+                let mut lines = run
+                    .2
+                    .iter()
+                    .map(|finding| finding.0.region().unwrap().start_line() as u32)
+                    .collect::<Vec<_>>();
+                lines.sort_unstable();
+                lines.dedup();
+                assert_eq!(lines, expected, "{name}: {run:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_guard_decline_cannot_reuse_a_legacy_scalar_kill() {
+        // The lowerer's old scalar classification recognizes the written
+        // primitive token, but selected type resolution sees a shadowing
+        // non-Copy nominal type. No absence claim exists for its String data.
+        let source = r#"struct usize(String);
+impl PartialEq<u32> for usize { fn eq(&self, _: &u32) -> bool { true } }
+fn source() -> usize { usize(String::new()) }
+fn sink(_: usize) {}
+pub fn run() {
+ let n: usize = source();
+ if n == 0 { sink(n); } else { sink(n); }
+}
+"#;
+        let policy = authored_guard_policy(
+            "(comparison-guard :relation equality :operand either)",
+            true,
+        );
+        for run in engine_runs_in_context(&policy, source, "optimistic", true) {
+            assert_eq!(
+                run.2.len(),
+                2,
+                "declined guard retains both paths: {run:#?}"
+            );
+            assert_ne!(run.1, PolicyRunCompletion::Complete, "{run:#?}");
+            assert!(
+                run.4
+                    .iter()
+                    .any(|message| message.contains("UnprovenComparisonSemantics")),
+                "{run:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unconfigured_policy_preserves_legacy_comparison_kills() {
+        let source = "fn source() -> usize { 42 }\nfn sink(_: usize) {}\npub fn run() {\n let n: usize = source();\n if n < 10 {\n  sink(n);\n } else {\n  sink(n);\n }\n}\n";
+        for run in engine_runs_in_context(COMPOSED_POLICY, source, "optimistic", true) {
+            assert_eq!(
+                run.2.len(),
+                1,
+                "unconfigured policy keeps legacy scalar kill: {run:#?}"
+            );
+            assert_eq!(run.2[0].0.region().unwrap().start_line(), 8, "{run:#?}");
+        }
+    }
+
+    #[test]
+    fn composed_guard_baseline_is_unfiltered_under_policy_proved_only() {
+        // Under PolicyProvedOnly, a declining guard must not inherit a legacy
+        // comparison kill from the composed provider's unfiltered baseline.
+        let source = r#"struct usize(String);
+impl PartialEq<u32> for usize { fn eq(&self, _: &u32) -> bool { true } }
+fn source() -> usize { usize(String::new()) }
+fn sink(_: usize) {}
+pub fn run() {
+ let n: usize = source();
+ if n < 10 { sink(n); } else { sink(n); }
+}
+"#;
+        let policy = authored_guard_policy(
+            "(comparison-guard :relation equality :operand either)",
+            true,
+        );
+        let [composed, _icfg] = engine_runs_in_context(&policy, source, "optimistic", true);
+        assert_eq!(composed.0.as_deref(), Some("composition"));
+        assert_eq!(
+            composed.2.len(),
+            2,
+            "composed baseline must stay unfiltered: {composed:#?}"
+        );
+        assert_ne!(composed.1, PolicyRunCompletion::Complete, "{composed:#?}");
+    }
+
+    #[test]
+    fn stored_mutable_borrow_alias_through_local_declines_guard() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CompilerOptions, SourceFormat, compile_source,
+        };
+        let source = r#"struct Allow;
+impl Allow { fn contains(&self, _: &widget::Data) -> bool { true } }
+fn source() -> widget::Data { widget::build() }
+fn sink(_: widget::Data) {}
+pub fn run(allow: &Allow) {
+ let mut cmd: widget::Data = source();
+ let alias = &mut cmd;
+ if allow.contains(&cmd) { let _ = alias; sink(cmd); } else { sink(cmd); }
+}
+"#;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"guard_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nwidget=\"0.4.25\"\n")
+            .file("src/lib.rs", source).build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..Default::default()
+        });
+        let pack = serde_json::json!({
+            "schema_version":45,"pack_id":"fixture.guard-interior-alias","version":"1.0.0",
+            "producer":{"name":"test","version":"1.0.0"},"language":"rust","ecosystem":"cargo",
+            "compatibility":{"toolchains":[]},"provenance":{"source":"TEST ONLY synthetic guarded non-Copy type; no production claims"},
+            "license":"NOASSERTION","completeness":"complete","safety":{"generated_code_only":false,"review_required":false},
+            "shards":[{"id":"fixture.guard-types","activation":[{}],"payload":{"kind":"declaration_facts",
+                "types":[
+                    {"id":"type.fixture.widget","name":"widget","type_kind":"module","visibility":"public","locator":{"kind":"artifact","path":"widget.rs","symbol":"widget"}},
+                    {"id":"type.fixture.widget-data","name":"widget.Data","type_kind":"struct","visibility":"public",
+                        "value_semantics":{"interior_mutability":{"kind":"absent"}},
+                        "locator":{"kind":"artifact","path":"widget.rs","symbol":"widget.Data"}}
+                ],
+                "members":[{"id":"member.fixture.build","owner":"type.fixture.widget","name":"build","member_kind":"function","visibility":"public","is_static":true,"callable_family_complete":true,
+                    "signature":{"parameters":[],"returns":{"kind":"declared","id":"type.fixture.widget-data","arguments":[]}},"locator":{"kind":"artifact","path":"widget.rs","symbol":"widget.build"}}],"relations":[]}}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "contains")))) :operand (argument :index 0))"#,
+            true,
+        );
+        let (outcome, _) = evaluate_with_packs(
+            &project,
+            &workspace,
+            &policy,
+            vec![(pack, "fixture.guard-interior-alias")],
+            false,
+        );
+        let [run] = outcome.report().runs() else {
+            panic!("one run")
+        };
+        assert_eq!(run.findings().len(), 2, "{run:#?}");
+        assert_ne!(run.completion(), &PolicyRunCompletion::Complete, "{run:#?}");
+        assert!(
+            run.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("StorageExclusivityUnknown")),
+            "{run:#?}"
+        );
+    }
+
+    #[test]
+    fn raw_pointer_cast_alias_declines_guard() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CompilerOptions, SourceFormat, compile_source,
+        };
+        let source = r#"struct Allow;
+impl Allow { fn contains(&self, _: &widget::Data) -> bool { true } }
+fn source() -> widget::Data { widget::build() }
+fn sink(_: widget::Data) {}
+pub fn run(allow: &Allow) {
+ let cmd: widget::Data = source();
+ let raw = &cmd as *const widget::Data;
+ if allow.contains(&cmd) { let _ = raw; sink(cmd); } else { sink(cmd); }
+}
+"#;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"guard_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nwidget=\"0.4.25\"\n")
+            .file("src/lib.rs", source).build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..Default::default()
+        });
+        let pack = serde_json::json!({
+            "schema_version":45,"pack_id":"fixture.guard-interior-raw","version":"1.0.0",
+            "producer":{"name":"test","version":"1.0.0"},"language":"rust","ecosystem":"cargo",
+            "compatibility":{"toolchains":[]},"provenance":{"source":"TEST ONLY synthetic guarded non-Copy type; no production claims"},
+            "license":"NOASSERTION","completeness":"complete","safety":{"generated_code_only":false,"review_required":false},
+            "shards":[{"id":"fixture.guard-types","activation":[{}],"payload":{"kind":"declaration_facts",
+                "types":[
+                    {"id":"type.fixture.widget","name":"widget","type_kind":"module","visibility":"public","locator":{"kind":"artifact","path":"widget.rs","symbol":"widget"}},
+                    {"id":"type.fixture.widget-data","name":"widget.Data","type_kind":"struct","visibility":"public",
+                        "value_semantics":{"interior_mutability":{"kind":"absent"}},
+                        "locator":{"kind":"artifact","path":"widget.rs","symbol":"widget.Data"}}
+                ],
+                "members":[{"id":"member.fixture.build","owner":"type.fixture.widget","name":"build","member_kind":"function","visibility":"public","is_static":true,"callable_family_complete":true,
+                    "signature":{"parameters":[],"returns":{"kind":"declared","id":"type.fixture.widget-data","arguments":[]}},"locator":{"kind":"artifact","path":"widget.rs","symbol":"widget.build"}}],"relations":[]}}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let policy = authored_guard_policy(
+            r#"(call-guard :selector (rql :schema-version 1 (language rust (call :callee (name "contains")))) :operand (argument :index 0))"#,
+            true,
+        );
+        let (outcome, _) = evaluate_with_packs(
+            &project,
+            &workspace,
+            &policy,
+            vec![(pack, "fixture.guard-interior-raw")],
+            false,
+        );
+        let [run] = outcome.report().runs() else {
+            panic!("one run")
+        };
+        assert_eq!(run.findings().len(), 2, "{run:#?}");
+        assert_ne!(run.completion(), &PolicyRunCompletion::Complete, "{run:#?}");
+        assert!(
+            run.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("StorageExclusivityUnknown")),
+            "{run:#?}"
+        );
     }
 
     /// Assert that both engines select as intended and agree on the
@@ -30894,8 +32890,9 @@ pub fn run() -> usize {
     }
 
     /// `std::format!` leaves `run` open with blocked gaps that no call dispatch
-    /// answers in the regression fixture. The composition's diagnostic must
-    /// name the family the ICFG engine names for the same procedure.
+    /// answers in the regression fixture. Unresolved calls can independently
+    /// open either the value path or its continuation. Both engines must retain
+    /// exactly the same diagnostic families for these blocked paths.
     #[test]
     #[hardwon(
         "a2f46bafa030: a composed run named a blocked-gap open procedure with a family the ICFG engine does not name"
@@ -30915,21 +32912,36 @@ pub fn run() {
     sink(moved);
 }
 "#;
+        let expected = [
+            CALL_SITE_EVIDENCE_FAMILY,
+            "taint discovery is incomplete: procedure semantics is unknown",
+        ];
         let [composed, icfg] = engine_runs(BLOCKED_GAP_SOURCE, "paranoid");
         assert_eq!(composed.0.as_deref(), Some("composition"));
         assert_eq!(icfg.0.as_deref(), Some("icfg (test override)"));
         assert_eq!(
             icfg.3,
-            ["taint discovery is incomplete: procedure semantics is unknown"],
-            "the ICFG engine names one family for this procedure"
+            ["taint discovery is incomplete: procedure semantics is unknown"]
         );
-        assert!(
-            composed.3.iter().all(|family| icfg.3.contains(family)),
-            "composed families {:?} are not a subset of the ICFG's {:?}",
-            composed.3,
-            icfg.3
-        );
+        // The source's empty String allocation is proved closed. The blocked
+        // formatting path retains its independent procedure-semantics cause.
+        assert!(composed.3.iter().all(|family| icfg.3.contains(family)));
         assert_eq!((&composed.1, &composed.2), (&icfg.1, &icfg.2));
+
+        for source in [
+            BLOCKED_GAP_SOURCE.replace("std::format!(\"{}\", raw)", "unresolved_external(raw)"),
+            BLOCKED_GAP_SOURCE.replace(
+                "let moved = std::format!(\"{}\", raw);\n    sink(moved);",
+                "unresolved_external();\n    sink(raw);",
+            ),
+        ] {
+            let [composed, icfg] = engine_runs(&source, "paranoid");
+            assert_eq!(composed.0.as_deref(), Some("composition"));
+            assert_eq!(icfg.0.as_deref(), Some("icfg (test override)"));
+            assert_eq!(icfg.3, expected, "ICFG families for {source}");
+            assert_eq!(composed.3, icfg.3, "family agreement for {source}");
+            assert_eq!((&composed.1, &composed.2), (&icfg.1, &icfg.2));
+        }
     }
 
     /// The composition crosses a call no model covers and no candidate body
@@ -31126,6 +33138,33 @@ pub fn run() {
     }
 
     #[test]
+    #[hardwon("#13175: partial discovery masked a capability_incomplete binding gap")]
+    fn a_static_binding_gap_is_reported_when_its_selector_matches_no_row() {
+        // The store dimension port is a return value, which no call site could
+        // satisfy, and the store selector matches nothing: the gap is decided
+        // by the policy alone, not by a selected row.
+        let policy = COMPOSED_POLICY.replacen(
+            ":sinks",
+            r#":stores (endpoint-set :entries [
+            (store-write :id put
+                :selector (rql :schema-version 1 (language rust (call :callee (name "absent"))))
+                :store primary :key return-value :input (argument :index 0))]) :sinks"#,
+            1,
+        );
+        let [composed, icfg] = engine_runs_of(&policy, "fn sink(_: i32) {}", "paranoid");
+        for run in [&composed, &icfg] {
+            assert_eq!(
+                run.1,
+                PolicyRunCompletion::inconclusive(vec![
+                    PolicyIncompleteReason::CapabilityIncomplete
+                ])
+                .unwrap(),
+                "{run:?}"
+            );
+        }
+    }
+
+    #[test]
     #[hardwon("#10723: complete sink models reclosed caller Deref obligations")]
     fn both_engines_degrade_a_user_deref_before_a_modeled_sink() {
         let source = r#"
@@ -31177,6 +33216,137 @@ pub fn run() {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13539: a pre-installation inventory reported a modeled call as discharged"
+    )]
+    fn icfg_diagnostics_exclude_a_curated_call_discharged_by_execution() {
+        // Exact call spans: modeled(source()) is 75..92; unmodeled() is 98..109.
+        let source = "fn source() -> i32 { 1 }\nfn sink(_: i32) {}\npub fn run() {\n    let value = modeled(source());\n    unmodeled();\n    sink(value);\n}\n";
+        let policy = COMPOSED_POLICY.replacen(
+            ":sinks",
+            r#":external-models (endpoint-set :entries [
+                (external-model :id transfer
+                    :selector (rql :schema-version 1 (language rust (call :callee (name "modeled"))))
+                    :transfers [(transfer :from (argument :index 0) :to return-value
+                        :labels [attacker-controlled] :effect propagate)])]) :sinks"#,
+            1,
+        );
+        let [_, raw] = engine_runs(source, "paranoid");
+        assert!(
+            raw.4.iter().any(|message| message.contains("bytes 75..92")),
+            "{raw:?}"
+        );
+        let [_, modeled] = engine_runs_of(&policy, source, "paranoid");
+        assert!(matches!(
+            modeled.1,
+            PolicyRunCompletion::Inconclusive { .. }
+        ));
+        assert!(
+            !modeled
+                .4
+                .iter()
+                .any(|message| message.contains("bytes 75..92")),
+            "{modeled:?}"
+        );
+        assert!(
+            modeled
+                .4
+                .iter()
+                .any(|message| message.contains("bytes 98..109")),
+            "{modeled:?}"
+        );
+
+        // All discovery calls in this second fixture are modeled, but a solver
+        // work limit still interrupts execution. Its explanation must describe
+        // that interruption instead of restoring a discharged discovery cause.
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                "fn source() -> i32 { 1 }\nfn sink(_: i32) {}\npub fn run() { let value: i32 = modeled(source()); sink(value); }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let registry = registry_for(&policy);
+        let loaded = registry.policies().next().expect("one modeled policy");
+        let cancellation = CancellationToken::default();
+        let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let compilation = super::with_icfg_taint_engine_for_test(|| {
+            TaintPolicyCompiler::new(
+                &workspace,
+                &flow_state,
+                None,
+                CodeQueryExecutionLimits::default(),
+                64,
+                &cancellation,
+            )
+            .compile(loaded, loaded.resolved_taint().unwrap(), None)
+        })
+        .unwrap_or_else(|failure| panic!("the modeled fixture compiles: {:?}", failure.error));
+        let TaintPolicyCompilation::Plans { roots, .. } = compilation else {
+            panic!("the modeled fixture has an analysis plan");
+        };
+        let [root] = roots.as_slice() else {
+            panic!("one modeled root");
+        };
+        let causes = root.plan.analysis().value_flow().incomplete_causes();
+        assert!(
+            !causes.is_empty(),
+            "the fixture must exercise discovery causes"
+        );
+        assert!(causes.iter().all(|cause| matches!(
+            cause,
+            brokk_bifrost_flow::value_flow::ValueFlowIncompleteCause::CallResolution { .. }
+                | brokk_bifrost_flow::value_flow::ValueFlowIncompleteCause::CallBinding { .. }
+                | brokk_bifrost_flow::value_flow::ValueFlowIncompleteCause::CallBindingCoverage { .. }
+        )), "only model-dischargeable discovery causes: {causes:?}");
+        let mut limits = CodeQueryExecutionLimits::default();
+        limits.value_flow.solver_work.interned_facts = 1;
+        let budget = PolicyBudget::builder()
+            .with_query_limits(limits)
+            .unwrap()
+            .build()
+            .unwrap();
+        let evaluator = super::with_icfg_taint_engine_for_test(|| {
+            ProductionTaintPolicyEvaluator::prepare(
+                &flow_state,
+                registry.policies(),
+                &workspace,
+                Ok(None),
+                None,
+                &budget,
+            )
+        });
+        let payloads = evaluator.prepared.lock().unwrap();
+        let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
+            panic!("one modeled policy payload");
+        };
+        assert!(matches!(
+            payload.completion,
+            PolicyRunCompletion::Inconclusive { .. }
+        ));
+        assert!(
+            payload.diagnostics.iter().any(|diagnostic| {
+                diagnostic.family() == "taint_analysis/solver_budget/interned_facts"
+                    && diagnostic.impact() == PolicyDiagnosticImpact::RunIncomplete
+            }),
+            "the solver interruption must explain the run: {:?}",
+            payload.diagnostics
+        );
+        assert!(
+            payload.diagnostics.iter().all(|diagnostic| {
+                !diagnostic
+                    .family()
+                    .starts_with("taint discovery is incomplete:")
+            }),
+            "no discharged discovery cause may return: {:?}",
+            payload.diagnostics
+        );
+    }
+
+    #[test]
     #[hardwon("#10687: a flagged conversion discarded the callee model, dropping its finding")]
     fn both_engines_keep_a_flagged_callee_transfer() {
         let source = r#"
@@ -31223,8 +33393,9 @@ pub fn run() { let w = source(); sink(modeled(w)); }
     /// `run` logs its source through an unresolved trait-object call, so the
     /// open `run` keeps that call as a residual call. Both engines name it
     /// with the same call-site message, which prints the call's retained
-    /// dispatch status independently of the procedure's snapshot status, so the
-    /// run carries one diagnostic on each engine.
+    /// dispatch status independently of the procedure's snapshot status. The
+    /// source's proved empty String allocation adds no unresolved-call cause;
+    /// neither engine invents cleanup causes.
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#10879: dyn trait results acquired spurious cleanup and lost residual-call diagnostic parity"
@@ -31247,7 +33418,7 @@ pub fn run(out: &dyn Out) {
         assert_eq!(composed.0.as_deref(), Some("composition"));
         assert_eq!(icfg.0.as_deref(), Some("icfg (test override)"));
         assert_eq!((&composed.1, &composed.2), (&icfg.1, &icfg.2));
-        assert_eq!(icfg.4.len(), 1, "{:#?}", icfg.4);
+        assert_eq!(composed.4.len(), 1, "{:#?}", composed.4);
         assert_eq!(composed.4, icfg.4);
     }
 
@@ -31585,6 +33756,7 @@ pub fn run(receiver: String) {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
@@ -31597,7 +33769,8 @@ pub fn run(receiver: String) {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: Default::default(),

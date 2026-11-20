@@ -306,6 +306,9 @@ impl RenderText for SummaryResult {
                     "structured semantic evidence was incomplete"
                 }
                 Some(SummaryIncompleteReason::StoreFailure) => "indexed reads failed",
+                Some(SummaryIncompleteReason::InternalInvariant) => {
+                    "an internal engine error stopped summary lookup"
+                }
                 Some(SummaryIncompleteReason::SourceUnavailable) => {
                     "source content was unavailable"
                 }

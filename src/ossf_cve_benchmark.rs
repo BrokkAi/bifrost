@@ -62,8 +62,8 @@ use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_policy::{PolicyEvaluationDate, PolicyEvaluationOptions};
 
 use crate::owasp_benchmark::{
-    BenchmarkSuite, CaseCompletion, CategorySpec, InjectionCategory, PolicyNaming, Sink, Source,
-    SuiteSemanticModels, WorkspaceRun, build_policy, evaluate_policy, policy_id,
+    BenchmarkSuite, CaseCompletion, CategorySpec, CoverageGap, InjectionCategory, PolicyNaming,
+    Sink, Source, WorkspaceRun, build_policy, evaluate_policy, policy_id,
 };
 
 /// The upstream commit the case metadata is read from.
@@ -80,7 +80,10 @@ pub const UPSTREAM_CASES_SHA256: &str =
 /// third-party library, and a library that returns its unsafe result instead
 /// of passing it to a sink are not selected, so a CVE without a finding is
 /// never reported as proven clean.
-const NAMED_CALL_SINKS_ONLY: &str = "only the named Node.js core and DOM call sinks are selected";
+const NAMED_CALL_SINKS_ONLY: &[CoverageGap] = &[CoverageGap {
+    reason: "only the named Node.js core and DOM call sinks are selected",
+    uncovered: None,
+}];
 
 /// The OpenSSF CVE Benchmark, as the shared policy renderer reads it.
 ///
@@ -102,12 +105,15 @@ pub static OSSF_CVE: BenchmarkSuite = BenchmarkSuite {
     },
     languages: &["javascript", "typescript"],
     sources: &[Source::Parameter],
+    // Every function parameter is a source, so the source table leaves
+    // nothing out.
+    source_gaps: &[],
     categories: &[
         // `document.write`, a response's `write`, `send` and `end`, jQuery's
         // `html`, and `insertAdjacentHTML(position, html)`.
         CategorySpec {
             category: InjectionCategory::Xss,
-            partial_coverage: Some(NAMED_CALL_SINKS_ONLY),
+            coverage_gaps: NAMED_CALL_SINKS_ONLY,
             sinks: &[
                 Sink::name("write", 0),
                 Sink::name("writeln", 0),
@@ -120,7 +126,7 @@ pub static OSSF_CVE: BenchmarkSuite = BenchmarkSuite {
         // `child_process`: the command string or file of every spawning call.
         CategorySpec {
             category: InjectionCategory::Cmdi,
-            partial_coverage: Some(NAMED_CALL_SINKS_ONLY),
+            coverage_gaps: NAMED_CALL_SINKS_ONLY,
             sinks: &[
                 Sink::name("exec", 0),
                 Sink::name("execSync", 0),
@@ -136,7 +142,7 @@ pub static OSSF_CVE: BenchmarkSuite = BenchmarkSuite {
         // positions are sinks; each needs the arity it names.
         CategorySpec {
             category: InjectionCategory::Codeinj,
-            partial_coverage: Some(NAMED_CALL_SINKS_ONLY),
+            coverage_gaps: NAMED_CALL_SINKS_ONLY,
             sinks: &[
                 Sink::name("eval", 0),
                 Sink::name("Function", 0),
@@ -151,7 +157,7 @@ pub static OSSF_CVE: BenchmarkSuite = BenchmarkSuite {
         // Express's `res.sendFile`.
         CategorySpec {
             category: InjectionCategory::Pathtraver,
-            partial_coverage: Some(NAMED_CALL_SINKS_ONLY),
+            coverage_gaps: NAMED_CALL_SINKS_ONLY,
             sinks: &[
                 Sink::name("readFile", 0),
                 Sink::name("readFileSync", 0),
@@ -177,13 +183,13 @@ pub static OSSF_CVE: BenchmarkSuite = BenchmarkSuite {
         // Express's `res.redirect(url)`.
         CategorySpec {
             category: InjectionCategory::Redirect,
-            partial_coverage: Some(NAMED_CALL_SINKS_ONLY),
+            coverage_gaps: NAMED_CALL_SINKS_ONLY,
             sinks: &[Sink::name("redirect", 0)],
         },
         // The `query(sql)` of the common SQL drivers.
         CategorySpec {
             category: InjectionCategory::Sqli,
-            partial_coverage: Some(NAMED_CALL_SINKS_ONLY),
+            coverage_gaps: NAMED_CALL_SINKS_ONLY,
             sinks: &[Sink::name("query", 0)],
         },
     ],
@@ -1034,7 +1040,6 @@ fn analyze_case(
         let run = WorkspaceRun {
             analysis_root: &root,
             workspace: &workspace,
-            semantic_models: &SuiteSemanticModels::Published,
             flow_state: &flow_state,
             options: &options,
             budget: &budget,

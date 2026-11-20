@@ -1108,9 +1108,116 @@ pub(crate) fn procedure_dispatch_observation_digest(dispatch: &DispatchResult) -
     procedure_dispatch_components_digest(
         dispatch.coverage(),
         dispatch.complete_receiver_hint_refinable(),
+        dispatch_family_premises_digest(dispatch.family()),
         &mut candidates,
         &mut boundaries,
     )
+}
+
+pub(in crate::analyzer::semantic) fn dispatch_family_membership_digest(
+    membership: &crate::analyzer::semantic::DispatchFamilyMembership,
+) -> StableDigest {
+    let mut digest =
+        LengthDelimitedDigest::new(b"bifrost-read-ledger:dispatch-family-membership:v1");
+    digest.push(if membership.members().is_empty() {
+        b"complete-empty"
+    } else {
+        b"complete"
+    });
+    push_locator(
+        &mut digest,
+        membership.call().procedure().semantics().locator(),
+    );
+    digest.push(&membership.call().id().get().to_le_bytes());
+    digest.push(&(membership.members().len() as u64).to_le_bytes());
+    for member in membership.members() {
+        push_locator(&mut digest, member);
+    }
+    match membership.external_remainder() {
+        None => digest.push(b"no-external-remainder"),
+        Some(remainder) => {
+            digest.push(b"external-remainder");
+            push_locator(&mut digest, remainder.locator());
+            digest.push(&remainder.arity().to_le_bytes());
+            digest.push(&[u8::from(remainder.has_receiver())]);
+            digest.push(&[u8::from(remainder.declaration_is_abstract())]);
+            use crate::analyzer::semantic::DispatchFamilyExternalSummaryInput;
+            digest.push(match remainder.summary_input() {
+                DispatchFamilyExternalSummaryInput::Absent => b"absent",
+                DispatchFamilyExternalSummaryInput::Partial => b"partial",
+                DispatchFamilyExternalSummaryInput::Ambiguous => b"ambiguous",
+                DispatchFamilyExternalSummaryInput::Reviewed => b"reviewed",
+            });
+            match remainder.descriptor() {
+                None => digest.push(b"no-provider-descriptor"),
+                Some(descriptor) => {
+                    digest.push(b"provider-descriptor");
+                    digest.push(descriptor.owner.provider_id.as_bytes());
+                    digest.push(descriptor.owner.owner_fqn.as_bytes());
+                    digest.push(&descriptor.ordinal.to_le_bytes());
+                }
+            }
+            digest.push(&(remainder.bindings().len() as u64).to_le_bytes());
+            for binding in remainder.bindings() {
+                push_locator(&mut digest, binding.actual_locator());
+                push_locator(&mut digest, binding.formal_locator());
+                digest.push(binding.model_id().as_bytes());
+                digest.push(binding.content().as_bytes());
+                digest.push(&binding.contract_version().to_le_bytes());
+                digest.push(&[u8::from(binding.covers_overrides())]);
+                match binding.actual_to_formal() {
+                    None => digest.push(b"positional-binding"),
+                    Some(mapping) => {
+                        digest.push(b"explicit-binding");
+                        digest.push(&(mapping.len() as u64).to_le_bytes());
+                        for slot in mapping {
+                            digest.push(&slot.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    digest.finish()
+}
+
+/// Input receipts are deliberately omitted. Equal published premises refresh
+/// their justifying reads independently, including absence/set reads.
+pub(in crate::analyzer::semantic) fn dispatch_family_premises_digest(
+    family: Option<&crate::analyzer::semantic::DispatchFamilyEvidence>,
+) -> StableDigest {
+    use crate::analyzer::semantic::DispatchFamilyMemberBody;
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-read-ledger:dispatch-family-premises:v1");
+    let Some(family) = family else {
+        digest.push(b"absent");
+        return digest.finish();
+    };
+    push_locator(&mut digest, family.call().procedure().semantics().locator());
+    digest.push(&family.call().id().get().to_le_bytes());
+    match family.membership() {
+        None => digest.push(b"unavailable"),
+        Some(membership) => digest.push(dispatch_family_membership_digest(membership).as_bytes()),
+    }
+    digest.push(&(family.inputs().len() as u64).to_le_bytes());
+    for input in family.inputs() {
+        push_locator(&mut digest, input.declaration());
+        match input.body() {
+            DispatchFamilyMemberBody::Materialized(body) => {
+                digest.push(b"materialized");
+                digest.push(
+                    body.artifact()
+                        .key()
+                        .procedure_lineage_fingerprint(body.semantics().locator().declaration())
+                        .as_bytes(),
+                );
+            }
+            DispatchFamilyMemberBody::AbstractDeclaration => digest.push(b"abstract-declaration"),
+            DispatchFamilyMemberBody::Unavailable => digest.push(b"body-unavailable"),
+        }
+        push_proof_status(&mut digest, input.proof());
+        push_evidence_completeness(&mut digest, input.completeness());
+    }
+    digest.finish()
 }
 
 #[doc(hidden)]
@@ -1298,7 +1405,7 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::source::procedure_dispatch_components_digest;
 
     #[test]
-    fn procedure_dispatch_v2_is_order_independent_and_rotates_coverage_and_refinement() {
+    fn procedure_dispatch_is_order_independent_and_rotates_published_premises() {
         let candidate_a = StableDigest::sha256(b"candidate-a");
         let candidate_b = StableDigest::sha256(b"candidate-b");
         let boundary_a = StableDigest::sha256(b"boundary-a");
@@ -1306,6 +1413,7 @@ mod tests {
         let baseline = procedure_dispatch_components_digest(
             CandidateCoverage::Open,
             false,
+            StableDigest::sha256(b"absent-family"),
             &mut [candidate_a, candidate_b],
             &mut [boundary_a, boundary_b],
         );
@@ -1314,6 +1422,7 @@ mod tests {
             procedure_dispatch_components_digest(
                 CandidateCoverage::Open,
                 false,
+                StableDigest::sha256(b"absent-family"),
                 &mut [candidate_b, candidate_a],
                 &mut [boundary_b, boundary_a],
             ),
@@ -1324,6 +1433,7 @@ mod tests {
             procedure_dispatch_components_digest(
                 CandidateCoverage::Truncated,
                 false,
+                StableDigest::sha256(b"absent-family"),
                 &mut [candidate_a, candidate_b],
                 &mut [boundary_a, boundary_b],
             ),
@@ -1334,10 +1444,22 @@ mod tests {
             procedure_dispatch_components_digest(
                 CandidateCoverage::Open,
                 true,
+                StableDigest::sha256(b"absent-family"),
                 &mut [candidate_a, candidate_b],
                 &mut [boundary_a, boundary_b],
             ),
             "the typed feedback-refinement exception is a planning-relevant axis"
+        );
+        assert_ne!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Open,
+                false,
+                StableDigest::sha256(b"complete-family"),
+                &mut [candidate_a, candidate_b],
+                &mut [boundary_a, boundary_b],
+            ),
+            "membership premises change the answer even when all raw arms are unchanged"
         );
     }
 }

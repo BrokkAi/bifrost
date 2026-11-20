@@ -1,4 +1,3 @@
-use crate::analyzer::java::semantic::numeric::{JavaNumericLiteral, java_numeric_literal};
 use brokk_bifrost_analysis::analyzer::java_integral_parameter::JavaScalarType;
 
 use crate::analyzer::java::semantic::syntax::*;
@@ -19,31 +18,6 @@ fn java_binding_declares_array(node: Node<'_>) -> bool {
                 .and_then(|declaration| declaration.child_by_field_name("type"))
         })
         .is_some_and(crate::analyzer::java::java_type_syntax_is_array)
-}
-
-/// The value an `int` or `long` local declarator's integer-literal
-/// initializer gives the local, converted to the declared type (JLS 5.2).
-/// Any other declared type, including `var`, an array or a narrower integral
-/// type, has no constant here.
-fn java_integral_literal_initializer(
-    source: &str,
-    declarator: Node<'_>,
-    type_node: Option<Node<'_>>,
-) -> Option<JavaNumericLiteral> {
-    if declarator.kind() != "variable_declarator" || java_binding_declares_array(declarator) {
-        return None;
-    }
-    let type_node = type_node.filter(|node| node.kind() == "integral_type")?;
-    let literal = java_numeric_literal(source, declarator.child_by_field_name("value")?)?;
-    match (type_node.child(0)?.kind(), literal) {
-        ("int", JavaNumericLiteral::Int(_)) | ("long", JavaNumericLiteral::Long(_)) => {
-            Some(literal)
-        }
-        ("long", JavaNumericLiteral::Int(value)) => {
-            Some(JavaNumericLiteral::Long(i64::from(value)))
-        }
-        _ => None,
-    }
 }
 
 /// A resolved, unambiguous field declaration: its own name's source anchor,
@@ -189,7 +163,7 @@ fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
 
 // An absent source member differs from an inherited or ambiguous member:
 // only the former lets lookup continue into an enclosing type.
-enum SourceFieldLookup<'tree> {
+pub(super) enum SourceFieldLookup<'tree> {
     Found {
         owner: Node<'tree>,
         field: FieldDeclarationAnchor<'tree>,
@@ -381,10 +355,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if node.kind() == "catch_formal_parameter" {
                     self.non_null_values.insert(value);
                 }
-                if let Some(constant) =
-                    java_integral_literal_initializer(self.prepared.source(), node, type_node)
+                if node.kind() == "variable_declarator"
+                    && node.child_by_field_name("value").is_some()
+                    && !java_binding_declares_array(node)
                 {
-                    self.constant_locals.insert(value, constant);
+                    self.constant_local_candidates
+                        .push((value, node, type_node));
                 }
                 self.locals
                     .entry(text.into())
@@ -432,10 +408,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 && let Some((binding, _)) = self.lexical_reference_binding(target)
             {
                 self.written_bindings.insert(binding);
-                self.constant_locals.remove(&binding);
             }
             Ok(WalkControl::Continue)
-        })
+        })?;
+        self.evaluate_constant_locals();
+        Ok(())
     }
 
     pub(in crate::analyzer::java::semantic) fn local_at(
@@ -834,7 +811,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// Resolve a source-declared type in the lexical type scopes of this use.
     /// Scope and owner identities keep same-named nested types distinct.
     /// An unknown external type stays unresolved.
-    fn source_type_named(&self, name: &str, focus: Node<'tree>) -> Option<Node<'tree>> {
+    pub(super) fn source_type_named(&self, name: &str, focus: Node<'tree>) -> Option<Node<'tree>> {
         let source = self.prepared.source();
         let mut scope = Some(focus);
         while let Some(node) = scope {
@@ -901,7 +878,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         SourceFieldLookup::Missing
     }
 
-    fn source_unqualified_field(&self, name: &str, focus: Node<'tree>) -> SourceFieldLookup<'tree> {
+    pub(super) fn source_unqualified_field(
+        &self,
+        name: &str,
+        focus: Node<'tree>,
+    ) -> SourceFieldLookup<'tree> {
         if self.pattern_definition_at(focus).is_some() || self.pattern_visibility_unproven(focus) {
             return SourceFieldLookup::Open;
         }
@@ -1077,6 +1058,90 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             })
     }
 
+    /// Whether the identifier receiver of a call names a type whose class
+    /// initialization the call's dispatch gap already covers (#13668). Reading
+    /// the name itself has no effect once it is proven to be a type: no lexical
+    /// binding, no field in this file or an enclosing type, no supertype that
+    /// could declare one (`SourceFieldLookup::Open`), and no static import.
+    /// A type declared in this file claims only when its initialization is a
+    /// no-op; a type declared elsewhere is covered by the call's
+    /// whole-program-dispatch gap.
+    pub(super) fn receiver_names_initialization_free_type(&self, receiver: Node<'tree>) -> bool {
+        debug_assert_eq!(receiver.kind(), "identifier");
+        let Some(name) = node_text(self.prepared.source(), receiver) else {
+            return false;
+        };
+        // A name that is not spelled like a type is more likely a variable the
+        // lowerer failed to see, so it stays refused.
+        java_type_name_spelling(name)
+            && self.lexical_reference_binding(receiver).is_none()
+            && matches!(
+                self.source_unqualified_field(name, receiver),
+                SourceFieldLookup::Missing
+            )
+            && self.method_reference_name_is_type(receiver)
+            && self.type_name_initialization_is_covered(name, receiver)
+    }
+
+    /// Whether class initialization of the type `name` names at `focus` is
+    /// harmless: a type declared in this file must have trivial
+    /// initialization; a type this file does not declare is covered by the
+    /// call's whole-program-dispatch gap. A name declared in this file that
+    /// lexical lookup misses (a member class inherited from an in-file
+    /// supertype) is neither, so it stays refused.
+    pub(super) fn type_name_initialization_is_covered(
+        &self,
+        name: &str,
+        focus: Node<'tree>,
+    ) -> bool {
+        match self.source_type_named(name, focus) {
+            Some(declaration) => self.source_type_initialization_is_trivial(declaration, focus),
+            None => !self
+                .source_type_nodes
+                .keys()
+                .any(|(_, declared)| &**declared == name),
+        }
+    }
+
+    /// A type declared in this file runs no initialization code when it is
+    /// the type already executing, or when it is a class, interface or record
+    /// with no superclass, no static initializer and no static field or
+    /// constant initializer. An enum runs its constant constructors.
+    pub(super) fn source_type_initialization_is_trivial(
+        &self,
+        declaration: Node<'tree>,
+        focus: Node<'tree>,
+    ) -> bool {
+        if enclosing_type_node(focus).is_some_and(|current| current == declaration) {
+            return true;
+        }
+        if !matches!(
+            declaration.kind(),
+            "class_declaration" | "interface_declaration" | "record_declaration"
+        ) || declaration.child_by_field_name("superclass").is_some()
+            // Initializing a class also initializes superinterfaces that
+            // declare default methods (JLS 12.4.1).
+            || declaration.child_by_field_name("interfaces").is_some()
+        {
+            return false;
+        }
+        let Some(body) = declaration.child_by_field_name("body") else {
+            return false;
+        };
+        named_children(body)
+            .into_iter()
+            .all(|member| match member.kind() {
+                "static_initializer" => false,
+                "field_declaration" | "constant_declaration" => {
+                    (member.kind() == "field_declaration" && !has_modifier(member, "static"))
+                        || children_by_field_name(member, "declarator")
+                            .into_iter()
+                            .all(|declarator| declarator.child_by_field_name("value").is_none())
+                }
+                _ => true,
+            })
+    }
+
     /// All qualified field reads and writes use the same storage decision.
     pub(super) fn field_memory_location(
         &mut self,
@@ -1197,6 +1262,49 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         ))
     }
 
+    /// The base value of an implicit `this.field` access (#11031): a fresh
+    /// value fed by a `Receiver` edge from this procedure's receiver, exactly
+    /// what an explicit `this` expression produces. The location's base must
+    /// trace to the receiver port through that edge, because call-location
+    /// projection exports only locations rooted at a formal port. Using the
+    /// raw receiver value as the base left a bare `q` access with no port
+    /// link, so a callee's store or load of it never reached the caller and
+    /// the run still reported itself complete.
+    fn implicit_field_base(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+    ) -> Result<ValueId, JavaLoweringError> {
+        let receiver = self
+            .receiver
+            .expect("an implicit instance field access has a receiver");
+        // The implicit receiver has no spelling of its own. Its read is
+        // anchored on the field identifier, the token where `this.` is
+        // implied, and marked Synthetic so it is distinct from the field's
+        // own read at the same token.
+        let anchor = source_anchor(node, 0).map_err(JavaLoweringError::Invalid)?;
+        let metadata = self
+            .session
+            .add_mapping(builder, anchor, SourceMappingKind::Synthetic)?;
+        let base = self.session.add_value_with_metadata(
+            builder,
+            metadata,
+            SemanticValueKind::Temporary,
+        )?;
+        self.session.append_effect_with_metadata(
+            builder,
+            point,
+            metadata,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Receiver,
+                source: receiver,
+                target: base,
+            },
+        )?;
+        Ok(base)
+    }
+
     #[track_caller]
     fn implicit_instance_field_address(
         &mut self,
@@ -1207,9 +1315,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some((member, name)) = self.implicit_instance_field_locator(node) else {
             return Ok(None);
         };
-        let base = self
-            .receiver
-            .expect("implicit_instance_field_locator only resolves when a receiver exists");
+        let base = self.implicit_field_base(builder, node, point)?;
         let field_anchor = member.anchor();
         let location = self.session.add_memory_location(
             builder,
@@ -1253,7 +1359,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// This carrier is the fix: a second, additional value this procedure
     /// mints once per field name, connected exactly the way #2571 already
     /// proved correct for locals -- a read edge into it
-    /// (`ValueFlowKind::Local`, from `emit_implicit_field_load`), an
+    /// (`ValueFlowKind::Local`, from `emit_implicit_field_load`, placed
+    /// before the load since #11031), an
     /// unconditional kill on a genuine assignment
     /// (`SemanticEffect::Assignment` plus a `ValueFlowKind::Local` edge, from
     /// `emit_implicit_field_store`, the same shape `assignment_expression`'s
@@ -1346,18 +1453,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         else {
             return Ok(());
         };
-        self.append_effect(
-            builder,
-            point,
-            SemanticEffect::MemoryLoad {
-                kind: MemoryAccessKind::Field,
-                location,
-                result,
-            },
-        )?;
         // #2573: also connect this read to the procedure's own per-field
         // virtual carrier -- see `implicit_field_carrier`'s own doc comment
-        // for why the `MemoryLoad` above is not precise enough on its own.
+        // for why the `MemoryLoad` below is not precise enough on its own.
+        //
+        // The carrier edge comes BEFORE the load (#11031). It is an
+        // assignment, so it kills whatever the result held; the carrier
+        // knows only this procedure's own stores and is empty on entry, so an
+        // assignment placed after the load overrode the heap load's fact and
+        // a store made by another procedure was silently lost. Placed first,
+        // the load adds the heap state to the result afterwards.
         let carrier = self.implicit_field_carrier(builder, &name, field_anchor)?;
         if carrier != result {
             self.append_effect(
@@ -1370,6 +1475,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
         }
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location,
+                result,
+            },
+        )?;
         Ok(())
     }
 
@@ -1437,9 +1551,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some((member, name)) = self.implicit_instance_field_locator(node) else {
             return Ok(None);
         };
-        let base = self
-            .receiver
-            .expect("implicit instance field has a receiver");
+        let base = self.implicit_field_base(builder, node, point)?;
         let anchor = member.anchor();
         let location = self.session.add_memory_location(
             builder,

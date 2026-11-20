@@ -7,9 +7,9 @@ use super::*;
 #[doc(hidden)]
 pub struct HierarchyEdgeProjection {
     pub implicit: bool,
+    pub kind: Option<crate::analyzer::resolution::NominalSupertypeKind>,
     pub implicit_undecided: bool,
     pub implicit_external: bool,
-    pub kind: Option<ResolutionSupertypeKind>,
     pub ordinal: u32,
     pub reference: SemanticId,
     pub targets: Vec<SemanticId>,
@@ -139,7 +139,8 @@ impl FactResolutionOperation<'_> {
             };
             let inventory_complete = stored.hierarchy_inventory_complete;
             let mut edges = Vec::with_capacity(stored.edges.len());
-            for edge in stored.edges.iter() {
+            for nominal in stored.edges.nominal() {
+                let edge = &nominal.edge;
                 let (Some(residual), Some(hierarchy), Some(transfer)) = (
                     flatten(&edge.residual_evidence, &self.hierarchy.evidence),
                     flatten(&edge.hierarchy_evidence, &self.hierarchy.evidence),
@@ -160,7 +161,7 @@ impl FactResolutionOperation<'_> {
                             ..
                         }
                     ),
-                    kind: edge.kind,
+                    kind: nominal.kind,
                     ordinal: edge.parent_ordinal,
                     reference: edge.reference,
                     targets: edge.targets.to_vec(),

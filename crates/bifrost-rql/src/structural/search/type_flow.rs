@@ -20,9 +20,9 @@ use super::semantic::SemanticProcedureValue;
 use super::witness_projection::{bounded_reason, record_omitted_witnesses, saturating_u64};
 use super::{
     CodeQueryAbsentMemberWitness, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryExhaustedCharge, CodeQueryExhaustedRoot, CodeQueryTypeFlowWork,
-    CodeQueryValueFlowLimits, MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, incomplete_diagnostic,
-    push_deduplicated_diagnostic, render_exhausted_roots,
+    CodeQueryDiagnosticImpact, CodeQueryExhaustedCharge, CodeQueryExhaustedRoot,
+    CodeQueryTypeFlowWork, CodeQueryValueFlowLimits, MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES,
+    incomplete_diagnostic, push_deduplicated_diagnostic, render_exhausted_roots,
 };
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
@@ -47,7 +47,7 @@ use brokk_bifrost_analysis::analyzer::store::class_set_root_results::{
     PersistedClassSetStatus,
 };
 use brokk_bifrost_analysis::analyzer::{
-    ReadKey, capture_query_reads, capture_subsumed_query_reads,
+    ReadKey, ReadLedger, capture_query_reads, capture_subsumed_query_reads,
 };
 use brokk_bifrost_core::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValuePermit,
@@ -1416,7 +1416,7 @@ impl TypeFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            Incompleteness::Operational(DerivationExecutionCause::Budget),
             format!(
                 "absent-member witness projection omitted at least {omitted_lower_bound} witness(es)"
             ),
@@ -1428,7 +1428,7 @@ impl TypeFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::TypeFlowWitnessTruncated,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            Incompleteness::Operational(DerivationExecutionCause::Budget),
             format!(
                 "absent-member witness projection omitted at least {omitted_lower_bound} step(s)"
             ),
@@ -1482,12 +1482,26 @@ impl TypeFlowQueryState {
             active_semantic_model_snapshot.clone(),
         );
         let (adapter, provider_behavior, field_slots) = inputs?;
+        // Direct queries still own the completed acquisition capture even
+        // when no policy capture encloses this reader.
+        let enclosing_capture = workspace.analyzer().current_thread_read_ledger();
+        let durable_capture = enclosing_capture
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&input_reads));
         let cache_key = TypeFlowCacheKey {
             root: SemanticProcedureReference::of(&procedure.handle),
             provider_behavior,
             field_slots: field_slots.digest(),
         };
         match self.cache.get(&cache_key).cloned() {
+            Some(CachedTypeFlowAnalysis::FindingFreeRows(_))
+                if !root_sql_capture_admitted(Some(durable_capture.as_ref())) =>
+            {
+                // A receipt-free durable projection needs the same recorded
+                // capture health when served from this query's local cache.
+                self.cache.remove(&cache_key);
+            }
             Some(CachedTypeFlowAnalysis::Failed) => {
                 workspace.analyzer().record_unattributed_read();
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
@@ -1546,52 +1560,70 @@ impl TypeFlowQueryState {
             )
         };
         let mut persistent_store_failed = false;
-        if let (Some(store), Some(persistent_key)) = (workspace.store(), persistent_key.as_ref()) {
-            match store.finding_free_class_set_root_result(
-                persistent_key,
-                limits.max_retained_relations,
-                limits.max_retained_bytes,
-                cancellation,
-            ) {
-                Ok(ClassSetRootResultLookup::Hit(persisted))
-                    if persisted.rows.len() <= limits.max_retained_relations
-                        && persisted.retained_bytes() <= limits.max_retained_bytes =>
-                {
-                    let rows: Arc<[ClassSetRowValue]> =
-                        persisted_class_set_rows(procedure.file(), *persisted).into();
-                    self.work.root_result_persistence_hits =
-                        self.work.root_result_persistence_hits.saturating_add(1);
-                    // SQLite legacy projections have no derivation receipt,
-                    // just like the later in-memory projection hit.
-                    workspace.analyzer().record_unattributed_read();
-                    let cached = CachedTypeFlowAnalysis::FindingFreeRows(rows);
-                    self.cache.insert(cache_key, cached.clone());
-                    return Some(cached);
-                }
-                Ok(ClassSetRootResultLookup::Hit(_) | ClassSetRootResultLookup::Rejected(_)) => {
-                    self.work.root_result_persistence_rejections = self
-                        .work
-                        .root_result_persistence_rejections
-                        .saturating_add(1);
-                }
-                Ok(ClassSetRootResultLookup::Miss) => {
-                    self.work.root_result_persistence_misses =
-                        self.work.root_result_persistence_misses.saturating_add(1);
-                }
-                Err(_) if cancellation.is_cancelled() => {
-                    push_deduplicated_diagnostic(
-                        &mut self.diagnostics,
-                        CodeQueryDiagnosticCode::Cancelled,
-                        Incompleteness::Operational(DerivationExecutionCause::Cancelled),
-                        "class-set root-result hydration was cancelled".to_string(),
-                    );
-                    self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
-                    return None;
-                }
-                Err(_) => {
-                    self.work.root_result_store_failures =
-                        self.work.root_result_store_failures.saturating_add(1);
-                    persistent_store_failed = true;
+        {
+            let _durable_read_scope = enclosing_capture.is_none().then(|| {
+                brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_read_ledger(
+                    workspace.analyzer(),
+                    Arc::clone(&durable_capture),
+                )
+            });
+            if let (Some(store), Some(persistent_key)) =
+                (workspace.store(), persistent_key.as_ref())
+                && root_sql_capture_admitted(Some(durable_capture.as_ref()))
+            {
+                match store.finding_free_class_set_root_result(
+                    persistent_key,
+                    limits.max_retained_relations,
+                    limits.max_retained_bytes,
+                    cancellation,
+                ) {
+                    Ok(ClassSetRootResultLookup::Hit(_))
+                        if !root_sql_capture_admitted(Some(durable_capture.as_ref())) =>
+                    {
+                        // A stop while reading is not evidence of a corrupt row.
+                    }
+                    Ok(ClassSetRootResultLookup::Hit(persisted))
+                        if persisted.rows.len() <= limits.max_retained_relations
+                            && persisted.retained_bytes() <= limits.max_retained_bytes =>
+                    {
+                        let rows: Arc<[ClassSetRowValue]> =
+                            persisted_class_set_rows(procedure.file(), *persisted).into();
+                        self.work.root_result_persistence_hits =
+                            self.work.root_result_persistence_hits.saturating_add(1);
+                        // SQLite legacy projections have no derivation receipt,
+                        // just like the later in-memory projection hit.
+                        workspace.analyzer().record_unattributed_read();
+                        let cached = CachedTypeFlowAnalysis::FindingFreeRows(rows);
+                        self.cache.insert(cache_key, cached.clone());
+                        return Some(cached);
+                    }
+                    Ok(
+                        ClassSetRootResultLookup::Hit(_) | ClassSetRootResultLookup::Rejected(_),
+                    ) => {
+                        self.work.root_result_persistence_rejections = self
+                            .work
+                            .root_result_persistence_rejections
+                            .saturating_add(1);
+                    }
+                    Ok(ClassSetRootResultLookup::Miss) => {
+                        self.work.root_result_persistence_misses =
+                            self.work.root_result_persistence_misses.saturating_add(1);
+                    }
+                    Err(_) if cancellation.is_cancelled() => {
+                        push_deduplicated_diagnostic(
+                            &mut self.diagnostics,
+                            CodeQueryDiagnosticCode::Cancelled,
+                            Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+                            "class-set root-result hydration was cancelled".to_string(),
+                        );
+                        self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
+                        return None;
+                    }
+                    Err(_) => {
+                        self.work.root_result_store_failures =
+                            self.work.root_result_store_failures.saturating_add(1);
+                        persistent_store_failed = true;
+                    }
                 }
             }
         }
@@ -1984,16 +2016,52 @@ impl TypeFlowQueryState {
             // importing those now-released resident admissions.
             match outcome {
                 Ok(result) => {
+                    if result.summary_profile.lookup_validation > 0 {
+                        // Recovery is not a semantic gap. The repaired summaries
+                        // may be retained, but this execution's advisory must not
+                        // enter a root memo or a policy unit with diagnostics.
+                        workspace.analyzer().refuse_read_reuse();
+                        let count = self
+                            .work
+                            .summary_profile
+                            .lookup_validation
+                            .saturating_add(result.summary_profile.lookup_validation);
+                        let message = format!(
+                            "rebuilt derived cache rows: class_set_summary={count} rejected restore attempts"
+                        );
+                        if let Some(diagnostic) = self.diagnostics.iter_mut().find(|diagnostic| {
+                            diagnostic.code == CodeQueryDiagnosticCode::DerivedCacheRebuilt
+                        }) {
+                            diagnostic.message = message;
+                        } else {
+                            self.diagnostics
+                                .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                                    // This recovered-cache advisory refused no call site.
+                                    has_non_utf8_refusal: false,
+                                    refusal_sites: Default::default(),
+                                    call_relation_facts: None,
+                                    uses_omissions: Vec::new(),
+                                    incompleteness: Incompleteness::Content,
+                                    code: CodeQueryDiagnosticCode::DerivedCacheRebuilt,
+                                    impact: CodeQueryDiagnosticImpact::Advisory,
+                                    branch: Vec::new(),
+                                    language: "workspace",
+                                    message,
+                                    source: None,
+                                    related: Vec::new(),
+                                    exhausted_roots: Vec::new(),
+                                    withheld_rows_path: None,
+                                    step_index: None,
+                                    step_op: None,
+                                    no_rows_reason: None,
+                                    cause_codes: Vec::new(),
+                                }));
+                        }
+                    }
                     let projected_rows = project_class_sets(&result);
-                    // A store read that failed inside this solve leaves a result that
-                    // must not outlive the request either (#11534): the durable row
-                    // would answer later requests as finding-free without the read.
-                    let solve_store_failed = workspace
-                        .analyzer()
-                        .current_thread_read_ledger()
-                        .is_some_and(|ledger| ledger.store_failed());
+                    // The root Result owns store-failure refusal. This pure
+                    // projection performs no store read after that boundary.
                     if !persistent_store_failed
-                    && !solve_store_failed
                     && result.persistence_status() == TypeFlowRootPersistenceStatus::Eligible
                     && result.findings.is_empty()
                     // Constructor-origin evidence is request-local:
@@ -2059,7 +2127,10 @@ impl TypeFlowQueryState {
                             TypeFlowPlanError::RootBudget(_)
                             | TypeFlowPlanError::RefinementBudget(_),
                         ) => CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                        TypeFlowError::Plan(_) | TypeFlowError::Solve(_) | TypeFlowError::Io(_) => {
+                        TypeFlowError::Plan(_)
+                        | TypeFlowError::Solve(_)
+                        | TypeFlowError::Io(_)
+                        | TypeFlowError::Store(_) => {
                             CodeQueryDiagnosticCode::SemanticProviderFailed
                         }
                     };
@@ -2283,6 +2354,13 @@ impl TypeFlowQueryState {
         limits: CodeQueryValueFlowLimits,
         cancellation: &CancellationToken,
     ) -> RootResultPublicationOutcome {
+        // The whole-workspace key certifies unattributed content reads, but
+        // cannot certify operational dependence or a disk-persistence refusal.
+        // Recheck this same capture after attachment acquisition below.
+        let capture = workspace.analyzer().current_thread_read_ledger();
+        if !root_sql_capture_admitted(capture.as_deref()) {
+            return RootResultPublicationOutcome::Continued;
+        }
         if result.persistence_status() != TypeFlowRootPersistenceStatus::Eligible
             || !result.findings.is_empty()
         {
@@ -2326,6 +2404,10 @@ impl TypeFlowQueryState {
                     return RootResultPublicationOutcome::Continued;
                 }
             };
+        // Attachment acquisition above can itself refuse the same capture.
+        if !root_sql_capture_admitted(capture.as_deref()) {
+            return RootResultPublicationOutcome::Continued;
+        }
         match store.publish_finding_free_class_set_root_result(persisted, cancellation) {
             Ok(true) => {
                 self.work.root_result_publications =
@@ -2450,6 +2532,17 @@ impl TypeFlowQueryState {
     pub(super) const fn semantic_budget_exhausted(&self) -> bool {
         self.semantic_budget_exhausted
     }
+}
+
+// The exact whole-workspace key covers unattributed content reads. Durable
+// root use still requires this capture's recorded operational and disk health.
+fn root_sql_capture_admitted(capture: Option<&ReadLedger>) -> bool {
+    capture.is_some_and(|reads| {
+        !reads.reuse_refused()
+            && reads.persistence_refusals() == 0
+            && reads.ambient_verdict().is_content()
+            && reads.explicit_verdict().is_content()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3689,6 +3782,9 @@ mod tests {
                     | LookupQuestion::ReceiverCallSite { rel_path, .. } => {
                         rel_path.as_ref() == path
                     }
+                    LookupQuestion::SelectedReceiverProof(question) => {
+                        question.source().rel_path.as_ref() == path
+                    }
                     LookupQuestion::Name { .. }
                     | LookupQuestion::Summary { .. }
                     | LookupQuestion::WorkspaceFact { .. }
@@ -4518,8 +4614,9 @@ mod tests {
 
     mod cached_read_replay {
         use super::super::{
-            CachedTypeFlowAnalysis, ClassSetRootResultLookup, FindingFreeClassSetRootResult,
-            TypeFlowRootProduct, root_result_persistence_key,
+            CLOSURE_LIMITS, CachedTypeFlowAnalysis, ClassSetRootResultLookup,
+            FindingFreeClassSetRootResult, RootResultPublicationOutcome, TypeFlowRootProduct,
+            project_class_sets, root_result_persistence_key,
         };
         use super::*;
         use crate::structural::search::semantic::SemanticQueryContext;
@@ -4531,6 +4628,12 @@ mod tests {
             AnalyzerQueryScope, ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
             ReadKey, ReadVerdict, verify_read_set_for_artifact,
         };
+        use brokk_bifrost_flow::dataflow::DataflowRequest;
+        use brokk_bifrost_flow::type_flow::{
+            FeedbackLimits, ProcedureRefinements, TypeFlowRootPersistenceStatus,
+            solve_type_flow_for_root_with_refinements,
+        };
+        use brokk_bifrost_flow::value_flow::ValueFlowCache;
         use brokk_bifrost_test_macros::hardwon;
         use std::sync::Arc;
 
@@ -4838,6 +4941,280 @@ mod tests {
             ));
             assert_eq!(state.work().cache_hits, 2);
             assert!(projection_reads.unattributed_reads() > 0);
+        }
+
+        #[test]
+        #[hardwon(
+            "#11997+#14127: the finding-free root SQL writer bypassed captured reuse refusal and budget execution dependence"
+        )]
+        fn root_sql_publication_requires_the_current_capture_admission() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file(
+                    "roots.py",
+                    "def first(value):\n    return value.missing()\n",
+                )
+                .build();
+            let workspace = WorkspaceAnalyzer::build_persisted(
+                project.project_dyn(),
+                AnalyzerConfig::default(),
+            )
+            .unwrap();
+            let procedure = root(&workspace, &project, "first");
+            let cancellation = CancellationToken::default();
+            let limits = CodeQueryValueFlowLimits::default();
+            let models = workspace.analyzer().active_semantic_model_snapshot();
+            let mut state = TypeFlowQueryState::default();
+            state.select_summary_partition(&workspace);
+            let (inputs, _) = state.capture_root_inputs(
+                &workspace,
+                &procedure,
+                &mut SemanticBudget::default(),
+                &cancellation,
+                models.clone(),
+            );
+            let (adapter, behavior, fields) = inputs.unwrap();
+            let key = root_result_persistence_key(
+                &workspace,
+                adapter,
+                behavior,
+                &fields,
+                &procedure.handle,
+                models.as_deref(),
+                limits,
+                state.allotment,
+            )
+            .unwrap();
+            let mut solver = SolverBudget::default();
+            let result = solve_type_flow_for_root_with_refinements(
+                &workspace,
+                adapter,
+                &fields,
+                &procedure.handle,
+                models,
+                CLOSURE_LIMITS,
+                FeedbackLimits::default(),
+                ValueFlowCache::default(),
+                brokk_bifrost_flow::type_flow::TypeFlowSummaryState::new(&workspace),
+                &mut SemanticBudget::default(),
+                &mut DataflowRequest::new(&mut solver, &cancellation),
+                &mut ProcedureRefinements::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                result.persistence_status(),
+                TypeFlowRootPersistenceStatus::Eligible
+            );
+            assert!(result.findings.is_empty());
+            assert!(
+                result.class_sets.iter().any(|set| !set.unknown.is_empty()),
+                "healthy content-incomplete roots remain publishable: {result:#?}"
+            );
+            let projected = project_class_sets(&result);
+            assert!(!projected.is_empty());
+            let store = workspace.store().unwrap();
+            assert!(!store.is_ephemeral());
+            let stored = || {
+                store
+                    .finding_free_class_set_root_result(
+                        &key,
+                        limits.max_retained_relations,
+                        limits.max_retained_bytes,
+                        &cancellation,
+                    )
+                    .unwrap()
+            };
+            assert!(matches!(stored(), ClassSetRootResultLookup::Miss));
+            let mut publish = || {
+                state.publish_finding_free_root_result(
+                    &workspace,
+                    &key,
+                    &result,
+                    &projected,
+                    limits,
+                    &cancellation,
+                )
+            };
+            // A missing capture is not a certificate of reusable inputs.
+            assert_eq!(publish(), RootResultPublicationOutcome::Continued);
+            assert!(matches!(stored(), ClassSetRootResultLookup::Miss));
+            let (_, refused) = capture_query_reads(workspace.analyzer(), || {
+                workspace.analyzer().mark_execution_dependent();
+                workspace.analyzer().refuse_read_reuse();
+                assert_eq!(publish(), RootResultPublicationOutcome::Continued);
+            });
+            assert!(refused.reuse_refused());
+            assert!(refused.execution_dependences() > 0);
+            assert!(matches!(stored(), ClassSetRootResultLookup::Miss));
+            let refuse_semantic_admission = || {
+                use brokk_bifrost_core::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+                let mut allowance = SemanticBudget::default().limits();
+                allowance.procedures = 1;
+                let mut budget = SemanticBudget::new(allowance).unwrap();
+                let judged = SemanticRequest::new(&mut budget, &cancellation).judged(|request| {
+                    request.budget.check_admission(SemanticWork {
+                        procedures: 2,
+                        ..SemanticWork::default()
+                    })
+                });
+                let exceeded = judged
+                    .value
+                    .expect_err("an actual semantic admission refuses");
+                assert_eq!(exceeded.dimension(), SemanticBudgetDimension::Procedures);
+                assert_eq!(
+                    judged.reuse,
+                    ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal)
+                );
+                workspace.analyzer().join_reuse_verdict(judged.reuse);
+                let active = workspace.analyzer().current_thread_read_ledger().unwrap();
+                assert!(
+                    !active.reuse_refused(),
+                    "budget refusal is not the reuse-refused flag"
+                );
+                assert!(active.budget_dependences() > 0);
+                assert!(!active.ambient_verdict().is_content());
+                assert!(!active.explicit_verdict().is_content());
+            };
+            let (_, budget_refused) = capture_query_reads(workspace.analyzer(), || {
+                refuse_semantic_admission();
+                assert_eq!(publish(), RootResultPublicationOutcome::Continued);
+            });
+            assert!(!budget_refused.reuse_refused());
+            assert!(budget_refused.budget_dependences() > 0);
+            let after_budget = stored();
+            assert!(
+                matches!(after_budget, ClassSetRootResultLookup::Miss),
+                "budget-dependent capture published a SQL root: {after_budget:#?}"
+            );
+            let (_, disk_refused) = capture_query_reads(workspace.analyzer(), || {
+                workspace
+                    .analyzer()
+                    .current_thread_read_ledger()
+                    .unwrap()
+                    .refuse_persistence();
+                assert_eq!(publish(), RootResultPublicationOutcome::Continued);
+            });
+            assert!(!disk_refused.reuse_refused());
+            assert_eq!(disk_refused.execution_dependences(), 0);
+            assert!(disk_refused.persistence_refusals() > 0);
+            assert!(matches!(stored(), ClassSetRootResultLookup::Miss));
+            let (_, healthy) = capture_query_reads(workspace.analyzer(), || {
+                // The exact whole-workspace SQL key certifies content reads
+                // without a per-question receipt; this is not an operational stop.
+                workspace.analyzer().record_unattributed_read();
+                assert_eq!(publish(), RootResultPublicationOutcome::Continued);
+            });
+            assert!(!healthy.reuse_refused());
+            assert!(healthy.unattributed_reads() > 0);
+            assert_eq!(healthy.execution_dependences(), 0);
+            assert!(healthy.ambient_verdict().is_content());
+            assert!(healthy.explicit_verdict().is_content());
+            assert!(matches!(stored(), ClassSetRootResultLookup::Hit(_)));
+            assert_eq!(state.work().root_result_publications, 1);
+
+            // A new policy-run state cannot reuse the durable row under an
+            // operational capture, even when reuse_refused itself stays false.
+            let mut stopped_reader = TypeFlowQueryState::default();
+            let (stopped_projection, stopped_reads) =
+                capture_query_reads(workspace.analyzer(), || {
+                    refuse_semantic_admission();
+                    stopped_reader.solve(
+                        &workspace,
+                        &procedure,
+                        &mut SemanticBudget::default(),
+                        limits,
+                        &cancellation,
+                        workspace.analyzer().active_semantic_model_snapshot(),
+                    )
+                });
+            assert!(!stopped_reads.reuse_refused());
+            assert!(stopped_reads.budget_dependences() > 0);
+            assert!(
+                matches!(stopped_projection, Some(CachedTypeFlowAnalysis::Owned(_))),
+                "a refused durable read must run the live root instead of applying SQL rows"
+            );
+            assert_eq!(stopped_reader.work().root_result_persistence_hits, 0);
+            assert_eq!(stopped_reader.work().solves, 1);
+            assert!(matches!(stored(), ClassSetRootResultLookup::Hit(_)));
+
+            // Public direct queries have an owned acquisition receipt, but
+            // need not have an ambient policy ledger at this boundary.
+            assert!(workspace.analyzer().current_thread_read_ledger().is_none());
+            let mut direct_reader = TypeFlowQueryState::default();
+            let direct_projection = direct_reader.solve(
+                &workspace,
+                &procedure,
+                &mut SemanticBudget::default(),
+                limits,
+                &cancellation,
+                workspace.analyzer().active_semantic_model_snapshot(),
+            );
+            assert!(matches!(
+                direct_projection,
+                Some(CachedTypeFlowAnalysis::FindingFreeRows(_))
+            ));
+            assert_eq!(direct_reader.work().root_result_persistence_hits, 1);
+            assert_eq!(direct_reader.work().solves, 0);
+
+            let mut healthy_reader = TypeFlowQueryState::default();
+            let (healthy_projection, healthy_reads) =
+                capture_query_reads(workspace.analyzer(), || {
+                    workspace.analyzer().record_unattributed_read();
+                    healthy_reader.solve(
+                        &workspace,
+                        &procedure,
+                        &mut SemanticBudget::default(),
+                        limits,
+                        &cancellation,
+                        workspace.analyzer().active_semantic_model_snapshot(),
+                    )
+                });
+            let Some(CachedTypeFlowAnalysis::FindingFreeRows(healthy_rows)) = healthy_projection
+            else {
+                panic!("healthy content capture reuses the persisted partial root");
+            };
+            let row_quality = |rows: &[super::super::ClassSetRowValue]| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.member.clone(),
+                            row.class.clone(),
+                            row.origin.clone(),
+                            row.status,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(row_quality(&healthy_rows), row_quality(&projected));
+            assert_eq!(healthy_reader.work().root_result_persistence_hits, 1);
+            assert_eq!(healthy_reader.work().solves, 0);
+            assert!(healthy_reads.unattributed_reads() > 0);
+            assert!(healthy_reads.ambient_verdict().is_content());
+            assert!(healthy_reads.explicit_verdict().is_content());
+
+            // The same durable projection is also gated on its later local
+            // cache hit; owned one-policy-run RootMemo products are unchanged.
+            let (cached_projection, cached_reads) =
+                capture_query_reads(workspace.analyzer(), || {
+                    refuse_semantic_admission();
+                    healthy_reader.solve(
+                        &workspace,
+                        &procedure,
+                        &mut SemanticBudget::default(),
+                        limits,
+                        &cancellation,
+                        workspace.analyzer().active_semantic_model_snapshot(),
+                    )
+                });
+            assert!(!cached_reads.reuse_refused());
+            assert!(cached_reads.budget_dependences() > 0);
+            assert!(matches!(
+                cached_projection,
+                Some(CachedTypeFlowAnalysis::Owned(_))
+            ));
+            assert_eq!(healthy_reader.work().root_result_persistence_hits, 1);
+            assert_eq!(healthy_reader.work().cache_hits, 0);
+            assert_eq!(healthy_reader.work().solves, 1);
         }
 
         #[test]
@@ -5203,12 +5580,14 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "#11534: a root product built while a store read failed was published to the shared memo and replayed to the next policy with no store error of its own"
+        "#11534+#11997: a root error from a current or earlier failed read was retained for a healthy policy"
     )]
     fn root_memo_refuses_a_product_built_under_a_store_failure() {
         use super::super::semantic::SemanticQueryContext;
         use super::{CachedTypeFlowAnalysis, TypeFlowRootMemo, TypeFlowRootProduct};
+        use crate::{CodeQueryDiagnosticImpact, Incompleteness};
         use brokk_bifrost_analysis::analyzer::i_analyzer::PolicyCompletionOwner;
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
         use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, ReadAttribution};
         use std::sync::Arc;
 
@@ -5254,13 +5633,51 @@ mod tests {
                         snapshot.clone(),
                     )
                 });
-            let Some(CachedTypeFlowAnalysis::Owned(result)) = result else {
-                panic!(
-                    "fixture root must produce evidence: {:?}",
-                    state.take_diagnostics()
-                );
+            let product = match result {
+                Some(CachedTypeFlowAnalysis::Owned(result)) => {
+                    assert!(
+                        result.product.failure.is_none(),
+                        "a failed root must not be returned as a public answer"
+                    );
+                    result.product
+                }
+                Some(CachedTypeFlowAnalysis::FindingFreeRows(_))
+                | Some(CachedTypeFlowAnalysis::Failed) => {
+                    panic!("a healthy live fixture solve must return its owned evidence")
+                }
+                None => {
+                    let diagnostics = state.take_diagnostics();
+                    assert!(
+                        diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == CodeQueryDiagnosticCode::SemanticProviderFailed
+                                && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+                                && matches!(
+                                    diagnostic.incompleteness,
+                                    Incompleteness::Operational(DerivationExecutionCause::Provider)
+                                )
+                        }),
+                        "the root must report its typed provider failure: {diagnostics:?}"
+                    );
+                    // Failed evidence stays on this query only; solve_live
+                    // withholds it instead of returning a positive answer.
+                    assert_eq!(state.cache.len(), 1);
+                    match state.cache.values().next().expect("one failed root") {
+                        CachedTypeFlowAnalysis::Owned(result) => {
+                            assert!(result.product.failure.is_some());
+                            assert!(!result.product.complete);
+                            assert!(result.product.projected_rows.is_empty());
+                            assert!(result.product.class_sets.is_empty());
+                            assert!(result.product.findings.is_empty());
+                            Arc::clone(&result.product)
+                        }
+                        CachedTypeFlowAnalysis::FindingFreeRows(_)
+                        | CachedTypeFlowAnalysis::Failed => {
+                            panic!("the query must retain its own typed failed root evidence")
+                        }
+                    }
+                }
             };
-            (result.product, owner.errors(), reads.store_failed())
+            (product, owner.errors(), reads.store_failed())
         };
         let observations = |product: &TypeFlowRootProduct| {
             format!(
@@ -5321,12 +5738,58 @@ mod tests {
         assert_eq!(policy_b.work.solves, 1);
         assert!(!Arc::ptr_eq(&product_b, &failed_product));
         assert_eq!(observations(&product_b), healthy_observations);
+        // The second query sees its own healthy product, never A's
+        // query-local failed entry through the shared memo or another cache.
+        assert_eq!(policy_b.cache.len(), 1);
+        match policy_b.cache.values().next().expect("B owns one root") {
+            CachedTypeFlowAnalysis::Owned(result) => {
+                assert!(result.product.failure.is_none());
+                assert!(Arc::ptr_eq(&result.product, &product_b));
+                assert!(!Arc::ptr_eq(&result.product, &failed_product));
+            }
+            CachedTypeFlowAnalysis::FindingFreeRows(_) | CachedTypeFlowAnalysis::Failed => {
+                panic!("B must own its freshly solved healthy evidence")
+            }
+        }
         // B's healthy product is published: a later policy reuses it.
         let mut policy_c = state_on(&memo, 0);
         let (product_c, errors_c, _) = solve_as_policy(&mut policy_c);
         assert!(errors_c.is_empty());
         assert_eq!(policy_c.work.root_memo_hits, 1);
         assert!(Arc::ptr_eq(&product_c, &product_b));
+
+        // #11997: a separate earlier answer failed before this root's capture
+        // existed. Its transient error product must not become a warm hit for
+        // a healthy request, even though this solve performs no new SQL read.
+        let memo = TypeFlowRootMemo::default();
+        {
+            let outer = AnalyzerQueryScope::new(workspace.analyzer());
+            {
+                let _answer = AnalyzerQueryScope::independent_answer(workspace.analyzer(), None);
+                workspace.analyzer().record_query_failure(
+                    brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                        "earlier independent answer",
+                    ),
+                );
+            }
+            let (failed, errors, failed_read) = solve_as_policy(&mut state_on(&memo, 0));
+            assert!(!errors.is_empty());
+            assert!(failed_read);
+            assert!(failed.channels.reuse_refused);
+            assert!(failed.failure.is_some());
+            assert!(outer.store_error().is_some());
+        }
+        let mut fresh = state_on(&memo, 0);
+        let (recovered, errors, failed_read) = solve_as_policy(&mut fresh);
+        assert!(errors.is_empty());
+        assert!(!failed_read);
+        assert_eq!(fresh.work.root_memo_hits, 0);
+        assert_eq!(fresh.work.solves, 1);
+        assert_eq!(observations(&recovered), healthy_observations);
+        let mut warm = state_on(&memo, 0);
+        let (_, errors, _) = solve_as_policy(&mut warm);
+        assert!(errors.is_empty());
+        assert_eq!(warm.work.root_memo_hits, 1);
 
         // A persisting failure reaches every policy as its own error.
         let memo = TypeFlowRootMemo::default();

@@ -2014,6 +2014,10 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn named_and_glob_imports_share_executable_routes_without_losing_import_identity() {
         let mut fixture = RustRootResolutionOperationFixture::new();
         fixture.replace_persisted_consumer_source(concat!(
@@ -2403,6 +2407,26 @@ pub mod rust_departing_root_tests {
             scale_source: fn(usize) -> String,
             unrelated_source: fn(usize) -> String,
         ) -> Self {
+            Self::new_with_sources_and_budget(
+                source_mount_count,
+                unrelated_crate_source_count,
+                consumer_suffix,
+                scale_source,
+                unrelated_source,
+                None,
+            )
+        }
+
+        /// As `new_with_sources`, with the store's owner retention budget given
+        /// (a budget that refuses admissions exercises every rebuild path).
+        pub(crate) fn new_with_sources_and_budget(
+            source_mount_count: usize,
+            unrelated_crate_source_count: usize,
+            consumer_suffix: &str,
+            scale_source: fn(usize) -> String,
+            unrelated_source: fn(usize) -> String,
+            budget: Option<brokk_bifrost_core::retention_budget::RetentionBudget>,
+        ) -> Self {
             assert!(
                 source_mount_count >= 3,
                 "the Rust root fixture needs its consumer and two provider mounts"
@@ -2410,7 +2434,14 @@ pub mod rust_departing_root_tests {
             let project_root = tempfile::tempdir().expect("Rust root operation test project root");
             let project = MutableGenerationProject::new(project_root.path(), Language::Rust);
             let adapter = RustAdapter::for_tests();
-            let store = AnalyzerStore::open_ephemeral().expect("Rust root operation test store");
+            let store = match budget {
+                None => AnalyzerStore::open_ephemeral(),
+                Some(budget) => AnalyzerStore::open_ephemeral_with_config(
+                    &brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+                    &budget,
+                ),
+            }
+            .expect("Rust root operation test store");
             let generation = store
                 .ensure_language_epoch_value("rust", "resolution-operation-rust-root-test-v1")
                 .expect("Rust root operation test language epoch");
@@ -3350,6 +3381,10 @@ pub mod rust_departing_root_tests {
     /// of both statements would return nothing on every probe and agree
     /// vacuously.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn the_scoped_endpoint_header_read_answers_the_unscoped_read_within_its_scope() {
         use brokk_bifrost_analysis::analyzer::store::resolution_lexical::PATH_ENDPOINT_HEADER_MOUNTS_SQL;
 
@@ -3862,14 +3897,32 @@ pub mod rust_departing_root_tests {
             // stage use also makes the selection's finish freshness check the
             // second read group (+3 statements/+3 rows), a cost the warm searches
             // pay without the cold-only COUNT (+5/+3).
+            // Readiness reads the JVM inventory generation in the selected
+            // snapshot for every language (+1 statement/+1 row, #12245).
             // #13339 installs the three shared Rust source-scope TEMP views in
             // selected-resolution schema setup: +3 cold-open statements and
             // decoded schema rows in both profiles. Search and warm work are
             // unchanged.
+            // #13400: the two derivation kinds RustFileAvailability and
+            // RustNameAvailability are read by every path and name question,
+            // which adds +6 statements and +6 rows to the cold search.
+            // #13941 builds Rust import provenance once per blob from
+            // RUST_IMPORT_CONTEXTS_SQL, replacing the per-group import probes.
+            // The cold search executes it twice and decodes two unconditional
+            // context rows: +2 decoded rows with the statement count unchanged.
+            // #14060/#13847 records the Rust selection epoch in the staging
+            // transaction, the snapshot the unit fill read, so a later Main-only
+            // drift rebaseline can prove the retained unit tables are current.
+            // That witness is one WORKSPACE_SELECTION_EPOCH_SQL execution and one
+            // decoded row on cold open in both profiles; the retained open and
+            // the point search are unchanged.
+            // #14245 removes the selected-resolution admission count TEMP view
+            // from the shared stage schema: -1 cold-open statement and decoded
+            // schema row in both profiles.
             if cfg!(debug_assertions) {
-                (314, 267, 341, 210)
+                (315, 268, 347, 218)
             } else {
-                (311, 264, 341, 210)
+                (312, 265, 347, 218)
             },
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
@@ -3930,8 +3983,10 @@ pub mod rust_departing_root_tests {
             // search. #12370's two macro type candidate pages (+2/0) and the
             // finish freshness boundary (+3/+3) add +5/+3; the cold-only
             // interior-validation COUNT is absent here.
-            (5, 4, 340, 209),
-            "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
+            // #13941's per-blob import-provenance build adds the same +2
+            // decoded rows to this warm search as the cold search.
+            (6, 5, 346, 217),
+            "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at six statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
             (
@@ -3960,7 +4015,9 @@ pub mod rust_departing_root_tests {
             // #12495's binary-operation pages (+3/0), #12370's two macro type
             // candidate pages (+2/0) and the finish freshness boundary (+3/+3)
             // add the same +8/+3 as the first warm search.
-            (5, 4, 340, 209),
+            // #13941's per-blob import-provenance build adds the same +2
+            // decoded rows to the repeated warm search.
+            (6, 5, 346, 217),
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);
@@ -3975,6 +4032,10 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_scope_owner_reader_preserves_executable_heads_and_type_body_classification()
      {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchResolutionFragmentSource;
@@ -4054,6 +4115,10 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_lexical_declarations_project_exact_source_identity_with_indexed_reads() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::explain_pin;
 
@@ -5021,6 +5086,10 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_rust_exports_match_fresh_derivation_after_content_changes() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::Module;
 
@@ -5239,6 +5308,10 @@ pub mod rust_departing_root_tests {
 
     #[test]
     #[hardwon("#11342: flat unknown activation evidence panicked in the crate row reader")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_flat_producer_inventory_evidence_remains_incomplete() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_rows::RustCrateRows;
         let mut fixture = RustRootResolutionOperationFixture::new();
@@ -5363,6 +5436,10 @@ pub mod rust_departing_root_tests {
     /// module for that request (`EditedMacroHost`), so the lookup answers
     /// incomplete rather than proving the item absent.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_rust_edited_macro_host_reopens_its_module_inventory() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::Module;
 
@@ -6594,15 +6671,16 @@ pub mod rust_departing_root_tests {
         assert_eq!(unbounded.lexical_definitions, answer.lexical_definitions);
         assert_eq!(unbounded_metrics, bounded_metrics);
 
-        let zero_scope = run(ReceiverAnalysisBudget {
-            max_scope_nodes: 0,
+        // Scope work never refuses (#13216); a zero round allowance is the stop.
+        let zero_rounds = run(ReceiverAnalysisBudget {
+            max_resolution_rounds: 0,
             ..ReceiverAnalysisBudget::default()
         });
         assert!(matches!(
-            zero_scope,
+            zero_rounds,
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work: ReceiverAnalysisWork { scope_nodes: 0, .. },
+                limit: ReceiverBudgetLimit::ResolutionRounds,
+                ..
             }
         ));
         assert!(!cancellation.is_cancelled());
@@ -6622,7 +6700,6 @@ pub mod rust_departing_root_tests {
         );
         let under_rounds = run(ReceiverAnalysisBudget {
             max_resolution_rounds: warm.resolution_rounds - 1,
-            max_scope_nodes: warm.scope_nodes,
             ..ReceiverAnalysisBudget::default()
         });
         assert!(matches!(
@@ -6637,7 +6714,6 @@ pub mod rust_departing_root_tests {
         let exact = run(ReceiverAnalysisBudget {
             max_summary_expansions: warm.summary_expansions,
             max_resolution_rounds: warm.resolution_rounds,
-            max_scope_nodes: warm.scope_nodes,
             ..ReceiverAnalysisBudget::default()
         });
         assert!(matches!(
@@ -6646,19 +6722,6 @@ pub mod rust_departing_root_tests {
                 work: exact_work,
                 ..
             } if exact_work == warm
-        ));
-        let under = run(ReceiverAnalysisBudget {
-            max_summary_expansions: warm.summary_expansions,
-            max_resolution_rounds: warm.resolution_rounds,
-            max_scope_nodes: warm.scope_nodes - 1,
-            ..ReceiverAnalysisBudget::default()
-        });
-        assert!(matches!(
-            under,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
         ));
         assert!(!cancellation.is_cancelled());
 
@@ -6806,6 +6869,10 @@ pub mod rust_departing_root_tests {
         answers.pop().expect("one semantic reference")
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn active_macro_capsules(
         operation: &SelectedResolutionOperation<'_, '_>,
     ) -> Vec<(u32, u32)> {
@@ -6816,6 +6883,10 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn actual_macro_frontier_closures_preserve_unrelated_gap_reasons() {
         pub(crate) fn definition_source(index: usize) -> String {
             if index == 0 {
@@ -6996,6 +7067,10 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn generated_head_pair_preserves_actual_ordinary_definition_authority() {
         let fixture = RustRootResolutionOperationFixture::new();
         let live = CancellationToken::new();
@@ -7570,6 +7645,10 @@ pub mod rust_departing_root_tests {
         "#11281+#5658: macro readers hydrated unused fact families and file-wide token inputs"
     )]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_macro_source_rows_preserve_invocation_snapshots() {
         let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
             4,
@@ -7677,6 +7756,10 @@ pub fn inactive() { unknown!({ nested(tokens) }); }
 
     #[hardwon("#11281+#4501: macro consumers repeated token and occurrence arena reads")]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_macro_overlay_scans_occurrence_arena_once_for_many_inputs() {
         let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
             4,
@@ -7840,6 +7923,10 @@ pub fn caller(t: &Tensor) {
     /// and a second preparation builds the same overlay again rather than finding
     /// the slot taken.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn a_crate_stage_s_macro_overlay_is_dropped_with_everything_it_registered() {
         let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
             4,
@@ -7991,6 +8078,10 @@ pub fn caller(t: &Tensor) {
     /// consumer at all, and how many macro inputs the reference overlay admits
     /// once the frontiers are prepared.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn selected_rust_byte_identical_replacement_admits_the_persisted_macro_inputs() {
         let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
             4,
@@ -8088,6 +8179,10 @@ pub fn caller(t: &Tensor) {
         );
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn macro_activation_closure_flags(
         operation: &SelectedResolutionOperation<'_, '_>,
     ) -> Vec<bool> {
@@ -8330,6 +8425,10 @@ pub fn caller(t: &Tensor) {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn with_dense_selected_macro_sources<T>(
         child_source: fn(usize) -> String,
         visit: impl FnOnce(&AnalyzerStore, &WorkspaceSnapshotId, Vec<DenseSelectedMacroFixture>) -> T,
@@ -8767,6 +8866,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn persisted_catalog_does_not_treat_a_shared_slot_as_a_local_semantic() {
         use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticProvenance;
 
@@ -8805,6 +8908,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn persisted_lexical_type_transfer_retains_unknown_placement_without_rules_and_on_stop()
      {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchResolutionFragmentSource;
@@ -9001,6 +9108,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn persisted_reverse_exclusion_rejects_a_qualified_gap_owned_by_the_typed_route() {
         use brokk_bifrost_analysis::analyzer::resolution::fact_lowering::LoweringGapOrigin;
 
@@ -9036,6 +9147,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn persisted_reference_seed_cancellation_retains_decoded_gap_prefix() {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchResolutionFragmentSource;
 
@@ -9132,6 +9247,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn sql_context_adapter_descriptor_conflict_rolls_back_after_full_derivation_charge()
     {
         let fixture = RustRootResolutionOperationFixture::new();
@@ -9310,12 +9429,15 @@ pub fn caller(t: &Tensor) {
         assert_eq!(answers[1].resolution, answers[2].resolution);
         assert!(operation.ready.operation_demand_state.hits_for_test() > 0);
         let before = operation.ready.operation_demand_state.hits_for_test();
-        let tiny = operation
+        // The completed-root memo key carries no work allowance (#13216), so a
+        // request with none left still finds the completed root and answers
+        // exactly as the funded ones did.
+        let starved = operation
             .resolve_rust_reference_for_caller_bounded(
                 Path::new(RUST_ROOT_CONSUMER_PATH),
                 &locator,
                 ReceiverAnalysisBudget {
-                    max_scope_nodes: 0,
+                    max_resolution_rounds: 0,
                     ..ReceiverAnalysisBudget::default()
                 },
                 &cancellation,
@@ -9323,11 +9445,24 @@ pub fn caller(t: &Tensor) {
                 &mut ResolutionBatchMetrics::default(),
             )
             .unwrap();
-        assert!(matches!(tiny, BoundedResolution::Exceeded { .. }));
+        let BoundedResolution::Complete {
+            value:
+                SelectedRustCallerReferenceOutcome::Operation(
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                        starved,
+                    )),
+                ),
+            ..
+        } = starved
+        else {
+            panic!("a memoized root completes without spending allowance");
+        };
         assert_eq!(
-            operation.ready.operation_demand_state.hits_for_test(),
-            before
+            only_rust_point_answer(starved).resolution,
+            answers[0].resolution
         );
+        assert!(operation.ready.operation_demand_state.hits_for_test() > before);
+        let before = operation.ready.operation_demand_state.hits_for_test();
         let fresh = fixture.open_ready(&cancellation);
         assert_eq!(fresh.ready.operation_demand_state.hits_for_test(), 0);
         drop(fresh);
@@ -9350,6 +9485,10 @@ pub fn caller(t: &Tensor) {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn rust_blob_placement_activity_reads_selected_cfg_routes() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity::Active as Active;
 
@@ -9491,6 +9630,10 @@ pub fn caller(t: &Tensor) {
     #[test]
     #[hardwon(
         "#11639: readers disagreed on activity for a descendant of an inactive module and for a module with an undecided twin; an overlay that re-activates a cfg-inactive module kept its callers dropped"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     pub(crate) fn rust_file_activity_has_one_definition_for_gate_and_route_index() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity::{
@@ -9642,6 +9785,10 @@ pub fn caller(t: &Tensor) {
     /// duplicate candidate as an inactive placement of activation -1, which is
     /// what keeps the verdict unknown.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn a_duplicate_placement_in_another_target_keeps_the_gate_unknown() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity::{
             Inactive, Unknown,
@@ -9779,7 +9926,6 @@ pub fn caller(t: &Tensor) {
                 ReceiverAnalysisBudget {
                     max_summary_expansions: 10_000,
                     max_resolution_rounds: 10_000,
-                    max_scope_nodes: 200_000,
                     ..ReceiverAnalysisBudget::default()
                 },
                 &cancellation,

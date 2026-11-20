@@ -144,12 +144,12 @@ use brokk_bifrost_core::hash::HashSet;
 const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
 pub(super) const RUSTDOC_FORMAT_VERSION: u32 = 61;
 const RUSTDOC_PRODUCER_CONTRACT: &str = "rustdoc-json-pack-producer/1";
-/// The highest authored schema this Rustdoc producer may write. Stability
-/// certificates require schema 40, above trait-member `Self` at schema 39.
+/// The highest authored schema this Rustdoc producer may write. Structural
+/// parameter kinds require schema 45, above stability at schema 40.
 /// Every generated pack is raised to this maximum, which also discharges the
 /// older conditional trait-Self schema raise without another uncancellable walk.
 pub(crate) const RUSTDOC_PACK_MAX_SCHEMA_VERSION: u32 =
-    brokk_bifrost_semantic::analyzer::semantic_model::model::RUST_STABILITY_MIN_SCHEMA_VERSION;
+    brokk_bifrost_semantic::analyzer::semantic_model::model::RUST_GENERIC_PARAMETER_KINDS_MIN_SCHEMA_VERSION;
 
 fn assert_pack_schema_within_producer_max(pack: Option<&AuthoredSemanticModelPack>) {
     if let Some(pack) = pack {
@@ -3335,6 +3335,7 @@ fn produce_document(
         };
         let (type_kind, generics, hierarchy) =
             type_shape(item, document, &type_ids, limits, &mut diagnostics);
+        let parameter_inventory = type_fact_parameter_inventory(item, generics);
         let impl_ids: &[Id] = match &item.inner {
             ItemEnum::Struct(ty) => &ty.impls,
             ItemEnum::Union(ty) => &ty.impls,
@@ -3360,6 +3361,7 @@ fn produce_document(
         }
         type_position.insert(item.id, types.len());
         types.push(TypeFact {
+            type_parameter_kinds: parameter_inventory.iter().map(|(_, kind)| *kind).collect(),
             alias_target: if let ItemEnum::TypeAlias(alias) = &item.inner {
                 exact_alias_target(
                     &alias.type_,
@@ -3408,18 +3410,14 @@ fn produce_document(
             type_kind,
             visibility: semantic_visibility(&item.visibility),
             is_abstract: matches!(item.inner, ItemEnum::Trait(_)),
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
-            type_parameters: if let ItemEnum::Primitive(primitive) = &item.inner {
-                match primitive.name.as_str() {
-                    "slice" => vec!["T".into()],
-                    "array" => vec!["T".into(), "N".into()],
-                    _ => Vec::new(),
-                }
-            } else {
-                generic_names(generics)
-            },
+            type_parameters: parameter_inventory
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
             value_semantics: None,
@@ -3849,6 +3847,8 @@ fn produce_document(
         }
         member_position.insert(item.id, members.len());
         members.push(MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: trait_implementation.map(|implementation| {
                 let mut fact = ImplementedTraitFact {
                     rust_stability: None,
@@ -4963,6 +4963,38 @@ fn generic_parameters(
     })
 }
 
+fn type_fact_parameter_inventory(
+    item: &Item,
+    generics: &Generics,
+) -> Vec<(
+    String,
+    brokk_bifrost_semantic::analyzer::semantic_model::GenericParameterKind,
+)> {
+    use brokk_bifrost_semantic::analyzer::semantic_model::GenericParameterKind;
+    if let ItemEnum::Primitive(primitive) = &item.inner {
+        return match primitive.name.as_str() {
+            "slice" => vec![("T".into(), GenericParameterKind::Type)],
+            "array" => vec![
+                ("T".into(), GenericParameterKind::Type),
+                ("N".into(), GenericParameterKind::Const),
+            ],
+            _ => Vec::new(),
+        };
+    }
+    generic_parameters(generics)
+        .map(|parameter| {
+            let kind = match parameter.kind {
+                rustdoc_types::GenericParamDefKind::Type { .. } => GenericParameterKind::Type,
+                rustdoc_types::GenericParamDefKind::Const { .. } => GenericParameterKind::Const,
+                rustdoc_types::GenericParamDefKind::Lifetime { .. } => {
+                    GenericParameterKind::Unknown
+                }
+            };
+            (parameter.name.clone(), kind)
+        })
+        .collect()
+}
+
 fn generic_names(generics: &Generics) -> Vec<String> {
     generic_parameters(generics)
         .map(|parameter| parameter.name.clone())
@@ -5065,6 +5097,7 @@ fn member_signature(
         _ => return None,
     };
     Some(Signature {
+        bounds: None,
         type_parameters,
         parameters,
         returns,
@@ -8676,6 +8709,8 @@ pub(super) mod tests {
                 if let brokk_bifrost_semantic::analyzer::semantic_model::AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload {
                     for ty in types {
                         ty.rust_stability = None;
+                        // Old schema fixtures predate structural kind evidence.
+                        ty.type_parameter_kinds.clear();
                         for implementation in &mut ty.implemented_traits { implementation.rust_stability = None; }
                         for implementation in &mut ty.generic_trait_impls { implementation.implementation.rust_stability = None; }
                     }
@@ -8768,6 +8803,13 @@ pub(super) mod tests {
                 && fact.aliases.contains(&"std.data.Traversal.walk".to_owned())
         }));
         assert_eq!(widget.type_parameters, ["T", "N"]);
+        assert_eq!(
+            widget.type_parameter_kinds,
+            [
+                brokk_bifrost_semantic::analyzer::semantic_model::GenericParameterKind::Type,
+                brokk_bifrost_semantic::analyzer::semantic_model::GenericParameterKind::Const,
+            ]
+        );
         assert_eq!(
             widget.type_parameter_defaults,
             [
@@ -10298,6 +10340,70 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn primitive_generic_parameter_kinds_preserve_array_const_position() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::GenericParameterKind;
+        let document = document(false);
+        let mut item = document.index.values().next().unwrap().clone();
+        for (name, expected) in [
+            ("slice", vec![("T".to_owned(), GenericParameterKind::Type)]),
+            (
+                "array",
+                vec![
+                    ("T".to_owned(), GenericParameterKind::Type),
+                    ("N".to_owned(), GenericParameterKind::Const),
+                ],
+            ),
+            ("u8", Vec::new()),
+        ] {
+            item.inner = ItemEnum::Primitive(rustdoc_types::Primitive {
+                name: name.into(),
+                impls: Vec::new(),
+            });
+            assert_eq!(
+                type_fact_parameter_inventory(&item, empty_generics()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn generic_parameter_kinds_do_not_infer_const_from_a_default_or_name() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::GenericParameterKind;
+        let document = document(false);
+        let item = document
+            .index
+            .values()
+            .find(|item| matches!(item.inner, ItemEnum::Struct(_)))
+            .unwrap();
+        let parameters = Generics {
+            params: vec![
+                rust_generic("N"),
+                GenericParamDef {
+                    name: "T".into(),
+                    kind: GenericParamDefKind::Const {
+                        type_: Type::Primitive("usize".into()),
+                        default: None,
+                    },
+                },
+                GenericParamDef {
+                    name: "a".into(),
+                    kind: GenericParamDefKind::Lifetime {
+                        outlives: Vec::new(),
+                    },
+                },
+            ],
+            where_predicates: Vec::new(),
+        };
+        assert_eq!(
+            type_fact_parameter_inventory(item, &parameters),
+            [
+                ("N".to_owned(), GenericParameterKind::Type),
+                ("T".to_owned(), GenericParameterKind::Const),
+            ]
+        );
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#12425: an unknown-self Clone impl globally interrupted unrelated method families"
     )]
@@ -10461,6 +10567,7 @@ pub(super) mod tests {
             concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-8"),
             concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-9"),
             concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-10"),
+            concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-12"),
         ] {
             let document = known_owner_trait_gap_document();
             let input = lower_hex_string(&sha256_bytes(&serde_json::to_vec(&document).unwrap()));
@@ -10480,9 +10587,27 @@ pub(super) mod tests {
                 old_pack.schema_version,
             )
             .unwrap();
-            let compiled = compile_pack(&old_pack, &CompilerOptions::default()).unwrap();
+            let slots=vec![brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(
+                brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Declarations,
+                brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::RustdocJson,&input)];
+            old_pack.extraction=Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
+                brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::RustdocJson,&slots));
+            for shard in &mut old_pack.shards {
+                for selector in &mut shard.activation {
+                    selector.artifact_sha256 = None;
+                    selector.production_input_digest = Some(input.clone());
+                }
+            }
+            let compiled =
+                brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_generated_pack(
+                    &old_pack,
+                    &CompilerOptions::default(),
+                )
+                .unwrap();
             let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-            catalog.install_generated(&old_key, &compiled).unwrap();
+            catalog
+                .install_generated(&old_key, &compiled, &slots)
+                .unwrap();
             assert!(catalog.generated_production(&old_key).unwrap().is_some());
             assert!(
                 catalog
@@ -10518,6 +10643,7 @@ pub(super) mod tests {
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: Some(NameSelector {
                     name: "widget".to_owned(),
                     version: Some("=1.2.3".to_owned()),

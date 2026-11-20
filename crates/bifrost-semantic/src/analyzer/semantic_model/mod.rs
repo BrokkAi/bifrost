@@ -9,6 +9,12 @@
 //! versioned source model, validation, canonical compilation, and defensive artifact decoding.
 
 #[doc(hidden)]
+pub mod approval;
+pub use approval::*;
+
+#[doc(hidden)]
+pub mod approximation;
+#[doc(hidden)]
 pub mod artifact;
 #[doc(hidden)]
 pub mod authoring;
@@ -45,6 +51,10 @@ pub mod runtime_contracts;
 pub mod source;
 #[doc(hidden)]
 pub mod validate;
+
+pub use crate::analyzer::semantic_model::approximation::ApproximationReason;
+
+pub use crate::analyzer::semantic_model::approximation::ApproximationReasons;
 
 pub use crate::analyzer::semantic_model::artifact::ArtifactEncoding;
 

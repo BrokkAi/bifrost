@@ -16,6 +16,7 @@
 //! `brokk-bifrost-analysis`, which re-exports every item below at its historical
 //! path.
 
+pub mod admitted_text;
 pub mod analyzer;
 pub mod attribution;
 #[doc(hidden)]
@@ -30,10 +31,13 @@ pub mod compact_graph;
 pub mod complete_value_cache;
 pub mod content_digest;
 pub mod definition_inventory;
+pub mod domain_memo;
 pub mod git_file;
 pub mod gitblob;
 pub mod hash;
 pub mod heap_release;
+#[doc(hidden)]
+pub mod host_input;
 pub mod lever_tokens;
 pub mod omission;
 pub mod panic_report;

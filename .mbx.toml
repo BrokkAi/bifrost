@@ -1,0 +1,3 @@
+[linker]
+# mbx fetches the pinned Linux linker. Set MBX_LINKER=system on other hosts.
+default = "mold@2.42.1"

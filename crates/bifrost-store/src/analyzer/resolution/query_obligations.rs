@@ -99,6 +99,8 @@ pub(crate) enum QueryNode {
     Suffix(super::SemanticId),
     /// Query-local hierarchy sources are insert-once and are never reset.
     Hierarchy(super::SemanticId),
+    /// Immutable selected input question, carrying only real incompleteness.
+    SelectedInputQuestion([u8; 32]),
     /// Recording-only marker for a read of the published node set.
     All,
 }
@@ -129,6 +131,13 @@ pub(crate) struct NodeQueryObligations {
 }
 
 impl NodeQueryObligations {
+    pub(crate) fn selected_input_questions(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.active.iter().filter_map(|node| match node {
+            QueryNode::SelectedInputQuestion(digest) => Some(*digest),
+            _ => None,
+        })
+    }
+
     pub(crate) fn ordered_sets_with_poll(
         &self,
         cancelled: &mut impl FnMut() -> bool,

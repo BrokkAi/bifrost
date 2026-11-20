@@ -12,11 +12,11 @@ fn value_flow_registration_failures_keep_their_domain_in_mixed_queries() {
 
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(
-        result.diagnostics[0].code,
+        result.diagnostics.semantic()[0].code,
         CodeQueryDiagnosticCode::ValueFlowRegistrationStale
     );
     assert!(
-        result.diagnostics[0]
+        result.diagnostics.semantic()[0]
             .message
             .contains("value-flow registration")
     );
@@ -2081,12 +2081,12 @@ fn indexed_candidates_preserve_nested_capture_negation_and_budget_cutoffs() {
                     .result
                     .diagnostics
                     .iter()
-                    .map(|diagnostic| diagnostic.code)
+                    .map(|diagnostic| diagnostic.code())
                     .collect::<Vec<_>>(),
                 scan.result
                     .diagnostics
                     .iter()
-                    .map(|diagnostic| diagnostic.code)
+                    .map(|diagnostic| diagnostic.code())
                     .collect::<Vec<_>>()
             );
             assert!(

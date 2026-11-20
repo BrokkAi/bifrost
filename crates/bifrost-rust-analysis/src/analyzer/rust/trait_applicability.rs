@@ -96,7 +96,8 @@ impl<'a, 'resolver> ModelApplicability<'a, 'resolver> {
 
     pub(super) fn member(&self, symbol: &SemanticModelSymbol) -> Option<Arc<MemberFact>> {
         let mut records = self.active.all_member_records_with_id(&symbol.id);
-        if records.open_for_language(&symbol.language).is_some() {
+        if let Some(open) = records.open_for_language(&symbol.language) {
+            let _cause = SemanticModelOverlay::record_open_proof(open, "model_trait_member");
             return None;
         }
         records
@@ -1388,9 +1389,9 @@ fn workspace_read<T>(
         Ok(value) => Some(value),
         Err(error) => {
             eprintln!("reading Rust workspace implementation evidence: {error:?}");
-            super::std_types::operational_proof_stop(
+            super::std_types::cargo_route_proof_stop(
                 "workspace_impl_inventory_unavailable",
-                super::std_types::cargo_route_execution_cause(&error),
+                &error,
             );
             None
         }

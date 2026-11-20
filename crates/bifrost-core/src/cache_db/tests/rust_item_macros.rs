@@ -376,3 +376,89 @@ fn populated_version_one_rust_facts_survive_migration_without_relabeling() {
     );
     validate_foreign_keys(&conn).unwrap();
 }
+
+#[test]
+fn sealed_rust_impl_census_macro_path_columns_are_checked_and_immutable() {
+    let conn = current_rust_connection();
+    let blob_id = seed_macro_route(&conn, "rust-census-macro-path", Some(0));
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(?1,1,0,1)",
+        [blob_id],
+    ).unwrap();
+    for (absolute, shadow, path) in [
+        (2, 0, "[\"std\",\"format\"]"),
+        (0, 2, "[\"std\",\"format\"]"),
+        (0, 0, "{\"std\":1}"),
+        (0, 0, "not json"),
+    ] {
+        assert!(
+            conn.execute(
+                "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte,macro_absolute,macro_shadow_possible,macro_path)
+                 VALUES(?1,0,0,3,?2,?3,jsonb(?4))",
+                params![blob_id, absolute, shadow, path],
+            )
+            .is_err(),
+            "{absolute} {shadow} {path}"
+        );
+    }
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte,macro_absolute,macro_shadow_possible,macro_path)
+         VALUES(?1,0,0,3,0,0,jsonb('[\"std\",\"format\"]'))",
+        [blob_id],
+    ).unwrap();
+    seal_rust_source_manifest(&conn, blob_id).unwrap();
+    for sql in [
+        "UPDATE source_rust_impl_census_boundaries SET macro_shadow_possible=1 WHERE blob_id=?1",
+        "UPDATE source_rust_impl_census_boundaries SET macro_absolute=1 WHERE blob_id=?1",
+        "UPDATE source_rust_impl_census_boundaries SET macro_path=jsonb('[\"format\"]') WHERE blob_id=?1",
+    ] {
+        let error = conn.execute(sql, [blob_id]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("sealed source facts are immutable"),
+            "{sql}: {error}"
+        );
+    }
+}
+
+#[test]
+fn macro_boundary_written_before_macro_paths_stays_uncertifiable_after_upgrade() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    configure_connection(&mut conn).unwrap();
+    conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+    let last_before = POST_BASELINE_MIGRATIONS
+        .iter()
+        .rev()
+        .nth(1)
+        .expect("a migration precedes the macro path migration");
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= last_before.version)
+    {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", last_before.version)
+        .unwrap();
+    let blob_id = seed_macro_route(&conn, "rust-census-pre-macro-path", Some(0));
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(?1,1,0,1)",
+        [blob_id],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte) VALUES(?1,0,0,3)",
+        [blob_id],
+    ).unwrap();
+    seal_rust_source_manifest(&conn, blob_id).unwrap();
+
+    migrate(&mut conn).unwrap();
+    let row: (i64, Option<i64>, Option<i64>, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT kind, macro_absolute, macro_shadow_possible, macro_path
+               FROM source_rust_impl_census_boundaries WHERE blob_id=?1",
+            [blob_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (0, None, None, None));
+}

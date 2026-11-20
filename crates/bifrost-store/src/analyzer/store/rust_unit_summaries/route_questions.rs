@@ -50,13 +50,39 @@ pub fn rust_unit_inputs(
     s: &WorkspaceSnapshotId,
     unit: &[u8; 32],
 ) -> Result<Option<([u8; 32], bool)>> {
+    use super::RustUnitAvailability;
+    match super::rust_unit_availability(c, s, unit)? {
+        Some(RustUnitAvailability::Published { .. }) => published_unit_inputs(c, s, unit),
+        Some(RustUnitAvailability::IntentionallyUnavailable { evidence, .. }) => {
+            Ok(Some((evidence, false)))
+        }
+        // A stale unit (after a derivation change, before reconcile rewrites it)
+        // has no content identity to report, and it may be an unavailable target
+        // with no summary row at all, so this point read fails. Stale is the
+        // normal upgrade window, not a store fault. Only the membership
+        // questions report a stale unit as partial.
+        Some(RustUnitAvailability::Stale) => Err(StoreError::new(format!(
+            "stale selected Rust unit {unit:02x?}: derivation or reconcile pending"
+        ))),
+        Some(RustUnitAvailability::Unpublished) => Err(StoreError::corrupt(format!(
+            "unpublished selected Rust unit {unit:02x?}"
+        ))),
+        None => Ok(None),
+    }
+}
+
+pub(super) fn published_unit_inputs(
+    c: &Connection,
+    s: &WorkspaceSnapshotId,
+    unit: &[u8; 32],
+) -> Result<Option<([u8; 32], bool)>> {
     check(c, s)?;
     let row = c
         .query_row(
             r#"SELECT x.summary_digest,x.summary_digest,m.rel_path,m.blob_oid,
                 x.complete,x.publication_state,x.derivation_identity,e.lang,
-                rv.manifest_file_version_id,x.unit_kind,t.publication_state,ctx.broad_complete,
-                t.producer_epoch=(SELECT epoch FROM main.analysis_epochs WHERE lang='rust')
+                cv.manifest_file_version_id,x.unit_kind,t.publication_state,ctx.broad_complete,
+                (t.producer_epoch=(SELECT epoch FROM main.analysis_epochs WHERE lang='rust') AND cv.topology_id IS NOT NULL)
          FROM temp.selected_workspace_revisions selected
          JOIN main.resolution_unit_summary_versions v
            ON v.workspace_id=selected.workspace_id AND v.lang=selected.lang
@@ -70,9 +96,14 @@ pub fn rust_unit_inputs(
            ON rv.workspace_id=v.workspace_id AND rv.lang=v.lang
           AND rv.generation=v.generation AND rv.unit_key=v.unit_key
           AND rv.valid_from=v.valid_from AND rv.summary_id=v.summary_id
+         LEFT JOIN main.rust_crate_versions cv
+           ON cv.workspace_id=v.workspace_id AND cv.lang=v.lang
+          AND cv.generation=v.generation AND cv.crate_key=v.unit_key
+          AND cv.topology_id=rv.topology_id AND cv.valid_from<=selected.revision
+          AND (cv.valid_until IS NULL OR selected.revision<cv.valid_until)
          LEFT JOIN main.rust_resolution_unit_summary_contexts ctx ON ctx.summary_id=x.summary_id
          LEFT JOIN main.rust_crate_topologies t ON t.topology_id=rv.topology_id
-         LEFT JOIN main.workspace_file_versions m ON m.file_version_id=rv.manifest_file_version_id
+         LEFT JOIN main.workspace_file_versions m ON m.file_version_id=cv.manifest_file_version_id
            AND m.workspace_id=v.workspace_id AND m.lang=v.lang AND m.generation=v.generation
            AND m.valid_from<=selected.revision
            AND (m.valid_until IS NULL OR selected.revision<m.valid_until)
@@ -134,7 +165,7 @@ pub fn rust_unit_inputs(
     INPUT_TRACE.with(|trace| trace.borrow_mut().clear());
     let mut hash = InputHasher(
         brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
-            b"derivation:rust_unit_inputs:v2",
+            b"derivation:rust_unit_inputs:v3",
         ),
     );
     hash.field("summary", &summary);
@@ -213,6 +244,42 @@ pub fn rust_unit_inputs(
         .collect::<Vec<_>>();
     placement_content.sort_unstable();
     hash.sequence("broad-placements", &placement_content);
+    // Route composition also reads activity derived from the placement gaps.
+    // Broad placement rows alone do not cover those answers: changing a gap's
+    // path can change activity while the unit remains broadly incomplete.
+    // Hash the decoded answers, not the gap JSON or its storage order.
+    let activity_code = |activity| match activity {
+        RustBlobActivity::Active => 1u8,
+        RustBlobActivity::Inactive => 0,
+        RustBlobActivity::Unknown => 2,
+    };
+    let mut file_activity = rust_unit_file_activity(c, s, unit)?
+        .into_iter()
+        .map(|(path, activity)| {
+            let mut row = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                b"rust-unit-input-file-activity:v1",
+            );
+            row.field("path", path.as_bytes());
+            row.field("activity", &[activity_code(activity)]);
+            row.finish().to_vec()
+        })
+        .collect::<Vec<_>>();
+    file_activity.sort_unstable();
+    hash.sequence("file-activity", &file_activity);
+    let mut placement_activity = rust_unit_placement_activity(c, s, unit)?
+        .into_iter()
+        .map(|(path, module_path, activity)| {
+            let mut row = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                b"rust-unit-input-placement-activity:v1",
+            );
+            row.field("path", path.as_bytes());
+            row.field("module", module_path.as_bytes());
+            row.field("activity", &[activity_code(activity)]);
+            row.finish().to_vec()
+        })
+        .collect::<Vec<_>>();
+    placement_activity.sort_unstable();
+    hash.sequence("placement-activity", &placement_activity);
     // Module facts are selected using this content key, never a reusable blob row id.
     hash.field("module-generation", &s.generation.0.to_be_bytes());
     hash.field("module-parse-variant", b"");
@@ -253,7 +320,7 @@ fn route_sql(question: RouteQuestion) -> String {
             "{LIVE} SELECT live.unit_key,n.role FROM main.resolution_unit_summary_dependencies d INDEXED BY resolution_unit_summary_dependencies_unit JOIN live ON live.summary_id=d.summary_id JOIN main.resolution_unit_summary_dependency_names n ON n.summary_id=d.summary_id AND n.dependency_ordinal=d.dependency_ordinal WHERE d.dependency_unit_key=?2 AND d.boundary='workspace' ORDER BY live.unit_key,n.role"
         ),
         RouteQuestion::FileUnits => format!(
-            "{LIVE} SELECT DISTINCT live.unit_key FROM main.resolution_unit_summary_members m INDEXED BY resolution_unit_summary_members_path JOIN live ON live.summary_id=m.summary_id JOIN temp.selected_workspace_file_versions f ON f.workspace_id=live.workspace_id AND f.lang='rust' AND f.generation=live.generation AND f.rel_path=m.rel_path CROSS JOIN temp.selected_unit_member_blobs attachment ON attachment.summary_id=m.summary_id AND attachment.member_ordinal=m.member_ordinal JOIN main.blobs b ON b.id=attachment.blob_id AND b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation WHERE m.rel_path=?2 ORDER BY live.unit_key"
+            "{LIVE} SELECT DISTINCT live.unit_key,m.rel_path FROM main.resolution_unit_summary_members m INDEXED BY resolution_unit_summary_members_path JOIN live ON live.summary_id=m.summary_id JOIN temp.selected_workspace_file_versions f ON f.workspace_id=live.workspace_id AND f.lang='rust' AND f.generation=live.generation AND f.rel_path=m.rel_path CROSS JOIN temp.selected_unit_member_blobs attachment ON attachment.summary_id=m.summary_id AND attachment.member_ordinal=m.member_ordinal JOIN main.blobs b ON b.id=attachment.blob_id AND b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation WHERE m.rel_path IN (SELECT value FROM json_each(?2)) ORDER BY live.unit_key,m.rel_path"
         ),
         // Detached summaries describe source ownership for other consumers;
         // they are not Cargo roots in the whole route index.
@@ -335,7 +402,7 @@ pub fn explain_rust_route_questions(
         (
             RouteQuestion::FileUnits,
             "file_units",
-            rusqlite::types::Value::Text(path.to_string()),
+            rusqlite::types::Value::Text(serde_json::to_string(&[path]).expect("paths serialize")),
         ),
         (
             RouteQuestion::CrateNameUnits,
@@ -373,56 +440,23 @@ pub fn rust_selected_units_known(
     s: &WorkspaceSnapshotId,
 ) -> Result<RustSelectedUnitsPublication> {
     check(c, s)?;
-    let rows = c
-        .prepare_cached(
-            r#"SELECT cv.crate_key,
- (SELECT ctx.broad_complete FROM main.rust_crate_topologies t
-  JOIN main.rust_resolution_unit_summary_versions rv ON rv.topology_id=t.topology_id AND rv.workspace_id=cv.workspace_id AND rv.generation=cv.generation AND rv.unit_key=cv.crate_key
-  JOIN main.resolution_unit_summary_versions v ON v.summary_id=rv.summary_id AND v.workspace_id=rv.workspace_id AND v.lang=rv.lang AND v.generation=rv.generation AND v.unit_key=rv.unit_key AND v.valid_from=rv.valid_from
-  JOIN main.rust_resolution_unit_summary_contexts ctx ON ctx.summary_id=v.summary_id
-  WHERE v.valid_from<=sel.revision AND (v.valid_until IS NULL OR sel.revision<v.valid_until) AND t.topology_id=cv.topology_id AND t.publication_state='complete'
-    AND t.producer_epoch=(SELECT epoch FROM main.analysis_epochs WHERE lang='rust')),
- EXISTS(
-  SELECT 1 FROM main.resolution_unit_summary_versions v
-  JOIN main.resolution_unit_summaries x ON x.summary_id=v.summary_id
-  JOIN main.resolution_producer_epochs e ON e.lang=v.lang AND e.producer_epoch=x.producer_epoch
-  JOIN main.rust_resolution_unit_summary_versions rv ON rv.workspace_id=v.workspace_id
-   AND rv.lang=v.lang AND rv.generation=v.generation AND rv.unit_key=v.unit_key
-   AND rv.valid_from=v.valid_from AND rv.summary_id=v.summary_id
-   AND rv.topology_id=cv.topology_id
-  WHERE v.workspace_id=cv.workspace_id AND v.lang=cv.lang AND v.generation=cv.generation
-   AND v.unit_key=cv.crate_key AND v.valid_from<=sel.revision
-   AND (v.valid_until IS NULL OR sel.revision<v.valid_until)
-   AND x.lang='rust' AND x.unit_kind='rust_crate' AND x.publication_state='complete'
-   AND x.derivation_identity=?2)
- FROM temp.selected_workspace_revisions sel
- JOIN main.rust_crate_versions cv ON cv.workspace_id=sel.workspace_id AND cv.lang=sel.lang
-  AND cv.generation=sel.generation AND cv.valid_from<=sel.revision
-  AND (cv.valid_until IS NULL OR sel.revision<cv.valid_until)
- WHERE sel.lang='rust' AND sel.workspace_id=?1"#,
-        )?
-        .query_map(
-            params![
-                s.workspace_id.as_str(),
-                rust_unit_summary_derivation_identity()
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    r.get::<_, Option<bool>>(1)?,
-                    r.get::<_, bool>(2)?,
-                ))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut partial = Vec::new();
     let mut unpublished = Vec::new();
-    for (unit, inventory, published) in rows {
-        let unit = key(unit)?;
-        if !published || inventory.is_none() {
-            unpublished.push(unit);
-        } else if inventory == Some(false) {
-            partial.push(unit);
+    for (unit, state) in super::availability::rust_published_units_availability(c, s)? {
+        match state {
+            super::RustUnitAvailability::Published { complete, .. } => {
+                if !complete {
+                    partial.push(unit)
+                }
+            }
+            // A stale row is not current, so membership is unknown exactly as for
+            // an unpublished one; the upgrade window before reconcile is normal.
+            super::RustUnitAvailability::Unpublished | super::RustUnitAvailability::Stale => {
+                unpublished.push(unit)
+            }
+            super::RustUnitAvailability::IntentionallyUnavailable { .. } => {
+                unreachable!("ordinary publication query only")
+            }
         }
     }
     unpublished.sort_unstable();
@@ -455,16 +489,32 @@ pub fn rust_file_units(
     s: &WorkspaceSnapshotId,
     path: &str,
 ) -> Result<Vec<[u8; 32]>> {
+    Ok(rust_files_units(c, s, &[path.to_owned()])?
+        .into_iter()
+        .map(|(unit, _)| unit)
+        .collect())
+}
+
+/// The same selected membership seek for a set of paths, retaining the path
+/// so availability can distinguish healthy owners from unowned package files.
+pub(super) fn rust_files_units(
+    c: &Connection,
+    s: &WorkspaceSnapshotId,
+    paths: &[String],
+) -> Result<Vec<([u8; 32], String)>> {
     check(c, s)?;
     let sql = route_sql(RouteQuestion::FileUnits);
+    let paths = serde_json::to_string(paths).expect("paths serialize");
     let rows = c
         .prepare_cached(&sql)?
         .query_map(
-            params![rust_unit_summary_derivation_identity(), path],
-            |r| r.get::<_, Vec<u8>>(0),
+            params![rust_unit_summary_derivation_identity(), paths],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(key).collect()
+    rows.into_iter()
+        .map(|(k, path)| Ok((key(k)?, path)))
+        .collect()
 }
 
 /// Whether the selection holds Rust state the persisted units never saw: an
@@ -713,6 +763,21 @@ pub fn rust_unit_package_rows(
     unit: &[u8; 32],
 ) -> Result<Option<(Vec<super::RustSummaryPackageRow>, bool)>> {
     check(c, s)?;
+    match super::rust_unit_availability(c, s, unit)? {
+        Some(super::RustUnitAvailability::IntentionallyUnavailable { .. }) => {
+            return Ok(Some((Vec::new(), false)));
+        }
+        // A stale unit may be an unavailable target with no summary row, which
+        // the query below would answer as not live, so this point read fails.
+        // Stale is the normal upgrade window, not a store fault.
+        Some(super::RustUnitAvailability::Stale) => {
+            return Err(StoreError::new(format!(
+                "stale selected Rust unit {unit:02x?}: derivation or reconcile pending"
+            )));
+        }
+        Some(state) => state.require_published_or_stale(unit)?,
+        None => return Ok(None),
+    }
     let sql = format!(
         // The topology join is the reconcile-currency guard, kept until #11173 M4:
         // a summary whose topology is unpublished or from an old producer epoch

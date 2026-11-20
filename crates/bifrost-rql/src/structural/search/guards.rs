@@ -8,13 +8,12 @@
 //! ids the `program_point` and `control_edge` rows publish, so a policy relates
 //! "the guard on this branch" to "the edge it makes infeasible" by id equality.
 //!
-//! Nothing is derived here. Unlike the control-relation family, which runs five
-//! algorithms per procedure, a guard row is a row of the frozen artifact: the
-//! lowerer already made the decision, and this module makes it addressable. The
-//! consequence is that a guard needs no budget, no completeness account of its
-//! own, and no memo -- its proof and completeness are the IR evidence row's,
-//! and its absence is answered by the adapter's `guard_facts` capability rather
-//! than by a diagnostic.
+//! Guard rows project frozen artifact facts without changing their evidence.
+//! Separately, decision coverage checks every ordinary outgoing control edge
+//! against the guards at its point, and reports missing conditions or relevant
+//! lowering gaps. Switch facts do not cover guards: query `switch_coverage` for
+//! their arm evidence. An empty answer proves absence only with this coverage
+//! and supported guard facts.
 
 use super::results::{CodeQueryGuard, CodeQueryResultRef, DetailedCodeQueryKey};
 use super::semantic::SemanticProcedureValue;
@@ -59,7 +58,11 @@ pub(super) struct GuardKey {
 }
 
 /// Every guard of one procedure, in the dense order the lowerer minted them.
-pub(super) fn guards_of_procedure(procedure: &SemanticProcedureValue) -> Vec<GuardValue> {
+pub(super) fn guards_of_procedure(
+    procedure: &SemanticProcedureValue,
+    diagnostics: &mut Vec<super::CodeQueryDiagnostic>,
+) -> Vec<GuardValue> {
+    report_decision_coverage(procedure, diagnostics);
     procedure
         .handle
         .semantics()
@@ -70,6 +73,146 @@ pub(super) fn guards_of_procedure(procedure: &SemanticProcedureValue) -> Vec<Gua
             guard: fact.id,
         })
         .collect()
+}
+
+/// Coverage concerns edge identities, including distinct edges to the same target.
+fn report_decision_coverage(
+    procedure: &SemanticProcedureValue,
+    diagnostics: &mut Vec<super::CodeQueryDiagnostic>,
+) {
+    use super::{CodeQueryDiagnosticCode, Incompleteness};
+    use crate::analyzer::semantic::{
+        CapabilitySupport, ControlEdgeId, ControlEdgeKind, SemanticCapability,
+    };
+    use std::collections::{BTreeMap, HashSet};
+
+    let facts = procedure.handle.semantics();
+    let path = super::rel_path_string(procedure.file());
+    // Partial support is localized by the procedure's gaps below, as in the
+    // flow-state relations; unsupported support leaves no decision to check.
+    let capabilities = procedure.handle.artifact().capabilities();
+    let unsupported: Vec<_> = [
+        SemanticCapability::GuardFacts,
+        SemanticCapability::NormalControlFlow,
+    ]
+    .into_iter()
+    .filter(|capability| capabilities.support(*capability) == CapabilitySupport::Unsupported)
+    .map(SemanticCapability::label)
+    .collect();
+    let (code, message) = if !unsupported.is_empty() {
+        (
+            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+            format!("{path}: semantic capabilities {unsupported:?} are unsupported"),
+        )
+    } else {
+        let covered: HashSet<_> = facts
+            .guard_facts()
+            .iter()
+            .flat_map(|guard| {
+                [guard.true_edge, guard.false_edge]
+                    .into_iter()
+                    .flatten()
+                    .map(move |edge| (guard.point, edge))
+            })
+            .collect();
+        let switch_edges: HashSet<_> = facts
+            .switch_facts()
+            .iter()
+            .flat_map(|switch| {
+                switch
+                    .cases
+                    .iter()
+                    .map(|case| case.edge)
+                    .chain(switch.default_edge)
+            })
+            .collect();
+        let mut outgoing = BTreeMap::<_, Vec<_>>::new();
+        for (index, edge) in facts.control_edges().iter().enumerate() {
+            if matches!(
+                edge.kind,
+                ControlEdgeKind::Normal
+                    | ControlEdgeKind::ConditionalTrue
+                    | ControlEdgeKind::ConditionalFalse
+                    | ControlEdgeKind::SwitchCase
+                    | ControlEdgeKind::LoopBack
+            ) {
+                outgoing.entry(edge.source_point).or_default().push((
+                    ControlEdgeId::new(u32::try_from(index).expect("validated edge id fits u32")),
+                    edge.kind,
+                ));
+            }
+        }
+        let mut uncovered = Vec::new();
+        for (point, edges) in outgoing {
+            if edges.len() < 2
+                || edges
+                    .iter()
+                    .all(|(edge, _)| covered.contains(&(point, *edge)))
+            {
+                continue;
+            }
+            let location = procedure
+                .point_value(point)
+                .expect("validated edge owns its source point")
+                .point_ref();
+            let kinds: Vec<_> = edges.iter().map(|(_, kind)| *kind).collect();
+            let switch_note = if edges.iter().any(|(edge, _)| switch_edges.contains(edge)) {
+                "; SwitchFact owns retained edges; see switch_coverage"
+            } else {
+                ""
+            };
+            uncovered.push(format!(
+                "{path}:{} retained edges {kinds:?}{switch_note}",
+                location.range.start_line
+            ));
+        }
+        let gaps: Vec<_> = facts
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                matches!(
+                    gap.capability,
+                    SemanticCapability::GuardFacts | SemanticCapability::NormalControlFlow
+                )
+            })
+            .collect();
+        if uncovered.is_empty() && gaps.is_empty() {
+            return;
+        }
+        let items: Vec<&dyn std::fmt::Debug> = uncovered
+            .iter()
+            .map(|decision| decision as &dyn std::fmt::Debug)
+            .chain(gaps.iter().map(|gap| gap as &dyn std::fmt::Debug))
+            .collect();
+        (
+            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "{path}: guards_of has uncovered decisions {uncovered:?}; relevant gaps: {gaps:?}"
+                ),
+                format_args!("{path}: guards_of has uncovered decisions or relevant gaps"),
+                items,
+            ),
+        )
+    };
+    let mut diagnostic = super::incomplete_diagnostic(
+        code,
+        Incompleteness::Content,
+        crate::analyzer::common::language_for_file(procedure.file()).config_label(),
+        message,
+        Vec::new(),
+    );
+    let span = procedure.byte_span();
+    diagnostic.source = Some(super::CodeQuerySourceSpan {
+        path: path.clone(),
+        range: procedure.public().range,
+        start_byte: span.start,
+        end_byte: span.end,
+    });
+    diagnostic.withheld_rows_path = Some(path);
+    if !diagnostics.iter().any(|existing| existing == &diagnostic) {
+        diagnostics.push(diagnostic);
+    }
 }
 
 /// Domain separator for the row family's stable ids.
@@ -222,9 +365,38 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
             None,
             Some(digest.get()),
         ),
+        GuardPredicate::ValueEquality { negated, .. } => (
+            None,
+            None,
+            Some(negated),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        GuardPredicate::ValueOrdering { relation, .. } => (
+            None,
+            None,
+            None,
+            Some(relation.label()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
         GuardPredicate::ConstantBoolean { .. } => {
             (None, None, None, None, None, None, None, None, None)
         }
+    };
+    let (left_value, right_value) = match fact.predicate {
+        GuardPredicate::ValueEquality { left, right, .. }
+        | GuardPredicate::ValueOrdering { left, right, .. } => {
+            (Some(u64::from(left.get())), Some(u64::from(right.get())))
+        }
+        _ => (None, None),
     };
     CodeQueryGuard {
         id: digest.finish().to_string(),
@@ -240,6 +412,8 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         equality_negated,
         integer_relation,
         constant_value,
+        left_value,
+        right_value,
         guarded_value,
         classes_value,
         member_value,
@@ -329,12 +503,22 @@ mod tests {
                     "method_invocation",
                 ),
             },
+            GuardPredicate::ValueEquality {
+                left: crate::analyzer::semantic::ValueId::new(0),
+                right: crate::analyzer::semantic::ValueId::new(1),
+                negated: false,
+            },
+            GuardPredicate::ValueOrdering {
+                left: crate::analyzer::semantic::ValueId::new(0),
+                right: crate::analyzer::semantic::ValueId::new(1),
+                relation: crate::analyzer::semantic::IntegerComparison::LessThan,
+            },
         ] {
             assert!(
                 GuardPredicate::LABELS.contains(&predicate.label()),
                 "{predicate:?}"
             );
         }
-        assert_eq!(GuardPredicate::LABELS.len(), 11);
+        assert_eq!(GuardPredicate::LABELS.len(), 13);
     }
 }

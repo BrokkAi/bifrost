@@ -357,6 +357,10 @@ other! { }
     #[hardwon(
         "#3737: source-fact validation moved out of seal triggers while sealed module rows stayed immutable"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_module_facts_are_immutable_after_seal() {
         let (store, oid, _) = published_module_fixture();
         let conn = store.read_conn().unwrap();
@@ -486,13 +490,13 @@ other! { }
             .name
             .clear();
         assert!(
-            store
-                .write_parsed_blob(
-                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter::for_tests(),
-                    &invalid
-                )
-                .is_err(),
+            crate::engine_tests::repair_parsed_source(
+                &store,
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+                &RustAdapter::for_tests(),
+                &invalid
+            )
+            .is_err(),
             "invalid replacement must fail at the canonical module CHECK"
         );
 
@@ -519,6 +523,10 @@ other! { }
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn raw_qualified_and_error_modules_reopen_with_exact_embedded_source_ids() {
         use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
 

@@ -14,12 +14,194 @@ use crate::analyzer::read_ledger::{
 };
 use brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal;
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static REFUSE_SELECTED_RECEIVER_PROOF_CAPTURE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFUSE_OWNER_APPLICATION_PROOF_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OWNER_APPLICATION_PROOF_REPLAY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Make the next real selected receiver-proof capture refuse reuse through
+/// the analyzer's ordinary refusal channel. The proof read still runs inside
+/// the actual captured ledger, which is then forwarded normally.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_selected_receiver_proof_capture_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    with_unpublishable_selected_receiver_proof_capture_after_for_test(0, run)
+}
+
+/// Refuse a selected receiver-proof capture after `successful_captures` real
+/// captures have completed. This lets a composite proof keep its nested
+/// owner receipt while refusing the enclosing Base capture.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_selected_receiver_proof_capture_after_for_test<T>(
+    successful_captures: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_SELECTED_RECEIVER_PROOF_CAPTURE_AFTER.with(|flag| flag.set(self.0));
+        }
+    }
+
+    let previous = REFUSE_SELECTED_RECEIVER_PROOF_CAPTURE_AFTER
+        .with(|flag| flag.replace(Some(successful_captures)));
+    let _restore = Restore(previous);
+    run()
+}
+
+/// Refuse the real current-instance transfer capture, if the normal query
+/// reaches one, and return the number of matching captures refused.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_current_instance_receiver_proof_capture_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Restore(bool, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE.with(|flag| flag.set(self.0));
+            CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE_HITS.with(|hits| hits.set(self.1));
+        }
+    }
+
+    let previous = REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE.with(|flag| flag.replace(true));
+    let previous_hits = CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE_HITS.with(|hits| hits.replace(0));
+    let _restore = Restore(previous, previous_hits);
+    let result = run();
+    let hits = CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE_HITS.with(std::cell::Cell::get);
+    (result, hits)
+}
+
+/// Refuse a stored selected-read receipt only after a real current-instance
+/// memo replay begins; the normal replay still forwards every ledger channel.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_current_instance_receiver_proof_replay_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Restore(bool, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY.with(|flag| flag.set(self.0));
+            CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY_HITS.with(|hits| hits.set(self.1));
+        }
+    }
+
+    let previous = REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY.with(|flag| flag.replace(true));
+    let previous_hits = CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY_HITS.with(|hits| hits.replace(0));
+    let _restore = Restore(previous, previous_hits);
+    let result = run();
+    let hits = CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY_HITS.with(std::cell::Cell::get);
+    (result, hits)
+}
+
+/// Refuse only a real owner-application memo replay through the normal ledger.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_unpublishable_owner_application_proof_replay_for_test<T>(
+    run: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Restore(bool, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_OWNER_APPLICATION_PROOF_REPLAY.with(|flag| flag.set(self.0));
+            OWNER_APPLICATION_PROOF_REPLAY_HITS.with(|hits| hits.set(self.1));
+        }
+    }
+    let previous = REFUSE_OWNER_APPLICATION_PROOF_REPLAY.with(|flag| flag.replace(true));
+    let previous_hits = OWNER_APPLICATION_PROOF_REPLAY_HITS.with(|hits| hits.replace(0));
+    let _restore = Restore(previous, previous_hits);
+    let result = run();
+    (
+        result,
+        OWNER_APPLICATION_PROOF_REPLAY_HITS.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn is_current_instance_receiver_proof_ledger(ledger: &super::read_ledger::ReadLedger) -> bool {
+    ledger.keys().iter().any(|key| {
+        matches!(
+            key,
+            ReadKey::Lookup {
+                kind: LookupKind::SelectedReceiverProof,
+                question: LookupQuestion::SelectedReceiverProof(
+                    super::semantic::read_ledger::SelectedReceiverProofQuestion::CurrentInstanceTransfer { .. }
+                ),
+                ..
+            }
+        )
+    })
+}
+
 #[doc(hidden)]
 pub struct AnalyzerSelectedServices<'a>(pub &'a dyn IAnalyzer);
+
+// Keep this exhaustive: a new receipt kind needs an explicit currency proof
+// before a retained frontier can replay it without reading its inputs again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroFrontierCoverage {
+    MainStore,
+    ModelSet,
+    Uncovered,
+}
+
+fn macro_frontier_coverage(key: &ReadKey) -> MacroFrontierCoverage {
+    match key {
+        // Selected mounts change fingerprint/routing/generation on content or overlay changes.
+        ReadKey::File {
+            language: _,
+            rel_path: _,
+            blob: _,
+            parse_variant: _,
+        } => MacroFrontierCoverage::MainStore,
+        // An in-memory index may read inputs outside the selected main database.
+        ReadKey::Index { family: _, key: _ } => MacroFrontierCoverage::Uncovered,
+        // Disk absence can change without a main publication or selected mount change.
+        ReadKey::PathAbsent {
+            language: _,
+            rel_path: _,
+        } => MacroFrontierCoverage::Uncovered,
+        // Derived/external lookup sources have no established main-store currency proof.
+        ReadKey::Lookup {
+            kind: _,
+            question: _,
+            digest: _,
+        } => MacroFrontierCoverage::Uncovered,
+        // An artifact can depend on external or attached inputs, not just selected rows.
+        ReadKey::Artifact { id: _, rel_path: _ } => MacroFrontierCoverage::Uncovered,
+        // Workspace scope can include non-selected or external state.
+        ReadKey::Scope {
+            languages: _,
+            identity: _,
+        } => MacroFrontierCoverage::Uncovered,
+        // The optional authority hash is stored and compared at adoption.
+        ReadKey::Models(_) => MacroFrontierCoverage::ModelSet,
+        // Policy text is not part of selected mount authority.
+        ReadKey::Policy {
+            semantic_hash: _,
+            source: _,
+        } => MacroFrontierCoverage::Uncovered,
+        // Analyzer configuration has no independent frontier adoption check.
+        ReadKey::Configuration(_) => MacroFrontierCoverage::Uncovered,
+        // Engine epochs have no independent frontier adoption check.
+        ReadKey::Epoch(_) => MacroFrontierCoverage::Uncovered,
+    }
+}
 
 // Owned keys prevent a caller's replay ledger from keeping evicted receipt backing alive.
 struct MacroFrontReceipt {
     keys: Vec<super::read_ledger::ReadKey>,
+    active_model_set_hash: Option<String>,
     channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
     first_refusal: Option<brokk_bifrost_core::profiling::ReadRefusal>,
     first_execution_refusal: Option<brokk_bifrost_core::profiling::ReadRefusal>,
@@ -29,6 +211,7 @@ struct MacroFrontReceipt {
 impl SelectedMacroFrontierReads for &dyn IAnalyzer {
     fn capture(
         &self,
+        active_model_set_hash: Option<&str>,
         prepare: &mut dyn FnMut() -> super::store::Result<SelectedResolutionStageOutcome>,
     ) -> (
         super::store::Result<SelectedResolutionStageOutcome>,
@@ -39,6 +222,7 @@ impl SelectedMacroFrontierReads for &dyn IAnalyzer {
             outcome,
             Box::new(MacroFrontReceipt {
                 keys: reads.unordered_keys(),
+                active_model_set_hash: active_model_set_hash.map(str::to_owned),
                 channels: reads.channels(),
                 first_refusal: reads.first_refusal(),
                 first_execution_refusal: reads.first_execution_refusal(),
@@ -73,6 +257,8 @@ impl SelectedMacroFrontierReads for &dyn IAnalyzer {
             .expect("macro frontier receipt belongs to the analyzer read ledger");
         std::mem::size_of_val(receipt) + receipt.keys.retained_bytes()
             - std::mem::size_of_val(&receipt.keys)
+            + receipt.active_model_set_hash.retained_bytes()
+            - std::mem::size_of_val(&receipt.active_model_set_hash)
             + receipt
                 .first_refusal
                 .as_ref()
@@ -83,11 +269,25 @@ impl SelectedMacroFrontierReads for &dyn IAnalyzer {
                 .map_or(0, |r| r.reason.capacity())
     }
 
-    fn receipt_is_reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool {
+    fn receipt_is_reusable(
+        &self,
+        receipt: &(dyn std::any::Any + Send + Sync),
+        active_model_set_hash: Option<&str>,
+    ) -> bool {
         let receipt = receipt
             .downcast_ref::<MacroFrontReceipt>()
             .expect("macro frontier receipt belongs to the analyzer read ledger");
-        receipt.channels.explicit_verdict.is_content()
+        receipt.active_model_set_hash.as_deref() == active_model_set_hash
+            && receipt
+                .keys
+                .iter()
+                .all(|key| match macro_frontier_coverage(key) {
+                    MacroFrontierCoverage::MainStore => true,
+                    MacroFrontierCoverage::ModelSet => matches!(key, ReadKey::Models(hash)
+                    if *hash == super::i_analyzer::current_model_set_digest(active_model_set_hash)),
+                    MacroFrontierCoverage::Uncovered => false,
+                })
+            && receipt.channels.explicit_verdict.is_content()
             && receipt.channels.budget_dependences == 0
             && receipt.channels.execution_dependences == 0
             && receipt.channels.unattributed_reads == 0
@@ -116,6 +316,13 @@ impl ReadReuseRefusal for AnalyzerSelectedServices<'_> {
 }
 
 impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
+    fn certify_selected_source_file(
+        &self,
+        expected: &super::store::resolution_operation::SelectedSourceFileCertificate<'_>,
+    ) -> bool {
+        self.0.certify_selected_source_file(expected)
+    }
+
     fn selected_read_recorder(
         &self,
     ) -> Option<super::store::selected_read::SelectedReadRecorder<'_>> {
@@ -148,6 +355,9 @@ impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
             SelectedDependency::Scope { languages } => self
                 .0
                 .record_read(self.0.workspace_scope_read_key(languages)),
+            SelectedDependency::WorkspaceFactDigest { question, digest } => self.0.record_read(
+                ReadKey::lookup(LookupKind::WorkspaceFact, (**question).clone(), *digest),
+            ),
             SelectedDependency::WorkspaceFact {
                 family,
                 question: _,
@@ -228,6 +438,106 @@ impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
         )
     }
 
+    fn record_selected_signature_metadata(
+        &self,
+        declaration: &CodeUnit,
+        metadata: Option<&[brokk_bifrost_core::analyzer::model::SignatureMetadata]>,
+    ) {
+        let digest = metadata.map_or_else(
+            super::read_ledger::absent_signature_metadata_digest,
+            |metadata| super::read_ledger::signature_metadata_digest(declaration, metadata),
+        );
+        self.0.record_read(ReadKey::lookup(
+            LookupKind::SignatureMetadata,
+            LookupQuestion::declaration(declaration),
+            digest,
+        ));
+    }
+
+    fn record_selected_receiver_proof(
+        &self,
+        question: &super::semantic::read_ledger::SelectedReceiverProofQuestion,
+        answer: &super::semantic::read_ledger::SelectedReceiverProofAnswer,
+    ) {
+        self.0.record_read(ReadKey::lookup(
+            LookupKind::SelectedReceiverProof,
+            LookupQuestion::SelectedReceiverProof(question.clone()),
+            answer.canonical_digest(),
+        ));
+    }
+
+    fn capture_selected_receiver_proof(
+        &self,
+        read: &mut dyn FnMut() -> super::store::Result<()>,
+    ) -> (
+        super::store::Result<()>,
+        Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) {
+        let (outcome, reads) = super::i_analyzer::capture_query_reads(self.0, || {
+            let outcome = read();
+            #[cfg(any(test, feature = "test-support"))]
+            if REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE.with(std::cell::Cell::get)
+                && self
+                    .0
+                    .current_thread_read_ledger()
+                    .is_some_and(|ledger| is_current_instance_receiver_proof_ledger(&ledger))
+            {
+                CURRENT_INSTANCE_RECEIVER_PROOF_CAPTURE_HITS.with(|hits| hits.set(hits.get() + 1));
+                self.refuse_read_reuse();
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if REFUSE_SELECTED_RECEIVER_PROOF_CAPTURE_AFTER.with(|flag| match flag.get() {
+                Some(0) => {
+                    flag.set(None);
+                    true
+                }
+                Some(remaining) => {
+                    flag.set(Some(remaining - 1));
+                    false
+                }
+                None => false,
+            }) {
+                self.refuse_read_reuse();
+            }
+            outcome
+        });
+        let receipt = reads
+            .publishable_keys()
+            .is_some()
+            .then(|| Arc::new(reads) as Arc<dyn std::any::Any + Send + Sync>);
+        (outcome, receipt)
+    }
+
+    fn replay_selected_receiver_proof(
+        &self,
+        receipt: &(dyn std::any::Any + Send + Sync),
+    ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        let reads = receipt
+            .downcast_ref::<Arc<super::read_ledger::ReadLedger>>()
+            .expect("receiver proof receipt belongs to the analyzer read ledger");
+        #[cfg(any(test, feature = "test-support"))]
+        if REFUSE_CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY.with(std::cell::Cell::get)
+            && is_current_instance_receiver_proof_ledger(reads)
+        {
+            CURRENT_INSTANCE_RECEIVER_PROOF_REPLAY_HITS.with(|hits| hits.set(hits.get() + 1));
+            reads.refuse_read_reuse();
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if REFUSE_OWNER_APPLICATION_PROOF_REPLAY.with(std::cell::Cell::get)
+            && reads.keys().iter().any(|key| matches!(key, ReadKey::Lookup {
+                kind: LookupKind::SelectedReceiverProof,
+                question: LookupQuestion::SelectedReceiverProof(super::semantic::read_ledger::SelectedReceiverProofQuestion::OwnerApplication { .. }), ..
+            })) {
+            OWNER_APPLICATION_PROOF_REPLAY_HITS.with(|hits| hits.set(hits.get() + 1));
+            reads.refuse_read_reuse();
+        }
+        super::i_analyzer::replay_query_reads(self.0, reads);
+        reads
+            .publishable_keys()
+            .is_some()
+            .then(|| Arc::clone(reads) as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
     fn declarations_named(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
         self.0.declarations_named(file, name)
     }
@@ -284,8 +594,16 @@ impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
         selected
     }
 
-    fn external_inventory_providers(&self) -> Vec<String> {
-        super::languages::selected_external_inventory_providers(self.0)
+    fn external_inventory_providers(&self, models: &ResolvedActiveSemanticModels) -> Vec<String> {
+        // Publish request-owned inventory before the retained index is checked.
+        if let Some(open) = models.gate_inventory_providers(&mut Vec::new()) {
+            self.record_model_family_open(open);
+        }
+        let mut providers = super::languages::selected_external_inventory_providers(self.0, models);
+        if let Some(open) = models.gate_inventory_providers(&mut providers) {
+            self.record_model_family_open(open);
+        }
+        providers
     }
 
     fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>> {
@@ -299,6 +617,17 @@ impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
             .semantic_model_overlay_read()
             .published()
             .map(|overlay| overlay as Arc<dyn SelectedModelAuthority + Send + Sync>)
+    }
+
+    fn record_model_family_open(&self, open: crate::analyzer::semantic_model::runtime::FamilyOpen) {
+        let reason = if open.is_cancellation() {
+            crate::analyzer::QueryReadIncomplete::Cancelled
+        } else {
+            crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                format!("semantic-model lookup is open: {}", open.reason).into(),
+            )
+        };
+        self.0.record_query_incomplete(reason);
     }
 
     fn record_source_read(&self, file: &ProjectFile) {
@@ -454,6 +783,27 @@ mod tests {
         }
     }
 
+    /// A language without a wrapper-supplied extension hashes nothing beyond
+    /// its own content identity (#13307).
+    #[test]
+    fn a_language_without_an_identity_extension_keeps_its_content_identity() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().canonicalize().expect("absolute workspace root");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Python]);
+        let analyzer = TreeSitterAnalyzer::new(project, EmptyPythonAdapter);
+        assert_eq!(
+            crate::analyzer::IAnalyzer::workspace_content_identities(&analyzer),
+            Some(
+                crate::analyzer::content_identity::WorkspaceContentIdentities::new([(
+                    Language::Python,
+                    analyzer.language_content_identity_with_omissions(),
+                )])
+            )
+        );
+    }
+
     #[test]
     #[hardwon("#9575: selected reuse refusal was discarded by nested read abstraction")]
     fn selected_service_refusal_survives_nested_shadowing_and_replay() {
@@ -482,6 +832,68 @@ mod tests {
         crate::analyzer::i_analyzer::replay_query_reads(&analyzer, &outer);
         assert!(replayed.reuse_refused());
         assert!(!replayed.is_bounded());
+    }
+
+    #[test]
+    fn selected_receiver_proof_receipts_require_publishable_read_ledgers() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().canonicalize().expect("absolute workspace root");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Python]);
+        let analyzer = TreeSitterAnalyzer::new(project, EmptyPythonAdapter);
+        let bridge = AnalyzerSelectedServices(&analyzer);
+        let service: &dyn SelectedAnalyzerServices = &bridge;
+
+        let (outcome, publishable) = service.capture_selected_receiver_proof(&mut || Ok(()));
+        assert!(outcome.is_ok());
+        let publishable = publishable.expect("empty bounded capture is publishable");
+        let consumer = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+        {
+            let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&consumer));
+            assert!(
+                service
+                    .replay_selected_receiver_proof(publishable.as_ref())
+                    .is_some()
+            );
+        }
+        assert!(consumer.is_bounded());
+
+        let (outcome, unattributed) = service.capture_selected_receiver_proof(&mut || {
+            analyzer.record_unattributed_read();
+            Ok(())
+        });
+        assert!(outcome.is_ok());
+        assert!(unattributed.is_none());
+
+        let (outcome, execution_dependent) = service.capture_selected_receiver_proof(&mut || {
+            analyzer.mark_execution_dependent();
+            Ok(())
+        });
+        assert!(outcome.is_ok());
+        assert!(execution_dependent.is_none());
+
+        let (outcome, refused) = service.capture_selected_receiver_proof(&mut || {
+            service.refuse_read_reuse();
+            Ok(())
+        });
+        assert!(outcome.is_ok());
+        assert!(refused.is_none());
+
+        let unpublishable = crate::analyzer::read_ledger::ReadLedger::new();
+        unpublishable.record_unattributed();
+        let unpublishable: Arc<dyn std::any::Any + Send + Sync> = Arc::new(Arc::new(unpublishable));
+        let consumer = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+        {
+            let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&consumer));
+            assert!(
+                service
+                    .replay_selected_receiver_proof(unpublishable.as_ref())
+                    .is_none()
+            );
+        }
+        assert_eq!(consumer.unattributed_reads(), 1);
+        assert!(!consumer.is_bounded());
     }
 
     #[test]

@@ -90,7 +90,6 @@ pub(crate) fn canonical_relative_glob(
 
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
-pub(crate) const COLD_WORKSPACE_REQUEST_BUDGET: Duration = Duration::from_millis(4_500);
 /// The budget every interactive request gets when no operator configured one.
 ///
 /// Without it a request that waits out cold initialization (#3279: a
@@ -194,15 +193,11 @@ impl RequestBudget {
     /// The bound on a request accepted at `accepted_at`: the operator's
     /// configured `BIFROST_MCP_REQUEST_BUDGET_SECS`, or the fallback rung for
     /// the tool and workspace state. `None` means the request is unbounded.
-    pub(crate) fn resolve(
-        tool_name: &str,
-        cold_workspace: bool,
-        accepted_at: Instant,
-    ) -> Option<Self> {
+    pub(crate) fn resolve(tool_name: &str, accepted_at: Instant) -> Option<Self> {
         // Validated at startup, so a value that fails to parse here cannot occur.
         let configured = mcp_analyzer_request_budget()
             .expect("BIFROST_MCP_REQUEST_BUDGET_SECS was validated at server startup");
-        Self::with_configured(configured, tool_name, cold_workspace, accepted_at)
+        Self::with_configured(configured, tool_name, accepted_at)
     }
 
     /// [`Self::resolve`] with the configured knob supplied by the caller, so
@@ -210,11 +205,10 @@ impl RequestBudget {
     pub(crate) fn with_configured(
         configured_budget: Option<Duration>,
         tool_name: &str,
-        cold_workspace: bool,
         accepted_at: Instant,
     ) -> Option<Self> {
         configured_budget
-            .or_else(|| fallback_request_budget(tool_name, cold_workspace))
+            .or_else(|| fallback_request_budget(tool_name))
             .map(|budget| Self {
                 budget,
                 deadline: accepted_at + budget,
@@ -248,22 +242,14 @@ impl RequestBudget {
 ///   already serialized by the workspace lock, and cutting a mutation
 ///   mid-flight on a timer nobody asked for trades a rare slow call for a
 ///   broken one.
-/// * A cold workspace fails non-discovery tools fast (4.5 s) with a typed,
-///   retryable not-ready error instead of billing them the whole interactive
-///   budget for a wait they cannot shorten.
-/// * Everything else -- `search_symbols` on a cold workspace included, and
-///   every read on a warm one -- gets the default interactive budget. That
-///   is the #3279 fix: discovery used to wait out cold initialization with
-///   no deadline at all, and warm reads had no deadline either.
-pub(crate) fn fallback_request_budget(tool_name: &str, cold_workspace: bool) -> Option<Duration> {
+/// * All other analyzer calls get the normal interactive execution budget.
+///   Initial workspace preparation returns not-ready before admission.
+pub(crate) fn fallback_request_budget(tool_name: &str) -> Option<Duration> {
     if tool_name == "run_policy" {
         return Some(DEFAULT_POLICY_REQUEST_BUDGET);
     }
     if serial_tool_request(tool_name) {
         return None;
-    }
-    if cold_workspace && tool_name != "search_symbols" {
-        return Some(COLD_WORKSPACE_REQUEST_BUDGET);
     }
     Some(DEFAULT_INTERACTIVE_REQUEST_BUDGET)
 }
@@ -574,6 +560,7 @@ fn degrade_get_summaries_value(
                     code: SearchToolsServiceErrorCode::Internal,
                     message: "list_symbols returned non-structured output during MCP budgeting"
                         .to_string(),
+                    workspace_incomplete: None,
                     retryable_stale_generation: false,
                 });
             };
@@ -1079,6 +1066,7 @@ fn render_container_listings_json(structured: &Value, render_line_numbers: bool)
 
 fn rendered_text_for_output(output: &ToolOutput) -> Option<String> {
     match output {
+        ToolOutput::QueryResponse(response) => Some(response.render_text()),
         ToolOutput::Structured { rendered_text, .. } => rendered_text.clone(),
         ToolOutput::Text(text) => Some(text.clone()),
     }
@@ -1225,20 +1213,16 @@ mod shared_tests {
         let accepted_at = Instant::now();
         let configured_budget = Duration::from_secs(8);
 
-        for (tool_name, cold_workspace) in [
+        for (tool_name, _cold_workspace) in [
             ("get_summaries", true),
             ("search_symbols", true),
             ("search_symbols", false),
             ("run_policy", false),
             ("refresh", true),
         ] {
-            let configured = RequestBudget::with_configured(
-                Some(configured_budget),
-                tool_name,
-                cold_workspace,
-                accepted_at,
-            )
-            .unwrap_or_else(|| panic!("{tool_name} should honor a configured budget"));
+            let configured =
+                RequestBudget::with_configured(Some(configured_budget), tool_name, accepted_at)
+                    .unwrap_or_else(|| panic!("{tool_name} should honor a configured budget"));
             assert_eq!(configured.budget(), configured_budget);
             assert_eq!(configured.deadline(), accepted_at + configured_budget);
         }
@@ -1257,9 +1241,8 @@ mod shared_tests {
             ("scan_usages_by_reference", false),
             ("get_symbol_sources", false),
         ] {
-            let budget =
-                RequestBudget::with_configured(None, tool_name, cold_workspace, accepted_at)
-                    .unwrap_or_else(|| panic!("{tool_name} must be bounded by the default budget"));
+            let budget = RequestBudget::with_configured(None, tool_name, accepted_at)
+                .unwrap_or_else(|| panic!("{tool_name} must be bounded by the default budget"));
             assert_eq!(
                 budget.budget(),
                 DEFAULT_INTERACTIVE_REQUEST_BUDGET,
@@ -1268,28 +1251,6 @@ mod shared_tests {
             assert_eq!(
                 budget.deadline(),
                 accepted_at + DEFAULT_INTERACTIVE_REQUEST_BUDGET
-            );
-        }
-        let cold_non_discovery =
-            RequestBudget::with_configured(None, "scan_usages_by_location", true, accepted_at)
-                .expect("cold non-discovery reads stay bounded");
-        assert_eq!(
-            cold_non_discovery.deadline(),
-            accepted_at + COLD_WORKSPACE_REQUEST_BUDGET
-        );
-    }
-
-    #[test]
-    #[hardwon("#3279: cold non-discovery reads lost their fail-fast budget")]
-    fn cold_non_discovery_reads_keep_the_fail_fast_budget() {
-        let accepted_at = Instant::now();
-        for tool_name in ["get_summaries", "scan_usages_by_reference", "usage_graph"] {
-            let budget = RequestBudget::with_configured(None, tool_name, true, accepted_at)
-                .unwrap_or_else(|| panic!("{tool_name} must keep its cold fail-fast budget"));
-            assert_eq!(budget.budget(), COLD_WORKSPACE_REQUEST_BUDGET);
-            assert_eq!(
-                budget.deadline(),
-                accepted_at + COLD_WORKSPACE_REQUEST_BUDGET
             );
         }
     }
@@ -1305,7 +1266,7 @@ mod shared_tests {
             ("get_active_workspace", false),
         ] {
             assert_eq!(
-                RequestBudget::with_configured(None, tool_name, cold_workspace, accepted_at),
+                RequestBudget::with_configured(None, tool_name, accepted_at),
                 None,
                 "{tool_name} (cold={cold_workspace}) must stay unbounded without a configured budget"
             );
@@ -1320,11 +1281,10 @@ mod shared_tests {
     fn synchronous_policy_runs_get_the_policy_budget() {
         let accepted_at = Instant::now();
         for cold_workspace in [false, true] {
-            let budget =
-                RequestBudget::with_configured(None, "run_policy", cold_workspace, accepted_at)
-                    .unwrap_or_else(|| {
-                        panic!("run_policy (cold={cold_workspace}) must be bounded by default")
-                    });
+            let budget = RequestBudget::with_configured(None, "run_policy", accepted_at)
+                .unwrap_or_else(|| {
+                    panic!("run_policy (cold={cold_workspace}) must be bounded by default")
+                });
             assert_eq!(budget.budget(), DEFAULT_POLICY_REQUEST_BUDGET);
             assert_eq!(
                 budget.deadline(),
@@ -1339,7 +1299,6 @@ mod shared_tests {
         let configured = RequestBudget::with_configured(
             Some(Duration::from_secs(30)),
             "run_policy",
-            false,
             accepted_at,
         )
         .expect("a configured budget applies to run_policy");

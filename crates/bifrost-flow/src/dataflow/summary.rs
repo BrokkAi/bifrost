@@ -1,5 +1,6 @@
 //! Demand-driven in-memory summary tabulation.
 
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::analyzer::{IAnalyzer, ReadKey, ReadLedger, capture_query_reads};
 use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
 use std::cmp::Ordering;
@@ -7,11 +8,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::analyzer::semantic::{
-    CallBoundary, CallSiteHandle, CallTransfer, CallTransferSet, EvidenceCompleteness,
-    IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection, OracleCallContext,
-    OracleLimits, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudget, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticWork,
+    CallBoundary, CallSiteHandle, CallTransfer, CallTransferSet, ControlEdgeId,
+    EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection,
+    OracleCallContext, OracleLimits, ProcedureHandle, ProcedureIcfgBoundary, ProcedureIcfgEdge,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::ordering::{
@@ -835,9 +836,14 @@ struct SummaryState<'a, Fact> {
     /// active summary evidence.
     evidence_free_entries: HashSet<EntryKey>,
     caller_conversions: HashSet<CallSiteHandle>,
+    /// Calls whose transfers are the analyzed arms of a sealed family.
+    analyzed_family_calls: HashSet<CallSiteHandle>,
     call_cache: HashMap<(CallSiteHandle, usize), CachedCallOutcome>,
     exit_cache: HashMap<ExitCacheKey, CachedExitOutcome>,
     call_to_return_cache: HashMap<(CallSiteHandle, usize), Arc<[ProcedureIcfgEdge]>>,
+    /// The provider's infeasible local control edges of each procedure this
+    /// solve has entered, by index into `procedures`.
+    infeasible_edges: HashMap<usize, Arc<[ControlEdgeId]>>,
     matched_return_cache: HashMap<MatchedReturnCacheKey, Arc<CachedMatchedReturnProjection>>,
     member_read_analyzer: Option<&'a dyn IAnalyzer>,
     member_receipts: Option<HashMap<ProcedureHandle, MemberReadReceipt>>,
@@ -855,6 +861,9 @@ struct SummaryState<'a, Fact> {
     best_effort_witness_retention: bool,
     complete_reusable_evidence: bool,
     witness_retention_truncated: bool,
+    // Execution dependence of the solve's own limits, such as a refused
+    // best-effort witness retention limit.
+    reuse: ReuseVerdict,
 }
 
 impl<'a, Fact> SummaryState<'a, Fact>
@@ -921,9 +930,11 @@ where
             reusable_entries: HashSet::default(),
             evidence_free_entries: HashSet::default(),
             caller_conversions: HashSet::default(),
+            analyzed_family_calls: HashSet::default(),
             call_cache: HashMap::default(),
             exit_cache: HashMap::default(),
             call_to_return_cache: HashMap::default(),
+            infeasible_edges: HashMap::default(),
             matched_return_cache: HashMap::default(),
             member_read_analyzer,
             member_receipts: member_read_analyzer.map(|_| HashMap::default()),
@@ -941,6 +952,7 @@ where
             best_effort_witness_retention,
             complete_reusable_evidence: witness_retention.requires_complete_reusable_evidence(),
             witness_retention_truncated: false,
+            reuse: ReuseVerdict::Content,
         }
     }
 
@@ -1147,13 +1159,14 @@ where
                         );
                         staged_witnesses.push(Some(alternatives));
                     }
-                    WitnessAdmission::Exhausted if self.best_effort_witness_retention => {
+                    WitnessAdmission::Exhausted(refused) if self.best_effort_witness_retention => {
+                        self.reuse.join_in(refused.reuse_verdict());
                         witness_exhausted = true;
                         break;
                     }
                     WitnessAdmission::Duplicate
                     | WitnessAdmission::Truncated
-                    | WitnessAdmission::Exhausted => {
+                    | WitnessAdmission::Exhausted(_) => {
                         return Err(SummaryDataflowError::WitnessInvariant(
                             "new root seed did not retain witness evidence",
                         ));
@@ -1356,11 +1369,12 @@ where
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
                     WitnessAdmission::Retained(id) => queued_evidence = Some(id),
-                    WitnessAdmission::Exhausted if self.best_effort_witness_retention => {
+                    WitnessAdmission::Exhausted(refused) if self.best_effort_witness_retention => {
+                        self.reuse.join_in(refused.reuse_verdict());
                         witness_exhausted = true;
                     }
                     WitnessAdmission::Duplicate | WitnessAdmission::Truncated => {}
-                    WitnessAdmission::Exhausted => {
+                    WitnessAdmission::Exhausted(_) => {
                         return Err(SummaryDataflowError::WitnessInvariant(
                             "strict witness retention exhausted without a solver budget",
                         ));
@@ -1479,7 +1493,12 @@ where
         if !needs_coverage {
             return None;
         }
+        // An analyzed family arm is a may-target by construction; every arm is
+        // covered, so its selection-only proof is not a coverage gap (#11296).
         let retain_unproven = !matches!(row.proof(), ProofStatus::Proven)
+            && !row
+                .origin()
+                .is_some_and(|call| self.analyzed_family_calls.contains(call))
             && !self.unproven_edges.contains(row.as_ref());
         let retain_partial = !matches!(row.completeness(), EvidenceCompleteness::Complete)
             && !self.partial_edges.contains(row.as_ref());
@@ -1762,7 +1781,7 @@ where
                 return Ok(Some(termination));
             }
         } else if let Some(termination) =
-            self.process_local_edges(problem, &point, queued, None, request)?
+            self.process_local_edges(provider, problem, &point, queued, None, request)?
         {
             return Ok(Some(termination));
         }
@@ -1889,6 +1908,38 @@ where
         )? {
             Ok(outcome) => outcome,
             Err(termination) => return Ok(Some(termination)),
+        };
+        // A sealed family whose every arm this problem analyzes accounts for
+        // the dispatch's selection-only weakness (#11296). Budget-limited,
+        // cancelled, unknown and ambiguous outcomes never qualify.
+        // The solver keeps the analyzed arms in place of the raw answer, so
+        // call, observation and matched-return edges and later cache hits all
+        // read the same factored evidence.
+        let analyzed_family = match outcome.as_ref() {
+            SemanticOutcome::Complete { value, work }
+            | SemanticOutcome::Unproven {
+                partial: value,
+                work,
+            } if problem.closes_analyzed_dispatch_families() => {
+                value.family_closure(&origin).map(|closure| {
+                    Arc::new(SemanticOutcome::Complete {
+                        value: closure.analyzed_arms(),
+                        work: *work,
+                    })
+                })
+            }
+            _ => None,
+        };
+        let outcome = match analyzed_family {
+            Some(analyzed) => {
+                self.analyzed_family_calls.insert(origin.clone());
+                self.call_cache.insert(
+                    (origin.clone(), queued.key.entry.context),
+                    Arc::clone(&analyzed),
+                );
+                analyzed
+            }
+            None => outcome,
         };
         if let Some(termination) = self.observe_semantic_outcome(
             point,
@@ -2106,6 +2157,7 @@ where
                     .through_evidence(&edge.proof, &edge.completeness);
                 let descriptor = descriptor(&edge)
                     .with_caller_conversion(self.caller_conversions.contains(&origin))
+                    .with_analyzed_family_arm(self.analyzed_family_calls.contains(&origin))
                     .with_call_transfer(transfer)
                     .with_call_context(&self.contexts[queued.key.entry.context])
                     .with_summary_entry_fact(self.facts[queued.key.entry.entry_fact.index()]);
@@ -2200,11 +2252,19 @@ where
             }
         }
 
-        self.process_local_edges(problem, point, queued, Some(semantic_call), request)
+        self.process_local_edges(
+            provider,
+            problem,
+            point,
+            queued,
+            Some(semantic_call),
+            request,
+        )
     }
 
-    fn process_local_edges<P>(
+    fn process_local_edges<P, Provider>(
         &mut self,
+        provider: &Provider,
         problem: &P,
         point: &ProgramPointHandle,
         queued: QueuedPath,
@@ -2213,13 +2273,29 @@ where
     ) -> Result<Option<SolverTermination>, SummaryDataflowError>
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
+        Provider: IcfgProvider + ?Sized,
     {
         let procedure = point.procedure();
         let semantics = procedure.semantics();
+        // The first path at a procedure asks the provider, inside that
+        // procedure's member capture, so its receipt names what the proof
+        // read. Later paths of the same procedure run under the same member.
+        let infeasible = Arc::clone(
+            self.infeasible_edges
+                .entry(queued.key.entry.procedure)
+                .or_insert_with(|| {
+                    provider
+                        .infeasible_control_edges(procedure, request.cancellation)
+                        .into()
+                }),
+        );
         let mut previous_projected = None;
-        for (_, edge) in semantics.successor_edges(point.id()) {
+        for (edge_id, edge) in semantics.successor_edges(point.id()) {
             if request.cancellation.is_cancelled() {
                 return Ok(Some(SolverTermination::Cancelled));
+            }
+            if infeasible.contains(&edge_id) {
+                continue;
             }
             if call.is_some_and(|call| {
                 crate::analyzer::semantic::icfg::is_call_scaffolding(edge, call)
@@ -2795,8 +2871,9 @@ where
                                 self.metrics.reusable_summary_misses.saturating_add(1);
                             return Ok(None);
                         }
-                        WitnessAdmission::Exhausted => {
+                        WitnessAdmission::Exhausted(refused) => {
                             if self.best_effort_witness_retention {
+                                self.reuse.join_in(refused.reuse_verdict());
                                 self.metrics.reusable_summary_misses =
                                     self.metrics.reusable_summary_misses.saturating_add(1);
                                 return Ok(None);
@@ -2873,8 +2950,9 @@ where
                         .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow {
                             index,
                         })?;
-                    if admission == WitnessAdmission::Exhausted {
+                    if let WitnessAdmission::Exhausted(refused) = admission {
                         if self.best_effort_witness_retention {
+                            self.reuse.join_in(refused.reuse_verdict());
                             self.metrics.reusable_summary_misses =
                                 self.metrics.reusable_summary_misses.saturating_add(1);
                             return Ok(None);
@@ -3414,11 +3492,12 @@ where
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
                     WitnessAdmission::Retained(id) => path_evidence = Some(id),
-                    WitnessAdmission::Exhausted if self.best_effort_witness_retention => {
+                    WitnessAdmission::Exhausted(refused) if self.best_effort_witness_retention => {
+                        self.reuse.join_in(refused.reuse_verdict());
                         witness_exhausted = true;
                     }
                     WitnessAdmission::Duplicate | WitnessAdmission::Truncated => {}
-                    WitnessAdmission::Exhausted => {
+                    WitnessAdmission::Exhausted(_) => {
                         return Err(SummaryDataflowError::WitnessInvariant(
                             "strict witness retention exhausted without a solver budget",
                         ));
@@ -3505,11 +3584,12 @@ where
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
                 match admission {
                     WitnessAdmission::Retained(id) => incoming_evidence = Some(id),
-                    WitnessAdmission::Exhausted if self.best_effort_witness_retention => {
+                    WitnessAdmission::Exhausted(refused) if self.best_effort_witness_retention => {
+                        self.reuse.join_in(refused.reuse_verdict());
                         witness_exhausted = true;
                     }
                     WitnessAdmission::Duplicate | WitnessAdmission::Truncated => {}
-                    WitnessAdmission::Exhausted => {
+                    WitnessAdmission::Exhausted(_) => {
                         return Err(SummaryDataflowError::WitnessInvariant(
                             "strict witness retention exhausted without a solver budget",
                         ));
@@ -3738,11 +3818,12 @@ where
                 .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
             match admission {
                 WitnessAdmission::Retained(id) => activated_evidence = Some(id),
-                WitnessAdmission::Exhausted if self.best_effort_witness_retention => {
+                WitnessAdmission::Exhausted(refused) if self.best_effort_witness_retention => {
+                    self.reuse.join_in(refused.reuse_verdict());
                     witness_exhausted = true;
                 }
                 WitnessAdmission::Duplicate | WitnessAdmission::Truncated => {}
-                WitnessAdmission::Exhausted => {
+                WitnessAdmission::Exhausted(_) => {
                     return Err(SummaryDataflowError::WitnessInvariant(
                         "strict witness retention exhausted without a solver budget",
                     ));
@@ -4201,6 +4282,10 @@ where
                         edge.origin()
                             .is_some_and(|call| self.caller_conversions.contains(call)),
                     )
+                    .with_analyzed_family_arm(
+                        edge.origin()
+                            .is_some_and(|call| self.analyzed_family_calls.contains(call)),
+                    )
                     .with_call_context(&self.contexts[caller.context])
                     .with_summary_entry_fact(self.facts[summary_entry_fact.index()]);
                 let outputs = match evaluate_transfer(
@@ -4461,9 +4546,36 @@ where
             self.metrics,
             witness_store,
             self.witness_retention_truncated,
+            self.reuse,
         )
         .with_caller_conversions(self.caller_conversions)
     }
+}
+
+/// A solve's result carries its own verdict, but the client results built from
+/// it do not all carry one. Join it into the current captures, where each
+/// refusal's ambient mark went, so none of them closes weaker.
+pub(crate) fn join_solve_verdict<Provider>(provider: &Provider, verdict: ReuseVerdict)
+where
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+{
+    if !verdict.is_content() {
+        provider
+            .memo_attribution()
+            .analyzer()
+            .join_reuse_verdict(verdict);
+    }
+}
+
+fn joined_solve_result<Provider, Fact>(
+    provider: &Provider,
+    result: SummaryDataflowResult<Fact>,
+) -> SummaryDataflowResult<Fact>
+where
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+{
+    join_solve_verdict(provider, result.reuse_verdict());
+    result
 }
 
 /// Solve one finite distributive problem with query-local procedure summaries.
@@ -4519,7 +4631,10 @@ where
     };
     let work = request.budget.used().saturating_sub(initial_work);
     let semantic_work = semantic_budget.used().saturating_sub(initial_semantic_work);
-    Ok(state.finish(termination, work, semantic_work))
+    Ok(joined_solve_result(
+        provider,
+        state.finish(termination, work, semantic_work),
+    ))
 }
 
 /// Solve with optional validated cross-query summaries at both the exact
@@ -4578,7 +4693,10 @@ where
     };
     let work = request.budget.used().saturating_sub(initial_work);
     let semantic_work = semantic_budget.used().saturating_sub(initial_semantic_work);
-    Ok(state.finish(termination, work, semantic_work))
+    Ok(joined_solve_result(
+        provider,
+        state.finish(termination, work, semantic_work),
+    ))
 }
 
 fn reserve_summary_application(request: &mut DataflowRequest<'_>) -> Option<SolverTermination> {

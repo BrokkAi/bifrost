@@ -34,15 +34,21 @@ use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifact
 use brokk_bifrost_semantic::analyzer::semantic_model::runtime::SemanticModelActivationEvidence;
 use brokk_bifrost_semantic::analyzer::semantic_model::{ArtifactSourceIdentity, CatalogCoordinate};
 
-/// Codec version 4 of the dependencies answer. Version 1 hashed `Debug` output;
+/// Codec version 6 of the dependencies answer. Version 1 hashed `Debug` output;
 /// version 2 hashed only the last selection failure, version 3 hashes every
 /// failure in the order selection met them, and version 4 hashes typed
-/// unresolved-coordinate failures.
+/// unresolved-coordinate failures. Version 5 binds preparation failures to
+/// dependency identity, closed cause and observed input metadata. Version 6
+/// drops the selection-wide artifact-limit failure: each dependency past the
+/// cap is a `not-indexed` dependency gap. That gap no longer arises: the
+/// selection reads every discovered dependency (#13851).
 pub(crate) const DEPENDENCIES_ANSWER_DOMAIN: &[u8] =
-    b"bifrost-external-selection-answer:dependencies:v4";
-/// Codec version 2 of the JDK answer. Version 1 hashed `Debug` output of the
-/// artifact kind and left most of each dependency out.
-pub(crate) const JDK_ANSWER_DOMAIN: &[u8] = b"bifrost-external-selection-answer:jdk:v2";
+    b"bifrost-external-selection-answer:dependencies:v6";
+/// Codec version 3 of the JDK answer. Version 1 hashed `Debug` output of the
+/// artifact kind and left most of each dependency out. Version 2 added each
+/// selected dependency's content pins, and version 3 (#13266) also hashes the
+/// consulted `PATH` and the `java` found on it.
+pub(crate) const JDK_ANSWER_DOMAIN: &[u8] = b"bifrost-external-selection-answer:jdk:v3";
 
 pub(crate) fn flag(hash: &mut CanonicalHasher, name: &str, value: bool) {
     hash.field(name, &[u8::from(value)]);
@@ -148,7 +154,8 @@ fn evidence(hash: &mut CanonicalHasher, value: &SemanticModelActivationEvidence)
         toolchain,
         target,
         configuration,
-        artifact_sha256,
+        verified_raw_artifacts,
+        production_input_digest,
     } = value;
     text(hash, "language", language);
     text(hash, "ecosystem", ecosystem);
@@ -157,7 +164,23 @@ fn evidence(hash: &mut CanonicalHasher, value: &SemanticModelActivationEvidence)
     coordinate(hash, "toolchain", toolchain);
     optional_text(hash, "target", target.as_deref());
     optional_text(hash, "configuration", configuration.as_deref());
-    optional_text(hash, "artifact_sha256", artifact_sha256.as_deref());
+    optional_text(
+        hash,
+        "production_input_digest",
+        production_input_digest.as_deref(),
+    );
+    for input in verified_raw_artifacts {
+        hash.field("raw_role", &[input.role as u8]);
+        text(
+            hash,
+            "raw_kind",
+            brokk_bifrost_semantic::analyzer::semantic_model::dependency::artifact_kind_name(
+                input.kind,
+            ),
+        );
+        optional_text(hash, "raw_module", input.module.as_deref());
+        hash.field("raw_sha256", &input.sha256);
+    }
 }
 
 fn rust_approximation(hash: &mut CanonicalHasher, value: &Option<RustArtifactApproximation>) {
@@ -315,7 +338,8 @@ mod tests {
                 toolchain: coordinate("toolchain", 1),
                 target: Some("target".into()),
                 configuration: Some("configuration".into()),
-                artifact_sha256: Some("a".repeat(64)),
+                production_input_digest: None,
+verified_raw_artifacts: (Some("a".repeat(64))).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
             },
             provenance: vec![
                 DependencyProvenance {
@@ -398,7 +422,7 @@ mod tests {
                 d.evidence.configuration = None
             }),
             ("evidence.artifact_sha256", |d| {
-                d.evidence.artifact_sha256 = None
+                d.evidence.verified_raw_artifacts.clear()
             }),
             ("provenance.key", |d| d.provenance[0].key = "kx".into()),
             ("provenance.value", |d| d.provenance[0].value = "vx".into()),

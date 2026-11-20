@@ -120,6 +120,49 @@ impl BarrierObservation {
 /// attach by borrowing it with `SemanticRequest::with_value_type_barrier_context`.
 /// The context must be dropped at the end of the request.
 pub trait ValueTypeBarrierContext {
+    /// Affirmative data stability for a shared-borrow branch guard. This is
+    /// distinct from shape predicates and from referent-immutable sanitizers.
+    fn guard_interior_mutability(
+        &self,
+        _observation: &BarrierObservation,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> crate::analyzer::semantic::partial_flow::guard_bindings::GuardInteriorMutability {
+        crate::analyzer::semantic::partial_flow::guard_bindings::GuardInteriorMutability::Unknown
+    }
+
+    /// Certify inline owned storage, independently of interior-mutability
+    /// absence. The guard proof also rejects escaping borrows and captures.
+    fn guard_storage_exclusivity(
+        &self,
+        _observation: &BarrierObservation,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> crate::analyzer::semantic::partial_flow::guard_bindings::GuardStorageExclusivity {
+        crate::analyzer::semantic::partial_flow::guard_bindings::GuardStorageExclusivity::Unknown
+    }
+
+    /// Certify the comparison's exact operand semantics. An equality-shaped
+    /// guard fact alone does not rule out a user-defined comparison operator.
+    fn guard_comparison_semantics(
+        &self,
+        _procedure: &crate::analyzer::semantic::ProcedureHandle,
+        _guard: &crate::analyzer::semantic::GuardFact,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<(), crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason>
+    {
+        Err(crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason::UnprovenComparisonSemantics)
+    }
+
+    /// Prove that passing a guarded value to this exact selected formal cannot
+    /// mutate its guarded data. A moved mutable reference is still mutable.
+    fn guard_argument_nonmutating(
+        &self,
+        _formal: &BarrierObservation,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<(), crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason>
+    {
+        Err(crate::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason::UnknownBorrow)
+    }
+
     fn observed_type(
         &self,
         _observation: &BarrierObservation,

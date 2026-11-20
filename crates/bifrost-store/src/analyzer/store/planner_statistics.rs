@@ -487,6 +487,11 @@ pub mod pinned_plans {
             super::super::surface_relations::PYTHON_RELATIONS,
         )
         .expect("Python summary surface pin views");
+        super::super::surface_relations::create_surface_views(
+            conn,
+            super::super::surface_relations::RUST_RELATIONS,
+        )
+        .expect("Rust surface pin views");
         super::super::go_unit_summaries::install_go_summary_surface_views(conn)
             .expect("Go summary surface pin views");
         super::super::go_unit_summaries::install_go_summary_sources(conn)
@@ -723,6 +728,30 @@ pub mod pinned_plans {
         vec![
             (
                 pin(
+                    "semantic_source_type_paths",
+                    q::SOURCE_TYPES_TOUCHING_PATH,
+                    vec![
+                        text(r#"["src/source17.rs","src"]"#),
+                        text("src/source17.rs/"),
+                        text("src/source17.rs0"),
+                    ],
+                ),
+                "catalog_declaration_types_path",
+            ),
+            (
+                pin(
+                    "semantic_source_member_paths",
+                    q::SOURCE_MEMBERS_TOUCHING_PATH,
+                    vec![
+                        text(r#"["src/source17.rs","src"]"#),
+                        text("src/source17.rs/"),
+                        text("src/source17.rs0"),
+                    ],
+                ),
+                "catalog_declaration_members_path",
+            ),
+            (
+                pin(
                     "semantic_search_owner_qualifications",
                     q::SEARCH_OWNER_QUALIFICATIONS,
                     vec![text(r#"["Owner17"]"#)],
@@ -821,6 +850,22 @@ pub mod pinned_plans {
                     vec![text("[\"Owner17\"]")],
                 ),
                 "catalog_declaration_members_owner_name",
+            ),
+            (
+                pin(
+                    "semantic_overlay_relations_from",
+                    q::OVERLAY_RELATIONS_FROM,
+                    vec![text(r#"["Type17","Type18"]"#)],
+                ),
+                "catalog_declaration_relations_from",
+            ),
+            (
+                pin(
+                    "semantic_overlay_relations_to",
+                    q::OVERLAY_RELATIONS_TO,
+                    vec![text(r#"["Base17","Base18"]"#)],
+                ),
+                "catalog_declaration_relations_to",
             ),
             (
                 pin("semantic_names", q::TYPES_BY_NAME, vec![text("Type17")]),
@@ -955,6 +1000,16 @@ pub mod pinned_plans {
         )];
         queries.extend([
             pin(
+                "rust_import_provenance_contexts",
+                super::super::resolution_operation::rust_crate_access::RUST_IMPORT_CONTEXTS_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "rust_import_provenance_routes",
+                super::super::resolution_operation::rust_crate_access::RUST_IMPORT_ROUTES_SQL,
+                vec![integer(1)],
+            ),
+            pin(
                 "python_structural_import_containers",
                 super::super::resolution_operation::PYTHON_STRUCTURAL_IMPORT_CONTAINERS_SQL,
                 vec![integer(1), integer(1), integer(1), integer(1)],
@@ -1029,6 +1084,16 @@ pub mod pinned_plans {
             "rust_receiver_impl_targets",
             RUST_RECEIVER_IMPL_TARGETS_SQL,
             vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_deferred_receiver_census",
+            super::super::resolution_typed::rust_members::RECEIVER_CENSUS,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_deferred_inherent_subjects",
+            super::super::resolution_typed::rust_members::INHERENT_SUBJECTS,
+            vec![text("[[0,1,1]]")],
         ));
         queries.push(pin(
             "rust_receiver_kind",
@@ -2074,6 +2139,30 @@ pub mod pinned_plans {
             vec![Value::Integer(1), Value::Integer(4095)],
         ));
         queries.push(pin(
+            "stage_admission_counts_match",
+            super::super::resolution_stage::ADMISSION_COUNTS_MATCH_SQL,
+            vec![
+                integer(1),
+                text(
+                    &serde_json::to_string(
+                        &vec![0; super::super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS.len()],
+                    )
+                    .expect("manifest counts JSON"),
+                ),
+                integer(super::super::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS.len() as i64),
+            ],
+        ));
+        queries.push(pin(
+            "stage_single_admission_validation",
+            super::super::resolution_stage::single_admission_validation_sql(),
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "stage_all_admissions_validation",
+            super::super::resolution_stage::admission_validation_sql(),
+            vec![],
+        ));
+        queries.push(pin(
             "stage_typed_frontiers",
             crate::analyzer::store::resolution_stage::TYPED_FRONTIER_QUERY,
             vec![text("[[17,null]]")],
@@ -2195,6 +2284,19 @@ pub mod pinned_plans {
                 text("0000000000000000000000000000000000000000"),
                 Value::Integer(0),
                 Value::Integer(1),
+            ],
+        ));
+        // The publication compare reads the persisted rows by their key prefix
+        // (workspace, generation, input_digest); the staged side is a parameter.
+        queries.push(pin(
+            "rust_feature_projection_unchanged",
+            crate::analyzer::store::rust_feature_projections::UNCHANGED_SQL,
+            vec![
+                text("workspace"),
+                integer(1),
+                Value::Blob(vec![0; 32]),
+                text("[]"),
+                text("[]"),
             ],
         ));
         queries.push(pin(
@@ -3237,17 +3339,17 @@ pub mod pinned_plans {
             vec![text(&"a".repeat(64)), integer(1), integer(1)],
         ));
         queries.push(pin(
-            "csharp_selected_global_using_coverage",
-            super::super::resolution_operation::csharp_units::SELECTED_GLOBAL_USING_COVERAGE,
+            "csharp_selected_global_using_inventory",
+            super::super::selected_read::queries::csharp::SELECTED_GLOBAL_USING_INVENTORY,
             vec![
                 integer(1),
                 Value::Blob(super::super::csharp_compilation::derivation_identity().to_vec()),
             ],
         ));
         queries.push(pin(
-            "csharp_selected_global_using_sites",
-            super::super::resolution_operation::csharp_units::SELECTED_GLOBAL_USING_SITES,
-            vec![integer(1)],
+            "csharp_selected_compilation_labels",
+            super::super::selected_read::queries::csharp::SELECTED_COMPILATION_LABELS,
+            vec![],
         ));
         queries.push(pin(
             "csharp_extent_publication_members",
@@ -3789,6 +3891,41 @@ pub mod pinned_plans {
             "mounted_declaration_scan",
             mounted_declaration_sql(),
             vec![text("csharp")],
+        ));
+        queries.push(pin(
+            "declaration_file_keys",
+            super::super::declaration_file_keys_sql().to_owned(),
+            vec![text("csharp"), text("src/Widget.cs")],
+        ));
+        queries.push(pin(
+            "mounted_declaration_files",
+            super::super::mounted_declaration_files_sql(),
+            vec![text("csharp"), text("src/Widget.cs")],
+        ));
+        queries.push(pin(
+            "mounted_declaration_files_unavailable",
+            super::super::mounted_declaration_files_unavailable_sql().to_owned(),
+            vec![text("cpp:c"), text("common.h")],
+        ));
+        queries.push(pin(
+            "mounted_declaration_files_primary",
+            super::super::mounted_declaration_files_primary_sql().to_owned(),
+            vec![
+                text("cpp"),
+                text("common.h"),
+                text("0123456789012345678901234567890123456789"),
+                rusqlite::types::Value::Blob(Vec::new()),
+            ],
+        ));
+        queries.push(pin(
+            "path_symbol_rows_for_files",
+            super::super::path_symbol_rows_for_files_sql().to_owned(),
+            vec![
+                text("typescript"),
+                text("target.ts"),
+                text("0123456789012345678901234567890123456789"),
+                rusqlite::types::Value::Blob(Vec::new()),
+            ],
         ));
         queries.push(pin(
             "mounted_declaration_scan_with_primary_ranges",
@@ -4365,6 +4502,31 @@ pub mod pinned_plans {
                 ),
             ],
         ));
+        queries.push(pin(
+            "rust_unit_closure_bindings_in_module",
+            super::super::rust_unit_summaries::CLOSURE_BINDINGS_IN_MODULE_SQL,
+            vec![integer(1), text("crate::api")],
+        ));
+        queries.push(pin(
+            "rust_unit_closure_bindings_named",
+            super::super::rust_unit_summaries::CLOSURE_BINDINGS_NAMED_SQL,
+            vec![integer(1), text("crate::api"), text("Item")],
+        ));
+        queries.push(pin(
+            "rust_unit_declaration_placement_sites_shared",
+            super::super::rust_unit_summaries::declaration_placement_sites_sql(),
+            vec![integer(1), text("crate::api"), integer(7), Value::Null],
+        ));
+        queries.push(pin(
+            "rust_unit_declaration_placement_sites_local",
+            super::super::rust_unit_summaries::declaration_placement_sites_sql(),
+            vec![integer(1), text("crate::api"), Value::Null, digest(1)],
+        ));
+        queries.push(pin(
+            "rust_unit_placement_site_candidates",
+            super::super::rust_unit_summaries::placement_site_candidates_sql(),
+            vec![integer(1), text("crate::api")],
+        ));
         // The summary-backed export walk reads one consumed unit's rows by summary id.
         {
             use super::super::rust_unit_summaries::export_walk;
@@ -4462,6 +4624,11 @@ pub mod pinned_plans {
             super::super::unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL,
             vec![text(OID), text("go"), Value::Blob(Vec::new())],
         ));
+        queries.push(pin(
+            "surface_rust_lexical_owners",
+            include_str!("surface_rust_lexical_owners.sql"),
+            vec![integer(1)],
+        ));
         queries
     }
 
@@ -4529,6 +4696,10 @@ pub mod pinned_plans {
     /// selection, exactly as the operator dump does, so the plans depend only
     /// on the schema and on `sqlite_stat1` and not on which workspace happened
     /// to be current.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn pinned_query_plans(store: &AnalyzerStore) -> Result<Vec<PinnedQueryPlan>> {
         let conn = store.read_conn_for_workspace(&WorkspaceSnapshots::default())?;
         prepare_pin_context(&conn);
@@ -5791,6 +5962,10 @@ pub mod tests {
     /// two outputs, is how issue #3016 produced its plan-flip list.
     #[test]
     #[ignore = "operator tool: needs BIFROST_3016_STORE_PATH pointing at a real store"]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn dump_pinned_plans_for_store() {
         let path = PathBuf::from(
             std::env::var("BIFROST_3016_STORE_PATH")
@@ -5965,6 +6140,49 @@ pub mod tests {
                     .all(|row| !row.starts_with("SCAN ") && !row.contains("AUTOMATIC")),
                 "{state} Rust receiver impl lookup must not scan tables or build automatic indexes: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rust_deferred_owners_seek_declarations_and_selected_subjects() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for (name, required) in [
+                (
+                    "rust_deferred_inherent_subjects",
+                    &[
+                        "SEARCH member_mount USING PRIMARY KEY (mount_ordinal=?)",
+                        "source_rust_item_body_children_fk_declaration_id (declaration_id=? AND blob_id=?)",
+                        "rust_summary_inherent_declaration",
+                        "resolution_rust_declaration_authorities_source_site (blob_id=? AND source_site=?)",
+                    ][..],
+                ),
+                (
+                    "rust_deferred_receiver_census",
+                    &[
+                        "SEARCH owner_mount USING PRIMARY KEY (mount_ordinal=?)",
+                        "resolution_unit_summary_members_blob",
+                    ][..],
+                ),
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                for required in required {
+                    assert!(
+                        plan.iter().any(|row| row.contains(required)),
+                        "{state} {name} must seek {required}: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter().all(|row| !row.contains("AUTOMATIC")),
+                    "{state} {name} must use declared indexes: {plan:?}"
+                );
+            }
         }
     }
 
@@ -6780,6 +6998,247 @@ pub mod tests {
                         && !row.contains("TEMP B-TREE")),
                 "{state}: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    #[hardwon("d90e82cd2168: cold Rust closure reads scanned each summary without statistics")]
+    fn rust_summary_cold_seed_reads_seek_module_keys() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .unwrap();
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for (name, keys) in [
+                (
+                    "rust_unit_closure_bindings_in_module",
+                    "(summary_id=? AND module_path=?)",
+                ),
+                (
+                    "rust_unit_closure_bindings_named",
+                    "(summary_id=? AND module_path=? AND name=?)",
+                ),
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                eprintln!("{state} {name}: {plan:?}");
+                assert!(
+                    plan.iter().any(|row| row.contains(
+                        "USING INDEX rust_resolution_unit_summary_effective_bindings_module_name"
+                    ) && row.contains(keys)),
+                    "{state} {name}: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|row| row.contains("USING PRIMARY KEY")
+                        || row.contains("SCAN rust_resolution_unit_summary_effective_bindings")
+                        || row.contains("AUTOMATIC")),
+                    "{state} {name}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("d90e82cd2168: cold Rust placement reads scanned the summary before statistics")]
+    fn rust_summary_cold_seed_placement_sites_seek_module_and_identity() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .unwrap();
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for name in [
+                "rust_unit_declaration_placement_sites_shared",
+                "rust_unit_declaration_placement_sites_local",
+                "rust_unit_placement_site_candidates",
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                eprintln!("{state} {name}: {plan:?}");
+                let attributes = plan
+                    .iter()
+                    .filter(|row| row.starts_with("SEARCH attributes "))
+                    .collect::<Vec<_>>();
+                assert!(
+                    !attributes.is_empty()
+                        && attributes
+                            .iter()
+                            .all(|row| row.contains("(summary_id=? AND module_path=?)")
+                                || row.contains("(summary_id=? AND container_path=?)")),
+                    "{state} {name}: attributes must seek one module: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|row| row.starts_with("SCAN attributes ")),
+                    "{state} {name}: {plan:?}"
+                );
+                for (alias, keys) in [
+                    (
+                        "placement",
+                        "(summary_id=? AND container_path=? AND member_ordinal=?)",
+                    ),
+                    ("members", "(summary_id=? AND member_ordinal=?)"),
+                    ("site", "(blob_id=? AND semantic_role=? AND semantic_key=?)"),
+                ] {
+                    let accesses = plan
+                        .iter()
+                        .filter(|row| row.starts_with(&format!("SEARCH {alias} ")))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        !accesses.is_empty() && accesses.iter().all(|row| row.contains(keys)),
+                        "{state} {name}: {alias} must seek {keys}: {plan:?}"
+                    );
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|row| row.starts_with(&format!("SCAN {alias} "))),
+                        "{state} {name}: {plan:?}"
+                    );
+                }
+                if name != "rust_unit_placement_site_candidates" {
+                    assert!(
+                        !plan.iter().any(|row| row.starts_with("SEARCH catalog ")
+                            && row.contains("USING PRIMARY KEY")),
+                        "{state} {name}: catalog must seek an identity: {plan:?}"
+                    );
+                    for key in [
+                        "(blob_id=? AND shared_identity=?)",
+                        "(blob_id=? AND identity_digest=?)",
+                    ] {
+                        assert!(
+                            plan.iter()
+                                .any(|row| row.starts_with("SEARCH catalog ") && row.contains(key)),
+                            "{state} {name}: catalog must seek {key}: {plan:?}"
+                        );
+                    }
+                }
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|row| row.contains("AUTOMATIC") || row.contains("CO-ROUTINE")),
+                    "{state} {name}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "d90e82cd2168: cold placement lookup scanned all summary placements before statistics"
+    )]
+    fn rust_summary_placement_site_base_join_preserves_view_rows() {
+        let store = AnalyzerStore::open_ephemeral().expect("open store");
+        let conn = store.conn.lock().expect("store mutex");
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .unwrap();
+        prepare_pin_context(&conn);
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+        // Twin members of one blob, several modules of one member, another
+        // summary of that blob, local and shared identities, and an unplaced
+        // member exercise the view's multiplicity and selection boundaries.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;
+            INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role)
+            VALUES(1,1,10,'src/lib.rs','source'),(1,2,10,'src/twin.rs','source'),
+                  (1,3,11,'src/hidden.rs','source'),(2,1,10,'src/lib.rs','source');
+            INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL),(1,'crate::api',''),(1,'crate::other',''),(1,'crate',''),(2,'',NULL);
+            INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal)
+            VALUES(1,'',1),(1,'crate::api',1),(1,'crate::api',2),(1,'crate::api',3),(1,'crate::other',2),(1,'crate',2),(2,'',1);
+            INSERT INTO rust_resolution_unit_summary_placement_attributes(summary_id,container_path,member_ordinal,placement,source_kind)
+            SELECT summary_id,container_path,member_ordinal,CASE container_path WHEN '' THEN 'root' ELSE 'mod_declaration' END,'declared'
+            FROM resolution_unit_summary_placements;
+            INSERT INTO temp.selected_rust_unplaced_placements VALUES(1,'crate::api',3,'crate::api','src/hidden.rs');
+            INSERT INTO resolution_semantic_catalog(blob_id,local_key,shared_identity,identity_digest)
+            VALUES(10,1,7,NULL),(10,2,NULL,zeroblob(32)),(10,3,8,NULL),(11,1,7,NULL);
+            INSERT INTO resolution_semantic_sites VALUES(10,100,'type','definition',1),(10,101,'type','definition',2),
+                (10,102,'type','reference',3),(11,100,'type','definition',1);").unwrap();
+        const OLD_FROM: &str = "FROM rust_unit_summary_placements AS placement
+            JOIN resolution_unit_summary_members AS members
+              ON members.summary_id=placement.summary_id AND members.member_ordinal=placement.member_ordinal
+            JOIN resolution_semantic_sites AS site
+              ON site.blob_id=members.blob_id AND site.semantic_role='definition'
+            JOIN resolution_semantic_catalog AS catalog
+              ON catalog.blob_id=site.blob_id AND catalog.local_key=site.semantic_key
+            WHERE placement.summary_id=?1 AND placement.module_path=?2";
+        let old_named = format!("SELECT placement.member_ordinal,site.source_site {OLD_FROM}
+            AND ((?3 IS NOT NULL AND catalog.shared_identity=?3) OR (?4 IS NOT NULL AND catalog.identity_digest=?4))
+            ORDER BY placement.member_ordinal,site.source_site");
+        let old_candidates = format!("SELECT placement.member_ordinal,site.source_site,catalog.shared_identity,hex(catalog.identity_digest)
+            {OLD_FROM} ORDER BY placement.member_ordinal,site.source_site");
+        let rows = |sql: &str, parameters: &[rusqlite::types::Value]| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    (0..columns)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        use rusqlite::types::Value;
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for module in ["crate", "crate::api", "crate::other", "crate::missing", ""] {
+                let mut parameters = vec![Value::Integer(1), Value::Text(module.into())];
+                if module == "crate::api" {
+                    eprintln!(
+                        "{state} old_placement_site_candidates: {:?}",
+                        super::pinned_plans::plan_rows_for_sql(&conn, &old_candidates, &parameters)
+                            .unwrap()
+                    );
+                    let mut identity_parameters = parameters.clone();
+                    identity_parameters.extend([Value::Integer(7), Value::Null]);
+                    eprintln!(
+                        "{state} old_declaration_placement_sites: {:?}",
+                        super::pinned_plans::plan_rows_for_sql(
+                            &conn,
+                            &old_named,
+                            &identity_parameters
+                        )
+                        .unwrap()
+                    );
+                }
+                let expected = rows(&old_candidates, &parameters);
+                assert_eq!(
+                    rows(
+                        super::super::rust_unit_summaries::placement_site_candidates_sql(),
+                        &parameters
+                    ),
+                    expected,
+                    "{state}: {module}"
+                );
+                assert_eq!(
+                    expected.len(),
+                    match module {
+                        "crate" => 4,
+                        "crate::other" => 2,
+                        "crate::api" => 4,
+                        _ => 0,
+                    },
+                    "{state}: {module}"
+                );
+                for identity in [
+                    (Value::Integer(7), Value::Null),
+                    (Value::Null, Value::Blob(vec![0; 32])),
+                    (Value::Integer(99), Value::Null),
+                ] {
+                    parameters.truncate(2);
+                    parameters.extend([identity.0, identity.1]);
+                    assert_eq!(
+                        rows(
+                            super::super::rust_unit_summaries::declaration_placement_sites_sql(),
+                            &parameters
+                        ),
+                        rows(&old_named, &parameters),
+                        "{state}: {module}"
+                    );
+                }
+            }
         }
     }
 
@@ -8810,6 +9269,42 @@ pub mod tests {
         }
     }
 
+    /// #13401: the import-provenance builder runs once per blob. Each statement
+    /// must seek by the blob prefix, so a large file never scans a whole table.
+    #[cfg(test)]
+    #[test]
+    fn rust_import_provenance_statements_seek_by_blob_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for name in [
+                "rust_import_provenance_contexts",
+                "rust_import_provenance_routes",
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                assert!(
+                    plan.iter().all(|step| {
+                        !step.contains("AUTOMATIC")
+                            && !step.contains("CO-ROUTINE")
+                            && !step.contains("source_occurrence_arenas")
+                            && !step.starts_with("SCAN ")
+                    }),
+                    "{state} {name} must seek, never scan or build an index: {plan:#?}"
+                );
+                assert!(
+                    plan.iter().any(|step| step.contains("blob_id=?")),
+                    "{state} {name} must seek by blob: {plan:#?}"
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     #[hardwon("#6218: TEMP root pages were mistaken for unrelated main-schema tables")]
     #[test]
@@ -9022,6 +9517,10 @@ pub mod tests {
     /// rewriting its rows is not.
     #[test]
     #[hardwon("d78f9a16030c: pooled readers retained statements prepared under old statistics")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_refresh_makes_a_pooled_reader_plan_with_the_new_statistics() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         {
@@ -9079,6 +9578,10 @@ pub mod tests {
     /// has, and reusing it would keep the old plans indefinitely.
     #[test]
     #[hardwon("d78f9a16030c: a reader checked out during refresh could re-enter the stale pool")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_reader_checked_out_across_a_refresh_is_not_returned_to_the_pool() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         {
@@ -9254,6 +9757,10 @@ mod native_tests {
     #[cfg(test)]
     #[test]
     #[hardwon("#3029: active and streaming reader pools retained plans from old statistics")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn refresh_recycles_all_store_reader_classes_and_populates_statistics() {
         let store = super::AnalyzerStore::open_ephemeral().unwrap();
         store.conn.execute(|conn| {

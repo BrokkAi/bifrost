@@ -3,6 +3,7 @@
 //! Operand metadata is projected from native macro fragments. Their owned
 //! trees remain available to consumers that execute or expose the expressions.
 
+use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +223,97 @@ pub fn rust_formatting_macro(name: &str) -> Option<RustFormattingMacro> {
         "panic" => Some(RustFormattingMacro::Panic),
         _ => None,
     }
+}
+
+fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
+    brokk_bifrost_core::analyzer::common::try_node_source_text(node, source)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMacroCallCandidate {
+    Formatting(RustFormattingMacro),
+    Logging(RustLoggingMacro),
+    Value(RustValueMacro),
+}
+
+/// Keep executable base lowering opaque for non-std qualified candidates.
+pub fn rust_macro_call_candidate(path: Node<'_>, source: &str) -> Option<RustMacroCallCandidate> {
+    let segments = crate::graph_support::rust_path_segments(path)?;
+    // matches! is not a call. Executable lowering keeps every spelling opaque; its
+    // guarded alternate lowers it as an intrinsic once std/core identity is proved.
+    if segments.last().is_some_and(|name| {
+        strip_raw_identifier_prefix(node_text(source, *name).unwrap_or_default()) == "matches"
+    }) {
+        return None;
+    }
+    if segments.len() == 1
+        && rust_logging_macro(
+            "log",
+            strip_raw_identifier_prefix(node_text(source, segments[0])?),
+        )
+        .is_some()
+    {
+        return None;
+    }
+    // #10972: non-std qualified macro tokens remain opaque until identity admission.
+    if let Some(owner) = segments.first().filter(|_| segments.len() > 1) {
+        let owner = strip_raw_identifier_prefix(node_text(source, *owner)?);
+        if !matches!(owner, "std" | "core" | "alloc") {
+            return None;
+        }
+    }
+    rust_macro_syntax_candidate(path, source)
+}
+
+/// Select argument grammar without asserting executable macro identity.
+/// Guarded realization can use this selector while base lowering retains its
+/// independent refusal boundary above (#10972).
+pub fn rust_macro_syntax_candidate(path: Node<'_>, source: &str) -> Option<RustMacroCallCandidate> {
+    let segments = crate::graph_support::rust_path_segments(path)?;
+    let terminal = segments.last()?;
+    let name = strip_raw_identifier_prefix(node_text(source, *terminal)?);
+    if rust_value_macro(name).is_some() && segments.len() > 1 {
+        let owner = strip_raw_identifier_prefix(node_text(source, segments[0])?);
+        if segments.len() != 2 || !matches!(owner, "std" | "core" | "alloc") {
+            return None;
+        }
+    }
+    if segments.len() == 1
+        && let Some(logging) = rust_logging_macro("log", name)
+    {
+        return Some(RustMacroCallCandidate::Logging(logging));
+    }
+    if segments.len() == 2 {
+        let owner = strip_raw_identifier_prefix(node_text(source, segments[0])?);
+        if let Some(logging) = rust_logging_macro(owner, name) {
+            return Some(RustMacroCallCandidate::Logging(logging));
+        }
+    }
+    rust_formatting_macro(name)
+        .map(RustMacroCallCandidate::Formatting)
+        .or_else(|| rust_value_macro(name).map(RustMacroCallCandidate::Value))
+}
+
+/// Whether a macro whose identity the resolver proved is a std, core or alloc
+/// macro whose expansion contains no items, under the selected standard
+/// library. Local, shadowed, third-party (including the `log` crate) and
+/// unresolved identities answer false.
+///
+/// This is the single owner of that answer, shared by the Drop census (#13259),
+/// the shared Rust relowering input (#13019 step 1b) and body macros from other
+/// crates (#13219). It answers true only for members audited at
+/// `ITEM_FREE_MACRO_STDLIB_REVISION` (#11532) and only when
+/// `selected_stdlib_revision` is that revision; anything else fails closed.
+pub fn rust_std_macro_expands_to_no_items(
+    identity: &crate::macro_matcher::StandardMacroIdentity,
+    selected_stdlib_revision: &str,
+) -> bool {
+    let crate::macro_matcher::StandardMacroIdentity::Standard { owner, member } = identity else {
+        return false;
+    };
+    selected_stdlib_revision == crate::macro_matcher::ITEM_FREE_MACRO_STDLIB_REVISION
+        && crate::macro_matcher::rust_item_free_macro_candidate(member)
+        && crate::macro_matcher::rust_standard_macro_in_crate(owner.as_str(), member)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

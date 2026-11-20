@@ -11,6 +11,20 @@ use crate::analyzer::semantic_model::{
 use crate::hash::{HashSet, set_with_capacity};
 pub use brokk_bifrost_semantic::analyzer::semantic_model::dependency::*;
 use std::sync::{OnceLock, RwLock};
+pub(crate) type CandidateSelection<T> = (Vec<T>, Vec<(String, CatalogError)>);
+
+/// Reads for provider selection; pinned implementations use the reader's borrowed connection.
+pub(crate) trait DependencyProviderReads {
+    fn provider_candidates(
+        &self,
+        query: &super::SemanticPackSelectorQuery,
+    ) -> Result<CandidateSelection<CatalogCandidate>, CatalogError>;
+    fn provider_extraction(
+        &self,
+        digest: &str,
+    ) -> Result<Option<PackExtractionAccounting>, CatalogError>;
+}
+
 /// One ecosystem's dependency resolver.
 ///
 /// Before this, the nine resolvers were free functions behind a hard-coded
@@ -36,6 +50,16 @@ pub trait DependencyResolver: Send + Sync {
     /// bounded file acquisition.
     fn is_discovery_membership_candidate(&self, rel_path: &std::path::Path) -> bool {
         self.is_discovery_candidate(rel_path)
+    }
+
+    /// Whether a discovery diagnostic of this kind is a function of the reads
+    /// the discovery recorded (project reads and verifiable external reads),
+    /// so that a discovery reporting it can carry across requests. This is an
+    /// allow-list: the default vouches for nothing, so a new kind refuses
+    /// until a reviewer has shown that its producer records every input it
+    /// consults, and that a failed or transient read refuses the discovery.
+    fn diagnostic_follows_recorded_reads(&self, _code: &str) -> bool {
+        false
     }
 
     /// The pack adapter that produces semantic packs from what this resolver
@@ -87,12 +111,14 @@ pub trait DependencyResolver: Send + Sync {
     /// Discover this ecosystem's exact local dependencies. `digests` is the
     /// workspace store's budget-charged content-digest region; an ecosystem
     /// that binds artifact content during discovery (the JDK) streams its
-    /// digests through it, and the others ignore it.
+    /// digests through it, and the others ignore it. `verifications` is the
+    /// store-owned holder shared by activation and request-time toolchain checks.
     fn resolve(
         &self,
         config: &crate::analyzer::AnalyzerConfig,
         project: &dyn crate::analyzer::Project,
         digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+        verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
         limits: &DependencyPackLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyDiscoveryOutcome;
@@ -171,6 +197,48 @@ pub(crate) fn semantic_pack_acquisition_hook() -> Option<SemanticPackAcquisition
         .expect("semantic-pack acquisition hook mutex poisoned")
 }
 
+// Keep full preparation and the installed stage on the same curated route.
+fn selects_curated_dependency_pack(
+    catalog: &SemanticPackCatalog,
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+) -> Result<bool, CatalogError> {
+    if adapter.installed_packs_only(dependency) {
+        return Ok(true);
+    }
+    if !adapter.reviewed_pack_supersedes_production(dependency) {
+        return Ok(false);
+    }
+    Ok(compatible_curated_installed_pack(catalog, dependency)?.is_some())
+}
+
+/// Activate a selected installed pack. This is the only place preparation adds
+/// an installed pack to its evidence and its activated list, and it takes no
+/// failure list: a pack that is installed and activated is never a preparation
+/// failure (f728c64932), so "quarantined and still activated" cannot be written.
+///
+/// A pack whose extraction accounting is not certified is activated all the
+/// same, and its coverage is partial. `dependency_gaps` derives that as a
+/// deterministic `PartialCoverage` gap from the active shard's manifest
+/// completeness, which is replayable through `ReadKey::Models` and
+/// deduplicated with the shard's own gap. `pack_is_activation_ready` is true
+/// for every complete manifest, so uncertified accounting always means a
+/// partial one and that derivation covers it.
+fn activate_installed_pack(
+    installed: PreparedInstalledDependencyPack,
+    evidence: &mut Vec<crate::analyzer::semantic_model::runtime::SemanticModelActivationEvidence>,
+    installed_packs: &mut Vec<PreparedInstalledDependencyPack>,
+    profile: &mut DependencyPackPreparationProfile,
+) {
+    debug_assert!(
+        installed.activation_ready || installed.completeness != Completeness::Complete,
+        "uncertified accounting on a complete pack would carry no partial-coverage gap: {installed:?}"
+    );
+    evidence.push(installed.evidence.clone());
+    installed_packs.push(installed);
+    profile.installed_packs += 1;
+}
+
 /// Prepare one ecosystem's discovered dependencies.
 ///
 /// A row the adapter marks [`DependencyPackAdapter::installed_packs_only`],
@@ -190,26 +258,46 @@ pub fn prepare_dependency_semantic_packs(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyPackPreparationOutcome {
-    let selects_installed = |dependency: &ResolvedDependency| {
-        adapter.installed_packs_only(dependency)
-            || (adapter.reviewed_pack_supersedes_production(dependency)
-                && !matches!(
-                    compatible_curated_installed_pack(catalog, dependency),
-                    Ok(None)
-                ))
+    // Diagnose obsolete metadata before routing or cache hits can hide it.
+    // This is an indexed dependency-coordinate read, not an artifact read.
+    let mut revision_diagnostics = BoundedDependencyDiagnostics::new(limits);
+    for dependency in dependencies.iter().take(limits.max_dependencies) {
+        if is_cancelled(cancellation) {
+            break;
+        }
+        if let Err(error) =
+            record_obsolete_dependency_candidates(catalog, dependency, &mut revision_diagnostics)
+        {
+            revision_diagnostics.warning("catalog.revision_probe", Some(&dependency.id), format!("preliminary producer revision lookup failed; full preparation will retry: {error}"));
+        }
+    }
+    let finish = |mut outcome: DependencyPackPreparationOutcome| {
+        // Preserve the request cap and error priority when adding probe warnings.
+        let mut combined = revision_diagnostics;
+        for diagnostic in outcome.diagnostics.drain(..) {
+            combined.push(diagnostic);
+        }
+        let (diagnostics, suppressed) = combined.finish();
+        outcome.diagnostics = diagnostics;
+        outcome.suppressed_diagnostics += suppressed;
+        outcome
     };
     let routes = dependencies
         .iter()
-        .map(selects_installed)
+        // A failed lookup takes the curated route so that full preparation
+        // reports it there, instead of producing a second symbol owner.
+        .map(|dependency| {
+            selects_curated_dependency_pack(catalog, adapter, dependency).unwrap_or(true)
+        })
         .collect::<Vec<_>>();
     if !routes.contains(&true) {
-        return prepare_produced_dependency_semantic_packs(
+        return finish(prepare_produced_dependency_semantic_packs(
             catalog,
             adapter,
             dependencies,
             limits,
             cancellation,
-        );
+        ));
     }
     let (mut locked, mut produced) = (Vec::new(), Vec::new());
     for (dependency, installed) in dependencies.iter().zip(routes) {
@@ -227,10 +315,11 @@ pub fn prepare_dependency_semantic_packs(
         cancellation,
     );
     if outcome.cancelled {
-        return outcome;
+        return finish(outcome);
     }
     let installed =
         prepare_compatible_installed_semantic_packs(catalog, &locked, limits, cancellation);
+    outcome.failures.extend(installed.failures);
     outcome.installed_packs.extend(installed.installed_packs);
     outcome.evidence.extend(installed.evidence);
     outcome.diagnostics.extend(installed.diagnostics);
@@ -239,7 +328,37 @@ pub fn prepare_dependency_semantic_packs(
     outcome.cancelled = installed.cancelled;
     outcome.profile.dependencies_considered += installed.profile.dependencies_considered;
     outcome.profile.installed_packs += installed.profile.installed_packs;
-    outcome
+    finish(outcome)
+}
+
+fn record_dependency_candidate_findings(
+    catalog: &SemanticPackCatalog,
+    dependency_id: &str,
+    findings: Vec<(String, CatalogError)>,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) -> Result<(), CatalogError> {
+    for (_, finding) in &findings {
+        if matches!(finding, CatalogError::StaleGeneratedSelector { .. }) {
+            diagnostics.warning(
+                "StaleGeneratedSelector",
+                Some(dependency_id),
+                finding.to_string(),
+            );
+        }
+    }
+    catalog.apply_candidate_findings(findings)
+}
+
+fn record_obsolete_dependency_candidates(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) -> Result<(), CatalogError> {
+    let Some(query) = installed_pack_query(dependency) else {
+        return Ok(());
+    };
+    let (_, findings) = catalog.provider_candidates(&query)?;
+    record_dependency_candidate_findings(catalog, &dependency.id, findings, diagnostics)
 }
 
 fn catalog_diagnostics(
@@ -268,6 +387,7 @@ fn prepare_produced_dependency_semantic_packs(
     cancellation: Option<&CancellationToken>,
 ) -> DependencyPackPreparationOutcome {
     let mut diagnostics = catalog_diagnostics(catalog, limits);
+    let mut failures = Vec::new();
     let mut packs = Vec::new();
     let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
@@ -293,6 +413,10 @@ fn prepare_produced_dependency_semantic_packs(
             break;
         }
         profile.dependencies_considered += 1;
+        let rejected = || DependencyPreparationFailure {
+            dependency_id: dependency.id.clone(),
+            cause: DependencyPreparationFailureCause::Rejected,
+        };
         if dependency.id.is_empty() {
             diagnostics.error(
                 "dependency.identity",
@@ -300,6 +424,7 @@ fn prepare_produced_dependency_semantic_packs(
                 None,
                 "resolved dependency identity must not be empty",
             );
+            failures.push(rejected());
             continue;
         }
         if dependency.artifacts.is_empty() || !adapter.can_produce(dependency) {
@@ -308,12 +433,14 @@ fn prepare_produced_dependency_semantic_packs(
                 dependency,
                 cancellation,
                 &mut diagnostics,
+                &mut failures,
             ) {
-                Ok(Some(installed)) => {
-                    evidence.push(installed.evidence.clone());
-                    installed_packs.push(installed);
-                    profile.installed_packs += 1;
-                }
+                Ok(Some(installed)) => activate_installed_pack(
+                    installed,
+                    &mut evidence,
+                    &mut installed_packs,
+                    &mut profile,
+                ),
                 Ok(None) => {}
                 Err(DeclaredPackCancelled) => {
                     cancelled = true;
@@ -322,13 +449,16 @@ fn prepare_produced_dependency_semantic_packs(
             }
             continue;
         }
-        if dependency.evidence.artifact_sha256.is_some() {
+        if !dependency.evidence.verified_raw_artifacts.is_empty()
+            || dependency.evidence.production_input_digest.is_some()
+        {
             diagnostics.error(
                 "dependency.artifact_evidence",
                 Some(&dependency.id),
                 None,
                 "resolved dependency artifact digest must be supplied by preparation",
             );
+            failures.push(rejected());
             continue;
         }
         if dependency
@@ -342,6 +472,7 @@ fn prepare_produced_dependency_semantic_packs(
                 None,
                 "dependency provenance keys and values must not be empty",
             );
+            failures.push(rejected());
             continue;
         }
         if dependency.artifacts.len() > limits.max_artifacts_per_dependency {
@@ -354,6 +485,7 @@ fn prepare_produced_dependency_semantic_packs(
                     limits.max_artifacts_per_dependency
                 ),
             );
+            failures.push(rejected());
             continue;
         }
 
@@ -364,6 +496,7 @@ fn prepare_produced_dependency_semantic_packs(
                 reusable_generated_pack_by_source_identity(
                     catalog,
                     &adapter.producer(),
+                    adapter.production_schema_version(),
                     identity,
                     dependency,
                 )
@@ -543,12 +676,17 @@ fn prepare_produced_dependency_semantic_packs(
             break;
         }
         if exact_artifacts.len() != dependency.artifacts.len() {
+            failures.push(DependencyPreparationFailure {
+                dependency_id: dependency.id.clone(),
+                cause: DependencyPreparationFailureCause::Rejected,
+            });
             continue;
         }
         let exact_go_source = match prepared_exact_go_source(dependency, &exact_artifacts) {
             Ok(source) => source,
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "go.source_registration", error);
+                failures.push(rejected());
                 continue;
             }
         };
@@ -556,6 +694,7 @@ fn prepare_produced_dependency_semantic_packs(
             Ok(key) => key,
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "production.identity", error);
+                failures.push(rejected());
                 continue;
             }
         };
@@ -585,6 +724,7 @@ fn prepare_produced_dependency_semantic_packs(
                     &prepared.production.manifest_digest,
                     &mut diagnostics,
                 ) {
+                    failures.push(rejected());
                     continue;
                 }
                 remember_dependency_source_identity(
@@ -607,6 +747,7 @@ fn prepare_produced_dependency_semantic_packs(
             Ok(None) => {}
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                failures.push(rejected());
                 continue;
             }
         }
@@ -619,6 +760,7 @@ fn prepare_produced_dependency_semantic_packs(
             Ok(lock) => lock,
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "production.lock", error);
+                failures.push(rejected());
                 continue;
             }
         };
@@ -632,6 +774,7 @@ fn prepare_produced_dependency_semantic_packs(
                 Ok(false) => std::thread::sleep(GENERATED_PRODUCTION_LOCK_RETRY),
                 Err(error) => {
                     diagnostics.catalog(Some(&dependency.id), "production.lock", error);
+                    failures.push(rejected());
                     break false;
                 }
             }
@@ -666,6 +809,7 @@ fn prepare_produced_dependency_semantic_packs(
                     &prepared.production.manifest_digest,
                     &mut diagnostics,
                 ) {
+                    failures.push(rejected());
                     continue;
                 }
                 remember_dependency_source_identity(
@@ -688,6 +832,7 @@ fn prepare_produced_dependency_semantic_packs(
             Ok(None) => {}
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                failures.push(rejected());
                 continue;
             }
         }
@@ -732,6 +877,7 @@ fn prepare_produced_dependency_semantic_packs(
                         &prepared.production.manifest_digest,
                         &mut diagnostics,
                     ) {
+                        failures.push(rejected());
                         continue;
                     }
                     remember_dependency_source_identity(
@@ -754,6 +900,7 @@ fn prepare_produced_dependency_semantic_packs(
                 Ok(None) => {}
                 Err(error) => {
                     diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                    failures.push(rejected());
                     continue;
                 }
             }
@@ -768,8 +915,8 @@ fn prepare_produced_dependency_semantic_packs(
         ) {
             Ok(production) => production,
             Err(failure) => {
-                let was_cancelled =
-                    matches!(&failure, DependencyProductionFailure::Cancelled { .. });
+                let was_cancelled = is_cancelled(cancellation)
+                    || matches!(&failure, DependencyProductionFailure::Cancelled { .. });
                 match failure {
                     DependencyProductionFailure::NoPack {
                         diagnostics: producer_diagnostics,
@@ -819,6 +966,10 @@ fn prepare_produced_dependency_semantic_packs(
                     cancelled = true;
                     break;
                 }
+                failures.push(DependencyPreparationFailure {
+                    dependency_id: dependency.id.clone(),
+                    cause: DependencyPreparationFailureCause::ProducerFailed,
+                });
                 continue;
             }
         };
@@ -845,12 +996,19 @@ fn prepare_produced_dependency_semantic_packs(
                     &production.compiled,
                     source.artifact,
                     &source.packages,
+                    &verified_raw_slots(&exact_artifacts),
                 ),
-                None => catalog.install_generated(&production.key, &production.compiled),
+                None => catalog.install_generated(
+                    &production.key,
+                    &production.compiled,
+                    &verified_raw_slots(&exact_artifacts),
+                ),
             }
         };
         match install {
             Ok(installed) => {
+                // Partial coverage belongs to the installed pack, not the set of
+                // dependencies that could not prepare any usable pack.
                 // The exact read has just proven this production for this
                 // dependency, so this process also leaves behind the read-free
                 // mapping that lets a later process find it without reading.
@@ -861,11 +1019,11 @@ fn prepare_produced_dependency_semantic_packs(
                     &dependency.id,
                     &mut diagnostics,
                 );
-                let activation_digest = exact_go_source
-                    .as_ref()
-                    .map(|source| source.artifact.sha256())
-                    .unwrap_or_else(|| production.key.input_digest());
-                let activation_evidence = activation_evidence(dependency, activation_digest);
+                let activation_evidence = activation_evidence(
+                    dependency,
+                    production.key.input_digest(),
+                    &exact_artifacts,
+                );
                 evidence.push(activation_evidence.clone());
                 packs.push(PreparedDependencyPack {
                     dependency_id: dependency.id.clone(),
@@ -876,7 +1034,13 @@ fn prepare_produced_dependency_semantic_packs(
                 });
                 profile.generated_packs += 1;
             }
-            Err(error) => diagnostics.catalog(Some(&dependency.id), "catalog.install", error),
+            Err(error) => {
+                failures.push(DependencyPreparationFailure {
+                    dependency_id: dependency.id.clone(),
+                    cause: DependencyPreparationFailureCause::Rejected,
+                });
+                diagnostics.catalog(Some(&dependency.id), "catalog.install", error);
+            }
         }
     }
 
@@ -917,6 +1081,7 @@ fn prepare_produced_dependency_semantic_packs(
         }
     }
     let complete = !cancelled
+        && failures.is_empty()
         && dependencies.len() <= limits.max_dependencies
         && packs
             .len()
@@ -933,6 +1098,7 @@ fn prepare_produced_dependency_semantic_packs(
             .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error);
     crate::profiling::note_with(|| format!("semantic_pack.preparation_profile {profile:?}"));
     DependencyPackPreparationOutcome {
+        failures,
         packs,
         installed_packs,
         evidence,
@@ -963,6 +1129,7 @@ pub fn prepare_compatible_installed_semantic_packs(
     cancellation: Option<&CancellationToken>,
 ) -> DependencyPackPreparationOutcome {
     let mut diagnostics = catalog_diagnostics(catalog, limits);
+    let mut failures = Vec::new();
     let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
     let mut profile = DependencyPackPreparationProfile::default();
@@ -989,6 +1156,10 @@ pub fn prepare_compatible_installed_semantic_packs(
             break;
         }
         profile.dependencies_considered += 1;
+        let rejected = || DependencyPreparationFailure {
+            dependency_id: dependency.id.clone(),
+            cause: DependencyPreparationFailureCause::Rejected,
+        };
         if dependency.id.is_empty() {
             failed = true;
             diagnostics.error(
@@ -997,14 +1168,21 @@ pub fn prepare_compatible_installed_semantic_packs(
                 None,
                 "resolved dependency identity must not be empty",
             );
+            failures.push(rejected());
             continue;
         }
+        if let Err(error) =
+            record_obsolete_dependency_candidates(catalog, dependency, &mut diagnostics)
+        {
+            diagnostics.warning("catalog.revision_probe", Some(&dependency.id), format!("preliminary producer revision lookup failed; installed selection will retry: {error}"));
+        }
         match compatible_curated_installed_pack(catalog, dependency) {
-            Ok(Some(installed)) => {
-                evidence.push(installed.evidence.clone());
-                installed_packs.push(installed);
-                profile.installed_packs += 1;
-            }
+            Ok(Some(installed)) => activate_installed_pack(
+                installed,
+                &mut evidence,
+                &mut installed_packs,
+                &mut profile,
+            ),
             Ok(None) => match installed_pack_query(dependency)
                 .map(|query| catalog.version_near_misses(&query))
             {
@@ -1019,12 +1197,14 @@ pub fn prepare_compatible_installed_semantic_packs(
                 }
                 Some(Err(error)) => {
                     failed = true;
+                    failures.push(rejected());
                     diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
                 }
                 None => {}
             },
             Err(error) => {
                 failed = true;
+                failures.push(rejected());
                 diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
             }
         }
@@ -1046,6 +1226,7 @@ pub fn prepare_compatible_installed_semantic_packs(
     let complete = !failed && dependencies.len() <= limits.max_dependencies;
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     DependencyPackPreparationOutcome {
+        failures,
         packs: Vec::new(),
         installed_packs,
         evidence,
@@ -1094,6 +1275,7 @@ pub fn prepare_installed_dependency_packs(
     cancellation: Option<&CancellationToken>,
 ) -> InstalledDependencyPackPreparation {
     let mut diagnostics = catalog_diagnostics(catalog, limits);
+    let mut failures = Vec::new();
     let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
     let mut profile = DependencyPackPreparationProfile::default();
@@ -1122,6 +1304,10 @@ pub fn prepare_installed_dependency_packs(
             break;
         }
         profile.dependencies_considered += 1;
+        let rejected = || DependencyPreparationFailure {
+            dependency_id: dependency.id.clone(),
+            cause: DependencyPreparationFailureCause::Rejected,
+        };
         if dependency.id.is_empty() {
             failed = true;
             diagnostics.error(
@@ -1130,39 +1316,71 @@ pub fn prepare_installed_dependency_packs(
                 None,
                 "resolved dependency identity must not be empty",
             );
+            failures.push(rejected());
             continue;
         }
-        let producible = !dependency.artifacts.is_empty() && adapter.can_produce(dependency);
         let mut settled = false;
-        if producible {
-            match compatible_curated_installed_pack(catalog, dependency) {
-                Ok(Some(installed)) => {
-                    // The full stage selects this same pack instead of
-                    // producing when the reviewed pack supersedes production.
-                    settled = adapter.reviewed_pack_supersedes_production(dependency);
-                    evidence.push(installed.evidence.clone());
-                    installed_packs.push(installed);
-                    profile.installed_packs += 1;
+        match selected_dependency_provider(catalog, adapter, dependency, limits).and_then(
+            |choice| {
+                record_dependency_candidate_findings(
+                    catalog,
+                    &dependency.id,
+                    choice.findings,
+                    &mut diagnostics,
+                )?;
+                for warning in &choice.warnings {
+                    diagnostics.warning(
+                        "installed.not-activation-ready",
+                        Some(&dependency.id),
+                        warning.clone(),
+                    );
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    failed = true;
-                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                if choice.installed.is_some()
+                    && !choice.has_complete_candidate
+                    && (dependency.artifacts.is_empty() || !adapter.can_produce(dependency))
+                    && let Some(query) = installed_pack_query(dependency)
+                {
+                    for near_miss in catalog.version_near_misses(&query)? {
+                        diagnostics.warning(
+                            "dependency.pack_version_mismatch",
+                            Some(&dependency.id),
+                            near_miss.describe(),
+                        );
+                    }
+                }
+                Ok((choice.installed, choice.settled))
+            },
+        ) {
+            Ok((installed, is_settled)) => {
+                settled = is_settled;
+                if let Some(installed) = installed {
+                    if is_settled && !installed.activation_ready {
+                        // The pack is activated below either way. A curated
+                        // selection is trusted without certified accounting;
+                        // any other uncertified pack leaves the preparation
+                        // incomplete, as its partial coverage does at the
+                        // activation stage. It is never a failure record.
+                        match selects_curated_dependency_pack(catalog, adapter, dependency) {
+                            Ok(true) => {}
+                            Ok(false) => failed = true,
+                            Err(error) => {
+                                failed = true;
+                                settled = false;
+                                diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                            }
+                        }
+                    }
+                    activate_installed_pack(
+                        installed,
+                        &mut evidence,
+                        &mut installed_packs,
+                        &mut profile,
+                    );
                 }
             }
-        } else {
-            match compatible_installed_pack(catalog, dependency, &mut diagnostics) {
-                Ok(Some(installed)) => {
-                    settled = true;
-                    evidence.push(installed.evidence.clone());
-                    installed_packs.push(installed);
-                    profile.installed_packs += 1;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    failed = true;
-                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
-                }
+            Err(error) => {
+                failed = true;
+                diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
             }
         }
         if !settled {
@@ -1182,10 +1400,11 @@ pub fn prepare_installed_dependency_packs(
             "dependency semantic-pack preparation was cancelled",
         );
     }
-    let complete = !failed && !cancelled && !required_pending;
+    let complete = !failed && !cancelled && !required_pending && failures.is_empty();
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     InstalledDependencyPackPreparation {
         outcome: DependencyPackPreparationOutcome {
+            failures,
             packs: Vec::new(),
             installed_packs,
             evidence,
@@ -1203,18 +1422,24 @@ pub(crate) fn reusable_generated_pack(
     catalog: &SemanticPackCatalog,
     key: &GeneratedProductionKey,
     dependency: &ResolvedDependency,
-    input_digest: &str,
-    exact_source_sha256: Option<&str>,
+    _input_digest: &str,
+    _exact_source_sha256: Option<&str>,
 ) -> Result<Option<PreparedDependencyPack>, CatalogError> {
     let Some(production) = catalog.generated_production(key)? else {
         return Ok(None);
     };
+    let Some(slots) = catalog.generated_input_slots(&production.key)? else {
+        return Ok(None);
+    };
+    let mut evidence = dependency.evidence.clone();
+    evidence.verified_raw_artifacts = slots;
+    evidence.production_input_digest = Some(production.key.input_digest().to_owned());
     Ok(Some(PreparedDependencyPack {
         dependency_id: dependency.id.clone(),
         completeness: production.completeness,
         production,
         status: DependencyPackPreparationStatus::Reused,
-        evidence: activation_evidence(dependency, exact_source_sha256.unwrap_or(input_digest)),
+        evidence,
     }))
 }
 
@@ -1227,21 +1452,30 @@ pub(crate) fn reusable_generated_pack(
 pub(crate) fn reusable_generated_pack_by_source_identity(
     catalog: &SemanticPackCatalog,
     producer: &Producer,
+    schema_version: u32,
     identity: &DependencySourceIdentity,
     dependency: &ResolvedDependency,
 ) -> Result<Option<PreparedDependencyPack>, CatalogError> {
-    let Some(production) =
-        catalog.generated_production_by_source_identity(identity.as_str(), producer)?
+    let Some(production) = catalog.generated_production_by_source_identity(
+        identity.as_str(),
+        producer,
+        schema_version,
+    )?
     else {
         return Ok(None);
     };
-    let input_digest = production.key.input_digest().to_owned();
+    let Some(slots) = catalog.generated_input_slots(&production.key)? else {
+        return Ok(None);
+    };
+    let mut evidence = dependency.evidence.clone();
+    evidence.verified_raw_artifacts = slots;
+    evidence.production_input_digest = Some(production.key.input_digest().to_owned());
     Ok(Some(PreparedDependencyPack {
         dependency_id: dependency.id.clone(),
         completeness: production.completeness,
         production,
         status: DependencyPackPreparationStatus::Reused,
-        evidence: activation_evidence(dependency, &input_digest),
+        evidence,
     }))
 }
 
@@ -1291,11 +1525,17 @@ pub(crate) fn resolve_declared_dependency_pack(
     dependency: &ResolvedDependency,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut BoundedDependencyDiagnostics,
+    failures: &mut Vec<DependencyPreparationFailure>,
 ) -> Result<Option<PreparedInstalledDependencyPack>, DeclaredPackCancelled> {
+    let rejected = || DependencyPreparationFailure {
+        dependency_id: dependency.id.clone(),
+        cause: DependencyPreparationFailureCause::Rejected,
+    };
     match compatible_installed_pack(catalog, dependency, diagnostics) {
         Ok(Some(installed)) => return Ok(Some(installed)),
         Ok(None) => {}
         Err(error) => {
+            failures.push(rejected());
             diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
             return Ok(None);
         }
@@ -1305,8 +1545,13 @@ pub(crate) fn resolve_declared_dependency_pack(
     // statement, so no pack serving it is no defect to report: the pack is
     // offered to the acquisition hook and otherwise simply not selected.
     let assumed = dependency.is_assumed();
-    let unavailable = |diagnostics: &mut BoundedDependencyDiagnostics| {
+    let unavailable = |diagnostics: &mut BoundedDependencyDiagnostics,
+                       failures: &mut Vec<DependencyPreparationFailure>| {
         if !assumed {
+            failures.push(DependencyPreparationFailure {
+                dependency_id: dependency.id.clone(),
+                cause: DependencyPreparationFailureCause::PackUnavailable,
+            });
             diagnostics.error(
                 "dependency.pack_unavailable",
                 Some(&dependency.id),
@@ -1323,17 +1568,22 @@ pub(crate) fn resolve_declared_dependency_pack(
     // release bundle already supplied a pack for this coordinate, and the
     // version the workspace declares is what does not match.
     let Some(query) = installed_pack_query(dependency) else {
-        unavailable(diagnostics);
+        unavailable(diagnostics, failures);
         return Ok(None);
     };
     let near_misses = match catalog.version_near_misses(&query) {
         Ok(near_misses) => near_misses,
         Err(error) => {
+            failures.push(rejected());
             diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
             return Ok(None);
         }
     };
     if !near_misses.is_empty() && !assumed {
+        failures.push(DependencyPreparationFailure {
+            dependency_id: dependency.id.clone(),
+            cause: DependencyPreparationFailureCause::Rejected,
+        });
         for near_miss in near_misses {
             diagnostics.error(
                 "dependency.pack_version_mismatch",
@@ -1346,7 +1596,7 @@ pub(crate) fn resolve_declared_dependency_pack(
     }
 
     let Some(acquire) = semantic_pack_acquisition_hook() else {
-        unavailable(diagnostics);
+        unavailable(diagnostics, failures);
         return Ok(None);
     };
     if is_cancelled(cancellation) {
@@ -1363,17 +1613,79 @@ pub(crate) fn resolve_declared_dependency_pack(
             format!("could not acquire declared dependency semantic pack: {error}"),
         );
     }
+    if is_cancelled(cancellation) {
+        return Err(DeclaredPackCancelled);
+    }
     match compatible_installed_pack(catalog, dependency, diagnostics) {
         Ok(Some(installed)) => Ok(Some(installed)),
         Ok(None) => {
-            unavailable(diagnostics);
+            unavailable(diagnostics, failures);
             Ok(None)
         }
         Err(error) => {
+            failures.push(rejected());
             diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
             Ok(None)
         }
     }
+}
+
+/// All compatible manifests are kept in ascending digest order, deduplicated.
+/// Curated providers may be retained without settling a producible dependency.
+/// Findings are data: only the live acquisition caller applies their actions.
+pub(crate) fn selected_dependency_provider(
+    reads: &impl DependencyProviderReads,
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+    limits: &DependencyPackLimits,
+) -> Result<DependencyProviderChoice, CatalogError> {
+    let (mut candidates, findings) = installed_candidates(reads, dependency)?;
+    let producible = !dependency.artifacts.is_empty() && adapter.can_produce(dependency);
+    if producible {
+        retain_curated_candidates(&mut candidates);
+    } else {
+        retain_installed_candidates(&mut candidates);
+    }
+    let warnings = if producible {
+        Vec::new()
+    } else {
+        candidates
+            .iter()
+            .filter(|candidate| !candidate.activation_ready)
+            .map(|candidate| candidate.not_activation_ready.clone())
+            .collect()
+    };
+    let has_complete_candidate = candidates
+        .iter()
+        .any(|candidate| candidate.completeness == Completeness::Complete);
+    let installed = prepared_installed_pack(dependency, &candidates);
+    let settled = installed.is_some()
+        && (!producible || adapter.reviewed_pack_supersedes_production(dependency));
+    let production = if settled || !producible {
+        None
+    } else {
+        pinned_generated_production_key(adapter, dependency, limits)?
+    };
+    Ok(DependencyProviderChoice {
+        installed,
+        settled,
+        production,
+        findings,
+        warnings,
+        has_complete_candidate,
+    })
+}
+
+pub struct DependencyProviderChoice {
+    pub installed: Option<PreparedInstalledDependencyPack>,
+    pub settled: bool,
+    /// Exact production key for an unsettled, producible dependency when its
+    /// artifacts are pinned. Otherwise the request retains its existing
+    /// source-identity or missing-production expectation when `settled` is false.
+    pub production: Option<GeneratedProductionKey>,
+    pub findings: Vec<(String, CatalogError)>,
+    warnings: Vec<String>,
+    has_complete_candidate: bool,
 }
 
 pub(crate) fn compatible_installed_pack(
@@ -1413,8 +1725,7 @@ pub(crate) fn compatible_installed_pack_evaluation(
     // This route acquires a pack when no installation serves the coordinate.
     // A reviewed workspace model is not an installation, so it neither stands
     // in for that acquisition nor answers as the coordinate's pack here.
-    candidates
-        .retain(|candidate| candidate.source_kind != CatalogPackSourceKind::EphemeralWorkspace);
+    retain_installed_candidates(&mut candidates);
     let has_complete_candidate = candidates
         .iter()
         .any(|candidate| candidate.completeness == Completeness::Complete);
@@ -1438,10 +1749,21 @@ pub(crate) fn compatible_curated_installed_pack(
     dependency: &ResolvedDependency,
 ) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
     let mut candidates = compatible_installed_pack_candidates(catalog, dependency)?;
+    retain_curated_candidates(&mut candidates);
+    Ok(prepared_installed_pack(dependency, &candidates))
+}
+
+fn retain_installed_candidates(candidates: &mut Vec<InstalledPackCandidateEvaluation>) {
+    candidates
+        .retain(|candidate| candidate.source_kind != CatalogPackSourceKind::EphemeralWorkspace);
+}
+
+fn retain_curated_candidates(candidates: &mut Vec<InstalledPackCandidateEvaluation>) {
     if candidates.iter().any(|candidate| {
         !candidate.activation_ready && candidate.source_kind == CatalogPackSourceKind::Installed
     }) {
-        return Ok(None);
+        candidates.clear();
+        return;
     }
     candidates.retain(|candidate| {
         candidate.activation_ready
@@ -1452,7 +1774,6 @@ pub(crate) fn compatible_curated_installed_pack(
                     | CatalogPackSourceKind::EphemeralWorkspace
             )
     });
-    Ok(prepared_installed_pack(dependency, &candidates))
 }
 
 #[derive(Debug)]
@@ -1469,12 +1790,22 @@ pub(crate) fn compatible_installed_pack_candidates(
     catalog: &SemanticPackCatalog,
     dependency: &ResolvedDependency,
 ) -> Result<Vec<InstalledPackCandidateEvaluation>, CatalogError> {
+    let (candidates, findings) = installed_candidates(catalog, dependency)?;
+    catalog.apply_candidate_findings(findings)?;
+    Ok(candidates)
+}
+
+fn installed_candidates(
+    reads: &impl DependencyProviderReads,
+    dependency: &ResolvedDependency,
+) -> Result<CandidateSelection<InstalledPackCandidateEvaluation>, CatalogError> {
     let Some(query) = installed_pack_query(dependency) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let mut candidates = Vec::new();
     let mut accounted_manifests: HashSet<String> = set_with_capacity(4);
-    for candidate in catalog.dependency_candidates(&query)? {
+    let (selected, findings) = reads.provider_candidates(&query)?;
+    for candidate in selected {
         if !matches!(
             candidate.source_kind(),
             CatalogPackSourceKind::Installed
@@ -1485,7 +1816,7 @@ pub(crate) fn compatible_installed_pack_candidates(
             continue;
         }
         if accounted_manifests.insert(candidate.manifest_digest().to_owned()) {
-            let extraction = catalog.extraction_accounting(candidate.manifest_digest())?;
+            let extraction = reads.provider_extraction(candidate.manifest_digest())?;
             let candidate_ready = crate::analyzer::semantic_model::pack_is_activation_ready(
                 candidate.completeness(),
                 extraction.as_ref(),
@@ -1506,7 +1837,7 @@ pub(crate) fn compatible_installed_pack_candidates(
             });
         }
     }
-    Ok(candidates)
+    Ok((candidates, findings))
 }
 
 pub(crate) fn prepared_installed_pack(
@@ -1650,13 +1981,402 @@ pub(crate) mod declared_pack_acquisition_tests {
                 }),
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: Vec::new(),
             artifacts: Vec::new(),
             scope: DependencyScope::Unknown,
             declared_by: None,
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: early terminal rejections vanished when diagnostics were suppressed"
+    )]
+    fn terminal_records_survive_suppression_but_exclude_unattempted_work() {
+        use super::*;
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut dependency = declared_python_dependency();
+        dependency.artifacts.push(ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Sources,
+            crate::analyzer::semantic_model::ExternalArtifactKind::PythonSource,
+            root.path().join("not-read.py"),
+        ));
+        let mut limits = DependencyPackLimits {
+            max_artifacts_per_dependency: 0,
+            max_diagnostics: 0,
+            ..Default::default()
+        };
+        let live = CancellationToken::default();
+        for invalid_provenance in [false, true] {
+            if invalid_provenance {
+                limits.max_artifacts_per_dependency = 1;
+                dependency.provenance.push(DependencyProvenance {
+                    key: String::new(),
+                    value: "invalid".into(),
+                });
+            }
+            let outcome = prepare_dependency_semantic_packs(
+                &catalog,
+                &NeverProducingAdapter,
+                std::slice::from_ref(&dependency),
+                &limits,
+                Some(&live),
+            );
+            assert!(outcome.diagnostics.is_empty(), "{outcome:#?}");
+            assert_eq!(
+                outcome.failures,
+                vec![DependencyPreparationFailure {
+                    dependency_id: dependency.id.clone(),
+                    cause: DependencyPreparationFailureCause::Rejected,
+                }]
+            );
+        }
+        limits.max_dependencies = 0;
+        let unattempted = prepare_dependency_semantic_packs(
+            &catalog,
+            &NeverProducingAdapter,
+            std::slice::from_ref(&dependency),
+            &limits,
+            Some(&live),
+        );
+        assert!(unattempted.failures.is_empty(), "{unattempted:#?}");
+        limits.max_dependencies = 1;
+        live.cancel();
+        let cancelled = prepare_dependency_semantic_packs(
+            &catalog,
+            &NeverProducingAdapter,
+            &[dependency],
+            &limits,
+            Some(&live),
+        );
+        assert!(cancelled.cancelled);
+        assert!(cancelled.failures.is_empty(), "{cancelled:#?}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: cancellation inside a NoPack producer was recorded as terminal failure"
+    )]
+    fn cancelled_no_pack_producer_records_no_failure() {
+        use super::*;
+        struct CancellingProducer;
+        impl DependencyPackAdapter for CancellingProducer {
+            fn adapter_name(&self) -> &str {
+                "cancelled-fixture"
+            }
+            fn adapter_version(&self) -> &str {
+                "1"
+            }
+            fn producer(&self) -> Producer {
+                NeverProducingAdapter.producer()
+            }
+            fn produce(
+                &self,
+                _: &ResolvedDependency,
+                _: &[ExactDependencyArtifact],
+                _: &crate::analyzer::semantic_model::producer::ArtifactProducerLimits,
+                cancellation: Option<&CancellationToken>,
+            ) -> DependencyPackProduction {
+                if let Some(cancellation) = cancellation {
+                    cancellation.cancel();
+                }
+                DependencyPackProduction {
+                    pack: None,
+                    diagnostics: Vec::new(),
+                    suppressed_diagnostics: Default::default(),
+                }
+            }
+        }
+        let _fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("types.pyi");
+        std::fs::write(&path, "class NoneType: ...\n").unwrap();
+        let mut dependency = declared_python_dependency();
+        dependency.artifacts.push(ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Declarations,
+            crate::analyzer::semantic_model::ExternalArtifactKind::PythonSource,
+            path,
+        ));
+        let terminal = prepare_dependency_semantic_packs(
+            &catalog,
+            &CancellingProducer,
+            std::slice::from_ref(&dependency),
+            &Default::default(),
+            None,
+        );
+        assert!(!terminal.complete, "{terminal:#?}");
+        assert!(!terminal.cancelled, "{terminal:#?}");
+        assert!(terminal.packs.is_empty(), "{terminal:#?}");
+        assert_eq!(
+            terminal.failures,
+            vec![super::DependencyPreparationFailure {
+                dependency_id: dependency.id.clone(),
+                cause: super::DependencyPreparationFailureCause::ProducerFailed,
+            }]
+        );
+        let cancellation = CancellationToken::default();
+        let outcome = prepare_dependency_semantic_packs(
+            &catalog,
+            &CancellingProducer,
+            &[dependency],
+            &Default::default(),
+            Some(&cancellation),
+        );
+        assert!(
+            cancellation.is_cancelled(),
+            "producer must have been invoked"
+        );
+        assert!(outcome.cancelled, "{outcome:#?}");
+        assert!(!outcome.complete, "{outcome:#?}");
+        assert!(outcome.failures.is_empty(), "{outcome:#?}");
+        assert!(outcome.packs.is_empty(), "{outcome:#?}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "68cfca6ab74a+f728c64932b3: an unusable installed pack had no terminal preparation record, and then an activated uncertified pack was also recorded as quarantined"
+    )]
+    fn uncertified_installed_pack_is_active_and_not_a_failure() {
+        let fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let partial = CPYTHON_PACK.replacen(
+            "\"completeness\": \"complete\"",
+            "\"completeness\": \"partial\"",
+            1,
+        );
+        install_fixture_pack(&catalog, &compiled_pack(&partial)).unwrap();
+        let outcome = prepare(&catalog, declared_python_dependency());
+        assert!(fixture.requests().is_empty());
+        // The pack is installed and activated, so it is not a failure. Its
+        // uncertified accounting still leaves the preparation incomplete.
+        assert!(!outcome.installed_packs[0].activation_ready);
+        assert_eq!(
+            outcome.installed_packs[0].completeness,
+            Completeness::Partial
+        );
+        assert_eq!(outcome.evidence.len(), 1, "{outcome:#?}");
+        assert!(outcome.failures.is_empty(), "{outcome:#?}");
+        assert!(!outcome.complete, "{outcome:#?}");
+        let installed_only = super::prepare_installed_dependency_packs(
+            &catalog,
+            &NeverProducingAdapter,
+            &[declared_python_dependency()],
+            &Default::default(),
+            None,
+        );
+        assert!(installed_only.pending.is_empty(), "{installed_only:#?}");
+        assert!(!installed_only.outcome.complete, "{installed_only:#?}");
+        assert!(
+            installed_only.outcome.failures.is_empty(),
+            "{installed_only:#?}"
+        );
+        assert_eq!(installed_only.outcome.evidence, outcome.evidence);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "cbc09cd693b2: usable partial packs were incorrectly classified as preparation failures"
+    )]
+    fn partial_generated_and_reused_packs_have_no_preparation_failure() {
+        use super::*;
+        struct PartialProducer;
+        impl DependencyPackAdapter for PartialProducer {
+            fn adapter_name(&self) -> &str {
+                "partial-fixture"
+            }
+            fn adapter_version(&self) -> &str {
+                "1"
+            }
+            fn production_schema_version(&self) -> u32 {
+                crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
+            }
+            fn producer(&self) -> Producer {
+                Producer {
+                    name: "bifrost-fixture".into(),
+                    version: "1.0.0".into(),
+                }
+                .with_dependency_revision()
+            }
+            fn produce(
+                &self,
+                _: &ResolvedDependency,
+                _: &[ExactDependencyArtifact],
+                _: &crate::analyzer::semantic_model::producer::ArtifactProducerLimits,
+                _: Option<&CancellationToken>,
+            ) -> DependencyPackProduction {
+                let mut pack: crate::analyzer::semantic_model::AuthoredSemanticModelPack =
+                    serde_json::from_str(CPYTHON_PACK).unwrap();
+                pack.schema_version =
+                    crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION;
+                pack.compatibility.bifrost = None;
+                pack.producer = self.producer();
+                pack.completeness = Completeness::Partial;
+                DependencyPackProduction {
+                    pack: Some(pack),
+                    diagnostics: Vec::new(),
+                    suppressed_diagnostics: Default::default(),
+                }
+            }
+        }
+        let _fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("types.pyi");
+        std::fs::write(&path, "class NoneType: ...\n").unwrap();
+        let mut dependency = declared_python_dependency();
+        dependency.artifacts.push(ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Declarations,
+            crate::analyzer::semantic_model::ExternalArtifactKind::PythonSource,
+            path,
+        ));
+        let limits = DependencyPackLimits {
+            max_diagnostics: 0,
+            ..Default::default()
+        };
+        for status in [
+            DependencyPackPreparationStatus::Generated,
+            DependencyPackPreparationStatus::Reused,
+        ] {
+            let outcome = prepare_dependency_semantic_packs(
+                &catalog,
+                &PartialProducer,
+                std::slice::from_ref(&dependency),
+                &limits,
+                None,
+            );
+            assert!(!outcome.complete, "{outcome:#?}");
+            assert!(outcome.diagnostics.is_empty(), "{outcome:#?}");
+            assert_eq!(outcome.packs.len(), 1, "{outcome:#?}");
+            assert_eq!(outcome.packs[0].status, status);
+            assert!(outcome.failures.is_empty(), "{outcome:#?}");
+            assert_eq!(outcome.packs[0].completeness, Completeness::Partial);
+            // Read back the installed manifest, rather than the producer's
+            // transient completeness: dependency gaps rely on this content.
+            let inventory = catalog.inventory_bounded(1).unwrap();
+            assert!(inventory.complete);
+            assert_eq!(inventory.packs.len(), 1);
+            assert_eq!(inventory.packs[0].completeness, Completeness::Partial);
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: installed preparation quarantined accepted trusted partial packs"
+    )]
+    fn trusted_partial_packs_agree_between_preparation_stages() {
+        use super::*;
+        struct CuratedAdapter;
+        impl DependencyPackAdapter for CuratedAdapter {
+            fn adapter_name(&self) -> &str {
+                "curated-fixture"
+            }
+            fn adapter_version(&self) -> &str {
+                "1"
+            }
+            fn producer(&self) -> Producer {
+                NeverProducingAdapter.producer()
+            }
+            fn installed_packs_only(&self, dependency: &ResolvedDependency) -> bool {
+                dependency.artifacts.is_empty()
+            }
+            fn reviewed_pack_supersedes_production(&self, _: &ResolvedDependency) -> bool {
+                true
+            }
+            fn produce(
+                &self,
+                _: &ResolvedDependency,
+                _: &[ExactDependencyArtifact],
+                _: &crate::analyzer::semantic_model::producer::ArtifactProducerLimits,
+                _: Option<&CancellationToken>,
+            ) -> DependencyPackProduction {
+                unimplemented!("the curated provider settles this dependency")
+            }
+        }
+        let _fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let partial = CPYTHON_PACK.replacen(
+            "\"completeness\": \"complete\"",
+            "\"completeness\": \"partial\"",
+            1,
+        );
+        install_fixture_pack(&catalog, &compiled_pack(&partial)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut dependency = declared_python_dependency();
+        for artifacts in [
+            Vec::new(),
+            vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Declarations,
+                crate::analyzer::semantic_model::ExternalArtifactKind::PythonSource,
+                root.path().join("not-read.pyi"),
+            )],
+        ] {
+            dependency.artifacts = artifacts;
+            let full = prepare_dependency_semantic_packs(
+                &catalog,
+                &CuratedAdapter,
+                std::slice::from_ref(&dependency),
+                &Default::default(),
+                None,
+            );
+            let preliminary = prepare_installed_dependency_packs(
+                &catalog,
+                &CuratedAdapter,
+                std::slice::from_ref(&dependency),
+                &Default::default(),
+                None,
+            );
+            assert!(full.complete, "{full:#?}");
+            assert!(preliminary.outcome.complete, "{preliminary:#?}");
+            assert!(full.failures.is_empty(), "{full:#?}");
+            assert!(preliminary.outcome.failures.is_empty(), "{preliminary:#?}");
+            assert!(preliminary.pending.is_empty(), "{preliminary:#?}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: retryable installed-stage catalog errors were recorded as terminal"
+    )]
+    fn preliminary_lookup_error_remains_pending_until_full_preparation_retries() {
+        use super::*;
+        let _fixture = HookFixture::install(HookBehavior::RecordOnly);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        install_fixture_pack(&catalog, &compiled_pack(CPYTHON_PACK)).unwrap();
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE catalog_packs RENAME TO temporarily_unavailable_packs")
+            .unwrap();
+        let dependency = declared_python_dependency();
+        let preliminary = prepare_installed_dependency_packs(
+            &catalog,
+            &NeverProducingAdapter,
+            std::slice::from_ref(&dependency),
+            &Default::default(),
+            None,
+        );
+        assert!(!preliminary.outcome.complete, "{preliminary:#?}");
+        assert!(
+            !preliminary.outcome.diagnostics.is_empty(),
+            "{preliminary:#?}"
+        );
+        assert!(preliminary.outcome.failures.is_empty(), "{preliminary:#?}");
+        assert_eq!(preliminary.pending, vec![dependency.id.clone()]);
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE temporarily_unavailable_packs RENAME TO catalog_packs")
+            .unwrap();
+        let full = prepare(&catalog, dependency);
+        assert!(full.complete, "{full:#?}");
+        assert!(full.failures.is_empty(), "{full:#?}");
     }
 
     // Independent SHA-256 of the v1 source-set frame for api.go and GO_SOURCE,
@@ -1671,6 +2391,13 @@ pub(crate) mod declared_pack_acquisition_tests {
 
         assert_eq!(fixture.requests(), vec!["declared:python:cpython@3.10.0"]);
         assert_eq!(outcome.installed_packs.len(), 0);
+        assert_eq!(
+            outcome.failures,
+            vec![super::DependencyPreparationFailure {
+                dependency_id: declared_python_dependency().id,
+                cause: super::DependencyPreparationFailureCause::PackUnavailable,
+            }]
+        );
         assert_eq!(
             brokk_bifrost_analysis::analyzer::semantic_model::dependency::diagnostic_codes(
                 &outcome.diagnostics
@@ -1692,6 +2419,7 @@ pub(crate) mod declared_pack_acquisition_tests {
 
         assert!(fixture.requests().is_empty());
         assert_eq!(outcome.installed_packs.len(), 1);
+        assert!(outcome.failures.is_empty(), "{outcome:#?}");
         assert!(outcome.diagnostics.is_empty(), "{:#?}", outcome.diagnostics);
     }
 
@@ -1840,6 +2568,7 @@ mod membership_tests {
             _: &crate::analyzer::AnalyzerConfig,
             _: &dyn crate::analyzer::Project,
             _: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             _: &DependencyPackLimits,
             _: Option<&CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -1860,6 +2589,7 @@ mod membership_tests {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CapturedDependencyDiscovery {
     pub outcome: DependencyDiscoveryOutcome,
     pub(crate) rust_cargo_graph: Option<super::RustSelectedCargoGraph>,
@@ -1882,13 +2612,20 @@ pub fn capture_dependency_discovery(
     discover: impl FnOnce() -> DependencyDiscoveryOutcome,
 ) -> CapturedDependencyDiscovery {
     RUST_CARGO_GRAPH_CAPTURE.with(|slot| *slot.borrow_mut() = None);
-    let ((outcome, external_reads), project_reads) =
+    let ((outcome, mut external_reads), project_reads) =
         brokk_bifrost_core::analyzer::project_reads::with_project_read_suppression(false, || {
             crate::analyzer::i_analyzer::capture_with_read_ledger_scope(analyzer, None, || {
                 crate::analyzer::dependency_support::capture_external_discovery_reads(discover)
             })
         });
     let rust_cargo_graph = RUST_CARGO_GRAPH_CAPTURE.with(|slot| slot.borrow_mut().take());
+    // A project read that failed, an execution dependence or a refused reuse
+    // leaves no key (#13517): the discovery's diagnostics or results then
+    // stand for something the recorded reads cannot reproduce, so the capture
+    // must not be carried.
+    if !project_reads.is_bounded() {
+        external_reads.refuse_unbounded_project_reads();
+    }
     CapturedDependencyDiscovery {
         outcome,
         rust_cargo_graph,

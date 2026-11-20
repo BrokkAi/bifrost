@@ -293,6 +293,23 @@ impl TypestateFact {
         )
     }
 
+    /// A bound event applies only to a non-abstained state of its subject.
+    /// An abstained fact stays at the state where analysis stopped.
+    pub(crate) fn accepts_bound_event(self, subject: TypestateSubjectId) -> bool {
+        match self.0 {
+            TypestateFactKind::State {
+                subject: fact_subject,
+                abstained: false,
+                ..
+            } => fact_subject == subject,
+            TypestateFactKind::Zero
+            | TypestateFactKind::State { .. }
+            | TypestateFactKind::Violation { .. }
+            | TypestateFactKind::NonViolation { .. }
+            | TypestateFactKind::Terminal { .. } => false,
+        }
+    }
+
     pub const fn violation(self) -> Option<TypestateViolation> {
         match self.0 {
             TypestateFactKind::Violation { violation, .. } => Some(violation),
@@ -901,13 +918,23 @@ impl<'plan> TypestateFlowProblem<'plan> {
         root: &ProcedureHandle,
         entry_facts: &[TypestateFact],
     ) -> BTreeSet<TypestateSubjectId> {
-        self.bindings
+        let mut subjects = self
+            .bindings
             .initial_seeds()
             .iter()
             .filter(|binding| observation_site_procedure(binding.site()) == root)
             .map(BoundTypestateInitialSeed::subject)
             .chain(entry_facts.iter().filter_map(|fact| fact.subject()))
-            .collect()
+            .collect::<BTreeSet<_>>();
+        let mut pending = subjects.iter().copied().collect::<Vec<_>>();
+        while let Some(source) = pending.pop() {
+            for transfer in self.bindings.state_transfers_from(source) {
+                if subjects.insert(transfer.result) {
+                    pending.push(transfer.result);
+                }
+            }
+        }
+        subjects
     }
 
     fn bindings_complete(&self, subjects: &BTreeSet<TypestateSubjectId>) -> bool {
@@ -1058,8 +1085,44 @@ impl<'plan> TypestateFlowProblem<'plan> {
     ) -> bool {
         let mut facts = TransferFactSet::new(facts);
         let subject = facts.subject();
-        let mut eligible_events = Vec::new();
-        let mut modeled_external_effect_applied = false;
+        let has_transfer = self
+            .bindings
+            .state_transfers_at_edge(edge.origin(), edge.source())
+            .any(|transfer| transfer.source == subject && transfer.source != Some(transfer.result));
+        let mut transfer_source = None;
+        let call_noninterference = subject.is_some_and(|subject| {
+            self.bindings
+                .call_is_proven_noninterfering(subject, edge.origin(), edge.source())
+        });
+        // The uncertainty a dispatch boundary leaves on this edge, unless an
+        // authored external model or a noninterference proof accounts for the
+        // call.
+        //
+        // Every event bound on this edge is accounted for exactly once, in
+        // stage order. `apply_binding` applies a binding or resolves that
+        // binding's own uncertainty. A call-stage binding the boundary
+        // withholds may or may not have fired, so the boundary's uncertainty
+        // resolves it where it stands: a later event on the same call then
+        // sees both outcomes. Resolving withheld events after the edge's
+        // other events would reverse their order, and offering an applied
+        // binding to the boundary would fire the authored event twice.
+        let boundary_cause = edge
+            .boundary()
+            .filter(|_| {
+                !call_noninterference && !self.modeled_external_effect_applies(edge, subject)
+            })
+            .map(|boundary| match boundary {
+                crate::analyzer::semantic::DispatchBoundaryKind::External(_)
+                | crate::analyzer::semantic::DispatchBoundaryKind::Unmaterialized(_)
+                | crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. } => {
+                    ProtocolUncertaintyCause::ExternalCall
+                }
+                crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
+                | crate::analyzer::semantic::DispatchBoundaryKind::HierarchyUnenumerated
+                | crate::analyzer::semantic::DispatchBoundaryKind::Truncated => {
+                    ProtocolUncertaintyCause::UnknownCall
+                }
+            });
         for binding in self
             .bindings
             .event_bindings_at_program_point_all_contexts(edge.source())
@@ -1067,13 +1130,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
             if !out.should_continue() {
                 return false;
             }
-            if point_occurrence(self.protocol, binding.event()) {
-                if subject == Some(binding.subject()) {
-                    eligible_events.push(EligibleEvent::from_binding(binding));
-                }
-                if !self.apply_binding(&mut facts, binding, out) {
-                    return facts.emit(out);
-                }
+            if point_occurrence(self.protocol, binding.event())
+                && !self.apply_binding(&mut facts, binding, out)
+            {
+                return facts.emit(out);
             }
         }
         for binding in self
@@ -1103,18 +1163,18 @@ impl<'plan> TypestateFlowProblem<'plan> {
                             None,
                             true,
                         )
+                        && stages.is_empty()
+                        && edge.boundary().is_some_and(deferred_boundary)
+                        && !self.apply_binding(&mut facts, binding, out)
                     {
-                        modeled_external_effect_applied = true;
-                        if stages.is_empty() && edge.boundary().is_some_and(deferred_boundary) {
-                            eligible_events.push(EligibleEvent::from_binding(binding));
-                            if !self.apply_binding(&mut facts, binding, out) {
-                                return facts.emit(out);
-                            }
-                        }
+                        return facts.emit(out);
                     }
                 }
             }
             for stage in stages {
+                if *stage == CallStage::AfterNormalReturn && has_transfer {
+                    transfer_source = Some(facts.clone());
+                }
                 for binding in self.bindings.event_bindings_at_call_site_all_contexts(call) {
                     if !out.should_continue() {
                         return false;
@@ -1131,16 +1191,17 @@ impl<'plan> TypestateFlowProblem<'plan> {
                             )
                         })
                         && edge.boundary().is_some_and(modeled_external_boundary);
-                    modeled_external_effect_applied |= modeled_boundary;
                     if call_occurrence(self.protocol, binding.event(), *stage) {
-                        if subject == Some(binding.subject()) {
-                            eligible_events.push(EligibleEvent::from_binding(binding));
-                        }
                         if event_survives_dispatch_boundary(
                             edge.boundary(),
                             binding,
                             modeled_boundary,
-                        ) && !self.apply_binding(&mut facts, binding, out)
+                        ) {
+                            if !self.apply_binding(&mut facts, binding, out) {
+                                return facts.emit(out);
+                            }
+                        } else if let Some(cause) = boundary_cause
+                            && !self.apply_withheld_binding(&mut facts, binding, cause, out)
                         {
                             return facts.emit(out);
                         }
@@ -1169,18 +1230,18 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 {
                     if subject == Some(binding.subject())
                         && binding.modeled_external_effect().is_some()
+                        && stages.is_empty()
+                        && edge.boundary().is_some_and(deferred_boundary)
+                        && !self.apply_binding(&mut facts, binding, out)
                     {
-                        modeled_external_effect_applied = true;
-                        if stages.is_empty() && edge.boundary().is_some_and(deferred_boundary) {
-                            eligible_events.push(EligibleEvent::from_binding(binding));
-                            if !self.apply_binding(&mut facts, binding, out) {
-                                return facts.emit(out);
-                            }
-                        }
+                        return facts.emit(out);
                     }
                 }
             }
             for stage in stages {
+                if *stage == CallStage::AfterNormalReturn && has_transfer {
+                    transfer_source = Some(facts.clone());
+                }
                 for binding in self
                     .bindings
                     .event_bindings_at_call_program_point_all_contexts(edge.source())
@@ -1191,16 +1252,17 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     let modeled_boundary = subject == Some(binding.subject())
                         && binding.modeled_external_effect().is_some()
                         && edge.boundary().is_some_and(modeled_external_boundary);
-                    modeled_external_effect_applied |= modeled_boundary;
                     if call_occurrence(self.protocol, binding.event(), *stage) {
-                        if subject == Some(binding.subject()) {
-                            eligible_events.push(EligibleEvent::from_binding(binding));
-                        }
                         if event_survives_dispatch_boundary(
                             edge.boundary(),
                             binding,
                             modeled_boundary,
-                        ) && !self.apply_binding(&mut facts, binding, out)
+                        ) {
+                            if !self.apply_binding(&mut facts, binding, out) {
+                                return facts.emit(out);
+                            }
+                        } else if let Some(cause) = boundary_cause
+                            && !self.apply_withheld_binding(&mut facts, binding, cause, out)
                         {
                             return facts.emit(out);
                         }
@@ -1221,45 +1283,21 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 }
             }
         }
-        eligible_events.sort_unstable();
-        eligible_events.dedup();
-
-        let call_noninterference = subject.is_some_and(|subject| {
-            self.bindings
-                .call_is_proven_noninterfering(subject, edge.origin(), edge.source())
-        });
-
-        if let Some(boundary) = edge.boundary() {
-            if !modeled_external_effect_applied && !call_noninterference {
-                let cause = match boundary {
-                    crate::analyzer::semantic::DispatchBoundaryKind::External(_)
-                    | crate::analyzer::semantic::DispatchBoundaryKind::Unmaterialized(_)
-                    | crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. } => {
-                        ProtocolUncertaintyCause::ExternalCall
-                    }
-                    crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
-                    | crate::analyzer::semantic::DispatchBoundaryKind::HierarchyUnenumerated
-                    | crate::analyzer::semantic::DispatchBoundaryKind::Truncated => {
-                        ProtocolUncertaintyCause::UnknownCall
-                    }
-                };
-                if !facts.map_stream(out, |fact, emit| {
-                    self.emit_uncertainty(fact, cause, &eligible_events, emit)
-                }) {
-                    return facts.emit(out);
-                }
+        if edge.boundary().is_some() {
+            if let Some(cause) = boundary_cause
+                && !self.apply_edge_uncertainty(&mut facts, &mut transfer_source, cause, out)
+            {
+                return facts.emit(out);
             }
-        } else if (!matches!(edge.proof(), ProofStatus::Proven)
+        } else if ((!matches!(edge.proof(), ProofStatus::Proven) && !edge.analyzed_family_arm())
             || !matches!(edge.completeness(), EvidenceCompleteness::Complete))
             && !call_noninterference
-            && !facts.map_stream(out, |fact, emit| {
-                self.emit_uncertainty(
-                    fact,
-                    ProtocolUncertaintyCause::IncompleteAnalysis,
-                    &eligible_events,
-                    emit,
-                )
-            })
+            && !self.apply_edge_uncertainty(
+                &mut facts,
+                &mut transfer_source,
+                ProtocolUncertaintyCause::IncompleteAnalysis,
+                out,
+            )
         {
             return facts.emit(out);
         }
@@ -1274,13 +1312,10 @@ impl<'plan> TypestateFlowProblem<'plan> {
             if !out.should_continue() {
                 return false;
             }
-            if exit_point_occurrence(self.protocol, binding.event(), edge.target()) {
-                if subject == Some(binding.subject()) {
-                    eligible_events.push(EligibleEvent::from_binding(binding));
-                }
-                if !self.apply_binding(&mut facts, binding, out) {
-                    return facts.emit(out);
-                }
+            if exit_point_occurrence(self.protocol, binding.event(), edge.target())
+                && !self.apply_binding(&mut facts, binding, out)
+            {
+                return facts.emit(out);
             }
         }
         for binding in self
@@ -1297,7 +1332,248 @@ impl<'plan> TypestateFlowProblem<'plan> {
             }
         }
 
+        let call_stages = if edge.origin().is_some() {
+            family.stages(edge.kind())
+        } else {
+            family.originless_call_stages()
+        };
+        if call_stages.contains(&CallStage::AfterNormalReturn) {
+            for transfer in self
+                .bindings
+                .state_transfers_at_edge(edge.origin(), edge.source())
+            {
+                if !out.should_continue() {
+                    return false;
+                }
+                // The same subject already observed this edge's events.
+                if transfer.source != subject || transfer.source == Some(transfer.result) {
+                    continue;
+                }
+                // The source's before-call observations have run; its return
+                // observations must not change the state inherited by a copy.
+                let copied = transfer_source
+                    .as_ref()
+                    .expect("normal-return transfer captured its source")
+                    .facts()
+                    .iter()
+                    .filter_map(|fact| {
+                        let TypestateFactKind::State {
+                            plan,
+                            subject,
+                            state,
+                            uncertainty,
+                            abstained,
+                        } = fact.0
+                        else {
+                            return None;
+                        };
+                        (transfer.source == Some(subject)).then(|| {
+                            TypestateFact::summary_state(
+                                plan,
+                                transfer.result,
+                                state,
+                                uncertainty,
+                                abstained,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if copied.is_empty() {
+                    continue;
+                }
+                let mut copied = TransferFactSet::new(copied);
+                let continuing = self.apply_transferred_result_observations(edge, &mut copied, out);
+                if !copied.emit(out) {
+                    return false;
+                }
+                if !continuing {
+                    return facts.emit(out);
+                }
+            }
+        }
         facts.emit(out)
+    }
+
+    /// Mark the edge's facts, and the state a transfer copies, with the
+    /// uncertainty the edge itself carries. The events bound on the edge are
+    /// already accounted for, so this fires none.
+    fn apply_edge_uncertainty(
+        &self,
+        facts: &mut TransferFactSet,
+        transfer_source: &mut Option<TransferFactSet>,
+        cause: ProtocolUncertaintyCause,
+        out: &dyn DataflowOutput<TypestateFact>,
+    ) -> bool {
+        if !facts.map_stream(out, |fact, emit| {
+            self.emit_uncertainty(fact, cause, &[], emit)
+        }) {
+            return false;
+        }
+        if let Some(source) = transfer_source {
+            return source.map_stream(out, |fact, emit| {
+                self.emit_uncertainty(fact, cause, &[], emit)
+            });
+        }
+        true
+    }
+
+    /// Resolve a call-stage binding a dispatch boundary withheld: the call may
+    /// or may not have fired it for this subject.
+    fn apply_withheld_binding(
+        &self,
+        facts: &mut TransferFactSet,
+        binding: &BoundTypestateEvent,
+        cause: ProtocolUncertaintyCause,
+        out: &dyn DataflowOutput<TypestateFact>,
+    ) -> bool {
+        facts.map_stream(out, |fact, emit| {
+            if fact.accepts_bound_event(binding.subject()) {
+                self.emit_uncertainty(fact, cause, &[EligibleEvent::from_binding(binding)], emit)
+            } else {
+                emit(fact)
+            }
+        })
+    }
+
+    /// Whether an authored external model accounts for this edge's dispatch
+    /// boundary for `subject`, so the boundary leaves no uncertainty of its
+    /// own.
+    fn modeled_external_effect_applies(
+        &self,
+        edge: DataflowEdge<'_, TypestateFact>,
+        subject: Option<TypestateSubjectId>,
+    ) -> bool {
+        if !edge.boundary().is_some_and(modeled_external_boundary) {
+            return false;
+        }
+        let modeled = |binding: &&BoundTypestateEvent| {
+            subject == Some(binding.subject()) && binding.modeled_external_effect().is_some()
+        };
+        let Some(call) = edge.origin() else {
+            return self
+                .bindings
+                .event_bindings_at_call_program_point_all_contexts(edge.source())
+                .any(|binding| modeled(&binding));
+        };
+        // Judge the arm this edge continues on. An edge with no arm (the call
+        // edge itself) closes only when neither arm is refused, so a Covered
+        // normal exit never hides a Refused exceptional one.
+        let arm = coverage_arm(edge.kind());
+        self.bindings
+            .event_bindings_at_call_site_all_contexts(call)
+            .filter(modeled)
+            .any(|binding| {
+                !coverage_refuses_at_arm(self.bindings, binding.subject(), Some(call), arm, true)
+            })
+    }
+
+    /// A copied result starts before the source's return observations. Apply
+    /// only the new subject's normal-return and exit observations; source facts
+    /// have already taken this path and must not take it a second time.
+    fn apply_transferred_result_observations(
+        &self,
+        edge: DataflowEdge<'_, TypestateFact>,
+        facts: &mut TransferFactSet,
+        out: &dyn DataflowOutput<TypestateFact>,
+    ) -> bool {
+        let subject = facts.subject();
+        let events = edge
+            .origin()
+            .into_iter()
+            .flat_map(|call| self.bindings.event_bindings_at_call_site_all_contexts(call))
+            .chain(
+                edge.origin()
+                    .is_none()
+                    .then_some(edge.source())
+                    .into_iter()
+                    .flat_map(|point| {
+                        self.bindings
+                            .event_bindings_at_call_program_point_all_contexts(point)
+                    }),
+            );
+        for binding in events {
+            if !out.should_continue() {
+                return false;
+            }
+            if subject != Some(binding.subject())
+                || !call_occurrence(self.protocol, binding.event(), CallStage::AfterNormalReturn)
+            {
+                continue;
+            }
+            let modeled_boundary = binding.modeled_external_effect().is_some()
+                && edge.boundary().is_some_and(modeled_external_boundary)
+                && edge.origin().is_none_or(|call| {
+                    !coverage_refuses_at_arm(
+                        self.bindings,
+                        binding.subject(),
+                        Some(call),
+                        coverage_phase(CallStage::AfterNormalReturn),
+                        true,
+                    )
+                });
+            if event_survives_dispatch_boundary(edge.boundary(), binding, modeled_boundary)
+                && !self.apply_binding(facts, binding, out)
+            {
+                return false;
+            }
+        }
+        let terminals = edge
+            .origin()
+            .into_iter()
+            .flat_map(|call| {
+                self.bindings
+                    .terminal_bindings_at_call_site_all_contexts(call)
+            })
+            .chain(
+                edge.origin()
+                    .is_none()
+                    .then_some(edge.source())
+                    .into_iter()
+                    .flat_map(|point| {
+                        self.bindings
+                            .terminal_bindings_at_call_program_point_all_contexts(point)
+                    }),
+            );
+        for binding in terminals {
+            if !out.should_continue() {
+                return false;
+            }
+            if subject == Some(binding.subject())
+                && terminal_call_occurrence(self.protocol, binding, CallStage::AfterNormalReturn)
+                && !self.append_terminal_observations(facts, binding, out)
+            {
+                return false;
+            }
+        }
+        for binding in self
+            .bindings
+            .event_bindings_at_program_point_all_contexts(edge.target())
+        {
+            if !out.should_continue() {
+                return false;
+            }
+            if subject == Some(binding.subject())
+                && exit_point_occurrence(self.protocol, binding.event(), edge.target())
+                && !self.apply_binding(facts, binding, out)
+            {
+                return false;
+            }
+        }
+        for binding in self
+            .bindings
+            .terminal_bindings_at_program_point_all_contexts(edge.target())
+        {
+            if !out.should_continue() {
+                return false;
+            }
+            if subject == Some(binding.subject())
+                && terminal_exit_point_occurrence(self.protocol, binding, edge.target())
+                && !self.append_terminal_observations(facts, binding, out)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Compute the exact finite preimage of one successor fact.
@@ -1321,7 +1597,18 @@ impl<'plan> TypestateFlowProblem<'plan> {
         }
 
         let subjects = match output_fact.subject() {
-            Some(subject) => vec![subject],
+            Some(subject) => {
+                let mut subjects = vec![subject];
+                subjects.extend(
+                    self.bindings
+                        .state_transfers_at_edge(edge.origin(), edge.source())
+                        .filter(|transfer| transfer.result == subject)
+                        .filter_map(|transfer| transfer.source),
+                );
+                subjects.sort_unstable();
+                subjects.dedup();
+                subjects
+            }
             None => self
                 .bindings
                 .subjects()
@@ -1404,10 +1691,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 Some(false) => return true,
                 None => {
                     return facts.map_stream(out, |fact, emit| {
-                        if !matches!(fact.0, TypestateFactKind::State { .. })
-                            || fact.subject() != Some(binding.subject())
-                            || fact.abstained()
-                        {
+                        if !fact.accepts_bound_event(binding.subject()) {
                             emit(fact)
                         } else {
                             self.emit_uncertainty(
@@ -1437,10 +1721,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 ProtocolEventOccurrence::Escape
             ) {
                 return facts.map_stream(out, |fact, emit| {
-                    if !matches!(fact.0, TypestateFactKind::State { .. })
-                        || fact.subject() != Some(binding.subject())
-                        || fact.abstained()
-                    {
+                    if !fact.accepts_bound_event(binding.subject()) {
                         emit(fact)
                     } else {
                         self.emit_uncertainty(
@@ -1453,10 +1734,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 });
             }
             return facts.map(out, |fact| {
-                if !matches!(fact.0, TypestateFactKind::State { .. })
-                    || fact.subject() != Some(binding.subject())
-                    || fact.abstained()
-                {
+                if !fact.accepts_bound_event(binding.subject()) {
                     vec![fact]
                 } else {
                     self.apply_event(fact, binding)
@@ -1469,10 +1747,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
         if retained_multiple
             && call_site
             && !facts.map_stream(out, |fact, emit| {
-                if !matches!(fact.0, TypestateFactKind::State { .. })
-                    || fact.subject() != Some(binding.subject())
-                    || fact.abstained()
-                {
+                if !fact.accepts_bound_event(binding.subject()) {
                     emit(fact)
                 } else {
                     self.emit_uncertainty(
@@ -1488,10 +1763,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
         }
         if (!quality.is_proven() || !quality.is_complete() || (retained_multiple && !call_site))
             && !facts.map_stream(out, |fact, emit| {
-                if !matches!(fact.0, TypestateFactKind::State { .. })
-                    || fact.subject() != Some(binding.subject())
-                    || fact.abstained()
-                {
+                if !fact.accepts_bound_event(binding.subject()) {
                     emit(fact)
                 } else {
                     self.emit_uncertainty(
@@ -2378,6 +2650,12 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
         self.zero_fact()
     }
 
+    // Every arm's facts join at the call's continuations, so a violation
+    // through any arm survives and a closed state needs every arm (#11296).
+    fn closes_analyzed_dispatch_families(&self) -> bool {
+        true
+    }
+
     fn normal_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,
@@ -2492,7 +2770,7 @@ impl EligibleEvent {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TransferFactSet {
     facts: BTreeSet<TypestateFact>,
     fallback: Option<TypestateFact>,
@@ -2759,10 +3037,12 @@ fn modeled_external_boundary(boundary: &crate::analyzer::semantic::DispatchBound
 /// reviewed call as if it had never happened.
 ///
 /// The boundary still reaches the answer through the uncertainty the transfer
-/// emits for the edge, and through `eligible_events`, so an unresolved or
-/// unmodeled target keeps the run inconclusive instead of being silently
-/// discharged. A binding that is not definitive keeps the conservative rule:
-/// only an authored external model may apply it across a boundary.
+/// emits for the edge, so an unresolved or unmodeled target keeps the run
+/// inconclusive instead of being silently discharged. That uncertainty does
+/// not fire the applied event again. A binding that is not definitive keeps
+/// the conservative rule: only an authored external model may apply it across
+/// a boundary, and otherwise the boundary's uncertainty decides whether it
+/// fired.
 ///
 /// A `Deferred` boundary is the exception, because it is about *when* the
 /// callee runs rather than which declaration it is: the call is registered at

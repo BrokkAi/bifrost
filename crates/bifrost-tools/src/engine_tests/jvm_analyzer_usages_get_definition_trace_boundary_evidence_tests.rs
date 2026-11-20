@@ -140,6 +140,7 @@ mod boundary_evidence_tests {
                     discover_java_home: false,
                     ..JvmStandardLibraryDiscoveryConfig::default()
                 },
+                ..JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         }

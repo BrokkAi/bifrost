@@ -214,9 +214,16 @@ impl KotlinAnalyzer {
                         use brokk_bifrost_jvm::kotlin::types::{
                             KotlinTypeName, resolve_kotlin_type_name,
                         };
-                        match resolve_kotlin_type_name(raw, scope, |candidate| {
-                            external.get(&recorder, candidate).is_some()
-                        }) {
+                        let misses = crate::analyzer::jvm::external::LadderMisses::default();
+                        let resolution = resolve_kotlin_type_name(raw, scope, |candidate| {
+                            misses.probe(external.get(&recorder, candidate)).is_some()
+                        });
+                        external.finish_ladder(
+                            &recorder,
+                            &misses,
+                            matches!(resolution, KotlinTypeName::Resolved(_)),
+                        );
+                        match resolution {
                             KotlinTypeName::Resolved(fqn) => Some(fqn),
                             _ => None,
                         }

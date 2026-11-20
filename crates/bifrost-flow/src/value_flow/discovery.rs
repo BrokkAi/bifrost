@@ -24,6 +24,7 @@ pub use super::selected_entry::{
 use std::sync::Arc;
 
 use crate::analyzer::WorkspaceAnalyzer;
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::analyzer::semantic::{
     CallBindings, CallSiteId, CancellationToken, CandidateCoverage, DispatchBoundary,
     DispatchBoundaryKind, DispatchResult, OracleCallContext, ProcedureHandle, SemanticBudget,
@@ -191,6 +192,15 @@ pub struct DiscoveredClosure {
     /// Index into `snapshots` of the root's own relations, absent when the
     /// root's relations were unavailable.
     pub root_snapshot: Option<usize>,
+    /// Execution dependence of the walk itself, such as a refused procedure
+    /// cap. Provider answers carry their own verdicts.
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for DiscoveredClosure {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 /// One dispatch answer owned by an exact entering-call context. These rows
@@ -221,6 +231,15 @@ pub struct ContextualDiscoveredClosure {
     pub dispatch: Vec<ContextualDispatchCoverage>,
     pub status: SemanticInputStatus,
     pub truncated: bool,
+    /// Execution dependence of the walk itself: a refused context or
+    /// procedure cap, or a truncated call context.
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for ContextualDiscoveredClosure {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 /// Acquire native source reachable only through bounded callback arguments.
@@ -242,6 +261,7 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
         dispatch: Vec::new(),
         status: SemanticInputStatus::Complete,
         truncated: false,
+        reuse: ReuseVerdict::Content,
     };
     let mut pending = vec![(root.clone(), OracleCallContext::empty())];
     let mut queued = HashSet::default();
@@ -256,12 +276,13 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
             nested_entries: 1 + context.calls().len(),
             ..SemanticWork::default()
         });
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Err(refused) = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             0,
             limits.max_contexts,
         )
-        .allows(1)
+        .try_allow(1)
         {
+            result.reuse.join_in(refused.reuse_verdict());
             result.truncated = true;
             result.status = result.status.merge(SemanticInputStatus::Unknown);
             break;
@@ -278,12 +299,14 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
         };
         let key = procedure.durable_key();
         if !acquired.contains(&key) {
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                acquired.len(),
-                limits.max_procedures,
-            )
-            .allows(1)
+            if let Err(refused) =
+                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    acquired.len(),
+                    limits.max_procedures,
+                )
+                .try_allow(1)
             {
+                result.reuse.join_in(refused.reuse_verdict());
                 result.truncated = true;
                 result.status = result.status.merge(SemanticInputStatus::Unknown);
                 break;
@@ -300,13 +323,24 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
             }
             acquired.insert(key);
         }
-        if context.was_truncated()
-            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        // A truncated context short-circuits the depth check, as the ambient
+        // marks did, so each stop reports exactly one verdict.
+        let depth_refused = if context.was_truncated() {
+            result.reuse.join_in(context.reuse_verdict());
+            true
+        } else if let Err(refused) =
+            brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 context.calls().len(),
                 limits.oracle.call_context_depth(),
             )
-            .allows(0)
+            .try_allow(0)
         {
+            result.reuse.join_in(refused.reuse_verdict());
+            true
+        } else {
+            false
+        };
+        if depth_refused {
             result.truncated = true;
             result.status = result.status.merge(SemanticInputStatus::Unknown);
             continue;
@@ -382,15 +416,18 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
                     });
                     let next = context.extended(call.clone(), limits.oracle);
                     if next.was_truncated() {
+                        result.reuse.join_in(next.reuse_verdict());
                         result.truncated = true;
                         result.status = result.status.merge(SemanticInputStatus::Unknown);
                     } else if !queued.contains(&(target.durable_key(), next.clone())) {
-                        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                            queued.len(),
-                            limits.max_contexts,
-                        )
-                        .allows(1)
+                        if let Err(refused) =
+                            brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                                queued.len(),
+                                limits.max_contexts,
+                            )
+                            .try_allow(1)
                         {
+                            result.reuse.join_in(refused.reuse_verdict());
                             result.truncated = true;
                             result.status = result.status.merge(SemanticInputStatus::Unknown);
                         } else {
@@ -588,6 +625,7 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         summary_cuts: Vec::new(),
         truncated: false,
         root_snapshot: None,
+        reuse: ReuseVerdict::Content,
     };
 
     while let Some(procedure) = pending.pop() {
@@ -617,12 +655,13 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         // for the same durable key. Remove it before checking the cap so this
         // full acquisition consumes the slot that the surface had reserved.
         hydrated_surfaces.remove(&procedure_key);
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Err(refused) = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             seen.len().saturating_add(hydrated_surfaces.len()),
             limits.max_procedures,
         )
-        .allows(1)
+        .try_allow(1)
         {
+            closure.reuse.join_in(refused.reuse_verdict());
             closure.truncated = true;
             // Keep the refused procedure with the other queued work so the
             // truncation pass marks every call site whose entered candidate
@@ -967,12 +1006,13 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         if seen.contains(&key) {
             continue;
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Err(refused) = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             closure.procedures.len(),
             limits.max_procedures,
         )
-        .allows(1)
+        .try_allow(1)
         {
+            closure.reuse.join_in(refused.reuse_verdict());
             closure.truncated = true;
             break;
         }

@@ -179,7 +179,7 @@ With `cache: true`, the action restores and saves Bifrost's standard
 `.bifrost/cache` store, the same store used by ordinary CLI and MCP scans. A
 workspace nested in a checkout uses the primary Git repository root; a nested
 Git repository uses its own root. The action sets `BIFROST_CACHE_DIR` to that
-exact directory for the scan and clears an inherited `BIFROST_CACHE_ROOT`;
+directory for the scan (the store is its `bifrost-store/` child) and clears an inherited `BIFROST_CACHE_ROOT`;
 `cache: false` leaves both environment settings untouched. GitHub cache
 snapshots are separated by runner OS, architecture, version, exact
 compiled-input build identity, and working-directory identity.

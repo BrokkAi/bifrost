@@ -847,7 +847,19 @@ shared index (#10470).
 
 The combined workspace and external ladder follows Java precedence: lexical
 and enclosing member types, single-type imports, same-package types, then
-on-demand imports together with implicit `java.lang`. Expression qualifiers
+on-demand imports together with implicit `java.lang`. The enclosing member
+type tier walks the enclosing classes from the innermost outward; for each
+class it checks the declared member types and then the member types the class
+inherits from its workspace supertypes before moving to the next outer class.
+Nearer supertype declarations hide farther ones (JLS 8.5) — including a
+declaration in a more specific supertype hiding a same-named declaration that
+also reaches the class along a less specific path — a private or
+otherwise inaccessible member type is not inherited, two inherited candidates
+that survive hiding make the name ambiguous, and a workspace supertype
+spelling that cannot be resolved stops the lookup as incomplete instead of
+falling through to an import. A class's own `extends` / `implements` /
+`permits` clause is outside its inherited scope, so header names resolve
+through the ordinary import tiers. Expression qualifiers
 first consider variables; dotted names bind their first segment before trying
 a package-qualified reading. A bound import miss or ambiguity cannot fall
 through to a lower tier. Fully qualified, same-package, on-demand, implicit

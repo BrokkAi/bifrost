@@ -3492,3 +3492,695 @@ fn rust_route_question_lookup_migration_backfills_and_seeks() {
         );
     }
 }
+
+#[test]
+fn implicit_root_candidate_and_declaration_modifier_schema_boundary() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    configure_connection(&mut conn).unwrap();
+    migrate(&mut conn).unwrap();
+    let blob = insert_empty_resolution_interior(&conn, "root-candidate-schema");
+    conn.execute(
+        "INSERT INTO resolution_implicit_root_candidates VALUES(?1,1,2,3)",
+        [blob],
+    )
+    .unwrap();
+    for (definition, reference, frontier) in [(1, 4, 5), (6, 2, 7), (8, 9, 3), (-1, 10, 11)] {
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_implicit_root_candidates VALUES(?1,?2,?3,?4)",
+                params![blob, definition, reference, frontier]
+            )
+            .is_err()
+        );
+    }
+    conn.execute(
+        "INSERT INTO resolution_declaration_modifiers VALUES(?1,1,0)",
+        [blob],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO resolution_declaration_modifiers VALUES(?1,2,2)",
+            [blob]
+        )
+        .is_err()
+    );
+    assert!(!conn.query_row("SELECT partial FROM resolution_declaration_modifiers WHERE blob_id=?1 AND definition=1",[blob],|row|row.get::<_,bool>(0)).unwrap());
+    conn.execute(
+        "DELETE FROM resolution_fragment_interiors WHERE blob_id=?1",
+        [blob],
+    )
+    .unwrap();
+    for table in [
+        "resolution_implicit_root_candidates",
+        "resolution_declaration_modifiers",
+    ] {
+        assert_eq!(
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE blob_id=?1"),
+                [blob],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "#12897: a later migration's table rebuild reinstated a predicate that #10934's 0468 had relaxed"
+)]
+fn selected_receiver_proof_upgrade_preserves_receipts_and_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("receiver-proof.sqlite3");
+    let conn = test_connection_through_migration(468);
+    seed_classset_and_policy_receipts(&conn);
+    // 0468 admits this name-only lookup; later ledger rebuilds must preserve it.
+    conn.execute_batch("INSERT INTO class_set_summary_reads(summary_id,read_ordinal,key_digest,kind,family,name,digest) VALUES(44,4,randomblob(32),'lookup','derivation:jvm_external_provider_inventory:v1','provider',zeroblob(32))").unwrap();
+    let provider_row = |conn: &Connection| {
+        conn.query_row(
+            "SELECT summary_id,read_ordinal,key_digest,kind,family,name,digest FROM class_set_summary_reads WHERE summary_id=44 AND read_ordinal=4",
+            [],
+            |row| (0..7).map(|index| row.get::<_, rusqlite::types::Value>(index)).collect::<rusqlite::Result<Vec<_>>>()
+        ).unwrap()
+    };
+    let original_provider_row = provider_row(&conn);
+    // Replay every intervening migration, including 0469's bounded listing.
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > 468 && migration.version <= 490)
+    {
+        conn.execute_batch(migration.sql).unwrap();
+        conn.pragma_update(None, "user_version", migration.version)
+            .unwrap();
+    }
+    for table in ["policy_read_keys", "class_set_summary_reads"] {
+        let (ids, values) = if table == "policy_read_keys" {
+            ("read_id", "56")
+        } else {
+            ("summary_id,read_ordinal", "44,1")
+        };
+        for (ordinal, family) in ["rust_drop_subject", "rust_drop_inventory"]
+            .into_iter()
+            .enumerate()
+        {
+            let (ids, values) = if ordinal == 0 {
+                (ids.to_owned(), values.to_owned())
+            } else if table == "policy_read_keys" {
+                ("read_id".into(), "57".into())
+            } else {
+                ("summary_id,read_ordinal".into(), "44,2".into())
+            };
+            let typed = if ordinal == 0 {
+                "NULL,NULL,NULL,NULL,NULL"
+            } else {
+                "zeroblob(32),'module',zeroblob(32),zeroblob(32),1"
+            };
+            conn.execute_batch(&format!("INSERT INTO {table}({ids},key_digest,kind,family,rel_path,blob_oid,start_byte,end_byte,digest,drop_owning_unit,drop_module_path,drop_identity_digest,drop_config_digest,drop_proof_version) VALUES({values},randomblob(32),'lookup','{family}','lib.rs','1111111111111111111111111111111111111111',4,8,zeroblob(32),{typed});")).unwrap();
+        }
+    }
+    let drop_rows = |conn: &Connection| {
+        ["policy_read_keys", "class_set_summary_reads"].map(|table| {
+            conn.prepare(&format!("SELECT family,hex(key_digest),rel_path,blob_oid,start_byte,end_byte,hex(digest),hex(drop_owning_unit),drop_module_path,hex(drop_identity_digest),hex(drop_config_digest),drop_proof_version FROM {table} WHERE family IN ('rust_drop_subject','rust_drop_inventory') ORDER BY family"))
+                .unwrap().query_map([], |row| (0..12).map(|i| row.get::<_,rusqlite::types::Value>(i)).collect::<rusqlite::Result<Vec<_>>>()).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        })
+    };
+    let original_drop_rows = drop_rows(&conn);
+    validate_foreign_keys(&conn).unwrap();
+    let unaffected = raw_schema_object_definitions(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, name, _)| {
+            !(kind == "table"
+                && ["policy_read_keys", "class_set_summary_reads"].contains(&name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    let before = conn.query_row("SELECT hex(key_digest),kind,languages,rel_path,blob_oid FROM policy_read_keys WHERE read_id=55", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).unwrap();
+    conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    drop(conn);
+    let mut conn = Connection::open(&path).unwrap();
+    configure_connection(&mut conn).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN")
+        .unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0491-selected-receiver-proof-reads.sql"
+    ))
+    .unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('policy_read_keys') WHERE name='selected_application_digest'", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+    conn.execute_batch("ROLLBACK; PRAGMA foreign_keys=ON")
+        .unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('policy_read_keys') WHERE name='selected_application_digest'", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0491-selected-receiver-proof-reads.sql"
+    ))
+    .unwrap();
+    conn.pragma_update(None, "user_version", 491).unwrap();
+    // Compare right after 0491, before migrate() applies anything later:
+    // every later migration may change other tables, and this check is only
+    // about what 0491 itself rewrites.
+    let actual = raw_schema_object_definitions(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, name, _)| {
+            !(kind == "table"
+                && ["policy_read_keys", "class_set_summary_reads"].contains(&name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        unaffected, actual,
+        "only the two general ledger table definitions change"
+    );
+    for table in ["policy_read_keys", "class_set_summary_reads"] {
+        let (ids, values) = if table == "policy_read_keys" {
+            ("read_id", "58")
+        } else {
+            ("summary_id,read_ordinal", "44,3")
+        };
+        conn.execute_batch(&format!("INSERT INTO {table}({ids},key_digest,kind,family,languages,rel_path,blob_oid,digest,parse_variant_kind,selected_receiver_question,selected_resolution_epoch,selected_application_digest) VALUES({values},randomblob(32),'lookup','selected_receiver_proof','csharp','C.cs','1111111111111111111111111111111111111111',zeroblob(32),'empty','owner_application','epoch',zeroblob(32));")).unwrap();
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    migrate(&mut conn).unwrap();
+    assert_eq!(
+        cache_migration_version(&conn).unwrap(),
+        CURRENT_MIGRATION_VERSION
+    );
+    let after = conn.query_row("SELECT hex(key_digest),kind,languages,rel_path,blob_oid FROM policy_read_keys WHERE read_id=55", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM policy_unit_reads WHERE unit_id=66 AND read_id=55",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM class_set_summary_reads WHERE summary_id=44 AND read_ordinal=0 AND kind='file'", [], |r| r.get::<_,i64>(0)).unwrap(),1);
+    validate_foreign_keys(&conn).unwrap();
+    assert!(current_schema_shape_is_valid(&conn).unwrap());
+    drop(conn);
+    let mut reopened = Connection::open(&path).unwrap();
+    configure_connection(&mut reopened).unwrap();
+    migrate(&mut reopened).unwrap();
+    validate_foreign_keys(&reopened).unwrap();
+    assert_eq!(drop_rows(&reopened), original_drop_rows);
+    assert_eq!(provider_row(&reopened), original_provider_row);
+    verify_upgraded_store(&reopened, &path).unwrap();
+    for table in ["policy_read_keys", "class_set_summary_reads"] {
+        assert_eq!(reopened.query_row(&format!("SELECT selected_receiver_question,selected_resolution_epoch,selected_application_digest FROM {table} WHERE family='selected_receiver_proof'"), [], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?))).unwrap(), ("owner_application".into(),"epoch".into(),vec![0;32]));
+    }
+
+    assert_eq!(
+        reopened
+            .query_row(
+                "SELECT COUNT(*) FROM policy_unit_reads WHERE unit_id=66 AND read_id=55",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn selected_receiver_proof_schema_checks_both_general_carriers() {
+    let conn = test_connection_through_490();
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0491-selected-receiver-proof-reads.sql"
+    ))
+    .unwrap();
+    for table in ["policy_read_keys", "class_set_summary_reads"] {
+        for tag in [
+            "owner_application",
+            "current_instance_transfer",
+            "base_receiver_context",
+        ] {
+            let prefix = if table == "class_set_summary_reads" {
+                "summary_id,read_ordinal,"
+            } else {
+                ""
+            };
+            let ids = if table == "class_set_summary_reads" {
+                "44,0,"
+            } else {
+                ""
+            };
+            let extra = if tag == "current_instance_transfer" {
+                "zeroblob(32),zeroblob(32)"
+            } else {
+                "NULL,NULL"
+            };
+            let application = if tag == "base_receiver_context" {
+                "NULL"
+            } else {
+                "zeroblob(32)"
+            };
+            let reference = if tag == "base_receiver_context" {
+                "zeroblob(32)"
+            } else {
+                "NULL"
+            };
+            let insert = format!(
+                "INSERT INTO {table}({prefix}key_digest,kind,family,languages,rel_path,blob_oid,digest,parse_variant_kind,selected_receiver_question,selected_resolution_epoch,selected_application_digest,selected_receiver_digest,selected_transfer_rule_digest,selected_reference_digest) VALUES({ids}randomblob(32),'lookup','selected_receiver_proof','csharp','C.cs','1111111111111111111111111111111111111111',zeroblob(32),'empty','{tag}','epoch',{application},{extra},{reference})"
+            );
+            conn.execute_batch("SAVEPOINT shape").unwrap();
+            conn.execute_batch(&insert).unwrap();
+            for change in [
+                "selected_receiver_question=NULL",
+                "selected_receiver_question='other'",
+                "selected_resolution_epoch=NULL",
+                "selected_resolution_epoch=''",
+                "selected_application_digest=zeroblob(31)",
+                "blob_oid=NULL",
+                "rel_path=''",
+                "languages=''",
+                "languages='csharp,rust'",
+                "parse_variant_kind=NULL",
+                "parse_variant_digest=zeroblob(32)",
+                "name='payload'",
+                "subject=zeroblob(32)",
+                "index_key=x'00'",
+                "start_byte=0,end_byte=0",
+            ] {
+                assert!(
+                    conn.execute_batch(&format!(
+                        "UPDATE {table} SET {change} WHERE family='selected_receiver_proof'"
+                    ))
+                    .is_err(),
+                    "{table}/{tag}: {change}"
+                );
+            }
+            for change in if tag == "base_receiver_context" {
+                [
+                    "selected_reference_digest=NULL",
+                    "selected_reference_digest=zeroblob(31)",
+                    "selected_application_digest=zeroblob(32)",
+                ]
+            } else {
+                [
+                    "selected_application_digest=NULL",
+                    "selected_application_digest=zeroblob(31)",
+                    "selected_reference_digest=zeroblob(32)",
+                ]
+            } {
+                assert!(
+                    conn.execute_batch(&format!(
+                        "UPDATE {table} SET {change} WHERE family='selected_receiver_proof'"
+                    ))
+                    .is_err(),
+                    "{table}/{tag}: {change}"
+                );
+            }
+            let change = if tag == "owner_application" || tag == "base_receiver_context" {
+                "selected_receiver_digest=zeroblob(32)"
+            } else {
+                "selected_transfer_rule_digest=NULL"
+            };
+            assert!(
+                conn.execute_batch(&format!(
+                    "UPDATE {table} SET {change} WHERE family='selected_receiver_proof'"
+                ))
+                .is_err()
+            );
+            conn.execute_batch("ROLLBACK TO shape; RELEASE shape")
+                .unwrap();
+        }
+    }
+    assert!(conn.execute_batch("INSERT INTO class_set_procedure_surface_reads(surface_id,read_ordinal,key_digest,kind,family,rel_path,subject,start_byte,end_byte,digest,site_ordinal) VALUES(1,0,zeroblob(32),'lookup','selected_receiver_proof','C.cs',zeroblob(32),0,1,zeroblob(32),0)").is_err(), "dispatch-only table must remain narrow");
+}
+
+#[test]
+fn selected_set_completeness_populated_upgrade_and_old_writer_paths() {
+    // This is a populated upgrade: the migration never backfills certificates.
+    let conn = test_connection_through_migration(447);
+    let workspace = "a".repeat(64);
+    conn.execute(
+        "INSERT INTO workspace_revisions VALUES(?1,'csharp',0,1)",
+        [&workspace],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO workspace_heads VALUES(?1,'csharp',0,1)",
+        [&workspace],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO workspace_file_versions(file_version_id,workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(1,?1,'csharp',0,'App.cs',?2,?3,1)",params![workspace,"1".repeat(40),"0".repeat(64)]).unwrap();
+    conn.execute(
+        "INSERT INTO csharp_file_version_decisions VALUES(1,zeroblob(32),zeroblob(32))",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0466-selected-set-completeness.sql"
+    ))
+    .unwrap();
+    validate_foreign_keys(&conn).unwrap();
+    let count = || {
+        conn.query_row(
+            "SELECT count(*) FROM workspace_selected_set_completeness",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    let certify = || {
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_selected_set_completeness VALUES(?1,'csharp',0,1)",
+            [&workspace],
+        )
+        .unwrap();
+    };
+    assert_eq!(count(), 0);
+    for recursive in [false, true] {
+        conn.pragma_update(None, "recursive_triggers", recursive)
+            .unwrap();
+        for statement in [
+            "INSERT OR REPLACE INTO csharp_file_version_decisions VALUES(1,zeroblob(32),zeroblob(32))",
+            "INSERT INTO csharp_file_version_decisions VALUES(1,zeroblob(32),zeroblob(32)) ON CONFLICT(file_version_id) DO UPDATE SET assignment_digest=excluded.assignment_digest",
+            "UPDATE csharp_file_version_decisions SET decision_digest=zeroblob(32) WHERE file_version_id=1",
+            "DELETE FROM csharp_file_version_decisions WHERE file_version_id=1",
+        ] {
+            conn.execute("INSERT OR IGNORE INTO csharp_file_version_decisions VALUES(1,zeroblob(32),zeroblob(32))",[]).unwrap();
+            certify();
+            conn.execute_batch(statement).unwrap();
+            assert_eq!(count(), 0, "{statement}; recursive={recursive}");
+        }
+        certify();
+        conn.execute(
+            "UPDATE workspace_file_versions SET projection_digest=?1 WHERE file_version_id=1",
+            ["2".repeat(64)],
+        )
+        .unwrap();
+        assert_eq!(count(), 0);
+        certify();
+        conn.execute("INSERT INTO workspace_heads VALUES(?1,'csharp',0,1) ON CONFLICT(workspace_id,lang,generation) DO UPDATE SET revision=excluded.revision",[&workspace]).unwrap();
+        assert_eq!(count(), 0);
+        certify();
+        conn.execute(
+            "UPDATE workspace_revisions SET revision=revision WHERE workspace_id=?1",
+            [&workspace],
+        )
+        .unwrap();
+        assert_eq!(count(), 0);
+        // Replacement of a source version cascades decision deletion even if
+        // SQLite's implicit REPLACE delete triggers are disabled.
+        certify();
+        conn.execute("INSERT OR REPLACE INTO workspace_file_versions(file_version_id,workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(1,?1,'csharp',0,'App.cs',?2,?3,1)",params![workspace,"1".repeat(40),"0".repeat(64)]).unwrap();
+        assert_eq!(count(), 0);
+        validate_foreign_keys(&conn).unwrap();
+    }
+    conn.execute("INSERT INTO csharp_compilation_sets(set_id,workspace_id,lang,generation,derivation_identity,input_digest,output_digest,gaps) VALUES(1,?1,'csharp',0,zeroblob(32),zeroblob(32),zeroblob(32),jsonb('[]'))",[&workspace]).unwrap();
+    // A second selection pins the set while REPLACE deletes/reinserts the
+    // first one. The existing owner GC deletes an unselected set immediately.
+    conn.execute(
+        "INSERT INTO workspace_revisions VALUES(?1,'csharp',0,2)",
+        [&workspace],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO csharp_compilation_selections VALUES(?1,'csharp',0,2,1)",
+        [&workspace],
+    )
+    .unwrap();
+    for statement in [
+        "INSERT OR REPLACE INTO csharp_compilation_selections VALUES(?1,'csharp',0,1,1)",
+        "INSERT INTO csharp_compilation_selections VALUES(?1,'csharp',0,1,1) ON CONFLICT(workspace_id,lang,generation,revision) DO UPDATE SET set_id=excluded.set_id",
+        "UPDATE csharp_compilation_selections SET set_id=set_id WHERE workspace_id=?1 AND revision=1",
+        "DELETE FROM csharp_compilation_selections WHERE workspace_id=?1 AND revision=1",
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO csharp_compilation_selections VALUES(?1,'csharp',0,1,1)",
+            [&workspace],
+        )
+        .unwrap();
+        certify();
+        conn.execute(statement, [&workspace]).unwrap();
+        assert_eq!(count(), 0, "{statement}");
+    }
+    for statement in [
+        "INSERT OR REPLACE INTO workspace_source_refusals VALUES(?1,'csharp',0,'Refused.cs','1111111111111111111111111111111111111111',jsonb('{}'),1,NULL)",
+        "UPDATE workspace_source_refusals SET reason=jsonb(json_object('changed',1)) WHERE workspace_id=?1",
+        "DELETE FROM workspace_source_refusals WHERE workspace_id=?1",
+    ] {
+        conn.execute("INSERT OR IGNORE INTO workspace_source_refusals VALUES(?1,'csharp',0,'Refused.cs','1111111111111111111111111111111111111111',jsonb('{}'),1,NULL)",[&workspace]).unwrap();
+        certify();
+        conn.execute(statement, [&workspace]).unwrap();
+        assert_eq!(count(), 0, "{statement}");
+    }
+    conn.execute(
+        "INSERT INTO csharp_compilation_selections VALUES(?1,'csharp',0,1,1)",
+        [&workspace],
+    )
+    .unwrap();
+    certify();
+    conn.execute("DELETE FROM csharp_compilation_sets WHERE set_id=1", [])
+        .unwrap();
+    assert_eq!(
+        count(),
+        0,
+        "FK cascade deletes invalidate selection certificates"
+    );
+    conn.pragma_update(None, "recursive_triggers", true)
+        .unwrap();
+    certify();
+    conn.execute(
+        "INSERT OR IGNORE INTO workspace_revisions VALUES(?1,'csharp',0,2)",
+        [&workspace],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE workspace_file_versions SET valid_until=2 WHERE file_version_id=1",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE workspace_heads SET revision=2 WHERE workspace_id=?1",
+        [&workspace],
+    )
+    .unwrap();
+    assert_eq!(
+        count(),
+        1,
+        "closing a version at NEW does not alter frozen OLD"
+    );
+    conn.execute(
+        "DELETE FROM workspace_file_versions WHERE file_version_id=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        count(),
+        0,
+        "retraction invalidates the frozen selection too"
+    );
+    validate_foreign_keys(&conn).unwrap();
+    for revision in 3..103 {
+        conn.execute(
+            "INSERT INTO workspace_revisions VALUES(?1,'csharp',0,?2)",
+            params![workspace, revision],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_selected_set_completeness VALUES(?1,'csharp',0,?2)",
+            params![workspace, revision],
+        )
+        .unwrap();
+    }
+    validate_foreign_keys(&conn).unwrap();
+    let trigger_sql = conn
+        .prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'selected_set_completeness_%' ORDER BY name")
+        .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    for state in crate::cache_gc::PlannerStatisticsState::BOTH {
+        state.install(&conn);
+        for (name, sql) in &trigger_sql {
+            // Plan the actual migration statements, substituting a concrete
+            // trigger row only for SQLite's OLD/NEW pseudo tables.
+            let body = sql
+                .split_once("BEGIN")
+                .unwrap()
+                .1
+                .rsplit_once("END")
+                .unwrap()
+                .0;
+            for statement in body
+                .split(';')
+                .filter(|statement| !statement.trim().is_empty())
+            {
+                let mut statement = statement.to_owned();
+                for owner in ["OLD", "NEW"] {
+                    for (column, value) in [
+                        ("file_version_id", "1"),
+                        ("workspace_id", "?1"),
+                        ("projection_digest", "'digest'"),
+                        ("generation", "0"),
+                        ("valid_until", "NULL"),
+                        ("valid_from", "1"),
+                        ("file_present", "1"),
+                        ("input_kind", "'source'"),
+                        ("rel_path", "'App.cs'"),
+                        ("blob_oid", "'oid'"),
+                        ("revision", "1"),
+                        ("reason", "'{}'"),
+                        ("lang", "'csharp'"),
+                    ] {
+                        statement = statement.replace(&format!("{owner}.{column}"), value);
+                    }
+                }
+                let mut query = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+                    .unwrap();
+                let parameters = (query.parameter_count() != 0).then_some(&workspace);
+                let plan = query
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().any(|line| line
+                        .contains("SEARCH workspace_selected_set_completeness USING PRIMARY KEY")),
+                    "{state:?} {name}: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|line| line
+                        .contains("SCAN workspace_selected_set_completeness")
+                        || line.contains("AUTOMATIC")),
+                    "{state:?} {name}: {plan:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_set_completeness_classifies_every_enumerating_trigger_column() {
+    let conn = test_connection_through_migration(CURRENT_MIGRATION_VERSION);
+    // Publication-only inventory refill; no ChangedFacts/census dependency.
+    let exemptions = std::collections::BTreeMap::from([(
+        "workspace_file_versions",
+        std::collections::BTreeSet::from(["definition_inventory_state".to_owned()]),
+    )]);
+    let triggers = conn
+        .prepare(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type='trigger' \
+             AND name LIKE 'selected_set_completeness_%_update' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let mut enumerating = std::collections::BTreeSet::new();
+    for (table, sql) in triggers {
+        // Triggers that invalidate on every update enumerate nothing and cannot
+        // silently exempt a new column.
+        if !sql.contains("IS NEW.") {
+            continue;
+        }
+        enumerating.insert(table.clone());
+        // Derive identity columns from the actual installed trigger, so deleting
+        // an identity comparison also requires an explicit exemption decision.
+        let tokens = sql
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        let identity = tokens
+            .windows(2)
+            .filter(|pair| pair[0] == "OLD" || pair[0] == "NEW")
+            .map(|pair| pair[1].to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let exempt = exemptions.get(table.as_str()).cloned().unwrap_or_default();
+        assert!(identity.is_disjoint(&exempt), "{table}");
+        let classified = identity
+            .union(&exempt)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let columns = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns, classified,
+            "{table}: classify every new column as trigger identity or an explicit exemption"
+        );
+    }
+    assert_eq!(
+        enumerating,
+        std::collections::BTreeSet::from([
+            "workspace_file_versions".to_owned(),
+            "workspace_source_refusals".to_owned()
+        ]),
+        "a new column-enumerating trigger needs its table classified here"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13416: upgraded stores need seeded per-revision selection epochs without losing input rows"
+)]
+fn workspace_selection_epoch_migration_seeds_existing_revisions() {
+    let migration_index = POST_BASELINE_MIGRATIONS
+        .iter()
+        .position(|migration| migration.version == 480)
+        .unwrap();
+    let conn =
+        test_connection_through_migration(POST_BASELINE_MIGRATIONS[migration_index - 1].version);
+    let workspace = "a".repeat(64);
+    conn.execute(
+        "INSERT INTO workspace_revisions VALUES(?1,'rust',0,1), (?1,'java',0,2)",
+        [&workspace],
+    )
+    .unwrap();
+    conn.execute_batch(POST_BASELINE_MIGRATIONS[migration_index].sql)
+        .unwrap();
+    let seeded: Vec<(String, i64, i64)> = conn
+        .prepare("SELECT lang,revision,epoch FROM workspace_selection_epochs ORDER BY lang")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(seeded, [("java".into(), 2, 1), ("rust".into(), 1, 1)]);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM workspace_revisions", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    let tables: Vec<String> = conn
+        .prepare("SELECT DISTINCT tbl_name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'workspace_selection_epochs_*' ORDER BY tbl_name")
+        .unwrap().query_map([], |row| row.get(0)).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        tables,
+        [
+            "resolution_producer_epochs",
+            "resolution_unit_summaries",
+            "resolution_unit_summary_dependencies",
+            "resolution_unit_summary_versions",
+            "rust_resolution_unit_summary_contexts",
+            "rust_resolution_unit_summary_versions"
+        ]
+    );
+    // Later migrations may land while this compatible addition is queued.
+    // Check this migration's data effect above, then compare the whole schema.
+    for migration in &POST_BASELINE_MIGRATIONS[migration_index + 1..] {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    validate_foreign_keys(&conn).unwrap();
+    assert_eq!(
+        schema_object_definitions_sha256(&conn).unwrap(),
+        CURRENT_SCHEMA_OBJECTS_SHA256
+    );
+}

@@ -88,6 +88,30 @@ pub(super) fn prepare(
     if cancellation.is_cancelled() {
         return Ok(false);
     }
+    let scopes = source
+        .rust_items
+        .native_impl_scopes
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        scopes.len(),
+        source.rust_items.native_impl_scopes.len(),
+        "one native attachment per impl declaration"
+    );
+    for item in &source.rust_items.impls {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        rows.rust_impl_declarations
+            .push(PreparedResolutionRow::new(vec![
+                item.declaration.get().into(),
+                scopes
+                    .get(&item.declaration)
+                    .map(|scope| scope.get())
+                    .into(),
+            ]));
+    }
     let references = resolution_operation::rust_reference_context_sources(source, cancellation)?
         .into_iter()
         .map(|row| (row.source_site(), row))

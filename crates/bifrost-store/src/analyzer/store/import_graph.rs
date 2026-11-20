@@ -587,13 +587,13 @@ pub struct WorkspaceImportGraphRefreshPlan {
 
 impl AnalyzerStore {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_dynamic_import_sources(
         &self,
-        workspace_id: &WorkspaceId,
+        snapshots: &super::WorkspaceSnapshots,
         seed_paths: Option<&[(String, String)]>,
     ) -> Result<Vec<(String, String)>> {
-        let snapshots = self.current_workspace_snapshots(workspace_id)?;
-        let connection = self.read_conn_for_workspace(&snapshots)?;
+        let connection = self.read_conn_for_workspace(snapshots)?;
         super::ensure_revisioned_workspace_views(&connection)?;
         let encoded_seeds = seed_paths
             .map(serde_json::to_string)
@@ -605,41 +605,6 @@ impl AnalyzerStore {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| StoreError::new(error.to_string()))
-    }
-
-    fn current_workspace_snapshots(
-        &self,
-        workspace_id: &WorkspaceId,
-    ) -> Result<super::WorkspaceSnapshots> {
-        let connection = self.read_conn()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT heads.lang, heads.generation, heads.revision
-             FROM workspace_heads AS heads
-             LEFT JOIN analysis_epochs AS epochs ON epochs.lang = heads.lang
-             WHERE heads.workspace_id = ?1
-               AND heads.generation = COALESCE(epochs.generation, 0)",
-        )?;
-        let rows = statement.query_map([workspace_id.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut snapshots = super::WorkspaceSnapshots::default();
-        for row in rows {
-            let (lang, generation, revision) = row?;
-            snapshots.insert(
-                lang.clone(),
-                super::WorkspaceSnapshotId {
-                    workspace_id: workspace_id.clone(),
-                    lang,
-                    generation: super::GenerationId(generation),
-                    revision,
-                },
-            );
-        }
-        Ok(snapshots)
     }
 
     #[doc(hidden)]
@@ -1854,6 +1819,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read_workspace_import_graph(
         &self,
         workspace_id: &WorkspaceId,
@@ -2023,6 +1989,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn unchanged_rust_inputs_advance_identity_without_rewriting_graph_rows() {
         let store = AnalyzerStore::open_ephemeral().expect("identity-only import graph store");
         let workspace_id = WorkspaceId::for_session();
@@ -2264,6 +2234,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn incremental_refresh_recomputes_changed_sources_and_route_dependents_only() {
         let store = AnalyzerStore::open_ephemeral().expect("import graph store");
         let workspace_id = WorkspaceId::for_session();
@@ -2664,6 +2638,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn removing_a_target_source_deletes_inbound_edge_facts_before_source_removal() {
         let store = AnalyzerStore::open_ephemeral().expect("removed target graph store");
         let workspace_id = WorkspaceId::for_session();
@@ -3263,6 +3241,10 @@ pub mod rust_tests_test_support {
         Vec<(String, i64, String)>,
     );
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn stored_import_graph_facts(
         store: &AnalyzerStore,
         workspace_id: &WorkspaceId,

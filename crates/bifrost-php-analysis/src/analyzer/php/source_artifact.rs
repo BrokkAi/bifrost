@@ -526,6 +526,7 @@ fn project_type<'tree>(
     };
     record_namespace(&work.namespace, namespaces);
     types.push(TypeFact {
+        type_parameter_kinds: Vec::new(),
         alias_target: None,
         tuple_fields: None,
         implemented_traits_complete: false,
@@ -541,6 +542,7 @@ fn project_type<'tree>(
         type_kind,
         visibility: Visibility::Public,
         is_abstract: has_modifier(work.node, source, "abstract"),
+        is_final: None,
         is_sealed: has_modifier(work.node, source, "final"),
         callable_surface_complete: false,
         has_explicit_type_terms: false,
@@ -684,6 +686,8 @@ fn project_callable(
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -758,6 +762,7 @@ fn callable_signature(node: Node<'_>, source: &str, ctx: &PhpFileContext) -> Sig
         }
     }
     Signature {
+        bounds: None,
         type_parameters: Vec::new(),
         parameters,
         returns: node
@@ -798,6 +803,7 @@ fn project_properties(
             continue;
         }
         let signature = Signature {
+            bounds: None,
             type_parameters: Vec::new(),
             parameters: Vec::new(),
             returns: declared.clone(),
@@ -815,6 +821,8 @@ fn project_properties(
             return_type: signature.returns.as_ref(),
         });
         members.push(MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -907,6 +915,8 @@ fn constant_member(
         return_type: None,
     });
     MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -951,6 +961,7 @@ fn namespace_fact(
     entry_path: &str,
 ) -> TypeFact {
     TypeFact {
+        type_parameter_kinds: Vec::new(),
         alias_target: None,
         tuple_fields: None,
         implemented_traits_complete: false,
@@ -969,6 +980,7 @@ fn namespace_fact(
         type_kind: TypeKind::Module,
         visibility: Visibility::Public,
         is_abstract: false,
+        is_final: None,
         is_sealed: false,
         callable_surface_complete: false,
         has_explicit_type_terms: false,

@@ -511,7 +511,8 @@ impl WorkspaceSemanticOracle<'_> {
             self.workspace,
             procedure,
             request.budget.limits().source_bytes,
-        );
+        )
+        .and_then(|source| source.on_budget(request.budget));
         let (file, source) = match source {
             Err(SemanticProviderError::InvalidIdentity(_)) => {
                 return Ok(SemanticOutcome::Unproven {
@@ -523,13 +524,14 @@ impl WorkspaceSemanticOracle<'_> {
                 });
             }
             Err(error) => return Err(error),
-            Ok(None) => {
-                return Ok(SemanticOutcome::Unknown {
+            Ok(Err(exceeded)) => {
+                return Ok(SemanticOutcome::ExceededBudget {
                     partial: None,
+                    exceeded,
                     work: SemanticWork::default(),
                 });
             }
-            Ok(Some(source)) => source,
+            Ok(Ok(source)) => source,
         };
         self.workspace.analyzer().mark_runtime_cache_touched();
         let (acquisition, _) = self.runtime_reads.acquire(procedure, request.cancellation);

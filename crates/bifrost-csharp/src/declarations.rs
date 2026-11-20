@@ -691,19 +691,21 @@ impl CSharpVisitor<'_, '_, '_> {
             code_unit.clone(),
             extract_csharp_supertypes(node, self.source),
         );
-        self.add_source_signature(
-            node,
-            code_unit.clone(),
-            // Recorded, not merely present: canonical identity reads a type
-            // declaration's arity, so a nongeneric type must be a proven zero
-            // rather than an unread list (#1651).
-            SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
-                .with_recorded_type_parameters(csharp_declaration_type_parameters(
-                    node,
-                    self.source,
-                ))
-                .with_class_like_kind(crate::syntax::csharp_nominal_kind(node)),
-        );
+        // Recorded, not merely present: canonical identity reads a type
+        // declaration's arity, so a nongeneric type must be a proven zero
+        // rather than an unread list (#1651).
+        let metadata = SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
+            .with_recorded_type_parameters(csharp_declaration_type_parameters(node, self.source));
+        let metadata = match csharp_class_like_static(node, self.source) {
+            Some(is_static) => metadata
+                .with_class_like_kind(crate::syntax::csharp_nominal_kind(node))
+                .with_class_like_static(is_static),
+            // The existing DTO has no "staticness unavailable" bit. Leave
+            // the class-like marker absent for unsupported written forms so
+            // selected authority cannot read default false as evidence.
+            None => metadata,
+        };
+        self.add_source_signature(node, code_unit.clone(), metadata);
         self.visit_primary_constructor(node, scope, &code_unit, &name);
 
         if let Some(body) = cs_type_body(node) {
@@ -1180,6 +1182,17 @@ fn csharp_type_code_unit(
     ))
 }
 
+fn csharp_class_like_static(node: Node<'_>, source: &str) -> Option<bool> {
+    if !csharp_has_modifier(source, node, "static") {
+        return Some(false);
+    }
+    // C# static class is the supported static nominal form. A written static
+    // modifier on another class-like grammar node is invalid or unsupported;
+    // the existing metadata shape cannot mark only staticness unknown, so omit
+    // its class-like marker rather than publish false.
+    (node.kind() == "class_declaration").then_some(true)
+}
+
 pub(crate) fn count_type_parameters(node: Node<'_>) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -1464,7 +1477,6 @@ fn csharp_signature_metadata<'tree>(
     });
     let metadata = SignatureMetadata::new(signature, parameters)
         .with_overload_discriminator(Some(csharp_overload_discriminator(node, source)))
-        .with_callable_arity(callable_arity)
         .with_callable_parameter_types(parameter_types)
         .with_type_parameters(type_parameters)
         .with_return_type_text(return_type_text)
@@ -1475,6 +1487,10 @@ fn csharp_signature_metadata<'tree>(
         .with_extension_receiver_is_unconstrained_type_parameter(
             extension_receiver_is_unconstrained_type_parameter,
         );
+    let metadata = match callable_arity {
+        Some(arity) => metadata.with_callable_arity(arity),
+        None => metadata,
+    };
     metadata
         .with_callable_override_modifier(csharp_override_modifier(source, node))
         .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
@@ -1778,32 +1794,27 @@ fn csharp_join_namespace(prefix: &str, path: &[String]) -> String {
     }
 }
 
-fn csharp_callable_arity(node: Node<'_>, source: &str) -> CallableArity {
+fn csharp_callable_arity(node: Node<'_>, source: &str) -> Option<CallableArity> {
     let Some(parameters) = csharp_parameter_list_node(node) else {
-        return CallableArity::exact(0);
+        return Some(CallableArity::exact(0));
     };
     let mut required = 0usize;
     let mut total = 0usize;
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
-        if parameter.kind() != "parameter" {
-            continue;
-        }
+    let formals = csharp_parameter_syntax(parameters, &mut || true)?;
+    let repeated = formals.iter().any(|formal| formal.params);
+    for formal in formals {
         total += 1;
-        let mut parameter_cursor = parameter.walk();
-        let optional = parameter
-            .children(&mut parameter_cursor)
-            .any(|child| child.kind() == "=")
+        let parameter = formal.anchor;
+        let optional = formal.params
+            || parameter
+                .children(&mut parameter.walk())
+                .any(|child| child.kind() == "=")
             || csharp_parameter_has_optional_attribute(parameter, source);
         if !optional {
             required += 1;
         }
     }
-    let repeated = csharp_parameter_list_has_params(parameters);
-    if repeated {
-        total += 1;
-    }
-    CallableArity::new(required, total, repeated)
+    Some(CallableArity::new(required, total, repeated))
 }
 
 fn csharp_parameter_has_optional_attribute(parameter: Node<'_>, source: &str) -> bool {
@@ -1834,11 +1845,170 @@ fn csharp_parameter_has_optional_attribute(parameter: Node<'_>, source: &str) ->
     false
 }
 
-pub(crate) fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
+/// One formal from the C# grammar, including its flattened parameter array.
+#[derive(Clone, Copy)]
+pub struct CSharpParameterSyntax<'tree> {
+    pub name: Node<'tree>,
+    pub type_node: Option<Node<'tree>>,
+    pub anchor: Node<'tree>,
+    pub params: bool,
+}
+
+/// Read a parameter list once, rejecting recovery and duplicate grammar fields.
+/// The anonymous params token is independent of the collection's written type.
+pub fn csharp_parameter_syntax<'tree>(
+    parameters: Node<'tree>,
+    step: &mut dyn FnMut() -> bool,
+) -> Option<Vec<CSharpParameterSyntax<'tree>>> {
+    if !step()
+        || !matches!(
+            parameters.kind(),
+            "parameter_list" | "bracketed_parameter_list"
+        )
+        || parameters.has_error()
+        || parameters.is_missing()
+    {
+        return None;
+    }
+    let mut result = Vec::new();
+    let mut params = false;
+    let mut name = None;
+    let mut type_node = None;
     let mut cursor = parameters.walk();
-    parameters
-        .children(&mut cursor)
-        .any(|child| child.kind() == "params")
+    for (index, child) in parameters.children(&mut cursor).enumerate() {
+        if !step() || child.is_missing() || child.has_error() {
+            return None;
+        }
+        match parameters.field_name_for_child(index as u32) {
+            Some("name") => {
+                if name.replace(child).is_some() {
+                    return None;
+                }
+            }
+            Some("type") => {
+                if type_node.replace(child).is_some() {
+                    return None;
+                }
+            }
+            Some(_) => return None,
+            None if child.kind() == "implicit_parameter" => {
+                if params {
+                    return None;
+                }
+                result.push(CSharpParameterSyntax {
+                    name: child,
+                    type_node: None,
+                    anchor: child,
+                    params: false,
+                });
+            }
+            None if child.kind() == "params" => {
+                if params {
+                    return None;
+                }
+                params = true;
+            }
+            None if child.kind() == "parameter" => {
+                if params {
+                    return None;
+                }
+                let mut formal_name = None;
+                let mut formal_type = None;
+                let mut default_pending = false;
+                let mut has_default = false;
+                for (index, field) in child.children(&mut child.walk()).enumerate() {
+                    if !step() || field.is_missing() || field.has_error() {
+                        return None;
+                    }
+                    match child.field_name_for_child(index as u32) {
+                        Some("name") => {
+                            if formal_name.replace(field).is_some() {
+                                return None;
+                            }
+                        }
+                        Some("type") => {
+                            if formal_type.replace(field).is_some() {
+                                return None;
+                            }
+                        }
+                        Some(_) => return None,
+                        // These grammar children do not introduce a binding.
+                        None if matches!(
+                            field.kind(),
+                            "modifier"
+                                | "attribute_list"
+                                | "preproc_if_in_attribute_list"
+                                | "comment"
+                        ) => {}
+                        None if field.kind() == "=" && !has_default => {
+                            has_default = true;
+                            default_pending = true;
+                        }
+                        // The grammar places the default expression after '='.
+                        None if default_pending && field.is_named() => default_pending = false,
+                        None => return None,
+                    }
+                }
+                if default_pending {
+                    return None;
+                }
+                result.push(CSharpParameterSyntax {
+                    name: formal_name.filter(|name| name.kind() == "identifier")?,
+                    type_node: formal_type,
+                    anchor: child,
+                    params: false,
+                });
+            }
+            // Punctuation and annotations carry no formal of their own. Ref,
+            // out, in, this, scoped and readonly are nested modifier children
+            // of an ordinary parameter; unexpected list-level modifiers fail
+            // closed rather than dropping a possible formal.
+            None if matches!(
+                child.kind(),
+                "(" | ")"
+                    | "["
+                    | "]"
+                    | ","
+                    | "comment"
+                    | "attribute_list"
+                    | "preproc_if_in_attribute_list"
+            ) => {}
+            None => return None,
+        }
+    }
+    if params {
+        let name = name.filter(|name| name.kind() == "identifier")?;
+        result.push(CSharpParameterSyntax {
+            name,
+            type_node: Some(type_node?),
+            // Shared formal traversal sorts anchors by source position.
+            anchor: name,
+            params: true,
+        });
+    } else if name.is_some() || type_node.is_some() {
+        return None;
+    }
+    Some(result)
+}
+
+/// The type of a formal anchor returned by the C# parameter reader.
+/// Flattened params formals use their name as anchor, not the enclosing list.
+pub fn csharp_parameter_type_node(anchor: Node<'_>) -> Option<Node<'_>> {
+    if anchor.kind() == "parameter" {
+        return anchor.child_by_field_name("type");
+    }
+    let list = anchor
+        .parent()
+        .filter(|node| matches!(node.kind(), "parameter_list" | "bracketed_parameter_list"))?;
+    csharp_parameter_syntax(list, &mut || true)?
+        .into_iter()
+        .find(|formal| formal.anchor == anchor)?
+        .type_node
+}
+
+pub(crate) fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
+    csharp_parameter_syntax(parameters, &mut || true)
+        .is_some_and(|formals| formals.iter().any(|formal| formal.params))
 }
 
 /// The parameter list a callable declaration declares.
@@ -1848,7 +2018,8 @@ pub(crate) fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
 /// admits the list as a plain named child (`repeat(choice($.type_parameter_list,
 /// $.parameter_list))`) with no field name, so the field lookup alone cannot see
 /// it (#1797).
-pub(crate) fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+#[doc(hidden)]
+pub fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     node.child_by_field_name("parameters")
         .or_else(|| first_named_child_of_kind(node, "parameter_list"))
 }
@@ -1891,48 +2062,22 @@ pub fn csharp_callable_parameter_type_nodes(node: Node<'_>) -> Vec<Option<Node<'
     let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
     };
-    let mut types = Vec::new();
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if child.kind() != "parameter" {
-            continue;
-        }
-        types.push(child.child_by_field_name("type"));
-    }
-    if csharp_parameter_list_has_params(parameters) {
-        types.push(parameters.child_by_field_name("type"));
-    }
-    types
+    csharp_parameter_syntax(parameters, &mut || true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|formal| formal.type_node)
+        .collect()
 }
 
 pub(crate) fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
     };
-    let mut labels = Vec::new();
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if child.kind() != "parameter" {
-            continue;
-        }
-        if let Some(name) = child.child_by_field_name("name") {
-            labels.push(name);
-            continue;
-        }
-        let mut param_cursor = child.walk();
-        if let Some(name) = child
-            .named_children(&mut param_cursor)
-            .find(|candidate| candidate.kind() == "identifier")
-        {
-            labels.push(name);
-        }
-    }
-    if csharp_parameter_list_has_params(parameters)
-        && let Some(name) = parameters.child_by_field_name("name")
-    {
-        labels.push(name);
-    }
-    labels
+    csharp_parameter_syntax(parameters, &mut || true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|formal| formal.name)
+        .collect()
 }
 
 fn csharp_property_signature(node: Node<'_>, source: &str) -> String {
@@ -1943,23 +2088,18 @@ fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
     let Some(parameters) = csharp_parameter_list_node(node) else {
         return "()".to_string();
     };
-    let mut parts = Vec::new();
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if child.kind() != "parameter" {
-            continue;
-        }
-        let part = child
-            .child_by_field_name("type")
-            .map(|type_node| csharp_render_node(type_node, source))
-            .unwrap_or_else(|| csharp_render_node(child, source));
-        parts.push(part);
-    }
-    if csharp_parameter_list_has_params(parameters)
-        && let Some(type_node) = parameters.child_by_field_name("type")
-    {
-        parts.push(csharp_render_node(type_node, source));
-    }
+    let Some(formals) = csharp_parameter_syntax(parameters, &mut || true) else {
+        // Keep recovered declarations navigable, as with recovered member
+        // headers, but never alias a malformed list to a valid overload key.
+        return format!(
+            "(<invalid-parameters>{})",
+            csharp_render_node(parameters, source)
+        );
+    };
+    let parts = formals
+        .into_iter()
+        .map(|formal| csharp_render_node(formal.type_node.unwrap_or(formal.anchor), source))
+        .collect::<Vec<_>>();
     format!("({})", parts.join(", "))
 }
 
@@ -2063,11 +2203,10 @@ fn csharp_overload_discriminator(node: Node<'_>, source: &str) -> [u8; 32] {
                 }
             }
         }
-        if csharp_parameter_list_has_params(list) {
-            tokens.extend(overload_parameter_tokens(
-                list.child_by_field_name("type"),
-                source,
-            ));
+        if let Some(formal) = csharp_parameter_syntax(list, &mut || true)
+            .and_then(|formals| formals.into_iter().find(|formal| formal.params))
+        {
+            tokens.extend(overload_parameter_tokens(formal.type_node, source));
             tokens.push("<passing:params>".to_owned());
         }
     }
@@ -2088,23 +2227,85 @@ mod primary_source_tests {
     }
 
     #[test]
+    #[hardwon("#13045: a malformed params list took the key of M()")]
+    fn malformed_parameter_list_has_a_distinct_incomplete_identity() {
+        let source = "class C { void M() {} void M(int x = ) {} }";
+        let parsed = parse(source);
+        let methods = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_function() && unit.identifier() == "M")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods.len(),
+            2,
+            "recovery must retain both declarations: {methods:?}"
+        );
+        let valid = methods
+            .iter()
+            .find(|unit| unit.signature() == Some("()"))
+            .unwrap();
+        let malformed = methods
+            .iter()
+            .find(|unit| unit.signature() != Some("()"))
+            .unwrap();
+        assert_ne!(valid, malformed);
+        assert!(
+            malformed
+                .signature()
+                .unwrap()
+                .contains("<invalid-parameters>")
+        );
+        assert!(
+            parsed.signature_metadata[*valid]
+                .iter()
+                .all(|row| row.callable_arity().is_some())
+        );
+        assert!(
+            parsed.signature_metadata[*malformed]
+                .iter()
+                .all(|row| row.callable_arity().is_none()),
+            "the malformed declaration must report an incomplete signature"
+        );
+    }
+
+    #[test]
     #[hardwon("#11253: record structs published class source signature metadata")]
     fn record_struct_signature_kind_is_struct() {
-        let parsed = parse("record struct Value(int X); record Reference(int X);");
+        let parsed = parse(
+            "record struct Value(int X); record Reference(int X); static class Utility {} interface I {} struct S {} enum E { A }",
+        );
         for (name, expected) in [
             ("Value", ClassLikeKind::Struct),
             ("Reference", ClassLikeKind::Class),
+            ("Utility", ClassLikeKind::Class),
+            ("I", ClassLikeKind::Interface),
+            ("S", ClassLikeKind::Struct),
+            ("E", ClassLikeKind::Enum),
         ] {
             let link = parsed
                 .source_declaration_metadata
                 .iter()
                 .find(|link| link.unit.short_name() == name)
                 .expect("nominal metadata");
-            assert_eq!(
-                parsed.signature_metadata[&link.unit][link.metadata_ordinal].class_like_kind(),
-                Some(expected)
-            );
+            let metadata = &parsed.signature_metadata[&link.unit][link.metadata_ordinal];
+            assert_eq!(metadata.class_like_kind(), Some(expected));
+            assert_eq!(metadata.class_like_is_static(), name == "Utility");
         }
+    }
+
+    #[test]
+    fn unsupported_written_static_nominal_stays_unclassified() {
+        let parsed = parse("static struct Invalid {}");
+        let link = parsed
+            .source_declaration_metadata
+            .iter()
+            .find(|link| link.unit.short_name() == "Invalid")
+            .expect("nominal metadata");
+        assert_eq!(
+            parsed.signature_metadata[&link.unit][link.metadata_ordinal].class_like_kind(),
+            None
+        );
     }
 
     #[test]

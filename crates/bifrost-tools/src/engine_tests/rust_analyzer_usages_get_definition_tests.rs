@@ -30,7 +30,7 @@ mod rust_departing_tests_tests {
 
     use brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch_with_source_and_cancellation;
 
-    use brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_requests;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::test_support::resolve_definition_requests;
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;

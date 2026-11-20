@@ -296,12 +296,20 @@ struct Replayable<T> {
     receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
 }
 
-#[derive(Default)]
-pub(crate) struct PythonDefinitionContextRequestMemo {
-    contexts:
-        KeyedPoolSafeMemo<PythonDefinitionContextKey, Replayable<Arc<PythonDefinitionContext>>>,
-    #[cfg(test)]
-    build_counters: Arc<PythonDefinitionBuildCounters>,
+// A hit replays the receipt of the build that produced the entry.
+impl<T> brokk_bifrost_core::domain_memo::ReplayEntry for Replayable<T> {}
+
+brokk_bifrost_core::domain_memo_set! {
+    #[derive(Default)]
+    pub(crate) struct PythonDefinitionContextRequestMemo {
+        contexts: brokk_bifrost_core::domain_memo::ReplayingStore<
+            KeyedPoolSafeMemo<
+                PythonDefinitionContextKey,
+                Replayable<Arc<PythonDefinitionContext>>,
+            >,
+        >,
+        ; test_only { build_counters: Arc<PythonDefinitionBuildCounters> }
+    }
 }
 
 fn definition_context_key(
@@ -397,56 +405,60 @@ pub(crate) fn request_definition_build_counts(py: &PythonAnalyzer) -> (usize, us
     )
 }
 
-/// Complete syntax facts live for one active query, or one provider when no
-/// outer query exists. Owners and selected reads are deliberately not cached.
-#[derive(Default)]
-struct PythonModuleMutationRequestMemo {
-    facts: Mutex<HashMap<[u8; 32], Arc<PythonModuleMutationFacts>>>,
-    #[cfg(test)]
-    collections: AtomicUsize,
+brokk_bifrost_core::domain_memo_set! {
+    /// Complete syntax facts live for one active query, or one provider when no
+    /// outer query exists. Owners and selected reads are deliberately not cached.
+    struct PythonModuleMutationRequestMemo {
+        // Certifying: the caller holds the prepared tree whose exact bytes the
+        // facts were collected from. Owners and selected reads are not cached.
+        facts: brokk_bifrost_core::domain_memo::CertifyingRegion<
+            [u8; 32],
+            PythonModuleMutationFacts,
+            brokk_bifrost_core::domain_memo::DigestAuthority,
+        >,
+        ; test_only { collections: AtomicUsize }
+    }
 }
+
+type ModuleMutationFacts = brokk_bifrost_core::retention_budget::BudgetedValue<
+    brokk_bifrost_core::domain_memo::Certified<
+        PythonModuleMutationFacts,
+        brokk_bifrost_core::domain_memo::DigestAuthority,
+    >,
+>;
 
 impl PythonModuleMutationRequestMemo {
     fn facts(
         &self,
         prepared: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
         session: &ResolutionSession,
-    ) -> Option<Arc<PythonModuleMutationFacts>> {
+    ) -> Option<ModuleMutationFacts> {
+        use brokk_bifrost_core::domain_memo::CertificationProof;
+        use brokk_bifrost_core::retention_budget::BudgetedValue;
         if !session.scope_step() {
             return None;
         }
+        let proof = CertificationProof::from_witness(prepared);
         let key = prepared.source_sha256();
-        let cached = self
-            .facts
-            .lock()
-            .expect("module mutation memo lock poisoned")
-            .get(&key)
-            .cloned();
-        if let Some(cached) = cached {
-            return session.scope_step().then_some(cached);
+        if let Some(cached) = self.facts.get(&key, &proof) {
+            return session
+                .scope_step()
+                .then_some(BudgetedValue::Retained(cached));
         }
         #[cfg(test)]
         self.collections.fetch_add(1, Ordering::Relaxed);
-        // Collection never holds the map lock and uses this caller's session.
-        let collected = Arc::new(PythonModuleMutationFacts::collect_bounded(
+        // Collection never holds a lock and uses this caller's session.
+        let collected = PythonModuleMutationFacts::collect_bounded(
             prepared.tree().root_node(),
             prepared.source(),
             || session.scope_step(),
-        )?);
+        )?;
         if !session.scope_step() {
             return None;
         }
-        let facts = {
-            let mut facts = self
-                .facts
-                .lock()
-                .expect("module mutation memo lock poisoned");
-            // A concurrent fill cannot repair this caller's stop while waiting.
-            if !session.scope_step() {
-                return None;
-            }
-            Arc::clone(facts.entry(key).or_insert(collected))
-        };
+        // A concurrent fill cannot repair this caller's stop while waiting. A
+        // refused or closed region hands back the complete request-owned facts.
+        let facts = self.facts.insert(key, collected, &proof);
         session.scope_step().then_some(facts)
     }
 }
@@ -467,7 +479,7 @@ impl<'a> PythonDefinitionProvider<'a> {
             // Choose once, before nested per-base scopes can change the registry.
             module_mutations: python
                 .active_query_request_memo::<PythonModuleMutationRequestMemo>()
-                .unwrap_or_else(|| Arc::new(PythonModuleMutationRequestMemo::default())),
+                .unwrap_or_else(|| python.standalone_request_memo()),
         }
     }
 
@@ -4584,7 +4596,7 @@ pub(crate) struct PythonDefinitionBatchOperation<'a> {
     request: Option<
         crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest<'a>,
     >,
-    reads: Option<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
+    reads: Option<brokk_bifrost_analysis::analyzer::usages::common::RequestReadState>,
 }
 
 /// Retained request state is read and written only inside a memo capture. Each
@@ -4614,9 +4626,9 @@ impl<'a> PythonDefinitionBatchOperation<'a> {
         self.request.is_some() && self.reads.is_some()
     }
 
-    /// Run one use of the retained request under `owner`. A rejected receipt
-    /// discards the request, so no product outlives the completion that
-    /// described it; `reads` is kept only while a request is retained.
+    /// Run one use of the retained request under `owner`. Operational failure
+    /// discards the request; a current-only refusal keeps its state and refuses
+    /// each later consumer. `reads` lives only while the request is retained.
     pub(crate) fn captured<T>(
         &mut self,
         owner: brokk_bifrost_analysis::analyzer::usages::common::QueryMemoOwner,
@@ -4803,7 +4815,7 @@ impl<'a> DefinitionBatchResolver<'a> for PythonDefinitionBatchOperation<'a> {
             |state| {
                 let walked = state
                     .request_in_capture(None)
-                    .with_native_request(|native| {
+                    .with_native_request(analyzer, |native| {
                         native.operation.with_python_direct_bases(
                             &native.environment,
                             &cancellation,
@@ -4970,9 +4982,8 @@ pub(crate) fn resolve_definition_dispatch<'a>(
 
 #[cfg(test)]
 mod bounded_tests {
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-
     use crate::analyzer::usages::get_definition::python::*;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::test_support::resolve_definition_requests;
 
     use brokk_bifrost_core::analyzer::model::Language;
 
@@ -5121,6 +5132,10 @@ mod bounded_tests {
             })
             .collect();
         let pool = oracle.prepare_workspace_dispatch_pool();
+        // A new request: this arm counts the pool's own operations, not the
+        // definition answers the arms above left in their request (#13847).
+        let _pooled_request =
+            AnalyzerQueryScope::with_new_outer_request_and_cancellation(analyzer, &cancellation);
         brokk_bifrost_analysis::analyzer::native_points::reset_native_point_operation_open_count_for_test();
         let ((pooled, pooled_receipt), pooled_reads) =
             brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
@@ -5164,6 +5179,136 @@ mod bounded_tests {
             format!("{:?}", pooled_receipt.incomplete_reasons()),
             format!("{:?}", independent_receipt.incomplete_reasons()),
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13847: each dispatch path re-resolved one Python callee site on a fresh native operation"
+    )]
+    fn python_definition_answers_are_shared_within_one_outer_request() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            CancellationToken, SemanticBudget, SemanticRequest,
+        };
+
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        return self\n",
+                ),
+                (
+                    "app.py",
+                    "from service import Service\n\ndef root():\n    value = Service()\n    return value.run()\n",
+                ),
+            ],
+        );
+        let workspace = &fixture.analyzer;
+        let analyzer = workspace.analyzer();
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &ProjectFile::new(fixture.project_root(), "app.py"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("materialize Python caller")
+            .available_value()
+            .cloned()
+            .expect("caller artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.locator().declaration().last_segment_name() == Some("root"))
+            .expect("root procedure");
+        let procedure = artifact.procedure_handle(caller.id()).expect("root handle");
+        // Every pass consumes the same lowered callee, so their work compares
+        // dispatch alone, not a cold lowering of service.py.
+        let _service_artifact = workspace
+            .materialize_program_semantics(
+                &ProjectFile::new(fixture.project_root(), "service.py"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("materialize the shared callee");
+        let calls = caller
+            .call_sites()
+            .iter()
+            .map(|call| procedure.call_site_handle(call.id).expect("call handle"))
+            .collect::<Vec<_>>();
+        let oracle = workspace.semantic_oracle_provider();
+        // Each resolution has its own dispatch session, as value-flow
+        // discovery and ICFG call transfers do. Returns the opened native
+        // operations, the answers and their complete receipt.
+        let resolve_all = || {
+            brokk_bifrost_analysis::analyzer::native_points::reset_native_point_operation_open_count_for_test();
+            let ((answers, receipt), reads) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                    QueryReadReceipt::capture(analyzer, || {
+                        calls
+                            .iter()
+                            .map(|call| {
+                                let mut session =
+                                    oracle.prepare_call_dispatch_session(Arc::clone(&artifact));
+                                let mut budget = SemanticBudget::default();
+                                format!(
+                                    "{:#?}",
+                                    session
+                                        .resolve_call(
+                                            call,
+                                            &mut SemanticRequest::new(&mut budget, &cancellation),
+                                        )
+                                        .expect("dispatch")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                });
+            (
+                brokk_bifrost_analysis::analyzer::native_points::native_point_operation_open_count_for_test(),
+                answers,
+                reads.keys(),
+                reads.channels(),
+                format!("{:?}", receipt.incomplete_reasons()),
+            )
+        };
+        let answers = || {
+            crate::analyzer::python::native_request::definition_lookup::request_definition_answers()
+                .expect("an open outer request")
+        };
+        let request =
+            AnalyzerQueryScope::with_new_outer_request_and_cancellation(analyzer, &cancellation);
+        let first = resolve_all();
+        let fills = answers().fills();
+        assert!(fills > 0, "the first dispatch computes its definitions");
+        let second = resolve_all();
+        assert_eq!(
+            answers().fills(),
+            fills,
+            "the same request reuses every definition answer"
+        );
+        assert!(
+            second.0 < first.0,
+            "a reused answer opens no operation: {} then {}",
+            first.0,
+            second.0
+        );
+        assert_eq!(
+            first.1, second.1,
+            "a replayed answer equals the computed one"
+        );
+        assert_eq!(first.2, second.2, "a replay names every read of its fill");
+        assert_eq!(first.3, second.3);
+        assert_eq!(first.4, second.4);
+        drop(request);
+        // The answers belong to the request: the next one computes its own.
+        let _next =
+            AnalyzerQueryScope::with_new_outer_request_and_cancellation(analyzer, &cancellation);
+        let third = resolve_all();
+        assert_eq!(answers().fills(), fills);
+        assert_eq!(first.0, third.0);
+        assert_eq!(first.1, third.1);
+        assert_eq!(first.2, third.2);
     }
 
     #[test]
@@ -5220,6 +5365,12 @@ mod bounded_tests {
                     .collect::<Vec<_>>()
             });
         let mut context = DefinitionBatchContext::new(&python, scope.token());
+        // A new request: the batch must open its own operation rather than
+        // reuse the single requests' answers (#13847).
+        let _batch_request = AnalyzerQueryScope::with_new_outer_request_and_cancellation(
+            &python,
+            &CancellationToken::default(),
+        );
         brokk_bifrost_analysis::analyzer::native_points::reset_native_point_operation_open_count_for_test();
         let (outcomes, batch_reads) =
             brokk_bifrost_analysis::analyzer::capture_query_reads(&python, || {
@@ -5607,12 +5758,14 @@ mod bounded_tests {
         );
 
         // Partial collection is not published; a funded caller can fill later.
-        let memo = PythonModuleMutationRequestMemo::default();
-        let mut tiny = INTERACTIVE_TYPE_LOOKUP_BUDGET;
-        tiny.max_scope_nodes = 1;
-        let stopped = ResolutionSession::bounded(tiny, None);
+        let memo: PythonModuleMutationRequestMemo =
+            brokk_bifrost_core::domain_memo::DomainMemo::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1 << 24),
+            );
+        let stopped =
+            ResolutionSession::bounded_with_total_work(INTERACTIVE_TYPE_LOOKUP_BUDGET, 1, None);
         assert!(memo.facts(&prepared, &stopped).is_none());
-        assert!(memo.facts.lock().unwrap().is_empty());
+        assert_eq!(memo.facts.stats().entries, 0);
         assert!(memo.facts(&prepared, &funded()).is_some());
         assert_eq!(memo.collections.load(Ordering::Relaxed), 2);
         assert!(
@@ -6148,13 +6301,7 @@ mod bounded_tests {
             );
         }
         for allowance in [0, 1, 8] {
-            let session = ResolutionSession::bounded(
-                ReceiverAnalysisBudget {
-                    max_scope_nodes: allowance,
-                    ..brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET
-                },
-                None,
-            );
+            let session = ResolutionSession::bounded_with_total_work(brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET, allowance, None);
             let selected =
                 imported_call_selection_with_steps(source, "run", || session.scope_step());
             assert!(
@@ -6224,6 +6371,7 @@ mod bounded_tests {
 
 #[cfg(test)]
 mod batch_context_tests {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::test_support::resolve_definition_requests;
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#11234: Python batch request hits lost opening completion and retained operational fills"

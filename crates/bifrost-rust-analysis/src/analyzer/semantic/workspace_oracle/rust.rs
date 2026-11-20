@@ -44,7 +44,9 @@ pub fn rust_std_builtin_call(
     let Some(mapping) = procedure.semantics().source_mapping(row.source) else {
         return Ok(None);
     };
-    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)? else {
+    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)
+        .and_then(|source| source.held_or_refused())?
+    else {
         return Ok(None);
     };
     let span = mapping.locator.anchor().span();
@@ -71,7 +73,9 @@ pub(crate) fn rust_std_direct_string_receiver(
     let Some(mapping) = procedure.semantics().source_mapping(row.source) else {
         return Ok(false);
     };
-    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)? else {
+    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)
+        .and_then(|source| source.held_or_refused())?
+    else {
         return Ok(false);
     };
     let span = mapping.locator.anchor().span();
@@ -118,7 +122,9 @@ pub fn rust_clone_certificate(
     let Some(mapping) = procedure.semantics().source_mapping(row.source) else {
         return Ok(empty(RustCloneVerdict::NotClone));
     };
-    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)? else {
+    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)
+        .and_then(|source| source.held_or_refused())?
+    else {
         return Ok(crate::analyzer::rust::std_types::rust_clone_source_unavailable(analyzer));
     };
     let span = mapping.locator.anchor().span();

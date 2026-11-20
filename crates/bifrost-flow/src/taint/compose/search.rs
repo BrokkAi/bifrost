@@ -50,7 +50,6 @@ use crate::value_flow::{
 
 use super::graph::{ComposedSourceId, Endpoint, ExecutionTarget, Hop, HopQuality, ObjectAnchor};
 use super::labels::{ComposeLabels, LabelFunctionId, LabelFunctions};
-use super::provider::bound_return_member_matches;
 use super::provider::{
     BlockedGap, BoundSanitizer, BoundSource, BoundTransform, CallModel, CallerLocation,
     Completeness, CompositionProvider, DispatchCandidate, EndpointEvidence, ExecutionArmContext,
@@ -58,6 +57,7 @@ use super::provider::{
     InteriorObservation, InteriorSeed, InteriorTarget, Openness, StoreChannelLink,
     StoreWriteObservation,
 };
+use super::provider::{ModelOutputRefusal, bound_return_member_matches, projected_model_actual};
 use super::{ComposeError, CompositionBudget};
 
 // Keep the CFG algorithm's typed stop when its ordering proof is unavailable.
@@ -2021,6 +2021,7 @@ where
         procedure: &DurableProcedureKey,
         uncertain: bool,
         crossed: &[Box<[CallSiteId]>],
+        target: &Endpoint,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(HopQuality, Box<[CallSiteId]>), ComposeError> {
         assert!(!crossed.is_empty(), "a flow has at least one path class");
@@ -2034,6 +2035,25 @@ where
             for &call in class.iter() {
                 let dispatch = self.dispatch_noted(&(procedure.clone(), call), request)?;
                 quality = quality.conjoin(dispatch.continuation);
+                if let Some(members) = self.crossed_returned_members(procedure, call, target)
+                    && !members.is_empty()
+                    && let Some(model) = self.model(&(procedure.clone(), call), request)?
+                {
+                    for member in members {
+                        if let Some(reason) =
+                            model.returned_member_refusal(&member, self.inputs.endpoint_projections)
+                        {
+                            self.note_model_content_refusal(
+                                &(procedure.clone(), call),
+                                &model,
+                                &dispatch,
+                                reason,
+                                request,
+                            );
+                            quality = quality.conjoin(HopQuality::new(true, false));
+                        }
+                    }
+                }
             }
             best = best.join(quality);
             if named.is_none_or(|(held, _)| score(quality) > score(held)) {
@@ -3265,8 +3285,13 @@ where
         }
         if let Endpoint::Port(port) = &key.node {
             for flow in data.into.get(port).cloned().unwrap_or_default() {
-                let (flow_quality, crossed) =
-                    self.flow_quality(&key.procedure, flow.uncertain, &flow.crossed, request)?;
+                let (flow_quality, crossed) = self.flow_quality(
+                    &key.procedure,
+                    flow.uncertain,
+                    &flow.crossed,
+                    &key.node,
+                    request,
+                )?;
                 let local = self
                     .provider
                     .local_function(
@@ -3320,8 +3345,13 @@ where
         };
         {
             for flow in reaching {
-                let (flow_quality, crossed) =
-                    self.flow_quality(&key.procedure, flow.uncertain, &flow.crossed, request)?;
+                let (flow_quality, crossed) = self.flow_quality(
+                    &key.procedure,
+                    flow.uncertain,
+                    &flow.crossed,
+                    &key.node,
+                    request,
+                )?;
                 let seed = flow.from;
                 let local = self
                     .provider
@@ -3518,6 +3548,105 @@ where
         }
     }
 
+    fn note_model_content_refusal(
+        &mut self,
+        call: &DurableCallSiteKey,
+        model: &CallModel<L::Function>,
+        dispatch: &DispatchAnswer,
+        reason: ModelOutputRefusal,
+        request: &mut SemanticRequest<'_>,
+    ) {
+        // The missing capability is a verdict about the selected model
+        // only when its provider records that input for this consult.
+        // Union every contributing typed cause before report retention;
+        // a content certificate cannot erase an operational dependency.
+        // A refused demand remains incomplete even when another path reaches
+        // the sink: silently dropping a sibling demand is no proof (#12846).
+        let mut causes = vec![self.provider.certify_model_content_refusal(request)];
+        if let Completeness::Incomplete { cause, .. } = &model.completeness
+            && !causes.contains(cause)
+        {
+            causes.push(*cause);
+        }
+        if let Some(cause) = dispatch.incomplete_cause
+            && !causes.contains(&cause)
+        {
+            causes.push(cause);
+        }
+        let operational = causes
+            .iter()
+            .any(|cause| matches!(cause, super::IncompleteCause::Operational(_)));
+        for cause in causes {
+            if operational && cause == super::IncompleteCause::Content {
+                continue;
+            }
+            self.note(Incompleteness::Model {
+                cause,
+                call: call.clone(),
+                reason: reason.reason().into(),
+            });
+        }
+    }
+
+    /// A projected caller input can be rooted in a crossed call's return.
+    /// Read existing call/reader-origin evidence only; never infer ownership
+    /// from a shared type or from an unrelated call on the path.
+    fn crossed_returned_members(
+        &self,
+        procedure: &DurableProcedureKey,
+        call: CallSiteId,
+        target: &Endpoint,
+    ) -> Option<Vec<PartialFlowPort>> {
+        if let Endpoint::Port(port @ PartialFlowPort::Heap { root, .. }) = target {
+            return matches!(root.as_ref(), PartialFlowPort::CallResult { call: owner, .. }
+                if *owner == call)
+            .then(|| vec![port.clone()]);
+        }
+        let handle = &self.inputs.handles.get(procedure)?.procedure;
+        let semantic = handle.semantics();
+        let (actual, selectors, tail, reader) = match target {
+            Endpoint::Location(location) => {
+                let consumer = semantic.call_site(location.call)?;
+                (
+                    call_input_value(consumer, &location.actual)?,
+                    location.selectors.clone(),
+                    location.tail,
+                    Some(location),
+                )
+            }
+            Endpoint::Sink(sink) => {
+                let spec = self.value_flow?.sink(*sink)?;
+                let ValueFlowCarrier::Location(location) = spec.carrier() else {
+                    return None;
+                };
+                let AccessPathRoot::Value(value) = location.path().root() else {
+                    return None;
+                };
+                if value.procedure() != handle {
+                    return None;
+                }
+                (
+                    value.id(),
+                    heap_selectors(location.path().selectors()),
+                    location.path().tail(),
+                    None,
+                )
+            }
+            _ => return None,
+        };
+        let producer = semantic.call_site(call)?;
+        let origins = reader
+            .and_then(|location| {
+                self.inputs
+                    .modeled_reader_origins
+                    .get(&(procedure.clone(), location.clone()))
+            })
+            .map_or(&[][..], Vec::as_slice);
+        Some(returned_member_demands(
+            handle, producer, actual, &selectors, tail, origins,
+        ))
+    }
+
     /// Backward through a call result: through the call's model when one
     /// replaces the call, otherwise into each candidate's return port and,
     /// when the dispatch has no candidate or is not complete, through the
@@ -3534,56 +3663,25 @@ where
         let dispatch = self.dispatch(&call_key, request)?;
         if let Some(model) = self.model(&call_key, request)? {
             self.note_dispatch_incomplete(&call_key, &dispatch);
-            // The capability admits component machinery, not this call's
-            // returned contents. A model with no declared return transfers
-            // leaves member demands unknown even if another pack enables
-            // projections (#11818). Whole-preserving return transfers still
-            // use apply_model's per-transfer member preservation proof.
-            let describes_return = model.transfers.iter().any(|transfer| {
-                matches!(&transfer.output, PartialFlowPort::CallResult { .. })
-                    || matches!(&transfer.output, PartialFlowPort::Heap { root, .. }
-                        if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
-            });
-            if !(self.inputs.endpoint_projections && describes_return)
-                && matches!(&key.node, Endpoint::Port(PartialFlowPort::Heap { root, .. })
-                    if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+            let Endpoint::Port(output) = &key.node else {
+                unreachable!("only call results descend")
+            };
+            if let Some(reason) =
+                model.returned_member_refusal(output, self.inputs.endpoint_projections)
             {
-                // The missing capability is a verdict about the selected model
-                // only when its provider records that input for this consult.
-                // Union every contributing typed cause before report retention;
-                // a content certificate cannot erase an operational dependency.
-                let mut causes = vec![self.provider.certify_model_content_refusal(request)];
-                if let Completeness::Incomplete { cause, .. } = &model.completeness
-                    && !causes.contains(cause)
-                {
-                    causes.push(*cause);
-                }
-                if let Some(cause) = dispatch.incomplete_cause
-                    && !causes.contains(&cause)
-                {
-                    causes.push(cause);
-                }
-                let operational = causes
-                    .iter()
-                    .any(|cause| matches!(cause, super::IncompleteCause::Operational(_)));
-                for cause in causes {
-                    if operational && cause == super::IncompleteCause::Content {
-                        continue;
+                if !model.describes_returned_member(output, self.inputs.endpoint_projections) {
+                    self.note_model_content_refusal(&call_key, &model, &dispatch, reason, request);
+                    if !model.retains_dispatch {
+                        return Ok(());
                     }
-                    self.note(Incompleteness::Model {
-                        cause,
-                        call: call_key.clone(),
-                        reason: "a call model does not describe a returned member".into(),
-                    });
-                }
-                if !model.retains_dispatch {
-                    return Ok(());
+                } else {
+                    self.apply_model(id, &call_key, &model, &dispatch, output, request)?;
                 }
             } else {
                 let Endpoint::Port(output) = &key.node else {
                     unreachable!()
                 };
-                self.apply_model(id, &call_key, &model, output, request)?;
+                self.apply_model(id, &call_key, &model, &dispatch, output, request)?;
             }
             if !model.retains_dispatch {
                 return Ok(());
@@ -3803,7 +3901,7 @@ where
                 let Endpoint::Port(output) = &key.node else {
                     unreachable!()
                 };
-                self.apply_model(id, &call_key, &model, output, request)?;
+                self.apply_model(id, &call_key, &model, &dispatch, output, request)?;
             }
             if !model.retains_dispatch {
                 return Ok(());
@@ -4249,9 +4347,9 @@ where
                         selectors: selectors.into(),
                         tail,
                     };
-                    self.dispatch_noted(&call_key, request)?;
+                    let dispatch = self.dispatch_noted(&call_key, request)?;
                     self.model(&call_key, request)?;
-                    self.apply_model(id, &call_key, &model, &heap, request)?;
+                    self.apply_model(id, &call_key, &model, &dispatch, &heap, request)?;
                 }
             }
         }
@@ -4266,6 +4364,7 @@ where
         id: usize,
         call: &DurableCallSiteKey,
         model: &CallModel<L::Function>,
+        dispatch: &DispatchAnswer,
         output: &PartialFlowPort,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(), ComposeError> {
@@ -4277,11 +4376,7 @@ where
                     Ok(Some(actual)) => actual,
                     Ok(None) => continue,
                     Err(reason) => {
-                        self.note(Incompleteness::Model {
-                            cause: super::IncompleteCause::Content,
-                            call: call.clone(),
-                            reason: reason.into(),
-                        });
+                        self.note_model_content_refusal(call, model, dispatch, reason, request);
                         continue;
                     }
                 }
@@ -5316,6 +5411,65 @@ fn place_transfer(
     placements
 }
 
+/// Map a reader-relative projection back to every owning return path.
+/// Dropping an alias prefix can certify a sibling transfer instead (#12846).
+pub(super) fn returned_member_demands(
+    procedure: &ProcedureHandle,
+    producer: &SemanticCallSite,
+    actual: ValueId,
+    selectors: &[HeapSelector],
+    tail: AccessPathTail,
+    origins: &[AbstractLocation],
+) -> Vec<PartialFlowPort> {
+    let mut demands = Vec::new();
+    let mut add = |value, prefix: &[HeapSelector], origin_tail| {
+        if prefix.is_empty()
+            && selectors.is_empty()
+            && origin_tail == AccessPathTail::Exact
+            && tail == AccessPathTail::Exact
+        {
+            return;
+        }
+        let Some(root @ PartialFlowPort::CallResult { .. }) = call_output_port(producer, value)
+        else {
+            return;
+        };
+        let demand = PartialFlowPort::Heap {
+            root: Box::new(root),
+            // A summary boundary precedes the relative read. Moving that
+            // read before the unknown suffix would certify a narrower member.
+            selectors: if origin_tail == AccessPathTail::Summary {
+                prefix.into()
+            } else {
+                prefix.iter().chain(selectors).cloned().collect()
+            },
+            tail: if tail == AccessPathTail::Summary || origin_tail == AccessPathTail::Summary {
+                AccessPathTail::Summary
+            } else {
+                AccessPathTail::Exact
+            },
+        };
+        if !demands.contains(&demand) {
+            demands.push(demand);
+        }
+    };
+    // The direct value is its own path; alias prefixes belong only to their
+    // recorded origins, never to this independently known identity.
+    add(actual, &[], AccessPathTail::Exact);
+    for origin in origins {
+        if let AccessPathRoot::Value(value) = origin.path().root()
+            && value.procedure() == procedure
+        {
+            add(
+                value.id(),
+                &heap_selectors(origin.path().selectors()),
+                origin.path().tail(),
+            );
+        }
+    }
+    demands
+}
+
 fn call_input_port(call: &SemanticCallSite, value: ValueId) -> Option<PartialFlowPort> {
     if call.receiver == Some(value) {
         return Some(PartialFlowPort::CallReceiver { call: call.id });
@@ -5346,74 +5500,6 @@ fn call_output_port(call: &SemanticCallSite, value: ValueId) -> Option<PartialFl
             call: call.id,
             ordinal: Some(u32::try_from(ordinal).expect("a call's result count fits u32")),
         })
-}
-
-/// Substitute an exact modeled endpoint prefix while retaining the demanded
-/// component suffix. This keeps a tainted tuple member distinct from its sibling
-/// through a summary that moves the tuple as a whole.
-fn projected_model_actual<Function>(
-    transfer: &super::ModelTransfer<Function>,
-    demanded_output: &PartialFlowPort,
-) -> Result<Option<PartialFlowPort>, &'static str> {
-    let actual = &transfer.actual;
-    let modeled_output = &transfer.output;
-    // Identical summarized endpoints use the authored transfer as an uncertain
-    // hop. They do not justify substituting any relative member suffix.
-    if modeled_output == demanded_output {
-        return Ok(Some(actual.clone()));
-    }
-    fn parts(port: &PartialFlowPort) -> (&PartialFlowPort, &[HeapSelector], AccessPathTail) {
-        match port {
-            PartialFlowPort::Heap {
-                root,
-                selectors,
-                tail,
-            } => (root, selectors, *tail),
-            root => (root, &[], AccessPathTail::Exact),
-        }
-    }
-    let (modeled_root, prefix, modeled_tail) = parts(modeled_output);
-    let (demanded_root, selectors, demanded_tail) = parts(demanded_output);
-    if modeled_tail == AccessPathTail::Summary && modeled_root == demanded_root {
-        let demanded = PartialFlowPort::Heap {
-            root: Box::new(demanded_root.clone()),
-            selectors: selectors.into(),
-            tail: demanded_tail,
-        };
-        if heap_ports_overlap(&demanded, modeled_output) {
-            return Err("a summarized modeled output cannot close a distinct component demand");
-        }
-    }
-    if modeled_tail != AccessPathTail::Exact
-        || modeled_root != demanded_root
-        || !selectors.starts_with(prefix)
-    {
-        return Ok(None);
-    }
-    let suffix = &selectors[prefix.len()..];
-    if suffix.is_empty() && demanded_tail == AccessPathTail::Exact {
-        return Ok(Some(actual.clone()));
-    }
-    if !transfer.preserves_member_contents() {
-        return Err(
-            "a modeled transfer has no member-path preservation proof for this component demand",
-        );
-    }
-    let (actual_root, actual_selectors, actual_tail) = parts(actual);
-    if actual_tail != AccessPathTail::Exact {
-        return Ok(None);
-    }
-    Ok(Some(PartialFlowPort::Heap {
-        root: Box::new(actual_root.clone()),
-        selectors: crate::semantic_summary::substitute_projection_prefix(
-            selectors,
-            prefix,
-            actual_selectors,
-        )
-        .expect("matching exact modeled prefixes admit substitution")
-        .into_boxed_slice(),
-        tail: demanded_tail,
-    }))
 }
 
 impl<Fact, Function> SearchInputs<Fact, Function> {

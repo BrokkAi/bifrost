@@ -117,6 +117,9 @@ pub struct TypeFlowSummaryProfile {
     pub lookup_source_partition: u64,
     pub lookup_entry: u64,
     pub lookup_relation: u64,
+    /// Rejected restore attempts for invalid derived class-set summary rows.
+    #[serde(skip_serializing_if = "TypeFlowSummaryProfile::is_zero_count")]
+    pub lookup_validation: u64,
     pub lookup_live_remap: u64,
     pub publication_incomplete_result: u64,
     pub publication_projection: u64,
@@ -129,6 +132,10 @@ pub struct TypeFlowSummaryProfile {
 }
 
 impl TypeFlowSummaryProfile {
+    const fn is_zero_count(value: &u64) -> bool {
+        *value == 0
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.preparation_call_contract == 0
             && self.preparation_dependency == 0
@@ -141,6 +148,7 @@ impl TypeFlowSummaryProfile {
             && self.lookup_source_partition == 0
             && self.lookup_entry == 0
             && self.lookup_relation == 0
+            && self.lookup_validation == 0
             && self.lookup_live_remap == 0
             && self.publication_incomplete_result == 0
             && self.publication_projection == 0
@@ -181,6 +189,9 @@ impl TypeFlowSummaryProfile {
                 .saturating_add(other.lookup_source_partition),
             lookup_entry: self.lookup_entry.saturating_add(other.lookup_entry),
             lookup_relation: self.lookup_relation.saturating_add(other.lookup_relation),
+            lookup_validation: self
+                .lookup_validation
+                .saturating_add(other.lookup_validation),
             lookup_live_remap: self
                 .lookup_live_remap
                 .saturating_add(other.lookup_live_remap),
@@ -242,6 +253,9 @@ impl TypeFlowSummaryProfile {
                 .saturating_sub(earlier.lookup_source_partition),
             lookup_entry: self.lookup_entry.saturating_sub(earlier.lookup_entry),
             lookup_relation: self.lookup_relation.saturating_sub(earlier.lookup_relation),
+            lookup_validation: self
+                .lookup_validation
+                .saturating_sub(earlier.lookup_validation),
             lookup_live_remap: self
                 .lookup_live_remap
                 .saturating_sub(earlier.lookup_live_remap),
@@ -298,6 +312,18 @@ enum SummaryProfileReason {
 }
 
 impl TypeFlowSummaryProfile {
+    fn record_validation(&mut self, error: SummaryValidationError) {
+        match error {
+            SummaryValidationError::InvalidDerivedRow(detail) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!("type_flow.invalid_derived_summary: {detail}")
+                });
+                self.record(SummaryProfileReason::LookupRelation);
+                self.lookup_validation = self.lookup_validation.saturating_add(1);
+            }
+        }
+    }
+
     fn record(&mut self, reason: SummaryProfileReason) {
         let counter = match reason {
             SummaryProfileReason::PreparationCallContract => &mut self.preparation_call_contract,
@@ -823,7 +849,13 @@ impl RuntimeSummaryInputs {
                 keys: reads.canonical_keys(),
                 channels: reads.channels(),
             },
-            None => Self::default(),
+            None => Self {
+                channels: ReadChannels {
+                    reuse_refused: true,
+                    ..Self::default().channels
+                },
+                ..Self::default()
+            },
         }
     }
 
@@ -3615,6 +3647,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         Provider: IcfgProvider + ?Sized,
     {
         self.maintenance_solver_budget_exhaustion = None;
+        let capture = self.workspace.analyzer().current_thread_read_ledger();
         #[derive(Clone)]
         struct DemandNode {
             procedure: ProcedureHandle,
@@ -3836,10 +3869,8 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                                 .then_some(summary)
                             }
                             Err(error) => {
-                                self.workspace.analyzer().record_query_failure(
-                                    error.context("validating current demanded class-set summary"),
-                                );
-                                return false;
+                                self.profile.record_validation(error);
+                                None
                             }
                         }
                     }
@@ -3991,6 +4022,11 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     == *nodes[index].current_lookup.as_bytes()
                 {
                     continue;
+                }
+                // Equal-output maintenance writes provenance too; the same
+                // derivation admission guards it as every new summary row.
+                if capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
+                    return false;
                 }
                 match rebind_equal_output_dependency(
                     &store,
@@ -4159,7 +4195,10 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                 self.profile.record(SummaryProfileReason::LookupLiveRemap);
                 return RootObservationPreflight::Indeterminate;
             }
-            Err(_) => return RootObservationPreflight::Indeterminate,
+            Err(error) => {
+                self.profile.record_validation(error);
+                return RootObservationPreflight::Indeterminate;
+            }
         };
         match self.root_observation_coverage(procedure, &restored) {
             RootObservationCoverage::Complete => {
@@ -4478,9 +4517,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     return Ok(None);
                 }
                 Err(error) => {
-                    self.workspace.analyzer().record_query_failure(
-                        error.context("validating persisted class-set summary"),
-                    );
+                    self.profile.record_validation(error);
                     return Ok(None);
                 }
             };
@@ -4949,8 +4986,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         if inputs.channels.reuse_refused {
             return 0;
         }
+        let capture = self.workspace.analyzer().current_thread_read_ledger();
         projected.into_iter().fold(0usize, |published, mut row| {
-            if !row.valid {
+            if !row.valid || capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
                 return published;
             }
             for dependency in &row.summary.dependencies {
@@ -5004,15 +5042,16 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
     }
 
     fn publish_surfaces(&mut self, cancellation: &CancellationToken) {
-        if RuntimeSummaryInputs::capture(self.workspace)
-            .channels
-            .reuse_refused
-        {
+        let capture = self.workspace.analyzer().current_thread_read_ledger();
+        if capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
             return;
         }
         let mut surfaces = self.surfaces.values().cloned().collect::<Vec<_>>();
         surfaces.sort_unstable_by_key(|surface| *surface.surface_digest());
         for surface in surfaces {
+            if capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
+                break;
+            }
             let inserted_in_memory = self.state.class_set.publish_surface(surface.clone());
             self.retained_publication_writes |= inserted_in_memory;
             let Some(store) = &self.store else {
@@ -5044,6 +5083,10 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         if cancellation.is_cancelled() {
             return ClassSetSummaryPersistence::Unavailable;
         }
+        let capture = self.workspace.analyzer().current_thread_read_ledger();
+        if capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
+            return ClassSetSummaryPersistence::Unavailable;
+        }
         let Some(store) = &self.store else {
             return ClassSetSummaryPersistence::Unavailable;
         };
@@ -5070,7 +5113,11 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             }
         };
         let lookup = row.header.key.lookup_digest;
-        let publication = match store.class_set_summary_for_digest(lookup) {
+        let current = store.class_set_summary_for_digest(lookup);
+        if capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
+            return ClassSetSummaryPersistence::Unavailable;
+        }
+        let publication = match current {
             Ok(Some(current)) => {
                 let semantic_publication_changed = !current.has_same_semantic_publication(&row);
                 store
@@ -5603,18 +5650,28 @@ fn persisted_fact_keys(
     }
 }
 
-/// The summary a persisted row states for this plan.
-///
-/// `Ok(None)` reports that the row does not fit the live plan: one of its
-/// facts names an event this plan does not seed, or seeds more than once.
-/// That is staleness, and the caller records it as a live-remap miss. Every
-/// other rejection is corruption and stays a hard error.
+/// Validation of an already-loaded derived relation. This path performs no
+/// store read: rejection is a cache miss, never an operational request stop.
+#[derive(Debug)]
+enum SummaryValidationError {
+    InvalidDerivedRow(Box<str>),
+}
+
+impl SummaryValidationError {
+    fn new(detail: impl Into<Box<str>>) -> Self {
+        Self::InvalidDerivedRow(detail.into())
+    }
+}
+
+/// The summary an already-loaded derived row states for this plan.
+/// `Ok(None)` is a stale live mapping; an invalid row is a typed validation
+/// miss. Neither outcome invents an operational failure of the store read.
 fn restore_persisted_summary(
     plan: &ValueFlowPlan,
     expected: &ClassSetSummaryLookupKey,
     expected_reads: &[ReadKey],
     row: ClassSetSummaryRow,
-) -> Result<Option<ClassSetProcedureSummary>, StoreError> {
+) -> Result<Option<ClassSetProcedureSummary>, SummaryValidationError> {
     let procedure = &expected.procedure;
     let header = &row.header;
     let expected_lookup = *class_set_lookup_fingerprint(expected).as_bytes();
@@ -5633,7 +5690,7 @@ fn restore_persisted_summary(
         || header.attachment.storage_language_key != expected.owner_storage_language_key
         || header.attachment.language != procedure.artifact().language().language()
     {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set summary header does not match the live procedure contract",
         ));
     }
@@ -5643,7 +5700,7 @@ fn restore_persisted_summary(
         .map(|read| &read.key)
         .ne(expected_reads.iter())
     {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set summary dispatch reads do not match the live plan",
         ));
     }
@@ -5654,17 +5711,17 @@ fn restore_persisted_summary(
         .facts
         .iter()
         .map(|fact| restore_persisted_fact(fact, &keys.carriers, &keys.sources, &keys.sinks))
-        .collect::<Result<Option<Vec<_>>, StoreError>>()?
+        .collect::<Result<Option<Vec<_>>, SummaryValidationError>>()?
     else {
         return Ok(None);
     };
     if facts.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set fact table is not in canonical order",
         ));
     }
     let Some(entry_fact) = facts.get(header.entry_fact_ordinal as usize) else {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set entry fact ordinal is absent",
         ));
     };
@@ -5682,20 +5739,20 @@ fn restore_persisted_summary(
                     source_partition, ..
                 } => *source_partition,
                 StableEntryFact::Zero => {
-                    return Err(StoreError::new(
+                    return Err(SummaryValidationError::new(
                         "persisted carrier entry does not match a zero lookup",
                     ));
                 }
             },
         },
         _ => {
-            return Err(StoreError::new(
+            return Err(SummaryValidationError::new(
                 "persisted class-set entry ordinal is not an entry fact",
             ));
         }
     };
     if restored_entry != expected.entry {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set entry fact does not match the lookup",
         ));
     }
@@ -5711,12 +5768,14 @@ fn restore_persisted_summary(
                 },
                 exit_fact: facts
                     .get(exit.fact_ordinal as usize)
-                    .ok_or_else(|| StoreError::new("persisted class-set exit fact is absent"))?
+                    .ok_or_else(|| {
+                        SummaryValidationError::new("persisted class-set exit fact is absent")
+                    })?
                     .clone(),
                 qualities: qualities_from_mask(exit.quality_mask)?,
             })
         })
-        .collect::<Result<Vec<_>, StoreError>>()?;
+        .collect::<Result<Vec<_>, SummaryValidationError>>()?;
     let mut canonical_exits = exits.clone();
     canonical_exits.sort_unstable_by(|left, right| {
         return_kind_ordinal(left.exit_kind)
@@ -5725,7 +5784,7 @@ fn restore_persisted_summary(
             .then_with(|| compare_qualities(&left.qualities, &right.qualities))
     });
     if exits != canonical_exits {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set exit relation is not in canonical order",
         ));
     }
@@ -5735,16 +5794,17 @@ fn restore_persisted_summary(
         .iter()
         .map(|reached| {
             Ok(StableReachedFact {
-                point: ProgramPointId::try_from_index(reached.point_id as usize)
-                    .map_err(|_| StoreError::new("persisted class-set point ID exceeds u32"))?,
+                point: ProgramPointId::try_from_index(reached.point_id as usize).map_err(|_| {
+                    SummaryValidationError::new("persisted class-set point ID exceeds u32")
+                })?,
                 fact: facts
                     .get(reached.fact_ordinal as usize)
-                    .ok_or_else(|| StoreError::new("persisted reached fact is absent"))?
+                    .ok_or_else(|| SummaryValidationError::new("persisted reached fact is absent"))?
                     .clone(),
                 qualities: qualities_from_mask(reached.quality_mask)?,
             })
         })
-        .collect::<Result<Vec<_>, StoreError>>()?;
+        .collect::<Result<Vec<_>, SummaryValidationError>>()?;
     let mut canonical_reached = reached.clone();
     canonical_reached.sort_unstable_by(|left, right| {
         left.point
@@ -5753,12 +5813,13 @@ fn restore_persisted_summary(
             .then_with(|| compare_qualities(&left.qualities, &right.qualities))
     });
     if reached != canonical_reached {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set reached relation is not in canonical order",
         ));
     }
-    let relation_rows = u64::try_from(exits.len().saturating_add(reached.len()))
-        .map_err(|_| StoreError::new("persisted class-set relation row count exceeds u64"))?;
+    let relation_rows = u64::try_from(exits.len().saturating_add(reached.len())).map_err(|_| {
+        SummaryValidationError::new("persisted class-set relation row count exceeds u64")
+    })?;
     let expected_charges = [
         ("solver.callback_rows", relation_rows),
         ("solver.propagated_outputs", relation_rows),
@@ -5770,7 +5831,7 @@ fn restore_persisted_summary(
             .zip(expected_charges)
             .any(|(actual, expected)| actual.kind != expected.0 || actual.amount != expected.1)
     {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set replay charges do not match the relation",
         ));
     }
@@ -5807,7 +5868,7 @@ fn restore_persisted_summary(
         .windows(2)
         .any(|rows| compare_relation_dependencies(&rows[0], &rows[1]) != Ordering::Less)
     {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set dependencies are not in canonical order",
         ));
     }
@@ -5841,7 +5902,7 @@ fn restore_persisted_fact(
     carriers: &HashMap<[u8; 32], Option<ValueFlowCarrierKey>>,
     sources: &HashMap<[u8; 32], Option<ValueFlowEventKey>>,
     sinks: &HashMap<[u8; 32], Option<ValueFlowEventKey>>,
-) -> Result<Option<StableValueFlowFact>, StoreError> {
+) -> Result<Option<StableValueFlowFact>, SummaryValidationError> {
     match &row.shape {
         ClassSetSummaryFactShapeRow::Zero => Ok(Some(StableValueFlowFact::Zero)),
         ClassSetSummaryFactShapeRow::Carrier {
@@ -5884,7 +5945,7 @@ fn restore_persisted_fact(
 fn restore_persisted_source(
     source: &ClassSetSummaryFactSourceRow,
     sources: &HashMap<[u8; 32], Option<ValueFlowEventKey>>,
-) -> Result<Option<StableSource>, StoreError> {
+) -> Result<Option<StableSource>, SummaryValidationError> {
     match source {
         ClassSetSummaryFactSourceRow::Entry => Ok(Some(StableSource::Entry)),
         ClassSetSummaryFactSourceRow::Event(event) => {
@@ -5892,7 +5953,7 @@ fn restore_persisted_source(
                 .cloned()
                 .map(StableSource::Event))
         }
-        ClassSetSummaryFactSourceRow::None => Err(StoreError::new(
+        ClassSetSummaryFactSourceRow::None => Err(SummaryValidationError::new(
             "persisted nonzero class-set fact has no source",
         )),
     }
@@ -5909,18 +5970,18 @@ fn unique_stable_key<'a, T>(
     keys: &'a HashMap<[u8; 32], Option<T>>,
     encoded: &[u8],
     label: &str,
-) -> Result<Option<&'a T>, StoreError> {
+) -> Result<Option<&'a T>, SummaryValidationError> {
     let digest: [u8; 32] = encoded.try_into().map_err(|_| {
-        StoreError::new(format!(
+        SummaryValidationError::new(format!(
             "persisted class-set {label} digest is not 32 bytes"
         ))
     })?;
     Ok(keys.get(&digest).and_then(Option::as_ref))
 }
 
-fn qualities_from_mask(mask: u8) -> Result<Box<[PathQuality]>, StoreError> {
+fn qualities_from_mask(mask: u8) -> Result<Box<[PathQuality]>, SummaryValidationError> {
     if !matches!(mask, 1 | 2 | 4 | 6 | 8) {
-        return Err(StoreError::new(
+        return Err(SummaryValidationError::new(
             "persisted class-set path-quality mask is not a valid frontier",
         ));
     }
@@ -6329,7 +6390,11 @@ impl PreparedClassSetSummaries<'_> {
         publications: Vec<ValidatedClassSetPublication>,
         cancellation: &CancellationToken,
     ) {
+        let capture = self.workspace.analyzer().current_thread_read_ledger();
         for publication in publications {
+            if capture.as_ref().is_none_or(|reads| reads.reuse_refused()) {
+                break;
+            }
             match publication {
                 ValidatedClassSetPublication::Runtime(publication) => {
                     self.retained_publication_writes |= self
@@ -7009,6 +7074,216 @@ mod tests {
             FieldSlotIndex::build(workspace, adapter, &mut field_budget, &cancellation)
                 .expect("runtime fixture field slots build");
         (field_slots, procedures)
+    }
+
+    #[test]
+    #[hardwon("3c23f63a5d50: type-flow summary errors lost their store error kind")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn interrupted_summary_read_preserves_its_kind_in_query_diagnostics() {
+        use crate::analyzer::AnalyzerQueryScope;
+        use crate::analyzer::i_analyzer::OuterRequest;
+        use crate::type_flow::TypeFlowError;
+        use std::error::Error;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_project, workspace, fields, procedures) = runtime_fixture(concat!(
+            "class Present:\n    def member(self):\n        pass\n",
+            "def leaf(value):\n    return value.member\n",
+            "def root():\n    return leaf(Present())\n",
+        ));
+        let root = &procedures["root"];
+        let state = TypeFlowSummaryState::new(&workspace);
+        let cache = ValueFlowCache::default();
+        let cold = solve_runtime_root(&workspace, &fields, root, state.clone(), cache.clone());
+        assert!(cold.published_summaries > 0, "{cold:#?}");
+        let store = workspace.store().expect("SQLite store");
+        // Compare every column of every class-set relation, including child
+        // rows. These test reads are outside the operation being observed.
+        let persisted = || {
+            let connection = store.read_conn().expect("snapshot reader");
+            let mut tables = connection.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'class_set_*' ORDER BY name",
+            ).expect("class-set tables");
+            let names = tables
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("table names")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("table rows");
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM {name}"))
+                        .expect("class-set relation snapshot");
+                    let columns = statement.column_count();
+                    let mut rows = statement
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|column| row.get_ref(column).map(|value| format!("{value:?}")))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .expect("snapshot query")
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("snapshot rows");
+                    rows.sort_unstable();
+                    (name, rows)
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = persisted();
+        let failed_state = TypeFlowSummaryState::new(&workspace);
+        let runtime_before = failed_state.class_set.runtime_snapshot();
+        let surfaces_before = failed_state.class_set.surfaces.lock().unwrap().clone();
+        let statements = Arc::new(AtomicUsize::new(0));
+        // The pool's LIFO checkout returns this reader. The callback-fired
+        // assertion detects a different checkout instead of passing vacuously.
+        let (trace_guard, interrupt) = {
+            let connection = store.read_conn().expect("summary reader");
+            let interrupt = Arc::new(std::sync::Mutex::new(Some(
+                connection.get_interrupt_handle(),
+            )));
+            let pending = interrupt.clone();
+            let statements = statements.clone();
+            let guard = brokk_bifrost_core::cache_db::sql_profile::attach_listener(
+                &connection,
+                Arc::new(move |event| {
+                    if let brokk_bifrost_core::cache_db::sql_profile::ListenerEvent::Statement {
+                        sql,
+                        ..
+                    } = event
+                    {
+                        statements.fetch_add(1, Ordering::Relaxed);
+                        if sql.is_some_and(|sql| {
+                            sql.contains("FROM class_set_procedure_surfaces AS surfaces")
+                        }) && let Some(handle) = pending.lock().unwrap().take()
+                        {
+                            handle.interrupt();
+                        }
+                    }
+                }),
+            );
+            (guard, interrupt)
+        };
+        let scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let solve = |state,
+                     cache,
+                     semantic_budget: &mut SemanticBudget,
+                     solver_budget: &mut SolverBudget| {
+            let cancellation = CancellationToken::default();
+            let mut request = DataflowRequest::new(solver_budget, &cancellation);
+            solve_type_flow_for_root(
+                &workspace,
+                python_type_flow_adapter(),
+                &fields,
+                root,
+                workspace.analyzer().active_semantic_model_snapshot(),
+                ClosureLimits { max_procedures: 32 },
+                FeedbackLimits::default(),
+                cache,
+                state,
+                semantic_budget,
+                &mut request,
+            )
+        };
+        let failed = solve(
+            failed_state.clone(),
+            ValueFlowCache::default(),
+            &mut SemanticBudget::default(),
+            &mut SolverBudget::default(),
+        );
+        assert!(
+            interrupt.lock().unwrap().is_none(),
+            "the summary SQL actually ran"
+        );
+        let error = scope
+            .store_error()
+            .expect("the interrupted read reaches request diagnostics");
+        assert!(
+            error
+                .to_string()
+                .contains("loading class-set procedure surface candidates"),
+            "{error}"
+        );
+        assert!(
+            error.is_sqlite_interrupted(),
+            "the request preserves the interruption kind: {error:?}"
+        );
+        let Err(crate::analyzer::QueryReadIncomplete::StoreFailure(completion_error)) =
+            scope.read_completion()
+        else {
+            panic!("the interrupted summary read must reach query completion");
+        };
+        assert!(
+            completion_error.is_sqlite_interrupted(),
+            "{completion_error:?}"
+        );
+        let failed = failed.expect_err("a failed request exposes no authoritative root payload");
+        let TypeFlowError::Store(original) = &failed else {
+            panic!("expected the typed store failure, got {failed:?}");
+        };
+        assert_eq!(original, &error);
+        assert!(failed.to_string().contains("SqliteInterrupted"), "{failed}");
+        assert_eq!(
+            failed
+                .source()
+                .and_then(|source| source.downcast_ref::<StoreError>()),
+            Some(&error)
+        );
+        assert_eq!(failed_state.class_set.runtime_snapshot(), runtime_before);
+        assert_eq!(
+            *failed_state.class_set.surfaces.lock().unwrap(),
+            surfaces_before
+        );
+        // Even existing warm answers cannot bypass the pre-body refusal.
+        let reads_before = statements.load(Ordering::Relaxed);
+        let cache_before = cache.stats();
+        let mut semantic_budget = SemanticBudget::default();
+        let mut solver_budget = SolverBudget::default();
+        let repeated = solve(
+            state,
+            cache.clone(),
+            &mut semantic_budget,
+            &mut solver_budget,
+        )
+        .expect_err("the failed request cannot recover through a warm root");
+        assert!(matches!(repeated, TypeFlowError::Store(ref repeated) if repeated == &error));
+        assert_eq!(
+            statements.load(Ordering::Relaxed),
+            reads_before,
+            "pre-body refusal performs no SQL"
+        );
+        assert_eq!(
+            cache.stats(),
+            cache_before,
+            "pre-body refusal performs no memo lookup"
+        );
+        assert_eq!(semantic_budget.used(), SemanticWork::default());
+        assert_eq!(solver_budget.used(), SolverWork::default());
+        drop(trace_guard);
+        assert_eq!(
+            persisted(),
+            before,
+            "the failed operation changes no SQLite class-set row"
+        );
+        // The failed request stays stopped; a new OuterRequest recovers both
+        // original exact answers with fresh solver state (#11775, #11997).
+        drop(scope);
+        let recovery_scope =
+            AnalyzerQueryScope::with_outer_request(workspace.analyzer(), OuterRequest::new());
+        let recovered = solve_runtime_root(
+            &workspace,
+            &fields,
+            root,
+            TypeFlowSummaryState::new(&workspace),
+            ValueFlowCache::default(),
+        );
+        assert!(recovery_scope.store_error().is_none());
+        assert!(recovery_scope.read_completion().is_ok());
+        assert_eq!(recovered.class_sets, cold.class_sets);
+        assert_eq!(recovered.findings, cold.findings);
     }
 
     fn solve_runtime_root(
@@ -8439,6 +8714,11 @@ mod tests {
             .expect("the persisted root lookup succeeds")
             .expect("the persisted root relation exists");
 
+        // Private validation needs the own read capture installed by the public root.
+        let _validation_capture = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            workspace.analyzer(),
+            Arc::new(crate::analyzer::ReadLedger::new()),
+        );
         let restored_state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut prepared = PreparedClassSetSummaries::new(
@@ -8468,6 +8748,10 @@ mod tests {
         )
         .expect("a refused optional root summary falls back to ordinary solving");
 
+        assert!(
+            solver_budget.refusal_count() > 0,
+            "the configured limit must refuse an actual summary probe"
+        );
         assert_eq!(result.result().metrics().reusable_root_summary_hits, 0);
         assert_eq!(solver_budget.used().summary_applications, 0);
         assert_eq!(restored_state.class_set.runtime_snapshot(), runtime_before);
@@ -8503,6 +8787,10 @@ mod tests {
             &mut DataflowRequest::new(&mut solver_budget, &cancellation),
         )
         .expect("a root rejected after provider staging falls back");
+        assert!(
+            solver_budget.refusal_count() > 0,
+            "the configured limit must refuse an actual summary probe"
+        );
         assert_eq!(result.result().metrics().reusable_root_summary_hits, 0);
         assert_eq!(solver_budget.used().summary_applications, 0);
         assert!(staged_state.class_set.runtime_snapshot().is_empty());
@@ -8512,6 +8800,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("69f8bcd43f27: rejected root probes warmed source-sensitive behavior")]
     fn source_sensitive_root_late_refusal_does_not_warm_behavior_cache() {
         let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
             "class A:\n    def member(self):\n        pass\n",
@@ -8531,6 +8820,11 @@ mod tests {
         );
         assert!(cold.published_summaries > 0, "{cold:#?}");
 
+        // Private validation needs the own read capture installed by the public root.
+        let _validation_capture = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            workspace.analyzer(),
+            Arc::new(crate::analyzer::ReadLedger::new()),
+        );
         let state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut recursive_callee = PreparedClassSetSummaries::new(
@@ -9354,6 +9648,12 @@ mod tests {
             )
             .expect("stale dependency provenance replaces atomically");
 
+        // This private validation path needs the read capture that the public
+        // root establishes before its body, not an empty capture at the write.
+        let _validation_capture = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            workspace.analyzer(),
+            Arc::new(crate::analyzer::ReadLedger::new()),
+        );
         let restored_state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["second_root"]);
         let mut prepared = PreparedClassSetSummaries::new(
@@ -9477,6 +9777,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#11997: equal-output dependency replacement bypassed the derivation's reuse refusal"
+    )]
     fn equal_output_rebind_changes_only_demanded_parent_provenance() {
         let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
             "def leaf(value):\n",
@@ -9557,6 +9860,106 @@ mod tests {
                 &stabilized,
             ),
             "a current non-leaf row cannot hide stale grandchild provenance"
+        );
+        // Keep an older, equal-output child row and point the persisted
+        // wrapper at it. Maintenance must rebind this real SQLite dependency,
+        // rather than merely report a successful walk with nothing to write.
+        let child = store
+            .class_set_summary_for_digest(*dependency.consumed_lookup.as_bytes())
+            .expect("current child lookup succeeds")
+            .expect("current child is persisted");
+        let historical_lookup = *StableDigest::sha256(b"historical-equal-child").as_bytes();
+        let mut historical_header = child.header.clone();
+        historical_header.key.lookup_digest = historical_lookup;
+        let historical_child = ClassSetSummaryRow::try_new(
+            historical_header,
+            child.facts.clone(),
+            child.exits.clone(),
+            child.reached.clone(),
+            child.dependencies.clone(),
+            child.reads.clone(),
+            child.charges.clone(),
+        )
+        .expect("the older child preserves its complete typed relation");
+        assert_eq!(historical_child.output_digest(), child.output_digest());
+        let cancellation = CancellationToken::default();
+        assert!(
+            store
+                .publish_class_set_summary(historical_child, &cancellation)
+                .unwrap()
+        );
+        let mut historical_dependencies = before.dependencies.clone();
+        historical_dependencies[evidence.dependency.ordinal as usize]
+            .consumed_child_lookup_digest = historical_lookup;
+        let historical_parent = ClassSetSummaryRow::try_new(
+            before.header.clone(),
+            before.facts.clone(),
+            before.exits.clone(),
+            before.reached.clone(),
+            historical_dependencies,
+            before.reads.clone(),
+            before.charges.clone(),
+        )
+        .expect("the wrapper retains valid older provenance");
+        assert!(
+            store
+                .replace_class_set_summary(
+                    *before.content_digest(),
+                    historical_parent.clone(),
+                    &cancellation,
+                )
+                .unwrap()
+        );
+        let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
+        let maintain = || {
+            let mut prepared = PreparedClassSetSummaries::new(
+                TypeFlowSummaryState::new(&workspace),
+                &workspace,
+                &plan,
+                &field_slots,
+                behavior,
+            );
+            let mut semantic_budget = SemanticBudget::default();
+            let mut solver_budget = SolverBudget::default();
+            prepared.stabilize_demanded_closure(
+                &procedures["root"],
+                &WorkspaceIcfgProvider::new(&workspace),
+                &mut semantic_budget,
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+            )
+        };
+        let (refused, refused_reads) = capture_query_reads(workspace.analyzer(), || {
+            workspace.analyzer().refuse_read_reuse();
+            maintain()
+        });
+        assert!(refused_reads.reuse_refused());
+        assert!(
+            !refused,
+            "the already-refused derivation must fall back before rebinding"
+        );
+        assert_eq!(
+            store
+                .class_set_summary_for_digest(evidence.dependent_lookup_digest)
+                .unwrap(),
+            Some(historical_parent),
+            "a refused capture changes no persisted dependency",
+        );
+        let (healthy, healthy_reads) = capture_query_reads(workspace.analyzer(), maintain);
+        assert!(!healthy_reads.reuse_refused());
+        assert!(
+            healthy,
+            "the healthy capture still completes the same demanded rebind"
+        );
+        let repaired = store
+            .class_set_summary_for_digest(evidence.dependent_lookup_digest)
+            .unwrap()
+            .expect("the healthy wrapper remains persisted");
+        assert_eq!(repaired.output_digest(), before.output_digest());
+        assert_eq!(
+            repaired.dependencies[evidence.dependency.ordinal as usize]
+                .consumed_child_lookup_digest,
+            *dependency.consumed_lookup.as_bytes(),
+            "the healthy capture replaces the old child provenance",
         );
         let replacement_child = StableDigest::sha256(b"equal-output-child-revision");
 

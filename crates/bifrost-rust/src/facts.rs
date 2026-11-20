@@ -44,6 +44,31 @@ use crate::declarations::{
 use crate::imports::{RustImportBindingName, RustImportOwner, RustProjectedImport};
 use crate::syntax::outer_attributes;
 
+/// The display import inventory includes primary module imports only; embedded
+/// declaration replay appends its admitted imports separately.
+pub(crate) fn primary_module_import_ids(
+    imports: impl IntoIterator<Item = RustProjectedImport>,
+    source_facts: &brokk_bifrost_core::analyzer::source_facts::SourceFactRows,
+) -> Vec<SourceImportId> {
+    let mut module_import_ids = Vec::new();
+    for projected in imports {
+        if !matches!(projected.owner, RustImportOwner::Module { .. }) {
+            continue;
+        }
+        let declaration = projected
+            .source_occurrences
+            .expect("an authoritative import has source identity")
+            .declaration;
+        if source_facts.occurrence(declaration).provenance
+            == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode
+            && let Some(source_import_id) = projected.source_import_id
+        {
+            module_import_ids.push(source_import_id);
+        }
+    }
+    module_import_ids
+}
+
 /// Canonical source metadata for the Rust module route surface. The source
 /// declaration collector owns declaration identities; this collector only
 /// records the module-specific interpretation at the same live AST creation
@@ -481,7 +506,6 @@ impl<'source> RustUsageFactCollector<'source> {
         self.collect_identifier_event(node);
         self.token_tree_frames.push(node.kind() == "token_tree");
         self.collect_import_event(node, projected_imports);
-        self.collect_include_event(node);
 
         if route_parent_active && node.kind() == "macro_invocation" {
             // The primary route walk stops at a macro invocation. Its raw
@@ -852,20 +876,7 @@ impl<'source> RustUsageFactCollector<'source> {
             module_routes: self.module_routes,
             include_edges,
         };
-        let mut module_import_ids = Vec::new();
-        for projected in self
-            .imports
-            .into_iter()
-            .filter(|projected| {
-                matches!(projected.owner, RustImportOwner::Module { .. })
-                    && source_facts.occurrence(projected.source_occurrences.expect("an authoritative import has source identity").declaration).provenance
-                        == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode
-            })
-        {
-            if let Some(source_import_id) = projected.source_import_id {
-                module_import_ids.push(source_import_id);
-            }
-        }
+        let module_import_ids = primary_module_import_ids(self.imports, source_facts);
         (facts, module_import_ids, module_sources)
     }
 
@@ -953,7 +964,11 @@ impl<'source> RustUsageFactCollector<'source> {
         }
     }
 
-    fn collect_include_event(&mut self, node: Node<'_>) {
+    pub(crate) fn collect_include_event(
+        &mut self,
+        node: Node<'_>,
+        sink: &mut dyn brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceSink,
+    ) {
         if node.kind() != "macro_invocation"
             || rust_unqualified_macro_invocation_name(node, self.source) != Some("include")
         {
@@ -980,6 +995,7 @@ impl<'source> RustUsageFactCollector<'source> {
         self.include_edges.push(RustIncludeEdgeFact {
             file_name: file_name.to_string(),
             include_start: node.start_byte(),
+            invocation_occurrence_id: Some(sink.intern_node(node)),
             host_bindings: Vec::new(),
             relative_path,
         });

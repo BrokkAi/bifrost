@@ -272,7 +272,8 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 // parameters by their positions and hash them positionally in their ids, so an
 // unchanged source jar produces a different set of static forwarders and
 // different forwarder ids.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 92;
+// #12385: class-file methods retain declared type-parameter bounds.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 93;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -328,6 +329,8 @@ pub struct CatalogCoordinate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticPackSelectorQuery {
+    pub verified_raw_artifacts: Vec<crate::analyzer::semantic_model::runtime::VerifiedRawArtifact>,
+    pub production_input_digest: Option<String>,
     pub language: String,
     pub ecosystem: String,
     pub package: Option<CatalogCoordinate>,
@@ -583,6 +586,21 @@ impl AcquisitionReceiptRequest {
                     &mut hasher,
                     "artifact_sha256",
                     query.artifact_sha256.as_deref(),
+                );
+                hash_optional(
+                    &mut hasher,
+                    "production_input_digest",
+                    query.production_input_digest.as_deref(),
+                );
+                hasher.sequence(
+                    "verified_raw_artifacts",
+                    &query.verified_raw_artifacts,
+                    |hasher, slot| {
+                        hasher.field("role", format!("{:?}", slot.role).as_bytes());
+                        hasher.field("kind", format!("{:?}", slot.kind).as_bytes());
+                        hash_optional(hasher, "module", slot.module.as_deref());
+                        hasher.field("sha256", &slot.sha256);
+                    },
                 );
                 hasher.field(
                     "bifrost_version",
@@ -934,6 +952,14 @@ pub enum CatalogMiss {
     Incompatible {
         reason: String,
     },
+    StaleGeneratedSelector {
+        producer: crate::analyzer::semantic_model::Producer,
+        reason: String,
+    },
+    SelectorOriginMismatch {
+        origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+        reason: String,
+    },
 }
 
 /// One pack that names a queried coordinate but rejects its exact version.
@@ -974,6 +1000,93 @@ impl SemanticPackVersionNearMiss {
     }
 }
 
+/// Origin belongs to the production record, independently of installation source kind.
+pub fn recorded_pack_origin_on(
+    connection: &Connection,
+    manifest_digest: &str,
+) -> Result<crate::analyzer::semantic_model::model::SemanticPackOrigin, CatalogError> {
+    let generated: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_generated_productions WHERE manifest_digest = ?1)",
+            [manifest_digest],
+            |row| row.get(0),
+        )
+        .map_err(|error| CatalogError::sqlite("read recorded pack origin", error))?;
+    Ok(if generated {
+        crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+    } else {
+        crate::analyzer::semantic_model::model::SemanticPackOrigin::Authored
+    })
+}
+
+/// Refuse obsolete generated metadata before decoding legacy selectors.
+pub fn check_generated_producer_revision(
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+    producer: &crate::analyzer::semantic_model::Producer,
+) -> Result<(), CatalogError> {
+    if origin == crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+        && !producer.has_current_dependency_revision()
+    {
+        return Err(CatalogError::StaleGeneratedSelector {
+            producer: producer.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Check the rule selected by trusted catalog provenance, before matching.
+pub fn check_catalog_selector_origin(
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+    extraction: Option<&crate::analyzer::semantic_model::ArtifactExtraction>,
+    selectors: &[ActivationSelector],
+) -> Result<(), CatalogError> {
+    use crate::analyzer::semantic_model::model::SemanticPackOrigin;
+    use crate::analyzer::semantic_model::validate::{
+        authored_selector_fields_valid, generated_selector_fields_valid,
+    };
+    let valid = match origin {
+        SemanticPackOrigin::Authored => selectors.iter().all(authored_selector_fields_valid),
+        SemanticPackOrigin::Generated => {
+            extraction.is_some() && selectors.iter().all(generated_selector_fields_valid)
+        }
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(CatalogError::SelectorOriginMismatch {
+        origin,
+        diagnostics: vec![crate::analyzer::semantic_model::Diagnostic::error(
+            "selector.provenance",
+            "$.activation",
+            "selectors violate their recorded catalog origin",
+        )],
+    })
+}
+
+pub fn check_catalog_shard_origin(
+    origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+    shard: &CompiledShard,
+) -> Result<(), CatalogError> {
+    let pack = crate::analyzer::semantic_model::artifact::authored_pack_from_compiled_shard(shard);
+    check_generated_producer_revision(origin, &pack.producer)?;
+    let diagnostics = match origin {
+        crate::analyzer::semantic_model::model::SemanticPackOrigin::Authored => {
+            crate::analyzer::semantic_model::validate::check_authored_selectors(&pack)
+        }
+        crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated => {
+            crate::analyzer::semantic_model::validate::check_generated_selectors(&pack)
+        }
+    };
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(CatalogError::SelectorOriginMismatch {
+            origin,
+            diagnostics,
+        })
+    }
+}
+
 /// One raw `catalog_selectors` join row, before compatibility filtering.
 #[doc(hidden)]
 pub struct DurableSelectorRow {
@@ -989,6 +1102,7 @@ pub struct DurableSelectorRow {
     pub source_kind: String,
     #[doc(hidden)]
     pub source_id: String,
+    pub origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
 }
 
 #[derive(Debug)]
@@ -1003,6 +1117,13 @@ pub enum CatalogError {
     },
     Artifact(String),
     Integrity(String),
+    StaleGeneratedSelector {
+        producer: crate::analyzer::semantic_model::Producer,
+    },
+    SelectorOriginMismatch {
+        origin: crate::analyzer::semantic_model::model::SemanticPackOrigin,
+        diagnostics: Vec<crate::analyzer::semantic_model::Diagnostic>,
+    },
     ReadOnly,
     IndexReconciliationRequired {
         manifest_digest: String,
@@ -1054,9 +1175,20 @@ impl From<brokk_bifrost_core::sqlite_template::TemplateIoError> for CatalogError
 impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StaleGeneratedSelector { producer } => write!(
+                formatter,
+                "StaleGeneratedSelector: obsolete dependency producer {producer:?}"
+            ),
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Sqlite { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Artifact(message) | Self::Integrity(message) => formatter.write_str(message),
+            Self::SelectorOriginMismatch {
+                origin,
+                diagnostics,
+            } => write!(
+                formatter,
+                "SelectorOriginMismatch: {origin:?} catalog provenance: {diagnostics:?}"
+            ),
             Self::IndexReconciliationRequired {
                 manifest_digest,
                 shard_id,
@@ -1134,8 +1266,11 @@ pub const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 // matching the formal-layout interpreter while rejecting positional fixed tails.
 #[doc(hidden)]
 // 11: validate schema-18 Rust defaults, trait impls and associated projections.
-pub // 12: schema-19 extraction envelopes and implementation conditions.
-const SHARD_VALIDATION_VERSION: u32 = 13;
+// 12: schema-19 extraction envelopes and implementation conditions.
+// 14 (#13500): locator and carried-source paths must be exactly canonical; an
+// empty, "." or ".." component is rejected.
+// #10572: validate the class-finality schema boundary.
+pub const SHARD_VALIDATION_VERSION: u32 = 15;
 
 #[doc(hidden)]
 pub fn decode_limits_digest(limits: &DecodeLimits) -> String {
@@ -1396,19 +1531,19 @@ pub fn durable_selector_rows_on(
          UNION ALL
          SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
          WHERE toolchain_name = ?5"
-    } else if query.artifact_sha256.is_some() {
-        "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
-         WHERE artifact_sha256 IS NULL
-         UNION ALL
-         SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
-         WHERE artifact_sha256 = ?8"
     } else {
         "SELECT * FROM catalog_selectors"
     };
+    // Match a complete build-metadata identifier, including when a separate
+    // language revision follows it. The Rust producer check stays authoritative.
+    let obsolete_producer_sql = "(instr(origin.producer_version, '+') = 0 OR
+        instr('.' || substr(origin.producer_version, instr(origin.producer_version, '+') + 1) || '.', ?13) = 0)";
     let candidate_sql = format!(
         "SELECT p.manifest_digest, ps.shard_id,
                 ps.descriptor_json, s.selector_json,
-                source.source_kind, source.source_id
+                source.source_kind, source.source_id,
+                EXISTS(SELECT 1 FROM catalog_generated_productions AS origin WHERE origin.manifest_digest = p.manifest_digest),
+                EXISTS(SELECT 1 FROM catalog_generated_productions AS origin WHERE origin.manifest_digest = p.manifest_digest AND {obsolete_producer_sql}) AS obsolete_generated
          FROM catalog_packs AS p
          JOIN catalog_pack_shards AS ps
            ON ps.manifest_digest = p.manifest_digest
@@ -1462,9 +1597,16 @@ pub fn durable_selector_rows_on(
              )
            )
            AND (
-             ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
+             (?8 IS NULL AND json_array_length(?11)=0) OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
+             OR s.artifact_sha256 IN (SELECT value FROM json_each(?11))
+             OR EXISTS(SELECT 1 FROM catalog_generated_productions AS origin WHERE origin.manifest_digest = p.manifest_digest)
+             OR NOT json_valid(s.selector_json)
+             OR s.production_input_digest IS NOT NULL
            )
-         ORDER BY p.manifest_digest, ps.shard_id,
+           AND (?12 IS NULL OR s.production_input_digest IS NULL OR s.production_input_digest = ?12
+             OR EXISTS(SELECT 1 FROM catalog_generated_productions AS origin WHERE origin.manifest_digest=p.manifest_digest AND (s.artifact_sha256 IS NOT NULL OR {obsolete_producer_sql}))
+             OR (s.production_input_digest IS NOT NULL AND NOT EXISTS(SELECT 1 FROM catalog_generated_productions AS origin WHERE origin.manifest_digest=p.manifest_digest)))
+         ORDER BY obsolete_generated, p.manifest_digest, ps.shard_id,
                   source.source_kind, source.source_id, s.selector_ordinal
          LIMIT ?9"
     );
@@ -1493,6 +1635,19 @@ pub fn durable_selector_rows_on(
                 query.artifact_sha256.as_deref(),
                 i64::try_from(max_rows).unwrap_or(i64::MAX),
                 GENERATED_PRODUCTION_CACHE_VERSION,
+                serde_json::to_string(
+                    &query
+                        .verified_raw_artifacts
+                        .iter()
+                        .map(|slot| lower_hex_string(&slot.sha256))
+                        .collect::<Vec<_>>()
+                )
+                .map_err(|e| CatalogError::Integrity(e.to_string()))?,
+                query.production_input_digest,
+                format!(
+                    ".{}.",
+                    crate::analyzer::semantic_model::model::dependency_production_revision()
+                ),
             ],
             |row| {
                 Ok(DurableSelectorRow {
@@ -1502,6 +1657,11 @@ pub fn durable_selector_rows_on(
                     selector_json: row.get::<_, Vec<u8>>(3)?,
                     source_kind: row.get::<_, String>(4)?,
                     source_id: row.get::<_, String>(5)?,
+                    origin: if row.get::<_, bool>(6)? {
+                        crate::analyzer::semantic_model::model::SemanticPackOrigin::Generated
+                    } else {
+                        crate::analyzer::semantic_model::model::SemanticPackOrigin::Authored
+                    },
                 })
             },
         )
@@ -2808,8 +2968,11 @@ pub fn open_session_semantic_catalog_in(
     let path = std::fs::canonicalize(root.path())
         .map_err(|error| CatalogError::io("canonicalize session callable-values root", error))?
         .join("session-callable-values.sqlite");
-    let mut connection = Connection::open(&path)
-        .map_err(|error| CatalogError::sqlite("open session callable-values database", error))?;
+    let mut connection =
+        brokk_bifrost_core::cache_db::open_owned_sqlite(&path, rusqlite::OpenFlags::default())
+            .map_err(|error| {
+                CatalogError::sqlite("open session callable-values database", error)
+            })?;
     brokk_bifrost_core::cache_db::sql_profile::install_catalog_session(&connection);
     connection.set_transaction_behavior(TransactionBehavior::Immediate);
     connection
@@ -2860,6 +3023,7 @@ pub fn open_session_semantic_catalog_in(
                toolchain_name TEXT,
                toolchain_version TEXT,
                artifact_sha256 TEXT,
+               production_input_digest TEXT,
                selector_json BLOB NOT NULL,
                PRIMARY KEY(manifest_digest, shard_id, selector_ordinal),
                FOREIGN KEY(manifest_digest, shard_id)
@@ -3226,8 +3390,8 @@ pub fn insert_selectors(
                 "INSERT INTO catalog_selectors(
                    manifest_digest, shard_id, selector_ordinal,
                    package_name, package_version, module_name, module_version,
-                   toolchain_name, toolchain_version, artifact_sha256, selector_json
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                   toolchain_name, toolchain_version, artifact_sha256, production_input_digest, selector_json
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     manifest_digest,
                     shard_id,
@@ -3248,6 +3412,7 @@ pub fn insert_selectors(
                         .as_ref()
                         .and_then(|value| value.version.as_deref()),
                     selector.artifact_sha256.as_deref(),
+                    selector.production_input_digest.as_deref(),
                     serde_json::to_vec(selector)
                         .map_err(|error| CatalogError::Integrity(error.to_string()))?
                 ],
@@ -3358,11 +3523,24 @@ pub fn selector_matches(
     {
         return Ok(false);
     }
-    if let (Some(expected), Some(actual)) = (&query.artifact_sha256, &selector.artifact_sha256)
-        && actual != expected
+    if query.artifact_sha256.is_none()
+        && query.verified_raw_artifacts.is_empty()
+        && query.production_input_digest.is_none()
     {
+        return Ok(true);
+    }
+    let mut digest_selector = selector.clone();
+    if query.artifact_sha256.is_some() && query.artifact_sha256 == selector.artifact_sha256 {
+        digest_selector.artifact_sha256 = None;
+    }
+    if !crate::analyzer::semantic_model::runtime::selector_digest_constraints_match(
+        &digest_selector,
+        &query.verified_raw_artifacts,
+        query.production_input_digest.as_deref(),
+    ) {
         return Ok(false);
     }
+
     Ok(true)
 }
 
@@ -3621,6 +3799,8 @@ mod acquisition_receipt_tests {
 
     fn declared_query() -> SemanticPackSelectorQuery {
         SemanticPackSelectorQuery {
+            verified_raw_artifacts: Vec::new(),
+            production_input_digest: None,
             language: "java".to_owned(),
             ecosystem: "maven".to_owned(),
             package: Some(CatalogCoordinate {

@@ -385,6 +385,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bundled_stage_frontier_plans_bound_key_work_under_both_statistics_states() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned;
 
@@ -473,6 +477,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn route_lookup_aliases_match_or_semantics_and_preserve_host_multiplicity() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);
@@ -583,7 +591,7 @@ mod jvm_extraction_tests {
         let non_invoking = LoweredBindingProjection::new(
             member_reference,
             member_binding,
-            BindingProjectionKind::NonInvokingMemberReference,
+            BindingProjectionKind::BindingOnlyMemberReference,
         );
         // Appended codec value: existing persisted projection codes stay unchanged.
         assert_eq!(code(ALL_BINDING_PROJECTION_KINDS, non_invoking.kind()), 8);
@@ -701,6 +709,10 @@ mod jvm_extraction_tests {
         connection.execute_batch("ROLLBACK").unwrap();
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn stage_reason_owner_conflict_agrees_with_fragment_constructor() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
@@ -758,6 +770,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn foreign_parameter_owner_admission_uses_full_selection_under_narrowed_scope() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
             2,
@@ -855,6 +871,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bundled_stage_observation_reverse_preserves_nodes_and_bounded_key_seeks() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned;
 
@@ -966,6 +986,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn observation_and_call_result_share_a_reference_in_both_append_orders() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
         for reference in [
@@ -1037,6 +1061,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_transfer_rule_conflicts_even_with_new_source_and_target() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
@@ -1097,6 +1125,10 @@ mod jvm_extraction_tests {
         assert_eq!(count, 0);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_call_identity_conflicts_even_with_new_callee_reference() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
@@ -1164,6 +1196,10 @@ mod jvm_extraction_tests {
         assert_eq!(count, 0);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_property_provenance_requires_same_owner_without_rejecting_new_frontier() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
         // JLS 9.2 gives a parentless interface a lookup-only Object member root.
@@ -1343,6 +1379,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn staged_property_gap_reason_seek_preserves_frontiers_and_host_scope() {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned;
 

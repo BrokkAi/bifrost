@@ -1096,6 +1096,8 @@ fn validate_wrapper(
         | RqlForm::EdgeTarget
         | RqlForm::BindingInitializerCallsOf
         | RqlForm::SelectedPropertyRelationsOf
+        | RqlForm::FieldWritesOf
+        | RqlForm::FieldReadsOf
         | RqlForm::FlowSource
         | RqlForm::FlowTarget
         | RqlForm::TargetOf

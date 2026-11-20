@@ -147,6 +147,7 @@ impl PythonReverseView {
     /// `None` when the summary no longer matches the selected blobs: a repair kept
     /// a member's OID but changed its surface, so the environment is unavailable
     /// until the next reconcile re-derives it.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn select(
         operation: &SelectedResolutionOperation<'_, '_>,
         environment: &PythonSelectedEnvironment,
@@ -331,6 +332,10 @@ impl PythonReverseObligation {
 /// SQL evidence has request lifetime and is cleared even on cancellation/error.
 struct ExposureEvidence<'a, 'store, 'input>(&'a SelectedResolutionOperation<'store, 'input>);
 impl Drop for ExposureEvidence<'_, '_, '_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn drop(&mut self) {
         let cleared = self
             .0
@@ -368,6 +373,7 @@ struct PythonReverseHooks<'a, 'store, 'input> {
     target: &'a CodeUnit,
 }
 impl PythonReverseHooks<'_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn conn(&self) -> &rusqlite::Connection {
         self.operation.ready.inventory.connection()
     }
@@ -1019,6 +1025,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// equality shortcut. Header validation has already proved unchanged members
     /// current; classify only the overlay delta, retaining added/removed masks.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn python_summary_coverage(&self, summary: i64) -> Result<PythonSummaryCoverage> {
         use super::super::unit_summaries::member_input_selected;
         let conn = self.ready.inventory.connection();
@@ -1193,6 +1200,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Classify a selected relative import only when this admitted reference
     /// actually demands that import. The route remains open in either case.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn python_graph_relative_import_routes(
         &self,
         environment: &PythonSelectedEnvironment,
@@ -1372,6 +1380,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn python_reverse_operation(
         &self,
         environment: &PythonSelectedEnvironment,
@@ -1401,13 +1410,16 @@ impl SelectedResolutionOperation<'_, '_> {
         let truncated = Cell::new(false);
         let conn = self.ready.inventory.connection();
         let before = conn.total_changes();
-        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS python_reverse_evidence(kind TEXT NOT NULL,container TEXT NOT NULL,blob INTEGER NOT NULL,site INTEGER NOT NULL,name TEXT NOT NULL,scope INTEGER NOT NULL,PRIMARY KEY(kind,container,blob,site,name,scope)) WITHOUT ROWID,STRICT; DELETE FROM temp.python_reverse_evidence")?;
+        self.ready.inventory.with_schema_mutation(|conn| {
+            Ok(conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS python_reverse_evidence(kind TEXT NOT NULL,container TEXT NOT NULL,blob INTEGER NOT NULL,site INTEGER NOT NULL,name TEXT NOT NULL,scope INTEGER NOT NULL,PRIMARY KEY(kind,container,blob,site,name,scope)) WITHOUT ROWID,STRICT; DELETE FROM temp.python_reverse_evidence")?)
+        })?;
         self.ready
             .inventory
             .account_committed_request_changes(conn.total_changes() - before);
         let before = conn.total_changes();
-        conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS python_reverse_operations(
+        self.ready.inventory.with_schema_mutation(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS python_reverse_operations(
             mount INTEGER NOT NULL, operation INTEGER NOT NULL, blob INTEGER NOT NULL,
             site INTEGER NOT NULL, name_site INTEGER NOT NULL, form INTEGER NOT NULL,
             effect INTEGER NOT NULL, name_kind INTEGER NOT NULL,
@@ -1415,7 +1427,8 @@ impl SelectedResolutionOperation<'_, '_> {
             possible_replacement INTEGER NOT NULL, patch_target TEXT,
             PRIMARY KEY(mount,operation)) WITHOUT ROWID,STRICT;
             DELETE FROM temp.python_reverse_operations",
-        )?;
+            )?)
+        })?;
         conn.prepare_cached("INSERT INTO temp.python_reverse_operations(mount,operation,blob,site,name_site,form,effect,name_kind,callee_reference,receiver_reference,receiver_slot,possible_replacement)
             SELECT mounts.mount_ordinal,op.id,op.blob_id,op.site,op.name_site,op.form,
                    op.effect,op.name_kind,op.callee_reference,op.receiver_reference,
@@ -1601,6 +1614,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 locators,
                 names: Vec::new(),
                 completion: ResolutionCompletion::Complete,
+                open_frontier_paths: Vec::new(),
             };
             output.push_str(&format!("nominations={}\n", candidates.locators.len()));
             for locator in &candidates.locators {
@@ -1924,6 +1938,7 @@ struct PythonReverseLifecycle<'a, 'store, 'input> {
     receivers: &'a HashMap<SelectedSemanticLocator, PythonReverseReceiver>,
 }
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn python_module_field(
         &self,
         definitions: &[SemanticId],
@@ -2057,6 +2072,7 @@ impl PythonReverseLifecycle<'_, '_, '_> {
 }
 
 impl PythonFieldIdentity<'_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn matches(
         &self,
         locator: &SelectedSemanticLocator,
@@ -2349,6 +2365,7 @@ impl PythonFieldIdentity<'_, '_, '_> {
         Ok(Some(matches_target))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn imported_identity(
         &self,
         forward: &FactResolutionAnswer,
@@ -2562,6 +2579,7 @@ impl reverse::ReverseScopedLifecycle for PythonReverseLifecycle<'_, '_, '_> {
             .ready
             .reverse_locate_in_session(locator, self.cancellation, self.session)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn with_evaluator<T>(
         &mut self,
         blueprint: &SelectedFactOperationBlueprint,
@@ -2861,6 +2879,7 @@ impl PythonReverseFiles<'_, '_, '_> {
         self.target.sites.push(site);
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn site(&self, locator: &SelectedSemanticLocator) -> Result<PythonNativeReverseSite> {
         let mount = self
             .operation
@@ -2921,6 +2940,7 @@ impl PythonReverseFiles<'_, '_, '_> {
             obligations: Vec::new(),
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn retain(
         &mut self,
         locators: &[SelectedSemanticLocator],

@@ -7,3 +7,6 @@
 #
 # Replaced the literal: RUST_SOURCE_LISTING_DERIVATION_VERSION = 3.
 11570-slice2b-derivation-identity
+13184-bounded-image-listing
+13429-ignore-scope-to-repo
+13399-revision-symlink-targets

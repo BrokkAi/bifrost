@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
+use crate::analyzer::semantic::partial_flow::ports::heap_ports_overlap;
 use crate::analyzer::semantic::partial_flow::{
     CrossedCalls, HeapSelector, PartialFlowPort, ProcedurePartialFlows,
 };
@@ -1243,6 +1244,53 @@ pub struct CallModel<Function = TaintEdgeFunction> {
 }
 
 impl<Function> CallModel<Function> {
+    pub(crate) fn describes_returned_member(
+        &self,
+        demand: &PartialFlowPort,
+        endpoint_projections: bool,
+    ) -> bool {
+        matches!(demand, PartialFlowPort::Heap { root, .. }
+            if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+            && endpoint_projections
+            && self
+                .transfers
+                .iter()
+                .any(|transfer| matches!(projected_model_actual(transfer, demand), Ok(Some(_))))
+    }
+
+    /// #11818/#12846: only the demanded output's transfer can describe its
+    /// contents. Relative members additionally require preservation proof.
+    /// Scan every overlapping transfer so a describing transfer cannot hide
+    /// a refusal from another alternative; preserve the first specific reason.
+    pub(crate) fn returned_member_refusal(
+        &self,
+        demand: &PartialFlowPort,
+        endpoint_projections: bool,
+    ) -> Option<ModelOutputRefusal> {
+        if !matches!(demand, PartialFlowPort::Heap { root, .. }
+            if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+        {
+            return None;
+        }
+        let mut refusal = ModelOutputRefusal::ReturnedMemberNotDescribed;
+        let mut described = false;
+        if endpoint_projections {
+            for transfer in &self.transfers {
+                match projected_model_actual(transfer, demand) {
+                    Ok(Some(_)) => described = true,
+                    Err(reason) if refusal == ModelOutputRefusal::ReturnedMemberNotDescribed => {
+                        refusal = reason;
+                    }
+                    Ok(None) | Err(_) => {}
+                }
+            }
+        }
+        if refusal == ModelOutputRefusal::ReturnedMemberNotDescribed && described {
+            return None;
+        }
+        Some(refusal)
+    }
+
     /// The quality of a path through the model. A curated or inferred model
     /// is proven and complete or neither. An authored model's transfers are
     /// unproven unless the closure guards admitted at least one closure, and
@@ -1299,4 +1347,93 @@ pub enum Openness {
 pub struct BlockedGap {
     pub gap: LogicalGapHandle,
     pub capability: SemanticCapability,
+}
+
+/// Typed refusals keep model application and bypassed member crossings in
+/// agreement, including the existing diagnostic wording (#12846).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelOutputRefusal {
+    SummarizedOutput,
+    MissingMemberPreservation,
+    ReturnedMemberNotDescribed,
+}
+
+impl ModelOutputRefusal {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::SummarizedOutput => {
+                "a summarized modeled output cannot close a distinct component demand"
+            }
+            Self::MissingMemberPreservation => {
+                "a modeled transfer has no member-path preservation proof for this component demand"
+            }
+            Self::ReturnedMemberNotDescribed => "a call model does not describe a returned member",
+        }
+    }
+}
+
+/// Substitute an exact modeled endpoint prefix while retaining the demanded
+/// component suffix. This keeps a tainted tuple member distinct from its sibling
+/// through a summary that moves the tuple as a whole.
+pub(crate) fn projected_model_actual<Function>(
+    transfer: &super::ModelTransfer<Function>,
+    demanded_output: &PartialFlowPort,
+) -> Result<Option<PartialFlowPort>, ModelOutputRefusal> {
+    let actual = &transfer.actual;
+    let modeled_output = &transfer.output;
+    // Identical summarized endpoints use the authored transfer as an uncertain
+    // hop. They do not justify substituting any relative member suffix.
+    if modeled_output == demanded_output {
+        return Ok(Some(actual.clone()));
+    }
+    fn parts(port: &PartialFlowPort) -> (&PartialFlowPort, &[HeapSelector], AccessPathTail) {
+        match port {
+            PartialFlowPort::Heap {
+                root,
+                selectors,
+                tail,
+            } => (root, selectors, *tail),
+            root => (root, &[], AccessPathTail::Exact),
+        }
+    }
+    let (modeled_root, prefix, modeled_tail) = parts(modeled_output);
+    let (demanded_root, selectors, demanded_tail) = parts(demanded_output);
+    if modeled_tail == AccessPathTail::Summary && modeled_root == demanded_root {
+        let demanded = PartialFlowPort::Heap {
+            root: Box::new(demanded_root.clone()),
+            selectors: selectors.into(),
+            tail: demanded_tail,
+        };
+        if heap_ports_overlap(&demanded, modeled_output) {
+            return Err(ModelOutputRefusal::SummarizedOutput);
+        }
+    }
+    if modeled_tail != AccessPathTail::Exact
+        || modeled_root != demanded_root
+        || !selectors.starts_with(prefix)
+    {
+        return Ok(None);
+    }
+    let suffix = &selectors[prefix.len()..];
+    if suffix.is_empty() && demanded_tail == AccessPathTail::Exact {
+        return Ok(Some(actual.clone()));
+    }
+    if !transfer.preserves_member_contents() {
+        return Err(ModelOutputRefusal::MissingMemberPreservation);
+    }
+    let (actual_root, actual_selectors, actual_tail) = parts(actual);
+    if actual_tail != AccessPathTail::Exact {
+        return Ok(None);
+    }
+    Ok(Some(PartialFlowPort::Heap {
+        root: Box::new(actual_root.clone()),
+        selectors: crate::semantic_summary::substitute_projection_prefix(
+            selectors,
+            prefix,
+            actual_selectors,
+        )
+        .expect("matching exact modeled prefixes admit substitution")
+        .into_boxed_slice(),
+        tail: demanded_tail,
+    }))
 }

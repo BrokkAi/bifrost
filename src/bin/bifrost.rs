@@ -12,17 +12,26 @@
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    HostActivationContext, VerifiedFirstPartyReleaseInventory,
+};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use chrono::{Datelike, Utc};
 use sha2::{Digest, Sha256};
+#[path = "bifrost/cli_progress.rs"]
+mod cli_progress;
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
+#[cfg(unix)]
+use brokk_bifrost::CancellationToken;
+use brokk_bifrost::ToolOutput;
 use brokk_bifrost::mcp_common::McpRenderOptions;
 use brokk_bifrost::mcp_install::install_mcp_hosts;
 use brokk_bifrost::mcp_registry::{
@@ -40,18 +49,20 @@ use brokk_bifrost::policy::{
     PolicyOnInconclusive, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
     PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
     PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
-    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, policy_bundles,
-    policy_source_identity, rank_policy_near_misses, relation_schema_catalog, write_policy_human,
-    write_policy_json, write_policy_sarif_for_outcome,
+    escape_terminal_text, evaluate_policy_inputs_with_host_activation_context,
+    explain_policy_inputs_with_host_activation_context, policy_bundles, policy_source_identity,
+    rank_policy_near_misses_with_host_activation_context, relation_schema_catalog,
+    write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
-    NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
-    run_stdio_server_with_build_identity,
+    NamedWorkspace, run_named_workspace_stdio_server_with_host_activation_context,
+    run_stdio_server_with_host_activation_context,
 };
-use brokk_bifrost::scoped_project::{create_cli_tool_service, create_scoped_service};
+use brokk_bifrost::scoped_project::{
+    ScopedProjectOptions, create_cli_tool_service_with_options, create_scoped_service_with_options,
+};
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
-use brokk_bifrost::{CancellationToken, ToolOutput};
 use code_query_repl::run_code_query_repl;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -137,28 +148,34 @@ fn main() -> ExitCode {
         unsafe { tikv_jemalloc_sys::nallocx(bytes, 0) }
     });
     let args = env::args().skip(1).collect::<Vec<_>>();
-    let result = if let Some(result) = run_portable_runtime_command(&args) {
-        result.map_err(|message| CliRunError {
-            message,
-            policy_invocation: false,
-        })
-    } else {
-        brokk_bifrost::ensure_global_rayon_pool();
-        // The CLI process owns one retention budget for every analyzer it builds.
-        let retention_budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
-            brokk_bifrost_analysis::AnalyzerConfig::default().retention_budget_bytes(),
-        );
-        // Windows gives the main thread a 1 MiB stack, Linux 8 MiB. RQL
-        // policy lowering recurses once per query nesting level with large
-        // frames, and overflowed on Windows (#4573). Run with the Linux
-        // size so every platform has the same headroom.
-        std::thread::Builder::new()
-            .name("bifrost-cli".into())
-            .stack_size(CLI_STACK_BYTES)
-            .spawn(move || run(args.into_iter(), &retention_budget))
-            .expect("spawn the CLI thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    let result = match parse_host_approval_invocation(args) {
+        Err(error) => Err(error),
+        Ok((args, selection)) => {
+            if let Some(result) = run_portable_runtime_command(&args) {
+                result.map_err(|message| CliRunError {
+                    message,
+                    policy_invocation: false,
+                })
+            } else {
+                brokk_bifrost::ensure_global_rayon_pool();
+                // The CLI process owns one retention budget for every analyzer it builds.
+                let retention_budget =
+                    brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
+                        brokk_bifrost_analysis::AnalyzerConfig::default().retention_budget_bytes(),
+                    );
+                // Windows gives the main thread a 1 MiB stack, Linux 8 MiB. RQL
+                // policy lowering recurses once per query nesting level with large
+                // frames, and overflowed on Windows (#4573). Run with the Linux
+                // size so every platform has the same headroom.
+                std::thread::Builder::new()
+                    .name("bifrost-cli".into())
+                    .stack_size(CLI_STACK_BYTES)
+                    .spawn(move || run_selected(args, &retention_budget, &selection))
+                    .expect("spawn the CLI thread")
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            }
+        }
     };
     // A one-shot run has no MCP request boundary to close, so this is the only
     // place the reader seam's counts can be made complete. Both instruments do
@@ -180,6 +197,81 @@ fn main() -> ExitCode {
     }
 }
 
+/// Only process argv can select host authority. Neither repository data nor a
+/// tool's JSON arguments can construct this launch input.
+#[derive(Debug, Default)]
+struct HostApprovalSelection {
+    override_input: Option<(PathBuf, String)>,
+}
+
+impl HostApprovalSelection {
+    fn parse(args: Vec<String>) -> Result<(Vec<String>, Self), String> {
+        let mut remaining = Vec::with_capacity(args.len());
+        let mut path = None;
+        let mut digest = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--pack-approval-inventory" => {
+                    let value = args
+                        .next()
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or("--pack-approval-inventory requires an absolute path")?;
+                    if path.replace(PathBuf::from(value)).is_some() {
+                        return Err("--pack-approval-inventory may only be provided once".into());
+                    }
+                }
+                "--pack-approval-inventory-sha256" => {
+                    let value = args
+                        .next()
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or("--pack-approval-inventory-sha256 requires a digest")?;
+                    if digest.replace(value).is_some() {
+                        return Err(
+                            "--pack-approval-inventory-sha256 may only be provided once".into()
+                        );
+                    }
+                }
+                _ if arg.starts_with("--pack-approval-") => {
+                    return Err(format!("Unknown host approval argument: {arg}"));
+                }
+                _ => remaining.push(arg),
+            }
+        }
+        let override_input = match (path, digest) {
+            (None, None) => None,
+            (Some(path), Some(digest)) => Some((path, digest)),
+            _ => return Err("--pack-approval-inventory and --pack-approval-inventory-sha256 must be supplied together".into()),
+        };
+        Ok((remaining, Self { override_input }))
+    }
+
+    fn build(
+        &self,
+        budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    ) -> Result<Arc<HostActivationContext>, String> {
+        let inventory = match &self.override_input {
+            Some((path, digest)) => {
+                VerifiedFirstPartyReleaseInventory::load_host_pinned_unbound(path, digest)?
+            }
+            None => VerifiedFirstPartyReleaseInventory::compiled_default()?,
+        };
+        HostActivationContext::from_inventory(inventory, budget)
+    }
+}
+
+fn host_approval_witness(host: &HostActivationContext) -> String {
+    let metadata = host
+        .metadata()
+        .expect("CLI launch always selects an inventory");
+    format!("pack-approval-inventory source={} sha256={} approval_identity={}",
+        match metadata.source {
+            brokk_bifrost_analysis::analyzer::semantic_model::FirstPartyApprovalInventorySource::CompiledDefault => "compiled_default",
+            brokk_bifrost_analysis::analyzer::semantic_model::FirstPartyApprovalInventorySource::HostOverride => "host_override",
+            brokk_bifrost_analysis::analyzer::semantic_model::FirstPartyApprovalInventorySource::LibraryNone => "library_none",
+        }, metadata.inventory_sha256, metadata.approval_identity)
+}
+
 fn install_semantic_model_packs_for_process() -> Result<(), String> {
     brokk_bifrost::install_bifrost_semantic_model_packs().map_err(|error| error.to_string())
 }
@@ -188,12 +280,51 @@ fn tool_activates_open_packs(tool_name: &str) -> bool {
     tool_name == "run_policy"
 }
 
+/// Keep argument errors on the invocation's exit contract, before authority
+/// parsing can reject them. Host options are global and precede subcommands too.
+fn parse_host_approval_invocation(
+    args: Vec<String>,
+) -> Result<(Vec<String>, HostApprovalSelection), CliRunError> {
+    let mut dispatch_args = Vec::new();
+    let mut remaining = args.iter().peekable();
+    while let Some(argument) = remaining.next() {
+        if matches!(
+            argument.as_str(),
+            "--pack-approval-inventory" | "--pack-approval-inventory-sha256"
+        ) {
+            if remaining
+                .peek()
+                .is_some_and(|value| !value.starts_with("--"))
+            {
+                let _ = remaining.next();
+            }
+        } else {
+            dispatch_args.push(argument.clone());
+        }
+    }
+    let policy_invocation = dispatch_args.first().map(String::as_str) == Some("scan")
+        || has_policy_syntax(&dispatch_args);
+    HostApprovalSelection::parse(args).map_err(|message| CliRunError {
+        message,
+        policy_invocation,
+    })
+}
+
+#[cfg(test)]
 fn run(
     args: impl Iterator<Item = String>,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<CliRunResult, CliRunError> {
+    let (args, selection) = parse_host_approval_invocation(args.collect())?;
+    run_selected(args, retention_budget, &selection)
+}
+
+fn run_selected(
+    args: Vec<String>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    selection: &HostApprovalSelection,
+) -> Result<CliRunResult, CliRunError> {
     let _product_entry = brokk_bifrost_analysis::analyzer::enter_product_entry();
-    let args = args.collect::<Vec<_>>();
     if let Some(result) = run_portable_runtime_command(&args) {
         return result.map_err(|message| CliRunError {
             message,
@@ -204,27 +335,56 @@ fn run(
     // flag surface stays untouched: everywhere else the word remains an
     // unknown argument exactly as before the subcommand existed.
     if args.first().map(String::as_str) == Some("scan") {
-        return run_scan(args.into_iter().skip(1), retention_budget).map_err(|message| {
-            CliRunError {
-                message,
-                // A scan failure reports through the policy exit contract: its
-                // run is a policy evaluation, so its errors are unreliable runs.
-                policy_invocation: true,
-            }
-        });
+        return run_scan(args.into_iter().skip(1), retention_budget, selection).map_err(
+            |message| {
+                CliRunError {
+                    message,
+                    // A scan failure reports through the policy exit contract: its
+                    // run is a policy evaluation, so its errors are unreliable runs.
+                    policy_invocation: true,
+                }
+            },
+        );
     }
     let policy_invocation = has_policy_syntax(&args);
-    run_inner(args.into_iter(), policy_invocation, retention_budget).map_err(|message| {
-        CliRunError {
-            message,
-            policy_invocation,
-        }
+    run_inner(
+        args.into_iter(),
+        policy_invocation,
+        retention_budget,
+        selection,
+    )
+    .map_err(|message| CliRunError {
+        message,
+        policy_invocation,
     })
 }
 
+enum PortableRuntimeCommand {
+    PackEngineProfile,
+    PreparePackApprovalInventory,
+    InstallSemanticPacks,
+    PolicySourceIdentity,
+    PrepareOpenPacks,
+    PackAdmission,
+}
+
+impl PortableRuntimeCommand {
+    fn from_args(args: &[String]) -> Option<Self> {
+        match args.first()?.as_str() {
+            "pack-engine-profile" => Some(Self::PackEngineProfile),
+            "prepare-pack-approval-inventory" => Some(Self::PreparePackApprovalInventory),
+            "install-semantic-packs" => Some(Self::InstallSemanticPacks),
+            "policy-source-identity" => Some(Self::PolicySourceIdentity),
+            "prepare-open-packs" => Some(Self::PrepareOpenPacks),
+            "pack-admission" => Some(Self::PackAdmission),
+            _ => None,
+        }
+    }
+}
+
 fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, String>> {
-    let result = match args.first().map(String::as_str) {
-        Some("pack-engine-profile") => {
+    let result = match PortableRuntimeCommand::from_args(args)? {
+        PortableRuntimeCommand::PackEngineProfile => {
             if args.len() != 1 {
                 Err("pack-engine-profile takes no arguments".to_owned())
             } else {
@@ -232,31 +392,80 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
                 Ok(CliRunResult::Complete)
             }
         }
-        Some("install-semantic-packs") => {
+        PortableRuntimeCommand::PreparePackApprovalInventory => {
+            run_prepare_pack_approval_inventory(&args[1..])
+        }
+        PortableRuntimeCommand::InstallSemanticPacks => {
             if args.len() != 3 || args[1].is_empty() || args[2].is_empty() {
                 Err("usage: bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT".to_owned())
             } else {
                 install_semantic_packs(Path::new(&args[1]), Path::new(&args[2]))
             }
         }
-        Some("policy-source-identity") => run_policy_source_identity_command(&args[1..]),
-        Some("prepare-open-packs") => match run_prepare_open_packs(&args[1..]) {
+        PortableRuntimeCommand::PolicySourceIdentity => {
+            run_policy_source_identity_command(&args[1..])
+        }
+        PortableRuntimeCommand::PrepareOpenPacks => match run_prepare_open_packs(&args[1..]) {
             Ok(result) => Ok(result),
             Err(message) => {
                 eprintln!("{}", escape_terminal_text(&message));
                 Ok(CliRunResult::Exit(2))
             }
         },
-        Some("pack-admission") => match run_pack_admission(&args[1..]) {
+        PortableRuntimeCommand::PackAdmission => match run_pack_admission(&args[1..]) {
             Ok(result) => Ok(result),
             Err(message) => {
                 eprintln!("{}", escape_terminal_text(&message));
                 Ok(CliRunResult::Exit(2))
             }
         },
-        _ => return None,
     };
     Some(result)
+}
+
+fn run_prepare_pack_approval_inventory(args: &[String]) -> Result<CliRunResult, String> {
+    use brokk_bifrost::analyzer::semantic_model::FirstPartyReleaseChannel;
+    let mut values = std::collections::HashMap::new();
+    for pair in args.chunks(2) {
+        if pair.len() != 2
+            || !matches!(
+                pair[0].as_str(),
+                "--archive" | "--archive-sha256" | "--channel" | "--release-tag" | "--output"
+            )
+            || pair[1].is_empty()
+            || values.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return Err("usage: bifrost prepare-pack-approval-inventory --archive PATH --archive-sha256 HEX --channel public-semantic-packs|private-semantic-packs|engine-semantic-packs --release-tag TAG --output PATH".into());
+        }
+    }
+    let get = |key| {
+        values
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("missing {key}"))
+    };
+    let channel = match get("--channel")? {
+        "public-semantic-packs" => FirstPartyReleaseChannel::PublicSemanticPacks,
+        "private-semantic-packs" => FirstPartyReleaseChannel::PrivateSemanticPacks,
+        "engine-semantic-packs" => FirstPartyReleaseChannel::EngineSemanticPacks,
+        _ => return Err("unrecognized official first-party release channel".into()),
+    };
+    let inventory =
+        brokk_bifrost::semantic_packs::approval::prepare_first_party_approval_inventory(
+            Path::new(get("--archive")?),
+            get("--archive-sha256")?,
+            channel,
+            get("--release-tag")?,
+        )?;
+    let output = Path::new(get("--output")?);
+    let digest = brokk_bifrost::semantic_packs::approval::write_first_party_approval_inventory(
+        output, &inventory,
+    )?;
+    println!(
+        "{}",
+        json!({"inventory_path": output, "inventory_sha256": digest})
+    );
+    Ok(CliRunResult::Complete)
 }
 
 fn run_policy_source_identity_command(args: &[String]) -> Result<CliRunResult, String> {
@@ -667,6 +876,9 @@ fn install_semantic_packs(bundle_dir: &Path, cache_root: &Path) -> Result<CliRun
 }
 
 fn has_policy_syntax(args: &[String]) -> bool {
+    if PortableRuntimeCommand::from_args(args).is_some() {
+        return false;
+    }
     let mut index = 0;
     while index < args.len() {
         let argument = args[index].as_str();
@@ -788,6 +1000,7 @@ fn run_inner(
     mut args: impl Iterator<Item = String>,
     policy_invocation: bool,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    selection: &HostApprovalSelection,
 ) -> Result<CliRunResult, String> {
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
@@ -800,6 +1013,7 @@ fn run_inner(
     let mut tool_args = json!({});
     let mut tool_args_seen = false;
     let mut tool_sources = Vec::new();
+    let mut without_project_build = false;
     let mut diff_snapshot_object_dir: Option<PathBuf> = None;
     let mut query_file: Option<String> = None;
     let mut workspace_scaled_limits = false;
@@ -938,6 +1152,7 @@ fn run_inner(
                 }
                 workspace_scaled_limits = true;
             }
+            "--without-project-build" => without_project_build = true,
             "--sources" => {
                 let value = args
                     .next()
@@ -1234,7 +1449,9 @@ fn run_inner(
                 return print_help(topic.as_deref()).map(|()| CliRunResult::Complete);
             }
             "--version" | "-V" => {
+                let host = selection.build(retention_budget)?;
                 println!("bifrost {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", host_approval_witness(&host));
                 // The shipped policy catalog is part of the behavior a version
                 // names, so a catalog change must surface here as a version
                 // event rather than a silent behavior change. The first line
@@ -1255,6 +1472,15 @@ fn run_inner(
         }
     }
 
+    if without_project_build
+        && tool_name.is_none()
+        && (!policy_invocation || tool_sources.is_empty())
+    {
+        return Err(
+            "--without-project-build requires --tool or a policy run with --sources".into(),
+        );
+    }
+
     if !named_workspaces.is_empty() {
         if root_explicit {
             return Err("--workspace cannot be combined with --root".to_string());
@@ -1266,6 +1492,8 @@ fn run_inner(
             return Err("--diff-snapshot-object-dir is not available with --workspace".to_string());
         }
     }
+
+    let host = selection.build(retention_budget)?;
 
     if policy_invocation {
         if query_file.is_some()
@@ -1486,21 +1714,23 @@ fn run_inner(
         );
         if let Some(mode) = explain_mode {
             let status = match mode {
-                ExplanationMode::Explanation(target) => run_policy_explain_mode(
+                ExplanationMode::Explanation(target) => run_policy_explain_mode_with_host(
                     &root,
                     &policy_inputs,
                     &target,
                     explain_generation,
                     policy_output,
                     retention_budget,
+                    &host,
                 ),
-                ExplanationMode::NearMiss(max_candidates) => run_policy_near_miss_mode(
+                ExplanationMode::NearMiss(max_candidates) => run_policy_near_miss_mode_with_host(
                     &root,
                     &policy_inputs,
                     max_candidates,
                     explain_generation,
                     policy_output,
                     retention_budget,
+                    &host,
                 ),
             };
             return Ok(CliRunResult::PolicyStatus(status));
@@ -1528,11 +1758,13 @@ fn run_inner(
                 color: policy_color,
                 require_explicit_schema_versions,
                 sources: tool_sources,
+                without_project_build,
                 builtin_selection,
                 builtin_pack_rejections,
             },
             &policy_inputs,
             retention_budget,
+            &host,
         );
         return Ok(CliRunResult::PolicyStatus(status));
     }
@@ -1576,7 +1808,11 @@ fn run_inner(
             root,
             "query_code",
             json!({ "query_file": query_file }),
-            &[],
+            ToolSourceScope {
+                sources: &[],
+                options: ScopedProjectOptions::default()
+                    .with_host_activation_context(Arc::clone(&host)),
+            },
             render_options,
             None,
             workspace_scaled_limits,
@@ -1607,7 +1843,13 @@ fn run_inner(
             root,
             &tool_name,
             tool_args,
-            &tool_sources,
+            ToolSourceScope {
+                sources: &tool_sources,
+                options: ScopedProjectOptions {
+                    without_project_build,
+                    host_activation: Arc::clone(&host),
+                },
+            },
             render_options,
             diff_snapshot_object_dir,
             false,
@@ -1635,7 +1877,7 @@ fn run_inner(
             return Err("--diff-snapshot-object-dir is only valid with --tool or MCP server mode; it cannot be combined with --repl".to_string());
         }
         install_semantic_model_packs_for_process()?;
-        return run_code_query_repl(root).map(|()| CliRunResult::Complete);
+        return run_code_query_repl(root, Arc::clone(&host)).map(|()| CliRunResult::Complete);
     }
 
     let mode = mcp_mode.as_deref().unwrap_or("searchtools");
@@ -1659,19 +1901,21 @@ fn run_inner(
     brokk_bifrost::open_packs::start_open_pack_acquisition()?;
     install_semantic_model_packs_for_process()?;
     if named_workspaces.is_empty() {
-        run_stdio_server_with_build_identity(
+        run_stdio_server_with_host_activation_context(
             initial_root,
             render_options,
             &spec,
             diff_snapshot_object_dir,
             brokk_bifrost::BIFROST_BUILD_IDENTITY,
+            Arc::clone(&host),
         )
     } else {
-        run_named_workspace_stdio_server_with_build_identity(
+        run_named_workspace_stdio_server_with_host_activation_context(
             named_workspaces,
             render_options,
             &spec,
             brokk_bifrost::BIFROST_BUILD_IDENTITY,
+            Arc::clone(&host),
         )
     }
     .map(|()| CliRunResult::Complete)
@@ -1694,6 +1938,7 @@ fn run_inner(
 fn run_scan(
     mut args: impl Iterator<Item = String>,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    approval_selection: &HostApprovalSelection,
 ) -> Result<CliRunResult, String> {
     let mut path: Option<PathBuf> = None;
     let mut list_builtin = false;
@@ -1882,6 +2127,8 @@ fn run_scan(
         .into_iter()
         .map(PolicyEvaluationInput::selected_builtin)
         .collect::<Vec<_>>();
+    let host = approval_selection.build(retention_budget)?;
+    eprintln!("{}", host_approval_witness(&host));
     let status = run_policy_mode(
         PolicyModeRequest {
             root,
@@ -1907,9 +2154,11 @@ fn run_scan(
             builtin_selection,
             builtin_pack_rejections,
             sources: Vec::new(),
+            without_project_build: false,
         },
         &policy_inputs,
         retention_budget,
+        &host,
     );
     Ok(CliRunResult::PolicyStatus(status))
 }
@@ -2202,6 +2451,7 @@ fn explanation_mode(
 /// failure to produce one at all (an unloadable policy, a selection that is
 /// not exactly one policy, a family with no adapter, an unknown finding
 /// identity, or an output write failure) exits `POLICY_EXIT_UNRELIABLE`.
+#[cfg(test)]
 fn run_policy_explain_mode(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
@@ -2210,16 +2460,34 @@ fn run_policy_explain_mode(
     output: Option<PathBuf>,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> u8 {
-    let explanation = match explain_policy_inputs(
+    run_policy_explain_mode_with_host(
         root,
         policy_inputs,
         target,
         generation,
-        None,
-        None,
-        None,
+        output,
+        retention_budget,
+        &HostActivationContext::library_none(),
+    )
+}
+
+fn run_policy_explain_mode_with_host(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
+    output: Option<PathBuf>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    host: &Arc<HostActivationContext>,
+) -> u8 {
+    let explanation = match explain_policy_inputs_with_host_activation_context(
+        root,
+        policy_inputs,
+        target,
+        generation,
         &ExplanationLimits::default(),
         retention_budget,
+        host,
     ) {
         Ok(explanation) => explanation,
         Err(error) => return policy_explanation_failure("explanation", error),
@@ -2244,6 +2512,7 @@ fn run_policy_explain_mode(
 /// the policy's own scope came close" rather than a failure. Only a failure to
 /// produce one at all exits `POLICY_EXIT_UNRELIABLE`, exactly as the two
 /// explanation flags behave.
+#[cfg(test)]
 fn run_policy_near_miss_mode(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
@@ -2252,16 +2521,34 @@ fn run_policy_near_miss_mode(
     output: Option<PathBuf>,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> u8 {
-    let ranking = match rank_policy_near_misses(
+    run_policy_near_miss_mode_with_host(
+        root,
+        policy_inputs,
+        max_candidates,
+        generation,
+        output,
+        retention_budget,
+        &HostActivationContext::library_none(),
+    )
+}
+
+fn run_policy_near_miss_mode_with_host(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    max_candidates: usize,
+    generation: Option<ExplanationGeneration>,
+    output: Option<PathBuf>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    host: &Arc<HostActivationContext>,
+) -> u8 {
+    let ranking = match rank_policy_near_misses_with_host_activation_context(
         root,
         policy_inputs,
         &NearMissCandidates::PolicySeedSearch,
         generation,
-        None,
-        None,
-        None,
         &ExplanationLimits::default().with_max_near_miss_candidates(max_candidates),
         retention_budget,
+        host,
     ) {
         Ok(ranking) => ranking,
         Err(error) => return policy_explanation_failure("near-miss ranking", error),
@@ -2356,6 +2643,7 @@ struct PolicyModeRequest {
     color: PolicyColorMode,
     require_explicit_schema_versions: bool,
     sources: Vec<String>,
+    without_project_build: bool,
     builtin_selection: Option<BuiltInPolicySelectionRecord>,
     builtin_pack_rejections: Vec<BuiltInRejectionNotice>,
 }
@@ -2364,7 +2652,11 @@ fn run_policy_mode(
     request: PolicyModeRequest,
     policy_inputs: &[PolicyEvaluationInput],
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    host: &Arc<HostActivationContext>,
 ) -> u8 {
+    let _sql_scope = brokk_bifrost::cache_db::sql_profile::request_scope("run_policy");
+    let (cancellation, progress) = cli_progress::start();
+    let _phase = cancellation.enter_phase("evaluating policies");
     let evaluation_date = match request.evaluation_date {
         Some(date) => date,
         None => {
@@ -2418,13 +2710,30 @@ fn run_policy_mode(
         }
     };
     let evaluation = if sources.is_empty() {
-        evaluate_policy_inputs(&request.root, policy_inputs, &options, retention_budget)
-            .map_err(|error| error.to_string())
+        evaluate_policy_inputs_with_host_activation_context(
+            &request.root,
+            policy_inputs,
+            &options,
+            &cancellation,
+            retention_budget,
+            host,
+        )
+        .map_err(|error| error.to_string())
     } else {
-        create_scoped_service(request.root.clone(), &sources, None).and_then(|service| {
-            service.evaluate_policy_inputs(&request.root, policy_inputs, &options)
+        create_scoped_service_with_options(
+            request.root.clone(),
+            &sources,
+            None,
+            ScopedProjectOptions {
+                without_project_build: request.without_project_build,
+                host_activation: Arc::clone(host),
+            },
+        )
+        .and_then(|service| {
+            service.evaluate_policy_inputs(&request.root, policy_inputs, &options, &cancellation)
         })
     };
+    drop(progress);
     let outcome = match evaluation {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -2741,11 +3050,17 @@ fn spawn_orphan_watchdog(cancellation: CancellationToken) {
 /// `isError: false` with the tool's structured content, or `isError: true`
 /// with the failure. Argument validation that happens before dispatch keeps
 /// reporting on stderr alone.
+#[derive(Clone)]
+struct ToolSourceScope<'a> {
+    sources: &'a [String],
+    options: ScopedProjectOptions,
+}
+
 fn run_tool(
     root: PathBuf,
     tool_name: &str,
     tool_args: Value,
-    tool_sources: &[String],
+    tool_sources: ToolSourceScope<'_>,
     render_options: McpRenderOptions,
     diff_snapshot_object_dir: Option<PathBuf>,
     workspace_scaled_limits: bool,
@@ -2780,22 +3095,25 @@ fn run_dispatched_tool(
     root: PathBuf,
     tool_name: &str,
     tool_args: Value,
-    tool_sources: &[String],
+    tool_sources: ToolSourceScope<'_>,
     render_options: McpRenderOptions,
     diff_snapshot_object_dir: Option<PathBuf>,
     workspace_scaled_limits: bool,
 ) -> Result<(), String> {
+    let (cancellation, progress) = cli_progress::start();
+    let _phase = cancellation.enter_phase(format!("executing {tool_name}"));
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     let (arguments, overlays) =
         normalize_tool_arguments_for_cli(tool_name, tool_args, &canonical_root)?;
-    let service = create_cli_tool_service(
+    let service = create_cli_tool_service_with_options(
         canonical_root,
         tool_name,
         &arguments,
-        tool_sources,
+        tool_sources.sources,
         overlays,
+        tool_sources.options,
     )?;
     let service = match diff_snapshot_object_dir {
         Some(dir) => service.with_diff_snapshot_object_dir(dir),
@@ -2808,38 +3126,67 @@ fn run_dispatched_tool(
     } else {
         service
     };
-    let cancellation = CancellationToken::new();
     #[cfg(unix)]
     spawn_orphan_watchdog(cancellation.clone());
-    let output = service
-        .call_tool_output_with_cancellation(
-            tool_name,
-            arguments,
-            RenderOptions {
-                render_line_numbers: render_options.render_line_numbers,
-            },
-            Some(&cancellation),
-        )
-        .map_err(|err| err.to_string())?;
+    let output = service.call_tool_output_with_cancellation(
+        tool_name,
+        arguments,
+        RenderOptions {
+            render_line_numbers: render_options.render_line_numbers,
+        },
+        Some(&cancellation),
+    );
+    drop(progress);
+    let output = output.map_err(|err| err.to_string())?;
 
+    write_dispatched_tool_output(&mut io::stdout().lock(), &output)
+}
+
+/// Borrow admitted query payloads through the final write without making a
+/// retained Value, display string, or encoded JSON copy.
+fn write_dispatched_tool_output(
+    writer: &mut impl Write,
+    output: &ToolOutput,
+) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a, T> {
+        #[serde(rename = "isError")]
+        is_error: bool,
+        #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+        structured_content: Option<&'a T>,
+    }
+
+    // Mirror the MCP shape without content: CLI stdout stays machine-only.
     let result = match output {
-        // Mirror the MCP tool result shape, but omit `content` so one-shot CLI
-        // stdout stays machine-only.
-        ToolOutput::Text(_) => json!({
-            "isError": false,
-        }),
-        ToolOutput::Structured {
-            structured,
-            rendered_text: _,
-        } => json!({
-            "structuredContent": structured,
-            "isError": false,
-        }),
+        ToolOutput::QueryResponse(response) => serde_json::to_writer(
+            &mut *writer,
+            &Envelope {
+                is_error: false,
+                structured_content: Some(response.as_ref()),
+            },
+        ),
+        ToolOutput::Structured { structured, .. } => serde_json::to_writer(
+            &mut *writer,
+            &Envelope {
+                is_error: false,
+                structured_content: Some(structured),
+            },
+        ),
+        ToolOutput::Text(_) => serde_json::to_writer(
+            &mut *writer,
+            &Envelope::<Value> {
+                is_error: false,
+                structured_content: None,
+            },
+        ),
     };
-    let encoded = serde_json::to_string(&result)
-        .map_err(|err| format!("Failed to serialize tool result: {err}"))?;
-    println!("{encoded}");
-    Ok(())
+    result.map_err(|err| format!("Failed to serialize tool result: {err}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|err| format!("Failed to write tool result newline: {err}"))?;
+    writer
+        .flush()
+        .map_err(|err| format!("Failed to flush tool result: {err}"))
 }
 
 fn print_help(topic: Option<&str>) -> Result<(), String> {
@@ -2877,6 +3224,8 @@ USAGE:
                                or built-in/open pack catalog
     bifrost prepare-open-packs --cache-dir DIR --receipt-path FILE --env-path FILE
                                Select packs and write a typed outcome; accepts --request-path FILE
+    bifrost prepare-pack-approval-inventory --archive PATH --archive-sha256 HEX --channel CHANNEL --release-tag TAG --output PATH
+                               Verify an official release and write host approval inventory
     bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT
                                Verify and install a native semantic-pack bundle
     bifrost --policy           Evaluate host-supplied policy packs on the project and exit
@@ -2912,6 +3261,11 @@ OPTIONS:
     --sources PATH         Restrict one-shot --tool or policy workspace construction to selected
                            files, directories, or globs. Repeatable. Explicit sources override
                            .bifrostignore.
+    --without-project-build
+                           Discover JVM dependencies only from selected sources instead of
+                           their project build. Applies to --tool and scoped policy runs.
+                           Revision scopes currently remain subset-only (#12427); this flag
+                           is a no-op for them until full revision build authority exists.
     --policy               Enter policy mode explicitly. A policy invocation with no
                            --policy-file and no built-in selector evaluates every built-in
                            policy pack; any explicit selection replaces that default.
@@ -3027,7 +3381,11 @@ OPTIONS:
     --output PATH          Atomically write policy output to PATH instead of stdout
     --no-line-numbers      Render source output without leading line numbers
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters
-    -V, --version          Show version and exit
+    --pack-approval-inventory PATH
+                          Replace the compiled host approval inventory (absolute, outside root)
+    --pack-approval-inventory-sha256 HEX
+                          Required SHA-256 pin for the opened inventory snapshot
+    -V, --version          Show version and effective pack approval inventory
         --build-identity   Show the exact embedded source identity and exit
 
 MCP TOOLSETS (--mcp):
@@ -3098,6 +3456,132 @@ The MCP server speaks its protocol over stdio (no network port). The workspace i
 in the background: the server is ready immediately and the first request waits for indexing.
 "#;
     print!("{bottom}");
+}
+
+#[cfg(test)]
+mod host_approval_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<(Vec<String>, HostApprovalSelection), String> {
+        HostApprovalSelection::parse(args.iter().map(|value| (*value).into()).collect())
+    }
+
+    #[test]
+    fn approval_pair_is_removed_before_all_subcommand_dispatch() {
+        let (args, selection) = parse(&[
+            "--pack-approval-inventory",
+            "/host/inventory.json",
+            "scan",
+            "fixture",
+            "--pack-approval-inventory-sha256",
+            "pin",
+        ])
+        .unwrap();
+        assert_eq!(args, ["scan", "fixture"]);
+        assert_eq!(
+            selection.override_input,
+            Some((PathBuf::from("/host/inventory.json"), "pin".into()))
+        );
+        // Portable, source-only and help commands do not load irrelevant
+        // inventory input. Analysis and version paths must call build().
+        let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        assert!(selection.build(&budget).is_err());
+        assert!(matches!(
+            run(
+                [
+                    "pack-engine-profile",
+                    "--pack-approval-inventory",
+                    "/host/not-present",
+                    "--pack-approval-inventory-sha256",
+                    "unused"
+                ]
+                .into_iter()
+                .map(str::to_owned),
+                &budget
+            ),
+            Ok(CliRunResult::Complete)
+        ));
+    }
+
+    #[test]
+    fn approval_pair_rejects_partial_duplicate_and_unknown_authority() {
+        for args in [
+            vec!["--pack-approval-inventory", "a"],
+            vec!["--pack-approval-inventory-sha256", "a"],
+            vec!["--pack-approval-inventory", "--version"],
+            vec!["--pack-approval-inventory-sha256"],
+            vec![
+                "--pack-approval-inventory",
+                "a",
+                "--pack-approval-inventory",
+                "b",
+                "--pack-approval-inventory-sha256",
+                "c",
+            ],
+            vec![
+                "--pack-approval-inventory",
+                "a",
+                "--pack-approval-inventory-sha256",
+                "b",
+                "--pack-approval-inventory-sha256",
+                "c",
+            ],
+            vec!["--pack-approval-disable"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14134: approval argument errors lost the policy unreliable-run exit contract"
+    )]
+    fn approval_argument_errors_keep_the_policy_contract_in_the_test_entrypoint() {
+        let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        for prefix in [vec!["scan", "."], vec!["--policy-file", "test.rqlp"]] {
+            let args = prefix.into_iter().chain(["--pack-approval-disable"]);
+            assert!(matches!(
+                run(args.map(str::to_owned), &budget),
+                Err(CliRunError {
+                    policy_invocation: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn official_cli_defaults_to_verified_inventory_and_override_replaces_it() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            FirstPartyApprovalInventorySource, FirstPartyReleaseInventoryDocument,
+        };
+        let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        let (_, selection) = parse(&[]).unwrap();
+        let default = selection.build(&budget).unwrap();
+        assert_eq!(
+            default.metadata().unwrap().source,
+            FirstPartyApprovalInventorySource::CompiledDefault
+        );
+        assert!(host_approval_witness(&default).contains("source=compiled_default"));
+        let host = tempfile::tempdir().unwrap();
+        let path = host.path().canonicalize().unwrap().join("inventory.json");
+        let bytes =
+            serde_json::to_vec(&FirstPartyReleaseInventoryDocument::new(Vec::new()).unwrap())
+                .unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let pin =
+            brokk_bifrost_analysis::analyzer::semantic_model::artifact::content_digest(&bytes);
+        let selection = HostApprovalSelection {
+            override_input: Some((path, pin.clone())),
+        };
+        let replacement = selection.build(&budget).unwrap();
+        assert_eq!(
+            replacement.metadata().unwrap().source,
+            FirstPartyApprovalInventorySource::HostOverride
+        );
+        assert!(host_approval_witness(&replacement).contains(&format!("sha256={pin}")));
+        assert_ne!(default.identity(), replacement.identity());
+    }
 }
 
 #[cfg(test)]
@@ -3216,6 +3700,111 @@ mod portable_runtime_cli_tests {
         )
         .expect("generate native release bundle");
         bundle_root
+    }
+
+    fn approval_archive(bundle: &Path, output: &Path) -> String {
+        let file = fs::File::create(output).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.append_dir_all("bifrost-semantic-packs", bundle)
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(fs::read(output).unwrap()).into(),
+        )
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14345: a raw symlinked TMPDIR root tripped the host approval symlink rejection"
+    )]
+    fn approval_inventory_verifies_release_membership_without_trusting_pack_names() {
+        if !brokk_bifrost_core::analyzer::project::rerun_test_with_symlinked_tempdir(
+            "portable_runtime_cli_tests::approval_inventory_verifies_release_membership_without_trusting_pack_names",
+            "BIFROST_ISSUE_14345_APPROVAL_INVENTORY_CLI_CHILD",
+        ) {
+            return;
+        }
+        use brokk_bifrost::analyzer::semantic_model::{
+            CompiledPackManifest, VerifiedFirstPartyReleaseInventory,
+        };
+        let fixture = tempdir().unwrap();
+        // macOS configures TMPDIR under /var, a symlink to /private/var. The
+        // host approval loader rejects any symlink component (#14345), so the
+        // archive, output and repository paths use the canonical temp root.
+        let root = fixture.path().canonicalize().unwrap();
+        let bundle = authored_release_bundle(&root);
+        let archive = root.join("official-fixture.tar.gz");
+        let pin = approval_archive(&bundle, &archive);
+        let output = root.join("approval.json");
+        let args = vec![
+            "--archive".into(),
+            archive.display().to_string(),
+            "--archive-sha256".into(),
+            pin,
+            "--channel".into(),
+            "public-semantic-packs".into(),
+            "--release-tag".into(),
+            "packs/v0.0.0-test-only".into(),
+            "--output".into(),
+            output.display().to_string(),
+        ];
+        // The test host explicitly authenticates this tiny synthetic archive;
+        // it is not a production catalog or a second shipped pack.
+        assert!(matches!(
+            run_prepare_pack_approval_inventory(&args).unwrap(),
+            CliRunResult::Complete
+        ));
+        let digest = brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(fs::read(&output).unwrap()).into(),
+        );
+        let repo = root.join("customer");
+        fs::create_dir(&repo).unwrap();
+        let inventory =
+            VerifiedFirstPartyReleaseInventory::load_host_pinned(&output, &digest, &repo).unwrap();
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("index.json")).unwrap()).unwrap();
+        let path = index["packs"][0]["manifest"]["path"].as_str().unwrap();
+        let mut manifest: CompiledPackManifest =
+            serde_json::from_slice(&fs::read(bundle.join(path)).unwrap()).unwrap();
+        assert_eq!(manifest.pack_id, "acme.widget");
+        assert!(inventory.covers_validated_manifest(&manifest));
+        let identical_copy = manifest.clone();
+        assert!(inventory.covers_validated_manifest(&identical_copy));
+        manifest.pack_id = "bifrost.rust-stdlib".into();
+        manifest.content_sha256 =
+            brokk_bifrost::analyzer::semantic_model::artifact::manifest_content_digest(&manifest)
+                .unwrap();
+        assert!(!inventory.covers_validated_manifest(&manifest));
+        manifest = identical_copy;
+        manifest.shards[0].stored_sha256 = "a".repeat(64);
+        assert!(!inventory.covers_validated_manifest(&manifest));
+        assert!(!repo.join(".bifrost").exists());
+    }
+
+    #[test]
+    fn approval_inventory_rejects_corrupt_bundle_even_under_a_matching_archive_pin() {
+        let fixture = tempdir().unwrap();
+        let bundle = authored_release_bundle(fixture.path());
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("index.json")).unwrap()).unwrap();
+        let path = index["packs"][0]["shards"][0]["asset"]["path"]
+            .as_str()
+            .unwrap();
+        fs::write(bundle.join(path), b"swapped payload").unwrap();
+        let archive = fixture.path().join("corrupt.tar.gz");
+        let pin = approval_archive(&bundle, &archive);
+        let output = fixture.path().join("approval.json");
+        let error = brokk_bifrost::semantic_packs::approval::prepare_first_party_approval_inventory(
+            &archive, &pin,
+            brokk_bifrost::analyzer::semantic_model::FirstPartyReleaseChannel::PublicSemanticPacks,
+            "packs/v0.0.0-test-only",
+        ).unwrap_err();
+        assert!(
+            error.contains("verify first-party release bundle"),
+            "{error}"
+        );
+        assert!(!output.exists());
     }
 
     #[test]
@@ -3776,5 +4365,251 @@ mod policy_explain_exit_status_tests {
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);
+    }
+}
+
+#[cfg(test)]
+mod dispatched_output_tests {
+    use super::*;
+    use brokk_bifrost::rql::{CodeQueryResponse, CodeQueryResult};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::Arc;
+
+    #[test]
+    #[hardwon("#14068: CLI query output erased shared backing before the final write")]
+    fn typed_query_clone_keeps_backing_through_newline_and_flush() {
+        use brokk_bifrost::rql::{
+            CodeQueryCallShapeArgument, CodeQueryRange, CodeQueryResultItem, CodeQueryResultValue,
+        };
+        use brokk_bifrost::{AnalyzerConfig, FilesystemProject, ProjectFile, WorkspaceAnalyzer};
+        use brokk_bifrost_analysis::retention_budget::RetentionBudget;
+        use brokk_bifrost_tools::site_context::{
+            KnownValue, KnownValueView, SiteAdmission, SiteContext, SiteLocation, SiteLocationView,
+            SiteRole, SiteValue, SiteValueView, view,
+        };
+
+        struct Writer<'a> {
+            owner: &'a RetentionBudget,
+            charged: u64,
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+        impl Write for Writer<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert_eq!(self.owner.accounted_bytes(), self.charged);
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                assert_eq!(self.owner.accounted_bytes(), self.charged);
+                assert_eq!(self.bytes.last(), Some(&b'\n'));
+                self.flushed = true;
+                Ok(())
+            }
+        }
+
+        // Use the actual workspace owner, without another pool or capacity.
+        // The empty workspace keeps unrelated analyzer allocations stable;
+        // the real site wire constructor supplies the nonempty admitted row.
+        let root = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(FilesystemProject::new(root.path()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let owner = workspace.retention_budget();
+        let baseline = owner.accounted_bytes();
+        let raw = "\"\"\"line\n\"quoted\"\n\"\"\"";
+        let decoded = "line\n\"quoted\"\n";
+        let context = SiteContext {
+            site: SiteLocation::Source {
+                path: ProjectFile::new(root.path(), "argument.py"),
+                byte_range: 0..raw.len(),
+                start_line: 1,
+                start_column: 1,
+                end_line: 3,
+                end_column: 4,
+                text: raw.to_owned(),
+            },
+            role: SiteRole::Argument {
+                index: 0,
+                name: None,
+            },
+            value: SiteValue::Known(KnownValue::Str(decoded.to_owned())),
+        };
+        let site = view(&context, &SiteAdmission::new(Some(owner))).unwrap();
+        drop(context);
+        let SiteLocationView::Source { text, .. } = &site.site else {
+            panic!("source text must be admitted");
+        };
+        let extracted_text = text.clone();
+        let SiteValueView::Known {
+            value: KnownValueView::Str { value },
+        } = &site.value
+        else {
+            panic!("decoded string must remain exact");
+        };
+        let extracted_value = value.clone();
+        let charged = owner.accounted_bytes();
+        assert!(charged > baseline + (raw.len() + decoded.len()) as u64);
+        let row = CodeQueryResultItem {
+            value: CodeQueryResultValue::CallArgument {
+                value: Box::new(CodeQueryCallShapeArgument {
+                    id: "argument:0".to_owned(),
+                    group_id: "group:0".to_owned(),
+                    site_id: "call:0".to_owned(),
+                    path: "argument.py".to_owned(),
+                    range: CodeQueryRange {
+                        start_line: 1,
+                        start_column: 1,
+                        end_line: 3,
+                        end_column: 4,
+                    },
+                    argument_index: 0,
+                    name: None,
+                    literal_value: Some(extracted_value.clone()),
+                    spread: false,
+                    site,
+                }),
+            },
+            provenance: Vec::new(),
+            provenance_truncated: false,
+            row_projection: Vec::new(),
+        };
+        let extracted_row = row.clone();
+        let CodeQueryResultValue::CallArgument { value } = &extracted_row.value else {
+            panic!("argument row remains typed");
+        };
+        let SiteLocationView::Source { text, .. } = &value.site.site else {
+            panic!("source remains present in extracted row");
+        };
+        assert_eq!(text.as_ptr(), extracted_text.as_ptr());
+        let flat = value.literal_value.as_ref().unwrap();
+        assert_eq!(flat.as_ref(), decoded);
+        assert_eq!(flat.as_ptr(), extracted_value.as_ptr());
+        assert_eq!(
+            value.site.value.known_str().unwrap().as_ptr(),
+            flat.as_ptr()
+        );
+        assert_eq!(owner.accounted_bytes(), charged);
+
+        let response = Arc::new(CodeQueryResponse::Results(CodeQueryResult {
+            results: vec![row],
+            ..Default::default()
+        }));
+        let response_weak = Arc::downgrade(&response);
+        let output = ToolOutput::QueryResponse(response);
+        let cloned = output.clone();
+        let (ToolOutput::QueryResponse(original), ToolOutput::QueryResponse(shared)) =
+            (&output, &cloned)
+        else {
+            panic!("query response remains typed");
+        };
+        assert!(Arc::ptr_eq(original, shared));
+        drop(output);
+        let mut writer = Writer {
+            owner,
+            charged,
+            bytes: Vec::new(),
+            flushed: false,
+        };
+        write_dispatched_tool_output(&mut writer, &cloned).expect("write admitted query");
+        assert!(writer.flushed);
+        let wire = std::mem::take(&mut writer.bytes);
+        drop(writer);
+        assert_eq!(wire.last(), Some(&b'\n'));
+        let payload: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(payload["isError"], false);
+        assert_eq!(payload["structuredContent"]["truncated"], false);
+        let rows = payload["structuredContent"]["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["result_type"], "call_argument");
+        assert_eq!(row["site"]["site"]["text"], raw);
+        assert_eq!(row["site"]["value"]["value"]["value"], decoded);
+        assert!(
+            row.get("literal_value").is_none(),
+            "flat literal stays internal"
+        );
+
+        drop(cloned);
+        assert!(response_weak.upgrade().is_none());
+        assert_eq!(
+            owner.accounted_bytes(),
+            charged,
+            "extracted row owns all site backing"
+        );
+        drop(extracted_row);
+        let leaves_charged = owner.accounted_bytes();
+        assert!(
+            leaves_charged < charged,
+            "row-only path backing is released"
+        );
+        assert!(leaves_charged > baseline);
+        let last_text = extracted_text.clone();
+        let last_value = extracted_value.clone();
+        assert_eq!(last_text.as_ptr(), extracted_text.as_ptr());
+        assert_eq!(last_value.as_ptr(), extracted_value.as_ptr());
+        drop(extracted_text);
+        drop(extracted_value);
+        assert_eq!(owner.accounted_bytes(), leaves_charged);
+        assert_eq!(last_text.as_ref(), raw);
+        assert_eq!(last_value.as_ref(), decoded);
+        drop(last_text);
+        assert!(owner.accounted_bytes() < leaves_charged);
+        assert!(
+            owner.accounted_bytes() > baseline,
+            "decoded backing still lives"
+        );
+        drop(last_value);
+        assert_eq!(owner.accounted_bytes(), baseline, "exact final-leaf refund");
+    }
+
+    #[test]
+    #[hardwon("#14068: CLI final writes did not propagate newline and flush failures")]
+    fn output_writer_reports_serialization_newline_and_flush_errors() {
+        struct FailingWriter {
+            fail_at: usize,
+            written: usize,
+            flush_fails: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.written >= self.fail_at {
+                    return Err(io::Error::other("output refused"));
+                }
+                let count = bytes.len().min(self.fail_at - self.written);
+                self.written += count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.flush_fails {
+                    Err(io::Error::other("flush refused"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let output = ToolOutput::QueryResponse(Arc::new(CodeQueryResponse::Results(
+            CodeQueryResult::default(),
+        )));
+        let mut wire = Vec::new();
+        write_dispatched_tool_output(&mut wire, &output).unwrap();
+        for (fail_at, flush_fails, expected) in [
+            (0, false, "Failed to serialize tool result"),
+            (wire.len() - 1, false, "Failed to write tool result newline"),
+            (usize::MAX, true, "Failed to flush tool result"),
+        ] {
+            let error = write_dispatched_tool_output(
+                &mut FailingWriter {
+                    fail_at,
+                    written: 0,
+                    flush_fails,
+                },
+                &output,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }

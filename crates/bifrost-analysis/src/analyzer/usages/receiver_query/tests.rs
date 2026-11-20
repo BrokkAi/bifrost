@@ -59,22 +59,21 @@ fn receiver_semantic_bridge_uses_every_receiver_limit() {
         context_depth: 2,
         max_targets: 3,
         max_summary_expansions: 9,
-        max_scope_nodes: 17,
         max_hierarchy_order_work: 17,
         max_resolution_rounds: ReceiverAnalysisBudget::default().max_resolution_rounds,
         max_hierarchy_order_steps: ReceiverAnalysisBudget::default().max_hierarchy_order_steps,
     })
     .expect("aggregate semantic budget");
     let semantic = bridge.budget.limits();
-    assert_eq!(semantic.procedures, 2);
-    assert_eq!(semantic.control_edges, 1);
-    assert_eq!(semantic.nested_entries, 5);
     assert_eq!(semantic.call_sites, 9);
     assert_eq!(semantic.memory_locations, 9);
     assert_eq!(semantic.captures, 9);
-    assert_eq!(semantic.source_bytes, 17 * 1_024);
-    let scope_limits = ReceiverSemanticBridge::receiver_work(semantic);
-    assert_eq!(scope_limits.scope_nodes, 17);
+    // Resident rows and text keep the semantic budget's own limits: visiting
+    // syntax is work and has no allowance (#13216).
+    let defaults = SemanticBudget::default().limits();
+    assert_eq!(semantic.procedures, defaults.procedures);
+    assert_eq!(semantic.nested_entries, defaults.nested_entries);
+    assert_eq!(semantic.owned_text_bytes, defaults.owned_text_bytes);
     let aggregate_work = ReceiverSemanticBridge::receiver_work(SemanticWork {
         call_sites: 4,
         memory_locations: 3,
@@ -101,18 +100,28 @@ fn receiver_semantic_bridge_uses_every_receiver_limit() {
 
     assert_eq!(
         ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
-            max_scope_nodes: ReceiverSemanticBridge::SCOPE_DIMENSIONS - 1,
-            ..ReceiverAnalysisBudget::default()
-        })
-        .unwrap_err(),
-        ReceiverBudgetLimit::ScopeNodes
-    );
-    assert_eq!(
-        ReceiverSemanticBridge::new(ReceiverAnalysisBudget {
             max_summary_expansions: ReceiverSemanticBridge::SUMMARY_DIMENSIONS - 1,
             ..ReceiverAnalysisBudget::default()
         })
         .unwrap_err(),
         ReceiverBudgetLimit::SummaryExpansions
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn incomplete_provider_rows_make_the_query_execution_dependent() {
+    use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
+    let mut ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+    assert_eq!(ledger.reuse_verdict(), ReuseVerdict::Content);
+    let outcome = charge_limited_projection(QueryBatch::incomplete(vec![1], 1), None, &mut ledger)
+        .expect("uncancelled projection");
+    assert!(matches!(
+        outcome,
+        CompatibilityOutcome::Unavailable("provider_rows_incomplete")
+    ));
+    assert_eq!(
+        ledger.reuse_verdict(),
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
     );
 }

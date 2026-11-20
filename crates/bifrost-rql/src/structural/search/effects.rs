@@ -34,7 +34,9 @@ use crate::analyzer::semantic_model::overlay::{
     ModelMembersState, ModelOwnerAnswer, ModelProvider, ModelProviderSelection, ModelSymbolRef,
     ModelTypeOwnerAnswer, SelectedModelResult,
 };
-use crate::analyzer::semantic_model::{SemanticModelSymbolKind, TypeRef, Visibility};
+use crate::analyzer::semantic_model::{
+    SemanticModelSymbolKind, TypeRef, Visibility, target_needs_override_claim,
+};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_cpp_analysis::analyzer::CppCallResultUseIndex;
 use brokk_bifrost_php_analysis::analyzer::php::PhpCallResultUseIndex;
@@ -961,7 +963,7 @@ pub(super) fn result_subject_use_expansions<'a>(
     let call = semantics
         .call_site(result.handle.id())
         .expect("validated call result");
-    let Some(materialized) = semantic.materialized_outcome(file) else {
+    let Ok(materialized) = semantic.materialized_outcome(file) else {
         return open(
             Outcome::Incomplete,
             "result_subject_semantic_state_unavailable",
@@ -3857,9 +3859,11 @@ pub(super) fn call_result_contract_expansions<'a>(
                 ..
             } => {
                 modeled_arm_count = modeled_arm_count.saturating_add(1);
-                let closes = key
-                    .as_ref()
-                    .is_some_and(|key| complete && (covers_overrides || !key.has_receiver));
+                let closes = key.as_ref().is_some_and(|key| {
+                    complete
+                        && (covers_overrides
+                            || !target_needs_override_claim(key.has_receiver, false))
+                });
                 (result_contracts, closes)
             }
             ModelAnswer::Conflict => {
@@ -3960,6 +3964,7 @@ pub(super) fn call_result_contract_expansions<'a>(
                     descriptor,
                     &application,
                 )?;
+            let matched = matched.matched;
             // Go has no overloads. Partial inventory does not erase one positive
             // declaration, but ambiguous provenance or application shapes stay open.
             use crate::analyzer::semantic_model::{
@@ -4389,7 +4394,7 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
         use_coverage,
         use_reason,
         answer,
-        dispatch_incompleteness,
+        mut dispatch_incompleteness,
     } = context;
     if !matches!(result_use, CallResultUse::Discarded) {
         return None;
@@ -4462,7 +4467,16 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                         break;
                     }
                     SemanticModelMatchDisposition::Open(open) => {
-                        unreachable!("a reviewed libc question has no JVM-family part: {open:?}")
+                        if let Some(cause) = SemanticModelOverlay::record_open_proof(
+                            open,
+                            "cpp_libc_result_obligations",
+                        ) {
+                            dispatch_incompleteness =
+                                dispatch_incompleteness.combine(Incompleteness::Operational(cause));
+                        }
+                        row.coverage = row.coverage.meet(EffectCoverage::Open);
+                        row.reason = Some("model_input_unavailable");
+                        break;
                     }
                 };
                 if summary.shard.manifest.pack_id != REVIEWED_LIBC_RESULT_USE_PACK_ID
@@ -4526,7 +4540,16 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                         break;
                     }
                     SemanticModelMatchDisposition::Open(open) => {
-                        unreachable!("a reviewed libc question has no JVM-family part: {open:?}")
+                        if let Some(cause) = SemanticModelOverlay::record_open_proof(
+                            open,
+                            "cpp_libc_result_obligations",
+                        ) {
+                            dispatch_incompleteness =
+                                dispatch_incompleteness.combine(Incompleteness::Operational(cause));
+                        }
+                        row.coverage = row.coverage.meet(EffectCoverage::Open);
+                        row.reason = Some("model_input_unavailable");
+                        break;
                     }
                 };
                 if summary.shard.manifest.pack_id != REVIEWED_LIBC_RESULT_USE_PACK_ID
@@ -4553,7 +4576,8 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                 break;
             };
             if summary.record.completeness != Completeness::Complete
-                || (summary.record.target.has_receiver && !binding.covers_overrides())
+                || (target_needs_override_claim(summary.record.target.has_receiver, false)
+                    && !binding.covers_overrides())
             {
                 row.reason = Some("obligation_unavailable");
                 break;
@@ -4577,7 +4601,9 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                 row.model_id = None;
                 row.summary_id = None;
             }
-            closes_residual &= !summary.record.target.has_receiver || binding.covers_overrides();
+            closes_residual &=
+                !target_needs_override_claim(summary.record.target.has_receiver, false)
+                    || binding.covers_overrides();
             row.modeled_arm_count += 1;
         }
     } else {
@@ -6048,7 +6074,8 @@ fn csharp_call_result_obligation_expansions(
                     }
                 };
             if summary.record.completeness != Completeness::Complete
-                || (target.has_receiver() && !binding.covers_overrides())
+                || (target_needs_override_claim(target.has_receiver(), false)
+                    && !binding.covers_overrides())
                 || binding.obligations().iter().any(|obligation| {
                     obligation.kind == ResultUseObligationKind::PureTransformationValue
                         && !binding.ordinary_heap_unchanged()
@@ -6076,7 +6103,8 @@ fn csharp_call_result_obligation_expansions(
                 row.model_id = None;
                 row.summary_id = None;
             }
-            closes_residual &= !target.has_receiver() || binding.covers_overrides();
+            closes_residual &= !target_needs_override_claim(target.has_receiver(), false)
+                || binding.covers_overrides();
             row.modeled_arm_count += 1;
         }
     } else {
@@ -6221,7 +6249,7 @@ fn csharp_bcl_evidence(evidence: &SemanticModelActivationEvidence) -> bool {
             .as_ref()
             .is_some_and(|package| package.name == "Microsoft.NETCore.App.Ref")
         && evidence.target.as_deref() == Some("net8.0")
-        && evidence.artifact_sha256.is_some()
+        && !evidence.verified_raw_artifacts.is_empty()
         && evidence.module.as_ref().is_some_and(|module| {
             matches!(
                 module.name.as_str(),
@@ -6614,7 +6642,7 @@ fn reviewed_js_ts_evidence_selected(
                         Some("typescript-lib:es5" | "typescript-lib:es2019")
                     ) | ("lib/lib.es2019.string.d.ts", Some("typescript-lib:es2019"))
                 )
-                && evidence.artifact_sha256.is_none()
+                && evidence.verified_raw_artifacts.is_empty()
         }
         crate::analyzer::Language::JavaScript => {
             evidence.language == "javascript"
@@ -6622,8 +6650,9 @@ fn reviewed_js_ts_evidence_selected(
                 && package_matches("pkg:generic/nodejs.org/node@22.11.0", None)
                 && evidence.configuration.as_deref()
                     == Some("70db7f8c799decb554bc25e8bf410079c8b377f2852ee2a982d56db40f054056")
-                && evidence.artifact_sha256.as_deref()
-                    == Some("24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222")
+                && evidence.contains_raw_sha256(
+                    "24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222",
+                )
         }
         _ => false,
     }
@@ -7372,7 +7401,7 @@ fn php_builtin_evidence(evidence: &SemanticModelActivationEvidence) -> bool {
         && evidence.module.is_none()
         && evidence.target.is_none()
         && evidence.configuration.is_none()
-        && evidence.artifact_sha256.is_none()
+        && evidence.verified_raw_artifacts.is_empty()
         && evidence
             .toolchain
             .as_ref()
@@ -7568,7 +7597,8 @@ pub(super) fn call_result_obligation_expansions(
                             row.summary_id = None;
                         }
                         closes_residual &=
-                            !target.has_receiver() || summary.record.covers_overrides;
+                            !target_needs_override_claim(target.has_receiver(), false)
+                                || summary.record.covers_overrides;
                         row.modeled_arm_count += 1;
                     }
                 } else {
@@ -9448,7 +9478,7 @@ pub(super) fn result_contract_failure_use_expansions<'a>(
         );
     }
     let procedure = condition.handle.procedure();
-    let Some(materialized) = semantic.materialized_outcome(&value.file) else {
+    let Ok(materialized) = semantic.materialized_outcome(&value.file) else {
         return open_result_contract_failure_use_expansions(
             analyzer,
             cache,
@@ -9786,7 +9816,7 @@ fn result_contract_success_guards<'a>(
     }
 
     let procedure = result.handle.procedure();
-    let Some(materialized) = semantic.materialized_outcome(file) else {
+    let Ok(materialized) = semantic.materialized_outcome(file) else {
         return ResultContractSuccessGuards::unknown();
     };
     let file_state = flow_state_cache.for_materialized_procedure(
@@ -11418,6 +11448,8 @@ fn normalized_success_guard_edges(
                     | GuardPredicate::HasMember { .. }
                     | GuardPredicate::Truthy { .. }
                     | GuardPredicate::NullComparison { .. }
+                    | GuardPredicate::ValueEquality { .. }
+                    | GuardPredicate::ValueOrdering { .. }
                     | GuardPredicate::Opaque { .. },
                 ) => return None,
                 (
@@ -11533,7 +11565,7 @@ fn direct_conditional_summary(
             covers_overrides,
             conditional_result_refinements,
             ..
-        } if covers_overrides || !key.has_receiver => {
+        } if covers_overrides || !target_needs_override_claim(key.has_receiver, false) => {
             ConditionalProcedureSummaryAnswer::Complete(conditional_result_refinements)
         }
         ModelAnswer::Modeled { .. }
@@ -12719,7 +12751,7 @@ fn validate_result_contract_uses<'a>(
     else {
         return ResultContractUseValidation::unknown(0);
     };
-    let Some(materialized) = semantic.materialized_outcome(file) else {
+    let Ok(materialized) = semantic.materialized_outcome(file) else {
         return ResultContractUseValidation::unknown(0);
     };
     // Every ordinary result-use proof is intraprocedural. Derive the parent
@@ -14131,7 +14163,9 @@ fn normal_return_refinement_calls(
                     ..
                 } if !normal_return_refinements.is_empty() => (
                     normal_return_refinements,
-                    complete && (covers_overrides || !key.has_receiver),
+                    complete
+                        && (covers_overrides
+                            || !target_needs_override_claim(key.has_receiver, false)),
                 ),
                 ModelAnswer::Modeled { .. }
                 | ModelAnswer::Conflict
@@ -14403,6 +14437,10 @@ fn record_effect_coverage_incomplete(
             message: format!("{message} in `{}`", rel_path_string(file)),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }),
         None,
     );
@@ -14438,7 +14476,7 @@ fn record_coverage(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EffectBudgetExhausted,
@@ -14450,6 +14488,7 @@ fn record_coverage(
                             .to_owned(),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
             }
             cache.incomplete = true;
@@ -14491,6 +14530,10 @@ fn record_open_callee(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 
@@ -14526,6 +14569,18 @@ struct ExternalEffectCallee {
     basis: EffectNodeBasis,
 }
 
+/// Whether a dispatch arm to the external member `key` is known to name
+/// exactly one implementation. The oracle marks a Rust external receiver arm
+/// Complete only through the exact closed bound-receiver proof: one inherent
+/// method on one concrete nominal type, which nothing can override. Go's
+/// closed concrete-receiver arms carry the same proof but are not admitted
+/// here yet, so their summaries still need an override claim and the leaf
+/// fails closed. Other languages' Complete external arms make no
+/// exact-dispatch claim.
+fn external_arm_dispatch_is_exact(key: &ModeledProcedureKey, arm_complete: bool) -> bool {
+    arm_complete && key.language == Language::Rust.config_label()
+}
+
 /// Classify one arm whose callee the workspace does not materialize, and mint
 /// the graph leaf it contributes, if any.
 ///
@@ -14546,10 +14601,14 @@ struct ExternalEffectCallee {
 ///   positive claim like "this writes to a stream" is authored, but the arm
 ///   does not close: an undeclared effect may still happen below it.
 /// * A conflict between activated packs, and no summary at all, claim nothing.
+///
+/// A Rust arm the dispatch reports Complete is exact dispatch
+/// ([`external_arm_dispatch_is_exact`]), so it also speaks for its one
+/// implementation without an override claim (#12846).
 fn external_arm_lookup(
     answer: ModelAnswer,
     key: &ModeledProcedureKey,
-    rust_receiver_dispatch_closed: bool,
+    arm_complete: bool,
 ) -> (ArmLookup, Option<ExternalEffectCallee>) {
     let (complete, covers_overrides, effects) = match answer {
         ModelAnswer::Modeled {
@@ -14562,8 +14621,12 @@ fn external_arm_lookup(
         ModelAnswer::InputUnavailable => return (ArmLookup::InputUnavailable, None),
         ModelAnswer::Empty => return (ArmLookup::Unmodeled { analyzable: false }, None),
     };
-    let closes =
-        complete && (covers_overrides || !key.has_receiver || rust_receiver_dispatch_closed);
+    let closes = complete
+        && (covers_overrides
+            || !target_needs_override_claim(
+                key.has_receiver,
+                external_arm_dispatch_is_exact(key, arm_complete),
+            ));
     if !closes && effects.is_empty() {
         return (ArmLookup::Unmodeled { analyzable: false }, None);
     }
@@ -14636,14 +14699,8 @@ fn classify_dispatch_arms(
             // at all and stays unmodeled, which is the #2579 family.
             None => match arm.unmaterialized_target.as_ref().map(external_modeled_key) {
                 Some(key) => {
-                    let rust_receiver_dispatch_closed = complete
-                        && key.language == Language::Rust.config_label()
-                        && key.has_receiver;
-                    let (lookup, leaf) = external_arm_lookup(
-                        cache.answer_for(analyzer, &key),
-                        &key,
-                        rust_receiver_dispatch_closed,
-                    );
+                    let (lookup, leaf) =
+                        external_arm_lookup(cache.answer_for(analyzer, &key), &key, complete);
                     external_callee = leaf;
                     (Some(key), lookup, None)
                 }
@@ -15249,8 +15306,10 @@ impl EffectGraphBuilder {
                     // Everything else leaves the declaration's own effect set
                     // unestablished, because the body it would have to read is
                     // not here.
-                    let established =
-                        declaration_only && complete && (covers_overrides || !key.has_receiver);
+                    let established = declaration_only
+                        && complete
+                        && (covers_overrides
+                            || !target_needs_override_claim(key.has_receiver, false));
                     let basis = if established {
                         EffectNodeBasis::CompleteSummary
                     } else {

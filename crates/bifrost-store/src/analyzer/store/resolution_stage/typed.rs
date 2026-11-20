@@ -10,6 +10,7 @@ use super::StageFamily;
 use super::codec;
 use super::lexical::semantic_cells as semantic_pair;
 use crate::CancellationToken;
+use crate::analyzer::resolution::fact_source::TypedFactInventoryEvidence;
 use crate::analyzer::resolution::*;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
@@ -1026,7 +1027,19 @@ fn decode_construction_requirement(
         row.get("kind")?,
     ))
 }
-fn decode_supertype(row: &Row<'_>) -> Result<LoweredSupertypeProperty> {
+fn decode_supertype(
+    row: &Row<'_>,
+    selection: &SelectedResolutionMountInventory<'_>,
+) -> Result<LoweredSupertypeProperty> {
+    let ordinal = SelectedResolutionMountOrdinal::new(row.get("host_ordinal")?);
+    let host = selection
+        .requested_mount_rows()
+        .known_record(ordinal)
+        .ok_or_else(|| {
+            StoreError::new(format!(
+                "staged supertype has no selected producer-language authority: {ordinal:?}"
+            ))
+        })?;
     let frontier = row_semantic(row, "frontier")?;
     let arguments: Vec<(Option<i64>, Option<i64>)> =
         serde_json::from_str(&row.get::<_, String>("applied_arguments")?).map_err(|error| {
@@ -1044,16 +1057,17 @@ fn decode_supertype(row: &Row<'_>) -> Result<LoweredSupertypeProperty> {
             LoweredDeclaredTypeArgument::new(frontier, position as u32, identity)
         })
         .collect::<Vec<_>>();
-    Ok(
-        LoweredSupertypeProperty::from(typed_rows::decode_supertype_fields(
+    Ok(LoweredSupertypeProperty::from_source(
+        typed_rows::decode_supertype_fields(
             row_semantic(row, "definition")?,
             row_semantic(row, "reference")?,
             frontier,
             row.get("kind")?,
             row.get("parent_ordinal")?,
-        ))
-        .with_source_arguments(&arguments),
+        ),
+        host.semantic_language(),
     )
+    .with_source_arguments(&arguments))
 }
 fn decode_property_gap(row: &Row<'_>) -> Result<LoweredDefinitionPropertyGap> {
     Ok(typed_rows::decode_definition_property_gap_fields(
@@ -1274,6 +1288,7 @@ pub(in crate::analyzer::store) fn visit_generic_type_alias_parameter_pages_for_d
 pub(in crate::analyzer::store) const VISIT_GENERIC_FORMAL_PAGES_FOR_OWNERS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_generic_formals fact ON fact.owner_definition_key IS request.value->>0 AND fact.owner_definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 pub(in crate::analyzer::store) const VISIT_GENERIC_FORMAL_DEFAULT_PAGES_FOR_OWNERS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_generic_formal_defaults fact ON fact.owner_definition_key IS request.value->>0 AND fact.owner_definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn visit_generic_formal_pages_for_owners(
     selection: &SelectedResolutionMountInventory<'_>,
     request: TypedFactRequest<'_, SemanticId>,
@@ -1293,6 +1308,7 @@ pub(in crate::analyzer::store) fn visit_generic_formal_pages_for_owners(
     )
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn visit_generic_formal_default_pages_for_owners(
     selection: &SelectedResolutionMountInventory<'_>,
     request: TypedFactRequest<'_, SemanticId>,
@@ -1571,7 +1587,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_definitions(
         &[&semantic_request_json(request)],
         cancellation,
         visitor,
-        decode_supertype,
+        |row| decode_supertype(row, selection),
         |_, _| {},
     )
 }
@@ -1591,7 +1607,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_references(
         &[&semantic_request_json(request)],
         cancellation,
         visitor,
-        decode_supertype,
+        |row| decode_supertype(row, selection),
         |_, _| {},
     )
 }
@@ -1611,7 +1627,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_frontiers(
         &[&semantic_request_json(request)],
         cancellation,
         visitor,
-        decode_supertype,
+        |row| decode_supertype(row, selection),
         |_, _| {},
     )
 }
@@ -1883,6 +1899,7 @@ pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_gap_reasons
 pub mod tests;
 
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn read_stage_rows<T>(
     required: &[StageFamily],
     selection: &SelectedResolutionMountInventory<'_>,
@@ -2288,7 +2305,10 @@ fn page_stage_answer<T>(
 ) -> Result<TypedFactReadOutcome> {
     let outcome = SelectedResolutionTypedSource::page_out(answer, cancellation, visitor)?;
     Ok(match outcome {
-        PageOutcome::Exhausted => TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete),
+        PageOutcome::Exhausted => TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+            .with_inventory_evidence(TypedFactInventoryEvidence::Established(
+                ResolutionCompletion::Complete,
+            )),
         PageOutcome::Stopped => TypedFactReadOutcome::stopped(evidence.finish_semantic().0),
         PageOutcome::Cancelled => TypedFactReadOutcome::cancelled(evidence.finish_semantic().0),
     })

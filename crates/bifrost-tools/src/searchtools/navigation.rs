@@ -473,6 +473,7 @@ pub(crate) fn search_symbols_with_cap(
     max_ranked_candidates: usize,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> SearchSymbolsResult {
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let _scope = profiling::scope("searchtools::search_symbols");
     // Matched declarations and their FQNs come from file reads that may be
     // incomplete (a C# `#if` branch that was never parsed can hold other

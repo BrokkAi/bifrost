@@ -20,6 +20,12 @@ pub enum PythonDirectScopeBindingKind {
     Other,
 }
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for PythonDirectScopeBindingKind {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 /// Whether `reference` reads a target introduced by an enclosing comprehension.
 ///
 /// Comprehensions create an implicit scope even at module level. The element

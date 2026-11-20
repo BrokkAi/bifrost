@@ -19,6 +19,8 @@ pub use brokk_bifrost_tools::{
 };
 
 pub mod analyzer_pool;
+mod call_path_query;
+pub mod flow_query;
 pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;

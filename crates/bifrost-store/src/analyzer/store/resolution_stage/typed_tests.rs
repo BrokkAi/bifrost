@@ -348,6 +348,10 @@ pub mod rust_root_test_support {
     use super::*;
 
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn begin_projection<'a>(
         selection: &'a SelectedResolutionMountInventory<'_>,
     ) -> &'a Connection {

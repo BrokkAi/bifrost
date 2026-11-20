@@ -78,6 +78,10 @@ pub(crate) struct SelectedMember {
     adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
     pub owner: String,
     extensibility: brokk_bifrost_core::analyzer::model::DispatchExtensibility,
+    /// The one declaration selected among same-keyed members of `owner`, when
+    /// selection narrowed them (#13916). Model consumers bind this record.
+    pub external_member_identity:
+        Option<brokk_bifrost_analysis::analyzer::resolution::ExternalMemberIdentity>,
 }
 
 impl SelectedMember {
@@ -88,7 +92,7 @@ impl SelectedMember {
     ) -> brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof {
         use brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof;
         use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
-        let mut proof = match self.extensibility {
+        let proof = match self.extensibility {
             DispatchExtensibility::Closed => ExactExternalCallProof::rust_bound_external_member(
                 &self.owner,
                 member,
@@ -98,6 +102,7 @@ impl SelectedMember {
                 ExactExternalCallProof::rust_trait_declaration(&self.owner, member, parameter_count)
             }
         };
+        let mut proof = proof.with_external_member_identity(self.external_member_identity.clone());
         proof.unadmitted_receiver_deref = self.unadmitted_receiver_deref;
         proof.receiver_adjustments = self.adjustments.clone();
         proof
@@ -134,10 +139,7 @@ pub(crate) fn select<'analyzer>(
     let scope = AnalyzerQueryScope::new(analyzer);
     let prepared = rust.prepared_syntax(scope.token(), file)?;
     if prepared.source() != source {
-        crate::analyzer::rust::std_types::operational_proof_stop(
-            "source_mismatch",
-            brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
-        );
+        crate::analyzer::rust::std_types::unavailable_proof_input("source_mismatch");
         return None;
     }
     let tree = prepared.tree();
@@ -183,6 +185,7 @@ pub(crate) fn select<'analyzer>(
             adjustments: Box::new([]),
             owner: owner.qualified_name.clone(),
             extensibility: DispatchExtensibility::Open,
+            external_member_identity: None,
         });
     }
     // Scope must be known before certifying even an inherent family: a
@@ -202,6 +205,9 @@ pub(crate) fn select<'analyzer>(
         let prelude = operation.rust_prelude_for_caller(file.rel_path(), cancellation)
         .unwrap_or_else(|error| {
             eprintln!("reading selected Rust trait prelude: {error}");
+            analyzer.record_query_incomplete(
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(error),
+            );
             crate::analyzer::rust::std_types::operational_proof_stop("store_error", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider);
             None
         })?;
@@ -375,9 +381,9 @@ pub(crate) fn select<'analyzer>(
                 Ok(is_trait) => is_trait,
                 Err(error) => {
                     eprintln!("reading source trait candidate {candidate:?}: {error:?}");
-                    crate::analyzer::rust::std_types::operational_proof_stop(
+                    crate::analyzer::rust::std_types::cargo_route_proof_stop(
                         "source_trait_scope_unknown",
-                        super::std_types::cargo_route_execution_cause(&error),
+                        &error,
                     );
                     return None;
                 }
@@ -509,12 +515,13 @@ pub(crate) fn select<'analyzer>(
             let memo = rust
                 .inner
                 .active_query_request_memo::<ModeledTraitOwnersMemo>()
-                .unwrap_or_default();
+                .unwrap_or_else(|| rust.inner.standalone_request_memo());
             // Include external imported and edition-prelude traits, not just
             // source_rivals. Declaration completeness (including the inherent
             // E0592 exemption) never bypasses this call-site competition check.
             let in_scope = memo
                 .owners(&overlay, analyzer, member)
+                .ok()?
                 .into_iter()
                 .filter(|candidate| {
                     visible(candidate)
@@ -525,9 +532,16 @@ pub(crate) fn select<'analyzer>(
                 .collect::<Vec<_>>();
             let mut has_inherent = false;
             let mut has_trait = false;
+            let mut applicable_records = Vec::new();
             for method in &family {
                 match applicability.member(method)?.implemented_trait.as_ref() {
-                    None => has_inherent = true,
+                    None => {
+                        has_inherent = true;
+                        applicable_records.push((
+                            method.provenance.pack_digest.as_str(),
+                            method.provenance.record_id.as_str(),
+                        ));
+                    }
                     Some(trait_type) => {
                         let trait_owner = applicability.owner(trait_type)?;
                         if in_scope
@@ -535,6 +549,10 @@ pub(crate) fn select<'analyzer>(
                             .any(|candidate| candidate.id == trait_owner.id)
                         {
                             has_trait = true;
+                            applicable_records.push((
+                                method.provenance.pack_digest.as_str(),
+                                method.provenance.record_id.as_str(),
+                            ));
                         }
                     }
                 }
@@ -548,9 +566,27 @@ pub(crate) fn select<'analyzer>(
                     || super::std_types::type_ref_mentions_type_parameter(&receiver_type))
             {
                 // Canonical ownership does not prove which instantiation's
-                // inherent impl applies. Today's packs omit that structural
-                // evidence; the shared gate refuses rather than guessing.
-                if brokk_bifrost_analysis::analyzer::semantic_model::overlay::rust_inherent_member_argument_independence(&receiver, member).is_err() {
+                // inherent impl applies. The shared gate refuses unless every
+                // same-named inherent member records a blanket impl block.
+                let mut inherent = Vec::new();
+                for method in &family {
+                    let fact = applicability.member(method)?;
+                    if fact.implemented_trait.is_none() {
+                        inherent.push((method, fact));
+                    }
+                }
+                use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+                    owner_declaration, rust_inherent_member_argument_independence,
+                };
+                if !owner_declaration(&active, &receiver).is_some_and(|declaration| {
+                    rust_inherent_member_argument_independence(
+                        &declaration,
+                        inherent
+                            .iter()
+                            .map(|(method, fact)| (method.as_ref(), fact.as_ref())),
+                    )
+                    .is_ok()
+                }) {
                     super::std_types::incomplete_proof("external_receiver_type_arguments_unknown");
                     return None;
                 }
@@ -640,6 +676,7 @@ pub(crate) fn select<'analyzer>(
                                 adjustments: adjustments.clone().into_boxed_slice(),
                                 owner: trait_.qualified_name.clone(),
                                 extensibility: DispatchExtensibility::Open,
+                                external_member_identity: None,
                             }
                         });
                     }
@@ -651,6 +688,61 @@ pub(crate) fn select<'analyzer>(
                     return None;
                 }
                 let matched = callable_on(&receiver);
+                // The same key can match an inherent item and same-named
+                // trait-impl members of this owner. An inherent associated item
+                // shadows trait items, and a trait item applies only with its
+                // trait in scope; an inherent item beside an in-scope trait item
+                // was refused above. When exactly one full-family record applies,
+                // select it, so that every model consumer binds that declaration
+                // rather than the whole key (#13916). The narrowed match must
+                // still prove itself: selection never certifies a record.
+                let selected = {
+                    let mut applicable = family.iter().filter(|record| {
+                        applicable_records.contains(&(
+                            record.provenance.pack_digest.as_str(),
+                            record.provenance.record_id.as_str(),
+                        ))
+                    });
+                    applicable
+                        .next()
+                        .filter(|_| family.len() > 1 && applicable.next().is_none())
+                }
+                .map(|record| {
+                    (
+                        record.provenance.pack_digest.clone(),
+                        record.provenance.record_id.clone(),
+                    )
+                });
+                let identity = selected.as_ref().and_then(|(pack_digest, record_id)| {
+                    // An owner whose rows may be missing cannot prove the
+                    // identity; without one no consumer could bind the
+                    // selected record, so the whole key is kept.
+                    brokk_bifrost_analysis::analyzer::store::active_models::external_member_identity_of_record(
+                        &active,
+                        &receiver.qualified_name,
+                        pack_digest,
+                        record_id,
+                    )
+                    .ok()
+                    .flatten()
+                });
+                let (matched, external_member_identity) = match (selected, identity) {
+                    (Some((pack_digest, record_id)), Some(identity)) => (
+                        overlay.callable_for_selected_application(
+                            SemanticModelCallableKey::new(
+                                "rust",
+                                &receiver.qualified_name,
+                                member,
+                                has_receiver,
+                                parameter_count,
+                            ),
+                            &application,
+                            Some((pack_digest.as_str(), record_id.as_str())),
+                        ),
+                        Some(identity),
+                    ),
+                    _ => (matched, None),
+                };
                 if receiver_steps > 0 && !adjustment_target_is_shared(&active, &matched) {
                     unadmitted_receiver_deref = true;
                     adjustments.clear();
@@ -663,6 +755,7 @@ pub(crate) fn select<'analyzer>(
                     adjustments: adjustments.clone().into_boxed_slice(),
                     owner: receiver.qualified_name.clone(),
                     extensibility,
+                    external_member_identity,
                 });
             }
             let mut dereferenced = &receiver_type;
@@ -783,6 +876,7 @@ pub(crate) fn select<'analyzer>(
                     } else {
                         DispatchExtensibility::Open
                     },
+                    external_member_identity: None,
                 })
             }
         }
@@ -831,7 +925,11 @@ fn adjustment_target_is_shared(
     !matched.records.is_empty()
         && matched.records.iter().all(|symbol| {
             let records = active.all_member_records_with_id(&symbol.id);
-            if records.open_for_language("rust").is_some() {
+            if let Some(open) = records.open_for_language("rust") {
+                let _cause = brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlay::record_open_proof(
+                    open,
+                    "model_shared_receiver_adjustment",
+                );
                 return false;
             }
             records

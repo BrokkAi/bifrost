@@ -5,6 +5,7 @@
 //! production evaluator actually retained rather than against a hand-built
 //! stand-in.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayStatus;
 use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::{
@@ -43,6 +44,10 @@ use super::why_not::{
 };
 
 use crate::inline_project::InlineTestProject;
+
+/// The status these explanations state. These tests check evidence projection,
+/// not semantic-model coverage.
+const NO_MODELS: &SemanticModelOverlayStatus = &SemanticModelOverlayStatus::NoModels;
 
 #[cfg(test)]
 mod typestate_contract_tests;
@@ -613,7 +618,7 @@ fn why_carries_every_retained_representative_row_with_its_exact_location() {
     let run = fixture.run(FORBID_READS_RELATIONAL);
     let id = only_finding(&run);
     let explanation =
-        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("explanation");
     let finding = &run.findings()[0];
 
     let assertion = explanation
@@ -703,8 +708,13 @@ fn why_joins_the_runs_unmet_obligations_for_the_same_assertion() {
     run.set_obligations(&[mine, other], false, 0, &PolicyBudget::default())
         .expect("the run accepts its obligations");
 
-    let explanation =
-        explain_finding(&run, &finding.id(), &ExplanationLimits::default()).expect("explanation");
+    let explanation = explain_finding(
+        &run,
+        &finding.id(),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("explanation");
     let obligations = child_labels(explanation.root(), ExplanationNodeKind::CoverageObligation);
     assert_eq!(
         obligations,
@@ -742,15 +752,22 @@ fn relational_why_explanations_serialize_byte_identically_across_runs() {
     let fixture = relational_fixture();
     let run = fixture.run(FORBID_READS_RELATIONAL);
     let id = only_finding(&run);
-    let first = explain_finding(&run, &id, &ExplanationLimits::default()).expect("first");
-    let second = explain_finding(&run, &id, &ExplanationLimits::default()).expect("second");
+    let first =
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("first");
+    let second =
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("second");
     assert_explanations_serialize_identically(&first, &second);
 
     let other_fixture = relational_fixture();
     let other_run = other_fixture.run(FORBID_READS_RELATIONAL);
     let other_id = only_finding(&other_run);
-    let third =
-        explain_finding(&other_run, &other_id, &ExplanationLimits::default()).expect("third");
+    let third = explain_finding(
+        &other_run,
+        &other_id,
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("third");
     assert_explanations_serialize_identically(&first, &third);
     assert_eq!(first.root().id(), third.root().id());
 }
@@ -1055,6 +1072,7 @@ fn the_host_explains_a_retained_finding_after_a_malformed_packs_document() {
         root,
         &inputs,
         &options,
+        &Default::default(),
         &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("normal evaluation diagnoses packs and continues");
@@ -1423,7 +1441,7 @@ fn why_explains_a_flow_finding_from_its_retained_witness_path() {
     let run = path_run(&fixture, FLOW_POLICY, FakePath::proved());
     assert_eq!(run.analysis_type(), PolicyAnalysisType::Flow);
     let id = only_finding(&run);
-    let explanation = explain_finding(&run, &id, &ExplanationLimits::default())
+    let explanation = explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default())
         .expect("the flow adapter answers");
 
     assert_eq!(explanation.format(), POLICY_EXPLANATION_FORMAT);
@@ -1508,7 +1526,7 @@ fn flow_why_reports_missing_evidence_as_unknown_obligations() {
     let run = path_run(&fixture, FLOW_POLICY, shape);
     let id = only_finding(&run);
     let explanation =
-        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("explanation");
 
     assert!(
         explanation
@@ -1583,7 +1601,7 @@ fn flow_why_states_an_absent_witness_rather_than_an_empty_path() {
     let run = path_run(&fixture, FLOW_POLICY, shape);
     let id = only_finding(&run);
     let explanation =
-        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("explanation");
 
     assert!(
         !explanation
@@ -1609,15 +1627,22 @@ fn flow_why_explanations_serialize_byte_identically_across_runs() {
     let fixture = Fixture::new();
     let run = path_run(&fixture, FLOW_POLICY, FakePath::proved());
     let id = only_finding(&run);
-    let first = explain_finding(&run, &id, &ExplanationLimits::default()).expect("first");
-    let second = explain_finding(&run, &id, &ExplanationLimits::default()).expect("second");
+    let first =
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("first");
+    let second =
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("second");
     assert_explanations_serialize_identically(&first, &second);
 
     let other_fixture = Fixture::new();
     let other_run = path_run(&other_fixture, FLOW_POLICY, FakePath::proved());
     let other_id = only_finding(&other_run);
-    let third =
-        explain_finding(&other_run, &other_id, &ExplanationLimits::default()).expect("third");
+    let third = explain_finding(
+        &other_run,
+        &other_id,
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("third");
     assert_explanations_serialize_identically(&first, &third);
     assert_eq!(first.root().id(), third.root().id());
 }
@@ -2475,8 +2500,13 @@ fn why_explains_a_typestate_finding_from_its_retained_protocol_witness() {
         },
     );
     let finding = &run.findings()[0];
-    let explanation = explain_finding(&run, &finding.id(), &ExplanationLimits::default())
-        .expect("a typestate finding is explainable from its retained evidence");
+    let explanation = explain_finding(
+        &run,
+        &finding.id(),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("a typestate finding is explainable from its retained evidence");
 
     assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Typestate);
     assert_eq!(explanation.root().label(), "typestate_finding");
@@ -2569,8 +2599,13 @@ fn why_names_the_event_and_states_of_a_violating_transition() {
         },
     );
     let finding = &run.findings()[0];
-    let explanation = explain_finding(&run, &finding.id(), &ExplanationLimits::default())
-        .expect("an error-transition finding is explainable");
+    let explanation = explain_finding(
+        &run,
+        &finding.id(),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("an error-transition finding is explainable");
 
     let transition = explanation
         .root()
@@ -2629,8 +2664,10 @@ fn typestate_why_explanations_serialize_byte_identically_across_runs() {
     let first = protocol_run(&fixture, shape);
     let second = protocol_run(&fixture, shape);
     let limits = ExplanationLimits::default();
-    let first = explain_finding(&first, &first.findings()[0].id(), &limits).expect("first");
-    let second = explain_finding(&second, &second.findings()[0].id(), &limits).expect("second");
+    let first =
+        explain_finding(&first, &first.findings()[0].id(), NO_MODELS, &limits).expect("first");
+    let second =
+        explain_finding(&second, &second.findings()[0].id(), NO_MODELS, &limits).expect("second");
     assert_explanations_serialize_identically(&first, &second);
 }
 
@@ -3136,7 +3173,7 @@ fn why_explains_a_relational_assertion_finding_from_retained_evidence() {
     let run = fixture.run(FORBID_READS_RELATIONAL);
     assert_eq!(run.analysis_type(), PolicyAnalysisType::Assertion);
     let id = only_finding(&run);
-    let explanation = explain_finding(&run, &id, &ExplanationLimits::default())
+    let explanation = explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default())
         .expect("the relational adapter answers why");
 
     assert_eq!(explanation.format(), POLICY_EXPLANATION_FORMAT);
@@ -3179,9 +3216,14 @@ fn the_node_limit_bounds_a_relational_why_answer() {
     let fixture = relational_fixture();
     let run = fixture.run(FORBID_READS_RELATIONAL);
     let id = only_finding(&run);
-    let full = explain_finding(&run, &id, &ExplanationLimits::default()).expect("full");
-    let bounded = explain_finding(&run, &id, &ExplanationLimits::default().with_max_nodes(2))
-        .expect("bounded");
+    let full = explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("full");
+    let bounded = explain_finding(
+        &run,
+        &id,
+        NO_MODELS,
+        &ExplanationLimits::default().with_max_nodes(2),
+    )
+    .expect("bounded");
     assert_node_limit_truncation(&full, &bounded, 2);
 }
 
@@ -3469,7 +3511,7 @@ fn flow_why_locations_all_trace_back_to_retained_finding_evidence() {
     let run = path_run(&fixture, FLOW_POLICY, shape);
     let id = only_finding(&run);
     let explanation =
-        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+        explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("explanation");
     let finding = &run.findings()[0];
     let PolicyFindingEvidence::Flow { evidence } = finding.evidence() else {
         panic!("a flow run retains flow evidence");
@@ -3532,7 +3574,7 @@ fn why_explains_a_taint_finding_in_the_security_vocabulary() {
     let run = path_run(&fixture, TAINT_POLICY, FakePath::proved());
     assert_eq!(run.analysis_type(), PolicyAnalysisType::Taint);
     let id = only_finding(&run);
-    let explanation = explain_finding(&run, &id, &ExplanationLimits::default())
+    let explanation = explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default())
         .expect("the taint adapter answers");
 
     assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Taint);
@@ -3566,9 +3608,14 @@ fn the_node_limit_bounds_a_flow_why_answer() {
     let fixture = Fixture::new();
     let run = path_run(&fixture, FLOW_POLICY, FakePath::proved());
     let id = only_finding(&run);
-    let full = explain_finding(&run, &id, &ExplanationLimits::default()).expect("full");
-    let bounded = explain_finding(&run, &id, &ExplanationLimits::default().with_max_nodes(3))
-        .expect("bounded");
+    let full = explain_finding(&run, &id, NO_MODELS, &ExplanationLimits::default()).expect("full");
+    let bounded = explain_finding(
+        &run,
+        &id,
+        NO_MODELS,
+        &ExplanationLimits::default().with_max_nodes(3),
+    )
+    .expect("bounded");
     assert_node_limit_truncation(&full, &bounded, 3);
 }
 

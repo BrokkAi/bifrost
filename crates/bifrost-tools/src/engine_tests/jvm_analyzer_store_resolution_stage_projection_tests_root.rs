@@ -64,6 +64,10 @@ mod jvm_extraction_tests {
     }).unwrap();
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bridge_repeat_uses_complete_descriptor_and_cancelled_dml_leaves_reader_reusable() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let selection = fixture.open_ready(&[]);
@@ -211,6 +215,10 @@ mod jvm_extraction_tests {
         assert_eq!(selection.mounts().unwrap().len(), 1);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_identity_lookup_preserves_late_shared_alias() {
         use brokk_bifrost_analysis::analyzer::resolution::local_identity::ResolutionSemanticIdentity;
 
@@ -272,6 +280,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn unsited_stage_reference_uses_payload_and_selected_owner() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);
         let selection = fixture.open_ready(&[]);
@@ -424,6 +436,10 @@ mod jvm_extraction_tests {
         assert_ne!(selection.candidate_coverage_fingerprint(), after);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordinary_candidate_identity_collision_is_rejected_before_stage_publication() {
         use brokk_bifrost_analysis::analyzer::resolution::batch::BatchResolutionFragmentSource;
 

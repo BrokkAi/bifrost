@@ -286,6 +286,10 @@ mod rust_departing_wave2_root_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_whole_workspace_point_retained_bytes_are_bounded_by_shared_name_cache() {
         fn statement_storage_release(
             reader: brokk_bifrost_analysis::analyzer::store::ReaderGuard<'_>,

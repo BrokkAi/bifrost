@@ -73,8 +73,8 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWor
 use brokk_bifrost_jvm::java::declarations::find_nearest_declaration_from_node;
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_from_node;
 use brokk_bifrost_jvm::java::graph_support::{
-    java_object_creation_enclosing_expression, java_type_parameter_bounds,
-    java_type_parameter_in_scope,
+    java_object_creation_enclosing_expression, java_qualified_this_qualifier,
+    java_type_parameter_bounds, java_type_parameter_in_scope,
 };
 use tree_sitter::Node;
 
@@ -108,6 +108,7 @@ pub(crate) struct JavaNativeDefinitionResolution {
 #[derive(Debug)]
 struct NativeExternalArgumentBinding {
     implicit_receiver: bool,
+    inherited_external_member: Option<brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedInheritedExternalMember>,
     completion: brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion,
     members: Vec<brokk_bifrost_analysis::analyzer::resolution::ExternalMemberIdentity>,
     reason_digests: Vec<(
@@ -120,6 +121,7 @@ struct NativeExternalArgumentBinding {
         brokk_bifrost_analysis::analyzer::resolution::ExternalOwnerIdentity,
         [u8; 32],
     )>,
+    obscuring_name_reason_digests: Vec<[u8; 32]>,
 }
 
 impl NativeExternalArgumentBinding {
@@ -195,6 +197,68 @@ enum JavaNativePointStop {
     Cancelled(ReceiverAnalysisWork),
 }
 
+// Keep nested grants stable for batch memo reuse while charging their work to
+// the enclosing point. A completed nested query may cross the aggregate limit.
+fn java_native_resolve_nested<T>(
+    query: BoundedReceiverQuery<'_>,
+    work: &mut ReceiverAnalysisWork,
+    resolve: impl FnOnce() -> BoundedResolution<T>,
+) -> Result<T, JavaNativePointStop> {
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    let limits = |work: ReceiverAnalysisWork| {
+        [
+            (
+                work.summary_expansions,
+                query.budget.max_summary_expansions,
+                ReceiverBudgetLimit::SummaryExpansions,
+            ),
+            (
+                work.resolution_rounds,
+                query.budget.max_resolution_rounds,
+                ReceiverBudgetLimit::ResolutionRounds,
+            ),
+            (
+                work.hierarchy_order_steps,
+                query.budget.max_hierarchy_order_work,
+                ReceiverBudgetLimit::HierarchyOrderSteps,
+            ),
+        ]
+    };
+    let exceeded = |limit, work| {
+        brokk_bifrost_analysis::analyzer::i_analyzer::join_execution_dependence(query.analyzer);
+        JavaNativePointStop::Exceeded(limit, work)
+    };
+    // Work up to a cap is allowed, and a nested query may need none of an
+    // axis the point has already used up, so only an actual overrun after
+    // adding the nested work stops the point.
+    let result = resolve();
+    let nested = match &result {
+        BoundedResolution::Complete { work, .. }
+        | BoundedResolution::Exceeded { work, .. }
+        | BoundedResolution::Unavailable { work, .. }
+        | BoundedResolution::Cancelled { work } => *work,
+    };
+    *work = work.saturating_add(nested);
+    match result {
+        BoundedResolution::Complete { value, .. } => {
+            if let Some((_, _, limit)) = limits(*work)
+                .into_iter()
+                .find(|(spent, cap, _)| spent > cap)
+            {
+                return Err(exceeded(limit, *work));
+            }
+            Ok(value)
+        }
+        BoundedResolution::Exceeded { limit, .. } => {
+            Err(JavaNativePointStop::Exceeded(limit, *work))
+        }
+        BoundedResolution::Unavailable { reason, .. } => {
+            Err(JavaNativePointStop::Unavailable(reason, *work))
+        }
+        BoundedResolution::Cancelled { .. } => Err(JavaNativePointStop::Cancelled(*work)),
+    }
+}
+
 pub(crate) fn resolve_java_definition_with_evidence_bounded(
     query: BoundedReceiverQuery<'_>,
     after_open: impl FnOnce(),
@@ -260,6 +324,8 @@ fn resolve_java_definition_with_evidence_uncached(
     after_open: impl FnOnce(),
 ) -> BoundedResolution<JavaNativeDefinitionResolution> {
     brokk_bifrost_analysis::analyzer::usages::get_definition::trace::begin_native_trace();
+    let trace_start =
+        brokk_bifrost_analysis::analyzer::usages::get_definition::trace::operation_start();
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(query.analyzer) else {
         return BoundedResolution::Complete {
             value: JavaNativeDefinitionResolution {
@@ -334,7 +400,12 @@ fn resolve_java_definition_with_evidence_uncached(
                 None
             };
             let Some(binding) = answer.argument_binding.as_ref() else {
-                return (None, boundary, fixed_source);
+                return (
+                    None,
+                    boundary,
+                    fixed_source,
+                    answer.java_qualified_super_proven,
+                );
             };
             let implicit_receiver = match answer.answer.binding().targets() {
                 [target] => answer.answer.proves_implicit_receiver(*target),
@@ -342,11 +413,13 @@ fn resolve_java_definition_with_evidence_uncached(
             };
             let binding = NativeExternalArgumentBinding {
                 implicit_receiver,
+                inherited_external_member: answer.java_inherited_external_member.clone(),
                 completion: binding.completion().clone(),
                 reason_digests: answer.argument_reason_digests.clone(),
                 static_type_qualifier_reason_digests: answer
                     .static_type_qualifier_reason_digests
                     .clone(),
+                obscuring_name_reason_digests: answer.obscuring_name_reason_digests.clone(),
                 call_binding_reason_digests: answer.call_binding_reason_digests.clone(),
                 constructor_hierarchy_reason_digests: answer
                     .constructor_hierarchy_reason_digests
@@ -357,11 +430,18 @@ fn resolve_java_definition_with_evidence_uncached(
                     .map(|member| member.identity.clone())
                     .collect(),
             };
-            (Some(binding), boundary, fixed_source)
+            (
+                Some(binding),
+                boundary,
+                fixed_source,
+                answer.java_qualified_super_proven,
+            )
         },
     );
-    let (resolution, (argument_binding, explicit_import_boundary, fixed_source)) = match resolution
-    {
+    let (
+        resolution,
+        (argument_binding, explicit_import_boundary, fixed_source, qualified_super_proven),
+    ) = match resolution {
         BoundedResolution::Complete {
             value: (outcome, projected),
             work,
@@ -392,7 +472,10 @@ fn resolve_java_definition_with_evidence_uncached(
         resolution,
     );
     match resolution {
-        BoundedResolution::Complete { mut value, work } => {
+        BoundedResolution::Complete {
+            mut value,
+            mut work,
+        } => {
             let mut call_binding_reason_digests = Vec::new();
             let mut evidence = match java_native_call_evidence(
                 java,
@@ -401,7 +484,10 @@ fn resolve_java_definition_with_evidence_uncached(
                 &external_static_imports,
                 argument_binding.as_ref(),
                 &mut call_binding_reason_digests,
+                &mut work,
                 batch,
+                trace_start,
+                qualified_super_proven,
             ) {
                 Ok(evidence) => evidence,
                 Err(JavaNativePointStop::Exceeded(limit, nested_work)) => {
@@ -747,6 +833,7 @@ enum JavaNativeReceiverForm {
     TypeQualifier,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_native_call_evidence(
     java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
@@ -754,7 +841,10 @@ fn java_native_call_evidence(
     external_static_imports: &[JavaExternalStaticImportBoundary],
     argument_binding: Option<&NativeExternalArgumentBinding>,
     call_binding_reason_digests: &mut Vec<[u8; 32]>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
+    trace_start: usize,
+    qualified_super_proven: bool,
 ) -> Result<CallEvidence, JavaNativePointStop> {
     if outcome.status == DefinitionLookupStatus::Unavailable {
         return Ok(CallEvidence::default());
@@ -763,6 +853,48 @@ fn java_native_call_evidence(
     let Some(call_site) = java_native_call_site(query) else {
         return Ok(evidence);
     };
+    if let JavaNativeCallSite::Method {
+        invocation,
+        receiver: Some(receiver),
+        ..
+    } = call_site
+    {
+        let invalid_receiver = if java_native_super_invocation(call_site) {
+            // Consume the exact selected receiver and concrete-overload proof.
+            // An unproved qualifier retains both its gap and trace refusal.
+            receiver.kind() != "super" && !qualified_super_proven
+        } else if let Some(qualifier) = java_qualified_this_qualifier(receiver) {
+            !java_native_qualified_this_is_enclosing(
+                java, query, invocation, qualifier, work, batch,
+            )?
+        } else {
+            false
+        };
+        if invalid_receiver {
+            // The selected answer is refused; the trace must not keep selecting it.
+            brokk_bifrost_analysis::analyzer::usages::get_definition::trace::reject_selected_answer_since(
+                trace_start,
+                outcome,
+                brokk_bifrost_core::analyzer::structural::resolution::RejectionReason::NotInScopeAtPosition,
+            );
+            outcome.status = DefinitionLookupStatus::Incomplete;
+            outcome.definitions.clear();
+            outcome.lexical_definition = None;
+            outcome.selected_sites.clear();
+            outcome.modeled_definitions.clear();
+            outcome.inventory_evidence = None;
+            outcome.incomplete_evidence = None;
+            outcome.reference = Some(query.site.clone());
+            outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                kind: "java_qualified_receiver_incomplete".into(),
+                message:
+                    "the qualified receiver has no unique supported enclosing-instance identity"
+                        .into(),
+                claim: None,
+            });
+            return Ok(evidence);
+        }
+    }
     let scope = AnalyzerQueryScope::new(query.analyzer);
     let token = scope.token();
     if let JavaNativeCallSite::Constructor {
@@ -772,7 +904,7 @@ fn java_native_call_evidence(
         && outcome.definitions.is_empty()
         && outcome.lexical_definition.is_none()
     {
-        let type_name = java_native_constructor_type_name(query, creation, type_node);
+        let type_name = java_native_constructor_type_name(query, creation, type_node, work, batch)?;
         if type_name.is_none()
             && java_object_creation_enclosing_expression(creation, type_node).is_some()
             && outcome.definitions.is_empty()
@@ -790,8 +922,8 @@ fn java_native_call_evidence(
         }
         let (actual_types, creation_arguments) = if type_name.is_some() {
             (
-                java_native_call_argument_types(java, query, token, creation, batch)?,
-                java_native_creation_type_arguments(query, creation, batch)?,
+                java_native_call_argument_types(java, query, token, creation, work, batch)?,
+                java_native_creation_type_arguments(query, creation, work, batch)?,
             )
         } else {
             (None, None)
@@ -881,7 +1013,7 @@ fn java_native_call_evidence(
                 return Ok(evidence);
             };
             let Some(actual_types) =
-                java_native_call_argument_types(java, query, token, invocation, batch)?
+                java_native_call_argument_types(java, query, token, invocation, work, batch)?
             else {
                 return Ok(evidence);
             };
@@ -889,6 +1021,7 @@ fn java_native_call_evidence(
             let mut receiver_call_reasons = Vec::new();
             let mut receiver_discharges = Vec::new();
             let receiver_type = receiver
+                .filter(|_| !qualified_super_proven)
                 .map(|receiver| {
                     java_native_external_receiver(
                         java,
@@ -898,12 +1031,34 @@ fn java_native_call_evidence(
                         invocation,
                         &mut receiver_call_reasons,
                         &mut receiver_discharges,
+                        work,
                         batch,
                     )
                 })
                 .transpose()?;
 
-            let external_call = if receiver.is_some() {
+            let inherited_external_member =
+                (matches!(receiver_type, Some(JavaNativeReceiverResolution::Typed))
+                    && receiver.is_some_and(|receiver| {
+                        !matches!(receiver.kind(), "this" | "super")
+                            && java_qualified_this_qualifier(receiver).is_none()
+                    })
+                    && !java_native_super_invocation(call_site))
+                .then(|| argument_binding?.inherited_external_member.as_ref())
+                .flatten()
+                .filter(|receipt| receipt.member_name == member_name);
+            let external_call = if let Some(receipt) = inherited_external_member {
+                java_native_external_method_resolution(
+                    java,
+                    query,
+                    token,
+                    &receipt.identity.owner.owner_fqn,
+                    member_name,
+                    &actual_types,
+                    JavaNativeReceiverForm::BoundValue,
+                    None,
+                )
+            } else if receiver.is_some() {
                 match receiver_type.as_ref() {
                     Some(
                         JavaNativeReceiverResolution::External {
@@ -926,6 +1081,26 @@ fn java_native_call_evidence(
                         *form,
                         arguments.as_deref(),
                     ),
+                    // JLS 10.7: the array's public Object members. `clone` is
+                    // the array's own public method (result type is the array
+                    // type) and `length` is a field; neither is Object's, so
+                    // they stay unresolved rather than binding Object.clone.
+                    Some(JavaNativeReceiverResolution::Array) => {
+                        brokk_bifrost_jvm::intrinsics::array_receiver_member_root(Language::Java)
+                            .filter(|_| member_name != "clone")
+                            .and_then(|root| {
+                                java_native_external_method_resolution(
+                                    java,
+                                    query,
+                                    token,
+                                    root,
+                                    member_name,
+                                    &actual_types,
+                                    JavaNativeReceiverForm::BoundValue,
+                                    None,
+                                )
+                            })
+                    }
                     Some(
                         JavaNativeReceiverResolution::Typed | JavaNativeReceiverResolution::Untyped,
                     )
@@ -961,7 +1136,11 @@ fn java_native_call_evidence(
             let external_call = external_call.or_else(|| {
                 // This canonical value comes from selected external inventory
                 // rows, not from parsing the call's source text.
-                if receiver.is_some_and(|receiver| !matches!(receiver.kind(), "this" | "super"))
+                if (!qualified_super_proven
+                    && receiver.is_some_and(|receiver| {
+                        !matches!(receiver.kind(), "this" | "super")
+                            && java_qualified_this_qualifier(receiver).is_none()
+                    }))
                     || !native_external_member_inventory_selected(outcome)
                 {
                     return None;
@@ -1006,6 +1185,25 @@ fn java_native_call_evidence(
                         mut proof,
                         dispatch_closed,
                     } => {
+                        // #11379: lookup routes a candidate, but only the exact
+                        // external invocation and this answer's admission can
+                        // publish it. Never turn source typing into Object typing.
+                        if let Some(receipt) = inherited_external_member {
+                            if proof.external_member_identity() != Some(&receipt.identity)
+                                || !argument_binding.is_some_and(|binding| {
+                                    binding.admits(
+                                        &proof,
+                                        &owner,
+                                        &member,
+                                        &receiver_call_reasons,
+                                        &receiver_discharges,
+                                    )
+                                })
+                            {
+                                return Ok(evidence);
+                            }
+                            proof.declaration_is_abstract = receipt.declaration_is_abstract;
+                        }
                         if matches!(
                             receiver_type.as_ref(),
                             Some(JavaNativeReceiverResolution::External {
@@ -1014,6 +1212,16 @@ fn java_native_call_evidence(
                             })
                         ) && let Some(binding) = argument_binding
                         {
+                            // JLS 6.5.2: a static-imported field may obscure
+                            // this type name. No member proof on the type
+                            // decides that, so the exact call stays unpublished.
+                            if !binding.obscuring_name_reason_digests.is_empty() {
+                                publish_java_external_incomplete_member_identity(
+                                    query, outcome, &owner, &member,
+                                );
+                                return Ok(evidence
+                                    .with_native_java_external_member_identity(&owner, &member));
+                            }
                             // The qualifier is a type, not a value whose declared
                             // type may be a supertype of the actual member owner.
                             // Only the exact declaring model identity can close it.
@@ -1091,7 +1299,11 @@ fn java_native_call_evidence(
                             *proof,
                             &owner,
                             &member,
-                            dispatch_closed || java_native_super_invocation(call_site),
+                            // The inherited-member bridge adds no nonvirtual
+                            // proof, but a selected final member keeps its own.
+                            dispatch_closed
+                                || (inherited_external_member.is_none()
+                                    && java_native_super_invocation(call_site)),
                         );
                     }
                     JavaNativeExternalInvocation::Witnessed => {
@@ -1116,7 +1328,9 @@ fn java_native_call_evidence(
                 publish_java_unmodeled_receiver_boundary(query, outcome, member_name);
             }
             if let Some(receiver) = receiver {
-                publish_java_imported_bound_boundary(java, query, token, receiver, outcome);
+                publish_java_imported_bound_boundary(
+                    java, query, token, receiver, outcome, work, batch,
+                )?;
             }
         }
         JavaNativeCallSite::Constructor { .. } => {}
@@ -1150,45 +1364,48 @@ fn publish_java_imported_bound_boundary(
     token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     receiver: Node<'_>,
     outcome: &mut DefinitionLookupOutcome,
-) {
+    work: &mut ReceiverAnalysisWork,
+    batch: Option<&NativePointBatch>,
+) -> Result<(), JavaNativePointStop> {
     if receiver.kind() != "identifier"
         || !outcome
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.kind == "jvm-import-owner-open")
     {
-        return;
+        return Ok(());
     }
     let Some(name) = node_text_for_query(receiver, query.source) else {
-        return;
+        return Ok(());
     };
     let Some(declaration) = find_nearest_declaration_from_node(receiver, name, query.source) else {
-        return;
+        return Ok(());
     };
     let Some(root) = query.tree.map(|tree| tree.root_node()) else {
-        return;
+        return Ok(());
     };
     let Some(node) = root
         .named_descendant_for_byte_range(declaration.range.start_byte, declaration.range.end_byte)
     else {
-        return;
+        return Ok(());
     };
     let declaration = node
         .parent()
         .filter(|parent| parent.kind() == "variable_declarator")
         .unwrap_or(node);
     let Some(type_node) = crate::analyzer::java::declared_type_node(declaration) else {
-        return;
+        return Ok(());
     };
     let Some(type_name) = java_type_name_from_node(type_node, query.source) else {
-        return;
+        return Ok(());
     };
     // A parameter declared directly with a single-type import has an import
     // owner even when that owner's members are not indexed (JLS 7.5.1).
     // Keep this distinct from an unbounded type parameter or a call result,
     // neither of which proves an imported owner.
     if let Some(site) = java_constructor_type_terminal(type_node)
-        && let Some(value) = java_native_expression_value_type_at_node(query, site)
+        && let Some(value) =
+            java_native_expression_value_type_at_node_in_batch(query, site, work, batch)?
         && value
             .value_types
             .types
@@ -1203,10 +1420,10 @@ fn publish_java_imported_bound_boundary(
         && value.value_types.types.iter().all(|ty| ty.fqn == canonical)
     {
         outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
-        return;
+        return Ok(());
     }
     let Some(parameter) = java_type_parameter_in_scope(type_node, query.source, &type_name) else {
-        return;
+        return Ok(());
     };
     // Select each bound's own route: another bound's gap cannot establish
     // that this spelling uses an import instead of a lexical source type.
@@ -1217,7 +1434,9 @@ fn publish_java_imported_bound_boundary(
         let Some(site) = java_constructor_type_terminal(bound) else {
             continue;
         };
-        let Some(bound_value) = java_native_expression_value_type_at_node(query, site) else {
+        let Some(bound_value) =
+            java_native_expression_value_type_at_node_in_batch(query, site, work, batch)?
+        else {
             continue;
         };
         if bound_value
@@ -1255,6 +1474,7 @@ fn publish_java_imported_bound_boundary(
             )),
         });
     }
+    Ok(())
 }
 
 fn java_native_source_call_evidence(
@@ -1329,6 +1549,98 @@ fn java_native_source_call_evidence(
     )
 }
 
+fn java_native_qualified_this_is_enclosing(
+    java: &JavaAnalyzer,
+    query: BoundedReceiverQuery<'_>,
+    invocation: Node<'_>,
+    qualifier: Node<'_>,
+    work: &mut ReceiverAnalysisWork,
+    batch: Option<&NativePointBatch>,
+) -> Result<bool, JavaNativePointStop> {
+    use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+
+    let Some(site_node) = java_native_receiver_type_site_node(qualifier) else {
+        return Ok(false);
+    };
+    let Some(site) = java_native_reference_site_at_node(query, site_node) else {
+        return Ok(false);
+    };
+    let qualifier_query = BoundedReceiverQuery {
+        site: &site,
+        ..query
+    };
+    // A value-type projection erases type parameters to their bounds. Check
+    // the selected declaration itself: a type parameter cannot name an
+    // enclosing instance even when its bound is that enclosing class.
+    let selected = java_native_resolve_nested(query, work, || {
+        brokk_bifrost_analysis::analyzer::usages::get_definition::trace::without_recording(|| {
+            brokk_bifrost_analysis::analyzer::native_points::resolve_native_definition_bounded_in_batch(
+                &java.inner,
+                qualifier_query,
+                Some(ResolutionNamespace::Type),
+                batch,
+                |operation, path, cancellation| {
+                    prepare_context(java, query.analyzer, operation, path, cancellation)
+                },
+                || {},
+            )
+        })
+    })?;
+    let [selected_class] = selected.definitions.as_slice() else {
+        return Ok(false);
+    };
+    if selected.status != DefinitionLookupStatus::Resolved
+        || selected.lexical_definition.is_some()
+        || !selected.modeled_definitions.is_empty()
+        || !selected_class.is_class()
+        || selected_class.source() != query.file
+    {
+        return Ok(false);
+    }
+    // Q.this names an enclosing instance only when every scope between the
+    // call and Q is an instance scope (JLS 8.1.3, 15.8.4). A static method,
+    // static initializer or static field initializer, or a nested type that is
+    // static (explicitly, or implicitly as an enum, record or interface), has
+    // no enclosing Q instance.
+    let classes = java.class_range_index(query.file);
+    let mut ancestor = invocation.parent();
+    while let Some(node) = ancestor {
+        if brokk_bifrost_jvm::java::callable_shape::java_callable_shape(node)
+            .is_some_and(|(_, _, is_static)| is_static)
+        {
+            return Ok(false);
+        }
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "interface_declaration"
+                | "annotation_type_declaration"
+        ) {
+            let Some(unit) = classes.unit_for_exact_span(node.start_byte(), node.end_byte()) else {
+                return Ok(false);
+            };
+            if unit == selected_class {
+                return Ok(true);
+            }
+            // A class declared in an interface or annotation body is
+            // implicitly static (JLS 9.5).
+            let static_member_type = node.kind() != "class_declaration"
+                || brokk_bifrost_jvm::java::declarations::java_modifier_keywords(node)
+                    .any(|keyword| keyword == "static")
+                || node.parent().is_some_and(|body| {
+                    matches!(body.kind(), "interface_body" | "annotation_type_body")
+                });
+            if static_member_type {
+                return Ok(false);
+            }
+        }
+        ancestor = node.parent();
+    }
+    Ok(false)
+}
+
 fn java_native_super_invocation(call_site: JavaNativeCallSite<'_>) -> bool {
     matches!(call_site, JavaNativeCallSite::Method { invocation, .. }
         if brokk_bifrost_jvm::java::graph_support::java_callable_receiver_origin(invocation)
@@ -1387,6 +1699,7 @@ fn java_native_external_receiver(
     enclosing_call: Node<'_>,
     receiver_call_reasons: &mut Vec<[u8; 32]>,
     receiver_discharges: &mut Vec<[u8; 32]>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<JavaNativeReceiverResolution, JavaNativePointStop> {
     let from_site_type = java_native_external_receiver_from_site_type(
@@ -1397,6 +1710,7 @@ fn java_native_external_receiver(
         enclosing_call,
         receiver_call_reasons,
         receiver_discharges,
+        work,
         batch,
     )?;
 
@@ -1500,6 +1814,7 @@ fn java_native_external_receiver_from_site_type(
 
     receiver_call_reasons: &mut Vec<[u8; 32]>,
     receiver_discharges: &mut Vec<[u8; 32]>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<JavaNativeReceiverResolution, JavaNativePointStop> {
     if receiver.kind() == "method_invocation" {
@@ -1511,6 +1826,7 @@ fn java_native_external_receiver_from_site_type(
                 receiver,
                 receiver_call_reasons,
                 receiver_discharges,
+                work,
                 batch,
             )? {
                 Some(TypeRef::Named {
@@ -1535,7 +1851,9 @@ fn java_native_external_receiver_from_site_type(
             },
         );
     }
-    if matches!(receiver.kind(), "this" | "super") {
+    if matches!(receiver.kind(), "this" | "super")
+        || java_qualified_this_qualifier(receiver).is_some()
+    {
         return Ok(JavaNativeReceiverResolution::Typed);
     }
     let mut receiver_expression = receiver;
@@ -1557,13 +1875,13 @@ fn java_native_external_receiver_from_site_type(
             .any(|child| child.kind() == "class_body")
         && let Some(type_node) = receiver_expression.child_by_field_name("type")
         && let Some(type_name) =
-            java_native_constructor_type_name(query, receiver_expression, type_node)
+            java_native_constructor_type_name(query, receiver_expression, type_node, work, batch)?
         && java_native_external_type(java, query, token, &type_name).is_some()
     {
         let actuals =
-            java_native_call_argument_types(java, query, token, receiver_expression, batch)?;
+            java_native_call_argument_types(java, query, token, receiver_expression, work, batch)?;
         let creation_arguments =
-            java_native_creation_type_arguments(query, receiver_expression, batch)?;
+            java_native_creation_type_arguments(query, receiver_expression, work, batch)?;
         let binding = java_native_external_constructor_proof(
             java,
             query,
@@ -1604,7 +1922,8 @@ fn java_native_external_receiver_from_site_type(
         return Ok(JavaNativeReceiverResolution::Untyped);
     };
 
-    let Some(value) = java_native_expression_value_type_at_node_in_batch(query, site_node, batch)?
+    let Some(value) =
+        java_native_expression_value_type_at_node_in_batch(query, site_node, work, batch)?
     else {
         return Ok(JavaNativeReceiverResolution::Untyped);
     };
@@ -1626,7 +1945,9 @@ fn java_native_external_receiver_from_site_type(
             name, arguments, ..
         }) = static_type
         else {
-            return if matches!(static_type, Some(TypeRef::Declared { .. })) {
+            return if matches!(static_type, Some(TypeRef::Array { .. })) {
+                JavaNativeReceiverResolution::Array
+            } else if matches!(static_type, Some(TypeRef::Declared { .. })) {
                 JavaNativeReceiverResolution::Typed
             } else {
                 JavaNativeReceiverResolution::Untyped
@@ -1671,18 +1992,25 @@ fn java_native_reference_site_at_node(
     })
 }
 
+#[cfg(test)]
 fn java_native_expression_value_type_at_node(
     query: BoundedReceiverQuery<'_>,
     node: Node<'_>,
 ) -> Option<NativeExpressionValueTypeLookup> {
-    java_native_expression_value_type_at_node_in_batch(query, node, None)
-        .ok()
-        .flatten()
+    java_native_expression_value_type_at_node_in_batch(
+        query,
+        node,
+        &mut ReceiverAnalysisWork::default(),
+        None,
+    )
+    .ok()
+    .flatten()
 }
 
 fn java_native_expression_value_type_at_node_in_batch(
     query: BoundedReceiverQuery<'_>,
     node: Node<'_>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<Option<NativeExpressionValueTypeLookup>, JavaNativePointStop> {
     let Some(site) = java_native_reference_site_at_node(query, node) else {
@@ -1693,7 +2021,7 @@ fn java_native_expression_value_type_at_node_in_batch(
         ..query
     };
     let resolve = || resolve_java_expression_value_type_in_batch(type_query, batch, || {});
-    let result = match batch {
+    java_native_resolve_nested(query, work, || match batch {
         Some(batch) => match resolve_analyzer::<JavaAnalyzer>(query.analyzer) {
             Some(java) => batch.expression(
                 &java.inner,
@@ -1704,17 +2032,8 @@ fn java_native_expression_value_type_at_node_in_batch(
             None => resolve(),
         },
         None => resolve(),
-    };
-    match result {
-        BoundedResolution::Complete { value, .. } => Ok(Some(value)),
-        BoundedResolution::Exceeded { limit, work } => {
-            Err(JavaNativePointStop::Exceeded(limit, work))
-        }
-        BoundedResolution::Unavailable { reason, work } => {
-            Err(JavaNativePointStop::Unavailable(reason, work))
-        }
-        BoundedResolution::Cancelled { work } => Err(JavaNativePointStop::Cancelled(work)),
-    }
+    })
+    .map(Some)
 }
 
 fn java_native_receiver_type_site_node(mut receiver: Node<'_>) -> Option<Node<'_>> {
@@ -1723,6 +2042,7 @@ fn java_native_receiver_type_site_node(mut receiver: Node<'_>) -> Option<Node<'_
     }
     match receiver.kind() {
         "identifier" | "type_identifier" | "scoped_type_identifier" => Some(receiver),
+        "scoped_identifier" => receiver.child_by_field_name("name"),
         // The expression-value resolver indexes references by source range;
         // a cast's target reference is the selected site for its value type.
         "cast_expression" => {
@@ -1752,6 +2072,9 @@ enum JavaNativeReceiverResolution {
         arguments: Option<Vec<TypeRef>>,
     },
     Typed,
+    /// An array-typed value (JLS 10.7). Its members come from the language's
+    /// array member root, except `clone` and `length`, which are array rules.
+    Array,
     Untyped,
 }
 
@@ -1769,7 +2092,8 @@ fn java_native_external_type(
         spelling,
         selected
             .as_ref()
-            .and_then(|evidence| evidence.artifact_sha256.as_deref()),
+            .and_then(|evidence| evidence.single_raw_sha256())
+            .as_deref(),
     )? {
         JavaTypeResolution::External(external) => Some(external.into_type()),
         JavaTypeResolution::Source(_) => None,
@@ -1787,7 +2111,8 @@ fn java_native_static_external_type(
     let selected = java.selected_jdk_artifact_for_file(query.analyzer, query.file);
     let surface = match selected
         .as_ref()
-        .and_then(|evidence| evidence.artifact_sha256.as_deref())
+        .and_then(|evidence| evidence.single_raw_sha256())
+        .as_deref()
     {
         Some(digest) => java.external_declarations_for_source_jdk(
             query.analyzer.semantic_model_overlay_read().published(),
@@ -1797,7 +2122,8 @@ fn java_native_static_external_type(
             java.external_declarations(query.analyzer.semantic_model_overlay_read().published())
         }
     };
-    surface.get(&QueryGapRecorder::new(java), fqn)
+    let recorder = QueryGapRecorder::new(java);
+    surface.or_record_miss(&recorder, surface.get(&recorder, fqn))
 }
 
 enum JavaNativeExternalInvocation {
@@ -1840,7 +2166,8 @@ fn java_native_external_method_resolution(
         &canonical,
         selected
             .as_ref()
-            .and_then(|evidence| evidence.artifact_sha256.as_deref()),
+            .and_then(|evidence| evidence.single_raw_sha256())
+            .as_deref(),
     )?;
     // The written receiver can inherit this member from another declaring owner.
     // Canonical declaration identity and bound-receiver dispatch are independent.
@@ -1853,7 +2180,8 @@ fn java_native_external_method_resolution(
     }
     let surface = match selected
         .as_ref()
-        .and_then(|artifact| artifact.artifact_sha256.as_deref())
+        .and_then(|artifact| artifact.single_raw_sha256())
+        .as_deref()
     {
         Some(digest) => java.external_declarations_for_source_jdk(
             query.analyzer.semantic_model_overlay_read().published(),
@@ -1937,7 +2265,9 @@ fn java_native_external_method_resolution(
             }),
     )
     .with_source_jdk_artifact(selected.filter(|artifact| {
-        artifact.artifact_sha256.as_deref() == resolved.jdk_artifact_sha256()
+        resolved
+            .jdk_artifact_sha256()
+            .is_some_and(|digest| artifact.contains_raw_sha256(digest))
             && resolved.jdk_artifact_sha256().is_some()
     }));
     let mut proof = proof;
@@ -1951,14 +2281,20 @@ fn java_native_external_method_resolution(
     proof.type_argument_bindings = owner_bindings.as_ref().and_then(|bindings| {
         resolved.selected_type_argument_bindings(bound_receiver, actual_types, &surface, bindings)
     });
-    let dispatch_closed = resolved
-        .non_overridable_for_argument_types(
-            bound_receiver,
-            actual_types,
-            Some(&surface),
-            owner_bindings.as_ref(),
-        )
-        .is_some();
+    // #10572: a final written receiver class has exactly one runtime class, so
+    // the uniquely selected instance member (declared or inherited, already
+    // resolved subtype-first from `query_owner`) has one effective target. The
+    // selection above supplies the unique applicable member.
+    let final_receiver = bound_receiver && surface.is_final_receiver_class(query_owner);
+    let dispatch_closed = final_receiver
+        || resolved
+            .non_overridable_for_argument_types(
+                bound_receiver,
+                actual_types,
+                Some(&surface),
+                owner_bindings.as_ref(),
+            )
+            .is_some();
     Some(JavaNativeExternalMethodResolution {
         model_member_selection: None,
         owner: owner.to_owned(),
@@ -2006,6 +2342,7 @@ fn java_native_call_argument_types(
     query: BoundedReceiverQuery<'_>,
     token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     call: Node<'_>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<Option<Vec<TypeRef>>, JavaNativePointStop> {
     let Some(arguments) = call.child_by_field_name("arguments") else {
@@ -2020,7 +2357,7 @@ fn java_native_call_argument_types(
             .named_children(&mut cursor)
             .filter(|argument| !argument.is_extra())
             .map(|argument| {
-                java_native_argument_type(java, query, token, argument, batch)
+                java_native_argument_type(java, query, token, argument, work, batch)
                     .map(|ty| ty.unwrap_or(TypeRef::Unknown))
             })
             .collect::<Result<Vec<_>, _>>()?,
@@ -2065,9 +2402,16 @@ pub(crate) fn java_native_model_argument_type(
         cancellation: cancellation.as_ref(),
     };
     let scope = AnalyzerQueryScope::new(java);
-    java_native_argument_type(java, query, scope.token(), expression, None)
-        .ok()
-        .flatten()
+    java_native_argument_type(
+        java,
+        query,
+        scope.token(),
+        expression,
+        &mut ReceiverAnalysisWork::default(),
+        None,
+    )
+    .ok()
+    .flatten()
 }
 
 fn java_native_argument_type(
@@ -2075,6 +2419,7 @@ fn java_native_argument_type(
     query: BoundedReceiverQuery<'_>,
     _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
     expression: Node<'_>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<Option<TypeRef>, JavaNativePointStop> {
     java_native_argument_type_with_call_reasons(
@@ -2084,6 +2429,7 @@ fn java_native_argument_type(
         expression,
         &mut Vec::new(),
         &mut Vec::new(),
+        work,
         batch,
     )
 }
@@ -2097,6 +2443,7 @@ fn java_native_creation_constructor_refused(
     !exact_external_call && !has_definition && !has_lexical_definition && !has_modeled_definition
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_native_argument_type_with_call_reasons(
     _java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
@@ -2104,6 +2451,7 @@ fn java_native_argument_type_with_call_reasons(
     mut expression: Node<'_>,
     call_binding_reason_digests: &mut Vec<[u8; 32]>,
     grounded_discharges: &mut Vec<[u8; 32]>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<Option<TypeRef>, JavaNativePointStop> {
     let mut stopped = None;
@@ -2145,7 +2493,7 @@ fn java_native_argument_type_with_call_reasons(
             }
 
             let creation_arguments = if expression.kind() == "object_creation_expression" {
-                match java_native_creation_type_arguments(query, expression, batch) {
+                match java_native_creation_type_arguments(query, expression, work, batch) {
                     Ok(arguments) => arguments,
                     Err(stop) => {
                         stopped = Some(stop);
@@ -2174,8 +2522,10 @@ fn java_native_argument_type_with_call_reasons(
                 budget: query.budget,
                 cancellation: query.cancellation,
             };
-            match resolve_java_definition_with_evidence_in_batch(call_query, batch, || {}) {
-                BoundedResolution::Complete { value, .. } => {
+            match java_native_resolve_nested(query, work, || {
+                resolve_java_definition_with_evidence_in_batch(call_query, batch, || {})
+            }) {
+                Ok(value) => {
                     if expression.kind() == "object_creation_expression"
                         && java_native_creation_constructor_refused(
                             value.evidence.exact_external_call().is_some(),
@@ -2261,16 +2611,8 @@ fn java_native_argument_type_with_call_reasons(
                         };
                     }
                 }
-                BoundedResolution::Exceeded { limit, work } => {
-                    stopped = Some(JavaNativePointStop::Exceeded(limit, work));
-                    return None;
-                }
-                BoundedResolution::Unavailable { reason, work } => {
-                    stopped = Some(JavaNativePointStop::Unavailable(reason, work));
-                    return None;
-                }
-                BoundedResolution::Cancelled { work } => {
-                    stopped = Some(JavaNativePointStop::Cancelled(work));
+                Err(stop) => {
+                    stopped = Some(stop);
                     return None;
                 }
             }
@@ -2279,6 +2621,7 @@ fn java_native_argument_type_with_call_reasons(
             let site = java_native_reference_site_at_node(query, callee)?;
             let argument_query = BoundedReceiverQuery {
                 site: &site,
+
                 ..query
             };
             let resolve = || {
@@ -2293,7 +2636,7 @@ fn java_native_argument_type_with_call_reasons(
             || {},
         )
             };
-            let result = match batch {
+            let result = java_native_resolve_nested(query, work, || match batch {
                 Some(batch) => batch.expression(
                     &_java.inner,
                     argument_query,
@@ -2301,25 +2644,17 @@ fn java_native_argument_type_with_call_reasons(
                     resolve,
                 ),
                 None => resolve(),
-            };
+            });
             return match result {
-                BoundedResolution::Complete { value, .. } => value.static_type,
-                BoundedResolution::Exceeded { limit, work } => {
-                    stopped = Some(JavaNativePointStop::Exceeded(limit, work));
-                    None
-                }
-                BoundedResolution::Unavailable { reason, work } => {
-                    stopped = Some(JavaNativePointStop::Unavailable(reason, work));
-                    None
-                }
-                BoundedResolution::Cancelled { work } => {
-                    stopped = Some(JavaNativePointStop::Cancelled(work));
+                Ok(value) => value.static_type,
+                Err(stop) => {
+                    stopped = Some(stop);
                     None
                 }
             };
         }
         let site = java_native_receiver_type_site_node(expression).unwrap_or(expression);
-        match java_native_expression_value_type_at_node_in_batch(query, site, batch) {
+        match java_native_expression_value_type_at_node_in_batch(query, site, work, batch) {
             Ok(value) => value?.static_type,
             Err(stop) => {
                 stopped = Some(stop);
@@ -2369,25 +2704,36 @@ fn java_native_constructor_type_name(
     query: BoundedReceiverQuery<'_>,
     creation: Node<'_>,
     type_node: Node<'_>,
-) -> Option<String> {
-    let type_name = java_type_name_from_node(type_node, query.source)?;
+    work: &mut ReceiverAnalysisWork,
+    batch: Option<&NativePointBatch>,
+) -> Result<Option<String>, JavaNativePointStop> {
+    let Some(type_name) = java_type_name_from_node(type_node, query.source) else {
+        return Ok(None);
+    };
     // A qualified creation selects the inner type of the enclosing instance,
     // never a same-named import in the caller's lexical scope.
     if let Some(enclosing) = java_object_creation_enclosing_expression(creation, type_node) {
-        let site = java_native_receiver_type_site_node(enclosing)?;
-        let value = java_native_expression_value_type_at_node(query, site)?.value_types;
+        let Some(site) = java_native_receiver_type_site_node(enclosing) else {
+            return Ok(None);
+        };
+        let Some(value) =
+            java_native_expression_value_type_at_node_in_batch(query, site, work, batch)?
+        else {
+            return Ok(None);
+        };
+        let value = value.value_types;
         if value.status
             != brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved
             || value.target_kind != TypeLookupTargetKind::ValueExpression
         {
-            return None;
+            return Ok(None);
         }
         let [owner] = value.types.as_slice() else {
-            return None;
+            return Ok(None);
         };
-        Some(format!("{}.{type_name}", owner.fqn))
+        Ok(Some(format!("{}.{type_name}", owner.fqn)))
     } else {
-        Some(type_name)
+        Ok(Some(type_name))
     }
 }
 
@@ -2396,6 +2742,7 @@ fn java_native_constructor_type_name(
 fn java_native_creation_type_arguments(
     query: BoundedReceiverQuery<'_>,
     creation: Node<'_>,
+    work: &mut ReceiverAnalysisWork,
     batch: Option<&NativePointBatch>,
 ) -> Result<Option<Vec<TypeRef>>, JavaNativePointStop> {
     let Some(ty) = creation.child_by_field_name("type") else {
@@ -2416,7 +2763,7 @@ fn java_native_creation_type_arguments(
     // A stopped lookup is reported to the caller, never read as a creation
     // without arguments.
     Ok(
-        match java_native_expression_value_type_at_node_in_batch(query, site, batch)?
+        match java_native_expression_value_type_at_node_in_batch(query, site, work, batch)?
             .and_then(|value| value.static_type)
         {
             Some(TypeRef::Named { arguments, .. }) if !arguments.is_empty() => Some(arguments),
@@ -2912,54 +3259,51 @@ pub(super) fn observed_value_type(
     })
 }
 
-/// Base Java import contexts that this request's point operations built.
-/// Every point opens its own selected operation, so without reuse a policy run
-/// rebuilt one file's base context once per point (#8127). The memo is
-/// request-scoped (it dies with the analyzer's query read cache) and bounded by
-/// retained bytes, so it never grows with the workspace.
-struct JavaImportContextSnapshots {
-    #[cfg(test)]
-    restores: std::sync::atomic::AtomicUsize,
-    entries: moka::sync::Cache<
-        brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshotKey,
-        std::sync::Arc<PublishedJavaImportContext>,
-    >,
+brokk_bifrost_core::domain_memo_set! {
+    /// Base Java import contexts that this request's point operations built.
+    /// Every point opens its own selected operation, so without reuse a policy run
+    /// rebuilt one file's base context once per point (#8127). The memo is
+    /// request-scoped (it dies with the analyzer's query read cache) and bounded by
+    /// retained bytes, so it never grows with the workspace.
+    struct JavaImportContextSnapshots {
+        entries: brokk_bifrost_core::domain_memo::ReplayingRegion<
+            RequestImportContextKey,
+            PublishedJavaImportContext,
+        >,
+        ; test_only { restores: std::sync::atomic::AtomicUsize }
+    }
+}
+
+/// A snapshot's key within the outer request that built it. Overlapping
+/// requests on one analyzer share the query's memo registry, and a build that
+/// read a request-pinned JVM selection holds only for the request that pinned
+/// it (#14322), so another request never restores it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RequestImportContextKey {
+    request: u64,
+    key: brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshotKey,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for RequestImportContextKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<u64>() + self.key.retained_bytes()
+    }
 }
 
 /// A published snapshot with the read receipt of the cold build that made it.
+/// A hit replays the receipt, once, when the snapshot restores.
 struct PublishedJavaImportContext {
     snapshot:
         brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshot,
     receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
 }
+impl brokk_bifrost_core::domain_memo::ReplayEntry for PublishedJavaImportContext {}
 
-impl PublishedJavaImportContext {
+impl brokk_bifrost_core::retention_budget::RetainedBytes for PublishedJavaImportContext {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
+        std::mem::size_of_val(self) - std::mem::size_of_val(&self.receipt)
             + self.snapshot.retained_bytes()
-            + std::mem::size_of_val(&self.receipt)
-    }
-}
-
-/// Retained bytes per request. One base context retains roughly tens to a few
-/// hundred KiB, and a policy run demands about one per Java file it reads.
-const JAVA_IMPORT_CONTEXT_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
-
-impl Default for JavaImportContextSnapshots {
-    fn default() -> Self {
-        Self {
-            #[cfg(test)]
-            restores: std::sync::atomic::AtomicUsize::new(0),
-            entries: moka::sync::Cache::builder()
-                .max_capacity(JAVA_IMPORT_CONTEXT_SNAPSHOT_BYTES)
-                .weigher(
-                    |key: &brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JvmImportContextSnapshotKey,
-                     published: &std::sync::Arc<PublishedJavaImportContext>| {
-                    u32::try_from(key.retained_bytes() + published.retained_bytes())
-                        .unwrap_or(u32::MAX)
-                })
-                .build(),
-        }
+            + self.receipt.allocated_bytes()
     }
 }
 
@@ -2974,14 +3318,18 @@ fn java_import_context(
     path: &str,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> brokk_bifrost_analysis::analyzer::store::Result<JavaImportContext> {
-    let Some(snapshots) = java
-        .inner
-        .active_query_request_memo::<JavaImportContextSnapshots>()
-    else {
+    let (Some(snapshots), Some(request)) = (
+        java.inner
+            .active_query_request_memo::<JavaImportContextSnapshots>(),
+        brokk_bifrost_analysis::analyzer::i_analyzer::current_outer_request(),
+    ) else {
         return operation.java_import_context(path, cancellation);
     };
-    let key = operation.jvm_import_context_snapshot_key(Language::Java, path);
-    if let Some(published) = snapshots.entries.get(&key) {
+    let key = RequestImportContextKey {
+        request: request.id(),
+        key: operation.jvm_import_context_snapshot_key(Language::Java, path),
+    };
+    if let Some(published) = snapshots.entries.peek(&key) {
         match operation.restore_jvm_import_context_snapshot(&published.snapshot)? {
             Ok(context) => {
                 #[cfg(test)]
@@ -3002,14 +3350,17 @@ fn java_import_context(
     let (context, snapshot) = built?;
     match snapshot {
         // A build that depended on budget, cancellation or a provider failure
-        // is never retained (#8184).
-        Ok(_) if receipt.has_execution_dependences() => {
+        // is never retained (#8184). A request-pinned input holds for this
+        // request's memo, and a hit replays the whole receipt (#14322).
+        Ok(_) if !receipt.request_memo_admissible() => {
             operation.profile_jvm_import_context_snapshot(("publish", "execution_dependent"));
         }
         Ok(snapshot) => {
-            snapshots.entries.insert(
-                key,
-                std::sync::Arc::new(PublishedJavaImportContext { snapshot, receipt }),
+            // A refused or closed region leaves the build request-only.
+            drop(
+                snapshots
+                    .entries
+                    .insert(key, PublishedJavaImportContext { snapshot, receipt }),
             );
             operation.profile_jvm_import_context_snapshot("published");
         }

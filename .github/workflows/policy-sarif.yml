@@ -116,10 +116,14 @@ jobs:
         uses: ./.github/actions/policy-scan
         with:
           version: local
-          # Content qualification is owned by bifrost-packs. This historical
-          # immutable pin fails explicitly until a qualified compatible tuple
-          # is selected; engine publication does not qualify external content.
-          packs-source: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.1.1","manifest_sha256":"6f188826fe5b4918967100d8c0816c8b230a13d4a47300497d2294390a112388","semantic_manifest_sha256":"f28356cb17e85d84de3432de837f2d045e554e6d3d8d1f08018015e4960446d8"}'
+          # Content qualification is owned by bifrost-packs; engine publication
+          # does not qualify external content. This immutable pin selects rules
+          # 0.15.0 and its exact dependency packs 0.14.0, each digest being the
+          # SHA-256 of that release's pack-release.json asset. When an engine
+          # change stops admitting it, the scan fails explicitly with
+          # incompatible-strict-selection: re-pin to the newest release pair
+          # the engine admits, reading both digests from the release assets.
+          packs-source: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.15.0","manifest_sha256":"c286b91a04e0eb38f067a00d88a3508d8ce0259895fae75b8409a0e6e82009c5","semantic_manifest_sha256":"e88bda17ea9fac57137ee89b704d032dedd12ca3631633b0c682d94b18f99d75"}'
           policy-timings: true
           artifact-name: bifrost-code-smells-report
           category: bifrost-code-smells

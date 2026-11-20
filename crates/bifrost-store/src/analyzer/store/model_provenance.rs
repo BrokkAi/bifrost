@@ -109,7 +109,8 @@ pub fn provenance_with_visits<E>(
         rule_id: None,
         origin: origin(shard, locator),
         activation: SemanticModelActivationProvenance {
-            approximate: shard.approximate,
+            approximate: shard.approximate(),
+            approximation: shard.approximation,
             status: "active".to_string(),
             reason: activation
                 .map(|explanation| explanation.reason.clone())
@@ -118,7 +119,9 @@ pub fn provenance_with_visits<E>(
             source_id: shard.source_id.clone(),
             matched_evidence: matched_evidence(&shard.matched_evidence),
         },
-        proof: if shard.matched_evidence.artifact_sha256.is_some() {
+        proof: if !shard.matched_evidence.verified_raw_artifacts.is_empty()
+            || shard.matched_evidence.production_input_digest.is_some()
+        {
             SemanticModelProof::ExactArtifact
         } else {
             SemanticModelProof::PackFact
@@ -136,7 +139,7 @@ pub fn origin(
     locator: Option<&Locator>,
 ) -> SemanticModelOriginKind {
     // Approximate activation carries positive pack facts, never verified origin.
-    if shard.approximate {
+    if shard.approximate() {
         return SemanticModelOriginKind::DeclarativeModel;
     }
     match shard.source_kind {

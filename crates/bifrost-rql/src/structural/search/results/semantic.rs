@@ -1295,8 +1295,7 @@ pub struct CodeQueryGuard {
     /// The guard's own display anchor: the condition's decision point.
     pub range: CodeQueryRange,
     pub point: CodeQueryProgramPointRef,
-    /// `constant_boolean`, `null_comparison`, `constant_equality`,
-    /// `ordered_integer_comparison`, `instance_of`, `has_member`, or `opaque`.
+    /// The normalized predicate label published by the semantic IR.
     pub predicate: &'static str,
     /// For a constant condition, the value it always takes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1309,16 +1308,24 @@ pub struct CodeQueryGuard {
     /// to `null_on_true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub null_target_id: Option<String>,
-    /// For a comparison against a constant, whether the comparison is an
-    /// inequality rather than an equality.
+    /// Whether an equality comparison is negated, for either a constant or
+    /// two exact value reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equality_negated: Option<bool>,
-    /// The ordered relation between the subject and `constant_value`.
+    /// The ordered relation between the subject and `constant_value`, or
+    /// between the left and right operands of a value-ordering guard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integer_relation: Option<&'static str>,
     /// The procedure-local value ID of the constant in a constant comparison.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constant_value: Option<u64>,
+    /// The exact procedure-local left operand of a value-equality or
+    /// value-ordering comparison, before any normalization of its relation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_value: Option<u64>,
+    /// The exact procedure-local right operand of a value comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_value: Option<u64>,
     /// The procedure-local value constrained by an instance/member predicate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guarded_value: Option<u64>,
@@ -1332,7 +1339,8 @@ pub struct CodeQueryGuard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opaque_digest: Option<u64>,
     /// The procedure-local value the condition tests, when the predicate names
-    /// one. Absent for a constant condition, which tests nothing.
+    /// one. Constant conditions test no value; general comparisons instead
+    /// name both operands in `left_value` and `right_value`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject_value: Option<u64>,
     /// The successor taken when the condition holds; equal to a `control_edge`

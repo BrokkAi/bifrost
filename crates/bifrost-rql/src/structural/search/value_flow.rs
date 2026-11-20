@@ -91,6 +91,9 @@ enum ValueFlowEngine {
     Composition,
 }
 
+#[cfg(test)]
+thread_local! { pub(super) static DISABLE_WITNESS_RETENTION_13525: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 thread_local! { static FORCE_ICFG_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 thread_local! { static FRESH_ICFG_RESULTS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
@@ -309,6 +312,12 @@ impl ValueFlowQueryState {
                     limits.max_retained_bytes,
                 )
                 .expect("validated CodeQuery value-flow retention limits are positive");
+                #[cfg(test)]
+                let retention = if DISABLE_WITNESS_RETENTION_13525.get() {
+                    WitnessRetentionLimits::disabled()
+                } else {
+                    retention
+                };
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
                 let solved = match solve_value_flow_with_witnesses(
@@ -379,7 +388,7 @@ impl ValueFlowQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted,
-                            Incompleteness::Operational(DerivationExecutionCause::Provider),
+                            Incompleteness::Operational(DerivationExecutionCause::Budget),
                             exceeded.to_string(),
                         );
                     }
@@ -815,13 +824,21 @@ impl ValueFlowQueryState {
                 limits.max_witness_expansions.min(remaining_expansions),
             )
             .expect("positive remaining CodeQuery value-flow witness budget");
-            let Ok(witness) = alternative.analysis.result.witness_for_meeting(
-                &alternative.meeting,
-                quality,
-                reconstruction,
-            ) else {
-                continue;
-            };
+            // Every error here is an invariant breach (#13525), never input: RQL always
+            // enables retention (RetentionDisabled); the meeting comes from this result
+            // (TargetNotInResult); `quality` comes from the meeting's own path_qualities,
+            // so the result retained it (QualityNotRetained); and InvalidEvidence checks
+            // internal topology. Byte-capped retention returns Ok with a truncation
+            // marker. If this ever asks for a quality the meeting did not retain,
+            // QualityNotRetained becomes a typed truncation instead, as in the taint
+            // engine (bifrost-flow taint/finding.rs).
+            let witness = alternative
+                .analysis
+                .result
+                .witness_for_meeting(&alternative.meeting, quality, reconstruction)
+                .unwrap_or_else(|error| {
+                    panic!("value-flow witness reconstruction invariant failed: {error:?}")
+                });
             self.work.witness_expansions = self
                 .work
                 .witness_expansions
@@ -862,7 +879,7 @@ impl ValueFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
-                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    Incompleteness::Operational(DerivationExecutionCause::Budget),
                     format!(
                         "value-flow witness projection omitted at least {removed_steps} step(s)"
                     ),
@@ -880,7 +897,7 @@ impl ValueFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
-                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    Incompleteness::Operational(DerivationExecutionCause::Budget),
                     format!(
                         "value-flow witness reconstruction or retention omitted at least {} step(s)",
                         witness.omitted_steps_lower_bound()
@@ -947,7 +964,7 @@ impl ValueFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::PipelineBudgetExhausted,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            Incompleteness::Operational(DerivationExecutionCause::Budget),
             format!(
                 "value-flow endpoint projection omitted at least {omitted_lower_bound} endpoint(s)"
             ),
@@ -964,7 +981,7 @@ impl ValueFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            Incompleteness::Operational(DerivationExecutionCause::Budget),
             format!(
                 "value-flow request witness budget omitted at least {omitted_lower_bound} witness(es)"
             ),
@@ -987,7 +1004,7 @@ impl ValueFlowQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    Incompleteness::Operational(DerivationExecutionCause::Budget),
                     format!("value-flow semantic input exceeded its budget: {exceeded}"),
                 );
             }
@@ -1035,7 +1052,7 @@ impl ValueFlowQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             code,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            super::context_error_incompleteness(&error),
             error.to_string(),
         );
     }
@@ -1058,6 +1075,11 @@ impl ValueFlowQueryState {
 }
 
 impl SemanticFlowEndpointValue {
+    /// Witness alternatives retain their analysis plan's artifact handles.
+    pub(super) fn retains_semantic_artifact(&self) -> bool {
+        !self.alternatives.is_empty()
+    }
+
     /// Equal IDs denote one source/sink proposition. Retain every distinct
     /// derivation with its own analysis owner for later witness reconstruction.
     pub(super) fn merge_evidence(&mut self, other: Self) {

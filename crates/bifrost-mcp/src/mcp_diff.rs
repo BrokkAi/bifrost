@@ -7,7 +7,6 @@ pub const DIFF_TOOL_NAMES: &[&str] = &[
     "cyclomatic_complexity",
     "list_function_sources",
     "missing_tests",
-    "relation_brief",
     "score_diff",
 ];
 
@@ -70,15 +69,6 @@ pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
             "missing_tests",
             "Find introduced or behavior-changed production functions for which Bifrost can establish no structured call path from test-context code. The blast-radius file graph is used only to bound each changed file's reverse importer closure; batched exact, location-anchored usage scans then follow enclosing callers within that reduced set. A complete exhausted search appears in `missing_functions`. Cancelled, incomplete, unresolved, ambiguous, or unproven searches appear in `indeterminate_functions` and are never promoted to a confident negative. Deleted functions, pure moves, and test-context functions are omitted. This is static structured reachability, not runtime coverage. Endpoint resolution is identical to analyze_diff, including the default worktree comparison and first-parent default for an explicit commit target.",
             endpoint_schema(json!({})),
-        ),
-        tool_descriptor(
-            "relation_brief",
-            "Build a reviewer relation brief with Affected callers, Paths (two-hop incoming use chains and changed outgoing calls), and Value flow sections. Every relation has target-snapshot path:line anchors and at least one anchor outside changed lines. Typed completeness accompanies subjects and relations. Deleted declarations are listed separately as not scanned; their presence makes caller and path sections incomplete. Value flow is not computed in this version. Selection alternates between sections; within a section, round-robin across changed symbols in diff order; omitted counts and incomplete scan notes remain visible. Defaults of 25 items and 7000 characters come from BrokkAi/mjolnir b1aed1fe review-arms/brief/WRITER.md and brief_driver.py. Endpoint resolution follows analyze_diff.",
-            endpoint_schema(json!({
-                "include_tests": {"type": "boolean", "default": false},
-                "max_items": {"type": "integer", "default": 25, "minimum": 1, "maximum": 200},
-                "max_chars": {"type": "integer", "default": 7000, "minimum": 1000, "maximum": 100000}
-            })),
         ),
         tool_descriptor(
             "score_diff",

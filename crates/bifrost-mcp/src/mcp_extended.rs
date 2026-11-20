@@ -22,6 +22,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "list_policies",
     "run_policy",
     "explain_policy",
+    "flow_query",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "most_relevant_files",
@@ -71,6 +72,49 @@ fn explain_policy_candidate_schema(description: &str) -> Value {
         "required": ["path", "byte_start"],
         "additionalProperties": false,
         "description": description
+    })
+}
+
+/// One `flow_query` point: a file, a position and an optional role.
+fn flow_query_point_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_RUN_POLICY_PATH_BYTES,
+                "description": "Workspace-relative path of the point's file."
+            },
+            "line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based line. Give with column, or give byte_offset."
+            },
+            "column": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based column counting characters. Give with line."
+            },
+            "byte_offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Byte offset into the file. Use this or line with column."
+            },
+            "role": {
+                "type": "string",
+                "enum": ["value", "call", "binding", "argument", "receiver", "return"],
+                "default": "value",
+                "description": "What the point is. A produced value (value, call result, return, binding) is observed after its effects; an argument or receiver is observed before the call."
+            },
+            "argument_index": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based argument position. Only with role argument."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
     })
 }
 
@@ -1410,7 +1454,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                  separately budgeted search that the policy's own seed scope bounds. Every answer \
                  states the `workspace_generation` it was produced under; pass that value back as \
                  `workspace_generation` to be refused rather than answered once the workspace has \
-                 moved on.",
+                 moved on. Every answer carries `semantic_models`; unless ready or no_models, the root is `unknown`.",
                 brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT,
                 brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT,
                 analysis_type_list(brokk_bifrost_policy::WHY_ADAPTER_ANALYSIS_TYPES),
@@ -1537,6 +1581,43 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     { "required": ["policy_categories"] },
                     { "required": ["policy_ids"] }
                 ],
+                "additionalProperties": false
+            }),
+        ),
+        tool_descriptor(
+            "flow_query",
+            "Answer a flow or reachability question between program points selected by file and position. \
+             `value_flow` asks whether the value at one point reaches another: one `from` with one or \
+             more `to` candidates, or several `from` candidates with one `to`. `control_path` asks for a \
+             control path between two points of one procedure. `call_path` asks whether the callable of \
+             `from` reaches the call at `to` through static calls; that answer has granularity `callable` \
+             and says nothing about order from the selected position. Each pair answers `reached` with the \
+             engine's witness, `not_reached` only from a complete search, or `incomplete` with the engine's \
+             typed reasons. A point that does not select exactly one program point, or a question the \
+             engine does not serve, returns `unsupported` with a typed reason. An absent path is not proof \
+             when the answer is incomplete.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "enum": ["value_flow", "control_path", "call_path"],
+                        "description": "The question to answer."
+                    },
+                    "from": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": flow_query_point_schema(),
+                        "description": "Origin points. One, except for value_flow with several candidate sources."
+                    },
+                    "to": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": flow_query_point_schema(),
+                        "description": "Destination points. One, except for value_flow with several candidate sinks."
+                    }
+                },
+                "required": ["question", "from", "to"],
                 "additionalProperties": false
             }),
         ),

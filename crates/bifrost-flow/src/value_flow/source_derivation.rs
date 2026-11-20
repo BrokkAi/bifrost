@@ -628,6 +628,11 @@ fn derive_selected_procedure(
             return Ok(());
         }
     };
+    // The derivation result cannot carry the walk's verdict, so it joins the
+    // current captures, where the walk's ambient marks went.
+    analyzer.analyzer().join_reuse_verdict(
+        crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(&closure),
+    );
     result.work.closure_procedures = closure.procedures.len();
     result.work.skipped_procedures = closure.skipped.len();
     result.work.closure_truncated = closure.truncated;

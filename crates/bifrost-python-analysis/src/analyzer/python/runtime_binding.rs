@@ -748,7 +748,7 @@ fn resolve_profile_graph(
     if artifacts.iter().any(|candidate| candidate != &artifact) {
         return Err("profile mixes artifact identities".into());
     }
-    if selected.artifact_sha256.as_deref() != Some(artifact.archive_sha256())
+    if !selected.contains_raw_sha256(artifact.archive_sha256())
         || !selected_package_matches(selected, artifact.purl())
     {
         return Err(
@@ -1867,7 +1867,8 @@ mod tests {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: Some(RAW_SHA256.to_owned()),
+            production_input_digest: None,
+verified_raw_artifacts: (Some(RAW_SHA256.to_owned())).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::PythonSource, &sha256)).collect(),
         }
     }
 
@@ -1908,6 +1909,7 @@ mod tests {
             .expect("validated fixture registers");
         let evidence = exact_evidence();
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![evidence.clone()],
@@ -2882,7 +2884,7 @@ mod tests {
     fn wrong_raw_digest_is_missing_model_before_profile_carrier_inspection() {
         let (active, evidence) = activate_fixture(|_| {});
         let mut wrong = evidence;
-        wrong.artifact_sha256 = Some("b".repeat(64));
+        wrong.verified_raw_artifacts[0].sha256 = [0xbb; 32];
         assert!(matches!(
             lookup(&active, &wrong, "parse"),
             Err(PythonRuntimeBindingError::MissingModel(_))

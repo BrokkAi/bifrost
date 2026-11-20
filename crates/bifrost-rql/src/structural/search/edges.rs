@@ -407,6 +407,7 @@ impl EdgeTraversalCache {
                         ),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                     }));
                 }
                 EdgeIncompleteReason::NoStructuralAdapter
@@ -420,17 +421,20 @@ impl EdgeTraversalCache {
                 | EdgeIncompleteReason::ForwardMetadataIncomplete
                 | EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
                 | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                | EdgeIncompleteReason::InverseIndexOpenSite(_)
                 | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding
                 | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
                 | EdgeIncompleteReason::InverseIndexMetadataIncomplete
                 | EdgeIncompleteReason::InverseIndexTargetUncovered
                 | EdgeIncompleteReason::TimeBudgetExceeded
+                | EdgeIncompleteReason::ReceiverBudgetExhausted
                 | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => {
                     let cause = match reason {
                         EdgeIncompleteReason::Cancelled => {
                             Some(DerivationExecutionCause::Cancelled)
                         }
                         EdgeIncompleteReason::TimeBudgetExceeded
+                        | EdgeIncompleteReason::ReceiverBudgetExhausted
                         | EdgeIncompleteReason::UsageListingTruncated => {
                             Some(DerivationExecutionCause::Budget)
                         }
@@ -462,6 +466,7 @@ impl EdgeTraversalCache {
                         ),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                     }), cause));
                 }
             }
@@ -513,6 +518,7 @@ impl EdgeTraversalCache {
                     newly_reported_global.iter(),
                 ),
                 withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }));
         }
         if !subject_local.is_empty() {
@@ -544,6 +550,7 @@ impl EdgeTraversalCache {
                         subject_local.iter(),
                     ),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
             }
         }
@@ -558,6 +565,7 @@ enum SelectedGlobalIncompleteReason {
     Resolution,
     Metadata,
     TimeBudget,
+    ReceiverBudget,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -573,7 +581,8 @@ fn selected_global_reason(reason: &EdgeIncompleteReason) -> Option<SelectedGloba
         EdgeIncompleteReason::InverseIndexResolutionIncomplete => {
             Some(SelectedGlobalIncompleteReason::Resolution)
         }
-        EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
+        EdgeIncompleteReason::InverseIndexOpenSite(_)
+        | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
             Some(SelectedGlobalIncompleteReason::Resolution)
         }
         EdgeIncompleteReason::InverseIndexMetadataIncomplete => {
@@ -581,6 +590,9 @@ fn selected_global_reason(reason: &EdgeIncompleteReason) -> Option<SelectedGloba
         }
         EdgeIncompleteReason::TimeBudgetExceeded => {
             Some(SelectedGlobalIncompleteReason::TimeBudget)
+        }
+        EdgeIncompleteReason::ReceiverBudgetExhausted => {
+            Some(SelectedGlobalIncompleteReason::ReceiverBudget)
         }
         EdgeIncompleteReason::NoStructuralAdapter
         | EdgeIncompleteReason::UsageListingTruncated
@@ -630,6 +642,9 @@ fn incomplete_reason_label(reason: &EdgeIncompleteReason) -> String {
         EdgeIncompleteReason::InverseIndexResolutionIncomplete => {
             "selected inverse index resolution was incomplete".to_string()
         }
+        EdgeIncompleteReason::InverseIndexOpenSite(site) => {
+            format!("selected inverse index inventory is open at {site}")
+        }
         EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
             "selected inverse edge has outstanding query obligations".to_string()
         }
@@ -641,6 +656,9 @@ fn incomplete_reason_label(reason: &EdgeIncompleteReason) -> String {
         }
         EdgeIncompleteReason::TimeBudgetExceeded => {
             "selected inverse query exceeded its time budget".to_string()
+        }
+        EdgeIncompleteReason::ReceiverBudgetExhausted => {
+            "selected inverse query exhausted its receiver-analysis budget before confirming every candidate site".to_string()
         }
         EdgeIncompleteReason::InverseIndexTargetUncovered => {
             "the declaration was outside the selected inverse index".to_string()

@@ -22,6 +22,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::analyzer::store::StoreError;
 use brokk_bifrost_core::profiling;
 
 use crate::analyzer::semantic::cfg_algorithms::{
@@ -43,9 +44,9 @@ use crate::analyzer::semantic::{
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{AnalyzerQueryScope, ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::{
-    DataflowRequest, PathQuality, SolverBudget, SolverBudgetExceeded, SolverTermination,
-    SolverWork, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
-    WitnessRetentionLimits,
+    DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, SolverBudgetExceeded,
+    SolverTermination, SolverWork, SummaryWitness, SummaryWitnessError,
+    WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
@@ -372,9 +373,11 @@ impl RootIncompleteEvidence {
     /// on: the root is complete exactly when its solve reached a fixed point
     /// and no plan refinement stopped short. A provider failure on the root
     /// never reaches interpretation (the plan build fails first), and
-    /// cancellation and solver-budget exhaustion both terminate the solver
-    /// before a fixed point. Boundary-only incompleteness -- an open dispatch
-    /// arm, a callee the closure never mounted, the closure procedure cap --
+    /// solver-budget exhaustion terminates the solver before a fixed point.
+    /// Discovery cancellation remains operational even if the solver reaches
+    /// a fixed point over its retained inputs. Boundary-only incompleteness --
+    /// an open dispatch arm, a callee the closure never mounted, the closure
+    /// procedure cap --
     /// still terminates at a fixed point and is expressed per sink through
     /// the Unknown reasons, never through this predicate.
     pub fn complete(&self) -> bool {
@@ -470,6 +473,8 @@ pub enum TypeFlowError {
     Plan(TypeFlowPlanError),
     Solve(ValueFlowSolveError),
     Io(std::io::Error),
+    /// An operational failure of this request, never a reusable input fact.
+    Store(StoreError),
     Cancelled,
 }
 
@@ -507,12 +512,27 @@ impl fmt::Display for TypeFlowError {
             Self::Plan(error) => error.fmt(formatter),
             Self::Solve(error) => write!(formatter, "type-flow solve failed: {error}"),
             Self::Io(error) => write!(formatter, "type-flow workspace enumeration failed: {error}"),
+            Self::Store(error) => write!(
+                formatter,
+                "type-flow store failure ({:?}): {error}",
+                error.kind()
+            ),
             Self::Cancelled => formatter.write_str("type-flow solve was cancelled"),
         }
     }
 }
 
-impl Error for TypeFlowError {}
+impl Error for TypeFlowError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Plan(error) => Some(error),
+            Self::Solve(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::Cancelled => None,
+        }
+    }
+}
 
 impl From<TypeFlowPlanError> for TypeFlowError {
     fn from(error: TypeFlowPlanError) -> Self {
@@ -588,232 +608,270 @@ pub fn solve_type_flow_for_root_with_refinements(
         workspace.analyzer(),
         active_semantic_model_snapshot.clone(),
     );
-    let _cancellation_scope =
+    let cancellation_scope =
         AnalyzerQueryScope::with_cancellation(workspace.analyzer(), request.cancellation);
-    let mut dispatch_hints = DispatchHints::empty();
-    /// The last complete feedback iteration, kept with the plan that produced
-    /// it. Receiver hints reach the solve only by changing the plan the next
-    /// iteration builds, so an iteration that rebuilds the same plan cannot
-    /// reach a different result.
-    struct CompletedIteration {
-        result: TypeFlowRootResult,
-        plan: TypeFlowPlan,
+    let refuse_store_failure = |error| {
+        // A capture opened after an earlier independent answer failed must
+        // also refuse this error product. Reuse the original error and owner;
+        // only the consuming capture's admission channels are joined here.
+        crate::analyzer::i_analyzer::record_store_failure(workspace.analyzer());
+        crate::analyzer::i_analyzer::join_execution_dependence(workspace.analyzer());
+        TypeFlowError::Store(error)
+    };
+    // The completion owner also guards publication. Refuse before any memo or
+    // SQL access, and again after the body so a late failure cannot escape as
+    // an otherwise converged root result (#11997).
+    if let Some(error) = cancellation_scope.request_store_error() {
+        return Err(refuse_store_failure(error));
     }
-    let mut previous: Option<CompletedIteration> = None;
-    /// A source-refinement round's witnessless solve and its interpretation,
-    /// retained because the round that followed it rebuilt the same plan.
-    struct RefinedPlanSolve {
-        result: ValueFlowSummaryResult,
-        interpreted: TypeFlowRootResult,
-        budget: SolverBudget,
-        attempt_index: usize,
+    // Publication snapshots this derivation's own reads, including when a
+    // direct caller supplied no ledger. Independent fills keep their own
+    // capture and do not inherit an unrelated parent's failure (#11701).
+    let (result, _) = crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+        solve(
+            workspace,
+            adapter,
+            field_slots,
+            root,
+            active_semantic_model_snapshot,
+            limits,
+            feedback_limits,
+            value_flow_cache,
+            summary_state,
+            semantic_budget,
+            request,
+            refinements,
+        )
+    });
+    if let Some(error) = cancellation_scope.request_store_error() {
+        return Err(refuse_store_failure(error));
     }
-    /// Which plan one attempt of a feedback iteration builds. An iteration
-    /// starts with summary cuts and moves to the full plan at most once, when
-    /// source refinement or a finding needs bodies a cut plan omits.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum PlanAttempt {
-        WithSummaryCuts,
-        Full,
-    }
-    /// What one feedback iteration's surviving plan attempt produced.
-    struct IterationOutcome {
-        plan: TypeFlowPlan,
-        interpreted: TypeFlowRootResult,
-        /// The iteration's staged semantic charges, committed to the root's
-        /// ledger only if the iteration's answer is kept or its writes are.
-        staged_budget: SemanticBudget,
-        maintenance: SummaryMaintenanceMetrics,
-        /// Whether the solve published cache state later queries can observe.
-        retained_publication_writes: bool,
-    }
-    impl IterationOutcome {
-        /// An attempt that stopped on refinement evidence before summary
-        /// preparation: it ran no maintenance and published nothing.
-        fn before_summaries(
+    return result;
+
+    #[allow(clippy::too_many_arguments)]
+    fn solve(
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        field_slots: &FieldSlotIndex,
+        root: &ProcedureHandle,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        limits: ClosureLimits,
+        feedback_limits: FeedbackLimits,
+        value_flow_cache: ValueFlowCache,
+        summary_state: TypeFlowSummaryState,
+        semantic_budget: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+        refinements: &mut ProcedureRefinements,
+    ) -> Result<TypeFlowRootResult, TypeFlowError> {
+        let mut dispatch_hints = DispatchHints::empty();
+        /// The last complete feedback iteration, kept with the plan that produced
+        /// it. Receiver hints reach the solve only by changing the plan the next
+        /// iteration builds, so an iteration that rebuilds the same plan cannot
+        /// reach a different result.
+        struct CompletedIteration {
+            result: TypeFlowRootResult,
+            plan: TypeFlowPlan,
+        }
+        let mut previous: Option<CompletedIteration> = None;
+        /// A source-refinement round's witnessless solve and its interpretation,
+        /// retained because the round that followed it rebuilt the same plan.
+        struct RefinedPlanSolve {
+            result: ValueFlowSummaryResult,
+            interpreted: TypeFlowRootResult,
+            budget: SolverBudget,
+            attempt_index: usize,
+        }
+        /// Which plan one attempt of a feedback iteration builds. An iteration
+        /// starts with summary cuts and moves to the full plan at most once, when
+        /// source refinement or a finding needs bodies a cut plan omits.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum PlanAttempt {
+            WithSummaryCuts,
+            Full,
+        }
+        /// What one feedback iteration's surviving plan attempt produced.
+        struct IterationOutcome {
             plan: TypeFlowPlan,
             interpreted: TypeFlowRootResult,
+            /// The iteration's staged semantic charges, committed to the root's
+            /// ledger only if the iteration's answer is kept or its writes are.
             staged_budget: SemanticBudget,
-        ) -> Self {
-            Self {
-                plan,
-                interpreted,
-                staged_budget,
-                maintenance: SummaryMaintenanceMetrics::default(),
-                retained_publication_writes: false,
+            maintenance: SummaryMaintenanceMetrics,
+            /// Whether the solve published cache state later queries can observe.
+            retained_publication_writes: bool,
+        }
+        impl IterationOutcome {
+            /// An attempt that stopped on refinement evidence before summary
+            /// preparation: it ran no maintenance and published nothing.
+            fn before_summaries(
+                plan: TypeFlowPlan,
+                interpreted: TypeFlowRootResult,
+                staged_budget: SemanticBudget,
+            ) -> Self {
+                Self {
+                    plan,
+                    interpreted,
+                    staged_budget,
+                    maintenance: SummaryMaintenanceMetrics::default(),
+                    retained_publication_writes: false,
+                }
             }
         }
-    }
-    let mut summary_profile = TypeFlowSummaryProfile::default();
-    // Publication eligibility is a property of the whole feedback/retry
-    // transaction, not only the final plan. A transient provider error can
-    // disappear on a later uncached lookup, but the request that observed it
-    // still must not turn its eventual result into a durable answer.
-    let mut persistence = TypeFlowRootPersistenceTracker::default();
-    // Observation rejection is request-total telemetry. A selective cut retry
-    // or feedback iteration must not erase a root probe that already fell back
-    // without charging solver work.
-    let mut root_summary_observation_rejections = 0usize;
-    let root_solver_limits = request.budget.limits();
-    let query_plan_config = request.query_plan_config();
-    let mut solver_attempts = Vec::new();
-    // Every plan attempt in this solve reuses the caller-owned procedure-local
-    // refinements. Keeping the cache outside the root solve also lets
-    // overlapping roots in one request share successful derivations.
-    for iteration in 0..feedback_limits.max_iterations() {
-        // A feedback pass is a speculative refinement of the preceding
-        // result. Stage its semantic charges so an exhausted refinement can
-        // fall back to that sound result without both degrading the answer
-        // and consuming work for a pass whose output is discarded.
-        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
-            workspace,
-            active_semantic_model_snapshot.clone(),
-            dispatch_hints.clone(),
-        );
-        let discovery_provider = WorkspaceValueFlowProvider::with_oracle(
-            provider.oracle().clone(),
-            provider.behavior_identity(),
-            value_flow_cache.clone(),
-        );
-        let mut acquisition_cuts = ClassSetAcquisitionCuts::new(
-            summary_state.clone(),
-            workspace,
-            &discovery_provider,
-            provider.behavior_identity(),
-            field_slots,
-            HashSet::<DurableProcedureKey>::default(),
-        );
-        let mut attempt = PlanAttempt::WithSummaryCuts;
-        // The plan this iteration actually solves, before source refinement
-        // mutates it. It is the whole input to everything the iteration does
-        // next, so it is what the next iteration compares against. A plan
-        // attempt can be abandoned (a selective summary-cut retry rebuilds the
-        // plan), and an abandoned attempt never solved its plan, so the
-        // assignment below happens on every attempt. Comparing against an
-        // abandoned attempt's plan would report a difference the solve never
-        // observed and re-solve an iteration whose plan is unchanged.
-        let mut solved_plan: Option<TypeFlowPlan> = None;
-        let IterationOutcome {
-            plan,
-            mut interpreted,
-            staged_budget: iteration_budget,
-            maintenance,
-            retained_publication_writes: publication_writes,
-        } = 'plan_attempt: loop {
-            let mut iteration_budget = semantic_budget.clone();
-            let plan_result = match attempt {
-                PlanAttempt::WithSummaryCuts => TypeFlowPlan::build_with_summary_cuts(
-                    workspace,
-                    adapter,
-                    field_slots,
-                    root,
-                    &discovery_provider,
-                    limits,
-                    &mut iteration_budget,
-                    request.cancellation,
-                    refinements,
-                    &mut acquisition_cuts,
-                ),
-                PlanAttempt::Full => TypeFlowPlan::build(
-                    workspace,
-                    adapter,
-                    field_slots,
-                    root,
-                    &discovery_provider,
-                    limits,
-                    &mut iteration_budget,
-                    request.cancellation,
-                    refinements,
-                ),
-            };
-            let plan_cache_writes = discovery_provider.take_retained_writes();
-            let mut plan = match plan_result {
-                Ok(plan) => plan,
-                Err(error) => {
-                    if plan_cache_writes {
-                        *semantic_budget = iteration_budget;
-                    }
-                    return Err(error.into());
-                }
-            };
-            if plan_cache_writes {
-                *semantic_budget = iteration_budget.clone();
-            }
-            if iteration + 1 < feedback_limits.max_iterations() {
-                solved_plan = Some(plan.clone());
-            }
-            if attempt == PlanAttempt::WithSummaryCuts
-                && previous
-                    .as_ref()
-                    .is_some_and(|completed| completed.plan.feedback_fixpoint_matches(&plan))
-            {
-                // The updated hints reached the plan without changing any
-                // input the solve or `interpret` reads. Refinement, the
-                // witness solve, and `interpret` all read this plan, so
-                // repeating them would repeat the previous iteration's
-                // work for the previous iteration's answer. That is the
-                // feedback fixpoint: stop here and keep the result already
-                // computed. The staged plan-build charge is discarded with
-                // the rest of this speculative pass unless it retained
-                // cache writes, which the branch above already committed.
-                let completed =
-                    previous.expect("the identical plan came from a completed iteration");
-                return Ok(completed.result);
-            }
-            // The refinement round that reproduced the plan, with the solve
-            // and interpretation it produced. Refinement rebuilds the plan
-            // from each round's evidence; when the rebuild reproduces the
-            // plan, the round already solved the plan the rest of this
-            // iteration reads.
-            let mut fixed_point_solve: Option<RefinedPlanSolve> = None;
-            if plan.needs_source_refinement() && !plan.refinement_budget_exhausted() {
-                if plan.has_summary_cuts() {
-                    *semantic_budget = iteration_budget;
-                    attempt = PlanAttempt::Full;
-                    continue 'plan_attempt;
-                }
-                let mut refinement_solve_phase = TypeFlowSolvePhase::ExploratoryRefinement;
-                fixed_point_solve = loop {
-                    // Collect complete may-source evidence before deriving any
-                    // exclusions. This trial never publishes reusable summaries.
-                    // It is an independent solve, so it receives the root's
-                    // unchanged per-solve limits on a zero-used child ledger.
-                    let mut refinement_solver_budget = SolverBudget::new(root_solver_limits);
-                    let mut refinement_request =
-                        DataflowRequest::new(&mut refinement_solver_budget, request.cancellation)
-                            .with_query_plan_config(query_plan_config);
-                    let preliminary = solve_value_flow_with_summaries(
-                        root,
-                        &provider,
-                        plan.value_flow(),
-                        &mut iteration_budget,
-                        &mut refinement_request,
-                    )?;
-                    let attempt_index = record_solver_attempt(
-                        &mut solver_attempts,
-                        refinement_solve_phase,
-                        &preliminary,
-                        refinement_solver_budget.used(),
-                    );
-                    refinement_solve_phase = TypeFlowSolvePhase::RefinedPlan;
-                    let preliminary_status = interpret(
+        let mut summary_profile = TypeFlowSummaryProfile::default();
+        // Publication eligibility is a property of the whole feedback/retry
+        // transaction, not only the final plan. A transient provider error can
+        // disappear on a later uncached lookup, but the request that observed it
+        // still must not turn its eventual result into a durable answer.
+        let mut persistence = TypeFlowRootPersistenceTracker::default();
+        // Observation rejection is request-total telemetry. A selective cut retry
+        // or feedback iteration must not erase a root probe that already fell back
+        // without charging solver work.
+        let mut root_summary_observation_rejections = 0usize;
+        let root_solver_limits = request.budget.limits();
+        let query_plan_config = request.query_plan_config();
+        let mut solver_attempts = Vec::new();
+        // Every plan attempt in this solve reuses the caller-owned procedure-local
+        // refinements. Keeping the cache outside the root solve also lets
+        // overlapping roots in one request share successful derivations.
+        for iteration in 0..feedback_limits.max_iterations() {
+            // A feedback pass is a speculative refinement of the preceding
+            // result. Stage its semantic charges so an exhausted refinement can
+            // fall back to that sound result without both degrading the answer
+            // and consuming work for a pass whose output is discarded.
+            let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+                workspace,
+                active_semantic_model_snapshot.clone(),
+                dispatch_hints.clone(),
+            );
+            let discovery_provider = WorkspaceValueFlowProvider::with_oracle(
+                provider.oracle().clone(),
+                provider.behavior_identity(),
+                value_flow_cache.clone(),
+            );
+            let mut acquisition_cuts = ClassSetAcquisitionCuts::new(
+                summary_state.clone(),
+                workspace,
+                &discovery_provider,
+                provider.behavior_identity(),
+                field_slots,
+                HashSet::<DurableProcedureKey>::default(),
+            );
+            let mut attempt = PlanAttempt::WithSummaryCuts;
+            // The plan this iteration actually solves, before source refinement
+            // mutates it. It is the whole input to everything the iteration does
+            // next, so it is what the next iteration compares against. A plan
+            // attempt can be abandoned (a selective summary-cut retry rebuilds the
+            // plan), and an abandoned attempt never solved its plan, so the
+            // assignment below happens on every attempt. Comparing against an
+            // abandoned attempt's plan would report a difference the solve never
+            // observed and re-solve an iteration whose plan is unchanged.
+            let mut solved_plan: Option<TypeFlowPlan> = None;
+            let IterationOutcome {
+                plan,
+                mut interpreted,
+                staged_budget: iteration_budget,
+                maintenance,
+                retained_publication_writes: publication_writes,
+            } = 'plan_attempt: loop {
+                let mut iteration_budget = semantic_budget.clone();
+                let plan_result = match attempt {
+                    PlanAttempt::WithSummaryCuts => TypeFlowPlan::build_with_summary_cuts(
                         workspace,
                         adapter,
                         field_slots,
                         root,
-                        &plan,
-                        &preliminary,
-                        &solver_attempts,
-                    );
-                    if !preliminary_status.complete()
-                        || preliminary_status.semantic_budget_exhausted()
-                    {
-                        if preliminary_status.semantic_budget_exhausted() {
-                            plan.mark_refinement_budget_exhausted(
-                                preliminary_status.semantic_exhaustion(),
-                            );
+                        &discovery_provider,
+                        limits,
+                        &mut iteration_budget,
+                        request.cancellation,
+                        refinements,
+                        &mut acquisition_cuts,
+                    ),
+                    PlanAttempt::Full => TypeFlowPlan::build(
+                        workspace,
+                        adapter,
+                        field_slots,
+                        root,
+                        &discovery_provider,
+                        limits,
+                        &mut iteration_budget,
+                        request.cancellation,
+                        refinements,
+                    ),
+                };
+                let plan_cache_writes = discovery_provider.take_retained_writes();
+                let mut plan = match plan_result {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        if plan_cache_writes {
+                            *semantic_budget = iteration_budget;
                         }
-                        let interpreted = interpret(
+                        return Err(error.into());
+                    }
+                };
+                if plan_cache_writes {
+                    *semantic_budget = iteration_budget.clone();
+                }
+                if iteration + 1 < feedback_limits.max_iterations() {
+                    solved_plan = Some(plan.clone());
+                }
+                if attempt == PlanAttempt::WithSummaryCuts
+                    && previous
+                        .as_ref()
+                        .is_some_and(|completed| completed.plan.feedback_fixpoint_matches(&plan))
+                {
+                    // The updated hints reached the plan without changing any
+                    // input the solve or `interpret` reads. Refinement, the
+                    // witness solve, and `interpret` all read this plan, so
+                    // repeating them would repeat the previous iteration's
+                    // work for the previous iteration's answer. That is the
+                    // feedback fixpoint: stop here and keep the result already
+                    // computed. The staged plan-build charge is discarded with
+                    // the rest of this speculative pass unless it retained
+                    // cache writes, which the branch above already committed.
+                    let completed =
+                        previous.expect("the identical plan came from a completed iteration");
+                    return Ok(completed.result);
+                }
+                // The refinement round that reproduced the plan, with the solve
+                // and interpretation it produced. Refinement rebuilds the plan
+                // from each round's evidence; when the rebuild reproduces the
+                // plan, the round already solved the plan the rest of this
+                // iteration reads.
+                let mut fixed_point_solve: Option<RefinedPlanSolve> = None;
+                if plan.needs_source_refinement() && !plan.refinement_budget_exhausted() {
+                    if plan.has_summary_cuts() {
+                        *semantic_budget = iteration_budget;
+                        attempt = PlanAttempt::Full;
+                        continue 'plan_attempt;
+                    }
+                    let mut refinement_solve_phase = TypeFlowSolvePhase::ExploratoryRefinement;
+                    fixed_point_solve = loop {
+                        // Collect complete may-source evidence before deriving any
+                        // exclusions. This trial never publishes reusable summaries.
+                        // It is an independent solve, so it receives the root's
+                        // unchanged per-solve limits on a zero-used child ledger.
+                        let mut refinement_solver_budget = SolverBudget::new(root_solver_limits);
+                        let mut refinement_request = DataflowRequest::new(
+                            &mut refinement_solver_budget,
+                            request.cancellation,
+                        )
+                        .with_query_plan_config(query_plan_config);
+                        let preliminary = solve_value_flow_with_summaries(
+                            root,
+                            &provider,
+                            plan.value_flow(),
+                            &mut iteration_budget,
+                            &mut refinement_request,
+                        )?;
+                        let attempt_index = record_solver_attempt(
+                            &mut solver_attempts,
+                            refinement_solve_phase,
+                            &preliminary,
+                            refinement_solver_budget.used(),
+                        );
+                        refinement_solve_phase = TypeFlowSolvePhase::RefinedPlan;
+                        let preliminary_status = interpret(
                             workspace,
                             adapter,
                             field_slots,
@@ -822,311 +880,90 @@ pub fn solve_type_flow_for_root_with_refinements(
                             &preliminary,
                             &solver_attempts,
                         );
-                        break 'plan_attempt IterationOutcome::before_summaries(
-                            plan,
-                            interpreted,
-                            iteration_budget,
-                        );
-                    }
-                    let refinement = DefinitionSources::new(
-                        &preliminary,
-                        plan.source_refinement_points(),
-                        &mut iteration_budget,
-                        request.cancellation,
-                    )
-                    .map_err(TypeFlowPlanError::from)
-                    .and_then(|evidence| {
-                        plan.refine_sources(
-                            workspace,
-                            adapter,
-                            field_slots,
-                            &evidence,
+                        if !preliminary_status.complete()
+                            || preliminary_status.semantic_budget_exhausted()
+                        {
+                            if preliminary_status.semantic_budget_exhausted() {
+                                plan.mark_refinement_budget_exhausted(
+                                    preliminary_status.semantic_exhaustion(),
+                                );
+                            }
+                            let interpreted = interpret(
+                                workspace,
+                                adapter,
+                                field_slots,
+                                root,
+                                &plan,
+                                &preliminary,
+                                &solver_attempts,
+                            );
+                            break 'plan_attempt IterationOutcome::before_summaries(
+                                plan,
+                                interpreted,
+                                iteration_budget,
+                            );
+                        }
+                        let refinement = DefinitionSources::new(
+                            &preliminary,
+                            plan.source_refinement_points(),
                             &mut iteration_budget,
                             request.cancellation,
                         )
-                    });
-                    match refinement {
-                        Ok(SourceRefinement::Unchanged) => {
-                            break Some(RefinedPlanSolve {
-                                result: preliminary,
-                                interpreted: preliminary_status,
-                                budget: refinement_solver_budget,
-                                attempt_index,
-                            });
+                        .map_err(TypeFlowPlanError::from)
+                        .and_then(|evidence| {
+                            plan.refine_sources(
+                                workspace,
+                                adapter,
+                                field_slots,
+                                &evidence,
+                                &mut iteration_budget,
+                                request.cancellation,
+                            )
+                        });
+                        match refinement {
+                            Ok(SourceRefinement::Unchanged) => {
+                                break Some(RefinedPlanSolve {
+                                    result: preliminary,
+                                    interpreted: preliminary_status,
+                                    budget: refinement_solver_budget,
+                                    attempt_index,
+                                });
+                            }
+                            Ok(SourceRefinement::Settled) => break None,
+                            Ok(SourceRefinement::Refined) => {}
+                            Err(TypeFlowPlanError::RefinementBudget(exceeded)) => {
+                                plan.mark_refinement_budget_exhausted(Some(exceeded));
+                                break None;
+                            }
+                            Err(error) => {
+                                *semantic_budget = iteration_budget;
+                                return Err(error.into());
+                            }
                         }
-                        Ok(SourceRefinement::Settled) => break None,
-                        Ok(SourceRefinement::Refined) => {}
-                        Err(TypeFlowPlanError::RefinementBudget(exceeded)) => {
-                            plan.mark_refinement_budget_exhausted(Some(exceeded));
-                            break None;
+                        if request.cancellation.is_cancelled() {
+                            return Err(TypeFlowPlanError::Cancelled.into());
                         }
-                        Err(error) => {
-                            *semantic_budget = iteration_budget;
-                            return Err(error.into());
-                        }
-                    }
-                    if request.cancellation.is_cancelled() {
-                        return Err(TypeFlowPlanError::Cancelled.into());
-                    }
-                };
-            }
-            if plan.refinement_budget_exhausted() {
-                let mut solve_budget = SolverBudget::new(root_solver_limits);
-                let mut solve_request =
-                    DataflowRequest::new(&mut solve_budget, request.cancellation)
-                        .with_query_plan_config(query_plan_config);
-                let result = solve_value_flow_with_summaries(
-                    root,
-                    &provider,
-                    plan.value_flow(),
-                    &mut iteration_budget,
-                    &mut solve_request,
-                )?;
-                record_solver_attempt(
-                    &mut solver_attempts,
-                    TypeFlowSolvePhase::RefinedPlan,
-                    &result,
-                    solve_budget.used(),
-                );
-                let interpreted = interpret(
-                    workspace,
-                    adapter,
-                    field_slots,
-                    root,
-                    &plan,
-                    &result,
-                    &solver_attempts,
-                );
-                break 'plan_attempt IterationOutcome::before_summaries(
-                    plan,
-                    interpreted,
-                    iteration_budget,
-                );
-            }
-            persistence.observe_provider_failure(plan.provider_failure_observed());
-            let cut_manifest = match attempt {
-                PlanAttempt::WithSummaryCuts => acquisition_cuts.take_manifest(),
-                PlanAttempt::Full => Default::default(),
-            };
-            let mut summaries = PreparedClassSetSummaries::new_with_cuts(
-                summary_state.clone(),
-                workspace,
-                &plan,
-                field_slots,
-                provider.behavior_identity(),
-                cut_manifest,
-            );
-            if summaries.take_retained_publication_writes() {
-                // Semantic component publication happens during construction,
-                // before maintenance owns a solver budget of its own.
-                *semantic_budget = iteration_budget.clone();
-            }
-            let mut maintenance_solver_budget = SolverBudget::new(root_solver_limits);
-            let mut maintenance_request =
-                DataflowRequest::new(&mut maintenance_solver_budget, request.cancellation)
-                    .with_query_plan_config(query_plan_config);
-            let mut maintenance_semantic_budget = iteration_budget.clone();
-            let stabilized = summaries.stabilize_demanded_closure(
-                root,
-                &provider,
-                &mut maintenance_semantic_budget,
-                &mut maintenance_request,
-            );
-            // Closure stabilization can fail after publishing complete descendant
-            // rows or rebinding equal-output provenance. The retained writes are
-            // safe cache improvements, but their work must remain charged even
-            // when the ordinary root path takes over.
-            if maintenance_solver_budget.used() != SolverWork::default()
-                || summaries.maintenance_solver_budget_exhaustion().is_some()
-            {
-                solver_attempts.push(TypeFlowSolveAttempt {
-                    phase: TypeFlowSolvePhase::SummaryMaintenance,
-                    work: maintenance_solver_budget.used(),
-                    budget_exhaustion: summaries.maintenance_solver_budget_exhaustion(),
-                });
-            }
-            iteration_budget = maintenance_semantic_budget;
-            summaries.finish_maintenance_publications();
-            if summaries.retained_maintenance_writes() {
-                // The outer feedback pass is also speculative. A later fallback
-                // to `previous` may discard its ordinary solve, but it must
-                // not discard the plan and maintenance charges behind cache
-                // writes that remain observable.
-                *semantic_budget = iteration_budget.clone();
-            }
-            if !stabilized {
-                summaries.prepare_fallback_after_maintenance();
-            }
-            let mut interpreted;
-            if let Some(mut fixed) = fixed_point_solve
-                && fixed.interpreted.findings.is_empty()
-            {
-                // The last refinement round solved this plan: its rebuild
-                // reproduced the plan, so nothing the solve reads changed
-                // after it ran. A trial or witness solve here would charge
-                // this root's ledger a second time for the relation that
-                // solve already produced. No sink produced a finding, so no
-                // witness is owed, which is the condition the reusable trial
-                // commits its own witnessless result under.
-                assert!(
-                    !plan.has_summary_cuts(),
-                    "a source-refined plan carries no summary cuts"
-                );
-                interpreted = fixed.interpreted;
-                let mut fixed_request =
-                    DataflowRequest::new(&mut fixed.budget, request.cancellation)
-                        .with_query_plan_config(query_plan_config);
-                interpreted.published_summaries =
-                    summaries.publish_complete(&fixed.result, &mut fixed_request);
-                solver_attempts[fixed.attempt_index].work = fixed_request.budget.used();
-            } else {
-                // Establish findings before allocating witness paths, including
-                // on a cold root with no reusable summaries. A finding-free
-                // relation owes no witness; retaining paths eagerly can exhaust
-                // the witness budget without producing anything to explain.
-                // Findings still require the exact strict witness solve below.
-                // Retain semantic charges for provider caches warmed by this
-                // trial, even when its staged solver result is discarded.
-                let has_reusable_rows = summaries.has_reusable_rows();
-                let mut trial_solver_budget = SolverBudget::new(root_solver_limits);
-                let mut trial_request =
-                    DataflowRequest::new(&mut trial_solver_budget, request.cancellation)
-                        .with_query_plan_config(query_plan_config);
-                let mut trial_semantic_budget = iteration_budget.clone();
-                let trial_result = {
-                    let _scope = profiling::scope("type_flow.solve");
-                    if has_reusable_rows {
-                        solve_value_flow_with_reusable_summaries(
-                            root,
-                            &provider,
-                            &mut summaries,
-                            plan.value_flow(),
-                            WitnessRetentionLimits::disabled(),
-                            &mut trial_semantic_budget,
-                            &mut trial_request,
-                        )
-                    } else {
-                        solve_value_flow_with_summaries(
-                            root,
-                            &provider,
-                            plan.value_flow(),
-                            &mut trial_semantic_budget,
-                            &mut trial_request,
-                        )
-                    }
-                };
-                let trial_publication_writes = summaries.take_retained_publication_writes();
-                let trial_result = match trial_result {
-                    Ok(result) => result,
-                    Err(error) if error.mandatory_summary_cut_miss().is_some() => {
-                        let failed = error
-                            .mandatory_summary_cut_miss()
-                            .expect("the guarded error names its failed cut");
-                        assert!(
-                            plan.is_summary_cut(failed),
-                            "a mandatory summary miss names a cut in the current plan"
-                        );
-                        assert!(
-                            acquisition_cuts.disable_cut(failed),
-                            "each mandatory summary miss disables a new durable cut"
-                        );
-                        // Discovery and the symbolic trial populate shared
-                        // semantic/value-flow caches. Their work is observable
-                        // by the selective retry, whose cache hits can therefore
-                        // be cheaper; retain the semantic charge even though the
-                        // speculative cut plan itself is discarded.
-                        *semantic_budget = trial_semantic_budget;
-                        summary_profile = summary_profile.saturating_add(summaries.profile());
-                        root_summary_observation_rejections = root_summary_observation_rejections
-                            .saturating_add(summaries.root_observation_rejections());
-                        continue 'plan_attempt;
-                    }
-                    Err(error) => {
-                        if trial_publication_writes {
-                            *semantic_budget = trial_semantic_budget;
-                        }
-                        return Err(error.into());
-                    }
-                };
-                let trial_attempt_index = record_solver_attempt(
-                    &mut solver_attempts,
-                    TypeFlowSolvePhase::ReusableTrial,
-                    &trial_result,
-                    trial_request.budget.used(),
-                );
-                if trial_publication_writes {
-                    *semantic_budget = trial_semantic_budget.clone();
-                }
-                let metrics = trial_result.result().metrics();
-                let trial_interpreted = interpret(
-                    workspace,
-                    adapter,
-                    field_slots,
-                    root,
-                    &plan,
-                    &trial_result,
-                    &solver_attempts,
-                );
-                // Whether the trial consumed a reusable row does not change
-                // what it computed: with no hit it solved the whole plan
-                // itself, and that is the same plan and the same relation the
-                // witness solve would produce. Only a finding owes a witness,
-                // so a witnessless trial with no finding is this iteration's
-                // solve however many rows it reused. Requiring a hit here
-                // charged the root's ledger twice for one answer.
-                if trial_interpreted.findings.is_empty() {
-                    iteration_budget = trial_semantic_budget;
-                    interpreted = trial_interpreted;
-                    interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
-                    interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
-                    interpreted.reusable_root_summary_hits = metrics.reusable_root_summary_hits;
-                    interpreted.reusable_root_summary_observation_rejections =
-                        summaries.root_observation_rejections();
-                    interpreted.published_summaries =
-                        summaries.publish_complete(&trial_result, &mut trial_request);
-                    solver_attempts[trial_attempt_index].work = trial_request.budget.used();
-                } else {
-                    if plan.has_summary_cuts() {
-                        // The witnessless trial can warm shared semantic cache
-                        // entries before a finding requires a fresh full plan.
-                        *semantic_budget = trial_semantic_budget;
-                        attempt = PlanAttempt::Full;
-                        summary_profile = summary_profile.saturating_add(summaries.profile());
-                        root_summary_observation_rejections = root_summary_observation_rejections
-                            .saturating_add(summaries.root_observation_rejections());
-                        continue 'plan_attempt;
-                    }
-                    // The witnessless trial can also warm the provider-owned
-                    // ICFG cache when no cut retry is needed. The witness solve
-                    // observes those zero-work replays, so retain the semantic
-                    // charge that originally produced them.
-                    drop(trial_interpreted);
-                    drop(trial_result);
-                    iteration_budget = trial_semantic_budget;
-                    let mut witness_solver_budget = SolverBudget::new(root_solver_limits);
-                    let mut witness_request =
-                        DataflowRequest::new(&mut witness_solver_budget, request.cancellation)
-                            .with_query_plan_config(query_plan_config);
-                    let result = {
-                        let _scope = profiling::scope("type_flow.solve");
-                        let result = solve_value_flow_with_witnesses(
-                            root,
-                            &provider,
-                            plan.value_flow(),
-                            WitnessRetentionLimits::new(1)
-                                .expect("one alternative is a valid witness retention limit"),
-                            &mut iteration_budget,
-                            &mut witness_request,
-                        );
-                        result?
                     };
-                    let witness_attempt_index = record_solver_attempt(
+                }
+                if plan.refinement_budget_exhausted() {
+                    let mut solve_budget = SolverBudget::new(root_solver_limits);
+                    let mut solve_request =
+                        DataflowRequest::new(&mut solve_budget, request.cancellation)
+                            .with_query_plan_config(query_plan_config);
+                    let result = solve_value_flow_with_summaries(
+                        root,
+                        &provider,
+                        plan.value_flow(),
+                        &mut iteration_budget,
+                        &mut solve_request,
+                    )?;
+                    record_solver_attempt(
                         &mut solver_attempts,
-                        TypeFlowSolvePhase::Witness,
+                        TypeFlowSolvePhase::RefinedPlan,
                         &result,
-                        witness_request.budget.used(),
+                        solve_budget.used(),
                     );
-                    interpreted = interpret(
+                    let interpreted = interpret(
                         workspace,
                         adapter,
                         field_slots,
@@ -1135,77 +972,319 @@ pub fn solve_type_flow_for_root_with_refinements(
                         &result,
                         &solver_attempts,
                     );
-                    interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
-                    interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
-                    interpreted.reusable_root_summary_hits = metrics.reusable_root_summary_hits;
-                    interpreted.reusable_root_summary_observation_rejections =
-                        summaries.root_observation_rejections();
+                    break 'plan_attempt IterationOutcome::before_summaries(
+                        plan,
+                        interpreted,
+                        iteration_budget,
+                    );
+                }
+                persistence.observe_provider_failure(plan.provider_failure_observed());
+                let cut_manifest = match attempt {
+                    PlanAttempt::WithSummaryCuts => acquisition_cuts.take_manifest(),
+                    PlanAttempt::Full => Default::default(),
+                };
+                let mut summaries = PreparedClassSetSummaries::new_with_cuts(
+                    summary_state.clone(),
+                    workspace,
+                    &plan,
+                    field_slots,
+                    provider.behavior_identity(),
+                    cut_manifest,
+                );
+                if summaries.take_retained_publication_writes() {
+                    // Semantic component publication happens during construction,
+                    // before maintenance owns a solver budget of its own.
+                    *semantic_budget = iteration_budget.clone();
+                }
+                let mut maintenance_solver_budget = SolverBudget::new(root_solver_limits);
+                let mut maintenance_request =
+                    DataflowRequest::new(&mut maintenance_solver_budget, request.cancellation)
+                        .with_query_plan_config(query_plan_config);
+                let mut maintenance_semantic_budget = iteration_budget.clone();
+                let stabilized = summaries.stabilize_demanded_closure(
+                    root,
+                    &provider,
+                    &mut maintenance_semantic_budget,
+                    &mut maintenance_request,
+                );
+                // Closure stabilization can fail after publishing complete descendant
+                // rows or rebinding equal-output provenance. The retained writes are
+                // safe cache improvements, but their work must remain charged even
+                // when the ordinary root path takes over.
+                if maintenance_solver_budget.used() != SolverWork::default()
+                    || summaries.maintenance_solver_budget_exhaustion().is_some()
+                {
+                    solver_attempts.push(TypeFlowSolveAttempt {
+                        phase: TypeFlowSolvePhase::SummaryMaintenance,
+                        work: maintenance_solver_budget.used(),
+                        budget_exhaustion: summaries.maintenance_solver_budget_exhaustion(),
+                    });
+                }
+                iteration_budget = maintenance_semantic_budget;
+                summaries.finish_maintenance_publications();
+                if summaries.retained_maintenance_writes() {
+                    // The outer feedback pass is also speculative. A later fallback
+                    // to `previous` may discard its ordinary solve, but it must
+                    // not discard the plan and maintenance charges behind cache
+                    // writes that remain observable.
+                    *semantic_budget = iteration_budget.clone();
+                }
+                if !stabilized {
+                    summaries.prepare_fallback_after_maintenance();
+                }
+                let mut interpreted;
+                if let Some(mut fixed) = fixed_point_solve
+                    && fixed.interpreted.findings.is_empty()
+                {
+                    // The last refinement round solved this plan: its rebuild
+                    // reproduced the plan, so nothing the solve reads changed
+                    // after it ran. A trial or witness solve here would charge
+                    // this root's ledger a second time for the relation that
+                    // solve already produced. No sink produced a finding, so no
+                    // witness is owed, which is the condition the reusable trial
+                    // commits its own witnessless result under.
+                    assert!(
+                        !plan.has_summary_cuts(),
+                        "a source-refined plan carries no summary cuts"
+                    );
+                    interpreted = fixed.interpreted;
+                    let mut fixed_request =
+                        DataflowRequest::new(&mut fixed.budget, request.cancellation)
+                            .with_query_plan_config(query_plan_config);
                     interpreted.published_summaries =
-                        summaries.publish_complete(&result, &mut witness_request);
-                    solver_attempts[witness_attempt_index].work = witness_request.budget.used();
+                        summaries.publish_complete(&fixed.result, &mut fixed_request);
+                    solver_attempts[fixed.attempt_index].work = fixed_request.budget.used();
+                } else {
+                    // Establish findings before allocating witness paths, including
+                    // on a cold root with no reusable summaries. A finding-free
+                    // relation owes no witness; retaining paths eagerly can exhaust
+                    // the witness budget without producing anything to explain.
+                    // Findings still require the exact strict witness solve below.
+                    // Retain semantic charges for provider caches warmed by this
+                    // trial, even when its staged solver result is discarded.
+                    let has_reusable_rows = summaries.has_reusable_rows();
+                    let mut trial_solver_budget = SolverBudget::new(root_solver_limits);
+                    let mut trial_request =
+                        DataflowRequest::new(&mut trial_solver_budget, request.cancellation)
+                            .with_query_plan_config(query_plan_config);
+                    let mut trial_semantic_budget = iteration_budget.clone();
+                    let trial_result = {
+                        let _scope = profiling::scope("type_flow.solve");
+                        if has_reusable_rows {
+                            solve_value_flow_with_reusable_summaries(
+                                root,
+                                &provider,
+                                &mut summaries,
+                                plan.value_flow(),
+                                WitnessRetentionLimits::disabled(),
+                                &mut trial_semantic_budget,
+                                &mut trial_request,
+                            )
+                        } else {
+                            solve_value_flow_with_summaries(
+                                root,
+                                &provider,
+                                plan.value_flow(),
+                                &mut trial_semantic_budget,
+                                &mut trial_request,
+                            )
+                        }
+                    };
+                    let trial_publication_writes = summaries.take_retained_publication_writes();
+                    let trial_result = match trial_result {
+                        Ok(result) => result,
+                        Err(error) if error.mandatory_summary_cut_miss().is_some() => {
+                            let failed = error
+                                .mandatory_summary_cut_miss()
+                                .expect("the guarded error names its failed cut");
+                            assert!(
+                                plan.is_summary_cut(failed),
+                                "a mandatory summary miss names a cut in the current plan"
+                            );
+                            assert!(
+                                acquisition_cuts.disable_cut(failed),
+                                "each mandatory summary miss disables a new durable cut"
+                            );
+                            // Discovery and the symbolic trial populate shared
+                            // semantic/value-flow caches. Their work is observable
+                            // by the selective retry, whose cache hits can therefore
+                            // be cheaper; retain the semantic charge even though the
+                            // speculative cut plan itself is discarded.
+                            *semantic_budget = trial_semantic_budget;
+                            summary_profile = summary_profile.saturating_add(summaries.profile());
+                            root_summary_observation_rejections =
+                                root_summary_observation_rejections
+                                    .saturating_add(summaries.root_observation_rejections());
+                            continue 'plan_attempt;
+                        }
+                        Err(error) => {
+                            if trial_publication_writes {
+                                *semantic_budget = trial_semantic_budget;
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    let trial_attempt_index = record_solver_attempt(
+                        &mut solver_attempts,
+                        TypeFlowSolvePhase::ReusableTrial,
+                        &trial_result,
+                        trial_request.budget.used(),
+                    );
+                    if trial_publication_writes {
+                        *semantic_budget = trial_semantic_budget.clone();
+                    }
+                    let metrics = trial_result.result().metrics();
+                    let trial_interpreted = interpret(
+                        workspace,
+                        adapter,
+                        field_slots,
+                        root,
+                        &plan,
+                        &trial_result,
+                        &solver_attempts,
+                    );
+                    // Whether the trial consumed a reusable row does not change
+                    // what it computed: with no hit it solved the whole plan
+                    // itself, and that is the same plan and the same relation the
+                    // witness solve would produce. Only a finding owes a witness,
+                    // so a witnessless trial with no finding is this iteration's
+                    // solve however many rows it reused. Requiring a hit here
+                    // charged the root's ledger twice for one answer.
+                    if trial_interpreted.findings.is_empty() {
+                        iteration_budget = trial_semantic_budget;
+                        interpreted = trial_interpreted;
+                        interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
+                        interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
+                        interpreted.reusable_root_summary_hits = metrics.reusable_root_summary_hits;
+                        interpreted.reusable_root_summary_observation_rejections =
+                            summaries.root_observation_rejections();
+                        interpreted.published_summaries =
+                            summaries.publish_complete(&trial_result, &mut trial_request);
+                        solver_attempts[trial_attempt_index].work = trial_request.budget.used();
+                    } else {
+                        if plan.has_summary_cuts() {
+                            // The witnessless trial can warm shared semantic cache
+                            // entries before a finding requires a fresh full plan.
+                            *semantic_budget = trial_semantic_budget;
+                            attempt = PlanAttempt::Full;
+                            summary_profile = summary_profile.saturating_add(summaries.profile());
+                            root_summary_observation_rejections =
+                                root_summary_observation_rejections
+                                    .saturating_add(summaries.root_observation_rejections());
+                            continue 'plan_attempt;
+                        }
+                        // The witnessless trial can also warm the provider-owned
+                        // ICFG cache when no cut retry is needed. The witness solve
+                        // observes those zero-work replays, so retain the semantic
+                        // charge that originally produced them.
+                        drop(trial_interpreted);
+                        drop(trial_result);
+                        iteration_budget = trial_semantic_budget;
+                        let mut witness_solver_budget = SolverBudget::new(root_solver_limits);
+                        let mut witness_request =
+                            DataflowRequest::new(&mut witness_solver_budget, request.cancellation)
+                                .with_query_plan_config(query_plan_config);
+                        let result = {
+                            let _scope = profiling::scope("type_flow.solve");
+                            let result = solve_value_flow_with_witnesses(
+                                root,
+                                &provider,
+                                plan.value_flow(),
+                                WitnessRetentionLimits::new(1)
+                                    .expect("one alternative is a valid witness retention limit"),
+                                &mut iteration_budget,
+                                &mut witness_request,
+                            );
+                            result?
+                        };
+                        let witness_attempt_index = record_solver_attempt(
+                            &mut solver_attempts,
+                            TypeFlowSolvePhase::Witness,
+                            &result,
+                            witness_request.budget.used(),
+                        );
+                        interpreted = interpret(
+                            workspace,
+                            adapter,
+                            field_slots,
+                            root,
+                            &plan,
+                            &result,
+                            &solver_attempts,
+                        );
+                        interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
+                        interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
+                        interpreted.reusable_root_summary_hits = metrics.reusable_root_summary_hits;
+                        interpreted.reusable_root_summary_observation_rejections =
+                            summaries.root_observation_rejections();
+                        interpreted.published_summaries =
+                            summaries.publish_complete(&result, &mut witness_request);
+                        solver_attempts[witness_attempt_index].work = witness_request.budget.used();
+                    }
                 }
-            }
-            let maintenance = summaries.maintenance_metrics();
-            summary_profile = summary_profile.saturating_add(summaries.profile());
-            root_summary_observation_rejections = root_summary_observation_rejections
-                .saturating_add(summaries.root_observation_rejections());
-            interpreted.reusable_root_summary_observation_rejections =
-                root_summary_observation_rejections;
-            interpreted.transaction_bar = persistence.bar();
-            let retained_publication_writes = summaries.take_retained_publication_writes();
-            break IterationOutcome {
-                plan,
-                interpreted,
-                staged_budget: iteration_budget,
-                maintenance,
-                retained_publication_writes,
-            };
-        };
-        interpreted.reusable_summary_hits = interpreted
-            .reusable_summary_hits
-            .saturating_add(maintenance.hits);
-        interpreted.reusable_summary_misses = interpreted
-            .reusable_summary_misses
-            .saturating_add(maintenance.misses);
-        interpreted.published_summaries = interpreted
-            .published_summaries
-            .saturating_add(maintenance.publications);
-        interpreted.summary_profile = summary_profile;
-        interpreted.incomplete_evidence.feedback_iteration = iteration;
-        interpreted.solver_attempts = solver_attempts.clone();
-        if interpreted.semantic_budget_exhausted() || !interpreted.complete() {
-            if let Some(completed) = previous {
-                let mut previous = completed.result;
-                if publication_writes {
-                    // The returned result comes from an earlier feedback pass,
-                    // but this pass published cache state that later queries
-                    // can observe. Retain the work that produced those writes.
-                    *semantic_budget = iteration_budget;
-                }
-                previous.summary_profile = summary_profile;
-                previous.reusable_root_summary_observation_rejections =
+                let maintenance = summaries.maintenance_metrics();
+                summary_profile = summary_profile.saturating_add(summaries.profile());
+                root_summary_observation_rejections = root_summary_observation_rejections
+                    .saturating_add(summaries.root_observation_rejections());
+                interpreted.reusable_root_summary_observation_rejections =
                     root_summary_observation_rejections;
-                previous.solver_attempts = solver_attempts;
-                previous.mark_feedback_fallback();
-                return Ok(previous);
+                interpreted.transaction_bar = persistence.bar();
+                let retained_publication_writes = summaries.take_retained_publication_writes();
+                break IterationOutcome {
+                    plan,
+                    interpreted,
+                    staged_budget: iteration_budget,
+                    maintenance,
+                    retained_publication_writes,
+                };
+            };
+            interpreted.reusable_summary_hits = interpreted
+                .reusable_summary_hits
+                .saturating_add(maintenance.hits);
+            interpreted.reusable_summary_misses = interpreted
+                .reusable_summary_misses
+                .saturating_add(maintenance.misses);
+            interpreted.published_summaries = interpreted
+                .published_summaries
+                .saturating_add(maintenance.publications);
+            interpreted.summary_profile = summary_profile;
+            interpreted.incomplete_evidence.feedback_iteration = iteration;
+            interpreted.solver_attempts = solver_attempts.clone();
+            if interpreted.semantic_budget_exhausted() || !interpreted.complete() {
+                if let Some(completed) = previous {
+                    let mut previous = completed.result;
+                    if publication_writes {
+                        // The returned result comes from an earlier feedback pass,
+                        // but this pass published cache state that later queries
+                        // can observe. Retain the work that produced those writes.
+                        *semantic_budget = iteration_budget;
+                    }
+                    previous.summary_profile = summary_profile;
+                    previous.reusable_root_summary_observation_rejections =
+                        root_summary_observation_rejections;
+                    previous.solver_attempts = solver_attempts;
+                    previous.mark_feedback_fallback();
+                    return Ok(previous);
+                }
+                *semantic_budget = iteration_budget;
+                return Ok(interpreted);
             }
             *semantic_budget = iteration_budget;
-            return Ok(interpreted);
+            let next_hints =
+                dispatch_hints.with_updates(dispatch_hint_updates(&plan, &interpreted));
+            if next_hints.digest() == dispatch_hints.digest()
+                || iteration + 1 == feedback_limits.max_iterations()
+            {
+                return Ok(interpreted);
+            }
+            previous = Some(CompletedIteration {
+                result: interpreted,
+                plan: solved_plan.expect("a continuing iteration retained the plan it solved"),
+            });
+            dispatch_hints = next_hints;
         }
-        *semantic_budget = iteration_budget;
-        let next_hints = dispatch_hints.with_updates(dispatch_hint_updates(&plan, &interpreted));
-        if next_hints.digest() == dispatch_hints.digest()
-            || iteration + 1 == feedback_limits.max_iterations()
-        {
-            return Ok(interpreted);
-        }
-        previous = Some(CompletedIteration {
-            result: interpreted,
-            plan: solved_plan.expect("a continuing iteration retained the plan it solved"),
-        });
-        dispatch_hints = next_hints;
+        unreachable!("FeedbackLimits requires at least one iteration")
     }
-    unreachable!("FeedbackLimits requires at least one iteration")
 }
 
 fn dispatch_hint_updates(plan: &TypeFlowPlan, result: &TypeFlowRootResult) -> Vec<DispatchHintSet> {
@@ -1312,10 +1391,13 @@ fn interpret(
     // carries a reason affects every class, so `member_store_evidence` answers
     // `Unknown` wherever it could apply. It is not a property of this root and
     // must not decide completion.
-    let value_flow_exhaustion = plan
+    // A required discovery input may have no reached solver boundary. Keep
+    // its operational stop alongside the solver's discharged public coverage.
+    let value_flow_status = plan
         .value_flow()
-        .public_semantic_status(result.result())
-        .budget_exceeded();
+        .discovery_status()
+        .merge(plan.value_flow().public_semantic_status(result.result()));
+    let value_flow_exhaustion = value_flow_status.budget_exceeded();
     // The lanes that stopped this root, kept typed so a consumer can name the
     // exact charge instead of re-running the solve under instrumentation.
     let mut lanes = Vec::new();
@@ -1325,6 +1407,11 @@ fn interpret(
         }
         SolverTermination::Cancelled => lanes.push(RootExhaustedLane::Cancelled),
         SolverTermination::FixedPoint => {}
+    }
+    if matches!(value_flow_status, SemanticInputStatus::Cancelled)
+        && !matches!(termination, SolverTermination::Cancelled)
+    {
+        lanes.push(RootExhaustedLane::Cancelled);
     }
     if plan.field_slot_semantic_exhausted() {
         lanes.push(RootExhaustedLane::Semantic {
@@ -2649,6 +2736,126 @@ mod retry_tests {
         MemberLookupHit,
     };
     use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon(
+        "#14127: required discovery stops disappeared from root quality without a reached solver boundary"
+    )]
+    fn retained_discovery_stop_survives_root_interpretation() {
+        use super::*;
+        use crate::analyzer::Language;
+        use crate::analyzer::semantic::{SemanticCapability, type_flow_adapter};
+        use crate::dataflow::SemanticInputStatus;
+
+        let exceeded = crate::test_support::procedure_budget_error(1, 2);
+        for status in [
+            SemanticInputStatus::ExceededBudget { exceeded },
+            SemanticInputStatus::Cancelled,
+            SemanticInputStatus::Complete,
+            SemanticInputStatus::Unknown,
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::ExceptionalControlFlow,
+            },
+        ] {
+            super::super::plan::with_discovery_quality_plan(
+                status,
+                |workspace, fields, root, plan| {
+                    if let Some(exceeded) = status.budget_exceeded() {
+                        assert_eq!(
+                            plan.value_flow().discovery_status().budget_exceeded(),
+                            Some(exceeded)
+                        );
+                    }
+                    if matches!(status, SemanticInputStatus::Cancelled) {
+                        assert_eq!(
+                            plan.value_flow().discovery_status(),
+                            SemanticInputStatus::Cancelled
+                        );
+                    }
+                    let cancellation = CancellationToken::default();
+                    let mut semantic = SemanticBudget::default();
+                    let mut solver = SolverBudget::default();
+                    let solved = solve_value_flow_with_summaries(
+                        root,
+                        &workspace.icfg_provider(),
+                        plan.value_flow(),
+                        &mut semantic,
+                        &mut DataflowRequest::new(&mut solver, &cancellation),
+                    )
+                    .expect("fixture solves");
+                    assert_eq!(solved.result().termination(), SolverTermination::FixedPoint);
+                    assert!(
+                        plan.value_flow()
+                            .public_semantic_status(solved.result())
+                            .budget_exceeded()
+                            .is_none(),
+                        "the operational stop must come from retained discovery: {solved:#?}"
+                    );
+                    let adapter = type_flow_adapter(Language::Python).expect("Python adapter");
+                    let interpreted =
+                        interpret(workspace, adapter, fields, root, plan, &solved, &[]);
+                    match status {
+                        SemanticInputStatus::ExceededBudget { exceeded } => {
+                            assert_eq!(
+                                interpreted.incomplete_evidence.lanes,
+                                vec![RootExhaustedLane::Semantic {
+                                    stage: SemanticExhaustionStage::ValueFlowSolve,
+                                    exceeded: Some(exceeded),
+                                }]
+                            );
+                            assert!(interpreted.semantic_budget_exhausted());
+                            assert_eq!(
+                                interpreted.persistence_status(),
+                                TypeFlowRootPersistenceStatus::Ineligible(
+                                    TypeFlowRootPersistenceRejection::SemanticBudget
+                                )
+                            );
+                        }
+                        SemanticInputStatus::Cancelled => {
+                            assert_eq!(
+                                interpreted.incomplete_evidence.lanes,
+                                vec![RootExhaustedLane::Cancelled]
+                            );
+                            assert!(!interpreted.complete());
+                            assert!(!interpreted.semantic_budget_exhausted());
+                            // A second cancellation source must not duplicate the lane.
+                            cancellation.cancel();
+                            let cancelled = solve_value_flow_with_summaries(
+                                root,
+                                &workspace.icfg_provider(),
+                                plan.value_flow(),
+                                &mut semantic,
+                                &mut DataflowRequest::new(&mut solver, &cancellation),
+                            )
+                            .expect("cancelled fixture returns its termination");
+                            assert_eq!(
+                                cancelled.result().termination(),
+                                SolverTermination::Cancelled
+                            );
+                            let interpreted =
+                                interpret(workspace, adapter, fields, root, plan, &cancelled, &[]);
+                            assert_eq!(
+                                interpreted.incomplete_evidence.lanes,
+                                vec![RootExhaustedLane::Cancelled]
+                            );
+                        }
+                        _ => {
+                            assert!(
+                                interpreted.incomplete_evidence.lanes.is_empty(),
+                                "{interpreted:#?}"
+                            );
+                            assert!(interpreted.complete());
+                            assert!(!interpreted.semantic_budget_exhausted());
+                            assert_eq!(
+                                interpreted.persistence_status(),
+                                TypeFlowRootPersistenceStatus::Eligible
+                            );
+                        }
+                    }
+                },
+            );
+        }
+    }
+
     #[test]
     #[hardwon(
         "dd9df356894c: The open-bound feedback fix in dd9df356894c pins that an exact class with open member evidence cannot close dispatch."

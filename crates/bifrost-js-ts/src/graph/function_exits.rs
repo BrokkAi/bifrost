@@ -35,15 +35,16 @@ pub(crate) struct FunctionBodyExits<'tree> {
 /// `None` means the exits are unknown: the body holds a parse error, which can
 /// hide a statement or replace part of one (a recovered `for` header reads as
 /// `for (;;)`), or a statement this walk does not model. `step` runs once for
-/// each statement visited, and its error stops the walk.
-pub(crate) fn function_body_exits<'tree, 'src, E>(
+/// each statement visited, and `false` from it (a cancelled request) stops the walk
+/// with unknown exits.
+pub(crate) fn function_body_exits<'tree, 'src>(
     body: Node<'tree>,
     source: &'src str,
-    mut step: impl FnMut() -> Result<(), E>,
-) -> Result<Option<FunctionBodyExits<'tree>>, E> {
+    mut step: impl FnMut() -> bool,
+) -> Option<FunctionBodyExits<'tree>> {
     debug_assert_eq!(body.kind(), "statement_block");
     if body.has_error() {
-        return Ok(None);
+        return None;
     }
     let mut completions: HashMap<usize, Completion<'tree, 'src>> = HashMap::default();
     let mut stack = vec![(body, false)];
@@ -53,9 +54,11 @@ pub(crate) fn function_body_exits<'tree, 'src, E>(
             completions.insert(node.id(), completion);
             continue;
         }
-        step()?;
+        if !step() {
+            return None;
+        }
         if !is_modeled(node.kind()) {
-            return Ok(None);
+            return None;
         }
         stack.push((node, true));
         stack.extend(parts(node).into_iter().rev().map(|part| (part, false)));
@@ -66,12 +69,12 @@ pub(crate) fn function_body_exits<'tree, 'src, E>(
     // A `break` or `continue` whose target is not inside the body is a syntax
     // error.
     if !body.breaks.is_empty() || !body.continues.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(FunctionBodyExits {
+    Some(FunctionBodyExits {
         returns: body.returns,
         falls_through: body.normal,
-    }))
+    })
 }
 
 /// How one statement can complete: `normal` says whether it can complete

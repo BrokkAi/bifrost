@@ -277,6 +277,25 @@ weights, and node scores are aggregated back to files. The score expresses
 relevance over analyzer evidence, without modeling execution order or general
 semantic importance.
 
+### Rust cross-file walk retention
+
+Rust import and binding walks keep settled intermediate values under the
+analyzer generation's existing `RustWalkCaches` memory budget. A finished
+walk can be Closed or Open with typed incomplete causes; a provisional cycle
+value is still in flight and is never retained. Failures and operational stops
+are not retained. File updates retire the generation owner, and a hit also
+requires the exact currently live reader binding. These entries do not grant
+reuse under a different reader transaction.
+
+A recursive group settles together. Each alias projects its own reachable
+completion causes from one shared immutable graph. The Open witness is the
+minimum full typed cause under a deterministic total order; the receipt digest
+covers the entire reachable cause set, including causes other than that
+witness. A hit restores its named reads, refusal channels and typed completion
+before exposing the value. An empty Open projection cannot establish absence.
+Stable incomplete inputs can still refuse policy-unit reuse: retaining the
+local walk value preserves and replays those refusal marks unchanged.
+
 ### Complete-value graph cache
 
 Workspace ranking graphs are snapshot-owned derived values. Their keys include

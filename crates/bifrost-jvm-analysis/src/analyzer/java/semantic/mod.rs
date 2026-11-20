@@ -83,6 +83,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (mut specs, mut initial_work, inventory_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
@@ -223,6 +224,7 @@ fn java_capabilities() -> SemanticCapabilities {
         .build()
 }
 
+mod constants;
 mod control;
 mod inventory;
 mod numeric;
@@ -332,14 +334,24 @@ struct CleanupRegion<'tree> {
 #[derive(Debug, Clone, Copy)]
 enum CleanupBody<'tree> {
     Statement(Node<'tree>),
-    OpaqueResource(Node<'tree>),
+    /// The implicit close of one try-with-resources resource. `statement` is
+    /// the try statement, which anchors the cleanup points, and `value` is the
+    /// resource's value expression, whose value the close releases.
+    OpaqueResource {
+        statement: Node<'tree>,
+        value: Node<'tree>,
+    },
     OpaqueMonitor(Node<'tree>),
 }
 
 impl<'tree> CleanupBody<'tree> {
     const fn source_node(self) -> Node<'tree> {
         match self {
-            Self::Statement(node) | Self::OpaqueResource(node) | Self::OpaqueMonitor(node) => node,
+            Self::Statement(node)
+            | Self::OpaqueResource {
+                statement: node, ..
+            }
+            | Self::OpaqueMonitor(node) => node,
         }
     }
 }
@@ -373,11 +385,16 @@ struct LoweringContext<'tree, 'targets> {
     type_name_roots: &'targets HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
     local_type_nodes: HashMap<ValueId, Node<'tree>>,
-    /// Effectively final `int` and `long` locals whose initializer is an
-    /// integer literal, with that value. Such a local holds the value at every
-    /// read, so a condition over these locals and literals can be decided at
-    /// lowering time (see `LoweringContext::constant_truth`).
-    constant_locals: HashMap<ValueId, numeric::JavaNumericLiteral>,
+    /// Effectively final `int`, `long`, `char`, `String` and `var` locals
+    /// whose initializer is a constant (see `constants::JavaConstant`), with
+    /// that value. Such a local holds the value at every read, so a condition
+    /// over these locals can be decided at lowering time (see
+    /// `LoweringContext::constant_truth`).
+    constant_locals: HashMap<ValueId, constants::JavaConstant>,
+    /// Locals with an initializer, in declaration order, that
+    /// `evaluate_constant_locals` tries once the writes are known: the value
+    /// binding, its declarator and its declared type.
+    constant_local_candidates: Vec<(ValueId, Node<'tree>, Option<Node<'tree>>)>,
     array_values: HashSet<ValueId>,
     non_null_values: HashSet<ValueId>,
     written_bindings: HashSet<ValueId>,
@@ -462,6 +479,7 @@ mod persistence_tests {
                 &prepared,
                 &SemanticBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
             )
             .unwrap()
         {
@@ -530,6 +548,220 @@ mod persistence_tests {
                 .any(|b| b.kind == CallControlKind::ExplicitCall
                     && b.disposition == CallControlDisposition::Represented)
         );
+    }
+
+    /// Call/control admission of every procedure named `f` in `source`.
+    fn admission_of_f(
+        source: &str,
+    ) -> Vec<Result<(), brokk_bifrost_semantic::analyzer::semantic::FootprintRefusal>> {
+        lower_call_control_fixture(source)
+            .iter()
+            .filter(|p| p.locator.declaration().last_segment_name() == Some("f"))
+            .map(|p| p.call_control_coverage.admission)
+            .collect()
+    }
+
+    /// `body` as the body of `R f(boolean c, R r)` beside a resource type `R`
+    /// and a helper type `A` with no initialization code.
+    fn direct_control_source(body: &str) -> String {
+        format!(
+            "class R {{ R() {{}} }} \
+             class A {{ static R open() {{ return null; }} static void close(R r) {{}} \
+             static void take(String s) {{}} static int n() {{ return 0; }} }} \
+             class C {{ R f(boolean c, R r) {{ {body} }} }}"
+        )
+    }
+
+    #[test]
+    fn direct_control_shapes_are_admitted() {
+        let mut failures = Vec::new();
+        for body in [
+            "R x = new R(); return x;",
+            "A.close(null); return null;",
+            "Ext.close(r); return r;",
+            "return new R();",
+            "if (c) { A.close(r); } return r;",
+            "if (r != null) { A.close(r); } return r;",
+            "if (null == r) { return r; } else { A.close(r); } return r;",
+            "try { A.take(\"s\"); } finally { A.close(r); } return r;",
+        ] {
+            let admission = admission_of_f(&direct_control_source(body));
+            if admission != vec![Ok(())] {
+                failures.push(format!("{body}: {admission:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn direct_control_refused_shapes_stay_refused() {
+        let mut failures = Vec::new();
+        for body in [
+            // A conversion that can box, unbox or cast. A method call result
+            // can need a caller-side checkcast the lowerer cannot rule out,
+            // because it never resolves the callee's declared return type
+            // (#14259).
+            "R x = open(); return x;",
+            "R x = A.open(); return x;",
+            "R x = Ext.open(); return x;",
+            "return A.open();",
+            "String s = A.name(); return r;",
+            "int x = A.n(); return null;",
+            "Object o = A.open(); return null;",
+            "Integer i = A.n(); return null;",
+            "Comparable<R> k = A.open(); return null;",
+            "var v = open(); return null;",
+            "R q[] = open(); return null;",
+            "java.util.List<R> l = open(); return null;",
+            "java.io.Closeable z = open(); return null;",
+            "Object o = new R(); return null;",
+            // Deferred execution, anonymous classes, array creation.
+            "A.take(() -> 1); return null;",
+            "A.take(R::toString); return null;",
+            "new R() {}; return null;",
+            "R[] a = new R[1]; return null;",
+            "new <String>R(); return null;",
+            "r.new Inner(); return null;",
+            "new R<String>(); return null;",
+            // A condition that unboxes or computes.
+            "Boolean b = null; if (b) { return r; } return null;",
+            "if (r.ok()) { return r; } return null;",
+            "if (c && r != null) { return r; } return null;",
+            "if (r == r) { return r; } return null;",
+            "String s = \"a\" + r; return null;",
+            // A receiver that may be a variable.
+            "x.close(); return null;",
+        ] {
+            let admission = admission_of_f(&direct_control_source(body));
+            if !matches!(admission.as_slice(), [Err(_)]) {
+                failures.push(format!("{body}: {admission:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[hardwon(
+        "#14259: a generic call result needing a caller checkcast was admitted without its ClassCastException edge"
+    )]
+    #[test]
+    fn generic_call_result_with_caller_checkcast_is_not_admitted() {
+        // `SB` is a non-generic subclass of `Box<String>`, so the caller's
+        // signature and locals are plain types the coverage admits. `b.get()`
+        // returns the erased `T`; javac checkcasts it to String in the caller,
+        // which a polluted box makes throw after the callee returned, and
+        // lowering has no edge for that cast. Only the call result reaching
+        // the String declarator may be refused.
+        let prelude = "class Box<T> { T get() { return null; } } class SB extends Box<String> {} ";
+        let admission = |body: &str| {
+            admission_of_f(&format!(
+                "{prelude}class C {{ String f() {{ SB b = null; {body} }} }}"
+            ))
+        };
+        // Control: the same shape without the call result is admitted, so the
+        // refusal below comes from the call result alone.
+        assert_eq!(
+            admission("String s = null; b.get(); return s;"),
+            vec![Ok(())]
+        );
+        let refused = admission("String s = b.get(); return s;");
+        assert!(matches!(refused.as_slice(), [Err(_)]), "{refused:?}");
+        // Control: `new R(..)` into its own type needs no cast and stays
+        // admitted. (An in-file supertype with its own initialization rules
+        // is refused by the class-initialization bound, not by this change.)
+        assert_eq!(
+            admission_of_f(&direct_control_source("R x = new R(); return x;")),
+            vec![Ok(())]
+        );
+    }
+
+    #[test]
+    fn direct_control_wrapper_returns_stay_refused() {
+        for (ret, body) in [
+            ("Integer", "return A.n();"),
+            ("Object", "return new R();"),
+            ("int", "return A.n();"),
+        ] {
+            let source = format!(
+                "class R {{}} class A {{ static int n() {{ return 0; }} }} \
+                 class C {{ {ret} f() {{ {body} }} }}"
+            );
+            assert!(
+                matches!(admission_of_f(&source).as_slice(), [Err(_)]),
+                "{ret} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_name_receiver_claim_respects_variables_and_initialization() {
+        let mut failures = Vec::new();
+        for (source, admitted) in [
+            // Control: a helper type without initialization code.
+            (
+                "class A { static void close() {} } class C { void f() { A.close(); } }",
+                true,
+            ),
+            // The type already executing is initialized.
+            (
+                "class C { static void own() {} void f() { C.own(); } }",
+                true,
+            ),
+            // A static initializer, static field initializer, enum constants
+            // or a superclass can run code at the call.
+            (
+                "class A { static { init(); } static void close() {} } class C { void f() { A.close(); } }",
+                false,
+            ),
+            (
+                "class A { static int n = g(); static void close() {} } class C { void f() { A.close(); } }",
+                false,
+            ),
+            (
+                "enum A { X; static void close() {} } class C { void f() { A.close(); } }",
+                false,
+            ),
+            (
+                "class B { static { init(); } } class A extends B { static void close() {} } class C { void f() { A.close(); } }",
+                false,
+            ),
+            (
+                "class A { static { init(); } } class C { void f() { new A(); } }",
+                false,
+            ),
+            (
+                "class B { static class Inner { static { init(); } } } class C extends B { void f() { new Inner(); } }",
+                false,
+            ),
+            (
+                "interface I { int X = init(); default void m() {} } class A implements I { static void close() {} } class C { void f() { A.close(); } }",
+                false,
+            ),
+            // A name that may be a field of a supertype, a static import, a
+            // local or a parameter.
+            (
+                "class A { static void close() {} } class B {} class C extends B { void f() { A.close(); } }",
+                false,
+            ),
+            (
+                "import static p.Q.A; class C { void f() { A.close(); } }",
+                false,
+            ),
+            (
+                "import static p.Q.*; class C { void f() { A.close(); } }",
+                false,
+            ),
+            ("class C { void f() { A a = null; a.close(); } }", true),
+            ("class C { void f(A A) { A.close(); } }", true),
+            ("class C { int A; void f() { A.close(); } }", false),
+        ] {
+            // `a.close()` on a local, and a parameter or field named like a
+            // type, are lexical or field reads, not type-name receivers; the
+            // admission there is decided by other claims.
+            if admission_of_f(source).iter().all(Result::is_ok) != admitted {
+                failures.push(format!("{source}: expected admitted={admitted}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
@@ -605,7 +837,13 @@ mod persistence_tests {
         let lowerer = JavaSemanticLowerer;
         let cancellation = CancellationToken::default();
         let parts = match lowerer
-            .lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &cancellation,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+            )
             .unwrap()
         {
             SemanticOutcome::Complete { value, .. } => value,

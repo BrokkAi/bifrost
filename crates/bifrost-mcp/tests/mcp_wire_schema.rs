@@ -20,10 +20,9 @@
 mod common;
 
 use brokk_bifrost_analysis::Language;
-use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-};
+use brokk_bifrost_mcp::benchmark_api::MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV;
 use common::InlineTestProject;
+use common::mcp_server::FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS;
 use common::mcp_wire::DrainedStderr;
 use jsonschema::Validator;
 use serde_json::{Value, json};
@@ -76,6 +75,25 @@ fn legacy_2025_11_25_stateful_session_emits_schema_valid_wire() {
             .as_array()
             .is_some_and(|tools| !tools.is_empty()),
         "{tools}"
+    );
+
+    let readiness = session.round_trip(json!({
+        "jsonrpc": "2.0", "id": "readiness", "method": "tools/call",
+        "params": {"name": "get_active_workspace", "arguments": {}}
+    }));
+    let probe = &readiness["result"]["structuredContent"];
+    assert!(probe["analyzer_ready"].is_boolean(), "{readiness}");
+    assert!(probe["retiring_workspaces"].is_array(), "{readiness}");
+    assert!(
+        probe["workspace_build"]["generation"].is_u64(),
+        "{readiness}"
+    );
+    assert!(
+        matches!(
+            probe["workspace_build"]["status"].as_str(),
+            Some("running" | "completed" | "failed")
+        ),
+        "{readiness}"
     );
 
     let resources = session.round_trip(json!({
@@ -504,16 +522,11 @@ impl WireSession {
     }
 
     fn spawn(revision: &'static str, mut command: Command) -> Self {
-        // A wire-schema test asserts message shape, not cold-start latency.
-        // Left at the production default, a first call made during the
-        // workspace build is held to COLD_WORKSPACE_REQUEST_BUDGET (4.5s), so
-        // suite saturation would fail a schema assertion for box load. Two
-        // tests prove the cold-start claim deliberately instead, on a reserved
-        // machine -- see `apply_test_request_budget` in
-        // `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
+        // Functional calls retry typed initial preparation in round_trip;
+        // this budget bounds their subsequent analyzer execution.
         command.env(
             MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-            BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+            FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS.to_string(),
         );
         let mut child = command
             .stdin(Stdio::piped())
@@ -559,8 +572,21 @@ impl WireSession {
     }
 
     fn round_trip(&mut self, message: Value) -> Value {
-        self.send(message);
-        self.recv()
+        let watchdog = Instant::now() + Duration::from_secs(120);
+        loop {
+            self.send(message.clone());
+            let response = self.recv();
+            if response["result"]["_meta"]["io.bifrost/incomplete"]["completion"]["reasons"]
+                != json!(["workspace_not_ready"])
+            {
+                return response;
+            }
+            assert!(
+                Instant::now() < watchdog,
+                "workspace never ready: {response}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn record(&mut self, direction: Direction, message: Value) {
@@ -604,13 +630,20 @@ impl WireSession {
     /// while already bound provokes no request, so this peeks at the method
     /// rather than assuming an exchange happens.
     fn call_answering_roots(&mut self, request: Value, roots_result: Value) -> Value {
-        self.send(request);
+        self.send(request.clone());
         let message = self.recv();
         if message["method"] != "roots/list" {
             return message;
         }
         self.send(json!({ "jsonrpc": "2.0", "id": message["id"], "result": roots_result }));
-        self.recv()
+        let response = self.recv();
+        if response["result"]["_meta"]["io.bifrost/incomplete"]["completion"]["reasons"]
+            == json!(["workspace_not_ready"])
+        {
+            self.round_trip(request)
+        } else {
+            response
+        }
     }
 
     /// Read until the response for `id` arrives, returning the

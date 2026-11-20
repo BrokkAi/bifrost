@@ -2,6 +2,7 @@
 mod rust_indirect_table_tests {
 
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_analysis::analyzer::workspace_authority::QueryEvidenceReadRecorder;
 
     use brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots;
 
@@ -50,11 +51,14 @@ mod rust_indirect_table_tests {
                 .dependency_file_evidence(
                     &WorkspaceSnapshots::from_iter([("rust".into(), snapshot)]),
                     brokk_bifrost_core::analyzer::Language::Rust,
+                    &QueryEvidenceReadRecorder,
                 )
                 .unwrap()
         };
         let first_selection = WorkspaceSnapshots::from_iter([("rust".into(), first.clone())]);
-        let old_locations = store.dependency_file_locations(&first_selection).unwrap();
+        let old_locations = store
+            .dependency_file_locations(&first_selection, &QueryEvidenceReadRecorder)
+            .unwrap();
         let before = read(first.clone());
         let after = read(second);
         assert_eq!(old_locations.len(), before.rows.len());
@@ -78,7 +82,9 @@ mod rust_indirect_table_tests {
         assert!(old_location.start_line > 1);
         assert_eq!(
             old_locations,
-            store.dependency_file_locations(&first_selection).unwrap()
+            store
+                .dependency_file_locations(&first_selection, &QueryEvidenceReadRecorder)
+                .unwrap()
         );
         assert!(
             before

@@ -19,6 +19,10 @@ use tree_sitter::Parser;
 /// The queries decode this table positionally from one shared column
 /// list, so a round trip that exercises only one does not cover the
 /// other readers.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 pub fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
     adapter: &A,
     lang: &str,
@@ -519,9 +523,7 @@ pub fn assert_prior_parsed_blob_invalidated<A: LanguageAdapter>(
             .unwrap()
     );
 
-    let current_generation = store
-        .ensure_language_epoch(language, &adapter.parser_language())
-        .unwrap();
+    let current_generation = store.ensure_language_epoch(adapter).unwrap();
 
     assert_ne!(current_generation, prior_generation);
     assert!(

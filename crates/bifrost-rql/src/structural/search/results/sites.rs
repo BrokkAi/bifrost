@@ -134,6 +134,10 @@ pub struct CodeQueryCallSite {
     pub caller_parameter_identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<CodeQueryRange>,
+    /// The receiver expression as a site: its source, role and constant value.
+    /// Present exactly when `receiver` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_site: Option<brokk_bifrost_tools::site_context::SiteContextView>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]
     pub arguments: Vec<CodeQueryCallArgument>,
@@ -161,6 +165,8 @@ pub struct CodeQueryCallArgument {
     pub identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_parameter_identity: Option<String>,
+    /// The written actual as a site: its source, role and constant value.
+    pub site: brokk_bifrost_tools::site_context::SiteContextView,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -169,7 +175,10 @@ pub struct CodeQueryExpressionSite {
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
-    pub text: String,
+    pub text: brokk_bifrost_core::admitted_text::AdmittedText,
+    /// The expression as a site: its source, role (`receiver` or the written
+    /// `argument`) and constant value.
+    pub site: brokk_bifrost_tools::site_context::SiteContextView,
     pub input_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameter_index: Option<usize>,
@@ -336,6 +345,61 @@ pub struct CodeQueryFieldWriteValue {
     pub proof: &'static str,
     pub completeness: &'static str,
     pub coverage: &'static str,
+}
+
+/// One modeled write to a field declaration: a store event of the production
+/// semantic IR whose member is the seed field.
+///
+/// `site` is the whole write (`m.count = 1`, the initializer `count: 1`);
+/// its value is the stored value when that is a literal. `value_site` is the
+/// stored expression itself, with role `value`. It is present for `f: expr`,
+/// the shorthand `Foo { f }` (the `f` identifier) and `m.f = expr`. It is
+/// absent for a compound assignment (`m.count += 1`) and for a struct
+/// functional update (`..base`), where the stored value is not one source
+/// node.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryFieldWrite {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The write site's source range, copied flat so policies can filter on it.
+    pub range: CodeQueryRange,
+    /// Stable declaration id of the seed field.
+    pub field_id: String,
+    pub member_fq_name: String,
+    /// Fully qualified name of the enclosing callable.
+    pub enclosing: String,
+    pub procedure_id: String,
+    pub program_point_id: String,
+    pub site: brokk_bifrost_tools::site_context::SiteContextView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_site: Option<brokk_bifrost_tools::site_context::SiteContextView>,
+    pub proof: &'static str,
+    pub completeness: &'static str,
+    pub strong_update: bool,
+}
+
+/// One modeled read of a field declaration: a load event of the production
+/// semantic IR whose member is the seed field.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryFieldRead {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The read site's source range, copied flat so policies can filter on it.
+    pub range: CodeQueryRange,
+    /// Stable declaration id of the seed field.
+    pub field_id: String,
+    pub member_fq_name: String,
+    /// Fully qualified name of the enclosing callable.
+    pub enclosing: String,
+    pub procedure_id: String,
+    pub program_point_id: String,
+    pub site: brokk_bifrost_tools::site_context::SiteContextView,
+    pub proof: &'static str,
+    pub completeness: &'static str,
 }
 
 /// One exact activation-aware runtime keyed read. Endpoint rows carry the
@@ -988,8 +1052,10 @@ pub struct CodeQueryCallShapeArgument {
     /// Decoded value when this positional argument is a string literal.
     /// Dynamic and non-string arguments remain `None`.
     #[serde(skip)]
-    pub literal_value: Option<String>,
+    pub literal_value: Option<brokk_bifrost_core::admitted_text::AdmittedText>,
     pub spread: bool,
+    /// The written argument as a site: its source, role and constant value.
+    pub site: brokk_bifrost_tools::site_context::SiteContextView,
 }
 
 /// One normalized actual-to-formal binding of one exact call site (#2438).
@@ -1041,7 +1107,14 @@ pub struct CodeQueryCallBinding {
     /// Decoded string value of a direct literal actual, when the structural
     /// facts adapter publishes one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub literal_value: Option<String>,
+    pub literal_value: Option<brokk_bifrost_core::admitted_text::AdmittedText>,
+    /// The written expression this row binds, as a site: its source, role and
+    /// constant value. Absent exactly when the row has no written expression
+    /// at the call site: a terminal row, a defaulted formal, a missing
+    /// required formal, or an implicit receiver. Never absent to mean an
+    /// unknown value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<brokk_bifrost_tools::site_context::SiteContextView>,
     /// Correlation identity for a lexical binding or direct decoded literal.
     /// The value carries a disjoint domain prefix and is only published when
     /// the corresponding structural identity is complete.

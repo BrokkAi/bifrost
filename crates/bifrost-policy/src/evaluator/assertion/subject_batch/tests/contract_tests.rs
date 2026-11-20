@@ -38,7 +38,7 @@ fn incomplete_subject_product_cannot_mask_a_complete_followup() {
         workspace.analyzer(),
         None,
         |retained| &mut retained.subjects,
-        ("subject".to_string(), false),
+        ("subject".to_string(), false, None),
         || Arc::clone(&incomplete),
     );
     assert!(matches!(
@@ -49,7 +49,7 @@ fn incomplete_subject_product_cannot_mask_a_complete_followup() {
         workspace.analyzer(),
         None,
         |retained| &mut retained.subjects,
-        ("subject".to_string(), false),
+        ("subject".to_string(), false, None),
         || Arc::clone(&complete),
     );
     assert!(matches!(second.completion, CodeQueryCompletion::Complete));
@@ -263,7 +263,7 @@ fn subject_product_is_never_reused_across_the_depth_opt_in_bit() {
             workspace.analyzer(),
             None,
             |retained| &mut retained.subjects,
-            ("subject".to_string(), depth_opt_in),
+            ("subject".to_string(), depth_opt_in, None),
             || {
                 executions.fetch_add(1, Ordering::SeqCst);
                 rows()

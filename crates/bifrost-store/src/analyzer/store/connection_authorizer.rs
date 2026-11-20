@@ -107,6 +107,47 @@ pub(super) fn without_member_blob_reads<T>(conn: &Connection, derive: impl FnOnc
     derive()
 }
 
+/// Add a test assertion without replacing the sealed-family owner's guard.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn with_test_authorizer<T>(
+    conn: &mut Connection,
+    authorize: impl for<'a> FnMut(AuthContext<'a>) -> Authorization + Send + 'static,
+    action: impl FnOnce(&mut Connection) -> T,
+) -> T {
+    let previous =
+        connection_tag(conn).and_then(|tag| with_state(|state| state.guards.get(&tag).cloned()));
+    let inherited = previous.clone();
+    let mut authorize = authorize;
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if let Some(guard) = &inherited
+            && guard(context) == Authorization::Deny
+        {
+            return Authorization::Deny;
+        }
+        authorize(context)
+    }))
+    .expect("install test write authorizer");
+    struct Restore<'a> {
+        conn: &'a mut Connection,
+        previous: Option<Guard>,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            if let Some(guard) = self.previous.take() {
+                install_guard(self.conn, guard).expect("restore writer authorizer");
+            } else {
+                self.conn
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .expect("remove test writer authorizer");
+            }
+        }
+    }
+    let restore = Restore { conn, previous };
+    let value = action(restore.conn);
+    drop(restore);
+    value
+}
+
 /// Functions whose value is a function of their SQL arguments alone, so a
 /// statement that calls them reads nothing beyond its recorded tables. Any
 /// other function (`random()`, `changes()`, the date and time functions, which

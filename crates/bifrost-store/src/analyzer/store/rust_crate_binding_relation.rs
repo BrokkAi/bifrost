@@ -77,7 +77,8 @@ CREATE TEMP VIEW IF NOT EXISTS cr_binding_rankless_conflicts AS
  SELECT node.node FROM cr_binding_nodes node
  CROSS JOIN cr_binding_owners owner ON owner.owner=node.owner
  CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
- JOIN cr_exports declaration ON declaration.crate_key=owner.crate_key
+ -- Namespace-specific: stay on the primary key, not the gap probes' partial cr_exports_name index.
+ JOIN cr_exports declaration INDEXED BY sqlite_autoindex_cr_exports_1 ON declaration.crate_key=owner.crate_key
  AND declaration.module_path=owner.module_path AND declaration.namespace=node.namespace
  AND declaration.name=node.name AND declaration.origin='declaration'
  WHERE owner.blob_id=0 AND owner.binder_scope=0
@@ -133,6 +134,24 @@ CREATE TEMP TABLE IF NOT EXISTS cr_binding_path_complete(
  blob_id INTEGER NOT NULL, import_ordinal INTEGER NOT NULL, module_path TEXT NOT NULL,
  position INTEGER NOT NULL,
  PRIMARY KEY(blob_id,import_ordinal,module_path,position)) WITHOUT ROWID;
+-- Completion queues contain proof keys, not endpoint deltas. A target can
+-- close long after the path that first requested its name was discovered.
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_path_dirty(
+ blob_id INTEGER NOT NULL,import_ordinal INTEGER NOT NULL,module_path TEXT NOT NULL,position INTEGER NOT NULL,
+ PRIMARY KEY(blob_id,import_ordinal,module_path,position)) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_path_work(
+ blob_id INTEGER NOT NULL,import_ordinal INTEGER NOT NULL,module_path TEXT NOT NULL,position INTEGER NOT NULL,
+ PRIMARY KEY(blob_id,import_ordinal,module_path,position)) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_import_dirty(
+ blob_id INTEGER NOT NULL,import_ordinal INTEGER NOT NULL,module_path TEXT NOT NULL,
+ PRIMARY KEY(blob_id,import_ordinal,module_path)) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_import_work(
+ blob_id INTEGER NOT NULL,import_ordinal INTEGER NOT NULL,module_path TEXT NOT NULL,
+ PRIMARY KEY(blob_id,import_ordinal,module_path)) WITHOUT ROWID;
+CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_prefix_completed AFTER INSERT ON cr_binding_path_complete BEGIN
+ INSERT OR IGNORE INTO cr_binding_path_dirty VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path,NEW.position);
+ INSERT OR IGNORE INTO cr_binding_import_dirty VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path);
+END;
 CREATE TEMP TABLE IF NOT EXISTS cr_binding_segments(
  blob_id INTEGER NOT NULL,import_ordinal INTEGER NOT NULL,ordinal INTEGER NOT NULL,segment TEXT NOT NULL,
  PRIMARY KEY(blob_id,import_ordinal,ordinal)) WITHOUT ROWID;
@@ -222,6 +241,20 @@ CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_new_path AFTER INSERT ON cr_binding
  DO UPDATE SET declaration_blob_id=excluded.declaration_blob_id,declaration_site=excluded.declaration_site,
  origin=excluded.origin,visibility=excluded.visibility,restricted_module_path=excluded.restricted_module_path;
 END;
+-- A named import shadows every glob of its name in a namespace where it
+-- binds nothing, once it is settled in that namespace, whenever it binds the
+-- name in some other namespace. An import that binds nothing in any namespace
+-- is an error in rustc: its name stays bound to the failed import and never to
+-- a glob or the extern prelude. It therefore leaves no row here and keeps
+-- shadowing.
+CREATE TEMP VIEW IF NOT EXISTS cr_binding_import_releases_namespace AS
+ SELECT done.blob_id,done.import_ordinal,done.module_path,done.namespace FROM cr_binding_import_complete done
+ WHERE NOT EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=done.blob_id
+ AND present.import_ordinal=done.import_ordinal AND present.module_path=done.module_path AND present.namespace=done.namespace)
+ AND EXISTS(SELECT 1 FROM cr_binding_import_present resolved WHERE resolved.blob_id=done.blob_id
+ AND resolved.import_ordinal=done.import_ordinal AND resolved.module_path=done.module_path);
+-- A glob endpoint waits for the import to be absent in its namespace. That
+-- happens when the import completes there or when it first binds elsewhere.
 CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_named_determined AFTER INSERT ON cr_binding_import_complete BEGIN
  INSERT INTO cr_binding_delta_next
  SELECT target.* FROM cr_binding_imports source
@@ -229,7 +262,24 @@ CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_named_determined AFTER INSERT ON cr
  CROSS JOIN cr_binding_targets target ON target.owner=glob.target_owner
  AND target.namespace=NEW.namespace AND target.name=source.bound_name
  WHERE source.blob_id=NEW.blob_id AND source.import_ordinal=NEW.import_ordinal
- AND source.module_path=NEW.module_path AND source.is_glob=0 ON CONFLICT(owner,namespace,name,target_crate_key,target_module_path,target_name)
+ AND source.module_path=NEW.module_path AND source.is_glob=0
+ AND EXISTS(SELECT 1 FROM cr_binding_import_releases_namespace absent WHERE absent.blob_id=NEW.blob_id
+ AND absent.import_ordinal=NEW.import_ordinal AND absent.module_path=NEW.module_path AND absent.namespace=NEW.namespace)
+ ON CONFLICT(owner,namespace,name,target_crate_key,target_module_path,target_name)
+ DO UPDATE SET declaration_blob_id=excluded.declaration_blob_id,declaration_site=excluded.declaration_site,
+ origin=excluded.origin,visibility=excluded.visibility,restricted_module_path=excluded.restricted_module_path;
+END;
+CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_named_resolved AFTER INSERT ON cr_binding_import_present BEGIN
+ INSERT INTO cr_binding_delta_next
+ SELECT target.* FROM cr_binding_imports source
+ CROSS JOIN cr_binding_import_releases_namespace absent ON absent.blob_id=source.blob_id
+ AND absent.import_ordinal=source.import_ordinal AND absent.module_path=source.module_path
+ CROSS JOIN cr_binding_globs glob ON glob.owner=source.owner
+ CROSS JOIN cr_binding_targets target ON target.owner=glob.target_owner
+ AND target.namespace=absent.namespace AND target.name=source.bound_name
+ WHERE source.blob_id=NEW.blob_id AND source.import_ordinal=NEW.import_ordinal
+ AND source.module_path=NEW.module_path AND source.is_glob=0
+ ON CONFLICT(owner,namespace,name,target_crate_key,target_module_path,target_name)
  DO UPDATE SET declaration_blob_id=excluded.declaration_blob_id,declaration_site=excluded.declaration_site,
  origin=excluded.origin,visibility=excluded.visibility,restricted_module_path=excluded.restricted_module_path;
 END;
@@ -247,13 +297,27 @@ CREATE TEMP TABLE IF NOT EXISTS cr_binding_name_next AS SELECT * FROM cr_binding
 CREATE TEMP TABLE IF NOT EXISTS cr_binding_lookup_new AS SELECT * FROM cr_binding_lookups WHERE 0;
 CREATE INDEX IF NOT EXISTS cr_binding_name_delta_owner ON cr_binding_name_delta(owner,namespace,name);
 CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_path_queued AFTER INSERT ON cr_binding_paths BEGIN
+ INSERT OR IGNORE INTO cr_binding_path_dirty VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path,NEW.position);
+ INSERT OR IGNORE INTO cr_binding_import_dirty VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path);
  INSERT INTO cr_binding_path_next VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path,NEW.position,NEW.owner);
 END;
 CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_name_queued AFTER INSERT ON cr_binding_names BEGIN
  INSERT INTO cr_binding_name_next VALUES(NEW.owner,NEW.namespace,NEW.name);
 END;
 CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_lookup_queued AFTER INSERT ON cr_binding_lookups BEGIN
+ INSERT OR IGNORE INTO cr_binding_path_dirty VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path,NEW.position);
+ INSERT OR IGNORE INTO cr_binding_import_dirty VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path);
  INSERT INTO cr_binding_lookup_new VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path,NEW.position,NEW.owner,NEW.namespace,NEW.name);
+END;
+CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_target_completed AFTER INSERT ON cr_binding_complete BEGIN
+ INSERT OR IGNORE INTO cr_binding_path_dirty
+ SELECT lookup.blob_id,lookup.import_ordinal,lookup.module_path,lookup.position
+ FROM cr_binding_lookups lookup INDEXED BY cr_binding_lookups_target
+ WHERE lookup.owner=NEW.owner AND lookup.namespace=NEW.namespace AND lookup.name=NEW.name;
+ INSERT OR IGNORE INTO cr_binding_import_dirty
+ SELECT lookup.blob_id,lookup.import_ordinal,lookup.module_path
+ FROM cr_binding_lookups lookup INDEXED BY cr_binding_lookups_target
+ WHERE lookup.owner=NEW.owner AND lookup.namespace=NEW.namespace AND lookup.name=NEW.name;
 END;
 CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_glob_names AFTER INSERT ON cr_binding_globs BEGIN
  INSERT INTO cr_binding_names SELECT * FROM (
@@ -282,10 +346,8 @@ CREATE TEMP VIEW IF NOT EXISTS cr_binding_prelude_reads(blob_id,import_ordinal,m
  AND NOT EXISTS(SELECT 1 FROM cr_binding_imports blocker
  WHERE blocker.owner=COALESCE(mask.base_owner,lookup.owner) AND blocker.bound_name=lookup.name AND blocker.is_glob=0
  AND (mask.owner IS NULL OR blocker.blob_id<>mask.blob_id OR blocker.import_ordinal<>mask.import_ordinal OR blocker.module_path<>mask.module_path)
- AND (NOT EXISTS(SELECT 1 FROM cr_binding_import_complete done WHERE done.blob_id=blocker.blob_id
- AND done.import_ordinal=blocker.import_ordinal AND done.module_path=blocker.module_path AND done.namespace='type')
- OR EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=blocker.blob_id
- AND present.import_ordinal=blocker.import_ordinal AND present.module_path=blocker.module_path AND present.namespace='type')));
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_import_releases_namespace absent WHERE absent.blob_id=blocker.blob_id
+ AND absent.import_ordinal=blocker.import_ordinal AND absent.module_path=blocker.module_path AND absent.namespace='type'));
 CREATE TEMP VIEW IF NOT EXISTS cr_binding_delta_reads AS
  SELECT lookup.blob_id,lookup.import_ordinal,lookup.module_path,lookup.position,target.*
  FROM cr_binding_delta target CROSS JOIN cr_binding_lookups lookup INDEXED BY cr_binding_lookups_target
@@ -357,6 +419,8 @@ DELETE FROM cr_binding_path_next;
 DELETE FROM cr_binding_name_delta;
 DELETE FROM cr_binding_name_next;
 DELETE FROM cr_binding_lookup_new;
+DELETE FROM cr_binding_path_dirty; DELETE FROM cr_binding_path_work;
+DELETE FROM cr_binding_import_dirty; DELETE FROM cr_binding_import_work;
 ";
 
 pub(super) const OWNERS_SQL: &str = "INSERT INTO cr_binding_owners(
@@ -614,12 +678,22 @@ pub(super) fn components(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Both completion statements run every pass. The first test skips rows an
-// earlier pass already settled, so each pass pays the proof only for open rows.
+// Drain snapshots separately: a newly completed prefix can settle an import
+// in this pass, while its next prefix must wait until the next path pass.
+// Notifications raised while stepping a completion statement stay queued.
+pub(super) const ADVANCE_PATH_COMPLETION_SQL: &str = "DELETE FROM cr_binding_path_work;
+INSERT INTO cr_binding_path_work SELECT * FROM cr_binding_path_dirty;
+DELETE FROM cr_binding_path_dirty;";
+pub(super) const ADVANCE_IMPORT_COMPLETION_SQL: &str = "DELETE FROM cr_binding_import_work;
+INSERT INTO cr_binding_import_work SELECT * FROM cr_binding_import_dirty;
+DELETE FROM cr_binding_import_dirty;";
 pub(super) const PATH_COMPLETE_SQL: &str = "INSERT INTO cr_binding_path_complete
  SELECT * FROM (
 SELECT done.blob_id,done.import_ordinal,done.module_path,done.position+1
- FROM cr_binding_path_complete done CROSS JOIN cr_binding_segments segment
+ FROM cr_binding_path_work dirty
+ CROSS JOIN cr_binding_path_complete done ON done.blob_id=dirty.blob_id
+ AND done.import_ordinal=dirty.import_ordinal AND done.module_path=dirty.module_path AND done.position=dirty.position
+ CROSS JOIN cr_binding_segments segment
  ON segment.blob_id=done.blob_id AND segment.import_ordinal=done.import_ordinal AND segment.ordinal=done.position
  WHERE NOT EXISTS(SELECT 1 FROM cr_binding_path_complete next WHERE next.blob_id=done.blob_id
  AND next.import_ordinal=done.import_ordinal AND next.module_path=done.module_path AND next.position=done.position+1)
@@ -629,10 +703,14 @@ SELECT done.blob_id,done.import_ordinal,done.module_path,done.position+1
  AND target.namespace=lookup.namespace AND target.name=lookup.name))
 ) WHERE true ON CONFLICT DO NOTHING";
 
+// Preserve the old covering-index and namespace traversal when emitting the
+// dirty subset: insertion order also orders downstream diagnostic evidence.
 pub(super) const IMPORT_COMPLETE_SQL: &str = "INSERT INTO cr_binding_import_complete
  SELECT * FROM (
 SELECT source.blob_id,source.import_ordinal,source.module_path,namespace.value
- FROM cr_binding_imports source CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace
+ FROM cr_binding_import_work dirty CROSS JOIN cr_binding_imports source
+ ON source.blob_id=dirty.blob_id AND source.import_ordinal=dirty.import_ordinal AND source.module_path=dirty.module_path
+ CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace
  CROSS JOIN cr_binding_path_complete done ON done.blob_id=source.blob_id AND done.import_ordinal=source.import_ordinal
  AND done.module_path=source.module_path AND done.position=source.segments
  WHERE NOT EXISTS(SELECT 1 FROM cr_binding_import_complete settled WHERE settled.blob_id=source.blob_id
@@ -644,6 +722,7 @@ SELECT source.blob_id,source.import_ordinal,source.module_path,namespace.value
  AND lookup.module_path=source.module_path AND lookup.position=source.segments AND lookup.namespace=namespace.value
  AND NOT EXISTS(SELECT 1 FROM cr_binding_complete target WHERE target.owner=lookup.owner
  AND target.namespace=lookup.namespace AND target.name=lookup.name)))
+ ORDER BY source.segments,source.imported_name,source.is_glob,source.blob_id,source.import_ordinal,source.module_path,namespace.key
 ) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const DECLARATION_COMPLETE_SQL: &str = "INSERT INTO cr_binding_complete
@@ -1189,6 +1268,11 @@ SELECT * FROM cr_authority_local_seeds
                 if sql == FOREIGN_SQL || sql == FOREIGN_CONFLICT_SQL || sql == FOREIGN_ROOT_SQL {
                     super::summary_equality_probes::capture(conn, sql)?;
                 }
+                if sql == PATH_COMPLETE_SQL {
+                    conn.execute_batch(ADVANCE_PATH_COMPLETION_SQL)?;
+                } else if sql == IMPORT_COMPLETE_SQL {
+                    conn.execute_batch(ADVANCE_IMPORT_COMPLETION_SQL)?;
+                }
                 let (written, _steps) = super::execute_with_vm_steps(conn, sql, [])?;
                 added += written;
                 edge_inputs_changed |= writes_edge_input && written > 0;
@@ -1435,10 +1519,8 @@ SELECT destination.owner,opened.namespace,COALESCE(source.bound_name,name.name),
  AND NOT EXISTS(SELECT 1 FROM cr_binding_imports named WHERE named.owner=source.owner
  AND named.is_glob=0 AND named.bound_name=name.name
  AND (mask.owner IS NULL OR named.blob_id<>mask.blob_id OR named.import_ordinal<>mask.import_ordinal OR named.module_path<>mask.module_path)
- AND (NOT EXISTS(SELECT 1 FROM cr_binding_import_complete complete WHERE complete.blob_id=named.blob_id
- AND complete.import_ordinal=named.import_ordinal AND complete.module_path=named.module_path AND complete.namespace=name.namespace)
- OR EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=named.blob_id
- AND present.import_ordinal=named.import_ordinal AND present.module_path=named.module_path AND present.namespace=name.namespace))))
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_import_releases_namespace absent WHERE absent.blob_id=named.blob_id
+ AND absent.import_ordinal=named.import_ordinal AND absent.module_path=named.module_path AND absent.namespace=name.namespace)))
  UNION
  SELECT name.owner,name.namespace,name.name,'workspace_local'
  FROM cr_binding_names name CROSS JOIN cr_binding_inventory_openness opened
@@ -1721,10 +1803,8 @@ SELECT name.owner,name.namespace,name.name,
  AND NOT EXISTS(SELECT 1 FROM cr_binding_targets item WHERE item.owner=name.owner AND item.namespace=name.namespace
  AND item.name=name.name AND item.origin IN ('declaration','reexport'))
  AND NOT EXISTS(SELECT 1 FROM cr_binding_imports named WHERE named.owner=name.owner AND named.is_glob=0 AND named.bound_name=name.name
- AND (NOT EXISTS(SELECT 1 FROM cr_binding_import_complete done WHERE done.blob_id=named.blob_id AND done.import_ordinal=named.import_ordinal
- AND done.module_path=named.module_path AND done.namespace=name.namespace)
- OR EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=named.blob_id AND present.import_ordinal=named.import_ordinal
- AND present.module_path=named.module_path AND present.namespace=name.namespace)))
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_import_releases_namespace absent WHERE absent.blob_id=named.blob_id AND absent.import_ordinal=named.import_ordinal
+ AND absent.module_path=named.module_path AND absent.namespace=name.namespace))
 ) WHERE true ON CONFLICT DO NOTHING";
 
 #[cfg(test)]
@@ -1732,6 +1812,99 @@ mod edge_input_tests {
     use super::*;
     use crate::analyzer::store::AnalyzerStore;
     use std::collections::BTreeSet;
+
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#12898: completed prefixes were rescanned quadratically along long import paths")]
+    fn completion_path_chain_vm_steps_scale_with_dirty_prefixes() {
+        let mut measurements = Vec::new();
+        for length in [256_i64, 512] {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            super::super::prepare_tables(&conn).unwrap();
+            conn.execute("INSERT INTO cr_binding_imports VALUES(1,0,'crate',1,0,'item','item','private',NULL,?1)", [length]).unwrap();
+            for position in 0..length {
+                conn.execute(
+                    "INSERT INTO cr_binding_segments VALUES(1,0,?1,'segment')",
+                    [position],
+                )
+                .unwrap();
+            }
+            conn.execute(SEED_PATH_COMPLETE_SQL, []).unwrap();
+            let mut steps = 0_u64;
+            for _ in 0..=length + 1 {
+                conn.execute_batch(ADVANCE_PATH_COMPLETION_SQL).unwrap();
+                let (paths, path_steps) =
+                    super::super::execute_with_vm_steps(&conn, PATH_COMPLETE_SQL, []).unwrap();
+                conn.execute_batch(ADVANCE_IMPORT_COMPLETION_SQL).unwrap();
+                let (imports, import_steps) =
+                    super::super::execute_with_vm_steps(&conn, IMPORT_COMPLETE_SQL, []).unwrap();
+                steps += path_steps + import_steps;
+                if paths + imports == 0 {
+                    break;
+                }
+            }
+            let prefixes: i64 = conn
+                .query_row("SELECT count(*) FROM cr_binding_path_complete", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let completed: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM cr_binding_import_complete",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                prefixes,
+                length + 1,
+                "vacuous prefixes close without lookups"
+            );
+            assert_eq!(completed, 3, "the terminal import closes in all namespaces");
+            eprintln!("completion-path-scale length={length} vm_steps={steps}");
+            measurements.push(steps);
+        }
+        assert!(
+            measurements[1] < measurements[0] * 5 / 2,
+            "doubling a path must not quadruple completion VM steps: {measurements:?}"
+        );
+    }
+
+    #[test]
+    fn completion_notifies_waiting_prefixes_after_target_closure() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        super::super::prepare_tables(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cr_binding_imports VALUES(1,0,'crate',1,0,'item','item','private',NULL,1);
+            INSERT INTO cr_binding_segments VALUES(1,0,0,'segment');
+            INSERT INTO cr_binding_lookups VALUES(1,0,'crate',0,7,'type','segment');
+            INSERT INTO cr_binding_lookups VALUES(1,0,'crate',1,8,'value','item');",
+        )
+        .unwrap();
+        conn.execute(SEED_PATH_COMPLETE_SQL, []).unwrap();
+        conn.execute_batch(ADVANCE_PATH_COMPLETION_SQL).unwrap();
+        assert_eq!(conn.execute(PATH_COMPLETE_SQL, []).unwrap(), 0);
+        // No new paths or lookups: only completion of the old requested name.
+        conn.execute(
+            "INSERT INTO cr_binding_complete VALUES(7,'type','segment')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(ADVANCE_PATH_COMPLETION_SQL).unwrap();
+        assert_eq!(conn.execute(PATH_COMPLETE_SQL, []).unwrap(), 1);
+        conn.execute_batch(ADVANCE_IMPORT_COMPLETION_SQL).unwrap();
+        assert_eq!(conn.execute(IMPORT_COMPLETE_SQL, []).unwrap(), 2);
+        conn.execute(
+            "INSERT INTO cr_binding_complete VALUES(8,'value','item')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(ADVANCE_IMPORT_COMPLETION_SQL).unwrap();
+        assert_eq!(conn.execute(IMPORT_COMPLETE_SQL, []).unwrap(), 1);
+    }
 
     /// The tables a statement reads and writes, as SQLite reports them while
     /// compiling it, through the views it expands and the triggers it fires.

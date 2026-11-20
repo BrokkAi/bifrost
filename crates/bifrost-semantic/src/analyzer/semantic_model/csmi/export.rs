@@ -910,9 +910,22 @@ fn export_semantic_document<'a>(
         )?;
     }
     for fact in &types {
+        if !fact.type_parameter_kinds.is_empty() {
+            return Err(CsmiExportError::Unsupported {
+                path: format!("types.{}.typeParameterKinds", fact.id),
+                semantic: "Rust type/const parameter kinds have no CSMI representation".to_owned(),
+            });
+        }
         let Some(value_semantics) = &fact.value_semantics else {
             continue;
         };
+        if value_semantics.interior_mutability.is_some() {
+            return Err(CsmiExportError::Unsupported {
+                path: format!("types.{}.valueSemantics.interiorMutability", fact.id),
+                semantic: "selected Rust interior-mutability claims have no CSMI representation"
+                    .to_owned(),
+            });
+        }
         let type_id = symbol_by_bifrost_id.get(&fact.id).cloned().ok_or_else(|| {
             CsmiExportError::MissingDeclaration {
                 path: format!("types.{}.valueSemantics", fact.id),

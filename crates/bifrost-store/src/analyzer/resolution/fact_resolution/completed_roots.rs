@@ -27,7 +27,9 @@ pub(super) struct RootMemoKey {
     request: u64,
     epoch: u64,
     scope: [u8; 32],
-    budget: Option<ReceiverAnalysisBudget>,
+    /// The question's parameters (context depth, target cap), never an allowance:
+    /// a complete answer does not depend on how much work remained (#13216).
+    parameters: Option<(usize, usize)>,
 }
 
 impl RootMemoKey {
@@ -48,9 +50,9 @@ impl RootMemoKey {
             request: authority.request,
             epoch: authority.content_epoch,
             scope: authority.scope,
-            budget: session
+            parameters: session
                 .resolution_session
-                .and_then(ResolutionSession::remaining_budget),
+                .and_then(ResolutionSession::question_parameters),
         })
     }
 
@@ -437,7 +439,7 @@ mod tests {
             request: authority.request,
             epoch: authority.content_epoch,
             scope: authority.scope,
-            budget: None,
+            parameters: None,
         };
         let memo = SelectedDemandState::default();
         for placement in 0..4 {

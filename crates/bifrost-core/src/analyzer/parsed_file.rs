@@ -130,6 +130,33 @@ pub struct ParsedFile {
     pub completeness: crate::analyzer::model::ParseCompleteness,
 }
 
+/// Request-local declarations for source comparison, without publishable facts.
+///
+/// A projection is not a `ParsedFile`: it cannot enter the indexing or source
+/// fact publication pipeline. Its collections preserve the full parser's
+/// declaration identities and per-declaration ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationProjection {
+    declarations: HashSet<CodeUnit>,
+    pub signatures: HashMap<CodeUnit, Vec<String>>,
+    pub ranges: HashMap<CodeUnit, Vec<Range>>,
+    pub test_region_units: HashSet<CodeUnit>,
+    pub imports: Vec<ImportInfo>,
+}
+
+impl DeclarationProjection {
+    pub fn declarations(&self) -> &HashSet<CodeUnit> {
+        &self.declarations
+    }
+
+    pub fn declaration_ranges(&self, code_unit: &CodeUnit) -> &[Range] {
+        self.ranges
+            .get(code_unit)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
 /// A primary-owned C# declaration input to fresh executable lowering. Event
 /// declarations participate without manufacturing display CodeUnits.
 #[derive(Debug, Clone)]
@@ -988,6 +1015,17 @@ impl ParsedFile {
             ranges.push(range);
         } else {
             self.navigation_ranges_truncated.insert(code_unit);
+        }
+    }
+
+    /// Keep only the request-local declaration surface, moving its collections.
+    pub fn into_declaration_projection(self) -> DeclarationProjection {
+        DeclarationProjection {
+            declarations: self.declarations,
+            signatures: self.signatures,
+            ranges: self.ranges,
+            test_region_units: self.test_region_units,
+            imports: self.imports,
         }
     }
 

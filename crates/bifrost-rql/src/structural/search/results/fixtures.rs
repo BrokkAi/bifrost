@@ -86,6 +86,7 @@ pub fn code_query_result_fixtures_json() -> Value {
                     origin: SemanticModelOriginKind::DeclarativeModel,
                     activation: SemanticModelActivationProvenance {
                         approximate: false,
+                        approximation: None,
                         status: "active".to_owned(),
                         reason: "explicit test-only wire fixture".to_owned(),
                         source_kind: "ephemeral_workspace".to_owned(),
@@ -373,6 +374,12 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::StateEvent {
             value: Default::default(),
         },
+        CodeQueryResultValue::FieldWrite {
+            value: Default::default(),
+        },
+        CodeQueryResultValue::FieldRead {
+            value: Default::default(),
+        },
         CodeQueryResultValue::BindingInitializerCall {
             value: Default::default(),
         },
@@ -490,7 +497,12 @@ pub fn code_query_result_fixtures_json() -> Value {
             message: "fixture diagnostic".to_owned(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        })],
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
+        })]
+        .into(),
     };
     let serialized =
         serde_json::to_value(result).expect("the canonical Rust result fixtures are serializable");

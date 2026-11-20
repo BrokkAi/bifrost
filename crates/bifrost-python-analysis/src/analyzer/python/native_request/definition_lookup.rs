@@ -30,9 +30,7 @@ use brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind;
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
-    ReceiverAnalysisWork, ReceiverBudgetLimit,
-};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
 use brokk_bifrost_core::analyzer::usages::resolution_session::{
     BoundedResolution, ResolutionSession,
 };
@@ -65,23 +63,361 @@ fn with_prior_work<T>(
 /// Opening failures are answers too; they never trigger legacy recovery.
 /// A store error also records a query failure on the current request, so a
 /// transient error is reported and never reused as an answer (#8411).
+///
+/// The operation opens on first use: a request whose definition lookups are
+/// all answered by the outer request's memo opens nothing (#13847).
 pub(crate) struct PythonReceiverRequest<'a> {
     python: &'a PythonAnalyzer,
-    opened: PythonNativeOpen<'a>,
+    cancellation: brokk_bifrost_core::cancellation::CancellationToken,
+    opened: Option<OpenedPythonRequest<'a>>,
     artifacts: brokk_bifrost_analysis::analyzer::resolution::batch::ForwardCandidateArtifactCache,
 }
 
+/// The opened operation and the receipt of the reads that opened it. A
+/// memoized definition answer replays that receipt as well as its own reads,
+/// because a hit in another receiver request never opened this operation.
+/// The answers of one operation share the receipt.
+struct OpenedPythonRequest<'a> {
+    native: PythonNativeOpen<'a>,
+    reads: Option<std::sync::Arc<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>>,
+}
+
 impl<'a> PythonReceiverRequest<'a> {
+    /// The selected native request, opened on first use under `analyzer`'s
+    /// read attribution.
+    fn native(&mut self, analyzer: &dyn IAnalyzer) -> &mut PythonNativeOpen<'a> {
+        let python = self.python;
+        let cancellation = &self.cancellation;
+        &mut self
+            .opened
+            .get_or_insert_with(|| {
+                let (native, admission) =
+                    brokk_bifrost_analysis::analyzer::usages::common::capture_memo_reads(
+                        brokk_bifrost_analysis::analyzer::usages::common::QueryMemoOwner::PythonDefinitionAnswer,
+                        analyzer,
+                        || open_native(python, cancellation),
+                    );
+                OpenedPythonRequest {
+                    native,
+                    reads: admission.admitted().map(std::sync::Arc::new),
+                }
+            })
+            .native
+    }
+
     /// Run `read` on the selected native request this receiver request holds,
     /// or return `None` when opening it did not produce one.
     pub(crate) fn with_native_request<R>(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         read: impl FnOnce(&mut PythonNativeRequest<'a>) -> R,
     ) -> Option<R> {
-        let PythonNativeOpen::Ready(request) = &mut self.opened else {
+        let PythonNativeOpen::Ready(request) = self.native(analyzer) else {
             return None;
         };
         Some(read(request))
+    }
+}
+
+/// One outer request's Python definition answers (#13847).
+///
+/// Value-flow discovery, ICFG call transfers, and the import and constructor
+/// probes of one dispatch each resolve the same callee site through a receiver
+/// request of their own, so one site used to be resolved several times per
+/// request, each time on a fresh forward operation. A lookup builds its own
+/// forward operation, so its answer and work depend only on the key below, not
+/// on which receiver request asks. Within one outer request each site is now
+/// resolved once; later asks replay its answer, its work and its read receipt,
+/// including the reads that opened the operation it ran on.
+///
+/// The memo is a resource of the outer request, carried to its workers and
+/// closed with it. It is not in the analyzer's query-scope memos, which
+/// overlapping requests share. Its entries live in request-private regions of
+/// the analyzer owner's retention budget, which invalidate when the request
+/// closes or drops; eviction under pressure means recomputation. Only a
+/// complete answer from a live lookup whose receipt was admitted is kept: a
+/// stopped, failed, cancelled or traced lookup is recomputed by the next ask.
+pub(crate) struct PythonDefinitionAnswers {
+    /// One region per retention owner; `None` once the request has closed,
+    /// so a worker still computing then keeps nothing.
+    regions: std::sync::Mutex<Option<Vec<PythonDefinitionRegion>>>,
+    /// The project views this request's answers name by allocation. Holding
+    /// them keeps an address from naming another view within the request.
+    projects:
+        std::sync::Mutex<Vec<std::sync::Arc<dyn brokk_bifrost_core::analyzer::project::Project>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    fills: std::sync::atomic::AtomicUsize,
+}
+
+type PythonDefinitionRegion = (
+    brokk_bifrost_core::retention_budget::RetentionBudget,
+    brokk_bifrost_core::retention_budget::BudgetRegion<PythonDefinitionKey, PythonDefinitionAnswer>,
+);
+
+struct PythonDefinitionAnswer {
+    value: (DefinitionLookupOutcome, CallEvidence),
+    work: ReceiverAnalysisWork,
+    opening: std::sync::Arc<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
+    reads: brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads,
+    bytes: usize,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for PythonDefinitionAnswer {
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl PythonDefinitionAnswer {
+    fn new(
+        value: (DefinitionLookupOutcome, CallEvidence),
+        work: ReceiverAnalysisWork,
+        opening: std::sync::Arc<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
+        reads: brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads,
+    ) -> Self {
+        use brokk_bifrost_analysis::analyzer::usages::common::allocated_memo_read_bytes;
+        // The shared opening receipt is charged to every answer: that
+        // overstates the retention of one operation's answers, never hides it.
+        let bytes = std::mem::size_of::<Self>()
+            + value.0.retained_heap_bytes()
+            + value.1.retained_heap_bytes()
+            + allocated_memo_read_bytes(&reads)
+            + allocated_memo_read_bytes(&opening);
+        Self {
+            value,
+            work,
+            opening,
+            reads,
+            bytes,
+        }
+    }
+}
+
+/// Everything a definition lookup reads besides the store: the selected
+/// snapshot and project view, the active model sets and runtime
+/// publication, and the caller's site, source and budget. An overlay clone
+/// keeps its base's snapshot but has a project view of its own, and an
+/// overlay edit within the request advances that view's generation.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PythonDefinitionKey {
+    snapshot: brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+    /// The analyzer's project allocation, retained by the memo, and the
+    /// generation its mutable inputs last published.
+    project: usize,
+    generation: u64,
+    model_snapshot: Option<String>,
+    model_overlay: Option<String>,
+    runtime: Option<[u8; 32]>,
+    file: brokk_bifrost_core::analyzer::ProjectFile,
+    site: brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+    source: [u8; 32],
+    parsed: bool,
+    budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for PythonDefinitionKey {
+    fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        let strings = [
+            Some(&self.snapshot.workspace_id.0),
+            Some(&self.snapshot.lang),
+            self.model_snapshot.as_ref(),
+            self.model_overlay.as_ref(),
+            Some(&self.site.path),
+            Some(&self.site.text),
+        ];
+        std::mem::size_of::<Self>()
+            + strings
+                .into_iter()
+                .flatten()
+                .map(|text| allocation_size(text.capacity()))
+                .sum::<usize>()
+            + self
+                .file
+                .retained_bytes()
+                .saturating_sub(std::mem::size_of_val(&self.file))
+    }
+}
+
+impl PythonDefinitionKey {
+    fn new(project: usize, python: &PythonAnalyzer, query: &BoundedReceiverQuery<'_>) -> Self {
+        let snapshot = python
+            .inner
+            .selected_workspace_snapshots()
+            .get("python")
+            .expect("selected Python snapshot")
+            .clone();
+        let active = query.analyzer.active_semantic_model_snapshot();
+        Self {
+            snapshot,
+            project,
+            generation: python.inner.project().analysis_generation(),
+            model_snapshot: active
+                .as_ref()
+                .map(|active| active.active_models().active_model_set_hash().to_owned()),
+            model_overlay: query
+                .analyzer
+                .semantic_model_overlay_read()
+                .published()
+                .as_ref()
+                .map(|overlay| overlay.active_model_set_hash().to_owned()),
+            runtime: active
+                .as_ref()
+                .and_then(|active| active.python_runtime())
+                .map(|publication| publication.evidence_digest),
+            file: query.file.clone(),
+            site: query.site.clone(),
+            source: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                query.source.as_bytes(),
+            ),
+            parsed: query.tree.is_some(),
+            budget: query.budget,
+        }
+    }
+}
+
+impl brokk_bifrost_core::analyzer::outer_request::RequestResource for PythonDefinitionAnswers {
+    fn close(&self) {
+        self.invalidate();
+    }
+}
+
+impl Drop for PythonDefinitionAnswers {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
+impl Default for PythonDefinitionAnswers {
+    fn default() -> Self {
+        Self {
+            regions: std::sync::Mutex::new(Some(Vec::new())),
+            projects: std::sync::Mutex::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            fills: std::sync::atomic::AtomicUsize::default(),
+        }
+    }
+}
+
+impl PythonDefinitionAnswers {
+    fn invalidate(&self) {
+        let closed = self
+            .regions
+            .lock()
+            .expect("Python definition answers poisoned")
+            .take();
+        for (_, region) in closed.into_iter().flatten() {
+            region.invalidate_all();
+        }
+    }
+
+    /// Keep `answer` unless the request has closed. The check and the insert
+    /// hold the lock `invalidate` takes, so no answer lands after it.
+    fn insert(
+        &self,
+        region: &brokk_bifrost_core::retention_budget::BudgetRegion<
+            PythonDefinitionKey,
+            PythonDefinitionAnswer,
+        >,
+        key: PythonDefinitionKey,
+        answer: PythonDefinitionAnswer,
+    ) {
+        let regions = self
+            .regions
+            .lock()
+            .expect("Python definition answers poisoned");
+        if regions.is_some() {
+            // A refused admission keeps nothing; the next ask recomputes.
+            region.insert(key, answer);
+        }
+    }
+
+    /// Answers this request computed under its memo, kept or not.
+    #[cfg(test)]
+    pub(crate) fn fills(&self) -> usize {
+        self.fills.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Answers this request keeps.
+    #[cfg(test)]
+    pub(crate) fn retained(&self) -> usize {
+        self.regions
+            .lock()
+            .expect("Python definition answers poisoned")
+            .iter()
+            .flatten()
+            .map(|(_, region)| region.stats().entries)
+            .sum()
+    }
+
+    /// `python`'s project view, held for the rest of the request.
+    fn project(&self, python: &PythonAnalyzer) -> usize {
+        let project = python.inner.shared_project();
+        let address = std::sync::Arc::as_ptr(&project).cast::<()>() as usize;
+        let mut projects = self
+            .projects
+            .lock()
+            .expect("Python definition answers poisoned");
+        if !projects
+            .iter()
+            .any(|held| std::sync::Arc::as_ptr(held).cast::<()>() as usize == address)
+        {
+            projects.push(project);
+        }
+        address
+    }
+
+    /// This request's private region of `python`'s retention owner; `None`
+    /// once the request has closed.
+    fn region(
+        &self,
+        python: &PythonAnalyzer,
+    ) -> Option<
+        brokk_bifrost_core::retention_budget::BudgetRegion<
+            PythonDefinitionKey,
+            PythonDefinitionAnswer,
+        >,
+    > {
+        let budget = python.inner.analyzer_store().retention_budget();
+        let mut regions = self
+            .regions
+            .lock()
+            .expect("Python definition answers poisoned");
+        let regions = regions.as_mut()?;
+        if let Some((_, region)) = regions.iter().find(|(owner, _)| owner.ptr_eq(budget)) {
+            return Some(region.clone());
+        }
+        let region = budget.region("python-definition-answers", None);
+        regions.push((budget.clone(), region.clone()));
+        Some(region)
+    }
+}
+
+/// The current outer request's answers; `None` outside a request or once it
+/// has closed.
+pub(crate) fn request_definition_answers() -> Option<std::sync::Arc<PythonDefinitionAnswers>> {
+    brokk_bifrost_analysis::analyzer::i_analyzer::current_outer_request()?
+        .resource::<PythonDefinitionAnswers, std::convert::Infallible>(
+            brokk_bifrost_core::analyzer::outer_request::RequestEntryKey::PythonDefinitionAnswers,
+            || Ok(std::sync::Arc::default()),
+        )
+        .ok()
+}
+
+fn open_native<'a>(
+    python: &'a PythonAnalyzer,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> PythonNativeOpen<'a> {
+    match open_python_native_request(python, cancellation) {
+        Ok(opened) => opened,
+        Err(error) => {
+            let message = error.to_string();
+            python.record_query_failure(error);
+            PythonNativeOpen::Unavailable {
+                kind: "native_store_error",
+                message,
+            }
+        }
     }
 }
 
@@ -100,7 +436,12 @@ impl PythonReceiverRequest<'_> {
             brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeReferenceTypes,
         >>,
     >>>{
-        let PythonNativeOpen::Ready(request) = &mut self.opened else {
+        self.native(query.analyzer);
+        let Some(OpenedPythonRequest {
+            native: PythonNativeOpen::Ready(request),
+            ..
+        }) = &mut self.opened
+        else {
             return Ok(None);
         };
         let Some(tree) = query.tree else {
@@ -163,10 +504,16 @@ impl PythonReceiverRequest<'_> {
 impl<'a> PythonReceiverRequest<'a> {
     pub(crate) fn exact_model_type_owner_id(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         fqn: &str,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Result<Option<String>, String> {
-        let PythonNativeOpen::Ready(request) = &mut self.opened else {
+        self.native(analyzer);
+        let Some(OpenedPythonRequest {
+            native: PythonNativeOpen::Ready(request),
+            ..
+        }) = &mut self.opened
+        else {
             return Ok(None);
         };
         request
@@ -242,7 +589,7 @@ impl<'a> PythonReceiverRequest<'a> {
         // The supplied source must be the selected source before any selected
         // fact is read, including the class fast path below.
         let session = ResolutionSession::bounded(query.budget, query.cancellation);
-        match &self.opened {
+        match self.native(query.analyzer) {
             PythonNativeOpen::Ready(_) => {}
             PythonNativeOpen::Unavailable { kind, message } => {
                 return session.finish(unavailable_type(query.site, kind, message.clone()));
@@ -269,18 +616,11 @@ impl<'a> PythonReceiverRequest<'a> {
             let node = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
                 tree.root_node(), query.site.focus_start_byte, query.site.focus_end_byte, || {
                     steps += 1;
-                    steps <= query.budget.max_scope_nodes
+                    true
                 },
             );
-            // The walk spends the request's scope-node allowance, which the
-            // lookups below receive as `remaining_after(prior)`.
-            prior.scope_nodes = steps.min(query.budget.max_scope_nodes);
-            if node.is_none() && steps > query.budget.max_scope_nodes {
-                return BoundedResolution::Exceeded {
-                    limit: ReceiverBudgetLimit::ScopeNodes,
-                    work: ReceiverAnalysisWork::default(),
-                };
-            }
+            // The walk's steps are telemetry: work never refuses (#13216).
+            prior.scope_nodes = steps;
             let preliminary_query = BoundedReceiverQuery {
                 budget: query.budget.remaining_after(prior),
                 ..query
@@ -340,7 +680,7 @@ impl<'a> PythonReceiverRequest<'a> {
                         && symbol.kind == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Class
                     {
                         let cancellation = query.cancellation.cloned().unwrap_or_default();
-                        match self.exact_model_type_owner_id(&symbol.qualified_name, &cancellation) {
+                        match self.exact_model_type_owner_id(query.analyzer, &symbol.qualified_name, &cancellation) {
                             Ok(Some(id)) if id == symbol.id => return BoundedResolution::Complete {
                                 value: TypeLookupOutcome {
                                     status: TypeLookupStatus::Resolved,
@@ -369,9 +709,12 @@ impl<'a> PythonReceiverRequest<'a> {
             ..query
         };
         let selected = self.resolve_native_type_at(query);
-        let request = match &mut self.opened {
-            PythonNativeOpen::Ready(request) => request,
-            _ => unreachable!("native opening was checked above"),
+        let Some(OpenedPythonRequest {
+            native: PythonNativeOpen::Ready(request),
+            ..
+        }) = &mut self.opened
+        else {
+            unreachable!("native opening was checked above")
         };
         let cancellation = query.cancellation.cloned().unwrap_or_default();
         let result = selected.and_then(|selected| {
@@ -489,25 +832,85 @@ impl<'a> PythonReceiverRequest<'a> {
         python: &'a PythonAnalyzer,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Self {
-        let opened = match open_python_native_request(python, cancellation) {
-            Ok(opened) => opened,
-            Err(error) => {
-                let message = error.to_string();
-                python.record_query_failure(error);
-                PythonNativeOpen::Unavailable {
-                    kind: "native_store_error",
-                    message,
-                }
-            }
-        };
         Self {
             python,
-            opened,
+            cancellation: cancellation.clone(),
+            opened: None,
             artifacts: Default::default(),
         }
     }
 
+    /// Resolve one definition, at most once per site in the outer request.
+    /// A later ask replays the first answer, its work and its read receipt.
     pub(crate) fn resolve_definition_with_call_evidence_bounded(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<(DefinitionLookupOutcome, CallEvidence)> {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, capture_memo_reads, is_native_operation_failure, replay_memo_reads,
+        };
+        // A trace records the selection as it happens, and a replayed answer
+        // has no selection to record. A cancelled ask, or one in a request
+        // whose store has failed, reports its own stop rather than an earlier
+        // answer, as a fresh resolution session does.
+        let answers =
+            if brokk_bifrost_analysis::analyzer::usages::get_definition::trace::recording()
+                || query.cancellation.is_some_and(|token| token.is_cancelled())
+                || brokk_bifrost_core::analyzer::carried_context::request_store_failed()
+            {
+                None
+            } else {
+                request_definition_answers()
+            };
+        let Some(answers) = answers else {
+            return self.resolve_definition_uncached(query);
+        };
+        let Some(region) = answers.region(self.python) else {
+            return self.resolve_definition_uncached(query);
+        };
+        let key = PythonDefinitionKey::new(answers.project(self.python), self.python, &query);
+        if let Some(answer) = region.get(&key) {
+            replay_memo_reads(&answer.opening, query.analyzer);
+            replay_memo_reads(&answer.reads, query.analyzer);
+            return BoundedResolution::Complete {
+                value: answer.value.clone(),
+                work: answer.work,
+            };
+        }
+        // Open outside the answer's capture: its receipt is shared by every
+        // answer this operation gives.
+        self.native(query.analyzer);
+        let Some(opening) = self.opened.as_ref().and_then(|opened| opened.reads.clone()) else {
+            return self.resolve_definition_uncached(query);
+        };
+        let (result, admission) = capture_memo_reads(
+            QueryMemoOwner::PythonDefinitionAnswer,
+            query.analyzer,
+            || self.resolve_definition_uncached(query),
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        answers
+            .fills
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let BoundedResolution::Complete { value, work } = &result
+            && !query.cancellation.is_some_and(|token| token.is_cancelled())
+            && !value
+                .0
+                .diagnostics
+                .iter()
+                .any(|diagnostic| is_native_operation_failure(&diagnostic.kind))
+            && let Some(reads) = admission.admitted()
+        {
+            answers.insert(
+                &region,
+                key,
+                PythonDefinitionAnswer::new(value.clone(), *work, opening, reads),
+            );
+        }
+        result
+    }
+
+    fn resolve_definition_uncached(
         &mut self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<(DefinitionLookupOutcome, CallEvidence)> {
@@ -515,7 +918,8 @@ impl<'a> PythonReceiverRequest<'a> {
         // The operation is reusable, but work and sticky stops belong to one
         // query. A warm request must still charge the current query's reads.
         let session = ResolutionSession::bounded(query.budget, query.cancellation);
-        let request = match &mut self.opened {
+        self.native(query.analyzer);
+        let request = match &mut self.opened.as_mut().expect("opened above").native {
             PythonNativeOpen::Ready(request) => request,
             PythonNativeOpen::Unavailable { kind, message } => {
                 return session.finish((
@@ -1376,7 +1780,7 @@ mod native_type_reader_tests {
             .expect("native fixture");
         let mut request = PythonReceiverRequest::open(python, &cancellation);
         assert!(
-            matches!(request.opened, PythonNativeOpen::Ready(_)),
+            matches!(request.native(analyzer), PythonNativeOpen::Ready(_)),
             "Python native request did not open"
         );
         for (expression, expected_slot, expected_widget_type) in [
@@ -1674,7 +2078,7 @@ mod native_type_reader_tests {
             .expect("native fixture");
         let mut request = PythonReceiverRequest::open(python, &cancellation);
         assert!(
-            matches!(request.opened, PythonNativeOpen::Ready(_)),
+            matches!(request.native(analyzer), PythonNativeOpen::Ready(_)),
             "Python native request did not open"
         );
         // Each callee name is a call's `function`; the producer publishes a
@@ -1713,5 +2117,91 @@ mod native_type_reader_tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+}
+
+#[cfg(test)]
+mod definition_answer_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::ProjectFile;
+    use brokk_bifrost_core::analyzer::outer_request::{OuterRequest, RequestEntryKey};
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+    use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+
+    /// The owner's state is one outer request: its answers are the memo.
+    #[test]
+    fn request_definition_answer_memo_completion_conformance() {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        let source =
+            "from service import Service\n\ndef handle(service: Service):\n    service.run()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        pass\n",
+                ),
+                ("app.py", source),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let python = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let tree = crate::analyzer::usages::get_definition::python::parse_python_tree(source)
+            .expect("Python tree");
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        python
+            .prepare_native_environment_for_test(&cancellation)
+            .expect("native fixture");
+        let start = source.rfind("run").expect("call");
+        let site = ResolvedReferenceSite {
+            path: "app.py".into(),
+            text: "run".into(),
+            range: brokk_bifrost_core::analyzer::Range {
+                start_byte: start,
+                end_byte: start + 3,
+                start_line: 4,
+                end_line: 4,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + 3,
+        };
+        assert_memo_owner_conformance_for_test(
+            QueryMemoOwner::PythonDefinitionAnswer,
+            analyzer,
+            OuterRequest::new,
+            |request| {
+                let _scope = AnalyzerQueryScope::with_outer_request(
+                    analyzer,
+                    std::sync::Arc::clone(request),
+                );
+                match PythonReceiverRequest::open(python, &cancellation)
+                    .resolve_definition_with_call_evidence_bounded(BoundedReceiverQuery {
+                        analyzer,
+                        file: &file,
+                        source,
+                        tree: Some(&tree),
+                        site: &site,
+                        budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                        cancellation: Some(&cancellation),
+                    }) {
+                    BoundedResolution::Complete { value, work } => {
+                        format!("{:?} {:?} {work:?}", value.0.definitions, value.0.status)
+                    }
+                    other => panic!("complete definition answer: {:?}", other.work()),
+                }
+            },
+            |request| {
+                request
+                    .resource_if_present::<PythonDefinitionAnswers>(
+                        &RequestEntryKey::PythonDefinitionAnswers,
+                    )
+                    .is_some_and(|answers| answers.retained() > 0)
+            },
+        );
     }
 }

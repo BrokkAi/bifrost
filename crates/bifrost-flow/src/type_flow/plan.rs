@@ -1008,6 +1008,9 @@ fn guard_transfers(
                 | GuardPredicate::NullComparison { .. } => {
                     (bindings.binding_for_guard(guard_index), None)
                 }
+                GuardPredicate::ValueEquality { .. } | GuardPredicate::ValueOrdering { .. } => {
+                    continue;
+                }
                 GuardPredicate::Opaque { .. } => {
                     match adapter.call_guard_narrowing(
                         workspace,
@@ -1849,6 +1852,12 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
             cuts,
         )
         .map_err(TypeFlowPlanError::Discovery)?;
+        // The plan built from this closure cannot carry the walk's verdict,
+        // so it joins the current captures, where the walk's ambient marks
+        // went.
+        provider.oracle().workspace().analyzer().join_reuse_verdict(
+            crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(&closure),
+        );
         Ok(Self {
             root: root.clone(),
             provider,
@@ -4408,6 +4417,110 @@ fn source_site(
 ) -> Option<SourceSite> {
     let file = file_for_locator(workspace, procedure.semantics().locator())?;
     Some(SourceSite { file, span, kind })
+}
+
+// Construct required input quality independently of whichever admission an
+// artifact cache happens to refuse first. This fixture is absent in production.
+#[cfg(test)]
+pub(super) fn with_discovery_quality_plan(
+    status: SemanticInputStatus,
+    check: impl FnOnce(&WorkspaceAnalyzer, &FieldSlotIndex, &ProcedureHandle, &TypeFlowPlan),
+) {
+    use crate::analyzer::semantic::{SemanticRequest, type_flow_adapter};
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::inline_project::InlineTestProject;
+    use crate::value_flow::ValueFlowCache;
+
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            "def root():\n    pass\n\ndef retained(value):\n    return target(value)\n\ndef target(value):\n    return value\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("app.py"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("fixture materializes")
+        .available_value()
+        .cloned()
+        .expect("fixture artifact");
+    let procedure = |name| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture procedure")
+    };
+    let root = procedure("root");
+    let retained = procedure("retained");
+    let adapter = type_flow_adapter(Language::Python).expect("Python adapter");
+    let field_slots = FieldSlotIndex::build(&workspace, adapter, &mut budget, &cancellation)
+        .expect("fixture field slots");
+    let provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
+    let mut discovery = TypeFlowDiscovery::new(
+        &root,
+        &provider,
+        ClosureLimits { max_procedures: 16 },
+        &mut budget,
+        &cancellation,
+    )
+    .expect("fixture discovery");
+    let retained_discovery = TypeFlowDiscovery::new(
+        &retained,
+        &provider,
+        ClosureLimits { max_procedures: 16 },
+        &mut budget,
+        &cancellation,
+    )
+    .expect("retained call discovery");
+    assert!(!retained_discovery.closure.bindings.is_empty());
+    // Required binding input quality survives independently of whether its
+    // call is reached by this solve. Snapshot-only content can be discharged
+    // during construction, so use the binding envelope from the actual bug.
+    discovery.closure.bindings.extend(
+        retained_discovery
+            .closure
+            .bindings
+            .into_iter()
+            .map(|input| ValueFlowInput::new(input.into_parts().0, status)),
+    );
+    discovery
+        .closure
+        .snapshots
+        .extend(retained_discovery.closure.snapshots);
+    discovery
+        .closure
+        .procedures
+        .extend(retained_discovery.closure.procedures);
+    discovery
+        .closure
+        .coverage
+        .extend(retained_discovery.closure.coverage);
+    let plan = discovery
+        .into_plan(
+            &workspace,
+            adapter,
+            &field_slots,
+            &mut budget,
+            &cancellation,
+            &mut ProcedureRefinements::default(),
+        )
+        .expect("fixture plan");
+    check(&workspace, &field_slots, &root, &plan);
 }
 
 #[cfg(test)]

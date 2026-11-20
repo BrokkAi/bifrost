@@ -48,7 +48,7 @@ fn invalid_typed_pipeline_returns_workspace_invalid_diagnostic() {
         json!({"files": 1})
     );
     assert_eq!(result.diagnostics.len(), 1, "{result:?}");
-    let diagnostic = &result.diagnostics[0];
+    let diagnostic = &result.diagnostics.semantic()[0];
     assert_eq!(diagnostic.code, CodeQueryDiagnosticCode::InvalidPlan);
     assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Invalid);
     assert_eq!(diagnostic.language, "workspace");

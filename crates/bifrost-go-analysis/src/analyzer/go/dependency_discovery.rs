@@ -617,7 +617,8 @@ fn build_curated_pack_evidence_outcome(
                 toolchain: Some(toolchain.clone()),
                 target: Some(target.clone()),
                 configuration: Some(configuration.clone()),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: module_provenance(&module),
             artifacts: Vec::new(),
@@ -636,7 +637,8 @@ fn build_curated_pack_evidence_outcome(
                 toolchain: Some(toolchain),
                 target: Some(target),
                 configuration: Some(configuration),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: vec![DependencyProvenance {
                 key: "go.version".to_owned(),
@@ -1110,7 +1112,8 @@ fn build_outcome(
                 toolchain: Some(toolchain.clone()),
                 target: Some(target.clone()),
                 configuration: Some(configuration.clone()),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance,
             artifacts: vec![ResolvedDependencyArtifact::source_set(
@@ -1623,7 +1626,8 @@ pub(crate) fn append_vendor_activation_rows(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance,
             artifacts: Vec::new(),
@@ -1964,6 +1968,10 @@ mod tests {
     #[test]
     #[hardwon(
         "#7154: unsaved import edits failed to publish while body-only overlays must reuse placement"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn installed_go_overlay_membership_discovery_and_unchanged_save_reuse() {
         use brokk_bifrost_analysis::analyzer::workspace::{
@@ -2762,6 +2770,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn installed_go_domain_lifecycle_reuses_placement_and_retries_incomplete_domains() {
         use crate::analyzer::go::dependency_packs::{
             GoReconciliationTrigger, reconcile_selected_go_domains,

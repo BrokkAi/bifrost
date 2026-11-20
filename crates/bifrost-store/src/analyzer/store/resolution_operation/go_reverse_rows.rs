@@ -2016,6 +2016,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// package name would capture or rebind. All reads are keyed by selected
     /// sites, scope endpoints, summary ids, and lookup identities.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_rename_conflict(
         &self,
         rename_context: &GoReverseRenameContext,
@@ -2232,6 +2233,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// shared lookup identity could name `target`. The caller still has to
     /// resolve each site in its own file-scoped Go context.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_reverse_candidate_sites(
         &self,
         target: &CodeUnit,
@@ -2655,6 +2657,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Share only target-independent physical work with other independent queries.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn confirm_go_reverse_candidates_with_memo<F>(
         &mut self,
         context_id: i64,

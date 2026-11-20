@@ -183,6 +183,10 @@ pub(in crate::engine_tests) mod tests {
     #[hardwon(
         "#13016: a #[macro_export] macro inside a function body was missing from the crate's exports"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn body_local_macro_export_is_not_a_complete_absence() {
         for (source, activation) in [
             (
@@ -335,6 +339,10 @@ pub(in crate::engine_tests) mod tests {
 
     #[test]
     #[hardwon("#13016: an overlay adding a body-local exported macro claimed a complete absence")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn body_local_macro_export_overlay_opens_selected_inventory() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::{
             PUBLISHED_OPEN_INVENTORY, SELECTED_MODULE_PLACEMENTS_FILL_SQL,
@@ -485,6 +493,10 @@ pub(in crate::engine_tests) mod tests {
 
     #[test]
     #[hardwon("#11129: identity probe failures silently retained stale content")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn update_identity_failure_publishes_failed_configured_update() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::TestProject;
@@ -729,6 +741,10 @@ pub(in crate::engine_tests) mod tests {
     #[cfg(unix)]
     #[test]
     #[hardwon("#11129: a symlink to a listed sibling was mistaken for a spelling alias")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn update_workspace_refreshes_sibling_symlink_omissions() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
@@ -820,6 +836,10 @@ pub(in crate::engine_tests) mod tests {
 
     #[test]
     #[hardwon("#11129: a case-insensitive update alias became a second selected file")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn update_alias_refreshes_only_authoritative_file_identities() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::TestProject;
@@ -1710,6 +1730,10 @@ pub(in crate::engine_tests) mod tests {
     #[hardwon(
         "#10953: warm stores retained dropped target-table dependencies and key-named path dependencies across producer upgrade"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn warm_dependency_name_upgrade_rederives_crates() {
         if run_derivation_identity_child() {
             return;
@@ -1902,6 +1926,10 @@ pub(in crate::engine_tests) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_path_probes_cover_walk_and_naming_inputs() {
         for name in ["Foo", "foo"] {
             let source = format!(
@@ -1988,6 +2016,10 @@ pub(in crate::engine_tests) mod tests {
     #[test]
     #[hardwon(
         "#9918: a glob cycle and its alias chain made valid same-crate re-exports unresolved imports"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn rust_summary_local_glob_cycle_imports() {
         let cases = [
@@ -2093,6 +2125,10 @@ pub(in crate::engine_tests) mod tests {
     #[test]
     #[hardwon(
         "#9918: the dep crate was incomplete, so the parity guard skipped it and hid the inactive-placement gap"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn keyed_rust_route_reads_match_whole_summary_rows() {
         use brokk_bifrost_analysis::analyzer::derivation_host::{
@@ -2205,7 +2241,7 @@ pub(in crate::engine_tests) mod tests {
             match host.demand::<RustUnitRoutes>(
                 analyzer.analyzer(),
                 &inventory,
-                &SelectedRustUnit::minted_by_test_fixture(unit, true),
+                &SelectedRustUnit::minted_by_test_fixture(unit),
             ) {
                 Demanded::Available { .. } => {
                     let recomputed = host.counters(RustUnitRoutes::ID).recomputed;
@@ -2213,7 +2249,7 @@ pub(in crate::engine_tests) mod tests {
                         host.demand::<RustUnitRoutes>(
                             analyzer.analyzer(),
                             &inventory,
-                            &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                            &SelectedRustUnit::minted_by_test_fixture(unit)
                         ),
                         Demanded::Available {
                             value: Handle::Retained(_),
@@ -2225,7 +2261,7 @@ pub(in crate::engine_tests) mod tests {
                         .demand::<RustTargetReachability>(
                             analyzer.analyzer(),
                             &inventory,
-                            &SelectedRustUnit::minted_by_test_fixture(unit, true),
+                            &SelectedRustUnit::minted_by_test_fixture(unit),
                         )
                     {
                         let rows = AnalyzerStore::rust_summary_cargo_route_rows_for_unit(
@@ -2304,7 +2340,7 @@ pub(in crate::engine_tests) mod tests {
                             host.demand::<RustTargetReachability>(
                                 analyzer.analyzer(),
                                 &inventory,
-                                &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                                &SelectedRustUnit::minted_by_test_fixture(unit)
                             ),
                             Demanded::Available {
                                 value: Handle::Retained(_),
@@ -2323,7 +2359,7 @@ pub(in crate::engine_tests) mod tests {
                         host.demand::<RustTargetReachability>(
                             analyzer.analyzer(),
                             &inventory,
-                            &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                            &SelectedRustUnit::minted_by_test_fixture(unit)
                         ),
                         Demanded::Unavailable(_)
                     ));
@@ -2646,7 +2682,7 @@ pub(in crate::engine_tests) mod tests {
         let before_route = host.demand::<RustUnitRoutes>(
             analyzer.analyzer(),
             &inventory,
-            &SelectedRustUnit::minted_by_test_fixture(main_unit, true),
+            &SelectedRustUnit::minted_by_test_fixture(main_unit),
         );
         assert!(matches!(before_route, Demanded::Available { .. }));
         let source = std::fs::read_to_string(project.root().join("dep/src/lib.rs")).unwrap();
@@ -2719,7 +2755,7 @@ pub(in crate::engine_tests) mod tests {
             host.demand::<RustUnitRoutes>(
                 changed.analyzer(),
                 &changed_inventory,
-                &SelectedRustUnit::minted_by_test_fixture(main_unit, true)
+                &SelectedRustUnit::minted_by_test_fixture(main_unit)
             ),
             Demanded::Available { .. }
         ));
@@ -2738,7 +2774,7 @@ pub(in crate::engine_tests) mod tests {
         let route_identity_before = match host.demand::<RustUnitRoutes>(
             changed.analyzer(),
             &changed_inventory,
-            &SelectedRustUnit::minted_by_test_fixture(main_unit, true),
+            &SelectedRustUnit::minted_by_test_fixture(main_unit),
         ) {
             Demanded::Available { identity, .. } => identity,
             Demanded::Unavailable(cause) => {
@@ -2811,7 +2847,7 @@ pub(in crate::engine_tests) mod tests {
         let route_identity_manifest = match host.demand::<RustUnitRoutes>(
             manifest_changed.analyzer(),
             &manifest_inventory,
-            &SelectedRustUnit::minted_by_test_fixture(main_unit, true),
+            &SelectedRustUnit::minted_by_test_fixture(main_unit),
         ) {
             Demanded::Available { identity, .. } => identity,
             Demanded::Unavailable(cause) => {
@@ -2823,6 +2859,10 @@ pub(in crate::engine_tests) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn broad_route_controls_survive_edits_and_ignore_old_topologies() {
         use brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
@@ -2942,7 +2982,7 @@ pub(in crate::engine_tests) mod tests {
                 check_complete!(host.demand::<RustTargetReachability>(
                     analyzer.analyzer(),
                     &inventory,
-                    &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                    &SelectedRustUnit::minted_by_test_fixture(unit)
                 ));
                 let input =
                     match host.demand::<RustUnitInputs>(analyzer.analyzer(), &inventory, &unit) {
@@ -2957,7 +2997,7 @@ pub(in crate::engine_tests) mod tests {
                 let routes = match host.demand::<RustUnitRoutes>(
                     analyzer.analyzer(),
                     &inventory,
-                    &SelectedRustUnit::minted_by_test_fixture(unit, true),
+                    &SelectedRustUnit::minted_by_test_fixture(unit),
                 ) {
                     Demanded::Available {
                         identity,
@@ -3094,7 +3134,7 @@ pub(in crate::engine_tests) mod tests {
                 missing_host.demand::<RustUnitRoutes>(
                     replaced.analyzer(),
                     &inventory,
-                    &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                    &SelectedRustUnit::minted_by_test_fixture(unit)
                 ),
                 Demanded::Available {
                     complete: false,
@@ -3106,6 +3146,10 @@ pub(in crate::engine_tests) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_route_change_controls() {
         use brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
@@ -3137,6 +3181,10 @@ pub(in crate::engine_tests) mod tests {
             SharedRename,
             SharedVersion,
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn observe(
             analyzer: &WorkspaceAnalyzer,
             host: &AnalyzerDerivations,
@@ -3199,7 +3247,7 @@ pub(in crate::engine_tests) mod tests {
             let routes = identity(host.demand::<RustUnitRoutes>(
                 analyzer.analyzer(),
                 &inventory,
-                &SelectedRustUnit::minted_by_test_fixture(unit, true),
+                &SelectedRustUnit::minted_by_test_fixture(unit),
             ));
             let route_naming_count = host.counters(RustUnitNaming::ID).recomputed;
             let naming =
@@ -3212,7 +3260,7 @@ pub(in crate::engine_tests) mod tests {
             let reach = host.demand::<RustTargetReachability>(
                 analyzer.analyzer(),
                 &inventory,
-                &SelectedRustUnit::minted_by_test_fixture(unit, true),
+                &SelectedRustUnit::minted_by_test_fixture(unit),
             );
             let (reach_identity, answer) = match reach {
                 Demanded::Available {
@@ -3506,6 +3554,10 @@ pub(in crate::engine_tests) mod tests {
     /// holds equal values, so reading the topology would pass them); a stale
     /// topology still closes package completeness.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_unit_inputs_follow_summary_context_completeness() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
             SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
@@ -3599,6 +3651,10 @@ pub(in crate::engine_tests) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_route_incomplete_summary_propagates_to_fragment_and_reachability() {
         use brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
@@ -3671,7 +3727,7 @@ pub(in crate::engine_tests) mod tests {
             host.demand::<RustUnitRoutes>(
                 analyzer.analyzer(),
                 &inventory,
-                &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                &SelectedRustUnit::minted_by_test_fixture(unit)
             ),
             Demanded::Available {
                 complete: false,
@@ -3682,7 +3738,7 @@ pub(in crate::engine_tests) mod tests {
             host.demand::<RustTargetReachability>(
                 analyzer.analyzer(),
                 &inventory,
-                &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                &SelectedRustUnit::minted_by_test_fixture(unit)
             ),
             Demanded::Available {
                 complete: false,
@@ -3694,7 +3750,7 @@ pub(in crate::engine_tests) mod tests {
                 host.demand::<RustUnitRoutes>(
                     analyzer.analyzer(),
                     &inventory,
-                    &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                    &SelectedRustUnit::minted_by_test_fixture(unit)
                 ),
                 Demanded::Available {
                     complete: false,
@@ -3716,7 +3772,7 @@ pub(in crate::engine_tests) mod tests {
             missing_host.demand::<RustUnitRoutes>(
                 analyzer.analyzer(),
                 &inventory,
-                &SelectedRustUnit::minted_by_test_fixture(unit, true)
+                &SelectedRustUnit::minted_by_test_fixture(unit)
             ),
             Demanded::Available {
                 complete: false,
@@ -3728,6 +3784,10 @@ pub(in crate::engine_tests) mod tests {
     /// Whether each route question answers on a fresh host at the store's
     /// current Rust head: the selection check, a file, a package, a crate
     /// name, and the dependents of the unit that holds `file`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn route_question_availability(
         analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
         file: &str,
@@ -3917,6 +3977,10 @@ pub(in crate::engine_tests) mod tests {
             .to_vec()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_broad_complete(
         analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
     ) -> bool {
@@ -3965,6 +4029,10 @@ pub(in crate::engine_tests) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn route_questions_are_unavailable_while_a_selected_crate_inventory_is_incomplete() {
         let crate_with = |lib: &str| {
             InlineTestProject::new()
@@ -4025,6 +4093,10 @@ pub(in crate::engine_tests) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn keyed_route_negative_alias_and_duplicate_blob_controls() {
         use brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
@@ -4209,6 +4281,10 @@ pub(in crate::engine_tests) mod tests {
     /// into `config`.
     #[test]
     #[hardwon("#10774+#10830: warm stores retained target-layout manifest gaps")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn warm_manifest_gap_upgrade_rederives_detached_crate() {
         if run_derivation_identity_child() {
             return;
@@ -4348,6 +4424,10 @@ pub(in crate::engine_tests) mod tests {
 
     #[test]
     #[hardwon("#10774+#10830: a target-layout .rs root was parsed as a Cargo manifest")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn only_cargo_toml_inputs_are_read_as_manifests() {
         // Since #10774 a package's `src/bin/<name>/main.rs` is a recorded
         // configuration input, beside Cargo.lock and the toolchain file. Bat
@@ -4426,6 +4506,10 @@ pub(in crate::engine_tests) mod tests {
     #[hardwon(
         "aaac3511d800: a dependency cycle forced every pending crate into one wave, so downstream crates were derived without their dependencies"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_dependency_cycle_forces_only_its_own_crates() {
         let project = cycle_fixture();
         let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
@@ -4492,6 +4576,10 @@ pub(in crate::engine_tests) mod tests {
 
     #[test]
     #[hardwon("#4503: chained Rust re-exports replayed every export fixpoint pass")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_crate_reexport_chain_reports_fixpoint_scaling() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
 
@@ -4707,6 +4795,10 @@ pub(in crate::engine_tests) mod tests {
     #[hardwon(
         "#3827: a Cargo bench root without a parsed blob must publish an incomplete topology"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cargo_benchmark_without_a_root_blob_publishes_incomplete_topology() {
         let fixture = InlineTestProject::new()
             .file(
@@ -4821,6 +4913,10 @@ pub(in crate::engine_tests) mod tests {
     /// fn-local item reaches it.
     #[test]
     #[hardwon("#11764: reordering items or pub-use lines moved the topology digest")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn the_topology_surface_digest_ignores_dense_coordinates() {
         const LIB: &str = "pub mod a;\n\
 use std::collections::HashMap;\n\
@@ -4960,6 +5056,10 @@ pub fn g() { struct L2; }\n";
     /// signatures: only the third edit moves it and only that one may derive
     /// `app` again.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_scoped_reconcile_publishes_what_the_full_pass_would() {
         // This reconcile oracle requires an inactive file to retain a broad placement.
         let fixture = fixture_with_decided_off_dependency();
@@ -5238,6 +5338,10 @@ pub fn g() { struct L2; }\n";
     /// A fresh process after a body edit scopes reconciliation when broad
     /// membership has a positive completeness certificate.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_fresh_process_after_a_body_edit_preserves_unreached_crates() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         let project = fixture();
@@ -5336,6 +5440,10 @@ pub fn g() { struct L2; }\n";
     /// without the marker runs the full pass, which restores it. An
     /// incremental update advances the marker to the head it reconciled.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_warm_start_skips_the_full_reconcile_only_while_the_marker_is_current() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         let project = fixture();
@@ -5423,6 +5531,28 @@ pub fn g() { struct L2; }\n";
             open - 1,
             "a start with a current marker walks no crate"
         );
+        {
+            let store = skipped.store().unwrap();
+            let rust_snapshot = store
+                .workspace_snapshots_for_current_languages(
+                    &brokk_bifrost_analysis::analyzer::store::WorkspaceId::for_root(
+                        project.project_dyn().root(),
+                    ),
+                    &["rust".to_string()],
+                )
+                .unwrap()
+                .remove("rust")
+                .unwrap();
+            let before_selection = store.workspace_selection_counts_for_test();
+            store
+                .reconcile_rust_crates_unless_current(&rust_snapshot)
+                .unwrap();
+            assert_eq!(
+                store.workspace_selection_counts_for_test(),
+                before_selection,
+                "warm-open reconcile must not open dedicated connections or write selections"
+            );
+        }
         assert_eq!(
             tamper(&skipped, "DELETE FROM rust_crate_reconciliations"),
             1
@@ -5457,6 +5587,10 @@ pub fn g() { struct L2; }\n";
     #[test]
     #[hardwon(
         "9888333a0d7f: external import boundaries must not be reported as missing local routes"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn crate_import_gaps_distinguish_external_boundaries_from_missing_local_routes() {
         let fixture = InlineTestProject::new()
@@ -5500,6 +5634,10 @@ pub fn g() { struct L2; }\n";
     /// resolving under the module directory, which is the base the two rules
     /// disagree about.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_path_attribute_in_a_module_file_resolves_against_that_file_directory() {
         let fixture = InlineTestProject::new()
             .file(
@@ -5593,6 +5731,10 @@ pub fn g() { struct L2; }\n";
     #[test]
     #[hardwon(
         "80645bcc16c2: one source file placed by two mod declarations has two module identities"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn one_file_reached_from_two_module_files_is_two_modules() {
         let fixture = InlineTestProject::new()
@@ -5688,6 +5830,10 @@ pub fn g() { struct L2; }\n";
     /// pinned beside the two-module case so the difference stays visible.
     #[test]
     #[hardwon("80645bcc16c2: duplicate module paths from two files remain ambiguous")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn one_module_path_placed_from_two_files_stays_a_duplicate_placement() {
         let fixture = InlineTestProject::new()
             .file(
@@ -5745,6 +5891,10 @@ pub fn g() { struct L2; }\n";
 
     #[test]
     #[hardwon("9888333a0d7f: enum glob imports need a persisted demand route")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_enum_glob_import_has_a_persisted_demand_route() {
         let fixture = InlineTestProject::new()
             .file(
@@ -5960,6 +6110,10 @@ pub fn g() { struct L2; }\n";
 
     #[test]
     #[hardwon("eea3f7fb1831: public use bindings were filtered out of crate import publication")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_rows_derive_exports_imports_and_public_invalidation() {
         let fixture = fixture();
         let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -6072,6 +6226,10 @@ pub fn g() { struct L2; }\n";
 
     #[test]
     fn crate_declaration_derivation_work_scales_with_blob_rows_not_container_product() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn measure(module_count: usize) -> (usize, i64) {
             let mut source = String::new();
             for module in 0..module_count {
@@ -6583,6 +6741,13 @@ pub fn g() { struct L2; }\n";
                             Integer(revision),
                             Integer(manifest),
                             Integer(id),
+                        ],
+                        "rust_crate_target_map_claims" => vec![
+                            text(&format!("[[{id},1]]")),
+                            text(&workspace),
+                            Integer(generation),
+                            Integer(revision),
+                            Blob(derivation_identity().to_vec()),
                         ],
                         "rust_crate_derivation_sql_cr_members_1" => vec![
                             text("crate"),
@@ -7101,6 +7266,10 @@ pub fn g() { struct L2; }\n";
     #[hardwon(
         "#4994: a projection drop pruned content-addressed summaries the next build re-derived"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn projection_drop_retains_summaries_for_rebinding_until_gc() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
 
@@ -7228,6 +7397,10 @@ pub fn g() { struct L2; }\n";
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_rows_release_foreign_keys_on_workspace_retirement_and_epoch_rotation() {
         let project = fixture();
         let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
@@ -7306,6 +7479,10 @@ pub fn g() { struct L2; }\n";
 
     #[test]
     #[hardwon("20974f2e7d10: distinct named re-export aliases were collapsed for one target")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_glob_reexports_reach_dependency_names_through_selected_rows() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers=[\"app\",\"dep\"]\nresolver=\"2\"\n")
@@ -7351,6 +7528,10 @@ pub fn g() { struct L2; }\n";
     // the loop runs again rather than closing the edges it already had.
     #[test]
     #[hardwon("#2130: chained glob imports were absent from reverse route discovery")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_import_routes_follow_a_chain_of_glob_imports() {
         let project = InlineTestProject::new()
             .file(
@@ -7448,6 +7629,10 @@ mod outer {
 
     #[test]
     #[hardwon("#11629: a blocker reached through a name lost its evidence file")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_point_rows_distinguish_open_and_closed_export_inventories() {
         let mut evidence = Vec::new();
         // The fourth and fifth cases write the second case's invocation under
@@ -7692,6 +7877,10 @@ mod outer {
 
     #[test]
     #[hardwon("#2767: identical blobs at different placements need distinct crate file identities")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_file_naming_keeps_same_blob_placements_and_bench_identity() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='identity'\nversion='0.1.0'\nedition='2024'\n[[bench]]\nname='custom_target'\npath='benches/routes.rs'\nharness=false\n")
@@ -7732,6 +7921,10 @@ mod outer {
 
     #[test]
     #[hardwon("285dc95915fc: inline module keys used the wrong source identity")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_inline_module_keys_use_declaration_names() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='inline'\nversion='0.1.0'\nedition='2024'\n")
@@ -7760,6 +7953,10 @@ mod outer {
 
     #[test]
     #[hardwon("dea5c8db472c: dependency re-exports were missing point binder rows")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_point_binder_rows_follow_dependency_named_reexports() {
         for (facade_source, imported_name) in [
             ("pub use dep::Thing as Public;", "Public"),
@@ -7838,6 +8035,10 @@ mod outer {
 
     #[test]
     #[hardwon("#5658: integer native namespaces published local types only as values")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn local_authority_namespace_codes_preserve_type_and_value_bindings() {
         use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
         let project = InlineTestProject::new()
@@ -7874,6 +8075,10 @@ mod outer {
     #[hardwon("#5658: an owner's unsupported item macro left macro bindings certified complete")]
     #[hardwon(
         "#12014: an unrelated module frontier voided own explicit type and value certificates"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn owner_gap_voids_published_binding_certificates() {
         let project = InlineTestProject::new()
@@ -7928,6 +8133,10 @@ mod outer {
     #[hardwon(
         "#5658: a private glob's conflict evidence reached a module that cannot import the name"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn glob_blockers_follow_importable_bindings() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname=\"glob_blockers\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n")
@@ -7968,6 +8177,10 @@ mod outer {
     #[test]
     #[hardwon(
         "#5658: P3 differential found an extern-prelude crate-root alias with no published alternative"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn prelude_root_aliases_publish_certified_named_import_witnesses() {
         let project = InlineTestProject::new()
@@ -8117,7 +8330,426 @@ mod outer {
             ));
             live.push((table, table_rows));
         }
+        // The feature projections are keyed by unit_key and input_digest, which
+        // are store-local, so they are compared by what the unit is called.
+        live.extend(feature_projection_rows(conn));
         live
+    }
+
+    /// The live units' feature projection and package rows, each unit named by
+    /// its crate name and kind instead of its key, so that an incrementally
+    /// maintained store and a from-scratch one compare equal exactly when they
+    /// persist the same projections (#13132).
+    fn feature_projection_rows(
+        conn: &Connection,
+    ) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        let rows = |sql: &str| -> Vec<Vec<rusqlite::types::Value>> {
+            let mut statement = conn.prepare(sql).unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map([], |row| (0..width).map(|index| row.get(index)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let live = "JOIN rust_crate_versions AS version ON version.crate_key=row.unit_key AND version.valid_until IS NULL
+                    JOIN rust_crate_topologies AS topology USING(topology_id)";
+        vec![
+            (
+                "rust_feature_projections".to_owned(),
+                rows(&format!(
+                    "SELECT topology.crate_name, topology.target_kind, row.projection_digest, row.complete,
+                            row.reason, row.manifest_path, row.configuration_directory
+                     FROM rust_feature_projections AS row {live} ORDER BY 1,2,3,4,5,6,7"
+                )),
+            ),
+            (
+                "rust_feature_projection_packages".to_owned(),
+                rows(&format!(
+                    "SELECT topology.crate_name, topology.target_kind, row.manifest_path, json(row.features), row.complete
+                     FROM rust_feature_projection_packages AS row {live} ORDER BY 1,2,3,4,5"
+                )),
+            ),
+        ]
+    }
+
+    /// Every persisted feature row of the store, live unit or not.
+    fn raw_feature_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn
+            .prepare(
+                "SELECT 'projection', hex(input_digest), hex(unit_key), hex(projection_digest), complete, reason, manifest_path, configuration_directory
+                 FROM rust_feature_projections
+                 UNION ALL
+                 SELECT 'package', hex(input_digest), hex(unit_key), manifest_path, json(features), complete, NULL, NULL
+                 FROM rust_feature_projection_packages
+                 ORDER BY 1,2,3,4,5,6,7,8",
+            )
+            .unwrap();
+        let width = statement.column_count();
+        statement
+            .query_map([], |row| (0..width).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn feature_chain_fixture(units: usize) -> BuiltInlineTestProject {
+        let members = (0..units)
+            .map(|index| format!("\"p{index}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut fixture = InlineTestProject::new().file(
+            "Cargo.toml",
+            format!("[workspace]\nmembers=[{members}]\nresolver=\"2\"\n"),
+        );
+        for index in 0..units {
+            let dependency = if index > 0 {
+                format!("[dependencies]\np{0}={{path=\"../p{0}\"}}\n", index - 1)
+            } else {
+                String::new()
+            };
+            fixture = fixture
+                .file(
+                    format!("p{index}/Cargo.toml"),
+                    format!(
+                        "[package]\nname=\"p{index}\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[features]\nf=[]\n{dependency}"
+                    ),
+                )
+                .file(format!("p{index}/src/lib.rs"), format!("pub fn f{index}() {{}}\n"));
+        }
+        fixture.file("README.md", "x\n").build()
+    }
+
+    /// A scoped pass that reaches no crate: nothing is derived, every unit's
+    /// projection is still recomputed and staged.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: test assertion reads raw persisted crate state"
+    )]
+    fn no_derive_pass(store: &AnalyzerStore) {
+        let snapshot = store
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT workspace_id,generation,revision FROM workspace_heads WHERE lang='rust'",
+                [],
+                |row| {
+                    Ok(WorkspaceSnapshotId {
+                        workspace_id: brokk_bifrost_analysis::analyzer::store::WorkspaceId(
+                            row.get(0)?,
+                        ),
+                        lang: "rust".into(),
+                        generation:
+                            brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(
+                                row.get(1)?,
+                            ),
+                        revision: row.get(2)?,
+                    })
+                },
+            )
+            .unwrap();
+        let report = store
+            .reconcile_rust_crates_after_changes(&snapshot, &snapshot, &["README.md".to_owned()])
+            .unwrap();
+        assert_eq!(report.derived, 0, "{report:?}");
+    }
+
+    #[test]
+    #[hardwon("#13132: a scoped reconcile pass rewrote every unit's feature projection")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: test assertion reads raw persisted crate state"
+    )]
+    fn tampered_feature_projection_rows_are_rewritten_by_a_no_derive_pass() {
+        let project = feature_chain_fixture(3);
+        let warm = project.workspace_analyzer(AnalyzerConfig::default());
+        let fresh = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = warm.store().unwrap();
+        let expected = feature_projection_rows(&fresh.store().unwrap().read_conn().unwrap());
+        assert_eq!(
+            expected[0].1.len(),
+            3,
+            "one projection per unit: {expected:?}"
+        );
+        assert_eq!(
+            feature_projection_rows(&store.read_conn().unwrap()),
+            expected
+        );
+        let raw = raw_feature_rows(&store.read_conn().unwrap());
+        let tampers: [(&str, &str); 4] = [
+            (
+                "a changed projection column",
+                "UPDATE rust_feature_projections SET manifest_path='tampered' WHERE unit_key=(SELECT min(unit_key) FROM rust_feature_projections)",
+            ),
+            (
+                "a changed package column",
+                "UPDATE rust_feature_projection_packages SET features=jsonb('[\"tampered\"]') WHERE unit_key=(SELECT min(unit_key) FROM rust_feature_projection_packages)",
+            ),
+            (
+                "a deleted projection row",
+                "DELETE FROM rust_feature_projections WHERE unit_key=(SELECT min(unit_key) FROM rust_feature_projections)",
+            ),
+            (
+                "an extra projection row",
+                "INSERT INTO rust_feature_projections SELECT workspace_id,generation,input_digest,zeroblob(32),projection_digest,complete,reason,manifest_path,configuration_directory FROM rust_feature_projections LIMIT 1",
+            ),
+        ];
+        for (what, sql) in tampers {
+            store
+                .conn
+                .execute_fixture(move |conn| -> Result<()> {
+                    conn.execute(sql, [])?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_ne!(
+                raw_feature_rows(&store.read_conn().unwrap()),
+                raw,
+                "{what} must change the persisted rows"
+            );
+            no_derive_pass(store.as_ref());
+            assert_eq!(
+                raw_feature_rows(&store.read_conn().unwrap()),
+                raw,
+                "{what} survived a pass with an unchanged input digest"
+            );
+            assert_eq!(
+                feature_projection_rows(&store.read_conn().unwrap()),
+                expected
+            );
+        }
+        // A deleted package row has no projection row to hang from, so it is a
+        // difference of the package table alone.
+        store
+            .conn
+            .execute_fixture(|conn| -> Result<()> {
+                conn.execute("DELETE FROM rust_feature_projection_packages WHERE unit_key=(SELECT min(unit_key) FROM rust_feature_projection_packages)", [])?;
+                Ok(())
+            })
+            .unwrap();
+        no_derive_pass(store.as_ref());
+        assert_eq!(raw_feature_rows(&store.read_conn().unwrap()), raw);
+        assert_eq!(
+            feature_projection_rows(&store.read_conn().unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn no_derive_pass_feature_statements_do_not_follow_the_unit_count() {
+        fn statements(units: usize) -> usize {
+            let project = feature_chain_fixture(units);
+            let warm = project.workspace_analyzer(AnalyzerConfig::default());
+            let store = warm.store().unwrap();
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            *store.feature_publication_statement_counter.lock().unwrap() = Some(counter.clone());
+            no_derive_pass(store.as_ref());
+            *store.feature_publication_statement_counter.lock().unwrap() = None;
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let small = statements(4);
+        let large = statements(8);
+        eprintln!("no-derive feature publication statements: 4 units={small}, 8 units={large}");
+        assert_eq!(small, large, "a no-derive pass must cost a constant");
+        // The compare and the revision UPDATE.
+        assert_eq!(small, 2);
+    }
+    #[test]
+    #[hardwon("#13383: Rust bundle epoch changes reused stale same-revision crate coordinates")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: test assertion reads raw persisted crate state"
+    )]
+    fn warm_bundle_epoch_rotation_rederives_same_revision_enum_coordinates() {
+        if run_derivation_identity_child() {
+            return;
+        }
+        use brokk_bifrost_analysis::analyzer::store::resolution::{
+            override_rust_bundle_epoch, resolution_bundle_epoch,
+        };
+        use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='coordinates'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod modes { pub enum Mode { Maybe, Yes(u8) } pub enum Later { Again } }",
+            )
+            .build();
+        let build = || {
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .unwrap()
+        };
+        let snapshot = |analyzer: &WorkspaceAnalyzer| {
+            analyzer.store().unwrap().read_conn().unwrap().query_row(
+                "SELECT workspace_id,generation,revision FROM workspace_heads WHERE lang='rust'", [],
+                |row| Ok(WorkspaceSnapshotId {
+                    workspace_id: brokk_bifrost_analysis::analyzer::store::WorkspaceId(row.get(0)?),
+                    lang: "rust".into(),
+                    generation: brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(row.get(1)?),
+                    revision: row.get(2)?,
+                }),
+            ).unwrap()
+        };
+        let marker = |analyzer: &WorkspaceAnalyzer| -> [u8; 32] {
+            analyzer
+                .store()
+                .unwrap()
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT derivation_identity FROM rust_crate_reconciliations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let topology = |analyzer: &WorkspaceAnalyzer| -> (i64, Vec<u8>) {
+            analyzer.store().unwrap().read_conn().unwrap().query_row(
+                "SELECT topology_id,topology_digest FROM rust_crate_versions JOIN rust_crate_topologies USING(topology_id) WHERE valid_until IS NULL", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+        // Follow ENUM_CONTAINERS' structured declaration -> native bridge ->
+        // definition site -> member scope join. No grammar numbering is pinned.
+        let coordinate = |analyzer: &WorkspaceAnalyzer| -> (i64, i64) {
+            analyzer.store().unwrap().read_conn().unwrap().query_row(
+                "SELECT container.enum_scope_node_key,scope.scope_head_node_key
+                 FROM rust_crate_versions AS version
+                 JOIN rust_crate_container_sources AS container USING(topology_id)
+                 JOIN source_declaration_units AS mapping ON mapping.blob_id=container.blob_id
+                 JOIN code_units AS unit ON unit.blob_id=mapping.blob_id AND unit.unit_key=mapping.unit_key
+                 JOIN source_native_declaration_bridges AS bridge ON bridge.blob_id=mapping.blob_id AND bridge.declaration_id=mapping.declaration_id
+                 JOIN resolution_semantic_sites AS site ON site.blob_id=bridge.blob_id AND site.source_site=bridge.source_site AND site.semantic_role='definition'
+                 JOIN resolution_member_scope_properties AS scope ON scope.blob_id=site.blob_id AND scope.definition_semantic_key=site.semantic_key AND scope.scope_kind='type_body'
+                 WHERE version.valid_until IS NULL AND container.container_path='crate::modes::Later' AND unit.identifier='Later'", [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+        let current_epoch = resolution_bundle_epoch(Language::Rust);
+        let old_epoch = override_rust_bundle_epoch("resolution-bundle-rust-before-13383");
+        let warm = build();
+        let before = snapshot(&warm);
+        let old_identity = marker(&warm);
+        let old_topology = topology(&warm);
+        let (actual, expected) = coordinate(&warm);
+        assert_eq!(actual, expected);
+        // Simulate an old producer whose per-file enum scope coordinate and
+        // matching derived crate coordinate differ from the current producer.
+        // Both rows remain sealed under the old bundle label until reopen.
+        // Scope head keys are interned node ids, so an adjacent value can
+        // belong to another scope; take one that no scope row uses.
+        let stale: i64 = warm
+            .store()
+            .unwrap()
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT MAX(scope_head_node_key) + 1 FROM resolution_member_scope_properties",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(stale, expected);
+        warm.store().unwrap().conn.execute_fixture(move |conn| -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            let conn = &tx;
+            let facts = conn.execute(
+                "UPDATE resolution_member_scope_properties SET scope_head_node_key=?1
+                 WHERE (blob_id, definition_semantic_key) IN (
+                   SELECT site.blob_id, site.semantic_key
+                   FROM source_declaration_units AS mapping
+                   JOIN code_units AS unit ON unit.blob_id=mapping.blob_id AND unit.unit_key=mapping.unit_key
+                   JOIN source_native_declaration_bridges AS bridge ON bridge.blob_id=mapping.blob_id AND bridge.declaration_id=mapping.declaration_id
+                   JOIN resolution_semantic_sites AS site ON site.blob_id=bridge.blob_id AND site.source_site=bridge.source_site AND site.semantic_role='definition'
+                   WHERE unit.identifier='Later') AND scope_kind='type_body'",
+                [stale],
+            )?;
+            assert_eq!(facts, 1);
+            // Keep the old producer's dependent fact rows referentially valid.
+            conn.execute(
+                "UPDATE resolution_member_type_coverage AS coverage SET scope_head_node_key=?1
+                 WHERE scope_head_node_key=?2 AND EXISTS (
+                   SELECT 1 FROM resolution_member_scope_properties AS scope
+                   WHERE scope.blob_id=coverage.blob_id
+                     AND scope.definition_semantic_key=coverage.definition_semantic_key
+                     AND scope.scope_head_node_key=?1)",
+                params![stale, expected],
+            )?;
+            conn.execute(
+                "UPDATE resolution_member_owner_properties AS member SET owner_scope_head_node_key=?1
+                 WHERE owner_scope_head_node_key=?2 AND EXISTS (
+                   SELECT 1 FROM resolution_member_scope_properties AS scope
+                   WHERE scope.blob_id=member.blob_id
+                     AND scope.definition_semantic_key=member.owner_definition_semantic_key
+                     AND scope.scope_head_node_key=?1)",
+                params![stale, expected],
+            )?;
+            let derived = conn.execute(
+                "UPDATE rust_crate_container_sources SET enum_scope_node_key=?1 WHERE topology_id=?2 AND container_path='crate::modes::Later'",
+                params![stale, old_topology.0],
+            )?;
+            assert_eq!(derived, 1);
+            tx.commit()
+        }).unwrap();
+        assert_eq!(coordinate(&warm), (stale, stale));
+        let fragment_epochs = |analyzer: &WorkspaceAnalyzer| -> Vec<String> {
+            analyzer.store().unwrap().read_conn().unwrap()
+                .prepare("SELECT DISTINCT producer_epoch FROM resolution_fragment_interiors WHERE lang='rust'").unwrap()
+                .query_map([], |row| row.get(0)).unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(
+            fragment_epochs(&warm),
+            ["resolution-bundle-rust-before-13383"]
+        );
+        drop(warm);
+        drop(old_epoch);
+        assert_eq!(resolution_bundle_epoch(Language::Rust), current_epoch);
+        let rotated = build();
+        assert_eq!(snapshot(&rotated), before);
+        assert_eq!(fragment_epochs(&rotated), [current_epoch]);
+        eprintln!(
+            "old coordinate={stale}, current expected={expected}, reopened derived/fact={:?}",
+            coordinate(&rotated)
+        );
+        assert_eq!(coordinate(&rotated), (expected, expected));
+        assert_ne!(marker(&rotated), old_identity);
+        assert_ne!(topology(&rotated).1, old_topology.1);
+        let fresh = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(coordinate(&rotated), coordinate(&fresh));
+        assert_eq!(topology(&rotated).1, topology(&fresh).1);
+        drop(fresh);
+        let current_identity = marker(&rotated);
+        let current_topology = topology(&rotated);
+        drop(rotated);
+        let again = build();
+        assert_eq!(snapshot(&again), before);
+        assert_eq!(marker(&again), current_identity);
+        assert_eq!(topology(&again), current_topology);
+        assert_eq!(coordinate(&again), (expected, expected));
+        let db_path = again.persisted_store_path().unwrap();
+        drop(again);
+        // Install the counter before the cold store's first reconciliation,
+        // rather than measuring an analyzer that already reconciled on open.
+        let store = AnalyzerStore::open_persistent(&db_path).unwrap();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *store.crate_statement_counter.lock().unwrap() = Some(counter.clone());
+        let report = store.reconcile_rust_crates_unless_current(&before).unwrap();
+        *store.crate_statement_counter.lock().unwrap() = None;
+        // The current path runs only the shared summary currency check. Any
+        // crate derivation adds statements outside that report's counter span.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            report.statements
+        );
+        assert_eq!(report.derived, 0, "{report:?}");
     }
 
     /// A derivation-version rotation on a warm store, which is what a release
@@ -8141,6 +8773,10 @@ mod outer {
     #[test]
     #[hardwon(
         "a48b9658c627: crate derivation changes reused stale Rust unit summaries on warm start"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn warm_derivation_identity_rotation_replaces_same_revision_versions() {
         if run_derivation_identity_child() {
@@ -8474,6 +9110,10 @@ mod outer {
     #[hardwon(
         "#9737: a manifest-only dependency rename left a stale manifest link in the crate row"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn warm_manifest_currency_upgrade_rederives_crates() {
         if run_derivation_identity_child() {
             return;
@@ -8544,6 +9184,10 @@ mod outer {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_topology_digests_follow_the_derivation_identity() {
         if run_derivation_identity_child() {
             return;
@@ -8651,6 +9295,10 @@ mod outer {
     /// subject, an inline module, and a trait that resolves nowhere.
     #[test]
     #[hardwon("abeb38d6a105: trait impl headers were not persisted for cross-blob lookup")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_trait_impl_rows_resolve_both_header_paths_through_module_routes() {
         let project = InlineTestProject::new()
             .file(
@@ -9236,6 +9884,10 @@ mod outer {
     /// summaries exist fails here instead of silently returning nothing.
     #[test]
     #[hardwon("#5249: five readers kept derivation_identity=7 after the writer moved to 8")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn every_rust_unit_summary_reader_observes_a_freshly_published_summary() {
         let project = InlineTestProject::new()
             .file(
@@ -9503,6 +10155,10 @@ mod outer {
     /// through the parent's imports, not only through the parent's own items.
     #[test]
     #[hardwon("141eef535530: use super glob missed parent private imports during impl binding")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_trait_impl_rows_bind_parent_private_imports_through_use_super_glob() {
         let project = InlineTestProject::new()
             .file(
@@ -9611,6 +10267,10 @@ mod outer {
     /// boundary, not by picking among every file that declares those bytes.
     #[test]
     #[hardwon("fbca556b2ffc: byte-identical declarations at distinct placements were conflated")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_trait_impl_rows_place_each_end_in_its_declaring_file() {
         let project = InlineTestProject::new()
             .file(
@@ -9712,6 +10372,10 @@ mod outer {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_cross_crate_reexport_routes_become_exports_and_bindings() {
         let project = InlineTestProject::new()
             .file(
@@ -9871,6 +10535,10 @@ mod outer {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_textual_macro_shadowing_requires_source_visibility_rows() {
         // #12239: exported candidates keep the child's textual shadowing order.
         for (guard, admitted) in [("custom_build_cfg", false), ("any()", true)] {
@@ -9984,6 +10652,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_include_splice_requires_multiple_blobs_at_one_module_path() {
         let project = InlineTestProject::new()
             .file(
@@ -10030,6 +10702,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_crate_include_reached_from_cfg_exclusive_files_is_one_member() {
         let project = InlineTestProject::new()
             .file(
@@ -10072,6 +10748,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_crate_same_blob_included_at_two_paths_preserves_paths_once_per_export() {
         let project = InlineTestProject::new()
             .file(
@@ -10140,6 +10820,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_local_imports_require_binder_scope_in_the_natural_key() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname=\"binders\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
@@ -10359,6 +11043,10 @@ pub mod second;
     }
     #[test]
     #[hardwon("6d1790cd65dc: revisioned enum alternatives collided in crate exports")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_revisioned_enum_variant_alternatives_share_one_export_key() {
         let crate_name = "revisioned_enum_exports";
         derivation::begin_legacy_export_compare(crate_name);
@@ -10438,6 +11126,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#4459: invalid enum and module collision aborted crate derivation")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_enum_variant_collision_keeps_first_declaration_export() {
         let project = InlineTestProject::new()
             .file(
@@ -10496,6 +11188,10 @@ pub mod second;
 
     #[test]
     #[hardwon("0fbbe7878a33: crate enum named variant import has a persisted demand route")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_enum_named_variant_import_has_a_persisted_demand_route() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname = \"enum_named\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
@@ -10531,6 +11227,10 @@ pub mod second;
         assert_eq!(containers, 1);
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn incremental_workspace_glob_discovers_new_member_before_unit_selection() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
 
@@ -10634,6 +11334,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_rows_reconcile_cargo_modules_and_body_update() {
         let fixture = fixture();
         let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -10722,6 +11426,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#5172: a warm version-8 summary omitted conditional import activation gaps")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cfg_if_warm_summary_rotation_preserves_unknown_imports() {
         use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RustUnitSummaries;
 
@@ -10955,6 +11663,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn broad_complete_uses_target_and_listing_evidence() {
         for (name, manifest, source, expected) in [
             (
@@ -11006,6 +11718,10 @@ pub mod second;
     #[hardwon(
         "#9737: active duplicate module files were dropped from the broad relation while broad_complete held"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn active_duplicate_module_files_remain_broad_candidates() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
@@ -11036,6 +11752,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn uncertified_active_edit_stays_scoped_and_matches_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file(
@@ -11081,6 +11801,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn broad_complete_covers_manifest_and_source_boundaries() {
         for (name, root_manifest, app_manifest, extra_path, extra_source, expected) in [
             (
@@ -11164,6 +11888,10 @@ pub mod second;
     #[hardwon(
         "#11111: certified absence accepted an escaping #[path] or include! whose candidates the workspace cannot represent"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn broad_complete_refuses_unrepresentable_module_paths() {
         for (name, lib, expected) in [
             (
@@ -11210,6 +11938,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn broad_complete_refuses_unpublished_rust_source() {
         for (name, bytes) in [
             ("refused", b"\0".to_vec()),
@@ -11235,6 +11967,10 @@ pub mod second;
     #[test]
     #[hardwon(
         "#10694: one long string line refused an ordinary Rust file and left the listing uncertified"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn a_long_string_line_keeps_an_ordinary_rust_file_and_its_listing() {
         let mut integration = String::new();
@@ -11292,6 +12028,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn detached_topology_requires_complete_traversed_source() {
         let fixture = InlineTestProject::new()
             .file("orphan.rs", "mod child;\n")
@@ -11310,6 +12050,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn stale_listing_certificate_scopes_edits_and_module_creation() {
         use brokk_bifrost_analysis::analyzer::store::{GenerationId, WorkspaceId};
         let fixture = InlineTestProject::new()
@@ -11359,6 +12103,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn absorbed_detached_helper_matches_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
@@ -11377,6 +12125,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn removed_module_becomes_detached_matches_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
@@ -11396,6 +12148,10 @@ pub mod second;
 
     // Recorded probes scope path-set events, including cross-crate case matches.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn path_probe_creation_scope_matches_fresh_rows() {
         for (path, everything, reached) in
             [("app/src/new.rs", false, 2), ("app/tests/new.rs", true, 0)]
@@ -11447,6 +12203,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#10552: deleting a required target root left other crates broad-complete")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn deleting_required_custom_root_matches_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers=['app','other']")
@@ -11474,6 +12234,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#11799: unrelated required target deletion changed fresh context completeness only")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn unrelated_target_deletion_preserves_warm_and_fresh_context_completeness() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers=['app','other']")
@@ -11506,6 +12270,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#11799: an escaping target gap missed a source owned across package boundaries")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn escaping_target_taints_cross_package_module_owners() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers=['app','shared','runner']")
@@ -11524,15 +12292,196 @@ pub mod second;
         assert_eq!(
             flags,
             vec![
-                ("app".to_owned(), false, false),
-                ("shared".to_owned(), false, false)
+                ("app".to_owned(), true, true),
+                ("shared".to_owned(), true, true)
             ]
         );
+        // #13400 moved #11799's guarantee from the crate flags to per-file
+        // availability: the module owner shared across packages answers
+        // incomplete with the typed reason naming the escaped runner target,
+        // while the healthy crates' own files stay complete.
+        let model = fixture.file("shared/src/model.rs");
+        with_certified_rust_routes(fixture.root(), |rust| {
+            use brokk_bifrost_analysis::analyzer::IAnalyzer;
+            use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
+                RustUnitAvailability, rust_file_unit_availability,
+            };
+            use brokk_bifrost_rust::selected_context::RustTargetRootUnavailableReason;
+            let routes = rust.file_routes(&model, None).unwrap();
+            assert!(
+                !routes.is_complete(),
+                "model.rs is claimed by the escaped runner"
+            );
+            let snapshot = rust
+                .selected_workspace_snapshots_for_reads()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let conn =
+                rust.analyzer_store()
+                    .read_conn_for_workspace(
+                        &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots::from_iter([
+                            ("rust".to_string(), snapshot.clone()),
+                        ]),
+                    )
+                    .unwrap();
+            let states =
+                rust_file_unit_availability(&conn, &snapshot, "shared/src/model.rs").unwrap();
+            assert!(
+                states.iter().any(|(_, state)| matches!(
+                    state,
+                    RustUnitAvailability::IntentionallyUnavailable { cause, .. }
+                        if cause.target_name == "runner"
+                            && cause.reason == RustTargetRootUnavailableReason::OutsidePackageUnsupported
+                )),
+                "{states:?}"
+            );
+            for path in ["app/src/lib.rs", "shared/src/lib.rs"] {
+                let file = fixture.file(path);
+                assert!(
+                    rust.file_routes(&file, None).unwrap().is_complete(),
+                    "{path} has only healthy owners"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[hardwon(
+        "#13400: a stale unit summary aborted the context build instead of reporting partial membership"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: test assertion reads raw persisted publication state"
+    )]
+    fn stale_unit_summary_reports_incomplete_membership_instead_of_failing() {
+        let fixture = InlineTestProject::new()
+            .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
+            .file("src/lib.rs", "pub fn app() {}")
+            .build();
+        with_certified_rust_routes(fixture.root(), |rust| {
+            use brokk_bifrost_analysis::IAnalyzer as _;
+            use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
+                RustSelectedUnitsPublication, RustUnitAvailability, rust_file_unit_availability,
+                rust_selected_units_known, rust_unit_inputs,
+            };
+            // A binary upgrade changed the summary derivation identity and
+            // reconcile has not rewritten the rows yet.
+            let rewritten = rust
+                .analyzer_store()
+                .conn
+                .execute(|conn| {
+                    conn.execute(
+                        "UPDATE resolution_unit_summaries SET derivation_identity=zeroblob(32) WHERE lang='rust' AND unit_kind='rust_crate'",
+                        [],
+                    )
+                })
+                .unwrap();
+            assert!(rewritten > 0);
+            let snapshot = rust
+                .selected_workspace_snapshots_for_reads()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let conn =
+                rust.analyzer_store()
+                    .read_conn_for_workspace(
+                        &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots::from_iter([
+                            ("rust".to_string(), snapshot.clone()),
+                        ]),
+                    )
+                    .unwrap();
+            let RustSelectedUnitsPublication::Unpublished(units) =
+                rust_selected_units_known(&conn, &snapshot).unwrap()
+            else {
+                panic!("a stale summary is not published membership")
+            };
+            assert!(!units.is_empty());
+            let states = rust_file_unit_availability(&conn, &snapshot, "src/lib.rs").unwrap();
+            assert!(
+                !states.is_empty()
+                    && states
+                        .iter()
+                        .all(|(_, state)| matches!(state, RustUnitAvailability::Stale)),
+                "{states:?}"
+            );
+            // A point read of one stale unit has no identity to report and fails
+            // closed; it is not a stale-generation retry.
+            let (unit, _) = states[0];
+            assert!(rust_unit_inputs(&conn, &snapshot, &unit).is_err());
+            drop(conn);
+
+            use brokk_bifrost_analysis::CodeUnitIndex as _;
+
+            // Exercise both operation readers after the upgrade, before reconcile
+            // can publish current summaries. Store-only availability checks above
+            // do not catch either reader rejecting Stale as an error.
+            use brokk_bifrost_analysis::analyzer::resolution::{
+                ResolutionCompletion, ResolutionIncompleteReason,
+            };
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+                SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+                SelectedRustFileContextOutcome,
+            };
+            use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+            let cancellation = brokk_bifrost_core::CancellationToken::new();
+            let snapshots = WorkspaceSnapshots::from_iter([("rust".to_owned(), snapshot.clone())]);
+            let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+            let SelectedResolutionOperationOpenOutcome::Ready(operation) = rust
+                .analyzer_store()
+                .open_selected_resolution_operation(
+                    SelectedResolutionOperationInput::new(
+                        rust.project(),
+                        &snapshot.workspace_id,
+                        &snapshots,
+                        &languages,
+                        &[],
+                    ),
+                    &cancellation,
+                )
+                .expect("a stale summary must still allow the selected operation to open")
+            else {
+                panic!("the stale-summary selection must open Ready")
+            };
+            let file = fixture.file("src/lib.rs");
+            let targets = operation
+                .rust_file_configuration_targets(file.rel_path(), &cancellation)
+                .expect("stale summaries must leave membership partial instead of failing");
+            assert!(!targets.membership_complete, "{targets:?}");
+            let SelectedRustFileContextOutcome::Ready { context, .. } = operation
+                .rust_context_for_file(file.rel_path(), &cancellation)
+                .expect("stale summaries must leave the context incomplete instead of failing")
+            else {
+                panic!("the stale-summary context must not be cancelled")
+            };
+            let ResolutionCompletion::Incomplete(reasons) = context.inventory_completion() else {
+                panic!("a stale unit must leave context inventory incomplete")
+            };
+            assert!(
+                reasons.iter().any(|reason| matches!(
+                    reason,
+                    ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                        if matches!(
+                            operation.ready.context_identities.named_reason(*semantic),
+                            Some(("RustUnitStale", _))
+                        )
+                )),
+                "context must retain the stale-unit reason: {reasons:?}"
+            );
+        });
     }
 
     #[test]
     #[hardwon(
         "#11799: selected completeness reused a topology whose broad flag was already partial"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn selected_completeness_changes_a_topology_already_broad_incomplete() {
         let fixture = InlineTestProject::new()
@@ -11564,6 +12513,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn certified_inactive_edit_scopes_to_its_crate() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers=['app','dep']")
@@ -11623,6 +12576,10 @@ pub mod second;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_scoped_file_creation_deletion_and_rename_match_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
@@ -11687,6 +12644,10 @@ pub mod second;
     // proves Real.rs absent: the scoped reconcile must reach the lib crate,
     // which has no placement row for the deleted path.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn deleting_a_file_a_candidate_matched_by_case_matches_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
@@ -11734,6 +12695,10 @@ pub mod second;
     // A selected src/foo.RS is a Rust source, and `#[path = "Foo.rs"]` matches it
     // by case, so creating it must reach the crate the way a fresh build does.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn creating_an_upper_case_rs_file_a_candidate_matches_by_case_matches_fresh_rows() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
@@ -11807,6 +12772,10 @@ pub mod second;
 
     /// The Rust listing certificate of the workspace's head revision: whether
     /// it is complete, and its failing rows.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_head_listing_certificate(
         analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
     ) -> (bool, Vec<(String, String)>) {
@@ -11911,6 +12880,10 @@ pub mod second;
     #[test]
     #[hardwon(
         "#9737: a point update rescanned every Rust file, and an unavailable listing dropped earlier failures"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn incremental_rust_listing_certificate_recomputes_after_oversized_source() {
         let mut builder = InlineTestProject::new()
@@ -12230,6 +13203,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#9737: a stored listing-unavailable certificate was never recomputed")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn incremental_rust_listing_certificate_recovers_when_listing_becomes_readable() {
         use brokk_bifrost_analysis::analyzer::store::{
             GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
@@ -12336,6 +13313,10 @@ pub mod second;
     }
 
     #[cfg(unix)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn scoped_directory_omission_case(case: &str) {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::FilesystemProject;
@@ -12443,6 +13424,10 @@ pub mod second;
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn directory_omissions_cover_the_implicit_library_root() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::FilesystemProject;
@@ -12559,6 +13544,10 @@ pub mod second;
     #[test]
     #[hardwon("#10321: deleting a symlink's target left the Rust listing certified")]
     #[hardwon("#10321: a listing-only change rewrote the certificate of an existing revision")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn incremental_rust_listing_certificate_agrees_for_directory_symlinks() {
         use brokk_bifrost_analysis::analyzer::store::{
             GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
@@ -12863,6 +13852,10 @@ pub mod second;
 
     #[test]
     #[hardwon("#10321: a point update opened an extra revision for its certificate")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn point_update_certifies_only_its_last_revision() {
         use brokk_bifrost_analysis::analyzer::store::{
             GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
@@ -13042,6 +14035,10 @@ pub mod second;
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_listing_construction_error_publishes_no_certificate() {
         use brokk_bifrost_core::analyzer::project::{FilesystemProject, PartialWorkspaceListing};
         use brokk_bifrost_core::retention_budget::RetentionBudget;
@@ -14496,6 +15493,10 @@ replay! { replay! { mod doubly_replayed; } }
     }
 
     /// The export rows and gaps the topology publishes for `top`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn top_rows(project: &BuiltInlineTestProject) -> (Vec<String>, Vec<String>) {
         let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
         let conn = analyzer.store().unwrap().read_conn().unwrap();
@@ -14725,6 +15726,10 @@ replay! { replay! { mod doubly_replayed; } }
     #[hardwon(
         "#12358: legal dev-dependency cycles forced library crates incomplete and made every Rust route partial"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_crate_dev_cycle_keeps_inventories_complete() {
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers=['a','b']\nresolver='2'\n")
@@ -14764,5 +15769,28 @@ replay! { replay! { mod doubly_replayed; } }
             !edges.contains(&("a".into(), "lib".into(), "b".into())),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13454: cold crate derivation retained cr_* tables and TEMP pages on idle pooled readers"
+    )]
+    fn cold_build_with_mixed_dependencies_and_forced_cycles_retains_no_cr_scratch_on_pooled_readers()
+     {
+        let project = cycle_fixture();
+        let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
+        let store = workspace.store().unwrap();
+        let idle = store.idle_reader_temp_summary_for_test();
+        for (pool_kind, cr_names, page_count, freelist_count) in &idle {
+            assert!(
+                cr_names.is_empty(),
+                "idle {pool_kind} pooled reader must retain no cr_* or rust_schedule_live TEMP tables: {cr_names:?}"
+            );
+            assert!(
+                *page_count <= 64 && *freelist_count == 0,
+                "idle {pool_kind} pooled reader must not retain derivation TEMP pages (pages={page_count}, freelist={freelist_count})"
+            );
+        }
+        store.assert_rust_summary_differential_for_test();
     }
 }

@@ -722,6 +722,7 @@ ORDER BY package_file.mount_ordinal,semantic.semantic_key
 
 impl SelectedResolutionOperation<'_, '_> {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_reference_at(
         &self,
         caller_path: &str,
@@ -761,6 +762,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Select the callable identity at a call site. Generic Go invocations
     /// can publish a type-name and callable reference at the same byte range.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_call_reference_at(
         &self,
         caller_path: &str,
@@ -808,6 +810,7 @@ impl SelectedResolutionOperation<'_, '_> {
         self.point_expression_value_slot_at("go", caller_path, start_byte, end_byte, cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn point_expression_value_slot_at(
         &self,
         storage_language: &str,
@@ -849,6 +852,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn point_call_argument_slot_at(
         &self,
         storage_language: &str,
@@ -911,6 +915,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_callable_result_slot(
         &self,
         caller_path: &str,
@@ -954,6 +959,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Select a package function's persisted callable-result anchor from one
     /// exact call reference in the caller blob.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_callable_result_anchor(
         &self,
         context_id: i64,
@@ -1048,6 +1054,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Read the declared Go type name belonging to one selected type identity.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_type_name(
         &self,
         identity: SemanticId,
@@ -1076,6 +1083,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_receiver_slot(
         &self,
         context_id: i64,
@@ -1116,6 +1124,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_receiver_type_anchor(
         &self,
         context_id: i64,
@@ -1284,6 +1293,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// anchors a Go receiver. The AST supplies the selected declaration-name
     /// range; each join stays within that caller blob.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_point_binding_type_anchor(
         &self,
         context_id: i64,
@@ -1365,6 +1375,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// declaration of `member_name` under that type. This is a fixed number of
     /// keyed reads, shared by Go point confirmation and reverse candidates.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn resolve_go_receiver_anchor_member(
         &self,
         context_id: i64,
@@ -1494,6 +1505,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(types)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_go_receiver_anchor_types(
         &self,
         context_id: i64,

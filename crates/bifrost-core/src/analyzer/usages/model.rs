@@ -45,6 +45,19 @@ pub enum UsageProof {
     Unproven,
 }
 
+/// How a call relation was obtained.
+///
+/// `StaticBinding` is the call's own resolved binding. `DispatchCandidate` is a
+/// possible runtime target that dispatch expansion adds, for example an
+/// implementation of a trait method called through `dyn Trait`. A candidate is
+/// always `UsageProof::Unproven` and is never a definition binding. Whether a
+/// candidate set is complete is reported separately from both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallRelationKind {
+    StaticBinding,
+    DispatchCandidate,
+}
+
 /// Who produced a reference or call answer, and therefore whether its proof
 /// tiers are authoritative.
 ///

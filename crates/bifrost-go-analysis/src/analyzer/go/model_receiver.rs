@@ -3,6 +3,7 @@
 use crate::analyzer::go::GoAnalyzer;
 use crate::analyzer::usages::get_definition::go::{
     AnalyzerGoDefinitionProvider, go_selected_receiver_argument_shape,
+    go_selected_receiver_argument_shape_for_call,
 };
 use brokk_bifrost_analysis::analyzer::QueryScope;
 use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
@@ -63,6 +64,16 @@ pub(crate) fn go_selected_model_receiver_call(
     selection: Option<&ProjectedNativeModelMemberSelection>,
     descriptor: &DeferredMemberSelection,
     session: &ResolutionSession,
+) -> GoModelReceiverSelection {
+    go_selected_model_receiver_call_at_call(query, selection, descriptor, session, None)
+}
+
+pub(crate) fn go_selected_model_receiver_call_at_call(
+    query: BoundedReceiverQuery<'_>,
+    selection: Option<&ProjectedNativeModelMemberSelection>,
+    descriptor: &DeferredMemberSelection,
+    session: &ResolutionSession,
+    call_node: Option<tree_sitter::Node<'_>>,
 ) -> GoModelReceiverSelection {
     let Some(selection) = selection else {
         return GoModelReceiverSelection::NotModel;
@@ -141,14 +152,25 @@ pub(crate) fn go_selected_model_receiver_call(
             session,
             query.analyzer.semantic_model_overlay_read().published(),
         );
-        go_selected_receiver_argument_shape(
-            &support,
-            scope.token(),
-            go,
-            query.file,
-            query.source,
-            callable,
-        )
+        if let Some(call) = call_node {
+            go_selected_receiver_argument_shape_for_call(
+                &support,
+                scope.token(),
+                go,
+                query.file,
+                query.source,
+                call,
+            )
+        } else {
+            go_selected_receiver_argument_shape(
+                &support,
+                scope.token(),
+                go,
+                query.file,
+                query.source,
+                callable,
+            )
+        }
     });
     let applicable_shape = shape.filter(|(count, spread)| {
         let Some(signature) = candidate.declaration.structured_signature.as_ref() else {

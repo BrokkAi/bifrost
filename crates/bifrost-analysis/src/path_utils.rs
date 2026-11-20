@@ -272,9 +272,9 @@ impl<'a> WorkspaceFileResolver<'a> {
             shared_index.read(
                 &attribution,
                 |cell| {
-                    Arc::clone(
-                        cell.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project))),
-                    )
+                    Arc::clone(cell.get_or_init(|| {
+                        Arc::new(WorkspaceFileIndex::build(self.project, Some(cell.as_ref())))
+                    }))
                 },
                 |index| {
                     index
@@ -295,7 +295,9 @@ impl<'a> WorkspaceFileResolver<'a> {
         self.private_index.read(
             &attribution,
             |cell| {
-                Arc::clone(cell.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project))))
+                Arc::clone(
+                    cell.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project, None))),
+                )
             },
             |index| {
                 index

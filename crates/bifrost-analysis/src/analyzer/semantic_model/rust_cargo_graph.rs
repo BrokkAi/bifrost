@@ -397,10 +397,9 @@ impl RustSelectedCargoGraph {
                 .saturating_add(evidence.target.as_ref().map_or(0, String::capacity))
                 .saturating_add(evidence.configuration.as_ref().map_or(0, String::capacity))
                 .saturating_add(
-                    evidence
-                        .artifact_sha256
-                        .as_ref()
-                        .map_or(0, String::capacity),
+                    evidence.production_input_digest.as_ref().map_or(0, String::capacity)
+                        + evidence.verified_raw_artifacts.iter().filter_map(|slot| slot.module.as_ref()).map(String::capacity).sum::<usize>()
+                        + evidence.verified_raw_artifacts.capacity() * std::mem::size_of::<brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact>(),
                 )
                 .saturating_add(id.package_id.0.capacity())
                 .saturating_add(id.configuration.as_ref().map_or(0, String::capacity))
@@ -460,7 +459,8 @@ fn evidence_graph_key(
     let mut key = evidence.clone();
     // Preparation adds the generated pack's input digest after Cargo discovery.
     // Every other component of the discovery row remains the exact lookup identity.
-    key.artifact_sha256 = None;
+    key.production_input_digest = None;
+    key.verified_raw_artifacts.clear();
     key
 }
 
@@ -477,7 +477,8 @@ mod tests {
             toolchain: None,
             target: Some("x86_64-unknown-linux-gnu".into()),
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }
     }
 
@@ -535,9 +536,9 @@ mod tests {
     #[test]
     fn digest_projection_rejects_distinct_package_ids() {
         let mut first = evidence();
-        first.artifact_sha256 = Some("a".into());
+        first.production_input_digest = Some("a".repeat(64));
         let mut second = evidence();
-        second.artifact_sha256 = Some("b".into());
+        second.production_input_digest = Some("b".repeat(64));
         let graph = RustSelectedCargoGraph::from_cargo_resolve(CargoResolveView::from_rows(
             vec![
                 CargoSelectedPackage {
@@ -829,6 +830,14 @@ mod tests {
                         assert!(content[..first].contains("#[cfg(test)]"));
                         continue;
                     }
+                    if path.ends_with("bifrost-analysis/src/analyzer/workspace.rs") {
+                        // One test fixture checks that a full activation drops
+                        // a subset carried graph.
+                        assert_eq!(count, 1);
+                        let first = content.find(call).expect("test constructor call exists");
+                        assert!(content[..first].contains("#[cfg(test)]"));
+                        continue;
+                    }
                     for _ in 0..count {
                         callers.push(path.clone());
                     }
@@ -841,9 +850,14 @@ mod tests {
                 scan(&src, &mut callers);
             }
         }
-        assert_eq!(callers.len(), 1, "constructor callers: {callers:?}");
+        // Runtime semantic activation publishes the graph it captures, and the
+        // passive exact-evidence path hands its own graph to offline producers.
+        // Both callers belong to rust dependency discovery.
+        assert_eq!(callers.len(), 2, "constructor callers: {callers:?}");
         assert!(
-            callers[0].ends_with("rust/dependency_discovery.rs"),
+            callers
+                .iter()
+                .all(|caller| caller.ends_with("rust/dependency_discovery.rs")),
             "{callers:?}"
         );
     }

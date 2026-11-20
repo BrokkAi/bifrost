@@ -2814,6 +2814,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                     brokk_bifrost_jvm::intrinsics::implicit_interface_members(language)
                         .expect("a producer member-root edge requires a language rule")
                         .methods
+                        .expect("a producer-owned JVM member root has a fixed inventory")
                         .iter()
                         .map(|method| method.name)
                         .collect::<BTreeSet<_>>()

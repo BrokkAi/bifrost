@@ -32,7 +32,9 @@ pub use binding::{
     TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey, TypestateTerminalBindingId,
     TypestateTerminalBindingSpec, UnprovenEventRelation,
 };
-pub use call_map::{CallSubjectMapSelection, CallSubjectMapping, call_subject_map};
+pub use call_map::{
+    CallSubjectMapSelection, CallSubjectMapping, call_family_subject_map, call_subject_map,
+};
 pub use client::compose_labels::{
     FirstUnprovenEvent, FirstUnprovenRelation, FirstUnprovenRelationKind, TypestateAliasGuard,
     TypestateComposeFact, TypestateComposeFunction, TypestateComposeLabels, TypestateComposeStep,
@@ -63,9 +65,8 @@ pub use planned::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use production::with_typestate_protocol_serving_for_test;
-pub use production::{DirectScalarSource, direct_scalar_source};
 pub use production::{
-    ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
+    ClassInitialization, ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
     ProductionSummaryProjectionError, ProductionTypestateExecutionContext,
     ProductionTypestateSolveError, ProductionTypestateSolveResult,
     ProductionTypestateSummaryRepository, RootCallClosure, RootCallClosureIncompleteReason,
@@ -73,6 +74,7 @@ pub use production::{
     project_production_semantic_summaries, project_workspace_root_call_closure,
     solve_typestate_with_production_summaries,
 };
+pub use production::{DirectScalarSource, direct_scalar_source, direct_snapshot_of};
 pub use protocol::{
     CompiledProtocol, CompiledProtocolEvent, CompiledProtocolGuard, CompiledProtocolTransition,
     CompiledTerminalExpectation, MAX_PROTOCOL_EVENTS, MAX_PROTOCOL_EXPECTATIONS,
@@ -102,3 +104,5 @@ pub use summary::{
 };
 
 pub(crate) use production::ProductionTypestateSummaryStorage;
+
+pub use binding::{BoundTypestateStateTransfer, TypestateStateTransferSpec};

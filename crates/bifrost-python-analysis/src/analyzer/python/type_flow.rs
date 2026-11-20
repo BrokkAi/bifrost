@@ -3528,14 +3528,20 @@ fn exact_builtin_class(
     indexed_builtin_is_unshadowed(python, reference, prepared)?.then_some(identity)
 }
 
-/// Completed lexical facts are independent of models and workspace bindings.
-/// Exact source bytes and the reference position determine the answer. Keep
-/// them for one query only; an interrupted bounded walk never supplies a fact.
-#[derive(Default)]
-struct PythonBuiltinShadowRequestMemo {
-    answers: Mutex<HashMap<([u8; 32], SourceSpan), bool>>,
-    #[cfg(test)]
-    walks: std::sync::atomic::AtomicUsize,
+brokk_bifrost_core::domain_memo_set! {
+    /// Completed lexical facts are independent of models and workspace bindings.
+    /// Exact source bytes and the reference position determine the answer. Keep
+    /// them for one query only; an interrupted bounded walk never supplies a fact.
+    struct PythonBuiltinShadowRequestMemo {
+        // Certifying: exact source bytes (the prepared tree's digest) determine
+        // the answer, and the caller holds that tree.
+        answers: brokk_bifrost_core::domain_memo::CertifyingRegion<
+            ([u8; 32], SourceSpan),
+            bool,
+            brokk_bifrost_core::domain_memo::DigestAuthority,
+        >,
+        ; test_only { walks: std::sync::atomic::AtomicUsize }
+    }
 }
 
 impl PythonBuiltinShadowRequestMemo {
@@ -3546,19 +3552,13 @@ impl PythonBuiltinShadowRequestMemo {
         session: &ResolutionSession,
         module_admission: impl FnMut(Node<'_>, &str, Node<'_>) -> Option<bool>,
     ) -> Option<bool> {
+        use brokk_bifrost_core::domain_memo::CertificationProof;
         if !session.scope_step() {
             return None;
         }
+        let proof = CertificationProof::from_witness(prepared);
         let key = (prepared.source_sha256(), span_for_node(reference));
-        if let Some(answer) = self
-            .answers
-            .lock()
-            .expect("builtin shadow memo lock poisoned")
-            .get(&key)
-            .cloned()
-        {
-            let keys = prepared.source_sha256();
-            debug_assert_eq!(key.0, keys);
+        if let Some(answer) = self.answers.get(&key, &proof).map(|hit| *hit.value()) {
             return session.scope_step().then_some(answer);
         }
         #[cfg(test)]
@@ -3573,16 +3573,8 @@ impl PythonBuiltinShadowRequestMemo {
         if !session.scope_step() {
             return None;
         }
-        {
-            let mut answers = self
-                .answers
-                .lock()
-                .expect("builtin shadow memo lock poisoned");
-            if !session.scope_step() {
-                return None;
-            }
-            answers.insert(key, answer);
-        }
+        // A refused or closed region returns the complete answer anyway.
+        drop(self.answers.insert(key, answer, &proof));
         session.scope_step().then_some(answer)
     }
 
@@ -3864,14 +3856,17 @@ fn identifier_reads_an_enclosing_local(reference: Node<'_>, source: &str) -> boo
     false
 }
 
-type PythonModuleBindingAnswers = HashMap<Box<str>, Option<PythonDirectScopeBindingKind>>;
-
-/// Successful syntax-only answers retained for one active query. Exact source
-/// bytes determine these bindings; workspace/model identities do not. A stopped
-/// walk is never cached, and hits still check the current session for stopping.
-#[derive(Default)]
-struct PythonModuleBindingRequestMemo {
-    bindings: Mutex<HashMap<[u8; 32], PythonModuleBindingAnswers>>,
+brokk_bifrost_core::domain_memo_set! {
+    /// Successful syntax-only answers retained for one active query. Exact source
+    /// bytes determine these bindings; workspace/model identities do not. A stopped
+    /// walk is never cached, and hits still check the current session for stopping.
+    struct PythonModuleBindingRequestMemo {
+        bindings: brokk_bifrost_core::domain_memo::CertifyingRegion<
+            ([u8; 32], Box<str>),
+            Option<PythonDirectScopeBindingKind>,
+            brokk_bifrost_core::domain_memo::DigestAuthority,
+        >,
+    }
 }
 
 fn resolve_module_binding(
@@ -3897,26 +3892,13 @@ impl PythonModuleBindingRequestMemo {
         if !session.scope_step() {
             return None;
         }
-        let source = prepared.source_sha256();
-        if let Some(binding) = self
-            .bindings
-            .lock()
-            .expect("module binding memo lock poisoned")
-            .get(&source)
-            .and_then(|bindings| bindings.get(name))
-            .cloned()
-        {
-            let keys = prepared.source_sha256();
-            debug_assert_eq!(source, keys);
+        let proof = brokk_bifrost_core::domain_memo::CertificationProof::from_witness(prepared);
+        let key = (prepared.source_sha256(), Box::<str>::from(name));
+        if let Some(binding) = self.bindings.get(&key, &proof).map(|hit| *hit.value()) {
             return Some(binding);
         }
         let binding = resolve_module_binding(prepared, name, session)?;
-        self.bindings
-            .lock()
-            .expect("module binding memo lock poisoned")
-            .entry(source)
-            .or_default()
-            .insert(name.into(), binding);
+        drop(self.bindings.insert(key, binding, &proof));
         Some(binding)
     }
 }
@@ -4315,19 +4297,22 @@ enum PythonClassProbe {
     ConstructorCallee,
 }
 
-#[derive(Default)]
-struct PythonClassLookupRequestMemo {
-    answers: Mutex<
-        HashMap<
-            PythonClassLookupKey,
-            (
-                ClassSeed,
-                Arc<brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt>,
-            ),
+/// A completed lookup with the receipt of the build that produced it.
+#[derive(Clone)]
+struct PythonClassLookupEntry {
+    answer: ClassSeed,
+    receipt: Arc<brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt>,
+}
+impl brokk_bifrost_core::domain_memo::ReplayEntry for PythonClassLookupEntry {}
+
+brokk_bifrost_core::domain_memo_set! {
+    #[derive(Default)]
+    struct PythonClassLookupRequestMemo {
+        answers: brokk_bifrost_core::domain_memo::ReplayingStore<
+            Mutex<HashMap<PythonClassLookupKey, PythonClassLookupEntry>>,
         >,
-    >,
-    #[cfg(test)]
-    lookups: std::sync::atomic::AtomicUsize,
+        ; test_only { lookups: std::sync::atomic::AtomicUsize }
+    }
 }
 
 /// Resolve the expression at `span` in `file` and interpret it as a class seed.
@@ -4469,7 +4454,7 @@ fn memoized_class_seed(
         .expect("class lookup memo lock poisoned")
         .get(&key)
         .cloned();
-    if let Some((answer, receipt)) = cached {
+    if let Some(PythonClassLookupEntry { answer, receipt }) = cached {
         receipt.replay();
         return answer;
     }
@@ -4488,7 +4473,13 @@ fn memoized_class_seed(
         memo.answers
             .lock()
             .expect("class lookup memo lock poisoned")
-            .insert(key, (answer.clone(), Arc::new(receipt)));
+            .insert(
+                key,
+                PythonClassLookupEntry {
+                    answer: answer.clone(),
+                    receipt: Arc::new(receipt),
+                },
+            );
     }
     answer
 }
@@ -10537,6 +10528,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             | GuardPredicate::OrderedIntegerComparison { .. }
             | GuardPredicate::OrderedFloatComparison { .. }
             | GuardPredicate::NanComparison { .. }
+            | GuardPredicate::ValueEquality { .. }
+            | GuardPredicate::ValueOrdering { .. }
             | GuardPredicate::Opaque { .. } => unknown(),
         }
     }
@@ -10570,6 +10563,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             | GuardPredicate::OrderedIntegerComparison { .. }
             | GuardPredicate::OrderedFloatComparison { .. }
             | GuardPredicate::NanComparison { .. }
+            | GuardPredicate::ValueEquality { .. }
+            | GuardPredicate::ValueOrdering { .. }
             | GuardPredicate::Opaque { .. } => return ClassSeed::NotApplicable,
         };
         let Ok(classes) = self.guard_classes(workspace, procedure, classes) else {
@@ -11285,6 +11280,11 @@ fn python_has_refinement_candidate(
 }
 
 #[cfg(test)]
+fn test_domain_memo<M: brokk_bifrost_core::domain_memo::DomainMemo>() -> M {
+    M::new(&brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1 << 24))
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -11513,7 +11513,9 @@ mod tests {
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
         let python = crate::analyzer::python::type_flow::python_analyzer(&workspace);
-        let memo = crate::analyzer::python::type_flow::PythonBuiltinShadowRequestMemo::default();
+        let memo = super::test_domain_memo::<
+            crate::analyzer::python::type_flow::PythonBuiltinShadowRequestMemo,
+        >();
         for _ in 0..3 {
             for (file, expected) in [("open.py", true), ("shadowed.py", false)] {
                 let prepared = crate::analyzer::python::type_flow::current_indexed_prepared(
@@ -11596,15 +11598,17 @@ mod tests {
             .unwrap()
             .named_child(0)
             .unwrap();
-        let memo = crate::analyzer::python::type_flow::PythonBuiltinShadowRequestMemo::default();
-        let mut tiny =
+        let memo = super::test_domain_memo::<
+            crate::analyzer::python::type_flow::PythonBuiltinShadowRequestMemo,
+        >();
+        // Scope work never refuses (#13216); a total-work allowance is the stop.
+        let tiny =
             brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
-        tiny.max_scope_nodes = 1;
         assert_eq!(
             memo.unshadowed(
                 base,
                 &prepared,
-                &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(tiny, None)
+                &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded_with_total_work(tiny, 1, None)
             ),
             None
         );
@@ -11621,12 +11625,14 @@ mod tests {
             Some(&cancellation),
         );
         assert_eq!(memo.unshadowed(base, &prepared, &stopped), None);
-        let fresh = crate::analyzer::python::type_flow::PythonBuiltinShadowRequestMemo::default();
+        let fresh = super::test_domain_memo::<
+            crate::analyzer::python::type_flow::PythonBuiltinShadowRequestMemo,
+        >();
         assert_eq!(
             fresh.unshadowed(
                 base,
                 &prepared,
-                &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(tiny, None)
+                &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded_with_total_work(tiny, 1, None)
             ),
             None
         );
@@ -11794,12 +11800,14 @@ mod tests {
             &file,
         )
         .expect("indexed class snapshot");
-        let memo = crate::analyzer::python::type_flow::PythonModuleBindingRequestMemo::default();
+        let memo = super::test_domain_memo::<
+            crate::analyzer::python::type_flow::PythonModuleBindingRequestMemo,
+        >();
         let session = |steps| {
-            let mut limits = brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
-            limits.max_scope_nodes = steps;
-            brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(
-                limits, None,
+            brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded_with_total_work(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                steps,
+                None,
             )
         };
         assert_eq!(memo.binding(&prepared, "Target", &session(1)), None);

@@ -464,7 +464,13 @@ impl WorkspaceSemanticOracle<'_> {
                 if target_semantics
                     .gaps()
                     .iter()
-                    .any(|gap| gap.capability == SemanticCapability::Captures)
+                    // Only missing creation bindings can be proved below by
+                    // complete slot coverage in this creating realization.
+                    .any(|gap| {
+                        gap.capability == SemanticCapability::Captures
+                            && gap.discharge
+                                != SemanticGapDischarge::CreatingRealizationBindsCaptures
+                    })
                 {
                     return Ok(returned_callable_refusal(request, &staged));
                 }
@@ -887,12 +893,13 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         ) else {
             return Ok(refuted);
         };
-        let Some((file, source)) =
+        let Ok((file, source)) =
             crate::analyzer::semantic::workspace_oracle::exact_source_for_procedure(
                 self.workspace,
                 procedure,
                 request.budget.limits().source_bytes,
             )?
+            .on_budget(request.budget)?
         else {
             return Ok(refuted);
         };
@@ -1214,6 +1221,7 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         ) else {
             return Ok(None);
         };
+        let matched = matched.matched;
         if matched.disposition != SemanticModelCallableDisposition::Unique {
             return Ok(None);
         }
@@ -1705,6 +1713,17 @@ impl WorkspaceSemanticOracle<'_> {
             // a Rust future does not execute its body's actual/formal, heap or
             // return transfers. Body-local analysis is independent of these
             // withheld caller-visible bindings.
+            if request.cancellation.is_cancelled() {
+                return interrupted_call_bindings(
+                    call,
+                    candidate,
+                    context,
+                    BindingBuild::new(true),
+                    Interruption::Cancelled,
+                    staged.work,
+                    *self.limits(),
+                );
+            }
             let bindings = materialize_call_bindings(
                 call,
                 candidate,
@@ -1713,12 +1732,6 @@ impl WorkspaceSemanticOracle<'_> {
                 CandidateCoverage::Open,
                 *self.limits(),
             )?;
-            if request.cancellation.is_cancelled() {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: Some(bindings),
-                    work: staged.work,
-                });
-            }
             *request.budget = staged.budget;
             return Ok(SemanticOutcome::Unknown {
                 partial: Some(bindings),
@@ -1757,20 +1770,41 @@ impl WorkspaceSemanticOracle<'_> {
                             let before = staged.budget.used();
                             let relevant = {
                                 let mut nested = staged.request(request.cancellation);
-                                logical_gap_is_discharged(
+                                let verdict = logical_gap_is_discharged(
                                     self,
                                     logical,
                                     call.procedure(),
                                     &mut nested,
                                     &mut caller_inert_drops,
-                                )? != GapDischargeVerdict::Discharged
-                                    && crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
-                                        gap,
-                                        call.procedure(),
-                                        self.workspace,
-                                        &mut nested,
-                                        &mut caller_allocation_lifetimes,
-                                    )? != GapDischargeVerdict::Discharged
+                                )?;
+                                match verdict {
+                                    GapDischargeVerdict::Discharged => false,
+                                    GapDischargeVerdict::RefusedByRequestBudget(exceeded) => {
+                                        interrupted = Some(Interruption::Budget(exceeded));
+                                        true
+                                    }
+                                    GapDischargeVerdict::Undischarged
+                                    | GapDischargeVerdict::RefusedByRequestLimit => {
+                                        let verdict = crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
+                                            gap,
+                                            call.procedure(),
+                                            self.workspace,
+                                            &mut nested,
+                                            &mut caller_allocation_lifetimes,
+                                        )?;
+                                        match verdict {
+                                            GapDischargeVerdict::Discharged => false,
+                                            GapDischargeVerdict::RefusedByRequestBudget(
+                                                exceeded,
+                                            ) => {
+                                                interrupted = Some(Interruption::Budget(exceeded));
+                                                true
+                                            }
+                                            GapDischargeVerdict::Undischarged
+                                            | GapDischargeVerdict::RefusedByRequestLimit => true,
+                                        }
+                                    }
+                                }
                             };
                             staged.work = staged
                                 .work
@@ -1781,6 +1815,20 @@ impl WorkspaceSemanticOracle<'_> {
             if relevant {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);
             }
+        }
+        if request.cancellation.is_cancelled() {
+            interrupted = Some(Interruption::Cancelled);
+        }
+        if let Some(interruption) = interrupted {
+            return interrupted_call_bindings(
+                call,
+                candidate,
+                context,
+                build,
+                interruption,
+                staged.work,
+                *self.limits(),
+            );
         }
         let runtime_outcome = self
             .runtime_refinements_for_procedure(callee, &mut staged.request(request.cancellation))?;
@@ -1821,23 +1869,31 @@ impl WorkspaceSemanticOracle<'_> {
                         let before = staged.budget.used();
                         let relevant = {
                             let mut nested = staged.request(request.cancellation);
-                            crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
-                            gap,
-                            callee,
-                            self.workspace,
-                            &mut nested,
-                        )? != GapDischargeVerdict::Discharged && logical_gap_is_discharged(
-                            self, logical, callee,
-                            &mut nested,
-                            &mut callee_inert_drops,
-                        )? != GapDischargeVerdict::Discharged
-                            && crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
-                                gap,
-                                callee,
-                                self.workspace,
-                                &mut nested,
-                                &mut callee_allocation_lifetimes,
-                            )? != GapDischargeVerdict::Discharged
+                            let mut relevant = true;
+                            for predicate in 0..3 {
+                                let verdict = match predicate {
+                                    0 => crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
+                                        gap, callee, self.workspace, &mut nested,
+                                    )?,
+                                    1 => logical_gap_is_discharged(self, logical, callee, &mut nested, &mut callee_inert_drops)?,
+                                    _ => crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
+                                        gap, callee, self.workspace, &mut nested, &mut callee_allocation_lifetimes,
+                                    )?,
+                                };
+                                match verdict {
+                                    GapDischargeVerdict::Discharged => {
+                                        relevant = false;
+                                        break;
+                                    }
+                                    GapDischargeVerdict::RefusedByRequestBudget(exceeded) => {
+                                        interrupted = Some(Interruption::Budget(exceeded));
+                                        break;
+                                    }
+                                    GapDischargeVerdict::Undischarged
+                                    | GapDischargeVerdict::RefusedByRequestLimit => {}
+                                }
+                            }
+                            relevant
                         };
                         staged.work = staged
                             .work
@@ -1852,8 +1908,6 @@ impl WorkspaceSemanticOracle<'_> {
 
         if request.cancellation.is_cancelled() {
             interrupted = Some(Interruption::Cancelled);
-        } else if let Some(refusal) = staged.budget.first_refusal() {
-            interrupted = Some(Interruption::Budget(refusal.exceeded));
         }
         if let Some(interruption) = interrupted {
             return interrupted_call_bindings(
@@ -2641,9 +2695,14 @@ impl WorkspaceSemanticOracle<'_> {
         }) {
             build.open = true;
         }
-        let coverage = if build.truncated {
+        if interrupted.is_none() && request.cancellation.is_cancelled() {
+            interrupted = Some(Interruption::Cancelled);
+        }
+        // An interrupted build may lack bindings; Open would say only that more
+        // candidates may exist (#13837).
+        let coverage = if build.truncated || interrupted.is_some() {
             CandidateCoverage::Truncated
-        } else if interrupted.is_some() || build.open {
+        } else if build.open {
             CandidateCoverage::Open
         } else {
             CandidateCoverage::Exhaustive
@@ -2653,9 +2712,6 @@ impl WorkspaceSemanticOracle<'_> {
         let quality = merge_relation_quality(gap_quality, has_unproven_relation);
         let bindings =
             materialize_call_bindings(call, candidate, context, build, coverage, *self.limits())?;
-        if interrupted.is_none() && request.cancellation.is_cancelled() {
-            interrupted = Some(Interruption::Cancelled);
-        }
         *request.budget = staged.budget;
         Ok(match interrupted {
             Some(Interruption::Budget(exceeded)) => SemanticOutcome::ExceededBudget {

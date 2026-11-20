@@ -149,6 +149,10 @@ mod jvm_extraction_tests {
             .unwrap();
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn ordered_reservations_match_scalar_policy_and_roll_back_overflow() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
         let selection = fixture.open_ready(&[]);
@@ -209,6 +213,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn cancellation_and_cross_host_failure_leave_no_reservations() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
         let selection = fixture.open_ready(&[]);
@@ -489,6 +497,10 @@ mod jvm_extraction_tests {
             .unwrap();
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn late_persisted_shared_alias_reuses_request_identity_and_replays_both_owners() {
         use brokk_bifrost_analysis::analyzer::resolution::model::SharedNameId;
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(1);
@@ -555,6 +567,10 @@ mod jvm_extraction_tests {
     }).unwrap();
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn replay_rejects_extra_wrong_host_and_reordered_variable_rows() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
         let selection = fixture.open_ready(&[]);

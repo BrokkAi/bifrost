@@ -52,12 +52,36 @@ pub fn ground_signature(
     remaining: &mut usize,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Option<bool> {
-    let mut pending: Vec<_> = signature
-        .parameters
-        .iter()
-        .map(|parameter| &parameter.r#type)
-        .chain(signature.returns.iter())
-        .collect();
+    ground_types(
+        signature
+            .parameters
+            .iter()
+            .map(|parameter| &parameter.r#type)
+            .chain(signature.returns.iter()),
+        remaining,
+        cancellation,
+    )
+}
+
+/// Prove that structured types contain no unresolved substitution inputs.
+#[doc(hidden)]
+pub fn ground_types<'a>(
+    types: impl IntoIterator<Item = &'a TypeRef>,
+    remaining: &mut usize,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Option<bool> {
+    ground_types_with_variables(types, remaining, cancellation, |_| false)
+}
+
+/// As ground_types, allowing variables whose declaration is known at the target.
+#[doc(hidden)]
+pub fn ground_types_with_variables<'a>(
+    types: impl IntoIterator<Item = &'a TypeRef>,
+    remaining: &mut usize,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    variable_is_ground: impl Fn(&str) -> bool,
+) -> Option<bool> {
+    let mut pending: Vec<_> = types.into_iter().collect();
     while let Some(ty) = pending.pop() {
         spend(remaining, cancellation, 1)?;
         match ty {
@@ -66,6 +90,7 @@ pub fn ground_signature(
             }
             TypeRef::Array { element } => pending.push(element),
             TypeRef::Wildcard { bound, .. } => pending.extend(bound.iter().map(Box::as_ref)),
+            TypeRef::TypeParameter { name } if variable_is_ground(name) => {}
             _ => return Some(false),
         }
     }

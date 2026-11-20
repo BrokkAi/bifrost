@@ -645,6 +645,17 @@ impl CodeUnitIndex for JavascriptAnalyzer {
         self.inner.all_declarations()
     }
 
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    // JS path-module membership also reads this file's selected imports; the
+    // module identity is path-derived, without enumerating other modules.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
+    }
+
     delegate_inner_methods! {
         fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
@@ -838,16 +849,34 @@ impl IAnalyzer for JavascriptAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let inner = self.inner.update_with_listing(changed_files, listing);
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
             // Rebuild from root so a changed jsconfig/tsconfig drops its stale parse cache.
+            // Configuration reads are recorded by the alias resolver's recorder,
+            // so the inner effects cover them.
             let alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&inner);
-            Self {
-                inner,
-                memo_budget: self.memo_budget,
-                memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-                alias_resolver,
-            }
+            (
+                Self {
+                    inner,
+                    memo_budget: self.memo_budget,
+                    memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+                    alias_resolver,
+                },
+                effects.no_changes_or_unreported(changed_files),
+            )
         })
     }
 

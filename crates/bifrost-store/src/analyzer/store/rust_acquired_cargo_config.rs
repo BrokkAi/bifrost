@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::dependency_file_evidence::{EvidenceReadRecorder, selected_set};
 use super::{Result, StoreError, WorkspaceSnapshotId};
 
 const FAMILY: &str = "bifrost.acquired-cargo-config.v2";
@@ -82,13 +83,12 @@ fn acquired_digest(identity: &str) -> Option<[u8; 32]> {
 pub(super) fn selected_digest(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
+    recorder: &dyn EvidenceReadRecorder,
 ) -> Result<Option<[u8; 32]>> {
-    let identity:Option<String>=conn.prepare_cached(
-        "SELECT inputs.input_digest FROM dependency_evidence_selections AS selection JOIN dependency_evidence_sets AS inputs USING(set_id)
-         WHERE selection.workspace_id=?1 AND selection.lang=?2 AND selection.generation=?3 AND selection.revision=?4")?
-        .query_row(
-        params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.get(),snapshot.revision],|row|row.get(0)).optional()?;
-    Ok(identity.as_deref().and_then(acquired_digest))
+    Ok(
+        selected_set(conn, snapshot, recorder)?
+            .and_then(|(_, identity)| acquired_digest(&identity)),
+    )
 }
 
 pub(super) fn persist(
@@ -267,8 +267,9 @@ pub(super) fn load(
 pub(super) fn selected(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
+    recorder: &dyn EvidenceReadRecorder,
 ) -> Result<Option<RustCargoAcquiredConfigView>> {
-    selected_digest(conn, snapshot)?
+    selected_digest(conn, snapshot, recorder)?
         .map(|digest| load(conn, snapshot, &digest))
         .transpose()
         .map(Option::flatten)
@@ -292,8 +293,9 @@ pub(super) fn reclaim(conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Resu
 pub(super) fn configuration(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
+    recorder: &dyn EvidenceReadRecorder,
 ) -> Result<Option<brokk_bifrost_rust::cargo_config::RustCargoConfiguration>> {
-    let Some(view) = selected(conn, snapshot)? else {
+    let Some(view) = selected(conn, snapshot, recorder)? else {
         return Ok(None);
     };
     let mut statement=conn.prepare_cached("SELECT files.rel_path,files.blob_oid,files.file_present,retained.source_bytes FROM workspace_file_versions AS files JOIN workspace_input_sources AS retained ON retained.content_oid=files.blob_oid WHERE files.workspace_id=?1 AND files.lang='rust' AND files.generation=?2 AND files.input_kind='configuration' AND files.valid_from<=?3 AND (files.valid_until IS NULL OR ?3<files.valid_until) ORDER BY files.rel_path")?;
@@ -339,12 +341,14 @@ impl super::AnalyzerStore {
     /// The reader is bound to the selected immutable snapshot and exact input
     /// record identity. Missing legacy acquisition is explicitly partial.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_rust_cargo_configuration(
         &self,
         snapshot: &WorkspaceSnapshotId,
+        recorder: &dyn EvidenceReadRecorder,
     ) -> Result<brokk_bifrost_rust::cargo_config::RustCargoConfiguration> {
         let conn = self.read_conn()?;
-        Ok(configuration(&conn, snapshot)?.unwrap_or_else(
+        Ok(configuration(&conn, snapshot, recorder)?.unwrap_or_else(
             brokk_bifrost_rust::cargo_config::RustCargoConfiguration::unknown_acquired,
         ))
     }
@@ -404,9 +408,10 @@ fn owner_facts(body: &Value) -> Result<(PathBuf, RustCargoConfigOwnerFacts)> {
 pub(super) fn configuration_at_directory(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
+    recorder: &dyn EvidenceReadRecorder,
     directory: &std::path::Path,
 ) -> Result<Option<brokk_bifrost_rust::cargo_config::RustCargoConfiguration>> {
-    let Some(expected) = selected_digest(conn, snapshot)? else {
+    let Some(expected) = selected_digest(conn, snapshot, recorder)? else {
         return Ok(None);
     };
     let identity = format!("{FAMILY}:{}", lower_hex_string(&expected));

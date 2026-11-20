@@ -3857,6 +3857,35 @@ enum SelectedBridgeTargetKind {
     Member,
 }
 
+// The path form is determined entirely by the already-keyed recipes, leaf
+// namespace and optional bound reference. It adds no identity bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SelectedBridgePath {
+    DemandNamespace(Box<[ResolutionLookupSemanticRecipe]>),
+    TypePrefix(Box<[ResolutionLookupSemanticRecipe]>),
+}
+
+impl SelectedBridgePath {
+    fn recipes(&self) -> &[ResolutionLookupSemanticRecipe] {
+        match self {
+            Self::DemandNamespace(rows) | Self::TypePrefix(rows) => rows,
+        }
+    }
+
+    fn valid(&self, prefix: Option<SemanticId>, leaf: ResolutionNamespace) -> bool {
+        match self {
+            Self::DemandNamespace(rows) => {
+                prefix.is_none() && rows.iter().all(|row| row.namespace() == leaf)
+            }
+            Self::TypePrefix(rows) => {
+                rows.iter()
+                    .all(|row| row.namespace() == ResolutionNamespace::Type)
+                    && (prefix.is_some() || (!rows.is_empty() && leaf != ResolutionNamespace::Type))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct SelectedRootBridgeDescriptor {
@@ -3907,7 +3936,7 @@ pub struct SelectedRootBridgeDescriptor {
     #[doc(hidden)]
     pub prefix_reference: Option<SemanticId>,
     #[doc(hidden)]
-    pub route: Box<[ResolutionLookupSemanticRecipe]>,
+    path: SelectedBridgePath,
     #[doc(hidden)]
     pub source_demand: ResolutionLookupSemanticRecipe,
     #[doc(hidden)]
@@ -3934,7 +3963,7 @@ impl std::hash::Hash for SelectedRootBridgeDescriptor {
         std::hash::Hash::hash(&self.candidate_origin_rank, state);
         std::hash::Hash::hash(&self.target_member_scope, state);
         std::hash::Hash::hash(&self.prefix_reference, state);
-        std::hash::Hash::hash(&self.route, state);
+        std::hash::Hash::hash(self.path.recipes(), state);
         std::hash::Hash::hash(&self.source_demand, state);
         std::hash::Hash::hash(&self.target_demand, state);
         std::hash::Hash::hash(&self.jvm_evidence, state);
@@ -4045,7 +4074,54 @@ impl SelectedRootBridgeDescriptor {
             target_language,
             target_export_token,
             None,
-            route,
+            SelectedBridgePath::DemandNamespace(route.into()),
+            source_demand,
+            target_demand,
+            None,
+            completion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub(crate) fn from_selected_route_tokens(
+        source_fragment: BindingFragmentId,
+        source_language: Language,
+        source_import_token: SemanticId,
+        anchor: ResolutionRootImportAnchor,
+        source_import_anchor: SemanticId,
+        target_fragment: BindingFragmentId,
+        target_language: Language,
+        target_export_token: SemanticId,
+        prefix_reference: Option<SemanticId>,
+        route: impl Into<Box<[ResolutionLookupSemanticRecipe]>>,
+        source_demand: ResolutionLookupSemanticRecipe,
+        target_demand: ResolutionLookupSemanticRecipe,
+        completion: ResolutionCompletion,
+    ) -> Self {
+        let route = route.into();
+        let path = if prefix_reference.is_some()
+            || (!route.is_empty()
+                && source_demand.namespace() != ResolutionNamespace::Type
+                && route
+                    .iter()
+                    .all(|segment| segment.namespace() == ResolutionNamespace::Type))
+        {
+            SelectedBridgePath::TypePrefix(route)
+        } else {
+            SelectedBridgePath::DemandNamespace(route)
+        };
+        Self::from_selected_path_tokens_inner(
+            source_fragment,
+            source_language,
+            source_import_token,
+            anchor,
+            source_import_anchor,
+            target_fragment,
+            target_language,
+            target_export_token,
+            prefix_reference,
+            path,
             source_demand,
             target_demand,
             None,
@@ -4086,7 +4162,41 @@ impl SelectedRootBridgeDescriptor {
             target_language,
             target_export_token,
             Some(prefix_reference),
-            route,
+            SelectedBridgePath::TypePrefix(route.into()),
+            source_demand,
+            target_demand,
+            None,
+            completion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_selected_type_prefix_tokens(
+        source_fragment: BindingFragmentId,
+        source_language: Language,
+        source_import_token: SemanticId,
+        anchor: ResolutionRootImportAnchor,
+        source_import_anchor: SemanticId,
+        target_fragment: BindingFragmentId,
+        target_language: Language,
+        target_export_token: SemanticId,
+        prefix_reference: Option<SemanticId>,
+        route: impl Into<Box<[ResolutionLookupSemanticRecipe]>>,
+        source_demand: ResolutionLookupSemanticRecipe,
+        target_demand: ResolutionLookupSemanticRecipe,
+        completion: ResolutionCompletion,
+    ) -> Self {
+        Self::from_selected_path_tokens_inner(
+            source_fragment,
+            source_language,
+            source_import_token,
+            anchor,
+            source_import_anchor,
+            target_fragment,
+            target_language,
+            target_export_token,
+            prefix_reference,
+            SelectedBridgePath::TypePrefix(route.into()),
             source_demand,
             target_demand,
             None,
@@ -4125,7 +4235,11 @@ impl SelectedRootBridgeDescriptor {
             target_language,
             target_export_token,
             prefix_reference,
-            route,
+            if prefix_reference.is_some() {
+                SelectedBridgePath::TypePrefix(route.into())
+            } else {
+                SelectedBridgePath::DemandNamespace(route.into())
+            },
             source_demand,
             target_demand,
             Some(jvm_evidence),
@@ -4144,7 +4258,7 @@ impl SelectedRootBridgeDescriptor {
         target_language: Language,
         target_export_token: SemanticId,
         prefix_reference: Option<SemanticId>,
-        route: impl Into<Box<[ResolutionLookupSemanticRecipe]>>,
+        path: SelectedBridgePath,
         source_demand: ResolutionLookupSemanticRecipe,
         target_demand: ResolutionLookupSemanticRecipe,
         jvm_evidence: Option<SelectedJvmBridgeEvidence>,
@@ -4206,21 +4320,16 @@ impl SelectedRootBridgeDescriptor {
                 "same-language selected root bridge demands need one namespace"
             );
         }
-        let route = route.into();
-        for segment in &route {
+        assert!(
+            path.valid(prefix_reference, source_demand.namespace()),
+            "noncanonical selected bridge path"
+        );
+        let route = path.recipes();
+        for segment in route {
             assert_eq!(
                 segment.identity_domain(),
                 language_identity_domain(source_language),
                 "selected root bridge route identity differs from its source language"
-            );
-            assert_eq!(
-                segment.namespace(),
-                if prefix_reference.is_some() {
-                    ResolutionNamespace::Type
-                } else {
-                    source_demand.namespace()
-                },
-                "selected root bridge route namespace differs from its demand or Type prefix"
             );
         }
         assert!(
@@ -4242,7 +4351,7 @@ impl SelectedRootBridgeDescriptor {
             candidate_origin_rank: None,
             target_member_scope: None,
             prefix_reference,
-            route,
+            path,
             source_demand,
             target_demand,
             jvm_evidence,
@@ -4531,7 +4640,7 @@ impl SelectedRootBridgeDescriptor {
 
     #[doc(hidden)]
     pub fn route(&self) -> &[ResolutionLookupSemanticRecipe] {
-        &self.route
+        self.path.recipes()
     }
 
     #[doc(hidden)]
@@ -4958,15 +5067,14 @@ fn validate_bridge(bridge: &SelectedRootBridgeDescriptor) -> StoreResult<()> {
         || bridge.target_demand().identity_domain() != target_identity_domain
         || (same_language
             && bridge.source_demand().namespace() != bridge.target_demand().namespace())
-        || bridge.route().iter().any(|segment| {
-            segment.identity_domain() != source_identity_domain
-                || segment.namespace()
-                    != bridge
-                        .prefix_reference()
-                        .map_or(bridge.source_demand().namespace(), |_| {
-                            ResolutionNamespace::Type
-                        })
-        })
+        || !bridge.path.valid(
+            bridge.prefix_reference(),
+            bridge.source_demand().namespace(),
+        )
+        || bridge
+            .route()
+            .iter()
+            .any(|segment| segment.identity_domain() != source_identity_domain)
     {
         return Err(StoreError::new(
             "selected root bridge identity domain differs from its source or target language",
@@ -5385,6 +5493,332 @@ fn poll_context_work(cancellation: &CancellationToken, work: &mut usize) -> bool
 
 #[cfg(test)]
 mod tests {
+    fn legacy_flattened_bridge_digest(
+        domain: &[u8],
+        bridge: &SelectedRootBridgeDescriptor,
+        identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<[u8; 32]> {
+        let digest = |key| {
+            crate::analyzer::resolution::canonical_identity::selected_identity_content_digest(
+                identities,
+                source,
+                key,
+                cancellation,
+            )
+        };
+        let mut hasher = CanonicalIdentityDescriptor::new(domain, digest);
+        hasher.field(
+            "source_fragment",
+            CanonicalIdentityPart::identity(bridge.source_fragment()),
+        )?;
+        hasher.field(
+            "source_language",
+            CanonicalIdentityPart::Label(bridge.source_language().config_label()),
+        )?;
+        hasher.field(
+            "source_import_token",
+            CanonicalIdentityPart::identity(bridge.source_import_token()),
+        )?;
+        hasher.field(
+            "anchor",
+            CanonicalIdentityPart::Content(match bridge.anchor() {
+                ResolutionRootImportAnchor::Lexical => b"lexical",
+                ResolutionRootImportAnchor::Absolute => b"absolute",
+                ResolutionRootImportAnchor::AliasQualified => b"alias_qualified",
+            }),
+        )?;
+        hasher.field(
+            "target_fragment",
+            CanonicalIdentityPart::identity(bridge.target_fragment()),
+        )?;
+        hasher.field(
+            "target_language",
+            CanonicalIdentityPart::Label(bridge.target_language().config_label()),
+        )?;
+        hasher.field(
+            "target_export_token",
+            CanonicalIdentityPart::identity(bridge.target_export_token()),
+        )?;
+        if let Some(import) = bridge.callable_import {
+            hasher.field("callable_import", CanonicalIdentityPart::identity(import))?;
+        }
+        if bridge.target_kind == SelectedBridgeTargetKind::Member {
+            hasher.field(
+                "target_authority",
+                CanonicalIdentityPart::Content(b"selected-member"),
+            )?;
+        }
+        if let Some(definition) = bridge.target_definition {
+            hasher.field(
+                "target_definition",
+                CanonicalIdentityPart::identity(definition),
+            )?;
+        }
+        if let Some(rank) = bridge.candidate_origin_rank {
+            hasher.field(
+                "candidate_origin_rank",
+                CanonicalIdentityPart::Content(&rank.to_le_bytes()),
+            )?;
+        }
+        if let Some(precedence) = bridge.precedence {
+            hasher.field(
+                "precedence_tier",
+                CanonicalIdentityPart::Label(precedence.tier.label()),
+            )?;
+            hasher.field(
+                "precedence_ordinal",
+                CanonicalIdentityPart::Content(&precedence.ordinal.to_le_bytes()),
+            )?;
+            hasher.field(
+                "precedence_semantic",
+                CanonicalIdentityPart::identity(precedence.semantic),
+            )?;
+        }
+        if let Some(scope_head) = bridge.target_member_scope {
+            hasher.field(
+                "target_member_scope",
+                CanonicalIdentityPart::identity(scope_head),
+            )?;
+        }
+        if let Some(prefix) = bridge.prefix_reference() {
+            hasher.field("prefix_reference", CanonicalIdentityPart::identity(prefix))?;
+        }
+        hasher.field(
+            "namespace",
+            CanonicalIdentityPart::Label(bridge.source_demand().namespace().identity_label()),
+        )?;
+        for segment in bridge.route() {
+            hasher.field(
+                "route",
+                CanonicalIdentityPart::Content(&segment.name_digest()),
+            )?;
+        }
+        hasher.field(
+            "source_demand",
+            CanonicalIdentityPart::Content(&bridge.source_demand().name_digest()),
+        )?;
+        hasher.field(
+            "target_demand",
+            CanonicalIdentityPart::Content(&bridge.target_demand().name_digest()),
+        )?;
+        if let Some(evidence) = bridge.jvm_evidence() {
+            hasher.field(
+                "jvm_source_namespace",
+                CanonicalIdentityPart::Label(evidence.source_namespace.identity_label()),
+            )?;
+            hasher.field(
+                "jvm_target_namespace",
+                CanonicalIdentityPart::Label(evidence.target_namespace.identity_label()),
+            )?;
+            hasher.field(
+                "jvm_dependency_identity",
+                CanonicalIdentityPart::Content(&evidence.dependency_identity),
+            )?;
+            hasher.field(
+                "jvm_target_declaration",
+                CanonicalIdentityPart::identity(evidence.target_declaration),
+            )?;
+            hasher.field(
+                "jvm_target_definition",
+                CanonicalIdentityPart::identity(evidence.target_definition),
+            )?;
+            hasher.field(
+                "jvm_visibility",
+                CanonicalIdentityPart::Content(match evidence.visibility {
+                    SelectedJvmBridgeVisibility::Public => b"public".as_slice(),
+                    SelectedJvmBridgeVisibility::Protected => b"protected".as_slice(),
+                    SelectedJvmBridgeVisibility::Package => b"package".as_slice(),
+                    SelectedJvmBridgeVisibility::Scoped => b"scoped".as_slice(),
+                    SelectedJvmBridgeVisibility::Open => b"open".as_slice(),
+                }),
+            )?;
+            match evidence.provenance {
+                SelectedJvmBridgeProvenance::StructuredPackageType {
+                    source_package,
+                    target_package,
+                } => {
+                    hasher.field(
+                        "jvm_provenance",
+                        CanonicalIdentityPart::Content(b"structured_package_type"),
+                    )?;
+                    hasher.field(
+                        "jvm_source_package",
+                        CanonicalIdentityPart::identity(source_package),
+                    )?;
+                    hasher.field(
+                        "jvm_target_package",
+                        CanonicalIdentityPart::identity(target_package),
+                    )?;
+                }
+                SelectedJvmBridgeProvenance::AliasFact { alias } => {
+                    hasher.field(
+                        "jvm_provenance",
+                        CanonicalIdentityPart::Content(b"alias_fact"),
+                    )?;
+                    hasher.field("jvm_alias", CanonicalIdentityPart::identity(alias))?;
+                }
+            }
+        }
+        Ok(hasher.finish())
+    }
+
+    fn legacy_flattened_bridge_hash<H: std::hash::Hasher>(
+        bridge: &SelectedRootBridgeDescriptor,
+        state: &mut H,
+    ) {
+        // Preserve the existing export descriptor hash sequence.
+        std::hash::Hash::hash(&bridge.source_fragment, state);
+        std::hash::Hash::hash(&bridge.source_language, state);
+        std::hash::Hash::hash(&bridge.source_import_token, state);
+        std::hash::Hash::hash(&bridge.anchor, state);
+        std::hash::Hash::hash(&bridge.source_import_anchor, state);
+        std::hash::Hash::hash(&bridge.target_fragment, state);
+        std::hash::Hash::hash(&bridge.target_language, state);
+        std::hash::Hash::hash(&bridge.target_export_token, state);
+        std::hash::Hash::hash(&bridge.target_definition, state);
+        std::hash::Hash::hash(&bridge.precedence, state);
+        std::hash::Hash::hash(&bridge.candidate_origin_rank, state);
+        std::hash::Hash::hash(&bridge.target_member_scope, state);
+        std::hash::Hash::hash(&bridge.prefix_reference, state);
+        std::hash::Hash::hash(bridge.route(), state);
+        std::hash::Hash::hash(&bridge.source_demand, state);
+        std::hash::Hash::hash(&bridge.target_demand, state);
+        std::hash::Hash::hash(&bridge.jvm_evidence, state);
+        std::hash::Hash::hash(&bridge.completion, state);
+        if let Some(import) = bridge.callable_import {
+            std::hash::Hash::hash(&"callable-import", state);
+            std::hash::Hash::hash(&import, state);
+        }
+        if bridge.target_kind == SelectedBridgeTargetKind::Member {
+            std::hash::Hash::hash(&"selected-member", state);
+        }
+    }
+    #[test]
+    fn bridge_path_kind_is_a_function_of_keyed_inputs() {
+        for leaf in [
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Callable,
+            ResolutionNamespace::Value,
+        ] {
+            for prefix in [None, Some(SemanticId::for_test(b"prefix"))] {
+                for namespaces in [
+                    vec![],
+                    vec![ResolutionNamespace::Type],
+                    vec![leaf],
+                    vec![ResolutionNamespace::Type, ResolutionNamespace::Callable],
+                ] {
+                    let rows: Box<[_]> = namespaces
+                        .into_iter()
+                        .map(|ns| {
+                            ResolutionLookupSemanticRecipe::new(Language::Java, ns, "segment")
+                        })
+                        .collect();
+                    let ordinary = SelectedBridgePath::DemandNamespace(rows.clone());
+                    let typed = SelectedBridgePath::TypePrefix(rows);
+                    assert!(
+                        !(ordinary.valid(prefix, leaf) && typed.valid(prefix, leaf)),
+                        "different payload kinds must never share keyed inputs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_legacy_flattened_identity_bytes_are_unchanged() {
+        use std::hash::{Hash, Hasher};
+        let identities = SelectedContextIdentities::new();
+        let authored_target = identities.node([42; 32]);
+        let source = BindingFragmentId::at_ordinal(0);
+        let target = BindingFragmentId::at_ordinal(1);
+        let recipe =
+            ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "Item");
+        let base = SelectedRootBridgeDescriptor::from_selected_path_tokens(
+            source,
+            Language::Java,
+            SemanticId::for_test(b"source"),
+            ResolutionRootImportAnchor::Absolute,
+            SemanticId::for_test(b"anchor"),
+            target,
+            Language::Java,
+            SemanticId::for_test(b"target"),
+            vec![recipe.clone()],
+            recipe.clone(),
+            recipe.clone(),
+            ResolutionCompletion::Complete,
+        );
+        let mut bound = base.clone();
+        bound.prefix_reference = Some(SemanticId::for_test(b"prefix"));
+        bound.path = SelectedBridgePath::TypePrefix(vec![recipe.clone()].into_boxed_slice());
+        let mut jvm = base.clone();
+        jvm.target_language = Language::Kotlin;
+        jvm.target_demand = ResolutionLookupSemanticRecipe::new(
+            Language::Kotlin,
+            ResolutionNamespace::Type,
+            "Item",
+        );
+        jvm.jvm_evidence = Some(SelectedJvmBridgeEvidence {
+            provenance: SelectedJvmBridgeProvenance::StructuredPackageType {
+                source_package: SemanticId::for_test(b"source-package"),
+                target_package: SemanticId::for_test(b"target-package"),
+            },
+            source_namespace: ResolutionNamespace::Type,
+            target_namespace: ResolutionNamespace::Type,
+            visibility: SelectedJvmBridgeVisibility::Public,
+            dependency_identity: [7; 32],
+            target_declaration: SemanticId::for_test(b"decl"),
+            target_definition: authored_target,
+        });
+        jvm.target_definition = Some(authored_target);
+        // The two ambiguous unbound shapes must be rejected at both boundaries.
+        for rows in [Vec::new(), vec![recipe.clone()]] {
+            let rejected = std::panic::catch_unwind(|| {
+                SelectedRootBridgeDescriptor::from_selected_type_prefix_tokens(
+                    base.source_fragment,
+                    base.source_language,
+                    base.source_import_token,
+                    base.anchor,
+                    base.source_import_anchor,
+                    base.target_fragment,
+                    base.target_language,
+                    base.target_export_token,
+                    None,
+                    rows.clone(),
+                    recipe.clone(),
+                    recipe.clone(),
+                    ResolutionCompletion::Complete,
+                )
+            });
+            assert!(rejected.is_err());
+            let mut invalid = base.clone();
+            invalid.path = SelectedBridgePath::TypePrefix(rows.into_boxed_slice());
+            assert!(validate_bridge(&invalid).is_err());
+        }
+        let source = super::super::PreloadedFragmentSource::from_lowered_fragments([]);
+        let cancellation = CancellationToken::default();
+        for bridge in [base, bound, jvm] {
+            validate_bridge(&bridge).unwrap();
+            let mut current = std::collections::hash_map::DefaultHasher::new();
+            let mut old = std::collections::hash_map::DefaultHasher::new();
+            bridge.hash(&mut current);
+            legacy_flattened_bridge_hash(&bridge, &mut old);
+            assert_eq!(current.finish(), old.finish());
+            assert_eq!(
+                bridge_digest(b"pin", &bridge, &identities, &source, &cancellation).unwrap(),
+                legacy_flattened_bridge_digest(
+                    b"pin",
+                    &bridge,
+                    &identities,
+                    &source,
+                    &cancellation
+                )
+                .unwrap()
+            );
+        }
+    }
+
     use crate::analyzer::resolution::selected_context::go_global_support_1::*;
 
     use crate::analyzer::resolution::fact_lowering::fixture_names::definition_node;
@@ -5651,11 +6085,9 @@ mod tests {
                     .iter()
                     .map(|mount| (mount.ordinal(), mount.fragment(), mount.semantic_language()))
                     .collect::<Vec<_>>();
-                let session = ResolutionSession::bounded(
-                    ReceiverAnalysisBudget {
-                        max_scope_nodes: limit,
-                        ..ReceiverAnalysisBudget::default()
-                    },
+                let session = ResolutionSession::bounded_with_total_work(
+                    ReceiverAnalysisBudget::default(),
+                    limit,
                     None,
                 );
                 let table = GoMountTable::from(mounts);
@@ -6506,8 +6938,8 @@ impl SelectedRootBridgeDescriptor {
         &self,
         heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
     ) {
-        heap.slice(&self.route);
-        for recipe in &self.route {
+        heap.slice(self.path.recipes());
+        for recipe in self.path.recipes() {
             heap.add(recipe.owned_bytes());
         }
         heap.add(self.source_demand.owned_bytes() + self.target_demand.owned_bytes());

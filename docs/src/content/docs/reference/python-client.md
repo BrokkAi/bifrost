@@ -279,7 +279,6 @@ method:
 
 | MCP tool | Use instead |
 | --- | --- |
-| `relation_brief` | The CLI (`bifrost --tool relation_brief`), MCP, or Rust `SearchToolsService`. |
 | `score_diff` | The CLI (`bifrost --tool score_diff`), MCP, or Rust `SearchToolsService`. |
 | `list_policies` | The CLI (`bifrost --list-policies` or `bifrost --tool list_policies`), MCP, or Rust. |
 | `run_policy` | The CLI (`bifrost --policy ...` or `bifrost --tool run_policy`), MCP, or Rust. |
@@ -554,6 +553,8 @@ only" means you must import the class from `bifrost_searchtools.models`.
 | `receiver_outcome` | `CodeQueryReceiverOutcome` | top level |
 | `receiver_evidence` | `CodeQueryReceiverEvidence` | top level |
 | `field_write_value` | `CodeQueryFieldWriteValue` | top level |
+| `field_write` | `CodeQueryFieldWrite` | top level |
+| `field_read` | `CodeQueryFieldRead` | top level |
 | `keyed_read_value` | `CodeQueryRuntimeKeyedReadValue` (alias of `CodeQueryKeyedReadValue`) | top level |
 | `call_shape` | `CodeQueryCallShape` | top level |
 | `call_result` | `CodeQueryCallResult` | top level |

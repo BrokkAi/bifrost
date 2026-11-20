@@ -34,7 +34,14 @@ use crate::analyzer::JavaAnalyzer;
 use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
 
 use crate::analyzer::java::imports::{JavaTypeResolution, TypeNameOutcome};
-use crate::analyzer::java::unshadowed::UseSite;
+use crate::analyzer::java::unshadowed::{
+    DirectExternalSupertypes, JavaContextualTypeOutcome, MemberTypeStep, OpenSupertype, UseSite,
+    WorkspaceMemberTypeEnv, external_supertypes_with_lazy, implicit_supertype_at_site,
+    inherited_external_member_types_with_lazy, resolve_accessible_member_types_of_owner,
+    resolve_contextual_java_type, resolve_java_direct_external_supertypes,
+};
+use crate::analyzer::jvm::external::{JvmExternalType, LazyExternal};
+use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
 use brokk_bifrost_jvm::java::graph_support::JavaTypeName;
 
 use brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite;
@@ -97,6 +104,10 @@ pub(crate) struct JavaResolutionSession<'a> {
         RefCell<HashMap<JavaTypeSpelling, Option<Vec<JavaReceiverType>>>>,
     >,
     receiver_depth: Cell<usize>,
+    /// The gap of the first type name this request bound past a supertype
+    /// nothing resolves (#14293). Such a supertype may declare a member type
+    /// that shadows the binding, so the answer is reported as incomplete.
+    open_supertype: RefCell<Option<String>>,
 }
 
 impl<'a> JavaResolutionSession<'a> {
@@ -113,6 +124,7 @@ impl<'a> JavaResolutionSession<'a> {
             type_parameter_bounds:
                 brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo::default(),
             receiver_depth: Cell::new(0),
+            open_supertype: RefCell::new(None),
         }
     }
 
@@ -132,7 +144,85 @@ impl<'a> JavaResolutionSession<'a> {
         )
     }
 
+    /// Record that `name` was bound through the file-level tiers past a
+    /// supertype nothing resolves. The gap is also recorded on the query, as
+    /// the lowering ladder records it, so a consumer that cannot carry the
+    /// doubt in its own answer (a conversion proof, a receiver type) still
+    /// reports its query incomplete.
+    fn note_open_supertype(&self, analyzer: &dyn IAnalyzer, open: &OpenSupertype, name: &str) {
+        let gap = open.gap(name);
+        analyzer.record_query_incomplete(
+            brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::SemanticEvidenceGap(
+                gap.clone().into_boxed_str(),
+            ),
+        );
+        self.open_supertype.borrow_mut().get_or_insert(gap);
+    }
+
+    /// The gap of the first type name this request bound past a supertype
+    /// nothing resolves.
+    pub(crate) fn open_supertype_gap(&self) -> Option<String> {
+        self.open_supertype.borrow().clone()
+    }
+
+    /// [`Self::finish`] for a definition answer: one bound past a supertype
+    /// nothing resolves is incomplete, never resolved or exact, and says why.
+    ///
+    /// A workspace answer carries its doubt in its status. An external one
+    /// (`UnresolvableImportBoundary`) has no incomplete status; its selection
+    /// is proved by the call evidence instead, so the exactness proofs are
+    /// dropped and the resolver-owned callee identity is kept.
+    pub(crate) fn finish_definition(
+        &self,
+        mut resolution: JavaDefinitionResolution,
+    ) -> BoundedResolution<JavaDefinitionResolution> {
+        if let Some(gap) = self.open_supertype.borrow().as_ref()
+            && (resolution.outcome.status.carries_definitions()
+                || matches!(
+                    resolution.outcome.status,
+                    DefinitionLookupStatus::Ambiguous
+                        | DefinitionLookupStatus::UnresolvableImportBoundary
+                ))
+        {
+            if resolution.outcome.status == DefinitionLookupStatus::Resolved {
+                resolution.outcome.status = DefinitionLookupStatus::Incomplete;
+            }
+            let evidence = &mut resolution.evidence;
+            evidence.exact_external_call = None;
+            evidence.model_member_selection = None;
+            evidence.dispatch_extensibility = None;
+            resolution
+                .outcome
+                .diagnostics
+                .push(DefinitionLookupDiagnostic {
+                    kind: "open_java_supertype".into(),
+                    message: gap.clone(),
+                    claim: None,
+                });
+        }
+        self.finish_reported(resolution)
+    }
+
+    /// Finish a request whose answer cannot carry the doubt of a type name
+    /// bound past a supertype nothing resolves (#14293): a conversion or
+    /// local-assignment certificate, a receiver type, a functional-interface
+    /// target. Such a request stays unavailable, as every request was before
+    /// the binding was allowed; the query already records the gap.
     pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
+        match self.finish_reported(value) {
+            BoundedResolution::Complete { work, .. } if self.open_supertype_gap().is_some() => {
+                BoundedResolution::Unavailable {
+                    reason: "a type name was bound past a supertype nothing resolves",
+                    work,
+                }
+            }
+            finished => finished,
+        }
+    }
+
+    /// Finish a request whose answer reports an open-supertype binding
+    /// itself, through its status and diagnostics.
+    pub(crate) fn finish_reported<T>(&self, value: T) -> BoundedResolution<T> {
         match self.unavailable.get() {
             Some(reason) => BoundedResolution::Unavailable {
                 reason,
@@ -347,12 +437,13 @@ impl<'a> JavaResolutionSession<'a> {
         java: &JavaAnalyzer,
         file: &ProjectFile,
         name: &str,
+        site: Option<&UseSite<'_>>,
     ) -> bool {
         let Some(name) = JavaTypeName::from_normalized_spelling(name) else {
             return false;
         };
         matches!(
-            java_resolve_type_with_selected_jdk(analyzer, token, java, file, &name, None),
+            java_resolve_type_with_selected_jdk(analyzer, token, java, file, &name, site),
             TypeNameOutcome::Resolved(_)
         )
     }
@@ -564,7 +655,7 @@ fn finish_java(
     session: &JavaResolutionSession<'_>,
     outcome: DefinitionLookupOutcome,
 ) -> BoundedResolution<JavaDefinitionResolution> {
-    session.finish(JavaDefinitionResolution {
+    session.finish_definition(JavaDefinitionResolution {
         outcome,
         evidence: CallEvidence::default(),
     })
@@ -641,7 +732,7 @@ fn resolve_java_in_session(
                 let (outcome, evidence) = resolve_java_constructor_call(
                     analyzer, token, java, session, file, source, creation,
                 );
-                return session.finish(JavaDefinitionResolution { outcome, evidence });
+                return session.finish_definition(JavaDefinitionResolution { outcome, evidence });
             }
             resolve_java_type_reference(analyzer, java, session, file, source, node)
         }
@@ -672,7 +763,10 @@ fn resolve_java_in_session(
                                 let (outcome, evidence) = resolve_java_method_invocation(
                                     analyzer, token, session, file, source, root, parent,
                                 );
-                                session.finish(JavaDefinitionResolution { outcome, evidence })
+                                session.finish_definition(JavaDefinitionResolution {
+                                    outcome,
+                                    evidence,
+                                })
                             }
                             Some(QualifiedAccessFocus::Qualifier) | None => finish_java(
                                 session,
@@ -741,7 +835,7 @@ fn resolve_java_in_session(
             ),
         ),
     };
-    session.finish(JavaDefinitionResolution {
+    session.finish_definition(JavaDefinitionResolution {
         outcome,
         evidence: call_evidence,
     })
@@ -953,25 +1047,56 @@ pub(crate) fn resolve_java_type_reference(
     {
         return outcome;
     }
-    if !normalized.contains('.')
-        && let Some(unit) =
-            java_local_type_in_scope(analyzer, session, file, normalized, node.start_byte())
-    {
-        return candidates_outcome(vec![unit]);
-    }
-    if let Some(unit) = java_nested_type_in_scope(
-        analyzer,
-        session,
-        session.enclosing_unit(analyzer, file, node.start_byte()),
-        normalized,
+    match java_contextual_type_at_site(
+        analyzer, token, java, session, file, source, normalized, node,
     ) {
-        return candidates_outcome(vec![unit]);
+        JavaContextualTypeOutcome::Resolved { unit, tier } => {
+            crate::analyzer::java::imports::trace_tier(
+                normalized,
+                std::slice::from_ref(&unit),
+                tier,
+            );
+            return candidates_outcome(vec![unit]);
+        }
+        JavaContextualTypeOutcome::Ambiguous(units) => {
+            crate::analyzer::java::imports::trace_tier(
+                normalized,
+                &units,
+                PrecedenceTier::InheritedMember,
+            );
+            return candidates_outcome(units);
+        }
+        JavaContextualTypeOutcome::Incomplete(blame) => {
+            return java_hierarchy_unavailable(&blame);
+        }
+        JavaContextualTypeOutcome::AmbiguousExternal(resolutions) => {
+            return ambiguous_external_type_outcome(normalized, resolutions);
+        }
+        JavaContextualTypeOutcome::ResolvedExternal { external, .. } => {
+            return external_type_boundary_outcome(external.fqn());
+        }
+        JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+        | JavaContextualTypeOutcome::ShadowedByTypeParameter => {
+            return no_definition(
+                "no_indexed_definition",
+                format!("`{normalized}` did not resolve to an indexed Java type"),
+            );
+        }
+        JavaContextualTypeOutcome::Unbound | JavaContextualTypeOutcome::OpenSupertype(_) => {}
     }
-    let candidates = java_file_then_qualified_nested_type_candidates(
+    match java_file_then_qualified_nested_type_candidates(
         analyzer, token, java, session, file, source, node, normalized,
-    );
-    if !candidates.is_empty() {
-        return candidates_outcome(candidates);
+    ) {
+        JavaQualifiedNestedCandidates::Candidates(candidates) if !candidates.is_empty() => {
+            return candidates_outcome(candidates);
+        }
+        JavaQualifiedNestedCandidates::Candidates(_) => {}
+        JavaQualifiedNestedCandidates::AmbiguousExternal(resolutions) => {
+            return ambiguous_external_type_outcome(normalized, resolutions);
+        }
+        JavaQualifiedNestedCandidates::Incomplete(blame) => {
+            return java_hierarchy_unavailable(&blame);
+        }
     }
     if let Some(outcome) =
         java_default_import_intrinsic(java, token, session, file, source, node, normalized)
@@ -1135,13 +1260,71 @@ fn java_explicit_scoped_type_reference(
         return None;
     }
 
-    let candidates = java_file_then_qualified_nested_type_candidates(
-        analyzer, token, java, session, file, source, node, normalized,
-    );
-    if !candidates.is_empty() {
-        return Some(candidates_outcome(candidates));
+    match java_contextual_type_at_site(
+        analyzer, token, java, session, file, source, normalized, scoped,
+    ) {
+        JavaContextualTypeOutcome::Resolved { unit, tier } => {
+            crate::analyzer::java::imports::trace_tier(
+                normalized,
+                std::slice::from_ref(&unit),
+                tier,
+            );
+            return Some(candidates_outcome(vec![unit]));
+        }
+        JavaContextualTypeOutcome::Ambiguous(units) => {
+            crate::analyzer::java::imports::trace_tier(
+                normalized,
+                &units,
+                PrecedenceTier::InheritedMember,
+            );
+            return Some(candidates_outcome(units));
+        }
+        JavaContextualTypeOutcome::Incomplete(blame) => {
+            return Some(java_hierarchy_unavailable(&blame));
+        }
+        JavaContextualTypeOutcome::AmbiguousExternal(resolutions) => {
+            return Some(ambiguous_external_type_outcome(normalized, resolutions));
+        }
+        JavaContextualTypeOutcome::ResolvedExternal { external, .. } => {
+            return Some(external_type_boundary_outcome(external.fqn()));
+        }
+        JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+        | JavaContextualTypeOutcome::ShadowedByTypeParameter => {
+            return Some(no_definition(
+                "no_indexed_definition",
+                format!("`{normalized}` did not resolve to an indexed Java type"),
+            ));
+        }
+        JavaContextualTypeOutcome::Unbound | JavaContextualTypeOutcome::OpenSupertype(_) => {}
     }
-    if session.type_name_resolves_with_external(analyzer, token, java, file, normalized) {
+
+    match java_file_then_qualified_nested_type_candidates(
+        analyzer, token, java, session, file, source, node, normalized,
+    ) {
+        JavaQualifiedNestedCandidates::Candidates(candidates) if !candidates.is_empty() => {
+            return Some(candidates_outcome(candidates));
+        }
+        JavaQualifiedNestedCandidates::Candidates(_) => {}
+        JavaQualifiedNestedCandidates::AmbiguousExternal(resolutions) => {
+            return Some(ambiguous_external_type_outcome(normalized, resolutions));
+        }
+        JavaQualifiedNestedCandidates::Incomplete(blame) => {
+            return Some(java_hierarchy_unavailable(&blame));
+        }
+    }
+    let scoped_site = UseSite {
+        token,
+        source,
+        node: scoped,
+    };
+    if session.type_name_resolves_with_external(
+        analyzer,
+        token,
+        java,
+        file,
+        normalized,
+        Some(&scoped_site),
+    ) {
         // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
         // above return early for any workspace-internal type; reaching here means
         // the name only resolves once external imports are considered.
@@ -1176,6 +1359,51 @@ fn java_explicit_scoped_type_reference(
     ))
 }
 
+fn external_type_boundary_outcome(fqn: &str) -> DefinitionLookupOutcome {
+    boundary_unchecked(
+        format!("`{fqn}` appears to cross a Java import boundary not indexed in this workspace"),
+        UnindexedClaim::external_boundary(fqn, ClaimSubjectRole::Type),
+    )
+}
+
+fn ambiguous_external_type_outcome(
+    name: &str,
+    resolutions: Vec<JavaTypeResolution>,
+) -> DefinitionLookupOutcome {
+    let mut definitions = Vec::new();
+    let mut fqns = Vec::new();
+    for resolution in resolutions {
+        match resolution {
+            JavaTypeResolution::Source(unit) => {
+                fqns.push(unit.fq_name().to_owned());
+                definitions.push(unit);
+            }
+            JavaTypeResolution::External(hit) => {
+                fqns.push(hit.fqn().to_owned());
+            }
+        }
+    }
+    fqns.sort_unstable();
+    fqns.dedup();
+    let mut outcome = candidates_outcome(definitions);
+    outcome.status = DefinitionLookupStatus::Ambiguous;
+    outcome.diagnostics = vec![DefinitionLookupDiagnostic {
+        claim: None,
+        kind: "ambiguous_definition".into(),
+        message: format!(
+            "`{name}` is ambiguous across Java types: {}",
+            fqns.join(", ")
+        ),
+    }];
+    outcome
+}
+
+enum JavaQualifiedNestedCandidates {
+    Candidates(Vec<CodeUnit>),
+    AmbiguousExternal(Vec<JavaTypeResolution>),
+    Incomplete(CodeUnit),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn java_file_then_qualified_nested_type_candidates(
     analyzer: &dyn IAnalyzer,
@@ -1186,14 +1414,12 @@ fn java_file_then_qualified_nested_type_candidates(
     source: &str,
     node: Node<'_>,
     normalized: &str,
-) -> Vec<CodeUnit> {
+) -> JavaQualifiedNestedCandidates {
     let candidates = session.resolve_type_name_candidates_in_file(token, java, file, normalized);
     if !candidates.is_empty() {
-        return candidates;
+        return JavaQualifiedNestedCandidates::Candidates(candidates);
     }
     java_qualified_nested_type(analyzer, token, java, session, file, source, node)
-        .into_iter()
-        .collect()
 }
 
 /// What a Java method invocation binds to, with the receiver types the binding
@@ -1314,7 +1540,7 @@ pub(crate) fn dispatch_implicit_resource_close(
             arity: 0,
         },
     );
-    let result = session.finish(JavaDefinitionResolution {
+    let result = session.finish_definition(JavaDefinitionResolution {
         outcome: binding.outcome,
         evidence: binding.evidence,
     });
@@ -1610,31 +1836,42 @@ fn java_bound_method_invocation_binding(
     } = invocation;
     let JavaCallSite { file, source, .. } = call_site;
     let call_site = Some(call_site);
-    if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer)
-        && let Some(owner) =
-            java_type_qualifier(analyzer, token, java, session, file, source, root, object)
-    {
-        let outcome = java_member_candidates(
-            analyzer,
-            token,
-            session,
-            &owner,
-            name,
-            JavaMemberLookupKind::Method,
-            Some(arity),
-            call_site,
-        );
-        return JavaInvocationBinding {
-            outcome: java_static_context_member_outcome(
-                analyzer,
-                session,
-                outcome,
-                JavaMemberLookupKind::Method,
-                name,
-            ),
-            receiver: vec![JavaReceiverType::plain(owner)],
-            evidence: CallEvidence::default(),
-        };
+    if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) {
+        match java_type_qualifier(analyzer, token, java, session, file, source, root, object) {
+            JavaTypeQualifier::Resolved(owner) => {
+                let outcome = java_member_candidates(
+                    analyzer,
+                    token,
+                    session,
+                    &owner,
+                    name,
+                    JavaMemberLookupKind::Method,
+                    Some(arity),
+                    call_site,
+                );
+                return JavaInvocationBinding {
+                    outcome: java_static_context_member_outcome(
+                        analyzer,
+                        session,
+                        outcome,
+                        JavaMemberLookupKind::Method,
+                        name,
+                    ),
+                    receiver: vec![JavaReceiverType::plain(owner)],
+                    evidence: CallEvidence::default(),
+                };
+            }
+            JavaTypeQualifier::Incomplete(blame) => {
+                return JavaInvocationBinding::without_receiver(java_hierarchy_unavailable(&blame));
+            }
+            JavaTypeQualifier::Blocked => {
+                return JavaInvocationBinding::without_receiver(no_definition(
+                    "unsupported_java_receiver",
+                    format!("receiver for Java method `{name}` is not resolved"),
+                ));
+            }
+            JavaTypeQualifier::Unbound => {}
+        }
     }
     let receiver = java_receiver_types(analyzer, token, session, file, source, root, object);
     if !receiver.is_empty() {
@@ -1761,18 +1998,51 @@ fn resolve_java_method_reference(
     // as a type would ask the type resolver about a type called `super` after
     // receiver typing already found the superclass open (#9703).
     if owner.is_empty() && receiver_node.kind() != "super" {
-        owner = java_type_text_with_context(
+        let normalized_receiver = normalize_java_type_text(receiver_text);
+        match java_contextual_type_at_site(
             analyzer,
             token,
             java,
             session,
             file,
-            normalize_java_type_text(receiver_text),
-            receiver_node.start_byte(),
-        )
-        .map(JavaReceiverType::plain)
-        .into_iter()
-        .collect();
+            source,
+            normalized_receiver,
+            receiver_node,
+        ) {
+            JavaContextualTypeOutcome::Resolved { unit, .. } => {
+                owner = vec![JavaReceiverType::plain(unit)];
+            }
+            JavaContextualTypeOutcome::Incomplete(blame) => {
+                return java_hierarchy_unavailable(&blame);
+            }
+            // In an expression a field obscures a type or package of the same
+            // name (JLS 6.4.2), and a supertype nothing resolves may declare
+            // that field as well as a member type. The field lookup cannot see
+            // through it, so the open supertype stays a refusal here.
+            JavaContextualTypeOutcome::OpenSupertype(open) => {
+                return java_hierarchy_unavailable(&open.declaration);
+            }
+            JavaContextualTypeOutcome::ResolvedExternal { .. }
+            | JavaContextualTypeOutcome::Ambiguous(_)
+            | JavaContextualTypeOutcome::AmbiguousExternal(_)
+            | JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+            | JavaContextualTypeOutcome::ShadowedByTypeParameter => {}
+            JavaContextualTypeOutcome::Unbound => {
+                owner = java_type_text_with_context(
+                    analyzer,
+                    token,
+                    java,
+                    session,
+                    file,
+                    source,
+                    normalized_receiver,
+                    receiver_node,
+                )
+                .map(JavaReceiverType::plain)
+                .into_iter()
+                .collect();
+            }
+        }
     }
     if java_method_reference_is_constructor(session, node) {
         // A constructor reference names one type. An intersection bound has no
@@ -1878,20 +2148,51 @@ fn resolve_java_constructor_call(
             CallEvidence::default(),
         );
     };
+    let is_unqualified = {
+        let mut cursor = node.walk();
+        !node
+            .named_children(&mut cursor)
+            .any(|child| child.end_byte() <= type_node.start_byte())
+    };
+    if is_unqualified {
+        match java_contextual_type_at_site(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            source,
+            normalize_java_type_text(java_node_text(type_node, source)),
+            type_node,
+        ) {
+            JavaContextualTypeOutcome::Resolved { unit, .. } => {
+                return (
+                    java_constructor_outcome(
+                        analyzer,
+                        java,
+                        session,
+                        unit,
+                        Some(argument_list_arity(node)),
+                    ),
+                    CallEvidence::default(),
+                );
+            }
+            JavaContextualTypeOutcome::ResolvedExternal { .. }
+            | JavaContextualTypeOutcome::Ambiguous(_)
+            | JavaContextualTypeOutcome::AmbiguousExternal(_)
+            | JavaContextualTypeOutcome::Incomplete(_)
+            | JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+            | JavaContextualTypeOutcome::ShadowedByTypeParameter => {
+                return (
+                    resolve_java_type_reference(analyzer, java, session, file, source, type_node),
+                    CallEvidence::default(),
+                );
+            }
+            JavaContextualTypeOutcome::Unbound | JavaContextualTypeOutcome::OpenSupertype(_) => {}
+        }
+    }
     let owner =
-        java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
-            .or_else(|| {
-                let raw = java_node_text(type_node, source);
-                java_type_text_with_context(
-                    analyzer,
-                    token,
-                    java,
-                    session,
-                    file,
-                    normalize_java_type_text(raw),
-                    type_node.start_byte(),
-                )
-            });
+        java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node);
     if let Some(owner) = owner {
         return (
             java_constructor_outcome(
@@ -1920,6 +2221,11 @@ fn resolve_java_constructor_call(
             owner,
             member,
             parameter_count,
+        }
+        | JavaExternalConstructorFamily::Arity {
+            owner,
+            member,
+            parameter_count,
         } => (owner, member, Some(parameter_count)),
         JavaExternalConstructorFamily::Open { owner, member } => (owner, member, None),
     };
@@ -1936,8 +2242,9 @@ fn resolve_java_constructor_call(
                 focus_end_byte: type_node.end_byte(),
             }),
         );
-    // Without an arity proof the overload stays open; model binding selects
-    // it from the argument types, as for an external method overload family.
+    // Without an arity proof the callee identity stays open. With one, model
+    // binding still selects the overload from the argument types, as for an
+    // external method overload family.
     let Some(parameter_count) = parameter_count else {
         return (outcome, CallEvidence::default());
     };
@@ -1977,7 +2284,8 @@ pub(crate) fn java_external_constructor(
             member,
             parameter_count,
         } => Some((owner, member, parameter_count)),
-        JavaExternalConstructorFamily::Open { .. } => None,
+        JavaExternalConstructorFamily::Arity { .. }
+        | JavaExternalConstructorFamily::Open { .. } => None,
     }
 }
 
@@ -1988,8 +2296,17 @@ enum JavaExternalConstructorFamily {
         member: String,
         parameter_count: u32,
     },
-    /// Several declared constructors accept the arity, a variadic one could,
-    /// or the creation names type arguments: arity alone does not select one.
+    /// Several fixed-arity constructors accept the arity, or the creation
+    /// names type arguments. Arity selects no declaration, but it proves the
+    /// callee identity: a constructor is not inherited or overridden, so the
+    /// call targets `owner.member` with exactly `parameter_count` formals.
+    Arity {
+        owner: String,
+        member: String,
+        parameter_count: u32,
+    },
+    /// A variadic constructor accepts the arity, so the formal count of the
+    /// target is not proven.
     Open { owner: String, member: String },
 }
 
@@ -2025,15 +2342,24 @@ fn java_external_constructor_family(
     }
     let components = java_type_name_components(type_node, source)?;
     let overlay = analyzer.semantic_model_overlay_read().published()?;
-    let resolved = session.query_optional_row(|| {
-        java.resolve_type_name_with_external(
-            token,
-            Some(overlay.clone()),
-            file,
-            &components.join("."),
-        )
-    })?;
-    let JavaTypeResolution::External(owner) = resolved else {
+    let parsed_name = JavaTypeName::from_components(components)?;
+    let site = UseSite {
+        token,
+        source,
+        node: type_node,
+    };
+    let TypeNameOutcome::Resolved(JavaTypeResolution::External(owner)) = session
+        .query_optional_row(|| {
+            Some(java_resolve_type_with_selected_jdk(
+                analyzer,
+                token,
+                java,
+                file,
+                &parsed_name,
+                Some(&site),
+            ))
+        })?
+    else {
         return None;
     };
     let arity = argument_list_arity(node);
@@ -2078,7 +2404,7 @@ fn java_external_constructor_family(
     // Producers may name a constructor with its source name or the JVM
     // <init> member name. Kind and owner identity select the declaration;
     // its recorded name then supplies the shared callable key.
-    let (selected, variadic) = *accepting.first()?;
+    let (selected, _) = *accepting.first()?;
     debug_assert!(
         accepting
             .iter()
@@ -2090,9 +2416,7 @@ fn java_external_constructor_family(
         owner: owner.fqn().to_owned(),
         member: selected.name.clone(),
     };
-    // Explicit or diamond type arguments need substitution before a formal
-    // shape can be published.
-    if accepting.len() > 1 || variadic || type_node.kind() == "generic_type" {
+    if accepting.iter().any(|(_, variadic)| *variadic) {
         return Some(open);
     }
     let arity = u32::try_from(arity).ok()?;
@@ -2103,11 +2427,24 @@ fn java_external_constructor_family(
     {
         return Some(open);
     }
-    Some(JavaExternalConstructorFamily::Unique {
-        owner: owner.fqn().to_owned(),
-        member: selected.name.clone(),
-        parameter_count: arity,
-    })
+    let (owner, member) = (owner.fqn().to_owned(), selected.name.clone());
+    // Explicit or diamond type arguments need substitution before a formal
+    // shape can be published.
+    Some(
+        if accepting.len() > 1 || type_node.kind() == "generic_type" {
+            JavaExternalConstructorFamily::Arity {
+                owner,
+                member,
+                parameter_count: arity,
+            }
+        } else {
+            JavaExternalConstructorFamily::Unique {
+                owner,
+                member,
+                parameter_count: arity,
+            }
+        },
+    )
 }
 
 /// The constructors of a workspace class that a creation's argument count
@@ -2608,9 +2945,22 @@ fn resolve_java_field_access(
     let Some(object) = node.child_by_field_name("object") else {
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
+    if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) {
+        match java_type_qualifier(analyzer, token, java, session, file, source, root, object) {
+            JavaTypeQualifier::Incomplete(blame) => return java_hierarchy_unavailable(&blame),
+            JavaTypeQualifier::Blocked => {
+                return no_definition(
+                    "unsupported_java_receiver",
+                    format!("receiver for Java field `{field}` is not resolved"),
+                );
+            }
+            JavaTypeQualifier::Resolved(_) | JavaTypeQualifier::Unbound => {}
+        }
+    }
     let owner = java_receiver_types(analyzer, token, session, file, source, root, object);
     if !owner.is_empty() {
         let mut nested_types = Vec::new();
+        let site_enclosing = session.enclosing_units(analyzer, file, node.start_byte());
         for candidate in &owner {
             let qualified_name = format!("{}.{}", candidate.unit.fq_name(), field);
             let members = support.fqn(&qualified_name);
@@ -2618,7 +2968,34 @@ fn resolve_java_field_access(
                 nested_types.clear();
                 break;
             }
-            nested_types.extend(members.into_iter().filter(CodeUnit::is_class));
+            let direct_classes = members
+                .into_iter()
+                .filter(CodeUnit::is_class)
+                .collect::<Vec<_>>();
+            if !direct_classes.is_empty() {
+                nested_types.extend(direct_classes);
+            } else if java_field_access_is_selector_receiver(node)
+                && let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer)
+            {
+                let env = SessionMemberTypeEnv::new(analyzer, java, session, token);
+                match resolve_accessible_member_types_of_owner(
+                    &env,
+                    &candidate.unit,
+                    field,
+                    file,
+                    &site_enclosing,
+                ) {
+                    MemberTypeStep::Resolved(unit) => nested_types.push(unit),
+                    MemberTypeStep::Ambiguous(units) => nested_types.extend(units),
+                    MemberTypeStep::AmbiguousResolutions(resolutions) => {
+                        return ambiguous_external_type_outcome(field, resolutions);
+                    }
+                    MemberTypeStep::Incomplete(blame) => {
+                        return java_hierarchy_unavailable(&blame);
+                    }
+                    MemberTypeStep::ResolvedExternal(_) | MemberTypeStep::Missing => {}
+                }
+            }
         }
         if !nested_types.is_empty() && java_field_access_is_selector_receiver(node) {
             return candidates_outcome(nested_types);
@@ -2813,9 +3190,19 @@ fn java_unresolved_receiver_outcome(
             || {
                 let imported_bound_is_none = imported_bound.is_none();
                 let member_is_none = java.is_none_or(|java| {
+                    let object_site = UseSite {
+                        token,
+                        source,
+                        node: object,
+                    };
                     let member = session.query_optional_row(|| {
                         java_resolve_member_with_selected_jdk(
-                            analyzer, token, java, file, &spelling,
+                            analyzer,
+                            token,
+                            java,
+                            file,
+                            &spelling,
+                            Some(&object_site),
                         )
                     });
                     member.is_none()
@@ -2890,7 +3277,7 @@ fn java_external_call_evidence(
         }
     }
     .with_source_jdk_artifact(source_jdk_artifact.filter(|artifact| {
-        artifact.artifact_sha256.as_deref() == callee_jdk_artifact_sha256
+        callee_jdk_artifact_sha256.is_some_and(|digest| artifact.contains_raw_sha256(digest))
             && callee_jdk_artifact_sha256.is_some()
     }));
     CallEvidence::selected_external_call(
@@ -2918,7 +3305,8 @@ fn java_resolve_type_with_selected_jdk(
         name,
         selected
             .as_ref()
-            .and_then(|evidence| evidence.artifact_sha256.as_deref()),
+            .and_then(|evidence| evidence.single_raw_sha256())
+            .as_deref(),
         site,
     )
 }
@@ -2929,16 +3317,19 @@ fn java_resolve_member_with_selected_jdk(
     java: &JavaAnalyzer,
     file: &ProjectFile,
     name: &str,
+    site: Option<&UseSite<'_>>,
 ) -> Option<crate::analyzer::jvm::external::JvmExternalMember> {
     let selected = java.selected_jdk_artifact_for_file(analyzer, file);
-    java.resolve_member_name_with_selected_jdk(
+    java.resolve_member_name_at(
         token,
         analyzer.semantic_model_overlay_read().published(),
         file,
         name,
         selected
             .as_ref()
-            .and_then(|evidence| evidence.artifact_sha256.as_deref()),
+            .and_then(|evidence| evidence.single_raw_sha256())
+            .as_deref(),
+        site,
     )
 }
 
@@ -2960,7 +3351,8 @@ fn java_resolve_member_of_resolved_owner(
         member_name,
         selected
             .as_ref()
-            .and_then(|evidence| evidence.artifact_sha256.as_deref()),
+            .and_then(|evidence| evidence.single_raw_sha256())
+            .as_deref(),
     )
 }
 
@@ -3432,6 +3824,7 @@ fn java_external_invocation_member(
                 java,
                 file,
                 &format!("{}.{member_name}", owner.fqn),
+                None,
             )
         }
     })?;
@@ -3493,6 +3886,7 @@ pub(crate) fn java_external_field_type(
                 java,
                 file,
                 &format!("{}.{field}", owner.fqn),
+                None,
             )
         }
     })?;
@@ -3836,16 +4230,41 @@ fn resolve_java_bare_identifier(
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
     if java_identifier_is_annotation_name(node) {
-        if let Some(unit) = java_type_text_with_context(
-            analyzer,
-            token,
-            java,
-            session,
-            file,
-            name,
-            node.start_byte(),
-        ) {
-            return candidates_outcome(vec![unit]);
+        match java_contextual_type_at_site(analyzer, token, java, session, file, source, name, node)
+        {
+            JavaContextualTypeOutcome::Resolved { unit, tier } => {
+                crate::analyzer::java::imports::trace_tier(name, std::slice::from_ref(&unit), tier);
+                return candidates_outcome(vec![unit]);
+            }
+            JavaContextualTypeOutcome::Ambiguous(units) => {
+                crate::analyzer::java::imports::trace_tier(
+                    name,
+                    &units,
+                    PrecedenceTier::InheritedMember,
+                );
+                return candidates_outcome(units);
+            }
+            JavaContextualTypeOutcome::Incomplete(blame) => {
+                return java_hierarchy_unavailable(&blame);
+            }
+            JavaContextualTypeOutcome::AmbiguousExternal(resolutions) => {
+                return ambiguous_external_type_outcome(name, resolutions);
+            }
+            JavaContextualTypeOutcome::ResolvedExternal { external, .. } => {
+                return external_type_boundary_outcome(external.fqn());
+            }
+            JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+            | JavaContextualTypeOutcome::ShadowedByTypeParameter => {
+                return no_definition(
+                    "no_indexed_definition",
+                    format!("`{name}` did not resolve to an indexed Java type"),
+                );
+            }
+            JavaContextualTypeOutcome::Unbound | JavaContextualTypeOutcome::OpenSupertype(_) => {}
+        }
+        let candidates = session.resolve_type_name_candidates_in_file(token, java, file, name);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
         }
         return java_bare_name_static_import_or_boundary(
             analyzer, token, java, session, file, name,
@@ -3860,7 +4279,9 @@ fn resolve_java_bare_identifier(
     // as a type reference, so resolving the type first made the two surfaces
     // disagree (#1754).
     let locally_bound =
-        java_local_binding_before(session, file, source, root, name, node.start_byte());
+        java_local_binding_before(session, file, source, root, name, node.start_byte())
+            || java_matching_lambda_parameter(session, root, source, name, node.start_byte())
+                .is_some();
     if !locally_bound {
         let (initial_static_context, outer_static_context) =
             session.enclosing_static_context(analyzer, file, node);
@@ -3887,16 +4308,77 @@ fn resolve_java_bare_identifier(
             format!("`{name}` resolves to a local Java binding"),
         );
     }
-    if let Some(unit) = java_type_text_with_context(
-        analyzer,
-        token,
-        java,
-        session,
-        file,
-        name,
-        node.start_byte(),
-    ) {
-        return candidates_outcome(vec![unit]);
+    if java_static_import_has_workspace_field(java, token, session, file, name) {
+        return java_bare_name_static_import_or_boundary(
+            analyzer, token, java, session, file, name,
+        );
+    }
+    if java_bare_identifier_can_denote_type(node) {
+        match java_contextual_type_at_site(analyzer, token, java, session, file, source, name, node)
+        {
+            JavaContextualTypeOutcome::Resolved { unit, tier } => {
+                crate::analyzer::java::imports::trace_tier(name, std::slice::from_ref(&unit), tier);
+                return candidates_outcome(vec![unit]);
+            }
+            JavaContextualTypeOutcome::Ambiguous(units) => {
+                crate::analyzer::java::imports::trace_tier(
+                    name,
+                    &units,
+                    PrecedenceTier::InheritedMember,
+                );
+                return candidates_outcome(units);
+            }
+            JavaContextualTypeOutcome::Incomplete(blame) => {
+                return java_hierarchy_unavailable(&blame);
+            }
+            JavaContextualTypeOutcome::AmbiguousExternal(resolutions) => {
+                return ambiguous_external_type_outcome(name, resolutions);
+            }
+            JavaContextualTypeOutcome::ResolvedExternal { external, .. } => {
+                return external_type_boundary_outcome(external.fqn());
+            }
+            JavaContextualTypeOutcome::MissingMemberOfBoundPrefix => {
+                return no_definition(
+                    "no_indexed_definition",
+                    format!("`{name}` did not resolve to an indexed Java type"),
+                );
+            }
+            JavaContextualTypeOutcome::ShadowedByTypeParameter => {
+                let is_selector_qualifier = java_field_access_is_selector_receiver(node)
+                    || node.parent().is_some_and(|parent| {
+                        parent.kind() == "method_invocation"
+                            && parent.child_by_field_name("object") == Some(node)
+                    });
+                if is_selector_qualifier {
+                    return no_definition(
+                        "no_indexed_definition",
+                        format!("`{name}` did not resolve to an indexed Java type"),
+                    );
+                }
+                return java_bare_name_static_import_or_boundary(
+                    analyzer, token, java, session, file, name,
+                );
+            }
+            // In an expression a field obscures a type or package of the same
+            // name (JLS 6.4.2), and a supertype nothing resolves may declare
+            // that field as well as a member type. The field lookup cannot see
+            // through it, so the open supertype stays a refusal here.
+            JavaContextualTypeOutcome::OpenSupertype(open) => {
+                return java_hierarchy_unavailable(&open.declaration);
+            }
+            JavaContextualTypeOutcome::Unbound => {}
+        }
+        if let Some(unit) = java_file_level_unique_type(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            name,
+            Some((source, node)),
+        ) {
+            return candidates_outcome(vec![unit]);
+        }
     }
     java_bare_name_static_import_or_boundary(analyzer, token, java, session, file, name)
 }
@@ -3912,6 +4394,31 @@ fn java_identifier_is_annotation_name(node: Node<'_>) -> bool {
         matches!(parent.kind(), "annotation" | "marker_annotation")
             && parent.child_by_field_name("name") == Some(node)
     })
+}
+
+/// Under JLS 6.5.1, an `identifier` outside an annotation name can denote a
+/// type only when it sits in an `AmbiguousName` qualifier position (`Files.x`,
+/// `Files.read()`, `Files::read`, `@Outer.Marker`) or in one of the grammar's
+/// non-`type_identifier` type positions (`record_pattern` and module `uses` /
+/// `provides` directives). A standalone `ExpressionName` (`return shared;`)
+/// denotes a value, never a type, so it must not enter type lookup or report
+/// incomplete hierarchy facts from the type tier.
+fn java_bare_identifier_can_denote_type(node: Node<'_>) -> bool {
+    if brokk_bifrost_jvm::java::graph::resolver::is_record_pattern_type_reference(node)
+        || brokk_bifrost_jvm::java::graph::resolver::is_module_type_reference(node)
+    {
+        return true;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "method_invocation" => parent.child_by_field_name("object") == Some(node),
+        "field_access" => parent.child_by_field_name("object") == Some(node),
+        "method_reference" => java_method_reference_receiver_contains_focus(parent, node),
+        "scoped_identifier" | "class_literal" => true,
+        _ => false,
+    }
 }
 
 /// The last two tiers a bare Java name falls through to once neither a
@@ -4171,9 +4678,18 @@ fn java_push_receiver_type(types: &mut Vec<JavaReceiverType>, candidate: JavaRec
     }
 }
 
-/// Resolve a method's syntactic type qualifier through its AST components.
-/// A lexical value with the first component's spelling takes precedence over
-/// a package/type path, including a value whose own type is unresolved.
+enum JavaTypeQualifier {
+    Resolved(CodeUnit),
+    Incomplete(CodeUnit),
+    Blocked,
+    Unbound,
+}
+
+/// Resolve a method or field's syntactic type qualifier through its AST
+/// components. A lexical value, enclosing/inherited field, or static-imported
+/// field with the first component's spelling takes precedence over a
+/// package/type path (JLS 6.4.2, 6.5.2), including a value whose own type is
+/// unresolved.
 #[allow(clippy::too_many_arguments)]
 fn java_type_qualifier(
     analyzer: &dyn IAnalyzer,
@@ -4184,37 +4700,351 @@ fn java_type_qualifier(
     source: &str,
     root: Node<'_>,
     object: Node<'_>,
-) -> Option<CodeUnit> {
+) -> JavaTypeQualifier {
     let mut components = Vec::new();
     let mut stack = vec![object];
     while let Some(node) = stack.pop() {
         if !session.charge_scope_step() {
-            return None;
+            return JavaTypeQualifier::Unbound;
         }
         match node.kind() {
             "identifier" | "type_identifier" => components.push(java_node_text(node, source)),
             "field_access" => {
-                stack.push(node.child_by_field_name("field")?);
-                stack.push(node.child_by_field_name("object")?);
+                let (Some(field), Some(inner_object)) = (
+                    node.child_by_field_name("field"),
+                    node.child_by_field_name("object"),
+                ) else {
+                    return JavaTypeQualifier::Unbound;
+                };
+                stack.push(field);
+                stack.push(inner_object);
             }
-            _ => return None,
+            _ => return JavaTypeQualifier::Unbound,
         }
     }
-    let first = components.first()?;
+    let Some(first) = components.first().copied() else {
+        return JavaTypeQualifier::Unbound;
+    };
+    match java_qualifier_head_obscured_by_variable(
+        analyzer, token, java, session, file, source, root, object, first,
+    ) {
+        Ok(true) => return JavaTypeQualifier::Unbound,
+        Ok(false) => {}
+        Err(blame) => return JavaTypeQualifier::Incomplete(blame),
+    }
+    let joined = components.join(".");
+    match java_contextual_type_at_site(
+        analyzer, token, java, session, file, source, &joined, object,
+    ) {
+        JavaContextualTypeOutcome::Resolved { unit, .. } => JavaTypeQualifier::Resolved(unit),
+        JavaContextualTypeOutcome::Incomplete(blame) => JavaTypeQualifier::Incomplete(blame),
+        // In an expression a field obscures a type or package of the same
+        // name (JLS 6.4.2), and a supertype nothing resolves may declare
+        // that field as well as a member type. The field lookup cannot see
+        // through it, so the open supertype stays a refusal here.
+        JavaContextualTypeOutcome::OpenSupertype(open) => {
+            JavaTypeQualifier::Incomplete(open.declaration)
+        }
+        JavaContextualTypeOutcome::Ambiguous(_)
+        | JavaContextualTypeOutcome::AmbiguousExternal(_)
+        | JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+        | JavaContextualTypeOutcome::ShadowedByTypeParameter => JavaTypeQualifier::Blocked,
+        // An inherited external member type is a valid type qualifier whose
+        // member lookup proceeds through `java_unresolved_receiver_outcome`.
+        JavaContextualTypeOutcome::ResolvedExternal { .. } => JavaTypeQualifier::Unbound,
+        JavaContextualTypeOutcome::Unbound => java_file_level_unique_type(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            &joined,
+            Some((source, object)),
+        )
+        .map_or(JavaTypeQualifier::Unbound, JavaTypeQualifier::Resolved),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_qualifier_head_obscured_by_variable(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    object: Node<'_>,
+    first: &str,
+) -> Result<bool, CodeUnit> {
     if java_bindings_before_scoped(session, file, source, root, object.start_byte())
         .is_shadowed(first)
+        || java_matching_lambda_parameter(session, root, source, first, object.start_byte())
+            .is_some()
     {
-        return None;
+        return Ok(true);
     }
-    java_type_text_with_context(
-        analyzer,
-        token,
-        java,
-        session,
-        file,
-        &components.join("."),
-        object.start_byte(),
-    )
+    match java_enclosing_or_inherited_field(analyzer, session, file, first, object.start_byte())? {
+        // An ambiguous inherited field reference still denotes a variable,
+        // not the type; the member chain reports the ambiguity when the head
+        // itself is resolved.
+        JavaEnclosingField::Unique(..) | JavaEnclosingField::Ambiguous => return Ok(true),
+        JavaEnclosingField::None => {}
+    }
+    Ok(java_static_import_has_workspace_field(
+        java, token, session, file, first,
+    ))
+}
+
+/// The surviving field candidates named `field_name` visible at a site:
+/// none, exactly one declaration, or several that no hiding rule separates
+/// (JLS 8.3, 6.4.2).
+enum JavaEnclosingField {
+    None,
+    Unique(CodeUnit, CodeUnit),
+    Ambiguous,
+}
+
+/// Whether `start` reaches `target` through direct workspace supertype edges.
+fn java_unit_inherits_from(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    provider: &dyn brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider,
+    start: &CodeUnit,
+    target: &CodeUnit,
+) -> Result<bool, CodeUnit> {
+    let mut seen = HashSet::default();
+    seen.insert(start.clone());
+    let mut queue = VecDeque::from(
+        session
+            .direct_ancestors(analyzer, provider, start)
+            .map_err(|_| start.clone())?,
+    );
+    while let Some(current) = queue.pop_front() {
+        if !session.observe_cancellation() {
+            return Err(start.clone());
+        }
+        if current == *target {
+            return Ok(true);
+        }
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let next = session
+            .direct_ancestors(analyzer, provider, &current)
+            .map_err(|_| current.clone())?;
+        queue.extend(next);
+    }
+    Ok(false)
+}
+
+fn java_enclosing_or_inherited_field(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    field_name: &str,
+    byte: usize,
+) -> Result<JavaEnclosingField, CodeUnit> {
+    use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+    let support: &dyn BoundedDefinitionLookup = session;
+    for enclosing in session.enclosing_units(analyzer, file, byte) {
+        if !session.charge_scope_step() {
+            return Ok(JavaEnclosingField::None);
+        }
+        let own = java_owned_member_candidates(
+            support.fqn(&format!("{}.{field_name}", enclosing.fq_name())),
+            JavaMemberLookupKind::Field,
+            &enclosing,
+        );
+        if let Some(found) = own.into_iter().next() {
+            return Ok(JavaEnclosingField::Unique(enclosing, found));
+        }
+        let Some(provider) = analyzer.type_hierarchy_provider() else {
+            continue;
+        };
+        let mut seen = HashSet::default();
+        seen.insert(enclosing.clone());
+        let mut queue = VecDeque::from(
+            session
+                .direct_ancestors(analyzer, provider, &enclosing)
+                .map_err(|_| enclosing.clone())?,
+        );
+        let mut survivors: Vec<(CodeUnit, CodeUnit)> = Vec::new();
+        while let Some(ancestor) = queue.pop_front() {
+            if !session.observe_cancellation() {
+                return Ok(JavaEnclosingField::None);
+            }
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            let candidates = java_owned_member_candidates(
+                support.fqn(&format!("{}.{field_name}", ancestor.fq_name())),
+                JavaMemberLookupKind::Field,
+                &ancestor,
+            );
+            if !candidates.is_empty() {
+                for candidate in candidates {
+                    let vis = java_signature_metadata(analyzer, Some(session), &candidate)
+                        .first()
+                        .and_then(|meta| meta.callable_declared_visibility());
+                    let inheritable = match vis {
+                        Some(
+                            DeclaredVisibility::Private | DeclaredVisibility::PrivateProtected,
+                        ) => false,
+                        Some(
+                            DeclaredVisibility::PackagePrivate | DeclaredVisibility::CrateOrModule,
+                        ) => candidate.package_name() == enclosing.package_name(),
+                        _ => true,
+                    };
+                    if inheritable {
+                        survivors.push((ancestor.clone(), candidate));
+                    }
+                }
+                // A supertype's own field declaration (even private) hides farther fields (JLS 8.3).
+                continue;
+            }
+            let next = session
+                .direct_ancestors(analyzer, provider, &ancestor)
+                .map_err(|_| ancestor.clone())?;
+            queue.extend(next);
+        }
+        // JLS 8.3 and 6.4.2: a field declared in a more specific supertype
+        // hides a same-named field a less specific supertype path also
+        // carries; survivors from unrelated supertypes are an ambiguous
+        // reference, not a first-come win.
+        if survivors.len() > 1 {
+            let mut hidden = HashSet::default();
+            for (index, (owner, _)) in survivors.iter().enumerate() {
+                for (other_index, (other_owner, _)) in survivors.iter().enumerate() {
+                    if index == other_index || owner == other_owner {
+                        continue;
+                    }
+                    if java_unit_inherits_from(analyzer, session, provider, other_owner, owner)? {
+                        hidden.insert(index);
+                        break;
+                    }
+                }
+            }
+            survivors = survivors
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !hidden.contains(index))
+                .map(|(_, survivor)| survivor)
+                .collect();
+        }
+        match survivors.len() {
+            0 => {}
+            1 => {
+                let (declaring_owner, field) = survivors.remove(0);
+                return Ok(JavaEnclosingField::Unique(declaring_owner, field));
+            }
+            _ => return Ok(JavaEnclosingField::Ambiguous),
+        }
+    }
+    Ok(JavaEnclosingField::None)
+}
+
+/// Whether a static import could actually bring this field into scope: only
+/// accessible static members are imported (JLS 7.5.3), so a private or
+/// instance field of the owner must not obscure a type of the same name.
+/// A field without recorded modifiers keeps the answer: the workspace parser
+/// publishes them, and dropping the obscuring signal on absent metadata would
+/// silently revert to treating the name as a type.
+fn java_static_import_field_is_imported(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file_package: &str,
+    candidate: &CodeUnit,
+) -> bool {
+    use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+    let metadata = java_signature_metadata(analyzer, Some(session), candidate);
+    let Some(meta) = metadata.first() else {
+        return true;
+    };
+    if !meta.field_is_static() {
+        return false;
+    }
+    match meta.callable_declared_visibility() {
+        Some(DeclaredVisibility::Private | DeclaredVisibility::PrivateProtected) => false,
+        Some(DeclaredVisibility::PackagePrivate | DeclaredVisibility::CrateOrModule) => {
+            candidate.package_name() == file_package
+        }
+        _ => true,
+    }
+}
+
+fn java_static_imported_workspace_fields(
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let support: &dyn BoundedDefinitionLookup = session;
+    let file_package = java.package_name_of(file).unwrap_or_default();
+    let mut fields = Vec::new();
+    for import in session.import_infos(token, java, file) {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        if path.kind
+            != Some(brokk_bifrost_core::analyzer::model::StructuredImportPathKind::StaticMember)
+        {
+            continue;
+        }
+        if import.is_wildcard {
+            let owner = path.render_segments(".");
+            let mut owner_fields = java_filter_member_candidates(
+                support.fqn(&format!("{owner}.{name}")),
+                JavaMemberLookupKind::Field,
+            );
+            if owner_fields.is_empty()
+                && let Some((leaf, outer_segments)) = path.segments.split_last()
+                && !outer_segments.is_empty()
+            {
+                owner_fields = java_filter_member_candidates(
+                    support.fqn(&format!("{}${leaf}.{name}", outer_segments.join("."))),
+                    JavaMemberLookupKind::Field,
+                );
+            }
+            fields.extend(owner_fields.into_iter().filter(|candidate| {
+                java_static_import_field_is_imported(java, session, &file_package, candidate)
+            }));
+            continue;
+        }
+        let Some((imported_member, owner_segments)) = path.segments.split_last() else {
+            continue;
+        };
+        if owner_segments.is_empty() || imported_member != name {
+            continue;
+        }
+        let owner = owner_segments.join(".");
+        let path_fqn = path.render_segments(".");
+        let mut imported =
+            java_filter_member_candidates(support.fqn(&path_fqn), JavaMemberLookupKind::Field);
+        if imported.is_empty() {
+            imported = java_filter_member_candidates(
+                support.fqn(&format!("{owner}${imported_member}")),
+                JavaMemberLookupKind::Field,
+            );
+        }
+        fields.extend(imported.into_iter().filter(|candidate| {
+            java_static_import_field_is_imported(java, session, &file_package, candidate)
+        }));
+    }
+    sort_units(&mut fields);
+    fields.dedup();
+    fields
+}
+
+fn java_static_import_has_workspace_field(
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> bool {
+    !java_static_imported_workspace_fields(java, token, session, file, name).is_empty()
 }
 
 /// Every class a Java receiver expression's static type gives member lookup.
@@ -4520,8 +5350,37 @@ fn java_receiver_types_for_java(
             ) {
                 return vec![JavaReceiverType::plain(unit)];
             }
-            if bindings.is_shadowed(name) {
+            if bindings.is_shadowed(name)
+                || java_matching_lambda_parameter(session, root, source, name, object.start_byte())
+                    .is_some()
+            {
                 return Vec::new();
+            }
+            match java_enclosing_or_inherited_field(
+                analyzer,
+                session,
+                file,
+                name,
+                object.start_byte(),
+            ) {
+                Ok(JavaEnclosingField::Unique(declaring_owner, field_unit)) => {
+                    return java_field_declared_type(
+                        analyzer,
+                        token,
+                        java,
+                        session,
+                        Some(&declaring_owner),
+                        &field_unit,
+                    )
+                    .map(JavaReceiverType::plain)
+                    .into_iter()
+                    .collect();
+                }
+                // Several inherited fields share the name: the reference is
+                // ambiguous, so no declared type may type this receiver.
+                Ok(JavaEnclosingField::Ambiguous) => return Vec::new(),
+                Ok(JavaEnclosingField::None) => {}
+                Err(_) => return Vec::new(),
             }
             // A variable beats a type of the same name as a qualifier (JLS
             // 6.5.2), and a static import brings a field into scope. Read the
@@ -4534,18 +5393,10 @@ fn java_receiver_types_for_java(
                     .into_iter()
                     .collect();
             }
-            java_type_text_with_context(
-                analyzer,
-                token,
-                java,
-                session,
-                file,
-                name,
-                object.start_byte(),
-            )
-            .map(JavaReceiverType::plain)
-            .into_iter()
-            .collect()
+            java_type_text_with_context(analyzer, token, java, session, file, source, name, object)
+                .map(JavaReceiverType::plain)
+                .into_iter()
+                .collect()
         }
         // A method-call receiver (`getABC().i`) is typed by the called method's
         // declared return type, which the call's own receiver may have to
@@ -4607,9 +5458,16 @@ fn java_receiver_types_for_java(
             let mut types = Vec::new();
             for owner in java_receiver_types(analyzer, token, session, file, source, root, receiver)
             {
-                if let Some(unit) =
-                    java_field_access_type(analyzer, token, java, session, &owner.unit, field)
-                {
+                if let Some(unit) = java_field_access_type(
+                    analyzer,
+                    token,
+                    java,
+                    session,
+                    file,
+                    object.start_byte(),
+                    &owner.unit,
+                    field,
+                ) {
                     java_push_receiver_type(&mut types, JavaReceiverType::plain(unit));
                 }
             }
@@ -4621,11 +5479,14 @@ fn java_receiver_types_for_java(
 
 /// The class a field access denotes: the declared type of the field its owner
 /// declares, or a nested type of the owner when the spelling names one.
+#[allow(clippy::too_many_arguments)]
 fn java_field_access_type(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    byte: usize,
     owner: &CodeUnit,
     field: &str,
 ) -> Option<CodeUnit> {
@@ -4634,7 +5495,19 @@ fn java_field_access_type(
     if let Some(field_unit) = candidates.iter().find(|unit| unit.is_field()) {
         return java_field_declared_type(analyzer, token, java, session, Some(owner), field_unit);
     }
-    candidates.into_iter().find(CodeUnit::is_class)
+    if let Some(direct_class) = candidates.into_iter().find(CodeUnit::is_class) {
+        return Some(direct_class);
+    }
+    let site_enclosing = session.enclosing_units(analyzer, file, byte);
+    let env = SessionMemberTypeEnv::new(analyzer, java, session, token);
+    match resolve_accessible_member_types_of_owner(&env, owner, field, file, &site_enclosing) {
+        MemberTypeStep::Resolved(unit) => Some(unit),
+        MemberTypeStep::ResolvedExternal(_)
+        | MemberTypeStep::Ambiguous(_)
+        | MemberTypeStep::AmbiguousResolutions(_)
+        | MemberTypeStep::Incomplete(_)
+        | MemberTypeStep::Missing => None,
+    }
 }
 
 /// The class a field's declared type names.
@@ -4658,8 +5531,30 @@ fn java_field_declared_type(
     let metadata = java_signature_metadata(analyzer, Some(session), field_unit);
     let type_text = java_field_type_text_from_metadata(&metadata)?;
     let normalized = normalize_java_type_text(&type_text);
-    java_nested_type_in_scope(analyzer, session, owner.cloned(), normalized)
-        .or_else(|| session.resolve_type_name_in_file(token, java, field_unit.source(), normalized))
+    match java_contextual_type_from_seed(
+        analyzer,
+        token,
+        java,
+        session,
+        field_unit.source(),
+        normalized,
+        owner.cloned(),
+    ) {
+        JavaContextualTypeOutcome::Resolved { unit, .. } => Some(unit),
+        JavaContextualTypeOutcome::ResolvedExternal { .. }
+        | JavaContextualTypeOutcome::Ambiguous(_)
+        | JavaContextualTypeOutcome::AmbiguousExternal(_)
+        | JavaContextualTypeOutcome::Incomplete(_)
+        | JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+        | JavaContextualTypeOutcome::ShadowedByTypeParameter => None,
+        JavaContextualTypeOutcome::OpenSupertype(open) => {
+            session.note_open_supertype(analyzer, &open, normalized);
+            session.resolve_type_name_in_file(token, java, field_unit.source(), normalized)
+        }
+        JavaContextualTypeOutcome::Unbound => {
+            session.resolve_type_name_in_file(token, java, field_unit.source(), normalized)
+        }
+    }
 }
 
 /// The one workspace field a static import brings into scope under `name`.
@@ -4670,18 +5565,8 @@ fn java_static_imported_workspace_field(
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    let mut fields = java_static_import_candidates(
-        analyzer,
-        token,
-        session,
-        file,
-        name,
-        JavaMemberLookupKind::Field,
-        None,
-    )
-    .outcome
-    .definitions;
-    fields.retain(CodeUnit::is_field);
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    let mut fields = java_static_imported_workspace_fields(java, token, session, file, name);
     (fields.len() == 1).then(|| fields.remove(0))
 }
 
@@ -4760,13 +5645,7 @@ fn java_receiver_types_in_tree(
         return java_type_parameter_types(analyzer, token, java, session, file, source, parameter);
     }
     java_type_text_with_context(
-        analyzer,
-        token,
-        java,
-        session,
-        file,
-        normalized,
-        type_node.start_byte(),
+        analyzer, token, java, session, file, source, normalized, type_node,
     )
     .map(|unit| JavaReceiverType {
         unit,
@@ -5538,9 +6417,8 @@ fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
 }
 
 /// Resolve the name of a `scoped_type_identifier` (`B.Foo`) by resolving the
-/// qualifier (`B`) and finding the nested type `Foo` in it — directly or via a
-/// superclass/interface. Handles cases the from-context nested lookup misses,
-/// like `class A extends B.Foo`.
+/// qualifier (`B`) and finding the nested type `Foo` in it -- directly or via a
+/// superclass/interface, enforcing JLS 8.5 hiding and JLS 6.6.1 accessibility.
 fn java_qualified_nested_type(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -5549,61 +6427,76 @@ fn java_qualified_nested_type(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-) -> Option<CodeUnit> {
-    let parent = node.parent()?;
+) -> JavaQualifiedNestedCandidates {
+    let Some(parent) = node.parent() else {
+        return JavaQualifiedNestedCandidates::Candidates(Vec::new());
+    };
     if parent.kind() != "scoped_type_identifier" {
-        return None;
+        return JavaQualifiedNestedCandidates::Candidates(Vec::new());
     }
     let mut cursor = parent.walk();
     let mut qualifier = None;
     for child in parent.named_children(&mut cursor) {
         if !session.charge_scope_step() {
-            return None;
+            return JavaQualifiedNestedCandidates::Candidates(Vec::new());
         }
         if child.id() != node.id() && child.end_byte() <= node.start_byte() {
             qualifier = Some(child);
             break;
         }
     }
-    let qualifier = qualifier?;
-    let qualifier_type =
-        java_type_from_node_with_context(analyzer, token, java, session, file, source, qualifier)?;
-    let name = java_node_text(node, source);
-
-    let nested = |owner: &CodeUnit| {
-        session
-            .fqn(&format!("{}.{}", owner.fq_name(), name))
-            .into_iter()
-            .find(|unit| unit.is_class())
+    let Some(qualifier) = qualifier else {
+        return JavaQualifiedNestedCandidates::Candidates(Vec::new());
     };
-    if let Some(unit) = nested(&qualifier_type) {
-        return Some(unit);
+    match java_contextual_type_at_site(
+        analyzer,
+        token,
+        java,
+        session,
+        file,
+        source,
+        normalize_java_type_text(java_node_text(qualifier, source)),
+        qualifier,
+    ) {
+        JavaContextualTypeOutcome::Incomplete(blame) => {
+            return JavaQualifiedNestedCandidates::Incomplete(blame);
+        }
+        JavaContextualTypeOutcome::ResolvedExternal { .. }
+        | JavaContextualTypeOutcome::Ambiguous(_)
+        | JavaContextualTypeOutcome::AmbiguousExternal(_)
+        | JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+        | JavaContextualTypeOutcome::ShadowedByTypeParameter => {
+            return JavaQualifiedNestedCandidates::Candidates(Vec::new());
+        }
+        JavaContextualTypeOutcome::Resolved { .. }
+        | JavaContextualTypeOutcome::Unbound
+        | JavaContextualTypeOutcome::OpenSupertype(_) => {}
     }
-    let provider = analyzer.type_hierarchy_provider()?;
-    let mut queue = VecDeque::from(
-        session
-            .direct_ancestors(analyzer, provider, &qualifier_type)
-            .ok()?,
-    );
-    let mut seen = HashSet::default();
-    seen.insert(qualifier_type);
-    while let Some(ancestor) = queue.pop_front() {
-        if !session.observe_cancellation() {
-            return None;
+    let Some(qualifier_type) =
+        java_type_from_node_with_context(analyzer, token, java, session, file, source, qualifier)
+    else {
+        return JavaQualifiedNestedCandidates::Candidates(Vec::new());
+    };
+    let name = java_node_text(node, source);
+    let site_enclosing = session.enclosing_units(analyzer, file, node.start_byte());
+    let env = SessionMemberTypeEnv::new(analyzer, java, session, token);
+    match resolve_accessible_member_types_of_owner(
+        &env,
+        &qualifier_type,
+        name,
+        file,
+        &site_enclosing,
+    ) {
+        MemberTypeStep::Resolved(unit) => JavaQualifiedNestedCandidates::Candidates(vec![unit]),
+        MemberTypeStep::Ambiguous(units) => JavaQualifiedNestedCandidates::Candidates(units),
+        MemberTypeStep::AmbiguousResolutions(resolutions) => {
+            JavaQualifiedNestedCandidates::AmbiguousExternal(resolutions)
         }
-        if !seen.insert(ancestor.clone()) {
-            continue;
+        MemberTypeStep::Incomplete(blame) => JavaQualifiedNestedCandidates::Incomplete(blame),
+        MemberTypeStep::ResolvedExternal(_) | MemberTypeStep::Missing => {
+            JavaQualifiedNestedCandidates::Candidates(Vec::new())
         }
-        if let Some(unit) = nested(&ancestor) {
-            return Some(unit);
-        }
-        queue.extend(
-            session
-                .direct_ancestors(analyzer, provider, &ancestor)
-                .ok()?,
-        );
     }
-    None
 }
 
 fn java_enclosing_scoped_type_identifier<'tree>(
@@ -5660,6 +6553,244 @@ fn java_scoped_type_qualifier_text<'a>(
     None
 }
 
+struct SessionMemberTypeEnv<'a, 's, 'q> {
+    analyzer: &'a dyn IAnalyzer,
+    java: &'a JavaAnalyzer,
+    session: &'a JavaResolutionSession<'s>,
+    token: QueryToken<'q>,
+    external: LazyExternal<'a>,
+    site: Option<(&'a ProjectFile, Node<'a>)>,
+}
+
+impl<'a, 's, 'q> SessionMemberTypeEnv<'a, 's, 'q> {
+    fn new(
+        analyzer: &'a dyn IAnalyzer,
+        java: &'a JavaAnalyzer,
+        session: &'a JavaResolutionSession<'s>,
+        token: QueryToken<'q>,
+    ) -> Self {
+        Self {
+            analyzer,
+            java,
+            session,
+            token,
+            external: LazyExternal::deferred(move || {
+                java.external_declarations(analyzer.semantic_model_overlay_read().published())
+            }),
+            site: None,
+        }
+    }
+
+    fn with_site(mut self, file: &'a ProjectFile, node: Node<'a>) -> Self {
+        self.site = Some((file, node));
+        self
+    }
+}
+
+impl WorkspaceMemberTypeEnv for SessionMemberTypeEnv<'_, '_, '_> {
+    fn is_live(&self) -> bool {
+        self.session.observe_cancellation() && !self.session.is_stopped()
+    }
+
+    fn charge_step(&self) -> bool {
+        self.session.charge_scope_step()
+    }
+
+    fn package_name_of_file(&self, file: &ProjectFile) -> String {
+        self.java.package_name_of(file).unwrap_or_default()
+    }
+
+    fn raw_supertypes_of(&self, unit: &CodeUnit) -> Vec<String> {
+        let mut raw = self.java.raw_supertypes_of(unit);
+        if let Some(implicit) = implicit_supertype_at_site(self.java, unit, self.site) {
+            self.external.get();
+            if !raw.iter().any(|s| s == implicit) {
+                raw.push(implicit.to_owned());
+            }
+        }
+        raw
+    }
+
+    fn forward_classes_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.session
+            .fqn(fqn)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect()
+    }
+
+    fn parent_of_unit(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        self.session.parent_of(self.analyzer, unit)
+    }
+
+    fn enclosing_class_units_at(&self, file: &ProjectFile, byte: usize) -> Vec<CodeUnit> {
+        self.session.enclosing_units(self.analyzer, file, byte)
+    }
+
+    fn unit_ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+        self.session.ranges(self.analyzer, unit)
+    }
+
+    fn signature_metadata_of(
+        &self,
+        unit: &CodeUnit,
+    ) -> Vec<brokk_bifrost_core::analyzer::model::SignatureMetadata> {
+        java_signature_metadata(self.analyzer, Some(self.session), unit)
+    }
+
+    fn import_infos_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<brokk_bifrost_core::analyzer::model::ImportInfo> {
+        self.session.import_infos(self.token, self.java, file)
+    }
+
+    fn resolve_type_name_candidates_in_file(
+        &self,
+        file: &ProjectFile,
+        normalized: &str,
+    ) -> Vec<CodeUnit> {
+        self.session
+            .resolve_type_name_candidates_in_file(self.token, self.java, file, normalized)
+    }
+
+    fn direct_hierarchy_ancestors(&self, unit: &CodeUnit) -> Result<Vec<CodeUnit>, ()> {
+        if unit.source().language() == Language::Java {
+            if !self.session.charge_hierarchy_expansion() {
+                return Err(());
+            }
+            let ancestors = self.java.legacy_direct_ancestors(unit);
+            if !self.session.observe_cancellation() || self.session.is_stopped() {
+                return Err(());
+            }
+            if !ancestors.is_complete() {
+                return Err(());
+            }
+            return Ok(self.session.track_rows(ancestors.edges));
+        }
+        let Some(provider) = self.analyzer.type_hierarchy_provider() else {
+            return Err(());
+        };
+        let ancestors = self
+            .session
+            .direct_ancestors(self.analyzer, provider, unit)
+            .map_err(|_| ())?;
+        if self.session.is_stopped() {
+            return Err(());
+        }
+        Ok(ancestors)
+    }
+
+    fn direct_external_supertypes(&self, unit: &CodeUnit) -> Result<DirectExternalSupertypes, ()> {
+        resolve_java_direct_external_supertypes(
+            self.java,
+            self.token,
+            self.analyzer.semantic_model_overlay_read().published(),
+            None,
+            unit,
+            implicit_supertype_at_site(self.java, unit, self.site),
+        )
+    }
+
+    fn inherited_external_member_types(
+        &self,
+        roots: &[JvmExternalType],
+        subtype_package: &str,
+        simple_name: &str,
+    ) -> Result<Vec<JvmExternalType>, ()> {
+        inherited_external_member_types_with_lazy(
+            self.java,
+            &self.external,
+            roots,
+            subtype_package,
+            simple_name,
+        )
+    }
+
+    fn external_supertypes(&self, fqn: &str) -> Result<Vec<String>, ()> {
+        external_supertypes_with_lazy(self.java, &self.external, fqn)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_contextual_type_at_site(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    normalized: &str,
+    site_node: Node<'_>,
+) -> JavaContextualTypeOutcome {
+    let Some(parsed) = JavaTypeName::from_normalized_spelling(normalized) else {
+        return JavaContextualTypeOutcome::Unbound;
+    };
+    let local_type = java_local_type_in_scope(
+        analyzer,
+        session,
+        file,
+        parsed.first(),
+        site_node.start_byte(),
+    );
+    let env = SessionMemberTypeEnv::new(analyzer, java, session, token).with_site(file, site_node);
+    let outcome = resolve_contextual_java_type(
+        &env,
+        file,
+        normalized,
+        Some((source, site_node)),
+        None,
+        local_type,
+    );
+    // A type-position caller binds an `OpenSupertype` name through the
+    // file-level tiers, as it does an unbound one, and the answer it reaches is
+    // then incomplete. An expression-position caller refuses it instead, and
+    // the note changes nothing for an answer without definitions.
+    if let JavaContextualTypeOutcome::OpenSupertype(open) = &outcome {
+        session.note_open_supertype(analyzer, open, normalized);
+    }
+    outcome
+}
+
+fn java_contextual_type_from_seed(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    normalized: &str,
+    seed_owner: Option<CodeUnit>,
+) -> JavaContextualTypeOutcome {
+    let env = SessionMemberTypeEnv::new(analyzer, java, session, token);
+    resolve_contextual_java_type(&env, file, normalized, None, seed_owner, None)
+}
+
+fn java_file_level_unique_type(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    normalized: &str,
+    site: Option<(&str, Node<'_>)>,
+) -> Option<CodeUnit> {
+    let resolved = session.resolve_type_name_in_file(token, java, file, normalized)?;
+    // The workspace resolver cannot see the external surface. A simple name it
+    // finds through an on-demand import competes with the other on-demand
+    // candidates, `java.lang` included (JLS 6.4.1), and two different types
+    // are an ambiguity the compiler rejects. Only the combined ladder can say.
+    if !normalized.contains('.')
+        && session
+            .import_infos(token, java, file)
+            .iter()
+            .any(|import| import.is_wildcard)
+        && java_type_name_is_ambiguous(analyzer, token, java, file, normalized, site)
+    {
+        return None;
+    }
+    Some(resolved)
+}
+
 pub(crate) fn java_type_from_node_with_context(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -5675,53 +6806,48 @@ pub(crate) fn java_type_from_node_with_context(
         java,
         session,
         file,
+        source,
         normalize_java_type_text(java_node_text(type_node, source)),
-        type_node.start_byte(),
+        type_node,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_type_text_with_context(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
+    source: &str,
     normalized: &str,
-    byte: usize,
+    site_node: Node<'_>,
 ) -> Option<CodeUnit> {
     if normalized.is_empty() {
         return None;
     }
-    if !normalized.contains('.')
-        && let Some(unit) = java_local_type_in_scope(analyzer, session, file, normalized, byte)
-    {
-        return Some(unit);
+    match java_contextual_type_at_site(
+        analyzer, token, java, session, file, source, normalized, site_node,
+    ) {
+        JavaContextualTypeOutcome::Resolved { unit, .. } => Some(unit),
+        JavaContextualTypeOutcome::ResolvedExternal { .. }
+        | JavaContextualTypeOutcome::Ambiguous(_)
+        | JavaContextualTypeOutcome::AmbiguousExternal(_)
+        | JavaContextualTypeOutcome::Incomplete(_)
+        | JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+        | JavaContextualTypeOutcome::ShadowedByTypeParameter => None,
+        JavaContextualTypeOutcome::Unbound | JavaContextualTypeOutcome::OpenSupertype(_) => {
+            java_file_level_unique_type(
+                analyzer,
+                token,
+                java,
+                session,
+                file,
+                normalized,
+                Some((source, site_node)),
+            )
+        }
     }
-    if !normalized.contains('.')
-        && let Some(unit) = java_nested_type_in_scope(
-            analyzer,
-            session,
-            session.enclosing_unit(analyzer, file, byte),
-            normalized,
-        )
-    {
-        return Some(unit);
-    }
-    let resolved = session.resolve_type_name_in_file(token, java, file, normalized)?;
-    // The workspace resolver cannot see the external surface. A simple name it
-    // finds through an on-demand import competes with the other on-demand
-    // candidates, `java.lang` included (JLS 6.4.1), and two different types
-    // are an ambiguity the compiler rejects. Only the combined ladder can say.
-    if !normalized.contains('.')
-        && session
-            .import_infos(token, java, file)
-            .iter()
-            .any(|import| import.is_wildcard)
-        && java_type_name_is_ambiguous(analyzer, token, java, file, normalized)
-    {
-        return None;
-    }
-    Some(resolved)
 }
 
 /// Whether the combined type ladder stops on `name` with an ambiguity or a
@@ -5732,11 +6858,17 @@ fn java_type_name_is_ambiguous(
     java: &JavaAnalyzer,
     file: &ProjectFile,
     name: &str,
+    site: Option<(&str, Node<'_>)>,
 ) -> bool {
     let Some(name) = JavaTypeName::from_normalized_spelling(name) else {
         return false;
     };
     let selected = java.selected_jdk_artifact_for_file(analyzer, file);
+    let use_site = site.map(|(source, node)| UseSite {
+        token,
+        source,
+        node,
+    });
     !matches!(
         java.resolve_type_name_outcome_at(
             token,
@@ -5745,8 +6877,9 @@ fn java_type_name_is_ambiguous(
             &name,
             selected
                 .as_ref()
-                .and_then(|evidence| evidence.artifact_sha256.as_deref()),
-            None,
+                .and_then(|evidence| evidence.single_raw_sha256())
+                .as_deref(),
+            use_site.as_ref(),
         ),
         TypeNameOutcome::Resolved(_) | TypeNameOutcome::Unbound
     )
@@ -6192,14 +7325,18 @@ fn java_lambda_parameter_type_before(
         name,
         before_byte,
     )?;
+    let site_node = session
+        .smallest_named_node_covering(root, before_byte, before_byte.saturating_add(1))
+        .unwrap_or(root);
     java_type_text_with_context(
         analyzer,
         token,
         java,
         session,
         file,
+        source,
         normalize_java_type_text(&type_text),
-        before_byte,
+        site_node,
     )
 }
 
@@ -7301,13 +8438,37 @@ fn java_hierarchy_crosses_unindexed_supertype(
         }
         for raw in java.raw_supertypes_of(&unit) {
             let normalized = normalize_java_type_text(&raw);
+            let parent_seed = session.parent_of(analyzer, &unit);
             if java_nested_type_in_scope(analyzer, session, Some(unit.clone()), normalized)
-                .is_none()
-                && session
-                    .resolve_type_name_in_file(token, java, unit.source(), normalized)
-                    .is_none()
+                .is_some()
             {
-                return true;
+                continue;
+            }
+            match java_contextual_type_from_seed(
+                analyzer,
+                token,
+                java,
+                session,
+                unit.source(),
+                normalized,
+                parent_seed,
+            ) {
+                JavaContextualTypeOutcome::Resolved { .. }
+                | JavaContextualTypeOutcome::ResolvedExternal { .. } => continue,
+                JavaContextualTypeOutcome::Ambiguous(_)
+                | JavaContextualTypeOutcome::AmbiguousExternal(_)
+                | JavaContextualTypeOutcome::Incomplete(_)
+                | JavaContextualTypeOutcome::OpenSupertype(_) => return true,
+                JavaContextualTypeOutcome::MissingMemberOfBoundPrefix
+                | JavaContextualTypeOutcome::ShadowedByTypeParameter
+                | JavaContextualTypeOutcome::Unbound => {
+                    if session
+                        .resolve_type_name_in_file(token, java, unit.source(), normalized)
+                        .is_none()
+                    {
+                        return true;
+                    }
+                }
             }
         }
         let Ok(ancestors) = session.direct_ancestors(analyzer, provider, &unit) else {
@@ -7571,6 +8732,7 @@ fn java_static_import_candidates(
                     java,
                     file,
                     &format!("{owner}.{member}"),
+                    None,
                 )
                 .and_then(|resolved| {
                     let parameter_count = resolved.applicable_parameter_count(false, arity)?;
@@ -8216,8 +9378,8 @@ mod tests {
         let project = InlineTestProject::with_language(Language::Java)
             .file("App.java", source)
             .build();
-        let workspace = project
-            .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+        let workspace =
+            project.workspace_analyzer(brokk_bifrost_analysis::test_support::no_host_jdk_config());
         let pack = compile_source(SourceFormat::Json, &serde_json::to_vec(&json!({
             "schema_version": 2, "pack_id": "test.constructor", "version": "1.0.0",
             "producer": {"name": "contract", "version": "1.0.0"}, "language": "java", "ecosystem": "jdk",
@@ -8254,6 +9416,7 @@ mod tests {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -8267,7 +9430,8 @@ mod tests {
                     }),
                     target: Some("jvm".into()),
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),
@@ -8365,7 +9529,8 @@ mod tests {
                 toolchain: None,
                 target: Some("jvm".to_owned()),
                 configuration: None,
-                artifact_sha256: Some("selected-artifact".to_owned()),
+                production_input_digest: None,
+verified_raw_artifacts: (Some("a".repeat(64))).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
             };
         for declared_artifact in [None, Some("different-artifact")] {
             let call = java_external_call_evidence(
@@ -8391,7 +9556,7 @@ mod tests {
             JavaExternalReceiverForm::BoundValue,
             0,
             Some(evidence.clone()),
-            evidence.artifact_sha256.as_deref(),
+            evidence.single_raw_sha256().as_deref(),
         );
         assert_eq!(
             jdk_call

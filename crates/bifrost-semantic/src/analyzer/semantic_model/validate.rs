@@ -93,6 +93,115 @@ fn contains_strict_source_range(outer: SourceByteRange, inner: SourceByteRange) 
     outer.start < inner.start && inner.end < outer.end
 }
 
+/// Authored input may omit pins, but cannot declare an engine production key.
+pub fn check_authored_selectors(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    for shard in &pack.shards {
+        for selector in &shard.activation {
+            if !authored_selector_fields_valid(selector) {
+                errors.push(Diagnostic::error(
+                    "selector.provenance",
+                    &shard.id,
+                    "authored selectors may use only artifact_sha256",
+                ));
+            }
+        }
+        if let Some(values) = &shard.callable_values {
+            for (index, identity) in values.anonymous_callables.iter().enumerate() {
+                if !shard.activation.iter().any(|selector| {
+                    selector.artifact_sha256.as_deref() == Some(&identity.artifact_sha256)
+                }) {
+                    errors.push(Diagnostic::error(
+                        "callable_values.anonymous_artifact",
+                        format!(
+                            "$.shards[{}/callable_values].anonymous_callables[{index}].artifact_sha256",
+                            shard.id
+                        ),
+                        "anonymous callable digest must match an artifact-pinned authored selector",
+                    ));
+                }
+            }
+        }
+        if let Some(values) = &shard.runtime_values {
+            for (index, exposure) in values.exposures.iter().enumerate() {
+                if !shard.activation.iter().any(|selector| {
+                    runtime_artifact_matches_selector(&exposure.runtime, selector)
+                        && selector
+                            .configurations
+                            .contains(&exposure.runtime_profile_digest)
+                }) {
+                    errors.push(Diagnostic::error("runtime.activation_profile_unbound", format!("$.shards[{}/runtime_values].exposures[{index}]", shard.id), "authored runtime artifact, digest and profile must be bound by one selector"));
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// Engine production must bind its full input and its own extraction identity.
+pub fn check_generated_selectors(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    let Some(extraction) = &pack.extraction else {
+        return vec![Diagnostic::error(
+            "selector.provenance",
+            "$.extraction",
+            "generated dependency requires extraction input evidence",
+        )];
+    };
+    for shard in &pack.shards {
+        for selector in &shard.activation {
+            if !generated_selector_fields_valid(selector) {
+                errors.push(Diagnostic::error(
+                    "selector.provenance",
+                    &shard.id,
+                    "generated selectors require only production_input_digest",
+                ));
+            }
+        }
+        if let Some(values) = &shard.callable_values {
+            for (index, identity) in values.anonymous_callables.iter().enumerate() {
+                if identity.artifact_sha256 != extraction.digest()
+                    || !shard.activation.iter().any(generated_selector_fields_valid)
+                {
+                    errors.push(Diagnostic::error("callable_values.anonymous_artifact", format!("$.shards[{}/callable_values].anonymous_callables[{index}].artifact_sha256", shard.id), "generated anonymous callable digest must match its extraction input and production selector"));
+                }
+            }
+        }
+        if let Some(values) = &shard.runtime_values {
+            for (index, exposure) in values.exposures.iter().enumerate() {
+                let runtime = &exposure.runtime;
+                if !shard.activation.iter().any(|selector| {
+                    generated_selector_fields_valid(selector)
+                        && selector
+                            .configurations
+                            .contains(&exposure.runtime_profile_digest)
+                        && match (
+                            runtime.runtime_artifact.as_deref(),
+                            runtime.runtime_artifact_digest.as_deref(),
+                        ) {
+                            (Some(artifact), Some(digest)) => {
+                                digest == extraction.digest()
+                                    && runtime_artifact_coordinate_matches(artifact, selector)
+                            }
+                            _ => selector.package.is_none(),
+                        }
+                }) {
+                    errors.push(Diagnostic::error("runtime.activation_profile_unbound", format!("$.shards[{}/runtime_values].exposures[{index}]", shard.id), "generated runtime artifact must match its extraction input and production selector"));
+                }
+            }
+        }
+    }
+    errors
+}
+
+pub fn authored_selector_fields_valid(selector: &ActivationSelector) -> bool {
+    selector.production_input_digest.is_none()
+}
+
+pub fn generated_selector_fields_valid(selector: &ActivationSelector) -> bool {
+    selector.artifact_sha256.is_none() && selector.production_input_digest.is_some()
+}
+
 pub(crate) fn validate_pack(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
@@ -158,8 +267,29 @@ pub(crate) fn validate_pack_internal(
         pack_id_bytes: pack.pack_id.len(),
         schema_version: pack.schema_version,
         required_schema_version: VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION,
+        generated_pack: pack.extraction.is_some() || pack.safety.generated_code_only,
         validate_references,
     };
+    // #10572: JVM is_sealed changes meaning at schema 43: it describes
+    // PermittedSubclasses only, instead of the legacy sealed-or-final bit.
+    // Minimization must preserve that meaning, even without explicit finality.
+    if pack.schema_version >= CLASS_FINALITY_MIN_SCHEMA_VERSION
+        && pack.extraction.as_ref().is_some_and(|extraction| {
+            matches!(
+                extraction.kind,
+                ArtifactExtractionKind::JavaClassJar
+                    | ArtifactExtractionKind::JavaSourceJar
+                    | ArtifactExtractionKind::JdkJmodSet
+                    | ArtifactExtractionKind::JdkSourceZip
+            )
+        })
+        && pack.shards.iter().any(|shard| {
+            matches!(&shard.payload,
+            AuthoredPayload::DeclarationFacts { types, .. } if !types.is_empty())
+        })
+    {
+        validator.required_schema_version = CLASS_FINALITY_MIN_SCHEMA_VERSION;
+    }
     validator.validate(pack);
     validator
         .diagnostics
@@ -292,6 +422,9 @@ struct Validator {
     /// The highest schema version whose gated fields this pack uses, never
     /// below the version-independent floor. See `predates_schema`.
     required_schema_version: u32,
+    /// The pack is generator output: it carries an extraction receipt or
+    /// declares itself generated code only. Authored review claims are refused.
+    generated_pack: bool,
     validate_references: bool,
 }
 
@@ -940,7 +1073,7 @@ impl Validator {
         &mut self,
         path: &str,
         identity: &AnonymousCallableIdentity,
-        activation: &[ActivationSelector],
+        _activation: &[ActivationSelector],
     ) -> bool {
         let mut valid = true;
         if self.language != "go" {
@@ -960,16 +1093,6 @@ impl Validator {
                 "callable_values.anonymous_artifact",
                 format!("{path}.artifact_sha256"),
                 "anonymous callable artifact identity must be a lowercase SHA-256 digest",
-            );
-            valid = false;
-        }
-        if !activation.iter().any(|selector| {
-            selector.artifact_sha256.as_deref() == Some(identity.artifact_sha256.as_str())
-        }) {
-            self.error(
-                "callable_values.anonymous_artifact",
-                format!("{path}.artifact_sha256"),
-                "anonymous callable digest must match an artifact-pinned shard activation selector",
             );
             valid = false;
         }
@@ -1383,6 +1506,15 @@ impl Validator {
         selector: &ActivationSelector,
         compatible_toolchains: &[VersionConstraint],
     ) {
+        if let Some(digest) = &selector.production_input_digest
+            && !is_lower_sha256(digest)
+        {
+            self.error(
+                "selector.invalid_digest",
+                format!("{path}.production_input_digest"),
+                "production input digest must be 64 lowercase hexadecimal characters",
+            );
+        }
         let selectors = [
             ("package", selector.package.as_ref()),
             ("module", selector.module.as_ref()),
@@ -1890,6 +2022,7 @@ impl Validator {
                         );
                     }
                     let fact_path = format!("{path}.types[{index}]");
+                    self.class_finality(&fact_path, fact.type_kind, fact.is_sealed, fact.is_final);
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.qualified_name(&format!("{fact_path}.name"), &fact.name);
                     self.unique_names(
@@ -2051,16 +2184,56 @@ impl Validator {
                             &fact.type_parameters,
                         );
                     }
+                    if !fact.type_parameter_kinds.is_empty() {
+                        if self.predates_schema(RUST_GENERIC_PARAMETER_KINDS_MIN_SCHEMA_VERSION) {
+                            self.error("declaration.generic_kinds_schema_version", &fact_path,
+                                format!("type_parameter_kinds requires schema version {RUST_GENERIC_PARAMETER_KINDS_MIN_SCHEMA_VERSION}"));
+                        }
+                        if self.language != "rust" {
+                            self.error(
+                                "declaration.generic_kinds_language",
+                                &fact_path,
+                                "type_parameter_kinds requires language rust",
+                            );
+                        }
+                        if fact.type_parameter_kinds.len() != fact.type_parameters.len() {
+                            self.error(
+                                "declaration.generic_kinds_arity",
+                                &fact_path,
+                                "generic parameter kinds must be parallel to type_parameters",
+                            );
+                        }
+                        for (index, default) in fact.type_parameter_defaults.iter().enumerate() {
+                            let contradicts = matches!(
+                                (fact.type_parameter_kind(index), default),
+                                (
+                                    GenericParameterKind::Type,
+                                    Some(GenericParameterDefault::Const { .. })
+                                ) | (
+                                    GenericParameterKind::Const,
+                                    Some(GenericParameterDefault::Type { .. })
+                                )
+                            );
+                            if contradicts {
+                                self.error(
+                                    "declaration.generic_kind_default_mismatch",
+                                    &fact_path,
+                                    "generic parameter kind contradicts its default",
+                                );
+                            }
+                        }
+                    }
                     if let Some(value_semantics) = &fact.value_semantics {
                         if value_semantics.copy.is_none()
                             && value_semantics.move_semantics.is_none()
                             && value_semantics.drop_glue.is_none()
                             && value_semantics.drop_effects.is_none()
+                            && value_semantics.interior_mutability.is_none()
                         {
                             self.error(
                                 "declaration.empty_value_semantics",
                                 format!("{fact_path}.value_semantics"),
-                                "value_semantics must state copy, move or drop behavior",
+                                "value_semantics must state copy, move, drop or interior-mutability behavior",
                             );
                         }
                         if value_semantics.drop_glue.is_some() {
@@ -2090,6 +2263,47 @@ impl Validator {
                                     &path,
                                     "drop_glue describes a struct, enum or union",
                                 );
+                            }
+                        }
+                        if let Some(claim) = &value_semantics.interior_mutability {
+                            let path = format!("{fact_path}.value_semantics.interior_mutability");
+                            if self.predates_schema(INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION) {
+                                self.error("declaration.interior_mutability_schema_version", &path,
+                                    format!("interior_mutability requires schema version {INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION}"));
+                            }
+                            if self.language != "rust" {
+                                self.error(
+                                    "declaration.interior_mutability_language",
+                                    &path,
+                                    "interior_mutability requires language rust",
+                                );
+                            }
+                            if !matches!(
+                                fact.type_kind,
+                                TypeKind::Struct | TypeKind::Enum | TypeKind::Union
+                            ) {
+                                self.error(
+                                    "declaration.interior_mutability_owner",
+                                    &path,
+                                    "interior_mutability describes a struct, enum or union",
+                                );
+                            }
+                            if let TypeInteriorMutability::DependsOnTypeArguments { which } = claim
+                            {
+                                let invalid_positions = which.is_empty()
+                                    || which
+                                        .iter()
+                                        .any(|&index| index as usize >= fact.type_parameters.len());
+                                if invalid_positions {
+                                    self.error("declaration.interior_mutability_arguments", &path,
+                                        "dependent interior mutability requires a nonempty set of valid type-parameter positions");
+                                } else if which.iter().any(|&index| {
+                                    fact.type_parameter_kind(index as usize)
+                                        != GenericParameterKind::Type
+                                }) {
+                                    self.error("declaration.interior_mutability_parameter_kind", &path,
+                                        "dependent interior mutability requires affirmative Type evidence for every selected parameter; Const or Unknown cannot prove absence");
+                                }
                             }
                         }
                         self.drop_claim(&fact_path, fact, value_semantics);
@@ -2547,6 +2761,81 @@ impl Validator {
                             );
                         }
                     }
+                    if let Some(arguments) = &fact.inherent_impl_self_arguments {
+                        let path = format!("{fact_path}.inherent_impl_self_arguments");
+                        if self.language != "rust"
+                            || fact.implemented_trait.is_some()
+                            || !matches!(
+                                fact.member_kind,
+                                MemberKind::Constructor | MemberKind::Method | MemberKind::Function
+                            )
+                        {
+                            self.error(
+                                "declaration.inherent_impl_self_arguments_owner",
+                                &path,
+                                "inherent_impl_self_arguments describes the impl block of a Rust inherent callable; a trait implementation member records implemented_trait instead",
+                            );
+                        }
+                        if self
+                            .type_parameters_by_id
+                            .get(&fact.owner)
+                            .is_some_and(|parameters| parameters.len() != arguments.len())
+                        {
+                            self.error(
+                                "declaration.inherent_impl_self_arguments_arity",
+                                &path,
+                                "inherent_impl_self_arguments records one argument for each type parameter of the owner",
+                            );
+                        }
+                        if self
+                            .predates_schema(RUST_INHERENT_IMPL_SELF_ARGUMENTS_MIN_SCHEMA_VERSION)
+                        {
+                            self.error(
+                                "declaration.inherent_impl_self_arguments_schema_version",
+                                &path,
+                                format!(
+                                    "inherent_impl_self_arguments requires schema version {RUST_INHERENT_IMPL_SELF_ARGUMENTS_MIN_SCHEMA_VERSION}"
+                                ),
+                            );
+                        }
+                        // The impl block binds its own parameters; the owner's
+                        // parameter names are not in scope in its self type.
+                        let mut impl_parameters = Vec::new();
+                        crate::analyzer::semantic::common::visit_type_refs(arguments, |ty| {
+                            if let TypeRef::TypeParameter { name } = ty {
+                                impl_parameters.push(name.clone());
+                            }
+                        });
+                        for (index, argument) in arguments.iter().enumerate() {
+                            self.type_ref(&format!("{path}[{index}]"), argument, &impl_parameters);
+                        }
+                    }
+                    if fact.target_independent.is_some() {
+                        let path = format!("{fact_path}.target_independent");
+                        if !fact.callable_family_complete {
+                            self.error(
+                                "declaration.target_independent_without_family_complete",
+                                &path,
+                                "target_independent qualifies a callable_family_complete claim",
+                            );
+                        }
+                        if self.generated_pack {
+                            self.error(
+                                "declaration.target_independent_on_generated_pack",
+                                &path,
+                                "target_independent is an authored review claim; generated and extraction packs cannot carry it",
+                            );
+                        }
+                        if self.predates_schema(TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION) {
+                            self.error(
+                                "declaration.target_independent_schema_version",
+                                &path,
+                                format!(
+                                    "target_independent requires schema version {TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION}"
+                                ),
+                            );
+                        }
+                    }
                     if !fact.exact_return_classes.is_empty() {
                         if self.predates_schema(EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION) {
                             self.error(
@@ -2787,15 +3076,14 @@ impl Validator {
                 &exposure.runtime_profile_digest,
             );
             if !activation.iter().any(|selector| {
-                runtime_artifact_matches_selector(&exposure.runtime, selector)
-                    && selector
-                        .configurations
-                        .contains(&exposure.runtime_profile_digest)
+                selector
+                    .configurations
+                    .contains(&exposure.runtime_profile_digest)
             }) {
                 self.error(
                     "runtime.activation_profile_unbound",
                     &current,
-                    "runtime artifact, digest, and profile digest must be bound by one activation selector",
+                    "runtime profile digest must be bound by an activation selector",
                 );
             }
             self.runtime_root_identity(
@@ -3649,7 +3937,7 @@ impl Validator {
                     "covers_overrides requires completeness: complete",
                 );
             }
-            if !summary.target.has_receiver {
+            if !super::model::target_needs_override_claim(summary.target.has_receiver, false) {
                 self.error(
                     "summary.covers_overrides_on_receiverless_target",
                     format!("{path}.covers_overrides"),
@@ -6021,8 +6309,24 @@ impl Validator {
             &format!("{path}.type_parameters"),
             &signature.type_parameters,
         );
+        if signature.bounds.is_some()
+            && self.predates_schema(METHOD_TYPE_PARAMETER_BOUNDS_MIN_SCHEMA_VERSION)
+        {
+            self.error(
+                "signature.bounds_schema_version",
+                path,
+                format!(
+                    "method bounds require schema {METHOD_TYPE_PARAMETER_BOUNDS_MIN_SCHEMA_VERSION}"
+                ),
+            );
+        }
         let mut available_type_parameters = owner_type_parameters.to_vec();
         available_type_parameters.extend(signature.type_parameters.iter().cloned());
+        for (index, bound) in signature.bounds.iter().flatten().enumerate() {
+            let bound_path = format!("{path}.bounds[{index}]");
+            self.type_ref(&bound_path, &bound.subject, &available_type_parameters);
+            self.implemented_trait(&bound_path, &bound.bound, &available_type_parameters);
+        }
         let mut parameter_names = HashSet::new();
         let mut positional_variadic = false;
         let mut named_variadic = false;
@@ -6717,11 +7021,20 @@ impl Validator {
                     }
                     match declaration {
                         EmittedDeclaration::Type {
+                            type_kind,
+                            is_sealed,
+                            is_final,
                             type_parameters,
                             hierarchy,
                             extension_surfaces,
                             ..
                         } => {
+                            self.class_finality(
+                                &format!("{emission_path}.declaration"),
+                                *type_kind,
+                                *is_sealed,
+                                *is_final,
+                            );
                             for (parameter_index, parameter) in type_parameters.iter().enumerate() {
                                 self.template(
                                     &format!(
@@ -7406,6 +7719,33 @@ impl Validator {
             .push(Diagnostic::error(code, path, message));
     }
 
+    fn class_finality(
+        &mut self,
+        path: &str,
+        kind: TypeKind,
+        is_sealed: bool,
+        is_final: Option<bool>,
+    ) {
+        if is_final.is_some() && self.predates_schema(CLASS_FINALITY_MIN_SCHEMA_VERSION) {
+            self.error(
+                "declaration.finality_schema_version",
+                format!("{path}.is_final"),
+                format!("is_final requires schema version {CLASS_FINALITY_MIN_SCHEMA_VERSION}"),
+            );
+        }
+        if self.schema_version >= CLASS_FINALITY_MIN_SCHEMA_VERSION
+            && brokk_bifrost_core::analyzer::model::semantic_pack_realm(&self.language) == "jvm"
+            && is_final == Some(true)
+            && (is_sealed || !matches!(kind, TypeKind::Class | TypeKind::Record | TypeKind::Enum))
+        {
+            self.error(
+                "declaration.finality_shape",
+                format!("{path}.is_final"),
+                "a final JVM type must be a class, record or enum without sealed inheritance",
+            );
+        }
+    }
+
     /// Records that the pack uses a field introduced in schema `minimum` and
     /// returns whether the pack declares an older version. Every per-field
     /// version gate goes through here, so the walk that enforces the gates
@@ -7461,6 +7801,10 @@ fn runtime_artifact_matches_selector(
     if selector.artifact_sha256.as_deref() != Some(artifact_digest) {
         return false;
     }
+    runtime_artifact_coordinate_matches(artifact, selector)
+}
+
+fn runtime_artifact_coordinate_matches(artifact: &str, selector: &ActivationSelector) -> bool {
     let Some(package) = selector.package.as_ref() else {
         return false;
     };
@@ -7645,23 +7989,17 @@ fn capture_cardinality_name(cardinality: CaptureCardinality) -> &'static str {
 }
 
 /// The path shape every pack locator and carried-source entry must have: a
-/// relative, canonical, slash-separated path with no prefix, root, `.`/`..`
-/// component, or backslash.
+/// relative, canonical, slash-separated path with no prefix, root, empty,
+/// `.` or `..` component, or backslash. The check reads the string itself:
+/// `Path::components` would normalize `src/./a.rs` and `src//a.rs`, which a
+/// locator index keyed by the exact spelling could then never match.
 #[doc(hidden)]
 pub fn is_canonical_relative_path(value: &str) -> bool {
-    use std::path::{Component, Path};
-
-    !(has_portable_windows_path_prefix(value)
-        || value.contains('\\')
-        || Path::new(value).components().any(|component| {
-            matches!(
-                component,
-                Component::Prefix(_)
-                    | Component::RootDir
-                    | Component::ParentDir
-                    | Component::CurDir
-            )
-        }))
+    !has_portable_windows_path_prefix(value)
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 // Use the same neutral semantic checks for native producer payloads and imported
@@ -8283,6 +8621,117 @@ mod native_deferred_bridge_tests {
         assert_eq!(
             validate_pack(&pack, limits)[0].code,
             "go.local_type_bare_reference"
+        );
+    }
+
+    #[test]
+    fn selector_digest_fields_follow_pack_provenance() {
+        fn selector_pack() -> AuthoredSemanticModelPack {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": SEMANTIC_MODEL_SCHEMA_VERSION,
+                "pack_id":"test.selector-provenance", "version":"1.0.0",
+                "producer":{"name":"test", "version":"1.0.0"},
+                "language":"java", "ecosystem":"maven", "compatibility":{},
+                "provenance":{"source":"test-only selector validation"},
+                "license":"MIT", "completeness":"complete",
+                "safety":{"generated_code_only":false,"review_required":false},
+                "shards":[{"id":"declarations", "activation":[{}],
+                    "payload":{"kind":"declaration_facts", "types":[{"id":"type.fixture","name":"example.Fixture","type_kind":"class","visibility":"public","locator":{"kind":"artifact","path":"example/Fixture.class","symbol":"example.Fixture"}}], "members":[]}}]
+            }))
+            .unwrap()
+        }
+        let limits = ValidationLimits {
+            max_shards: 100,
+            max_records_per_shard: 1000,
+            max_records_per_pack: 1000,
+            max_text_bytes: 10_000,
+            max_depth: 100,
+        };
+        for generated in [false, true] {
+            for raw in [false, true] {
+                for production in [false, true] {
+                    let mut pack = selector_pack();
+                    if generated {
+                        pack.extraction = Some(ArtifactExtraction::source_set(
+                            ArtifactExtractionKind::JavaClassJar,
+                            &"a".repeat(64),
+                        ));
+                    }
+                    let selector = &mut pack.shards[0].activation[0];
+                    selector.artifact_sha256 = raw.then(|| "a".repeat(64));
+                    selector.production_input_digest = production.then(|| "b".repeat(64));
+                    let mut errors = validate_pack_locally(&pack, limits);
+                    errors.extend(if generated {
+                        check_generated_selectors(&pack)
+                    } else {
+                        check_authored_selectors(&pack)
+                    });
+                    let rejected = errors
+                        .iter()
+                        .any(|error| error.code == "selector.provenance");
+                    let valid = if generated {
+                        !raw && production
+                    } else {
+                        !production
+                    };
+                    if valid {
+                        assert!(errors.is_empty(), "{errors:?}");
+                    }
+                    assert_eq!(
+                        rejected, !valid,
+                        "generated={generated}, raw={raw}, production={production}: {errors:?}"
+                    );
+                }
+            }
+        }
+        let mut pack = selector_pack();
+        pack.extraction = Some(ArtifactExtraction::source_set(
+            ArtifactExtractionKind::JavaClassJar,
+            &"a".repeat(64),
+        ));
+        pack.shards[0].activation[0].production_input_digest = Some("B".repeat(64));
+        assert!(
+            validate_pack_locally(&pack, limits)
+                .iter()
+                .any(|error| error.code == "selector.invalid_digest")
+        );
+
+        let mut pack = selector_pack();
+        pack.language = "go".into();
+        pack.ecosystem = "gomod".into();
+        pack.extraction = Some(ArtifactExtraction::source_set(
+            ArtifactExtractionKind::GoSourceSet,
+            &"a".repeat(64),
+        ));
+        pack.shards[0].activation[0].production_input_digest = Some("b".repeat(64));
+        pack.shards[0].callable_values = Some(serde_json::from_value(serde_json::json!({
+            "facts":[], "coverage":[], "anonymous_callables":[{
+                "id":"anon", "artifact_sha256":"a".repeat(64), "package_import_path":"example.org/pkg",
+                "anchor":{"file":"main.go", "byte_range":{"start":10,"end":30}, "kind":"function_literal"},
+                "lexical_owner_chain":[],
+                "signature":{"function_type":{"file":"main.go", "byte_range":{"start":10,"end":20}},
+                    "parameters":[], "results":[], "declaration_chain":[]}
+            }]
+        })).unwrap());
+        let errors = check_generated_selectors(&pack);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.code == "callable_values.anonymous_artifact"),
+            "{errors:?}"
+        );
+        pack.shards[0]
+            .callable_values
+            .as_mut()
+            .unwrap()
+            .anonymous_callables[0]
+            .artifact_sha256 = "c".repeat(64);
+        let errors = check_generated_selectors(&pack);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "callable_values.anonymous_artifact"),
+            "{errors:?}"
         );
     }
 

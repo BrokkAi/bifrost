@@ -4037,6 +4037,10 @@ fn cpp_incomplete_type_outcome(
         QueryReadIncomplete::ProofStopped { reason, .. } => {
             no_definition("analysis_incomplete", *reason)
         }
+        QueryReadIncomplete::InternalInvariant(detail) => no_definition(
+            "analysis_incomplete",
+            format!("internal invariant: {detail}"),
+        ),
         QueryReadIncomplete::SemanticModelsPending => no_definition(
             "analysis_incomplete",
             "semantic models selected but not published",
@@ -12361,6 +12365,7 @@ pub(crate) fn definition_lexical_fallback(
 #[cfg(test)]
 mod batch_context_tests {
     use crate::analyzer::usages::get_definition::cpp;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::test_support::resolve_definition_requests;
 
     use brokk_bifrost_analysis::analyzer::usages::get_definition::test_support::navigation;
 

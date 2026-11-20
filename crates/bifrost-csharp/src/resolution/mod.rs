@@ -30,6 +30,8 @@ struct Context {
     package: ResolutionScopeId,
     owner: Option<ResolutionSiteId>,
     type_parameters: Option<ResolutionScopeId>,
+    owner_has_type_parameters: bool,
+    unsupported_enclosing_application: bool,
 }
 
 struct Producer<'a, 's> {
@@ -39,7 +41,10 @@ struct Producer<'a, 's> {
     facts: FileResolutionFacts,
     names: HashMap<String, ResolutionNameId>,
     claimed: HashSet<usize>,
-    declared_types: HashMap<(usize, ResolutionScopeId), ResolutionTypeSlotId>,
+    declared_types:
+        HashMap<(usize, ResolutionScopeId), (ResolutionTypeSlotId, Option<ResolutionSiteId>)>,
+    owner_applications: HashMap<ResolutionSiteId, ResolutionTypeSlotId>,
+    member_expression_outputs: HashMap<usize, ResolutionTypeSlotId>,
     namespace_paths: HashMap<ResolutionScopeId, Vec<ResolutionNameId>>,
     imports: Vec<(ResolutionSiteId, bool, Option<ResolutionNameId>)>,
     excluded: Vec<(usize, usize)>,
@@ -76,6 +81,8 @@ pub fn produce<'s>(
         names: HashMap::default(),
         claimed: HashSet::default(),
         declared_types: HashMap::default(),
+        owner_applications: HashMap::default(),
+        member_expression_outputs: HashMap::default(),
         namespace_paths: HashMap::default(),
         imports: Vec::new(),
         excluded,
@@ -103,7 +110,7 @@ pub fn produce<'s>(
     ));
     p.package(root, None, site, Vec::new());
     // M5 attaches the selected compilation's global/SDK implicit usings.
-    // Static usings can publish types, values and callables in other files.
+    // These usings add lexical type, value and callable candidates, not exports.
     for namespace in [
         ResolutionNamespace::Type,
         ResolutionNamespace::Value,
@@ -115,7 +122,7 @@ pub fn produce<'s>(
                 scope: root,
                 name: None,
                 namespace: Some(namespace),
-                may_publish: true,
+                may_publish: false,
             },
         );
     }
@@ -124,6 +131,8 @@ pub fn produce<'s>(
         package: root,
         owner: None,
         type_parameters: None,
+        owner_has_type_parameters: false,
+        unsupported_enclosing_application: false,
     };
     // #10342: recovery can attach a damaged directive to a following declaration.
     let mut directive_nodes = named_children(tree.root_node());
@@ -152,6 +161,7 @@ pub fn produce<'s>(
                     | "interface_declaration"
                     | "enum_declaration"
                     | "record_declaration"
+                    | "record_struct_declaration"
                     | "delegate_declaration"
                     | "global_statement"
                     | "global_attribute"
@@ -243,6 +253,14 @@ pub fn produce<'s>(
                     p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
                     continue;
                 };
+                let Some(part_names) = parts
+                    .iter()
+                    .map(|&part| p.name(part))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+                    continue;
+                };
                 let mut path = p.namespace_paths[&ctx.package].clone();
                 let end = if node.kind() == "file_scoped_namespace_declaration" {
                     source.len()
@@ -259,7 +277,7 @@ pub fn produce<'s>(
                     let owner = p.site(site_node, ctx.scope, ResolutionSiteKind::ModuleDeclaration);
                     let declaration =
                         p.site(site_node, ctx.scope, ResolutionSiteKind::PackageDeclaration);
-                    path.push(p.name(part));
+                    path.push(part_names[index]);
                     let scope = p.facts.allocate_lexical_scope(
                         ctx.scope,
                         Some(owner),
@@ -286,13 +304,14 @@ pub fn produce<'s>(
             | "struct_declaration"
             | "interface_declaration"
             | "record_declaration"
+            | "record_struct_declaration"
             | "enum_declaration"
             | "delegate_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     let site = p.declare(
                         node,
                         name,
-                        ctx.scope,
+                        ctx,
                         ResolutionSiteKind::TypeDeclaration,
                         ResolutionNamespace::Type,
                         ResolutionBinderKind::Type,
@@ -311,6 +330,11 @@ pub fn produce<'s>(
                             namespace: ResolutionNamespace::Type,
                         });
                     }
+                    // A nested declaration keeps its own formals. The current
+                    // source application has no enclosing instantiation relation.
+                    ctx.unsupported_enclosing_application |= ctx.owner_has_type_parameters;
+                    ctx.owner_has_type_parameters =
+                        first_named_child_of_kind(node, "type_parameter_list").is_some();
                     ctx.owner = Some(site);
                     ctx.type_parameters = None;
                     if first_named_child_of_kind(node, "type_parameter_list").is_some() {
@@ -323,6 +347,10 @@ pub fn produce<'s>(
                         );
                         ctx.type_parameters = Some(ctx.scope);
                     }
+                    // C# 7.7.2: declaration type parameters are visible in
+                    // the header, but the current/inherited nested-type tier
+                    // applies only within the body. Keep outer scopes intact.
+                    p.authored_parents(node, site, ctx);
                     ctx.scope = p.facts.allocate_lexical_scope(
                         ctx.scope,
                         Some(site),
@@ -330,6 +358,8 @@ pub fn produce<'s>(
                         node.start_byte(),
                         node.end_byte(),
                     );
+                    p.root_candidate(node, site, ctx);
+                    p.owner_application(node, site, ctx);
                     if csharp_has_modifier(source, node, "partial") {
                         // Other parts in this compilation can publish members.
                         let gap = p.site(node, ctx.scope, ResolutionSiteKind::UnsupportedRoute);
@@ -351,7 +381,7 @@ pub fn produce<'s>(
                     let site = p.declare(
                         node,
                         name,
-                        ctx.scope,
+                        ctx,
                         if constructor {
                             ResolutionSiteKind::ConstructorDeclaration
                         } else {
@@ -458,7 +488,10 @@ pub fn produce<'s>(
                     // implicit declaration to its owner syntax without claiming
                     // a source declaration token or source-declaration bridge.
                     let site = p.site(keyword, ctx.scope, ResolutionSiteKind::ValueDeclaration);
-                    let name = p.facts.intern_name(&mut p.names, "value");
+                    let name = p
+                        .facts
+                        .intern_name(&mut p.names, "value")
+                        .expect("static non-empty literal");
                     p.facts.identifiers.push(PositionedIdentifierFact {
                         site,
                         name,
@@ -478,7 +511,7 @@ pub fn produce<'s>(
                     let site = p.declare(
                         node,
                         name,
-                        ctx.scope,
+                        ctx,
                         ResolutionSiteKind::ValueDeclaration,
                         ResolutionNamespace::Value,
                         ResolutionBinderKind::Field,
@@ -513,7 +546,9 @@ pub fn produce<'s>(
             | "var_pattern"
             | "recursive_pattern"
             | "list_pattern"
-            | "catch_declaration" => {
+            | "catch_declaration"
+                if node.kind() != "type_parameter" || !p.claimed.contains(&node.id()) =>
+            {
                 let name = node
                     .child_by_field_name("name")
                     .or_else(|| (node.kind() == "implicit_parameter").then_some(node));
@@ -550,7 +585,10 @@ pub fn produce<'s>(
                     let site = p.declare(
                         node,
                         name,
-                        binding_scope,
+                        Context {
+                            scope: binding_scope,
+                            ..ctx
+                        },
                         if type_parameter {
                             ResolutionSiteKind::TypeDeclaration
                         } else {
@@ -604,7 +642,7 @@ pub fn produce<'s>(
                     p.declare(
                         node,
                         name,
-                        ctx.scope,
+                        ctx,
                         ResolutionSiteKind::ValueDeclaration,
                         ResolutionNamespace::Value,
                         ResolutionBinderKind::Local,
@@ -622,7 +660,7 @@ pub fn produce<'s>(
                     p.declare(
                         name,
                         name,
-                        ctx.scope,
+                        ctx,
                         ResolutionSiteKind::ValueDeclaration,
                         ResolutionNamespace::Value,
                         ResolutionBinderKind::Local,
@@ -642,8 +680,11 @@ pub fn produce<'s>(
                 let name = node
                     .child_by_field_name("name")
                     .expect("extern alias has a name");
+                let Some(name) = p.name(name) else {
+                    p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+                    continue;
+                };
                 let site = p.site(node, ctx.scope, ResolutionSiteKind::ImportDeclaration);
-                let name = p.name(name);
                 p.facts.extern_aliases.push(ResolutionExternAliasFact {
                     site,
                     scope: ctx.scope,
@@ -675,11 +716,9 @@ pub fn produce<'s>(
                 if !p.claimed.contains(&node.id()) =>
             {
                 if node.kind() == "member_access_expression"
-                    && node
-                        .child_by_field_name("expression")
-                        .is_some_and(|receiver| matches!(receiver.kind(), "this" | "base"))
+                    && p.member_expression(node, ctx).is_some()
                 {
-                    p.instance_member(node, ctx);
+                    // The expression publisher claimed its exact member spine.
                 } else if p.path(node).is_some() {
                     p.reference_path(node, ctx);
                 } else {
@@ -1088,7 +1127,8 @@ impl Producer<'_, '_> {
         span_is_contained(&self.excluded, node.start_byte(), node.end_byte())
     }
 
-    fn name(&mut self, node: Node<'_>) -> ResolutionNameId {
+    /// A MISSING or zero-width identifier has no spelling and so no name.
+    fn name(&mut self, node: Node<'_>) -> Option<ResolutionNameId> {
         let spelling = names::spelling(node, self.source);
         self.facts.intern_name(&mut self.names, &spelling)
     }
@@ -1137,11 +1177,12 @@ impl Producer<'_, '_> {
         &mut self,
         node: Node<'_>,
         name: Node<'_>,
-        scope: ResolutionScopeId,
+        ctx: Context,
         site_kind: ResolutionSiteKind,
         namespace: ResolutionNamespace,
         kind: ResolutionBinderKind,
     ) -> ResolutionSiteId {
+        let scope = ctx.scope;
         let site = self.site(name, scope, site_kind);
         let spelling = if site_kind == ResolutionSiteKind::TypeDeclaration
             && node.kind() != "type_parameter"
@@ -1150,7 +1191,10 @@ impl Producer<'_, '_> {
         } else {
             crate::syntax::csharp_lookup_identifier(csharp_identifier_text(name, self.source))
         };
-        let name_id = self.facts.intern_name(&mut self.names, &spelling);
+        let Some(name_id) = self.facts.intern_name(&mut self.names, &spelling) else {
+            self.facts.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return site;
+        };
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name: name_id,
@@ -1236,25 +1280,7 @@ impl Producer<'_, '_> {
             && type_node.kind() != "implicit_type"
             && !self.is_excluded(type_node)
         {
-            let slot = self.declared_type(
-                type_node,
-                Context {
-                    scope,
-                    package: {
-                        let mut package = scope;
-                        while !self.namespace_paths.contains_key(&package) {
-                            package = self
-                                .facts
-                                .scope(package)
-                                .parent
-                                .expect("lexical scope reaches package");
-                        }
-                        package
-                    },
-                    owner: None,
-                    type_parameters: None,
-                },
-            );
+            let slot = self.declared_type(type_node, ctx);
             self.attach_declared_type(site, slot, type_node, role);
         }
         if (site_kind == ResolutionSiteKind::TypeDeclaration && node.kind() != "type_parameter")
@@ -1327,6 +1353,9 @@ impl Producer<'_, '_> {
         use brokk_bifrost_core::analyzer::model::DeclarationKind;
         let lexical_kind = match kind {
             ResolutionBinderKind::Parameter => Some(DeclarationKind::Parameter),
+            ResolutionBinderKind::Type if node.kind() == "type_parameter" => {
+                Some(DeclarationKind::Parameter)
+            }
             ResolutionBinderKind::Pattern => Some(DeclarationKind::PatternVariable),
             ResolutionBinderKind::Local => Some(DeclarationKind::LocalVariable),
             ResolutionBinderKind::Callable if node.kind() == "local_function_statement" => {
@@ -1669,5 +1698,69 @@ mod grammar_boundary {
         assert_eq!(parameters, [("identifier", "from")]);
         assert_eq!(variables, [("identifier", "var")]);
         assert_eq!(references, [("identifier", "from"), ("identifier", "var")]);
+    }
+}
+
+#[cfg(test)]
+mod missing_names {
+    use super::*;
+    use brokk_bifrost_core::analyzer::ProjectFile;
+
+    /// A MISSING or zero-width identifier leaves a gap and no empty spelling
+    /// (C# counterpart of Rust's `missing_names_leave_gaps_not_empty_spellings`,
+    /// #4286). A malformed type path projects no type at all: its last named
+    /// part is a prefix, not the declared type.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: a MISSING type-path part made `A.<int> f` project f's type as A"
+    )]
+    fn missing_names_leave_gaps_not_empty_spellings() {
+        let mut saw_missing = false;
+        for source in [
+            "namespace { class C {} }\n",
+            "namespace A. { class C {} }\n",
+            "extern alias ;\n",
+            "class C { A. f; }\n",
+            "class C { A.<int> f; }\n",
+        ] {
+            let (tree, scan) = crate::preprocessor::parse_csharp_scanned(source).expect("C# tree");
+            saw_missing |= tree.root_node().to_sexp().contains("MISSING");
+            let file = ProjectFile::new(std::env::temp_dir(), "Fixture.cs");
+            let parsed = crate::declarations::parse_csharp_file_with_native_facts(
+                &file, source, &tree, &scan,
+            );
+            let facts = &parsed.resolution_facts;
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}"
+            );
+            assert!(
+                facts
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.kind == ResolutionGapKind::MalformedSyntax),
+                "the recovered tree keeps malformed-syntax evidence for {source:?}"
+            );
+            let prefix_sites = facts
+                .identifiers
+                .iter()
+                .filter(|identifier| {
+                    facts
+                        .names
+                        .iter()
+                        .any(|name| name.id == identifier.name && name.spelling == "A")
+                })
+                .map(|identifier| identifier.site)
+                .collect::<Vec<_>>();
+            assert!(
+                facts.binding_projections.iter().all(|projection| {
+                    projection.kind != BindingProjectionKind::TargetTypeIdentity
+                        || !prefix_sites.contains(&projection.reference)
+                }),
+                "no path prefix becomes the declared type for {source:?}: {:?}",
+                facts.binding_projections
+            );
+        }
+        assert!(saw_missing, "recovery inserts a MISSING node in this table");
     }
 }

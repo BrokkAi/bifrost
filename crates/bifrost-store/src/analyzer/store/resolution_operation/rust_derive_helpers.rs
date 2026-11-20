@@ -121,6 +121,7 @@ impl SelectedResolutionMountInventory<'_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn decide_derive_helpers(
         &self,
         reached: impl Iterator<Item = (u32, Option<u32>)>,

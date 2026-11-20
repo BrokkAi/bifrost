@@ -9,7 +9,8 @@ FROM {frontier} AS demand
 CROSS JOIN cr_reexports AS routes ON routes.module_path = demand.module_path {name_predicate}
 WHERE demand.crate_key = (SELECT crate_key FROM cr_identity)
   AND routes.visibility = 'public'
-  AND NOT EXISTS (SELECT 1 FROM cr_exports AS selected
+  -- Namespace-specific: stay on the primary key, not the gap probes' partial cr_exports_name index.
+  AND NOT EXISTS (SELECT 1 FROM cr_exports AS selected INDEXED BY sqlite_autoindex_cr_exports_1
                   WHERE selected.crate_key = demand.crate_key
                     AND selected.module_path = routes.module_path
                     AND selected.namespace = 'type' AND selected.name = routes.bound_name)

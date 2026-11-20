@@ -161,6 +161,15 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
     fn the_graph_authority_digest_separates_a_flipped_language_from_production() {
         struct StandInLegacyPass(EdgePassId);
         impl LanguageEdgePass for StandInLegacyPass {
+            // This fake has no source admission.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
             fn id(&self) -> EdgePassId {
                 self.0
             }

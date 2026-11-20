@@ -56,7 +56,7 @@ use brokk_bifrost_flow::type_flow::{FieldSlotIndex, FieldSlotIndexCache};
 use brokk_bifrost_flow::value_flow::ValueFlowCache;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, CompleteEmptyFromOperandZero, IntersectPrefixProduct, MergedUnitRows,
-    UnitExecutionResult, continue_empty_operand_zero, continue_intersect_prefix,
+    UnitExecutionResult, continue_selector_empty_operand_zero, continue_selector_intersect_prefix,
     execute_code_query_unit, execute_intersect_prefix, merge_unit_rows_in_scope, plan_seed_files,
     push_skipped_unit_diagnostic, push_unit_budget_diagnostic, remaining_unit_limits,
 };
@@ -193,10 +193,12 @@ impl UnitAttempt {
     }
 
     pub(crate) fn reused(&mut self) {
+        brokk_bifrost_core::profile_count!("units.reused", 1);
         self.reused = self.reused.saturating_add(1);
     }
 
     pub(crate) fn recomputed(&mut self) {
+        brokk_bifrost_core::profile_count!("units.recomputed", 1);
         self.recomputed = self.recomputed.saturating_add(1);
     }
 
@@ -207,6 +209,7 @@ impl UnitAttempt {
     }
 
     pub(crate) fn unbounded(&mut self) {
+        brokk_bifrost_core::profile_count!("units.unbounded", 1);
         self.unbounded = self.unbounded.saturating_add(1);
     }
 
@@ -462,6 +465,10 @@ impl<'a> UnitReuse<'a> {
         keys: &[PolicyUnitKey],
         row_node_count: Option<usize>,
     ) -> Result<(), WidenReason> {
+        brokk_bifrost_core::profile_count!(
+            "units.prefetched",
+            u64::try_from(keys.len()).expect("unit key count fits u64")
+        );
         let started = Instant::now();
         let loaded = self
             .incremental
@@ -580,6 +587,7 @@ impl<'a> UnitReuse<'a> {
                 return Ok(None);
             }
         };
+        brokk_bifrost_core::profile_count!("units.verified", 1);
         match verify_read_set_for_artifact(
             artifact,
             self.incremental.workspace(),
@@ -978,6 +986,9 @@ pub(crate) struct UnitQueryExecution<'a> {
     /// execution is shared with. A unit it serves replays the reads of the
     /// execution that produced it, so it publishes under the same ledger.
     pub(crate) subject_batch: Option<&'a SubjectQueryBatch<'a>>,
+    /// The batch identity of this policy's guard-barrier configuration, so a
+    /// guarded policy's unit products never mix with an unguarded policy's.
+    pub(crate) guard_identity: Option<String>,
 }
 
 /// The seed file one query unit covers, as a partition spelling needs it.
@@ -1559,6 +1570,10 @@ impl UnitSlice for OperandProbeSlice<'_> {
                         message: "test-injected incomplete operand probe".to_string(),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+                        step_index: None,
+                        step_op: None,
+                        no_rows_reason: None,
+                        cause_codes: Vec::new(),
                     },
                 ));
             rows.completion =
@@ -1804,7 +1819,7 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
     }
 
     fn suffix(&self, products: Self::Merged, _skipped: usize) -> Self::Output {
-        continue_intersect_prefix(
+        continue_selector_intersect_prefix(
             self.execution.analyzer,
             self.execution.flow_state.clone(),
             self.execution.workspace,
@@ -2116,7 +2131,7 @@ pub(crate) fn sliced_query_units(
                 .analyzer
                 .test_hooks()
                 .record_empty_operand_probe_shortcut_for_test();
-            let merged = continue_empty_operand_zero(
+            let merged = continue_selector_empty_operand_zero(
                 execution.analyzer,
                 execution.flow_state.clone(),
                 execution.workspace,
@@ -2250,12 +2265,13 @@ pub(crate) fn sliced_query_units(
         execution,
         execute: |(file, remaining)| {
             let shared = execution.subject_batch.and_then(|batch| {
-                batch.query_units(
+                batch.query_units_with_guards(
                     query,
                     execution.analyzer,
                     execution.workspace,
                     remaining,
                     execution.depth_opt_in,
+                    execution.guard_identity.clone(),
                 )
             });
             let execute = || {
@@ -2382,6 +2398,7 @@ mod cache_fill_tests {
             depth_opt_in: false,
             workspace_files: &files,
             subject_batch: None,
+            guard_identity: None,
         };
         for name in [
             "FileQuerySlice",
@@ -2520,6 +2537,7 @@ mod cache_fill_tests {
                 depth_opt_in: false,
                 workspace_files: &files,
                 subject_batch: None,
+                guard_identity: None,
             };
             let _outer = AnalyzerQueryScope::new(analyzer);
             let execute = |(seed, allowance): (&ProjectFile, CodeQueryExecutionLimits)| {
@@ -2595,6 +2613,7 @@ mod cache_fill_tests {
     }
 
     #[test]
+    #[hardwon("#12410: provider call-path coverage could authorize unit replay as Content")]
     fn merged_union_rows_reach_the_root_result_cap_across_seed_files() {
         use brokk_bifrost_analysis::CodeUnitIndex;
         use brokk_bifrost_rql::structural::search::MergedLimit;
@@ -2631,6 +2650,44 @@ mod cache_fill_tests {
                     "both branch rows remain until the shared merge"
                 );
                 assert!(check_exhaustive_rows(&rows).is_ok());
+                let mut provider_rows = rows.clone();
+                provider_rows
+                    .diagnostics
+                    .push(brokk_bifrost_rql::CodeQueryDiagnostic::new(
+                        brokk_bifrost_rql::CodeQueryDiagnostic {
+                            has_non_utf8_refusal: false,
+                            refusal_sites: Default::default(),
+                            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+                                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                            ),
+                            code:
+                                brokk_bifrost_rql::CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                            impact: brokk_bifrost_rql::CodeQueryDiagnosticImpact::Incomplete,
+                            language: "rust",
+                            message: "call-reachability provider coverage".into(),
+                            exhausted_roots: Vec::new(),
+                            withheld_rows_path: None,
+                            step_index: None,
+                            step_op: None,
+                            no_rows_reason: None,
+                            cause_codes: Vec::new(),
+                            branch: Vec::new(),
+                            related: Vec::new(),
+                            source: None,
+                            call_relation_facts: None,
+                            uses_omissions: Vec::new(),
+                        },
+                    ));
+                assert!(matches!(
+                    check_exhaustive_rows(&provider_rows),
+                    Err(WidenReason::UnitDiagnostics)
+                ));
+                let replay: UnitExecutionResult =
+                    serde_json::from_str(&serde_json::to_string(&provider_rows).unwrap()).unwrap();
+                assert!(matches!(
+                    check_exhaustive_rows(&replay),
+                    Err(WidenReason::UnitDiagnostics)
+                ));
                 rows
             })
             .collect::<Vec<_>>();
@@ -3209,6 +3266,7 @@ mod field_slot_verification_tests {
             depth_opt_in: true,
             workspace_files: &files,
             subject_batch: None,
+            guard_identity: None,
         };
         let mut reuse = UnitReuse::new(policy, &context, &budget, &flow);
         let mut attempt = UnitAttempt::default();
@@ -3314,6 +3372,7 @@ mod field_slot_verification_tests {
             depth_opt_in: false,
             workspace_files: &files,
             subject_batch: None,
+            guard_identity: None,
         };
         let mut reuse = UnitReuse::new(policy, &context, &budget, &flow);
         let mut attempt = UnitAttempt::default();

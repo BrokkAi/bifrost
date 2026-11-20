@@ -18,17 +18,16 @@ pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
 // Native Go/JVM/Rust point and receiver calibration used at most 147 rounds.
 // Four times that maximum, rounded up to a power of two, is 1024.
 pub const DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS: usize = 1_024;
-pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
-pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS: usize = DEFAULT_RECEIVER_MAX_SCOPE_NODES;
+pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS: usize = 20_000;
 /// Session allowance for C3 hierarchy-order work: cold order steps plus the order cost charged when
-/// a relation is replayed into a later consumer. Each preset uses its own scope allowance, the
-/// allowance order work shared before it had its own axis (#8704). On Django (2026-11-01) no
+/// a relation is replayed into a later consumer. It started as the scope allowance, which order work
+/// shared before it had its own axis (#8704). On Django (2026-11-01) no
 /// session stopped on this axis and the highest observed admitted use was 51% of an allowance, so
 /// the rule leaves headroom there; it is not shown to be optimal. Sessions stopped on other axes
 /// remain censored observations. Replay pressure was not exercised by that corpus, and the Go
 /// definition budget follows the rule without measurement. RQL does not use this rule: its fact
 /// budget gives order work only what scope and summary leave.
-pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK: usize = DEFAULT_RECEIVER_MAX_SCOPE_NODES;
+pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK: usize = 20_000;
 
 /// Budget for one interactive `get_type_by_location` request.
 ///
@@ -43,7 +42,6 @@ pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnaly
     max_targets: 32,
     max_summary_expansions: 256,
     max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
-    max_scope_nodes: 200_000,
     max_hierarchy_order_work: 200_000,
     max_hierarchy_order_steps: 200_000,
 };
@@ -254,7 +252,6 @@ pub struct ReceiverAnalysisBudget {
     pub max_summary_expansions: usize,
     /// Typed convergence and lexical frontier iterations within one query.
     pub max_resolution_rounds: usize,
-    pub max_scope_nodes: usize,
     pub max_hierarchy_order_work: usize,
     /// Optional hierarchy discharge ordering; exhaustion never stops aggregate resolution.
     pub max_hierarchy_order_steps: usize,
@@ -267,7 +264,6 @@ impl Default for ReceiverAnalysisBudget {
             max_targets: DEFAULT_RECEIVER_MAX_TARGETS,
             max_summary_expansions: DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS,
             max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
-            max_scope_nodes: DEFAULT_RECEIVER_MAX_SCOPE_NODES,
             max_hierarchy_order_work: DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK,
             max_hierarchy_order_steps: DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS,
         }
@@ -282,14 +278,12 @@ impl ReceiverAnalysisBudget {
             max_targets,
             max_summary_expansions,
             max_resolution_rounds,
-            max_scope_nodes,
             max_hierarchy_order_work,
             max_hierarchy_order_steps,
         } = *self;
         Self {
             context_depth,
             max_targets,
-            max_scope_nodes: max_scope_nodes.saturating_sub(work.scope_nodes),
             max_summary_expansions: max_summary_expansions.saturating_sub(work.summary_expansions),
             max_resolution_rounds: max_resolution_rounds.saturating_sub(work.resolution_rounds),
             max_hierarchy_order_work: max_hierarchy_order_work
@@ -305,7 +299,6 @@ impl ReceiverAnalysisBudget {
             max_targets: 1,
             max_summary_expansions: 1,
             max_resolution_rounds: 1,
-            max_scope_nodes: 1,
             max_hierarchy_order_work: 1,
             max_hierarchy_order_steps: 1,
         }
@@ -362,7 +355,6 @@ pub struct ReceiverAnalysisCacheKey {
     pub max_targets: usize,
     pub max_summary_expansions: usize,
     pub max_resolution_rounds: usize,
-    pub max_scope_nodes: usize,
     pub max_hierarchy_order_work: usize,
     pub max_hierarchy_order_steps: usize,
 }
@@ -383,7 +375,6 @@ impl ReceiverAnalysisCacheKey {
             max_targets: query.budget.max_targets,
             max_summary_expansions: query.budget.max_summary_expansions,
             max_resolution_rounds: query.budget.max_resolution_rounds,
-            max_scope_nodes: query.budget.max_scope_nodes,
             max_hierarchy_order_work: query.budget.max_hierarchy_order_work,
             max_hierarchy_order_steps: query.budget.max_hierarchy_order_steps,
         }
@@ -556,19 +547,9 @@ impl ReceiverAnalysisBudgetTracker {
         }
     }
 
-    pub fn record_scope_node(&mut self) -> Result<(), ReceiverBudgetLimit> {
+    /// Counts one scope node. Visiting syntax is work and never refuses (#13216).
+    pub fn record_scope_node(&mut self) {
         self.scope_nodes += 1;
-        if let Err(refused) = crate::analyzer::work_budget::LimitedCounter::from_usage(
-            self.scope_nodes,
-            self.budget.max_scope_nodes,
-        )
-        .try_allow(0)
-        {
-            self.reuse.join_in(refused.reuse_verdict());
-            Err(ReceiverBudgetLimit::ScopeNodes)
-        } else {
-            Ok(())
-        }
     }
 
     pub fn work(&self) -> ReceiverAnalysisWork {
@@ -610,7 +591,8 @@ impl CarriesReuseVerdict for ReceiverAnalysisBudgetTracker {
 pub enum ReceiverBudgetLimit {
     SummaryExpansions,
     ResolutionRounds,
-    ScopeNodes,
+    /// Retained semantic rows or text outgrew the resident admission limits.
+    ResidentRows,
     HierarchyOrderSteps,
     TotalWork,
 }
@@ -620,7 +602,7 @@ impl ReceiverBudgetLimit {
         match self {
             ReceiverBudgetLimit::SummaryExpansions => "summary_expansions",
             ReceiverBudgetLimit::ResolutionRounds => "resolution_rounds",
-            ReceiverBudgetLimit::ScopeNodes => "scope_nodes",
+            ReceiverBudgetLimit::ResidentRows => "resident_rows",
             ReceiverBudgetLimit::HierarchyOrderSteps => "hierarchy_order_steps",
             ReceiverBudgetLimit::TotalWork => "total_work",
         }
@@ -689,20 +671,17 @@ impl ReceiverFileFacts {
 
 /// What preparing one file for receiver queries produced, or why it produced nothing.
 ///
-/// The three failure shapes are distinct observable outcomes, not degrees of one: an
-/// unparseable file is reported as unsupported, an oversized one charges its partial
-/// traversal and reports a budget limit, and a cancelled one aborts the query.
+/// The failure shapes are distinct observable outcomes, not degrees of one: an
+/// unparseable file is reported as unsupported, and a cancelled one aborts the query.
+/// A large file is not a failure: setup visits every node it needs.
 pub enum ReceiverFileSetup {
     Ready {
         tree: tree_sitter::Tree,
         facts: ReceiverFileFacts,
-        /// Nodes the setup traversal visited, charged against the query's scope budget.
+        /// Nodes the setup traversal visited, reported as setup work.
         visited: usize,
     },
     ParseFailed,
-    ExceededScope {
-        visited: usize,
-    },
     Cancelled,
 }
 
@@ -710,7 +689,6 @@ pub struct ReceiverFileCtx<'a> {
     pub file: &'a ProjectFile,
     pub language: Language,
     pub source: &'a str,
-    pub max_scope_nodes: usize,
     pub cancellation: Option<&'a CancellationToken>,
 }
 

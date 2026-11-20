@@ -150,13 +150,13 @@ pub fn publish(root: &Path, digest: &str, bytes: &[u8]) -> Result<(PathBuf, bool
     Ok((relative, true))
 }
 
+/// Enforce the digest-derived object path and no-symlink storage policy.
 #[doc(hidden)]
-pub fn read(
+pub fn validate_object_path(
     root: &Path,
     relative: &str,
     digest: &str,
-    stored_size: u64,
-) -> Result<Vec<u8>, CatalogError> {
+) -> Result<PathBuf, CatalogError> {
     validate_digest(digest)?;
     let expected = relative_object_path(digest);
     if Path::new(relative) != expected {
@@ -171,6 +171,17 @@ pub fn read(
             .expect("digest object path always has a prefix directory"),
     )?;
     reject_symlink(&path, "catalog object")?;
+    Ok(path)
+}
+
+#[doc(hidden)]
+pub fn read(
+    root: &Path,
+    relative: &str,
+    digest: &str,
+    stored_size: u64,
+) -> Result<Vec<u8>, CatalogError> {
+    let path = validate_object_path(root, relative, digest)?;
     verify(&path, digest, stored_size)?;
     let mut bytes = Vec::with_capacity(
         usize::try_from(stored_size)

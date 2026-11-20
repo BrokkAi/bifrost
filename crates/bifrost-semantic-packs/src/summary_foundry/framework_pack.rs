@@ -410,6 +410,7 @@ impl PackIdentity {
                 ecosystem: "jdk".to_owned(),
                 pinned: true,
                 activation: ActivationSelector {
+                    production_input_digest: None,
                     package: None,
                     module: None,
                     toolchain: Some(NameSelector {
@@ -451,6 +452,7 @@ impl PackIdentity {
             // a faked pin.
             pinned: false,
             activation: ActivationSelector {
+                production_input_digest: None,
                 package: Some(NameSelector {
                     name: package_name,
                     version: Some(version),

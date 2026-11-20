@@ -135,6 +135,10 @@ fn report(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 

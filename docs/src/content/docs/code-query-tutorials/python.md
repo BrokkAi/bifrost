@@ -1906,6 +1906,29 @@ The broad shape “call named `post`” finds both calls. Adding `receiver`, ord
       "selector_proof": "derived",
       "semantic_target_id": "<public-id>",
       "signature_id": "<public-id>",
+      "site": {
+        "role": {
+          "index": 0,
+          "kind": "argument"
+        },
+        "site": {
+          "end_byte": 395,
+          "end_column": 17,
+          "end_line": 21,
+          "kind": "source",
+          "path": "python/app.py",
+          "start_byte": 387,
+          "start_column": 9,
+          "start_line": 21,
+          "text": "object()"
+        },
+        "value": {
+          "cause": {
+            "kind": "not_constant"
+          },
+          "kind": "unknown"
+        }
+      },
       "site_ast_id": "<public-id>",
       "site_id": "<public-id>",
       "target": {

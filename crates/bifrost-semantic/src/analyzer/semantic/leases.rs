@@ -612,6 +612,33 @@ mod replay_fit_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#14365: optional index capacity misses poisoned semantic lease windows"
+    )]
+    fn optional_reservations_leave_capacity_misses_recoverable() {
+        let mut child = SemanticArtifactLeaseSet::new(100).snapshot().into_child();
+        let window = child.begin_window(0);
+        assert!(window.try_reserve_other_live_bytes(101).is_err());
+        assert!(window.overflow().is_none());
+        let reservation = window.try_reserve_other_live_bytes(100).expect("exact fit");
+        assert!(window.try_reserve_other_live_bytes(1).is_err());
+        assert!(window.overflow().is_none());
+        drop(reservation);
+        drop(
+            window
+                .try_reserve_other_live_bytes(100)
+                .expect("headroom refunded"),
+        );
+        assert!(window.reserve_other_live_bytes(101).is_err());
+        assert!(
+            window.overflow().is_some(),
+            "mandatory admission still latches failure"
+        );
+        drop(window);
+        drop(child.into_charge());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#8389: cached root bytes exceeded the retained cap without another solve"
     )]
     fn replay_bytes_fit_matches_window_admission() {
@@ -696,34 +723,31 @@ impl SemanticArtifactLeaseWindow {
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        let state = &mut *guard;
-        let other_live_bytes = state.other_live_bytes;
-        let open = state.open_for_handle();
-        if let Some(error) = open.overflow {
+        if let Err(error) = guard.try_reserve_other_live_bytes(additional_bytes) {
+            guard.open_for_handle().overflow = Some(error);
             return Err(error);
         }
-        let next_other_live_bytes = match other_live_bytes.checked_add(additional_bytes) {
-            Some(bytes) => bytes,
-            None => {
-                open.overflow = Some(SemanticArtifactLeaseError::RetainedBytesOverflow);
-                return Err(SemanticArtifactLeaseError::RetainedBytesOverflow);
-            }
-        };
-        if let Err(error) = check_retained_capacity(
-            [&open.base.storage, open.promoted.as_ref(), &open.staged],
-            next_other_live_bytes,
-            open.max_retained_bytes,
-        ) {
-            open.overflow = Some(error);
-            return Err(error);
-        }
-        let next_active_live_reservations = state
-            .active_live_reservations
-            .checked_add(1)
-            .expect("semantic lease live-reservation count fits usize");
-        state.other_live_bytes = next_other_live_bytes;
-        state.active_live_reservations = next_active_live_reservations;
         drop(guard);
+        Ok(SemanticArtifactLeaseLiveReservation {
+            state: Arc::clone(&self.state),
+            reserved_bytes: additional_bytes,
+            release_on_drop: true,
+        })
+    }
+
+    /// Reserve optional acceleration metadata without latching a capacity
+    /// miss as a window failure. An earlier mandatory failure is preserved.
+    /// Callers can recompute without the allocation when this returns an error.
+    pub fn try_reserve_other_live_bytes(
+        &self,
+        additional_bytes: usize,
+    ) -> Result<SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("semantic artifact lease window mutex poisoned");
+        state.try_reserve_other_live_bytes(additional_bytes)?;
+        drop(state);
         Ok(SemanticArtifactLeaseLiveReservation {
             state: Arc::clone(&self.state),
             reserved_bytes: additional_bytes,
@@ -929,6 +953,32 @@ struct OpenWindow {
 }
 
 impl LeaseWindowState {
+    fn try_reserve_other_live_bytes(
+        &mut self,
+        additional_bytes: usize,
+    ) -> Result<(), SemanticArtifactLeaseError> {
+        let other_live_bytes = self.other_live_bytes;
+        let open = self.open_for_handle();
+        if let Some(error) = open.overflow {
+            return Err(error);
+        }
+        let next_other_live_bytes = other_live_bytes
+            .checked_add(additional_bytes)
+            .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)?;
+        check_retained_capacity(
+            [&open.base.storage, open.promoted.as_ref(), &open.staged],
+            next_other_live_bytes,
+            open.max_retained_bytes,
+        )?;
+        let next_active_live_reservations = self
+            .active_live_reservations
+            .checked_add(1)
+            .expect("semantic lease live-reservation count fits usize");
+        self.other_live_bytes = next_other_live_bytes;
+        self.active_live_reservations = next_active_live_reservations;
+        Ok(())
+    }
+
     /// The open window behind a live `SemanticArtifactLeaseWindow`. Only
     /// `commit`, `discard` and the handle's `Drop` close the window, and each
     /// consumes the handle, so a handle method always finds it open.

@@ -85,7 +85,10 @@ pub(crate) mod jvm_extraction_tests {
         use brokk_bifrost_analysis::analyzer::resolution::lower_resolution_facts_for_selection;
         use brokk_bifrost_core::analyzer::resolution_facts::ResolutionImportRouteKind;
 
-        let source = "package use; import dep.Target; import decoy.*; import static util.Holder.Target; import static util.Holder.*; class Use { Target field; Other other; }";
+        // JLS 7.5.3 rejects a single-static import of a type whose simple name
+        // a single-type import also binds, so the static import publishes its
+        // own name. That keeps the fixture valid and exercises all four routes.
+        let source = "package use; import dep.Target; import decoy.*; import static util.Holder.StaticTarget; import static util.Holder.*; class Use { Target field; Other other; StaticTarget third; }";
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
             .file(JAVA_ROOT_CONSUMER_PATH, source)
             .build();

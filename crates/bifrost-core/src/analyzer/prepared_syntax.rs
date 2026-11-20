@@ -104,10 +104,11 @@ pub enum PreparedSourceOrigin {
 pub struct PreparedSyntaxTree {
     source: PreparedSyntaxSource,
     source_sha256: OnceLock<[u8; 32]>,
+    source_oid: OnceLock<git2::Oid>,
     parse_variant: crate::gitblob::ParseVariant,
     #[cfg(debug_assertions)]
     source_key: (usize, usize),
-    tree: Tree,
+    tree: Arc<Tree>,
     preprocessor: Option<Arc<dyn SourcePreprocessor>>,
     line_starts: Vec<usize>,
     dialect: LanguageDialect,
@@ -135,10 +136,11 @@ impl PreparedSyntaxTree {
         Self {
             source,
             source_sha256: OnceLock::new(),
+            source_oid: OnceLock::new(),
             parse_variant: crate::gitblob::ParseVariant::Empty,
             #[cfg(debug_assertions)]
             source_key,
-            tree,
+            tree: Arc::new(tree),
             preprocessor: None,
             line_starts,
             dialect,
@@ -180,6 +182,22 @@ impl PreparedSyntaxTree {
     /// SHA-256 of the exact immutable source bytes, computed once per prepared
     /// snapshot. Revalidating several nodes must not rehash the whole file.
     pub fn source_sha256(&self) -> [u8; 32] {
+        self.assert_source_backing();
+        *self
+            .source_sha256
+            .get_or_init(|| crate::analyzer::canonical_hash::sha256_bytes(self.source().as_bytes()))
+    }
+
+    /// Content identity of the exact prepared bytes, computed once per backing.
+    pub fn source_oid(&self) -> git2::Oid {
+        self.assert_source_backing();
+        *self.source_oid.get_or_init(|| {
+            git2::Oid::hash_object(git2::ObjectType::Blob, self.source().as_bytes())
+                .expect("hashing an in-memory source blob")
+        })
+    }
+
+    fn assert_source_backing(&self) {
         #[cfg(debug_assertions)]
         {
             let source = self.source();
@@ -190,9 +208,6 @@ impl PreparedSyntaxTree {
                 "prepared source backing must stay immutable"
             );
         }
-        *self
-            .source_sha256
-            .get_or_init(|| crate::analyzer::canonical_hash::sha256_bytes(self.source().as_bytes()))
     }
 
     /// Which backing this tree was prepared from. An `Exact` snapshot carries
@@ -204,6 +219,12 @@ impl PreparedSyntaxTree {
 
     pub fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    /// Share this exact tree, including its root identity. Tree::clone makes
+    /// a new root and cannot share an inventory indexed by root node IDs.
+    pub fn shared_tree(&self) -> Arc<Tree> {
+        Arc::clone(&self.tree)
     }
 
     pub fn declaration_node(&self, code_unit: &CodeUnit) -> Option<Node<'_>> {

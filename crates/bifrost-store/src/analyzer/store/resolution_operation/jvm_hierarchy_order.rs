@@ -2,13 +2,13 @@
 //!
 //! This policy reads only structured edge kinds, ordinal heads and shared tail
 //! membership. The driver owns expansion, deduplication and cancellation.
+use crate::analyzer::resolution::ClassifiedSupertypeKind;
 use crate::analyzer::resolution::{
     HierarchyLinearizationPolicy, HierarchyOrderBudget, HierarchyOrderDecision,
     HierarchyOrderFrontier, HierarchyOrderPolicyId, HierarchySequenceRole, HierarchyTailMembership,
     ResolutionCompletion,
 };
 use crate::analyzer::store::Result as StoreResult;
-use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind;
 
 #[derive(Debug)]
 pub(super) struct JvmDeclaredOrder;
@@ -32,13 +32,7 @@ impl HierarchyLinearizationPolicy for JvmDeclaredOrder {
         let mut candidates = frontier.heads.iter().collect::<Vec<_>>();
         candidates.sort_by_key(|head| match head.role {
             HierarchySequenceRole::Base { kind, ordinal, .. } => (
-                match kind {
-                    Some(
-                        ResolutionSupertypeKind::Superclass
-                        | ResolutionSupertypeKind::ImplicitSuperclass,
-                    ) => 0,
-                    _ => 1,
-                },
+                kind.map_or(1, ClassifiedSupertypeKind::nominal_order_tier),
                 ordinal,
             ),
             HierarchySequenceRole::DeclaredBases => (2, 0),

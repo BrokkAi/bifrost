@@ -689,6 +689,7 @@ pub(crate) mod tests {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().expect("version"),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -699,7 +700,8 @@ pub(crate) mod tests {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),

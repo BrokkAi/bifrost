@@ -101,6 +101,134 @@ fn timing_enabled(value: Option<&OsStr>) -> bool {
     )
 }
 
+/// Whether the named counters are on: `BIFROST_COUNTERS` is set to anything but
+/// an off spelling (see [`timing_enabled`]: empty, 0, false, off) AND
+/// `BIFROST_SQL_PROFILE` is set, because the request record of the SQL profile
+/// is the only output. Read once per process. A disabled call site costs one
+/// `OnceLock` read.
+pub fn counters_enabled() -> bool {
+    #[cfg(test)]
+    if FORCE_COUNTERS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        timing_enabled(env::var_os("BIFROST_COUNTERS").as_deref())
+            && env::var_os(crate::cache_db::sql_profile::PROFILE_PATH_ENV).is_some()
+    })
+}
+
+/// The test seam for [`counters_enabled`], whose environment read is kept for
+/// the process.
+#[cfg(test)]
+pub(crate) static FORCE_COUNTERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One named counter. Declare it with [`profile_count!`]; it registers itself
+/// on its first counted event and never takes a lock after that.
+pub struct CounterSite {
+    name: &'static str,
+    value: std::sync::atomic::AtomicU64,
+    registered: std::sync::Once,
+}
+
+static COUNTER_SITES: std::sync::Mutex<Vec<&'static CounterSite>> =
+    std::sync::Mutex::new(Vec::new());
+
+impl CounterSite {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            value: std::sync::atomic::AtomicU64::new(0),
+            registered: std::sync::Once::new(),
+        }
+    }
+
+    pub fn add(&'static self, count: u64) {
+        if !counters_enabled() {
+            return;
+        }
+        self.registered.call_once(|| {
+            COUNTER_SITES
+                .lock()
+                .expect("counter registry poisoned")
+                .push(self);
+        });
+        self.value
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Add `$n` to the process-wide counter `$name` (a `&'static str`, dotted).
+/// Profiling only: never an input to an answer, admission or identity.
+#[macro_export]
+macro_rules! profile_count {
+    ($name:expr, $n:expr) => {{
+        static SITE: $crate::profiling::CounterSite = $crate::profiling::CounterSite::new($name);
+        SITE.add($n);
+    }};
+}
+
+/// Add `count` to the counter `<prefix>.<label>`, for a counter family whose
+/// label is picked at run time from a closed set of static labels, such as a
+/// lookup kind's stable label. While counters are on, each event takes one
+/// lock; each distinct name allocates one site once. Profiling only.
+pub fn profile_count_labeled(prefix: &'static str, label: &'static str, count: u64) {
+    type LabeledSite = (&'static str, &'static str, &'static CounterSite);
+    static SITES: std::sync::Mutex<Vec<LabeledSite>> = std::sync::Mutex::new(Vec::new());
+    if !counters_enabled() {
+        return;
+    }
+    let site = {
+        let mut sites = SITES.lock().expect("labeled counter registry poisoned");
+        match sites
+            .iter()
+            .find(|(site_prefix, site_label, _)| *site_prefix == prefix && *site_label == label)
+        {
+            Some((_, _, site)) => *site,
+            None => {
+                let name: &'static str = Box::leak(format!("{prefix}.{label}").into_boxed_str());
+                let site: &'static CounterSite = Box::leak(Box::new(CounterSite::new(name)));
+                sites.push((prefix, label, site));
+                site
+            }
+        }
+    };
+    site.add(count);
+}
+
+/// Every counter's current total, summed over the sites that share a name.
+/// `None` when counters are off.
+pub fn counters_snapshot() -> Option<std::collections::HashMap<&'static str, u64>> {
+    if !counters_enabled() {
+        return None;
+    }
+    let mut totals = std::collections::HashMap::new();
+    for site in COUNTER_SITES
+        .lock()
+        .expect("counter registry poisoned")
+        .iter()
+    {
+        *totals.entry(site.name).or_insert(0) +=
+            site.value.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(totals)
+}
+
+/// The nonzero growth of every counter between two [`counters_snapshot`]s.
+pub fn counters_delta(
+    before: &std::collections::HashMap<&'static str, u64>,
+    after: &std::collections::HashMap<&'static str, u64>,
+) -> std::collections::BTreeMap<&'static str, u64> {
+    after
+        .iter()
+        .filter_map(|(&name, &total)| {
+            let delta = total - before.get(name).copied().unwrap_or(0);
+            (delta > 0).then_some((name, delta))
+        })
+        .collect()
+}
+
 pub fn note(label: impl AsRef<str>) {
     if !enabled() {
         return;

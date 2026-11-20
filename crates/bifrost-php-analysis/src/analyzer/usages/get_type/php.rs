@@ -234,7 +234,6 @@ function callIntersection(Left&Right $intersection): void {
                     source,
                     receiver,
                     ReceiverAnalysisBudget {
-                        max_scope_nodes: 100_000,
                         ..ReceiverAnalysisBudget::default()
                     },
                     None,
@@ -248,7 +247,6 @@ function callIntersection(Left&Right $intersection): void {
                 source,
                 receiver,
                 ReceiverAnalysisBudget {
-                    max_scope_nodes: 100_000,
                     ..ReceiverAnalysisBudget::default()
                 },
                 None,
@@ -280,7 +278,6 @@ function callIntersection(Left&Right $intersection): void {
                     &source,
                     &receiver_for_thread,
                     ReceiverAnalysisBudget {
-                        max_scope_nodes: 500_000,
                         max_summary_expansions: 2_000,
                         ..ReceiverAnalysisBudget::default()
                     },
@@ -300,11 +297,6 @@ namespace App;
 class Service { public function run(): void {} }
 function call(Service $service): void { $service->run(); }
 "#;
-
-        assert!(matches!(
-            resolve_receiver(source, "$service", ReceiverAnalysisBudget::tiny(), None),
-            BoundedResolution::Exceeded { .. }
-        ));
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
@@ -463,7 +455,6 @@ class Child extends Base {
                     source,
                     receiver,
                     ReceiverAnalysisBudget {
-                        max_scope_nodes: 100_000,
                         ..ReceiverAnalysisBudget::default()
                     },
                     None,

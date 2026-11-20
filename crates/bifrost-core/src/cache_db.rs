@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Once, OnceLock, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -141,6 +141,34 @@ pub fn test_connection_through_405() -> Connection {
     test_connection_through_migration(405)
 }
 
+/// #12385 M2: the migration that clears the JVM external projection, so providers
+/// keyed by their input artifact SHA re-project with method bounds. Tests name it
+/// through this constant so a renumber at landing moves one line.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const JVM_METHOD_BOUNDS_MIGRATION_VERSION: i64 = 489;
+
+/// Apply one registered migration's SQL to an open store, the step an upgrade across
+/// that migration takes. Lowering `user_version` instead would replay every later
+/// migration over a schema that already has them.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_apply_migration(conn: &Connection, version: i64) {
+    let migration = POST_BASELINE_MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == version)
+        .expect("registered cache migration");
+    conn.execute_batch(migration.sql)
+        .expect("apply registered migration");
+}
+
+/// Real prerequisite schema for receiver-proof codec upgrade/downgrade tests.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_connection_through_490() -> Connection {
+    test_connection_through_migration(490)
+}
+
 /// Pre-structural-trait-impl schema for populated admission upgrade tests.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -153,8 +181,40 @@ pub fn test_connection_before_structural_trait_impls() -> Connection {
     test_connection_through_migration(previous)
 }
 
+/// Registered predecessor of #12385's generic-surface migration. A store at
+/// this version holds JVM inventory rows without the generic-surface columns.
 #[cfg(any(test, feature = "test-support"))]
-fn test_connection_through_migration(version: i64) -> Connection {
+#[doc(hidden)]
+pub fn test_pre_jvm_generic_surfaces_migration_version() -> i64 {
+    let index = POST_BASELINE_MIGRATIONS
+        .iter()
+        .position(|migration| {
+            migration
+                .sql
+                .contains("-- #12385: project external JVM generic declarations")
+        })
+        .expect("registered JVM generic-surface migration");
+    POST_BASELINE_MIGRATIONS[index - 1].version
+}
+
+/// Registered predecessor of the JVM purge, the first of step 3d's two
+/// migrations. A store at this version has the generic-surface JVM columns.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_pre_lookup_question_shapes_migration_version() -> i64 {
+    let index = POST_BASELINE_MIGRATIONS
+        .iter()
+        .position(|migration| {
+            migration
+                .sql
+                .contains("-- #9559 step 3d rotates the jvm-external-projection identity.")
+        })
+        .expect("registered JVM purge migration");
+    POST_BASELINE_MIGRATIONS[index - 1].version
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_connection_through_migration(version: i64) -> Connection {
     disable_sqlite_memory_statistics();
     let mut conn = Connection::open_in_memory().expect("open test cache");
     configure_connection(&mut conn).expect("configure test cache");
@@ -952,6 +1012,108 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 460,
         sql: include_str!("../migrations/cache/0460-rust-structural-trait-impls.sql"),
     },
+    // COMPATIBLE: additive certificate and invalidation triggers. Older binaries never
+    // open this versioned file (filename plus TooFarAhead), so only this binary writes it.
+    CacheMigration {
+        version: 466,
+        sql: include_str!("../migrations/cache/0466-selected-set-completeness.sql"),
+    },
+    // Compatible: clear derived JVM rows under the rotated projection identity (#12445, #12245).
+    CacheMigration {
+        version: 467,
+        sql: include_str!("../migrations/cache/0467-clear-jvm-external-inventory.sql"),
+    },
+    // Compatible: shared lookup relaxation and JVM inventory generation.
+    CacheMigration {
+        version: 468,
+        sql: include_str!("../migrations/cache/0468-summary-lookup-question-shapes.sql"),
+    },
+    // Compatible additive: bounded-tree listing record; older certificates read as no record.
+    CacheMigration {
+        version: 469,
+        sql: include_str!("../migrations/cache/0469-rust-listing-bounded-tree.sql"),
+    },
+    // Compatible-additive: old readers ignore the counters; old writers fire
+    // the persistent invalidation triggers, including across shared-cache processes.
+    CacheMigration {
+        version: 480,
+        sql: include_str!("../migrations/cache/0480-workspace-selection-epochs.sql"),
+    },
+    // FINAL 0482 assigned after the pre-Ready master merge.
+    // Compatible: preserve facts; installed triggers also cover older writers.
+    CacheMigration {
+        version: 482,
+        sql: include_str!("../migrations/cache/0482-selected-publication-witnesses.sql"),
+    },
+    // COMPATIBLE: additive source-only rows, refreshed through the Rust salt.
+    CacheMigration {
+        version: 483,
+        sql: include_str!("../migrations/cache/0483-rust-macro-argument-keys.sql"),
+    },
+    // Stores that already applied 0467 still hold projections without method
+    // bounds, so M2 needs its own clear above that migration.
+    // #12385 M2; COMPATIBLE: clears a derived cache. JAR-route providers are
+    // keyed by input artifact SHA and are never re-projected, so this clear lets
+    // an upgraded store receive known bounds just like a fresh store. Clear
+    // publications first because inventory seal triggers guard the row deletes.
+    CacheMigration {
+        version: 489,
+        sql: include_str!("../migrations/cache/0489-jvm-external-method-bounds.sql"),
+    },
+    CacheMigration {
+        version: 490,
+        sql: include_str!("../migrations/cache/0490-implicit-root-candidates.sql"),
+    },
+    CacheMigration {
+        version: 491,
+        sql: include_str!("../migrations/cache/0491-selected-receiver-proof-reads.sql"),
+    },
+    // #7314: raw visibility accounting must exclude retired producer interiors.
+    CacheMigration {
+        version: 492,
+        sql: include_str!("../migrations/cache/0492-active-epoch-declaration-visibility.sql"),
+    },
+    // BREAKING: scoped JVM provider keys; user_version fences older readers.
+    CacheMigration {
+        version: 493,
+        sql: include_str!("../migrations/cache/0493-jvm-provider-aliases.sql"),
+    },
+    // BREAKING: old guard predicate decoders reject tags 11/12; versioned
+    // cache files and user_version fence old readers. The rebuild retains rows.
+    CacheMigration {
+        version: 496,
+        sql: include_str!("../migrations/cache/0496-guard-value-comparisons.sql"),
+    },
+    // Impl enclosing scopes and include invocations (#11183).
+    CacheMigration {
+        version: 500,
+        sql: include_str!("../migrations/cache/0500-rust-impl-scopes-and-include-invocations.sql"),
+    },
+    // Compatible additive actual-borrow columns (#13672); coordinated Ready migration.
+    CacheMigration {
+        version: 512,
+        sql: include_str!("../migrations/cache/0512-actual-borrow-columns.sql"),
+    },
+    // Compatible additive: nullable macro path columns; older boundaries read as uncertifiable.
+    CacheMigration {
+        version: 514,
+        sql: include_str!("../migrations/cache/0514-rust-census-macro-paths.sql"),
+    },
+    // BREAKING: creating-realization capture obligation, fenced by user_version.
+    CacheMigration {
+        version: 516,
+        sql: include_str!("../migrations/cache/0516-creating-realization-captures.sql"),
+    },
+    // BREAKING: versioned store files and user_version exclude older writers.
+    CacheMigration {
+        version: 517,
+        sql: include_str!("../migrations/cache/0517-rust-package-target-routes.sql"),
+    },
+    // BREAKING: function shapes carry the bound a closure parameter's type is read from.
+    CacheMigration {
+        version: 518,
+        sql: include_str!("../migrations/cache/0518-rust-function-shapes.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -977,8 +1139,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    157, 87, 106, 123, 20, 15, 91, 189, 214, 99, 232, 81, 97, 110, 50, 197, 170, 205, 244, 39, 123,
-    76, 71, 25, 223, 45, 62, 202, 201, 194, 160, 73,
+    49, 131, 217, 235, 16, 236, 53, 230, 48, 148, 205, 226, 75, 179, 219, 54, 232, 148, 26, 154,
+    156, 64, 129, 157, 132, 251, 161, 55, 166, 85, 9, 201,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -1207,13 +1369,197 @@ fn open_store_connection(
     role: ConnectionRole,
 ) -> rusqlite::Result<Connection> {
     disable_sqlite_memory_statistics();
-    let mut conn = Connection::open_with_flags(db_path, flags)?;
+    let mut conn = open_owned_sqlite(db_path, flags)?;
     if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
         register_seal_validation(&conn)?;
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
     }
     sql_profile::install(&conn, role);
     Ok(conn)
+}
+
+/// The SQLite databases this process has opened through [`open_owned_sqlite`]:
+/// analyzer stores and semantic-pack catalogs.
+///
+/// POSIX advisory locks belong to the process, and `close` on any descriptor
+/// of a file releases every lock the process holds on it. SQLite's WAL
+/// protocol keeps a read lock on `-shm` for the life of a connection, so one
+/// stray `open` and `close` of a live store file by this process (hashing it
+/// as a working-tree file, #13703) makes another process believe it is the
+/// last connection. It then recovers the WAL and unlinks `-wal` and `-shm`
+/// under this process's connection, which goes on writing to a deleted log.
+/// Code that opens files by path therefore asks [`is_open_store_file`] and
+/// leaves these files to SQLite. Hashing holds the read guard until its file
+/// is closed, and registration precedes opening SQLite under the write guard.
+///
+/// Entries are never removed on close: a connection is a plain `rusqlite`
+/// value with no close hook. The hazard runs one way only: an open connection
+/// whose files are missing from this registry. A stale entry for a closed
+/// store is harmless, because this process holds no locks on it and a cache
+/// database is never source. An entry whose database file no longer exists is
+/// ignored by queries and dropped at the next registration, so a reused inode
+/// cannot be skipped by mistake.
+static OPEN_STORES: RwLock<Vec<OpenStore>> = RwLock::new(Vec::new());
+
+struct OpenStore {
+    /// Canonical database path.
+    db: PathBuf,
+    /// File names of the database and each of its sidecars, the cheap first
+    /// test of [`is_open_store_file`].
+    file_names: Vec<std::ffi::OsString>,
+}
+
+/// Open a SQLite database that Bifrost owns and record it in [`OPEN_STORES`].
+/// Every analyzer-store and semantic-pack catalog connection opens here, so
+/// no live database of this process can be hashed or listed as a work-tree
+/// file (#13703).
+pub fn open_owned_sqlite(db_path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
+    // Resolve a not-yet-created database through its existing parent, including
+    // relative paths and symlinked directories, before SQLite creates it.
+    let absolute = std::path::absolute(db_path)
+        .map_err(|_| rusqlite::Error::InvalidPath(db_path.to_owned()))?;
+    let file_name = absolute
+        .file_name()
+        .ok_or_else(|| rusqlite::Error::InvalidPath(db_path.to_owned()))?;
+    let canonical = absolute
+        .canonicalize()
+        .or_else(|_| {
+            absolute
+                .parent()
+                .expect("an absolute database path has a parent")
+                .canonicalize()
+                .map(|parent| parent.join(file_name))
+        })
+        .map_err(|_| rusqlite::Error::InvalidPath(db_path.to_owned()))?;
+    // Wait for every hash that checked before registration to close its file.
+    // Keep the write guard through open so another registration cannot prune
+    // this entry before SQLite has created the database.
+    let mut stores = OPEN_STORES.write().expect("open store registry poisoned");
+    let added = register_open_store(&mut stores, &canonical);
+    let conn = Connection::open_with_flags(db_path, flags);
+    if added {
+        match &conn {
+            Err(_) => stores.retain(|store| store.db != canonical),
+            Ok(_) => {
+                // A dangling symlink resolves only once SQLite has created its
+                // target, so register the file SQLite actually opened. The
+                // write guard is still held, so no hash saw the interim name.
+                let opened = absolute
+                    .canonicalize()
+                    .expect("a database SQLite just opened exists");
+                if opened != canonical {
+                    stores.retain(|store| store.db != canonical);
+                    register_open_store(&mut stores, &opened);
+                }
+            }
+        }
+    }
+    conn
+}
+
+fn register_open_store(stores: &mut Vec<OpenStore>, canonical: &Path) -> bool {
+    stores.retain(|store| store.db.exists());
+    if stores.iter().any(|store| store.db == canonical) {
+        return false;
+    }
+    let file_names = STORE_FILE_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            store_file_with_suffix(canonical, suffix)
+                .file_name()
+                .expect("a canonical database path names a file")
+                .to_owned()
+        })
+        .collect();
+    stores.push(OpenStore {
+        db: canonical.to_owned(),
+        file_names,
+    });
+    true
+}
+
+/// A file's identity, so another spelling of a store file's path is still
+/// that file. Unix locks are per inode; elsewhere the canonical path stands in.
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = PathBuf;
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        path.canonicalize().ok()
+    }
+}
+
+/// Every file of every store this process has opened whose database still
+/// exists, as canonical paths: the database, `-wal`, `-shm` and `-journal` of
+/// each. Sidecars may not exist.
+pub fn open_store_file_paths() -> Vec<PathBuf> {
+    OPEN_STORES
+        .read()
+        .expect("open store registry poisoned")
+        .iter()
+        .filter(|store| store.db.exists())
+        .flat_map(|store| {
+            STORE_FILE_SUFFIXES
+                .iter()
+                .map(|suffix| store_file_with_suffix(&store.db, suffix))
+        })
+        .collect()
+}
+
+/// Whether `path` is the database, `-wal`, `-shm` or `-journal` of a store
+/// this process has opened.
+///
+/// The workspace walk asks this for every entry, so the first test is the file
+/// name under a shared lock, with no system call: a file whose name no open
+/// store's file has is not one. On a name match the file is compared by
+/// identity, so another spelling of the same path (a symlinked directory, a
+/// relative path) is recognized and a same-named file elsewhere is not. A hard
+/// link or symlink to a store file under a different name is not recognized;
+/// Bifrost never creates one.
+pub fn is_open_store_file(path: &Path) -> bool {
+    open_store_read_guard().is_open_store_file(path)
+}
+
+/// Keeps store registration excluded until a by-path read has closed its file.
+/// This borrows the same registry as the ordinary membership query.
+pub(crate) struct OpenStoreReadGuard(RwLockReadGuard<'static, Vec<OpenStore>>);
+
+pub(crate) fn open_store_read_guard() -> OpenStoreReadGuard {
+    OpenStoreReadGuard(OPEN_STORES.read().expect("open store registry poisoned"))
+}
+
+impl OpenStoreReadGuard {
+    pub(crate) fn is_open_store_file(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        let named: Vec<PathBuf> = self
+            .0
+            .iter()
+            .filter(|store| store.file_names.iter().any(|file| file.as_os_str() == name))
+            .map(|store| store.db.clone())
+            .collect();
+        if named.is_empty() {
+            return false;
+        }
+        let Some(candidate) = file_identity(path) else {
+            return false;
+        };
+        named.iter().filter(|db| db.exists()).any(|db| {
+            STORE_FILE_SUFFIXES.iter().any(|suffix| {
+                file_identity(&store_file_with_suffix(db, suffix)).as_ref() == Some(&candidate)
+            })
+        })
+    }
 }
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
@@ -1413,7 +1759,7 @@ fn open_unified_connection_unclassified(
     // the canonical database key used by the SQLite initialization lock below.
     // Canonicalizing the existing project directory also makes equivalent
     // spellings of the default cache path share the same preparation lock.
-    let preparation_key = default_project_dir_for_cache(db_path)
+    let preparation_key = project_dir_for_cache(db_path)
         .and_then(|project_dir| project_dir.canonicalize().ok())
         .unwrap_or_else(|| db_path.to_path_buf());
     let process_local_preparation_lock = process_local_open_lock_cell(&preparation_key)?;
@@ -1854,8 +2200,90 @@ fn unified_cache_initialized(conn: &Connection) -> Result<bool> {
     .map_err(|err| format!("cache DB initialization-state query SQLite error: {err}"))
 }
 
+/// The store files `BIFROST_CACHE_DIR` held directly before #13703 placed the
+/// store in a `bifrost-store` child, when `db_path` is that child's store: every
+/// versioned store file, of any schema version, still in the directory itself.
+/// Bifrost never moves or deletes them: it is the user's directory. When the
+/// variable names a directory that a run without it also uses, such as a
+/// repository's `.bifrost/cache`, those files are that run's live stores, not
+/// abandoned ones.
+fn abandoned_cache_dir_stores(db_path: &Path) -> Result<Vec<PathBuf>> {
+    let Some(store_dir) = db_path.parent() else {
+        return Ok(Vec::new());
+    };
+    if store_dir.file_name() != Some(std::ffi::OsStr::new(crate::gitblob::CACHE_DIR_STORE_SUBDIR)) {
+        return Ok(Vec::new());
+    }
+    let Some(cache_dir) = store_dir.parent() else {
+        return Ok(Vec::new());
+    };
+    if crate::gitblob::is_store_dir_without_cache_dir_override(cache_dir) {
+        return Ok(Vec::new());
+    }
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        // A first run creates the directory; nothing was left there.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("listing {}: {err}", cache_dir.display())),
+    };
+    let mut stores = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|err| format!("listing {}: {err}", cache_dir.display()))?
+            .path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(store_file_version)
+            .is_some()
+        {
+            stores.push(path);
+        }
+    }
+    stores.sort();
+    Ok(stores)
+}
+
+/// Print the abandoned-store warning once per process and file, to stderr,
+/// which the CLI shows and the MCP server logs. There is no persisted marker:
+/// every run says it while a file remains. The scan is advisory: when the
+/// directory cannot be listed, Bifrost says the check could not run and opens
+/// the store anyway, as it did before the store moved into its child.
+fn warn_about_abandoned_cache_dir_stores(db_path: &Path) {
+    static WARNED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let stores = match abandoned_cache_dir_stores(db_path) {
+        Ok(stores) => stores,
+        Err(err) => {
+            eprintln!("Bifrost could not check for an abandoned BIFROST_CACHE_DIR store: {err}");
+            return;
+        }
+    };
+    let mut warned = WARNED
+        .lock()
+        .expect("abandoned store warning mutex poisoned");
+    for old in stores {
+        if warned.contains(&old) {
+            continue;
+        }
+        eprintln!(
+            "Bifrost no longer uses {}: BIFROST_CACHE_DIR now holds the store in {}. \
+             The old file (and any {}-wal, -shm or -journal beside it) can be deleted, \
+             as can any semantic-pack-catalog.v<N> directory an earlier version left \
+             beside it.",
+            old.display(),
+            db_path
+                .parent()
+                .expect("a store path has a parent")
+                .display(),
+            old.display(),
+        );
+        warned.push(old);
+    }
+}
+
 fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
-    if let Some(project_dir) = default_project_dir_for_cache(db_path) {
+    warn_about_abandoned_cache_dir_stores(db_path);
+    if let Some(project_dir) = project_dir_for_cache(db_path) {
         migrate_legacy_project_cache(project_dir)?;
     }
     if let Some(parent) = db_path.parent() {
@@ -2099,17 +2527,6 @@ fn store_user_version(path: &Path) -> Result<i64> {
     cache_migration_version(&conn)
 }
 
-fn default_project_dir_for_cache(db_path: &Path) -> Option<&Path> {
-    let explicit_override = std::env::var_os(crate::gitblob::CACHE_DIR_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|cache_dir| cache_dir.join(cache_db_file_name()));
-    if explicit_override.as_deref() == Some(db_path) {
-        return None;
-    }
-    project_dir_for_cache(db_path)
-}
-
 fn project_dir_for_cache(db_path: &Path) -> Option<&Path> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return None;
@@ -2321,9 +2738,12 @@ pub fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
 /// nor churn its mtime. An existing file that does not ignore the generated
 /// directory is an error rather than a silent source of live SQLite files.
 fn ensure_cache_dir_self_ignored(cache_dir: &Path) -> Result<()> {
-    // An explicit override skips legacy migration, but a reserved cache layout
-    // still contains generated state that must never enter Git-backed scans.
-    if project_dir_for_cache(&cache_dir.join(cache_db_file_name())).is_none() {
+    // Only a directory Bifrost created gets the file: the default layout, the
+    // `BIFROST_CACHE_ROOT` child and the `BIFROST_CACHE_DIR` store child. A
+    // directory the caller chose may hold the caller's own files (#13703).
+    if project_dir_for_cache(&cache_dir.join(cache_db_file_name())).is_none()
+        && !crate::gitblob::is_bifrost_created_store_dir(cache_dir)
+    {
         return Ok(());
     }
     let ignore_path = cache_dir.join(".gitignore");
@@ -2650,7 +3070,7 @@ fn retry_initialization_phase_with<T>(
 }
 
 fn ensure_safe_cache_path(db_path: &Path) -> Result<()> {
-    if let Some(project_dir) = default_project_dir_for_cache(db_path) {
+    if let Some(project_dir) = project_dir_for_cache(db_path) {
         reject_symlink(project_dir, "Bifrost project directory")?;
     }
     let Some(parent) = db_path.parent() else {
@@ -3432,6 +3852,212 @@ mod tests {
         validate_foreign_keys(conn).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_store_does_not_hide_a_same_named_file_even_on_its_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let db_path = root.join("gone.db");
+        drop(open_unified_connection(&db_path).unwrap());
+        let db_identity = std::fs::metadata(&db_path)
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+            .unwrap();
+        for suffix in STORE_FILE_SUFFIXES {
+            let file = store_file_with_suffix(&db_path, suffix);
+            if file.exists() {
+                std::fs::remove_file(&file).unwrap();
+            }
+        }
+        assert!(!db_path.exists());
+        // The candidate has the deleted store's file name, so it passes the
+        // name test and the identity check decides. Try to land it on the
+        // store's freed inode too; most filesystems reuse one quickly.
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        let candidate = other.join("gone.db");
+        let mut reused = false;
+        for _ in 0..5000 {
+            std::fs::write(&candidate, "not a store").unwrap();
+            let metadata = std::fs::metadata(&candidate).unwrap();
+            reused = (metadata.dev(), metadata.ino()) == db_identity;
+            if reused {
+                break;
+            }
+            std::fs::remove_file(&candidate).unwrap();
+        }
+        if !reused {
+            std::fs::write(&candidate, "not a store").unwrap();
+        }
+        assert!(
+            !is_open_store_file(&candidate),
+            "a deleted store hid a same-named file (inode reused: {reused})"
+        );
+    }
+
+    #[test]
+    fn failed_store_open_removes_only_its_new_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("failed-open.db");
+        assert!(open_owned_sqlite(&path, OpenFlags::SQLITE_OPEN_READ_WRITE).is_err());
+        assert!(
+            !OPEN_STORES
+                .read()
+                .unwrap()
+                .iter()
+                .any(|store| store.db == path)
+        );
+        // The parent must exist, but the database need not. Canonicalizing the
+        // parent must also recognize a new database through a symlinked path.
+        #[cfg(unix)]
+        let open_path = {
+            std::os::unix::fs::symlink(&root, root.join("linked")).unwrap();
+            root.join("linked").join("failed-open.db")
+        };
+        #[cfg(not(unix))]
+        let open_path = path.clone();
+        let _conn = open_owned_sqlite(&open_path, OpenFlags::default()).unwrap();
+        assert!(is_open_store_file(&path));
+        assert!(
+            open_owned_sqlite(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .is_err()
+        );
+        assert!(is_open_store_file(&path));
+        assert!(open_owned_sqlite(&root.join("missing").join("db"), OpenFlags::default()).is_err());
+        // A dangling symlink is registered under the target SQLite creates,
+        // so a hash of the target by its own name is still refused.
+        #[cfg(unix)]
+        {
+            let target = root.join("created-target.db");
+            let link = root.join("dangling-link.db");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let _linked = open_owned_sqlite(&link, OpenFlags::default()).unwrap();
+            assert!(is_open_store_file(&target));
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13703: the abandoned-store warning told users to delete a repository's default-layout store"
+    )]
+    fn an_old_store_that_a_default_run_still_uses_is_not_abandoned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let name = cache_db_file_name();
+        // An earlier build's store usually carries an older schema version.
+        let older = cache_db_file_name_for_version(cache_db_schema_version() - 1);
+        // A repository's .bifrost/cache is a default run's store directory
+        // only when BIFROST_CACHE_ROOT does not take precedence.
+        let cache_root_set =
+            std::env::var_os(crate::gitblob::CACHE_ROOT_ENV).is_some_and(|value| !value.is_empty());
+        for (cache_dir, abandoned) in [
+            (root.join("repo/.bifrost/cache"), cache_root_set),
+            (root.join("chosen-cache"), true),
+        ] {
+            let store_dir = cache_dir.join(crate::gitblob::CACHE_DIR_STORE_SUBDIR);
+            std::fs::create_dir_all(&store_dir).unwrap();
+            std::fs::write(cache_dir.join(&older), "old store").unwrap();
+            std::fs::write(cache_dir.join("bifrost_cache.db.schema14.bak"), "backup").unwrap();
+            let expected: Vec<PathBuf> = if abandoned {
+                vec![cache_dir.join(&older)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                abandoned_cache_dir_stores(&store_dir.join(name)).unwrap(),
+                expected,
+                "{}",
+                cache_dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn open_store_files_are_recognized_by_identity_and_source_files_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let db_path = root.join("any-name.db");
+        let _conn = open_unified_connection(&db_path).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = store_file_with_suffix(&db_path, suffix);
+            assert!(file.exists(), "{}", file.display());
+            assert!(is_open_store_file(&file), "{}", file.display());
+        }
+        // Another spelling of the same path, through a symlinked directory.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, root.join("linked")).unwrap();
+            assert!(is_open_store_file(
+                &root.join("linked").join("any-name.db-wal")
+            ));
+        }
+        // The same name elsewhere is a different file.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("any-name.db"), "not a store").unwrap();
+        assert!(!is_open_store_file(&elsewhere.join("any-name.db")));
+        std::fs::write(root.join("source.rs"), "fn main() {}\n").unwrap();
+        assert!(!is_open_store_file(&root.join("source.rs")));
+        assert!(!is_open_store_file(&root.join("missing")));
+    }
+
+    #[test]
+    fn populated_jvm_provider_alias_migration_withdraws_inventory() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 493) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO jvm_external_owners(provider_id, owner_fqn, callables_complete, values_complete, types_complete, supertypes_complete, type_parameters_jsonb)
+             VALUES('artifact', 'example.Owner', 1, 1, 1, 1, jsonb('[]'));
+             INSERT INTO jvm_external_owner_supertypes(provider_id, owner_fqn, supertype_fqn, ordinal, type_arguments_jsonb)
+             VALUES('artifact', 'example.Owner', 'java.lang.Object', 0, jsonb('[]'));
+             INSERT INTO jvm_external_provider_publications VALUES('artifact', 'catalog', zeroblob(32), zeroblob(32), 1, 0, 1);",
+        ).unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0493-jvm-provider-aliases.sql"
+        ))
+        .unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        for table in [
+            "jvm_external_provider_publications",
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO jvm_external_owners(provider_id, owner_fqn, callables_complete, values_complete, types_complete, supertypes_complete, type_parameters_jsonb)
+             VALUES('scoped', 'example.Owner', 1, 1, 1, 1, jsonb('[]'));
+             INSERT INTO jvm_external_owner_supertypes(provider_id, owner_fqn, supertype_fqn, ordinal, type_arguments_jsonb)
+             VALUES('scoped', 'example.Owner', 'java.lang.Object', 0, jsonb('[]'));
+             INSERT INTO jvm_external_provider_publications(provider_id, semantic_sha256, source_identity, publication_state, projection_identity, projected_rows_sha256, owner_count, member_count, supertype_count)
+             VALUES('scoped', 'artifact', 'catalog', 'sealed', zeroblob(32), zeroblob(32), 1, 0, 1);
+             COMMIT;
+             DELETE FROM jvm_external_provider_publications WHERE provider_id='scoped';",
+        ).unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM jvm_external_owner_supertypes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
     #[test]
     fn cut_hint_migration_preserves_populated_evaluation_rows() {
         for foreign_keys in [false, true] {
@@ -3979,6 +4605,46 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#9559: summary receipts rejected name-only provider inventory questions")]
+    fn lookup_shape_migration_preserves_rows_and_admits_name_only_lookup() {
+        let predecessor = test_pre_lookup_question_shapes_migration_version();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= predecessor)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute_batch("INSERT INTO class_set_summary_reads(summary_id,read_ordinal,key_digest,kind,digest) VALUES(1,0,zeroblob(32),'models',zeroblob(32))").unwrap();
+        let insert = "INSERT INTO class_set_summary_reads(summary_id,read_ordinal,key_digest,kind,family,name,digest) VALUES(1,1,randomblob(32),'lookup','derivation:jvm_external_provider_inventory:v1','provider',zeroblob(32))";
+        assert!(conn.execute_batch(insert).is_err());
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|m| {
+                    m.sql
+                        .contains("CREATE TABLE jvm_external_inventory_generation(")
+                })
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        let generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM jvm_external_inventory_generation WHERE id=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
+        conn.execute_batch(insert).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM class_set_summary_reads WHERE kind='models' AND digest=zeroblob(32)", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn publication_read_columns_reject_malformed_rows_in_both_general_ledgers() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(CURRENT_FRESH_SCHEMA_SQL).unwrap();
@@ -4274,6 +4940,75 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn bounded_tree_listing_upgrade_keeps_exact_certificates() {
+        // A store from before 0469 holds exact-rows certificates. The upgrade
+        // reads them as certificates with no bounded-tree record.
+        let conn = test_connection_through_migration(447);
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO rust_source_listing_certificates
+             (workspace_id,lang,generation,revision,derivation_identity,complete)
+             VALUES ('w','rust',1,1,zeroblob(32),0)",
+            [],
+        )
+        .unwrap();
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 469)
+            .expect("bounded-tree listing migration");
+        conn.execute_batch(migration.sql).unwrap();
+        let (tree, digest): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT bounded_tree_oid, materialized_digest
+                 FROM rust_source_listing_certificates",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((tree, digest), (None, None));
+        let materialized: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM rust_source_listing_materialized",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(materialized, 0);
+        // The record's constraints: a 20-byte tree id and a 32-byte digest.
+        assert!(
+            conn.execute(
+                "UPDATE rust_source_listing_certificates
+                 SET bounded_tree_oid = zeroblob(7), materialized_digest = zeroblob(32)",
+                [],
+            )
+            .is_err(),
+            "a tree id is 20 or 32 bytes"
+        );
+        conn.execute(
+            "UPDATE rust_source_listing_certificates
+             SET bounded_tree_oid = zeroblob(20), materialized_digest = zeroblob(32)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute(
+            "INSERT INTO rust_source_listing_materialized
+             VALUES ('w','rust',1,1,'materialized','src/lib.rs')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO rust_source_listing_materialized
+                 VALUES ('w','rust',1,1,'nonsense','src/x.rs')",
+                [],
+            )
+            .is_err(),
+            "the role is one of the three kinds"
         );
     }
 
@@ -5679,6 +6414,7 @@ mod tests {
             "table"
         );
 
+        conn.execute("INSERT INTO resolution_producer_epochs(lang, producer_epoch) VALUES('java', 'schema64-test')", []).unwrap();
         let canonical_blob =
             insert_visibility_blob_fixture(&conn, "visibility-view-canonical", Some(1), 1);
         conn.execute(
@@ -7198,15 +7934,9 @@ mod tests {
         ).unwrap();
     }
 
-    #[test]
-    fn declaration_candidate_family_upgrade_preserves_both_read_tables() {
-        let mut conn = create_current_baseline_without_migration();
-        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 243) {
-            conn.execute_batch(migration.sql).unwrap();
-        }
-        conn.pragma_update(None, "user_version", 242).unwrap();
+    fn seed_classset_and_policy_receipts(conn: &Connection) {
         let blob_id =
-            insert_visibility_blob_fixture(&conn, "declaration-candidate-upgrade", None, 1);
+            insert_visibility_blob_fixture(conn, "declaration-candidate-upgrade", None, 1);
         conn.execute_batch(&format!(
             "INSERT INTO class_set_procedure_surfaces(
                surface_id, surface_digest, procedure_lineage, owner_rel_path,
@@ -7252,7 +7982,17 @@ mod tests {
              INSERT INTO policy_unit_reads(unit_id, read_id) VALUES(66, 55);"
         ))
         .unwrap();
-        validate_foreign_keys(&conn).unwrap();
+        validate_foreign_keys(conn).unwrap();
+    }
+
+    #[test]
+    fn declaration_candidate_family_upgrade_preserves_both_read_tables() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 243) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 242).unwrap();
+        seed_classset_and_policy_receipts(&conn);
         let rows = |conn: &Connection, table: &str, order: &str| {
             let mut statement = conn
                 .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
@@ -7923,6 +8663,271 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10979: producer A-B-A and REPLACE returned the same epoch over different rows"
+    )]
+    fn selected_producer_sequences_cover_sql_write_paths() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 482) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO resolution_producer_epochs VALUES('python', 'A');
+             INSERT INTO semantic_ir_producer_epochs VALUES('rust', 'A');",
+        )
+        .unwrap();
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|m| m.version == 482)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        for (table, kind, lang) in [
+            ("resolution_producer_epochs", "resolution", "python"),
+            ("semantic_ir_producer_epochs", "semantic_ir", "rust"),
+        ] {
+            let sequence = || {
+                conn.query_row(
+                    "SELECT value FROM selected_publication_sequences WHERE kind=?1 AND lang=?2",
+                    [kind, lang],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(sequence(), 0, "backfilled {kind}");
+            let upsert = format!(
+                "INSERT INTO {table} VALUES(?1, ?2)
+                 ON CONFLICT(lang) DO UPDATE SET producer_epoch=excluded.producer_epoch"
+            );
+            conn.execute(&upsert, [lang, "A"]).unwrap();
+            assert_eq!(sequence(), 0, "unchanged {kind} upsert");
+            conn.execute(&upsert, [lang, "B"]).unwrap();
+            conn.execute(
+                &format!("UPDATE {table} SET producer_epoch='A' WHERE lang=?1"),
+                [lang],
+            )
+            .unwrap();
+            assert_eq!(sequence(), 2, "{kind} A-B-A");
+            conn.execute_batch("SAVEPOINT producer_rollback").unwrap();
+            conn.execute(&format!("DELETE FROM {table} WHERE lang=?1"), [lang])
+                .unwrap();
+            assert_eq!(sequence(), 3, "{kind} tombstone");
+            conn.execute_batch("ROLLBACK TO producer_rollback; RELEASE producer_rollback")
+                .unwrap();
+            assert_eq!(sequence(), 2, "{kind} rollback");
+            conn.execute(&format!("DELETE FROM {table} WHERE lang=?1"), [lang])
+                .unwrap();
+            conn.execute(&format!("INSERT INTO {table} VALUES(?1, 'A')"), [lang])
+                .unwrap();
+            assert_eq!(sequence(), 4, "{kind} delete/reinsert");
+            for recursive in [false, true] {
+                conn.pragma_update(None, "recursive_triggers", recursive)
+                    .unwrap();
+                let before = sequence();
+                conn.execute(
+                    &format!("INSERT OR REPLACE INTO {table} VALUES(?1, 'A')"),
+                    [lang],
+                )
+                .unwrap();
+                assert!(sequence() > before, "{kind} REPLACE, recursive={recursive}");
+                let before = sequence();
+                assert!(
+                    conn.execute(
+                        "INSERT OR REPLACE INTO selected_publication_sequences VALUES(?1, ?2, 0)",
+                        [kind, lang],
+                    )
+                    .is_err()
+                );
+                assert_eq!(sequence(), before, "{kind} cannot reset via REPLACE");
+            }
+            assert!(
+                conn.execute(
+                    "DELETE FROM selected_publication_sequences WHERE kind=?1 AND lang=?2",
+                    [kind, lang],
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(
+                    "UPDATE selected_publication_sequences SET value=0 WHERE kind=?1 AND lang=?2",
+                    [kind, lang],
+                )
+                .is_err()
+            );
+            let renamed = format!("{lang}-renamed");
+            let before = sequence();
+            conn.execute(
+                &format!("UPDATE {table} SET lang=?1 WHERE lang=?2"),
+                [&renamed, lang],
+            )
+            .unwrap();
+            assert!(sequence() > before, "rename leaves {kind} tombstone");
+            let renamed_sequence: i64 = conn
+                .query_row(
+                    "SELECT value FROM selected_publication_sequences WHERE kind=?1 AND lang=?2",
+                    [kind, &renamed],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(renamed_sequence, 1, "rename publishes new {kind} owner");
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM selected_publication_sequences WHERE lang='never-published'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "never-published is distinct from a retained tombstone"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10979: rebuilding a deleted workspace reused revision one in the same generation"
+    )]
+    fn selected_revision_incarnations_survive_rebuild_and_rollback() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 482) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let workspace = "a".repeat(64);
+        let insert = "INSERT INTO workspace_revisions VALUES(?1, 'python', 0, 1)";
+        conn.execute(insert, [&workspace]).unwrap();
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|m| m.version == 482)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        let witness = || {
+            conn.query_row(
+                "SELECT incarnation FROM workspace_revision_incarnations
+                 WHERE workspace_id=?1 AND lang='python' AND generation=0 AND revision=1",
+                [&workspace],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let backfilled = witness();
+        assert_eq!(backfilled, 0);
+        conn.execute(
+            "UPDATE workspace_revisions SET revision=revision WHERE workspace_id=?1",
+            [&workspace],
+        )
+        .unwrap();
+        assert_eq!(
+            witness(),
+            backfilled,
+            "no-op update preserves the incarnation"
+        );
+        conn.execute(
+            "DELETE FROM workspace_revisions WHERE workspace_id=?1",
+            [&workspace],
+        )
+        .unwrap();
+        conn.execute(insert, [&workspace]).unwrap();
+        let first = witness();
+        assert!(first > backfilled);
+        conn.execute_batch("SAVEPOINT revision_rollback").unwrap();
+        conn.execute(
+            "DELETE FROM workspace_revisions WHERE workspace_id=?1",
+            [&workspace],
+        )
+        .unwrap();
+        conn.execute(insert, [&workspace]).unwrap();
+        assert!(witness() > first);
+        conn.execute_batch("ROLLBACK TO revision_rollback; RELEASE revision_rollback")
+            .unwrap();
+        assert_eq!(witness(), first, "rollback restores the committed witness");
+        conn.execute(
+            "DELETE FROM workspace_revisions WHERE workspace_id=?1",
+            [&workspace],
+        )
+        .unwrap();
+        conn.execute(insert, [&workspace]).unwrap();
+        assert!(witness() > first, "committed incarnations are never reused");
+        for recursive in [false, true] {
+            conn.pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            let before = witness();
+            conn.execute(
+                "INSERT OR REPLACE INTO workspace_revisions VALUES(?1, 'python', 0, 1)",
+                [&workspace],
+            )
+            .unwrap();
+            assert!(
+                witness() > before,
+                "revision REPLACE, recursive={recursive}"
+            );
+        }
+        for sql in [
+            "DELETE FROM workspace_revision_incarnations",
+            "UPDATE workspace_revision_incarnations SET incarnation=0",
+            "INSERT OR REPLACE INTO workspace_revision_incarnations SELECT workspace_id, lang, generation, revision, 0 FROM workspace_revisions",
+            "UPDATE workspace_revisions SET revision=2",
+        ] {
+            assert!(
+                conn.execute(sql, []).is_err(),
+                "rejected identity mutation: {sql}"
+            );
+        }
+        assert!(
+            !conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10979: the historical immutable-revision trigger rejected an unchanged writer UPDATE"
+    )]
+    fn selected_revision_noop_update_preserves_identity() {
+        for recursive in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate(&mut conn).unwrap();
+            conn.pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_revisions VALUES(?1,'python',0,1)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+            let witness = || {
+                conn.query_row(
+                    "SELECT incarnation FROM workspace_revision_incarnations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+            let original = witness();
+            conn.execute(
+                "UPDATE workspace_revisions SET workspace_id=workspace_id,lang=lang,
+                 generation=generation,revision=revision",
+                [],
+            )
+            .unwrap();
+            assert_eq!(witness(), original, "recursive={recursive}");
+            assert!(
+                conn.execute("UPDATE workspace_revisions SET revision=2", [])
+                    .is_err(),
+                "identity changes are refused, recursive={recursive}"
+            );
+            assert_eq!(witness(), original, "failed change is atomic");
+        }
+    }
+
+    #[test]
     fn consumed_unit_migration_keeps_existing_summaries_reusable() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cache.sqlite3");
@@ -8041,9 +9046,11 @@ mod tests {
         );
     }
 
-    /// The #12385 migration that clears the JVM external projection. Tests name it
+    /// The #12385 migrations that clear the JVM external projection: M1 adds the
+    /// generic-surface columns, M2 re-projects with method bounds. Tests name them
     /// here so a renumber at landing moves one line.
-    const JVM_GENERIC_SURFACES_VERSION: i64 = 422;
+    const JVM_GENERIC_SURFACES_VERSION: i64 = 425;
+    const JVM_METHOD_BOUNDS_VERSION: i64 = super::JVM_METHOD_BOUNDS_MIGRATION_VERSION;
 
     fn last_migration_before(version: i64) -> i64 {
         POST_BASELINE_MIGRATIONS
@@ -8051,32 +9058,31 @@ mod tests {
             .map(|migration| migration.version)
             .filter(|&candidate| candidate < version)
             .max()
-            .expect("a migration precedes the JVM generic surfaces migration")
+            .expect("a migration precedes the JVM projection clear")
     }
 
     #[test]
-    fn generic_surface_upgrade_clears_populated_jvm_inventory() {
-        for foreign_keys in [false, true] {
+    fn jvm_projection_clears_populated_jvm_inventory() {
+        for (clearing, foreign_keys) in [JVM_GENERIC_SURFACES_VERSION, JVM_METHOD_BOUNDS_VERSION]
+            .into_iter()
+            .flat_map(|clearing| [(clearing, false), (clearing, true)])
+        {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
             for migration in POST_BASELINE_MIGRATIONS
                 .iter()
-                .filter(|migration| migration.version < JVM_GENERIC_SURFACES_VERSION)
+                .filter(|migration| migration.version < clearing)
             {
                 conn.execute_batch(migration.sql).unwrap();
             }
             conn.pragma_update(None, "foreign_keys", foreign_keys)
                 .unwrap();
-            conn.execute_batch("INSERT INTO jvm_external_owners VALUES('provider','Owner',1,1,1,1);
+            conn.execute_batch("INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES('provider','Owner',1,1,1,1);
 INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb) VALUES('provider','Owner',0,'method','method','public',1,1,1,jsonb('[]'));
-INSERT INTO jvm_external_owner_supertypes VALUES('provider','Owner','Parent',0);
+INSERT INTO jvm_external_owner_supertypes(provider_id,owner_fqn,supertype_fqn,ordinal) VALUES('provider','Owner','Parent',0);
 INSERT INTO jvm_external_provider_publications VALUES('provider','source',zeroblob(32),zeroblob(32),1,1,1);").unwrap();
-            conn.pragma_update(
-                None,
-                "user_version",
-                last_migration_before(JVM_GENERIC_SURFACES_VERSION),
-            )
-            .unwrap();
+            conn.pragma_update(None, "user_version", last_migration_before(clearing))
+                .unwrap();
             migrate(&mut conn).unwrap();
             for table in [
                 "jvm_external_provider_publications",
@@ -8089,10 +9095,97 @@ INSERT INTO jvm_external_provider_publications VALUES('provider','source',zerobl
                         row.get(0)
                     })
                     .unwrap();
-                assert_eq!(count, 0, "{table}");
+                assert_eq!(count, 0, "{clearing} {table}");
             }
             validate_foreign_keys(&conn).unwrap();
             assert!(current_schema_shape_is_valid(&conn).unwrap());
+        }
+    }
+
+    /// A store that ran migration 0425 and then projected rows under the
+    /// previous projection identity must lose them at the JVM purge (#12445):
+    /// until #12245 the JVM read does not enforce identity. A store from
+    /// before 0425 reaches the purge with the tables already empty. Each
+    /// migration is applied alone so a foreign key violation names its step.
+    #[test]
+    #[hardwon(
+        "#12445: JVM rows projected after migration 0425 survived the upgrade that rotates the projection identity"
+    )]
+    fn jvm_purge_clears_rows_projected_after_generic_surfaces_migration() {
+        let purge = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 467)
+            .expect("JVM purge migration");
+        assert!(purge.sql.contains("DELETE FROM jvm_external_owners"));
+        for start in [
+            JVM_GENERIC_SURFACES_VERSION - 1,
+            JVM_GENERIC_SURFACES_VERSION,
+        ] {
+            for foreign_keys in [false, true] {
+                let label = format!("start={start} FK={foreign_keys}");
+                let conn = Connection::open_in_memory().unwrap();
+                conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+                for migration in POST_BASELINE_MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version <= start)
+                {
+                    conn.execute_batch(migration.sql).unwrap();
+                }
+                conn.pragma_update(None, "foreign_keys", foreign_keys)
+                    .unwrap();
+                if start < JVM_GENERIC_SURFACES_VERSION {
+                    conn.execute_batch("INSERT INTO jvm_external_owners VALUES('provider','Owner',1,1,1,1);
+INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb) VALUES('provider','Owner',0,'method','method','public',1,1,1,jsonb('[]'));
+INSERT INTO jvm_external_owner_supertypes VALUES('provider','Owner','Parent',0);
+INSERT INTO jvm_external_provider_publications VALUES('provider','source',zeroblob(32),zeroblob(32),1,1,1);").unwrap();
+                } else {
+                    // As master's binary writes after 0425: generic columns set.
+                    conn.execute_batch("INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete,type_parameters_jsonb) VALUES('provider','Owner',1,1,1,1,jsonb('[{\"name\":\"T\",\"bounds\":{\"state\":\"unknown\"}}]'));
+INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb,type_parameters_jsonb) VALUES('provider','Owner',0,'method','method','public',1,1,1,jsonb('[]'),jsonb('[]'));
+INSERT INTO jvm_external_owner_supertypes(provider_id,owner_fqn,supertype_fqn,ordinal,type_arguments_jsonb) VALUES('provider','Owner','Parent',0,jsonb('[]'));
+INSERT INTO jvm_external_provider_publications VALUES('provider','source',zeroblob(32),zeroblob(32),1,1,1);").unwrap();
+                }
+                validate_foreign_keys(&conn).unwrap();
+                let rows = |conn: &Connection| -> i64 {
+                    [
+                        "jvm_external_provider_publications",
+                        "jvm_external_owners",
+                        "jvm_external_owner_members",
+                        "jvm_external_owner_supertypes",
+                    ]
+                    .iter()
+                    .map(|table| {
+                        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                    })
+                    .sum()
+                };
+                assert!(rows(&conn) > 0, "{label}");
+                for migration in POST_BASELINE_MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version > start)
+                {
+                    conn.execute_batch(migration.sql).unwrap();
+                    validate_foreign_keys(&conn)
+                        .unwrap_or_else(|error| panic!("{label} v{}: {error}", migration.version));
+                    // 0425 and 0467 both withdraw every JVM row.
+                    if migration.version == 425 || migration.version == 467 {
+                        assert_eq!(rows(&conn), 0, "{label} v{}", migration.version);
+                    }
+                }
+                // The purge precedes the generation triggers (0468), so the
+                // rows it deleted did not advance the generation.
+                let generation: i64 = conn
+                    .query_row(
+                        "SELECT generation FROM jvm_external_inventory_generation WHERE id=0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(generation, 0, "{label}");
+            }
         }
     }
 
@@ -8146,6 +9239,23 @@ INSERT INTO jvm_external_provider_publications VALUES('provider','source',zerobl
             1
         );
 
+        // Earlier friend migrations preserve the row; the lookup-shape upgrade
+        // intentionally withdraws all JVM inventory before first-use rebuild.
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM jvm_external_owner_members",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'csharp', 0)",
             ["b".repeat(40)],
@@ -8181,6 +9291,206 @@ INSERT INTO jvm_external_provider_publications VALUES('provider','source',zerobl
             schema_object_definitions_sha256(&conn).unwrap(),
             CURRENT_SCHEMA_OBJECTS_SHA256
         );
+    }
+
+    #[test]
+    fn actual_borrow_migration_upgrades_a_populated_comparison_cache() {
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.sql.contains("ADD COLUMN actual_borrow"))
+            .unwrap();
+        let predecessor = POST_BASELINE_MIGRATIONS
+            .iter()
+            .rfind(|candidate| candidate.version < migration.version)
+            .unwrap()
+            .version;
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+        for earlier in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|candidate| candidate.version < migration.version)
+        {
+            conn.execute_batch(earlier.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", predecessor)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+            ["f".repeat(40)],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'rust', 'actual-borrow-upgrade', zeroblob(32), 0, 0, 0, 2, 0, jsonb('[]'), 'complete')", [blob]).unwrap();
+        let tables = ["semantic_ir_values", "candidate_macro_semantic_ir_values"];
+        for table in tables {
+            conn.execute(&format!("INSERT INTO {table}(blob_id, procedure, value, kind, source, evidence) VALUES(?1, 0, 0, 6, 0, 0)"), [blob]).unwrap();
+            assert!(
+                conn.prepare(&format!("SELECT actual_borrow FROM {table}"))
+                    .is_err()
+            );
+        }
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        for table in tables {
+            let row = conn
+                .query_row(
+                    &format!("SELECT value, actual_borrow FROM {table} WHERE blob_id=?1"),
+                    [blob],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (0, 0), "old row keeps Unknown: {table}");
+            conn.execute(
+                &format!("UPDATE {table} SET actual_borrow=1 WHERE blob_id=?1"),
+                [blob],
+            )
+            .unwrap();
+            assert!(
+                conn.execute(
+                    &format!("UPDATE {table} SET actual_borrow=4 WHERE blob_id=?1"),
+                    [blob]
+                )
+                .is_err()
+            );
+        }
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        validate_foreign_keys(&conn).unwrap();
+        migrate(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn guard_value_comparison_migration_preserves_legacy_rows() {
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| {
+                migration
+                    .sql
+                    .contains("CREATE TABLE semantic_ir_guard_facts_value_comparisons")
+            })
+            .unwrap();
+        let predecessor = POST_BASELINE_MIGRATIONS
+            .iter()
+            .rfind(|candidate| candidate.version < migration.version)
+            .unwrap()
+            .version;
+        for foreign_keys in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for earlier in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|candidate| candidate.version < migration.version)
+            {
+                conn.execute_batch(earlier.sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", predecessor)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+                ["e".repeat(40)],
+            )
+            .unwrap();
+            let blob = conn.last_insert_rowid();
+            conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'rust', 'guard-comparison-migration', zeroblob(32), 0, 0, 0, 22, 0, jsonb('[]'), 'complete')", [blob]).unwrap();
+            let tables = [
+                "semantic_ir_guard_facts",
+                "candidate_macro_semantic_ir_guard_facts",
+            ];
+            let insert = |table: &str| {
+                format!(
+                    "INSERT INTO {table}(blob_id, procedure, guard, point, subject, predicate, flag, relation, constant, operand_a, operand_b, digest, true_target, true_kind, false_target, false_kind, source, evidence) VALUES(?1, 0, ?2, 3, NULL, ?2, 1, 2, 5, 6, 7, -1, 8, 1, 9, 2, 10, 11)"
+                )
+            };
+            let rows = |conn: &Connection, table: &str| {
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT * FROM {table} ORDER BY blob_id, procedure, guard"
+                    ))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            for table in tables {
+                for tag in 0..=10 {
+                    conn.execute(&insert(table), rusqlite::params![blob, tag])
+                        .unwrap();
+                }
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob, 11])
+                        .is_err()
+                );
+            }
+            let value_tables = ["semantic_ir_values", "candidate_macro_semantic_ir_values"];
+            for table in value_tables {
+                conn.execute(&format!("INSERT INTO {table}(blob_id, procedure, value, kind, source, evidence) VALUES(?1, 0, 0, 6, 0, 0)"), [blob]).unwrap();
+            }
+            let before = tables.map(|table| rows(&conn, table));
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            migrate(&mut conn).unwrap();
+            assert_eq!(
+                tables.map(|table| rows(&conn, table)),
+                before,
+                "legacy rows changed with foreign_keys={foreign_keys}"
+            );
+            for table in value_tables {
+                let old_borrow: u32 = conn
+                    .query_row(
+                        &format!("SELECT actual_borrow FROM {table} WHERE blob_id=?1"),
+                        [blob],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(old_borrow, 0, "old value rows retain Unknown borrowing");
+                assert!(
+                    conn.execute(
+                        &format!("UPDATE {table} SET actual_borrow=4 WHERE blob_id=?1"),
+                        [blob]
+                    )
+                    .is_err()
+                );
+            }
+            assert!(current_schema_shape_is_valid(&conn).unwrap());
+            validate_foreign_keys(&conn).unwrap();
+            for table in tables {
+                for tag in [11, 12] {
+                    conn.execute(&insert(table), rusqlite::params![blob, tag])
+                        .unwrap();
+                }
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob, 13])
+                        .is_err()
+                );
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob, 0])
+                        .is_err()
+                );
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob + 1, 0])
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+                    .unwrap(),
+                1
+            );
+            for table in tables {
+                assert!(rows(&conn, table).is_empty());
+            }
+        }
     }
 
     #[test]
@@ -8269,9 +9579,20 @@ INSERT INTO jvm_external_provider_publications VALUES('provider','source',zerobl
             for table in tables {
                 conn.execute(&insert(table), rusqlite::params![blob, 2, 14])
                     .unwrap();
+                // The current schema also admits the creating-realization
+                // capture obligation; the next unassigned code stays invalid.
+                let maximum_discharge = 16;
+                conn.execute(
+                    &insert(table),
+                    rusqlite::params![blob, 3, maximum_discharge],
+                )
+                .unwrap();
                 assert!(
-                    conn.execute(&insert(table), rusqlite::params![blob, 3, 16])
-                        .is_err()
+                    conn.execute(
+                        &insert(table),
+                        rusqlite::params![blob, 4, maximum_discharge + 1]
+                    )
+                    .is_err()
                 );
                 assert!(
                     conn.execute(&insert(table), rusqlite::params![blob + 1, 0, 0])
@@ -12655,8 +13976,7 @@ INSERT INTO jvm_external_provider_publications VALUES('provider','source',zerobl
         // and nothing from the cache directory.
         let mut options = git2::StatusOptions::new();
         options.include_untracked(true).recurse_untracked_dirs(true);
-        let untracked: Vec<String> = repo
-            .statuses(Some(&mut options))
+        let untracked: Vec<String> = crate::gitblob::worktree_statuses(&repo, Some(&mut options))
             .unwrap()
             .iter()
             .filter_map(|entry| entry.path().map(str::to_string))

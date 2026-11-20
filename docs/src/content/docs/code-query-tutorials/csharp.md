@@ -737,12 +737,33 @@ call-site row carries its receiver and argument binding identities.
             "end_line": 16,
             "start_column": 21,
             "start_line": 16
+          },
+          "site": {
+            "role": {
+              "index": 0,
+              "kind": "argument"
+            },
+            "site": {
+              "end_byte": 351,
+              "end_column": 26,
+              "end_line": 16,
+              "kind": "source",
+              "path": "csharp/Parity.cs",
+              "start_byte": 346,
+              "start_column": 21,
+              "start_line": 16,
+              "text": "value"
+            },
+            "value": {
+              "cause": {
+                "kind": "not_constant"
+              },
+              "kind": "unknown"
+            }
           }
         }
       ],
       "call_kind": "function",
-      "completeness": "complete",
-      "coverage": "exhaustive",
       "callee": {
         "end_line": 23,
         "fq_name": "Parity.Consume",
@@ -768,6 +789,8 @@ call-site row carries its receiver and argument binding identities.
         "start_line": 14
       },
       "caller_parameter_identity": "<public-id>",
+      "completeness": "complete",
+      "coverage": "exhaustive",
       "language": "csharp",
       "path": "csharp/Parity.cs",
       "program_point_id": "<public-id>",

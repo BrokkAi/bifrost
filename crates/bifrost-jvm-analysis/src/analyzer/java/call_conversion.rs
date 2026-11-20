@@ -333,7 +333,7 @@ pub(super) fn modeled_result_formal_identity(
         if provider != constructor.provenance.pack_digest
             || record != constructor.provenance.record_id
             || descriptor.owner.owner_fqn.as_ref() != owner
-            || descriptor.owner.provider_id.as_ref() != provider
+            || descriptor.owner.provider_id.as_ref() != brokk_bifrost_analysis::analyzer::store::jvm_external_publication::jvm_external_provider_id(&provider)
         {
             return unknown();
         }
@@ -365,9 +365,9 @@ pub(super) fn modeled_result_formal_identity(
     if slot.variadic.is_some() {
         return unknown();
     }
-    let Ok(ResolvedConversionType::External {
+    let Ok(JavaConversionType::Value(ResolvedConversionType::External {
         identity: formal_identity,
-    }) = resolve_formal_type(
+    })) = resolve_formal_type(
         java,
         scope.token(),
         Some(overlay.clone()),
@@ -487,14 +487,14 @@ pub(crate) fn prove_argument(
         .map_err(TypeResolutionFailure::target)?;
         array_java_type(element, rank)
     } else {
-        JavaConversionType::Value(resolve_formal_type(
+        resolve_formal_type(
             java,
             token,
             packs.clone(),
             formal_file,
             formal,
             formal_source,
-        )?)
+        )?
     };
     // Native selection has certified the implicit array formal. Render its
     // conversion with the same selected static-type classifier used by model
@@ -1155,7 +1155,8 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
                 });
                 let surface = match selected
                     .as_ref()
-                    .and_then(|evidence| evidence.artifact_sha256.as_deref())
+                    .and_then(|evidence| evidence.single_raw_sha256())
+                    .as_deref()
                 {
                     Some(digest) => java.external_declarations_for_source_jdk(packs, digest),
                     None => java.external_declarations(packs),
@@ -1360,7 +1361,7 @@ fn resolve_formal_type(
     file: &ProjectFile,
     formal: Node<'_>,
     source: &str,
-) -> Result<ResolvedConversionType, ConversionUnknown> {
+) -> Result<JavaConversionType, ConversionUnknown> {
     if !matches!(
         formal.kind(),
         "formal_parameter" | "receiver_parameter" | "catch_formal_parameter"
@@ -1368,11 +1369,14 @@ fn resolve_formal_type(
         return Err(ConversionUnknown::UnresolvedSignature);
     }
     let type_node = declared_type_node(formal).ok_or(ConversionUnknown::UnresolvedSignature)?;
-    if declaration_declares_array(formal, type_node) {
-        return Err(ConversionUnknown::UnsupportedConversion);
-    }
-    resolve_type_node(java, token, packs, file, type_node, source)
-        .map_err(TypeResolutionFailure::target)
+    let (element_type_node, array_dimensions) = declared_java_type_shape(formal, type_node)
+        .map_err(|reason| match reason {
+            ConversionUnknown::UnresolvedSourceType => ConversionUnknown::UnresolvedTargetType,
+            other => other,
+        })?;
+    let element = resolve_type_node(java, token, packs, file, element_type_node, source)
+        .map_err(TypeResolutionFailure::target)?;
+    Ok(array_java_type(element, array_dimensions))
 }
 
 /// Read static types through the incumbent's existing structured conversion
@@ -1986,12 +1990,9 @@ pub(crate) fn java_source_creation(
                     formal_source,
                 ),
             ) {
-                (Ok(actual), Ok(formal)) => classify_java_conversion_applicability(
-                    java,
-                    packs.as_deref(),
-                    actual,
-                    JavaConversionType::Value(formal),
-                ),
+                (Ok(actual), Ok(formal)) => {
+                    classify_java_conversion_applicability(java, packs.as_deref(), actual, formal)
+                }
                 // No declaration of the formal's type is available, but the
                 // formal may still be named by Java's own import rules.
                 (
@@ -2524,7 +2525,7 @@ fn java_array_dimension_count_bounded(dimensions: Node<'_>) -> Result<usize, Con
 /// The declared element type and array dimension count, read structurally
 /// from tree-sitter `array_type` element/dimensions fields and declarator
 /// dimension fields. No rendered-spelling parsing.
-fn declared_java_type_shape<'a>(
+pub(crate) fn declared_java_type_shape<'a>(
     declaration: Node<'a>,
     type_node: Node<'a>,
 ) -> Result<(Node<'a>, usize), ConversionUnknown> {
@@ -2546,7 +2547,9 @@ fn declared_java_type_shape<'a>(
 
 /// The element type and array dimension count of one written type node, read
 /// from tree-sitter `array_type` element/dimensions fields.
-fn java_type_node_shape(type_node: Node<'_>) -> Result<(Node<'_>, usize), ConversionUnknown> {
+pub(crate) fn java_type_node_shape(
+    type_node: Node<'_>,
+) -> Result<(Node<'_>, usize), ConversionUnknown> {
     let mut element = type_node;
     let mut dimensions = 0usize;
     while element.kind() == "array_type" {
@@ -2686,9 +2689,13 @@ fn resolve_external_spelling(
     unknown: ConversionUnknown,
 ) -> Result<ResolvedConversionType, ConversionUnknown> {
     let access_package = java.package_name_of(file).unwrap_or_default();
-    let external = java
-        .external_declarations(packs.clone())
-        .resolve_qualified_name(&QueryGapRecorder::new(java), spelling, &access_package)
+    let surface = java.external_declarations(packs.clone());
+    let recorder = QueryGapRecorder::new(java);
+    let external = surface
+        .or_record_miss(
+            &recorder,
+            surface.resolve_qualified_name(&recorder, spelling, &access_package),
+        )
         .and_then(|external| external_identity(java, packs.as_deref(), &external));
     external
         .map(|identity| ResolvedConversionType::External { identity })
@@ -3387,7 +3394,8 @@ fn native_argument_applicability(
     });
     let surface = match selected
         .as_ref()
-        .and_then(|evidence| evidence.artifact_sha256.as_deref())
+        .and_then(|evidence| evidence.single_raw_sha256())
+        .as_deref()
     {
         Some(digest) => java.external_declarations_for_source_jdk(packs.clone(), digest),
         None => java.external_declarations(packs.clone()),
@@ -3433,7 +3441,8 @@ fn native_argument_applicability(
     scope_digest.push(scope_identity.as_bytes());
     match selected
         .as_ref()
-        .and_then(|evidence| evidence.artifact_sha256.as_deref())
+        .and_then(|evidence| evidence.single_raw_sha256())
+        .as_deref()
     {
         Some(artifact) => scope_digest.push(artifact.as_bytes()),
         None => scope_digest.push(b"no-selected-jdk-artifact"),
@@ -3558,6 +3567,7 @@ mod tests {
             )
             .unwrap();
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -3571,7 +3581,8 @@ mod tests {
                 }),
                 target: Some("jvm".into()),
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),

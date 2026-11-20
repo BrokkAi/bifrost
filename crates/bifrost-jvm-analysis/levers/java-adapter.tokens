@@ -18,3 +18,10 @@
 12939-java-store-fault-exits
 11165-java-implicit-close-occurrences
 7632-header-scoped-bindings
+12745-jvm-external-receipt-carry
+13763-string-intrinsic-folding
+11031-java-bare-field-receiver
+13668-java-claim-rules
+14294-java-twr-resource-locals
+14259-java-method-result-cast-coverage
+14540-twr-partial-init-close

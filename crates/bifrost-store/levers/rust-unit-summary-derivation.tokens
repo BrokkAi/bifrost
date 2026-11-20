@@ -17,3 +17,6 @@
 # Replaces the literal 42 -> 43 bump from the #12164 checkpoint.
 12164-all-features-test
 10381-per-unit-feature-projection
+12964-impl-anonymous-owners
+11183-r4-1a-consumer-projections
+13259-census-macro-paths

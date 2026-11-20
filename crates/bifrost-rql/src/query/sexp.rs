@@ -2053,7 +2053,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
         }
-        RqlForm::BindingInitializerCallsOf | RqlForm::SelectedPropertyRelationsOf => {
+        RqlForm::BindingInitializerCallsOf
+        | RqlForm::SelectedPropertyRelationsOf
+        | RqlForm::FieldWritesOf
+        | RqlForm::FieldReadsOf => {
             expect_len(expr, items, 2, head)?;
             let op = form
                 .query_step_op()
@@ -3384,6 +3387,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::EdgeTarget
         | RqlForm::BindingInitializerCallsOf
         | RqlForm::SelectedPropertyRelationsOf
+        | RqlForm::FieldWritesOf
+        | RqlForm::FieldReadsOf
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::FlowSource

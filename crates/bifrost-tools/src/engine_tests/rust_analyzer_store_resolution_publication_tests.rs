@@ -55,8 +55,6 @@ mod rust_departing_root_tests {
 
     use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::selected_publication::rust_root_test_support::counted_logical_store_rows as counted_logical_store_rows;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::selected_publication::rust_root_test_support::owner as owner;
-
     use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::selected_publication::rust_root_test_support::ready as ready;
 
     use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::selected_publication::rust_root_test_support::roots as roots;
@@ -64,6 +62,16 @@ mod rust_departing_root_tests {
     const SOURCE: &str = "pub fn target() {}\npub fn caller() { target(); }\n";
 
     const HOST: &str = "src/lib.rs";
+
+    fn owner(store: &AnalyzerStore, name: char) -> WorkspaceSnapshotId {
+        let snapshot = brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::selected_publication::rust_root_test_support::owner(store, name);
+        // This fixture supplies the Rust lowerer, so it owns installing its IR
+        // epoch before selected publication checks that captured authority.
+        store
+            .ensure_prepared_resolution_epochs(&[prepared(&snapshot)])
+            .unwrap();
+        snapshot
+    }
 
     fn prepared(snapshot: &WorkspaceSnapshotId) -> PreparedParsedBlob {
         let state = parsed_fixture_state(&RustAdapter::for_tests(), HOST, SOURCE);
@@ -182,7 +190,7 @@ mod rust_departing_root_tests {
             })
         };
         seed_obsolete();
-        persist_one(&store, prepared(&snapshot));
+        store.repair_prepared_blob(prepared(&snapshot)).unwrap();
         assert_current();
         seed_obsolete();
         store.conn.execute(|conn| conn.execute("UPDATE resolution_producer_epochs SET producer_epoch='obsolete' WHERE lang='rust'", [])).unwrap();
@@ -399,6 +407,13 @@ mod rust_departing_root_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store.conn.execute(|conn| {
             *conn = brokk_bifrost_core::cache_db::test_connection_before_structural_trait_impls();
+            // Production opens every store through migrate() before any purge
+            // runs (cache_db.rs open_unified_connection), so the generation
+            // purge may name post-0517 tables. This test deliberately holds an
+            // old schema while the epoch is created; stand in for the one
+            // table the purge reads and drop it before the real migration.
+            conn.execute_batch("CREATE TABLE rust_package_route_versions(generation INTEGER)")
+                .unwrap();
         });
         let snapshot = owner(&store, 'f');
         let generation = snapshot.generation.0;
@@ -425,6 +440,8 @@ mod rust_departing_root_tests {
                 ],
             )
             .unwrap();
+            conn.execute_batch("DROP TABLE rust_package_route_versions")
+                .unwrap();
             brokk_bifrost_core::cache_db::migrate(conn).unwrap();
         });
         assert!(matches!(
@@ -607,6 +624,10 @@ mod rust_departing_root_tests {
     #[hardwon(
         "3da13ca2218b: legacy replacement and restored roots escaped complete row accounting"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn parsed_legacy_replacement_and_restored_roots_are_fully_charged() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let snapshot = owner(&store, '2');
@@ -677,7 +698,14 @@ mod rust_departing_root_tests {
             "legacy fallback differs only by the deleted payload-cost row"
         );
         assert_eq!(fallback.payload_bytes, replaced.payload_bytes);
-        let stats = persist_one(&store, prepared(&snapshot));
+        let (outcomes, stats) =
+            brokk_bifrost_analysis::analyzer::store::test_support::repair_prepared_blobs(
+                &store,
+                vec![prepared(&snapshot)],
+                &CancellationToken::default(),
+                brokk_bifrost_analysis::analyzer::store::PersistBatchTargets::PRODUCTION,
+            );
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
         assert_eq!(
             stats.logical_rows,
             new_rows + fallback.logical_rows + 1,

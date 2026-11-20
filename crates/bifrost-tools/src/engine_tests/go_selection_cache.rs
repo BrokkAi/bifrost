@@ -86,6 +86,10 @@ use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
 
     #[test]
     #[hardwon("d629d480653d: lazy generic TEMP schema discarded the first retained selection")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn single_reader_exact_selection_key_reuses_materialization_and_changed_mask_rebuilds() {
         let mut receipts = Vec::new();
         for (storage_language, semantic_language) in

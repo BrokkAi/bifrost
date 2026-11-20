@@ -44,15 +44,17 @@ impl SemanticModelOverlay {
             max_visits,
             cancellation,
             |current| {
-                let (parameters, edges) = self
-                    .java_hierarchy
-                    .get(&current.id)
+                let active = self
+                    .active_models
+                    .as_ref()
                     .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
-                if !parameters.is_empty() {
+                let owner = owner_declaration(active, current)
+                    .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
+                if !owner.type_parameters.is_empty() {
                     return Err(JavaHierarchyIncomplete::GenericSubstitution);
                 }
                 Ok((
-                    edges.clone(),
+                    owner.hierarchy.clone(),
                     current.provenance.completeness == SemanticModelCompleteness::Complete,
                     None,
                 ))
@@ -103,12 +105,9 @@ impl SemanticModelOverlay {
                 // supertypes, so a walk that misses it can only miss Object
                 // itself, which the Java conversion classifier proves first
                 // (#12136). Otherwise a missing witness stays open.
-                let (_, edges) = self
-                    .java_hierarchy
-                    .get(&current.id)
-                    .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
+                let owner = owner.ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
                 Ok((
-                    edges.clone(),
+                    owner.hierarchy.clone(),
                     current.callable_surface_complete && !current.provenance.ambiguous,
                     None,
                 ))

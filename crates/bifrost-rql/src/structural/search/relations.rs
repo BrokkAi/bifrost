@@ -80,7 +80,10 @@ pub(super) fn source_call_site_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     mode: SourceCallInventoryMode,
-) -> (Vec<PipelineExpansion>, bool) {
+) -> (
+    Vec<PipelineExpansion>,
+    Result<(), Vec<DiagnosticExecutionCause>>,
+) {
     let file = declaration.unit.source();
     let reuse = &mut cache.reuse;
     let metered = mode == SourceCallInventoryMode::Reachability;
@@ -98,18 +101,24 @@ pub(super) fn source_call_site_expansions(
             .source_call_inventory
             .read_mut(&memo_attribution(analyzer), |inventories| {
                 if let Some(inventory) = inventories.get(file) {
-                    return Some(inventory.clone());
+                    return Ok(inventory.clone());
                 }
-                let facts = read_facts()?;
+                let facts = read_facts().ok_or(DiagnosticExecutionCause::Provider)?;
                 let mut owners: HashMap<(usize, usize), Vec<u32>> = HashMap::default();
                 for (id, node) in facts.nodes().iter().enumerate() {
-                    if cancellation.is_some_and(CancellationToken::is_cancelled)
-                        || budget.fact_nodes.saturating_add(budget.examined_references)
-                            >= limits.max_fact_nodes
+                    let stop = if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        Some(DiagnosticExecutionCause::Cancelled)
+                    } else if budget.fact_nodes.saturating_add(budget.examined_references)
+                        >= limits.max_fact_nodes
                     {
+                        Some(DiagnosticExecutionCause::Budget)
+                    } else {
+                        None
+                    };
+                    if let Some(cause) = stop {
                         analyzer.mark_execution_dependent();
                         reuse.join_in(EXECUTION_DEPENDENT);
-                        return None;
+                        return Err(cause);
                     }
                     budget.fact_nodes += 1;
                     if !node.kind.satisfies(NormalizedKind::Call) {
@@ -122,7 +131,7 @@ pub(super) fn source_call_site_expansions(
                         {
                             analyzer.mark_execution_dependent();
                             reuse.join_in(EXECUTION_DEPENDENT);
-                            return None;
+                            return Err(DiagnosticExecutionCause::Budget);
                         }
                         budget.fact_nodes += 1;
                         let owner = facts.node(parent_id);
@@ -138,46 +147,63 @@ pub(super) fn source_call_site_expansions(
                 }
                 let inventory = Arc::new(SourceCallInventory { facts, owners });
                 inventories.insert(file.clone(), inventory.clone());
-                Some(inventory)
+                Ok(inventory)
             })
     } else {
         // Preserve master's legacy enumeration, including calls in non-callable
         // declarations. It must neither populate nor bypass the metered memo.
-        read_facts().map(|facts| {
-            Arc::new(SourceCallInventory {
-                facts,
-                owners: HashMap::default(),
+        read_facts()
+            .map(|facts| {
+                Arc::new(SourceCallInventory {
+                    facts,
+                    owners: HashMap::default(),
+                })
             })
-        })
+            .ok_or(DiagnosticExecutionCause::Provider)
     };
-    let Some(inventory) = inventory else {
-        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-            has_non_utf8_refusal: false,
-            refusal_sites: Default::default(),
-            call_relation_facts: None,
-            uses_omissions: Vec::new(),
-            incompleteness: Incompleteness::Content,
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::CallRelationParseFailed,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: crate::analyzer::common::language_for_file(file).config_label(),
-            message: format!(
-                "call-sites-from could not read call facts for {}",
-                declaration.unit.fq_name()
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        }));
-        return (Vec::new(), true);
+    let inventory = match inventory {
+        Ok(inventory) => inventory,
+        Err(DiagnosticExecutionCause::Budget) => {
+            push_spent_budget_diagnostic(diagnostics, budget, limits, 2);
+            return (Vec::new(), Err(vec![DiagnosticExecutionCause::Budget]));
+        }
+        Err(DiagnosticExecutionCause::Cancelled) => {
+            push_cancelled_diagnostic(diagnostics);
+            return (Vec::new(), Err(vec![DiagnosticExecutionCause::Cancelled]));
+        }
+        Err(cause) => {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
+                incompleteness: Incompleteness::Operational(cause),
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::CallRelationParseFailed,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: crate::analyzer::common::language_for_file(file).config_label(),
+                message: format!(
+                    "call-sites-from could not read call facts for {}",
+                    declaration.unit.fq_name()
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
+            }));
+            return (Vec::new(), Err(vec![cause]));
+        }
     };
     let Some(semantic) = semantic.as_mut() else {
-        return (Vec::new(), true);
+        return (Vec::new(), Err(vec![DiagnosticExecutionCause::Provider]));
     };
     let mut expansions = Vec::new();
     let mut seen = HashSet::default();
-    let mut exhausted = false;
+    let mut causes = Vec::new();
     let facts = &inventory.facts;
     let legacy_ids = 0..if metered { 0 } else { facts.nodes().len() };
     let owned_ids = inventory
@@ -191,7 +217,10 @@ pub(super) fn source_call_site_expansions(
         .chain(owned_ids)
     {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            exhausted = true;
+            push_cancelled_diagnostic(diagnostics);
+            if !causes.contains(&DiagnosticExecutionCause::Cancelled) {
+                causes.push(DiagnosticExecutionCause::Cancelled);
+            }
             break;
         }
         let node = facts.node(node_index);
@@ -227,7 +256,7 @@ pub(super) fn source_call_site_expansions(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                incompleteness: Incompleteness::Content,
+                incompleteness: Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::CallRelationAnalysisFailed,
@@ -240,12 +269,15 @@ pub(super) fn source_call_site_expansions(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }));
         }
         let Some(shape) =
             crate::analyzer::usages::call_shape::call_shape_for_call(facts, file, node_index, None)
         else {
-            exhausted = true;
+            if !causes.contains(&DiagnosticExecutionCause::Provider) {
+                causes.push(DiagnosticExecutionCause::Provider);
+            }
             continue;
         };
         let range = shape.outcome.range;
@@ -261,8 +293,10 @@ pub(super) fn source_call_site_expansions(
                     bindings.resolved_call_target(analyzer, file, callee, cancellation)
                 })
             });
-        if cause.execution_cause().is_some() {
-            exhausted = true;
+        if let Some(cause) = cause.execution_cause()
+            && !causes.contains(&cause)
+        {
+            causes.push(cause);
         }
         let mut emit =
             |callee: Option<CodeUnit>, target: CallSiteTargetEvidence, proof: UsageProof| {
@@ -270,7 +304,9 @@ pub(super) fn source_call_site_expansions(
                     return;
                 }
                 if expansions.len() >= max_outputs {
-                    exhausted = true;
+                    if !causes.contains(&DiagnosticExecutionCause::Budget) {
+                        causes.push(DiagnosticExecutionCause::Budget);
+                    }
                     return;
                 }
                 let kind = if callee.as_ref().is_some_and(CodeUnit::is_class) {
@@ -288,6 +324,7 @@ pub(super) fn source_call_site_expansions(
                             range: arg.range,
                             name: arg.name.clone(),
                             position: arg.name.is_none().then_some(arg.argument_index),
+                            written_position: arg.position,
                             formal_index: None,
                             formal_name: None,
                             variadic: false,
@@ -371,7 +408,14 @@ pub(super) fn source_call_site_expansions(
             );
         }
     }
-    (expansions, exhausted)
+    (
+        expansions,
+        if causes.is_empty() {
+            Ok(())
+        } else {
+            Err(causes)
+        },
+    )
 }
 
 pub(super) fn reference_expansion(
@@ -405,7 +449,7 @@ pub(super) fn call_site_expansions(
     if !incoming
         && crate::analyzer::common::language_for_file(declaration.unit.source()) == Language::Rust
     {
-        return source_call_site_expansions(
+        let (expansions, completion) = source_call_site_expansions(
             analyzer,
             declaration,
             filter,
@@ -418,6 +462,7 @@ pub(super) fn call_site_expansions(
             semantic,
             SourceCallInventoryMode::Legacy,
         );
+        return (expansions, completion.is_err());
     }
     let result = cached_call_relation(
         analyzer,
@@ -441,9 +486,20 @@ pub(super) fn call_site_expansions(
         .collect::<Vec<_>>();
     let truncated = result.truncated || result.cancelled || sites.len() > max_outputs;
     sites.truncate(max_outputs);
+    let mut current_caller_file: Option<ProjectFile> = None;
     let expansions = sites
         .into_iter()
         .map(|mut site| {
+            // A site's semantic identity keeps no artifact handle, so the
+            // previous caller file's artifact can go before the next loads.
+            if current_caller_file
+                .as_ref()
+                .is_some_and(|previous| previous != &site.file)
+                && let Some(semantic) = semantic.as_mut()
+            {
+                semantic.release_unreferenced_artifacts();
+            }
+            current_caller_file = Some(site.file.clone());
             let semantic_identity = semantic
                 .as_mut()
                 .and_then(|semantic| semantic.call_site_identity_at_source(&site.file, site.range));
@@ -481,6 +537,10 @@ pub(super) fn call_site_expansions(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }));
             }
             pipeline_expansion(PipelineValue::CallSite(CallSiteValue::new(
@@ -1065,6 +1125,10 @@ pub(super) fn unadmitted_call_relation(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }));
             }
             diagnostics.extend(
@@ -1164,14 +1228,18 @@ pub(super) fn map_call_relation_diagnostic(
         diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
     );
     let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
+    let cause = match diagnostic.code {
+        CallRelationDiagnosticCode::BudgetExhausted
+        | CallRelationDiagnosticCode::CandidateLimit
+        | CallRelationDiagnosticCode::ScanGrantRefused(_) => DiagnosticExecutionCause::Budget,
+        _ => DiagnosticExecutionCause::Provider,
+    };
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
         has_non_utf8_refusal: false,
         refusal_sites: Default::default(),
         call_relation_facts: Some(Box::new(diagnostic.facts.clone())),
         uses_omissions: Vec::new(),
-        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
-            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
-        ),
+        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(cause),
         related: Vec::new(),
         source: None,
         code,
@@ -1181,6 +1249,10 @@ pub(super) fn map_call_relation_diagnostic(
         message: diagnostic.message(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     })
 }
 
@@ -1215,6 +1287,8 @@ pub(super) fn call_input_expansions(
                 input: ExpressionInput::Parameter {
                     index: *index,
                     name: argument.formal_name.clone(),
+                    actual_written_position: argument.written_position,
+                    actual_name: argument.name.clone(),
                 },
             })
             .collect(),
@@ -1230,6 +1304,8 @@ pub(super) fn call_input_expansions(
                     input: ExpressionInput::Parameter {
                         index: argument.formal_index?,
                         name: argument.formal_name.clone(),
+                        actual_written_position: argument.written_position,
+                        actual_name: argument.name.clone(),
                     },
                 })
             })
@@ -1360,6 +1436,7 @@ pub(super) fn report_unclassified_reference_kinds(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
     }));
 }
 
@@ -1392,6 +1469,10 @@ fn report_undecided_enclosing_patterns(
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 
@@ -1787,6 +1868,7 @@ pub(super) fn outbound_reference_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     sort_reference_sites(&mut sites);

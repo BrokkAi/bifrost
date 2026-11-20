@@ -256,7 +256,10 @@
           ]
         },
         "receipt": {
-          "$ref": "pack-selection-receipt-v3.schema.json"
+          "oneOf": [
+            { "$ref": "pack-selection-receipt-v3.schema.json" },
+            { "$ref": "pack-selection-receipt-v4.schema.json" }
+          ]
         }
       },
       "required": [

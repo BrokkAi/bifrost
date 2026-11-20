@@ -75,6 +75,17 @@ impl SolverTermination {
             _ => None,
         }
     }
+
+    /// The verdict of the budget refusal that stopped propagation, or
+    /// `Content`. A cancellation reports through its token, not here.
+    pub fn budget_verdict(self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        self.budget_exceeded().map_or(
+            crate::analyzer::reuse_verdict::ReuseVerdict::Content,
+            |exceeded| {
+                crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(&exceeded)
+            },
+        )
+    }
 }
 
 /// One deterministically ordered reached `(node, fact)` state.
@@ -119,6 +130,12 @@ pub struct DataflowResult<Fact> {
     coverage: DataflowCoverage,
     termination: SolverTermination,
     work: SolverWork,
+}
+
+impl<Fact> crate::analyzer::reuse_verdict::CarriesReuseVerdict for DataflowResult<Fact> {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        self.termination.budget_verdict()
+    }
 }
 
 impl<Fact> DataflowResult<Fact> {

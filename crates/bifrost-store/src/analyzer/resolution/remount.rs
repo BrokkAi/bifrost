@@ -62,6 +62,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed,
             common,
             identities,
+            rust_gap_scan_work,
         } = self;
         let (identities, translation) = (*identities).rekey_dense();
         let cancellation = CancellationToken::default();
@@ -76,6 +77,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed,
             common,
             identities: Box::new(identities),
+            rust_gap_scan_work,
         }
     }
 
@@ -122,6 +124,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed,
             common,
             identities,
+            rust_gap_scan_work,
         } = self;
         let fragment = lexical.fragment();
         let lexical = remount_lexical(lexical, fragment, assigned, cancellation)?;
@@ -132,6 +135,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed,
             common,
             identities: Box::new(identities.retargeted(assigned)),
+            rust_gap_scan_work,
         })
     }
 
@@ -149,6 +153,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed,
             common,
             identities,
+            rust_gap_scan_work,
         } = self;
         let (identities, translation) = (*identities).remount(fragment, cancellation)?;
         let lexical = remount_lexical(lexical, fragment, &translation, cancellation)?;
@@ -164,6 +169,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed,
             common,
             identities: Box::new(identities),
+            rust_gap_scan_work,
         })
     }
 }
@@ -1211,9 +1217,20 @@ fn remount_common(
         row.package_scope = translation.node(row.package_scope);
         remounted_package_object_exports.push(row);
     }
+    let mut remounted_root_candidates =
+        Vec::with_capacity(shared_language.implicit_root_candidates.len());
+    for mut row in shared_language.implicit_root_candidates {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.frontier = translation.semantic(row.frontier);
+        remounted_root_candidates.push(row);
+    }
     let shared_language = LoweredSharedLanguageFacts {
         aliases: shared_language.aliases,
         extern_aliases: shared_language.extern_aliases,
+        implicit_root_candidates: remounted_root_candidates,
+        declaration_modifiers: shared_language.declaration_modifiers,
         csharp_friend_attributes: shared_language.csharp_friend_attributes,
         compilation_imports: shared_language.compilation_imports,
         call_argument_lists: shared_language.call_argument_lists,

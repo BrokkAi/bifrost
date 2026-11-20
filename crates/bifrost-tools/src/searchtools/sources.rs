@@ -958,30 +958,10 @@ fn semantic_model_source_outcome_with_anchor(
     source_budget: &SourceByteBudget,
 ) -> Option<SourceLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay_read().published()?;
-    let mut matched = if symbol.starts_with("bifrost-model://") {
-        overlay.symbols_at_uri(symbol)
-    } else {
-        overlay.symbols_with_id(symbol)
+    let matched = match required_path {
+        Some(path) => overlay.symbols_for_reference_in_file(symbol, path),
+        None => overlay.symbols_for_reference(symbol),
     };
-    if matched.records.is_empty()
-        && !matches!(
-            matched.disposition,
-            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
-                _
-            )
-        )
-    {
-        matched = overlay.symbols_named(symbol);
-    }
-    if let Some(required_path) = required_path {
-        matched.records.retain(|model| {
-            matches!(
-                &model.location,
-                brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
-                    if anchor.path == required_path
-            )
-        });
-    }
     let disposition = if matches!(
         matched.disposition,
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)

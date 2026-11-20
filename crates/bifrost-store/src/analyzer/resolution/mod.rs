@@ -8,6 +8,13 @@
 pub mod batch;
 mod canonical_identity;
 #[doc(hidden)]
+pub mod classified_supertype;
+pub use classified_supertype::{
+    ClassifiedSupertypeKind, NominalParentTargetKind, NominalSupertypeKind,
+    SupertypeClassification, SupertypeKindEvidence, SupertypeKindOpenReason,
+    classify_supertype_kind,
+};
+#[doc(hidden)]
 pub mod common_fact_lowering;
 #[doc(hidden)]
 pub mod completion_reasons;
@@ -412,7 +419,7 @@ pub(super) const fn binding_projection_kind_rank(
         BindingProjectionKind::TargetMemberOwnerType => 5,
         BindingProjectionKind::TargetNominalTypeIdentity => 6,
         BindingProjectionKind::TargetCallableLaterResultType => 7,
-        BindingProjectionKind::NonInvokingMemberReference => 8,
+        BindingProjectionKind::BindingOnlyMemberReference => 8,
         BindingProjectionKind::BareTermBinding => 9,
         BindingProjectionKind::BareTermBindingNoExpectedType => 10,
     }
@@ -629,6 +636,11 @@ pub use fact_resolution::FactTargetReferenceAnswer;
 pub use fact_resolution::FactTargetReferenceBatchAnswer;
 pub use fact_resolution::SelectedFactResolutionEngine;
 pub use fact_resolution::SelectedFactResolutionSnapshot;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use fact_resolution::admit_base_receiver_for_test;
+pub use fact_resolution::receiver_proof::BaseReceiverContextObservation;
+pub use fact_resolution::{BaseReceiverRejection, DeferredBaseReceiverRequest};
 
 #[doc(hidden)]
 pub use fact_resolution::FactIntrinsicTypeDescriptor;
@@ -642,11 +654,11 @@ pub use fact_resolution::FactProjectedTypeNodeForm;
 pub use fact_resolution::FactProjectedTypeShape;
 pub(crate) use fact_resolution::FactResolutionOperation;
 pub(crate) use fact_resolution::ForwardOperationArtifactContext;
-pub(crate) use fact_resolution::GoReceiverSlotTypeOverlay;
 pub(crate) use fact_resolution::PolledCompletionAccumulator;
 pub(crate) use fact_resolution::SelectedFactOperationBlueprint;
 #[doc(hidden)]
 pub use fact_resolution::SelectedFactOperationBlueprintConstruction;
+pub(crate) use fact_resolution::SelectedReceiverSlotOverride;
 #[doc(hidden)]
 pub use fact_resolution::{
     CanonicalChannelDirection, CanonicalTypeIdentity, CanonicalTypeNode,
@@ -662,14 +674,14 @@ pub use fact_resolution::reverse_fact_evaluation_count_for_test;
 #[doc(hidden)]
 pub use fact_resolution::with_full_typed_pass_for_test;
 pub(crate) use fact_resolution::{
-    CloseContinuationId, CloseProgress, CloseResume, HierarchyCursorScope, HierarchyDemandRequest,
-    HierarchyLinearizationPolicy, HierarchyOrderBudget, HierarchyOrderDecision,
-    HierarchyOrderFrontier, HierarchyOrderHead, HierarchyOrderOutcome, HierarchyOrderOutcomeId,
-    HierarchyOrderPolicyId, HierarchyOrderRequest, HierarchyOrderStatus, HierarchyOrderedOwner,
-    HierarchyProvenanceView, HierarchyProviderAuthority, HierarchyProviderKey,
-    HierarchyProviderObservation, HierarchyProviderOperand, HierarchyProviderVisit,
-    HierarchySelectionProvenance, HierarchySequenceId, HierarchySequenceRole,
-    HierarchyTailMembership, ProviderObservationStore, RootClosure,
+    CloseContinuationId, CloseProgress, CloseResume, CompleteSelection, HierarchyCursorScope,
+    HierarchyDemandRequest, HierarchyLinearizationPolicy, HierarchyOrderBudget,
+    HierarchyOrderDecision, HierarchyOrderFrontier, HierarchyOrderHead, HierarchyOrderOutcome,
+    HierarchyOrderOutcomeId, HierarchyOrderPolicyId, HierarchyOrderRequest, HierarchyOrderStatus,
+    HierarchyOrderedOwner, HierarchyProvenanceView, HierarchyProviderAuthority,
+    HierarchyProviderKey, HierarchyProviderObservation, HierarchyProviderOperand,
+    HierarchyProviderVisit, HierarchySelectionProvenance, HierarchySequenceId,
+    HierarchySequenceRole, HierarchyTailMembership, ProviderObservationStore, RootClosure,
 };
 #[doc(hidden)]
 pub use fact_resolution::{
@@ -718,9 +730,14 @@ pub(crate) use fact_source::language_jvm_package_requires_directory_agreement;
 pub(crate) use fact_source::language_type_qualifiers_search_companion_members;
 pub(crate) use fact_source::visit_mapped_typed_pages;
 pub use fact_source::{
-    ClassCreationKind, ConditionalTypeSeed, ImplicitAppendedBase, ImplicitBaseAuthority,
-    ImplicitBaseInputs, ImplicitRootObject, ImplicitWrittenBaseObjects,
+    ClassCreationKind, ConditionalTypeSeed, ConditionalTypeSeedContext, ConditionalTypeSeedRead,
+    ImplicitAppendedBase, ImplicitBaseAuthority, ImplicitBaseInputs, ImplicitRootObject,
+    ImplicitWrittenBaseObjects, SelectedDeclarationMethodAttributes, SelectedImplicitRootInput,
+    SelectedSourceImplicitRoot,
 };
+
+#[doc(hidden)]
+pub use fact_resolution::{NormalizedDirectParent, NormalizedDirectParents};
 
 pub use fact_source::DeferredMemberOwnerLookupName;
 pub use fact_source::DeferredMemberOwnerProof;
@@ -762,11 +779,11 @@ pub use fact_source::SelectedTypedRow;
 pub use fact_source::SelectedTypedRowIdentity;
 pub use fact_source::SelectedTypedRowKey;
 pub use fact_source::TypedFactPageVisitor;
-pub use fact_source::TypedFactReadOutcome;
 pub use fact_source::TypedFactReadTerminal;
 pub use fact_source::TypedFactRequest;
 pub use fact_source::{FactModelMember, FactModelMemberSelection};
 pub(crate) use fact_source::{SelectedJavaGapOccurrence, SelectedJavaTypeFrontierContribution};
+pub use fact_source::{TypedFactInventoryEvidence, TypedFactReadOutcome};
 
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
 
@@ -988,6 +1005,7 @@ pub struct LoweredResolutionFactsWithIdentityCatalog {
     pub common: common_fact_lowering::LoweredCommonFacts,
     #[doc(hidden)]
     pub identities: Box<ResolutionIdentityCatalog>,
+    pub(crate) rust_gap_scan_work: crate::analyzer::span_index::SpanScanWork,
 }
 
 fn binder_namespace_matches_kind(
@@ -1088,6 +1106,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed: self.typed.clone(),
             common: self.common.clone(),
             identities: self.identities.clone(),
+            rust_gap_scan_work: self.rust_gap_scan_work,
         }
     }
 
@@ -1177,6 +1196,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed: self.typed.clone(),
             common: self.common.clone(),
             identities: self.identities.clone(),
+            rust_gap_scan_work: self.rust_gap_scan_work,
         }
         .rekey_dense()
     }
@@ -1249,6 +1269,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             typed: LoweredTypedFragment::empty(fragment, language),
             common,
             identities: Box::new(identities),
+            rust_gap_scan_work: crate::analyzer::span_index::SpanScanWork::default(),
         }
         .rekey_dense()
     }
@@ -1497,9 +1518,9 @@ pub fn lower_resolution_facts_for_selection(
         language,
         facts,
     );
-    let common =
+    let (common, rust_gap_scan_work) =
         common_fact_lowering::lower_common_resolution_facts(&mut identities, language, facts);
-    finish_lowered_resolution_facts(lexical, typed, common, identities)
+    finish_lowered_resolution_facts(lexical, typed, common, identities, rust_gap_scan_work)
 }
 
 #[cfg(test)]
@@ -1517,9 +1538,9 @@ pub(crate) fn lower_resolution_paths_with_identity_catalog_for_test(
         language,
         &facts,
     );
-    let common =
+    let (common, rust_gap_scan_work) =
         common_fact_lowering::lower_common_resolution_facts(&mut identities, language, &facts);
-    finish_lowered_resolution_facts(lexical, typed, common, identities)
+    finish_lowered_resolution_facts(lexical, typed, common, identities, rust_gap_scan_work)
 }
 
 fn finish_lowered_resolution_facts(
@@ -1527,6 +1548,7 @@ fn finish_lowered_resolution_facts(
     typed: typed_fact_lowering::LoweredTypedFragment,
     common: common_fact_lowering::LoweredCommonFacts,
     identities: local_identity::ResolutionIdentityCatalogBuilder,
+    rust_gap_scan_work: crate::analyzer::span_index::SpanScanWork,
 ) -> LoweredResolutionFactsWithIdentityCatalog {
     let identities = identities.finish();
     assert_lookup_recipes_reach_emitted_artifact(&lexical, &typed, &common, &identities);
@@ -1536,6 +1558,7 @@ fn finish_lowered_resolution_facts(
         typed,
         common,
         identities: Box::new(identities),
+        rust_gap_scan_work,
     }
     .rekey_dense()
 }

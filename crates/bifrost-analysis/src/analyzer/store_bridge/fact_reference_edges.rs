@@ -2448,8 +2448,10 @@ const fn inverse_reason_rank(reason: &EdgeIncompleteReason) -> u8 {
         EdgeIncompleteReason::InverseIndexMetadataIncomplete => 13,
         EdgeIncompleteReason::InverseIndexTargetUncovered => 14,
         EdgeIncompleteReason::TimeBudgetExceeded => 15,
+        EdgeIncompleteReason::ReceiverBudgetExhausted => 18,
         EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => 16,
         EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => 17,
+        EdgeIncompleteReason::InverseIndexOpenSite(_) => 19,
     }
 }
 

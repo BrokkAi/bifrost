@@ -368,6 +368,7 @@ impl AnalyzerStore {
         Ok(())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn finding_free_class_set_root_result(
         &self,
         key: &FindingFreeClassSetRootKey,
@@ -405,6 +406,10 @@ impl AnalyzerStore {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn class_set_root_result_store_snapshot_for_test(
         &self,
     ) -> Result<ClassSetRootResultStoreSnapshot> {

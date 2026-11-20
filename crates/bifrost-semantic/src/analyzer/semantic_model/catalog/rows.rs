@@ -7,6 +7,26 @@ use super::{CatalogError, SessionSemanticCatalog};
 
 pub const SEMANTIC_ROWS_INDEX_VERSION: i64 = 4;
 
+/// Payload-projected tables that can contribute composed-search fill rows.
+/// Keep this registry beside the declaration projection below. The fill read
+/// observation test checks it against SQLite's actual prepared statements.
+pub const SEARCH_FILL_TABLES: &[&str] = &[
+    "catalog_declaration_types",
+    "catalog_declaration_names",
+    "catalog_declaration_members",
+    "catalog_member_aliases",
+    "catalog_declaration_relations",
+];
+
+/// Conservative table-level relevance; all these rows are projections of the
+/// CompiledShard payload covered by artifact::semantic_digest.
+pub fn search_fill_relevance_statement() -> String {
+    let predicates = SEARCH_FILL_TABLES.iter().map(|table| {
+        format!("EXISTS(SELECT 1 FROM active_{table} WHERE source_db=:source_db AND shard_key=:shard_key)")
+    }).collect::<Vec<_>>();
+    format!("SELECT ({}) AS relevant", predicates.join(" OR "))
+}
+
 /// Payload families recorded beside their child rows. Optional companions
 /// distinguish absent from present-empty; declaration vectors such as forwards
 /// publish presence only when nonempty. The schema boundary test pins the CHECK.
@@ -713,6 +733,65 @@ mod tests {
             )
             .unwrap();
         shard
+    }
+
+    #[test]
+    #[hardwon("#9559: request-owned search read each candidate's rows by point lookups")]
+    fn search_owner_qualification_batches_bound_cold_sql_work() {
+        use crate::analyzer::semantic_model::catalog::statements::SEARCH_OWNER_QUALIFICATIONS;
+        for (count, requested) in [(64, 64), (2048, 2048), (2048, 1), (2048, 0)] {
+            let durable = open_session_semantic_catalog().unwrap();
+            let session = open_session_semantic_catalog().unwrap();
+            let manifest = "1".repeat(64);
+            for catalog in [&durable, &session] {
+                let shard = seed(&catalog.connection, &manifest, "seed");
+                catalog.connection.execute(
+                    "WITH RECURSIVE ids(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM ids WHERE i+1<?1)
+                     INSERT INTO catalog_declaration_types(shard_key,record_id,record_json)
+                     SELECT ?2,'id'||i,json_object('type_kind','class','name','Type'||i,'guard',NULL)
+                     FROM ids", params![count, shard],
+                ).unwrap();
+                catalog
+                    .connection
+                    .execute(
+                        "INSERT INTO catalog_declaration_names
+                     SELECT shard_key,record_key,record_id,'java','type',1
+                     FROM catalog_declaration_types WHERE record_id<>'seed'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            attach_session_rows(&durable.connection, &session).unwrap();
+            for source in ["durable", "session"] {
+                select_active_shard_source(&durable.connection, &manifest, "seed", source)
+                    .unwrap()
+                    .unwrap();
+            }
+            let ids = serde_json::to_string(
+                &(0..requested).map(|i| format!("id{i}")).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            // First execution on a fresh reader at each inventory size. Measure
+            // VM work as well as returned rows: one statement can still contain
+            // a quadratic nested scan through the compound active views.
+            let mut query = durable
+                .connection
+                .prepare(SEARCH_OWNER_QUALIFICATIONS)
+                .unwrap();
+            let rows = query
+                .query_map(rusqlite::named_params! { ":ids": ids }, |row| {
+                    row.get::<_, String>("record_id")
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows.len(), 2 * requested as usize);
+            let steps = query.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(
+                steps < requested * 600 + 10_000,
+                "{requested} requested of {count} owners: {steps} VM steps"
+            );
+        }
     }
 
     #[test]

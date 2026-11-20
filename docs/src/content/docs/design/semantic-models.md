@@ -29,11 +29,14 @@ Artifact validity, applicability, declaration binding, and behavioral
 completeness are recorded independently.
 
 An exact closed Rust receiver can select one nongeneric inherent declaration
-without establishing its external body's effects. Call-binding results name
-this proof `resolver_declaration`; `selector_exact` certifies declaration
-selection and formal mapping. Runtime dispatch completeness remains on the
-separate dispatch fields. Structured source projections still validate the
-selected declaration's return type, and traversal still needs admitted
+without establishing its external body's effects. When dispatch proves that
+selection exact, including a partial arm whose only gap is the unavailable
+body, the binding reports the stronger `derived` selector proof. A
+declaration-only proof whose runtime dispatch is not exact is reported
+separately as `resolver_declaration`. `selector_exact` certifies declaration
+selection and formal mapping, while runtime dispatch completeness remains on
+the separate dispatch fields. Structured source projections still validate
+the selected declaration's return type, and traversal still needs admitted
 summaries or native effects. Generic owners whose declaring impl conditions
 are unavailable remain refused.
 
@@ -44,6 +47,46 @@ with the call's ordinary dispatch and unmodeled residual. Their proof comes
 from their own evidence; partial coverage leaves unknown effects and prevents
 clean absence through the call. A partial sanitizer affects only its declared
 transfer edge.
+
+## Host approval of first-party packs
+
+Review-gated packs require either an explicit compatible enable control or host
+approval of their exact validated content. The official CLI carries a compact
+inventory of a verified first-party release. It contains manifest and shard
+identities, not pack payloads; packs must still be installed and applicable to
+the workspace. A pack name, publisher label, acquisition receipt or installation
+source never grants approval. Byte-identical copies retain their content
+membership; changed content requires its own approval. Explicit disable,
+compatibility, entitlement and license checks still apply.
+
+A host may replace the compiled inventory with an absolute, nonsymlink file
+outside every analyzed root, pinned by process arguments:
+
+```text
+--pack-approval-inventory PATH --pack-approval-inventory-sha256 HEX
+```
+
+Both arguments are required together. There is no environment, repository
+configuration or tool-request equivalent. The engine hashes the opened file
+snapshot and refuses invalid authority rather than falling back. A rootless
+server checks the outside-root condition when it binds each workspace. The
+effective source, inventory digest and approval identity appear in version and
+pack-activation diagnostics. Library embeddings without a host context have an
+explicit library-none identity and receive no default approval.
+
+The offline `prepare-pack-approval-inventory` command derives metadata from an
+archive pinned by SHA-256. It shares release verification of safe extraction,
+index and manifest agreement, SHA256SUMS and every shard digest. Runtime launch
+loads the resulting compact inventory once and passes one immutable context to
+all analyzer factories and query scopes. It does no inventory work per request
+or resident fence. A new release or override changes activation-dependent keys,
+including empty model sets and no-model reads. Source-only parse, index,
+resolution and Rust unit-summary identities remain independent of approval.
+
+A policy that resolves qualified model declarations also records their activation
+provenance in its resolved meaning. Its resolved semantic hash therefore follows
+the active-set identity even when its authored text is unchanged. Source-only
+policy meaning does not acquire this model provenance.
 
 ## Exact binding
 
@@ -64,6 +107,29 @@ Binding requires:
 
 If the required identity is absent, ambiguous, conflicting, or only partially
 modeled, Bifrost preserves that boundary in the result.
+
+Callable groups are chosen from the complete owner, member name, receiver and
+provider context before filtering a call's arguments. A resolver-selected
+record chooses its declaration group; every overload in that group contributes
+to its family identity. Language rules supply the partition. In Rust, inherent
+members and implementations of different traits belong to separate groups.
+Instantiations of the same trait declaration share one group, including when
+a type argument is unknown. The original arguments remain in the record's
+signature, applicability and certification checks. An unknown trait
+declaration cannot certify a group, and it keeps a known trait group open
+when it could belong to that group. The inherent group remains distinct from
+trait implementations. Selection narrows candidates and still requires the
+selected group's completeness evidence.
+
+Qualified declaration locators use the same group and certification checks.
+Rust can nominate an inherent declaration group when a type-owned locator
+actually matches an inherent member. The call site independently proves scope
+and applicability, so naming that declaration cannot resolve an uncertain
+call. Owner-only multi-record aliases retain an endpoint identity over their
+matched declaration subset. Group metadata is a runtime projection of facts
+already covered by the pack digest and record identity. It adds neither an
+authored field nor an independent composition input; generated declarations
+currently use the owner group.
 
 Python runtime class bases and exact imported calls share bounded, structured
 lexical import selection. A function-local import is eligible only when it is
@@ -226,6 +292,15 @@ for the acquisition, registers the selected packs and activates the whole set.
 Policy catalog loading waits for the acquisition on first use. One-shot
 commands acquire before they run.
 
+Open-pack selection receipts identify releases and verified content, independently
+of the cache's absolute location. A new process can use an intact cache copied
+to a different `BIFROST_LAUNCHER_CACHE_DIR` while offline. Artifact locations are
+derived from that process's cache root and manifest digests. Older receipts may
+contain diagnostic paths; readers never open those paths and verify the current
+cache's bytes instead. A published selection with a missing required artifact
+refuses bootstrap, rather than becoming a successful startup without its models.
+An empty offline cache retains the ordinary no-selection behavior.
+
 Startup verifies the release envelope and the assets it consumes. It does not
 hash unused distribution assets, so damage to one of those assets can remain
 undetected until another operation reads it. Full-bundle verification remains
@@ -340,6 +415,21 @@ When a language's own reconcile has already run discovery for an update, activat
 
 The provider identity includes one digest of the evidence that consumers read, the declared modules and the truncated flag of each language. So products built from different evidence never replay against each other.
 
+## JVM catalog search reuse
+
+JVM search warming is optional work after the final activation becomes Ready
+(#9559). Readiness certifies the activation, not a latency target or a populated
+search cache. Library callers fill on demand. Warming and ordinary requests
+must use the same input selection and fill path, so warming cannot establish a
+second source of model authority.
+
+Search reuse follows the selected inputs rather than the spelling of a realm
+filter. An unfiltered search and a JVM-filtered search may share storage when
+they select identical inputs. In a mixed-language activation they may select
+different inputs and must remain separate. This sharing does not remove the
+asking request's dependency reads: both input derivation and reused results
+must retain their read evidence.
+
 ### Reusing complete activation within one generation
 
 A repeated request against the same immutable analyzer generation reuses a complete dependency activation instead of running discovery again. Reuse requires the pre-discovery activation key to match, no captured discovery to still be pending publication, every recorded external read to still match, and the retained Ready snapshot to remain the published one. Project membership and project reads are fixed for the generation, so those inputs cannot change. Partial, cancelled and configured Python-runtime activations reactivate. The update carry below is the cross-generation counterpart: it separately proves the new generation's inputs after discovery.
@@ -348,13 +438,13 @@ A repeated request against the same immutable analyzer generation reuses a compl
 
 Every reader gets the selected models from one accessor on the analyzer. It answers one of three states: published, pending, or not selected. A pending answer is typed incompleteness (`semantic_models_pending`) that every query in the request records. Absence of an overlay is never read as "no models apply".
 
-A workspace update starts with no published overlay on the new snapshot. It carries the previous publication over only when the activation key is equal and the changed paths meet three conditions. No changed path equals, contains or lies inside the workspace model directory. No changed path equals, contains or lies inside a workspace path the published overlay was authored from, including the anchors of a row-backed overlay. Every changed spelling can be certified. Otherwise the new snapshot stays pending, and the existing coalesced background warm publishes the replacement. An update never rebuilds an activation synchronously. Once an update has gone pending, a later unrelated edit does not make the older publication reusable again.
+A workspace update starts with no published overlay on the new snapshot. It carries the previous publication over only when the activation key is equal, no changed path touches the workspace model directory, and no workspace-bound Authored anchor is touched. A fallback source locator remains a dependency even when it previously resolved to a model URI or a carried-source zero-range anchor. Related fallback locators are re-resolved against the next workspace and compared with the publication. A changed binding leaves the next snapshot pending, and the existing coalesced background warm publishes its replacement. An update never rebuilds an activation synchronously. Once an update has gone pending, a later unrelated edit does not make the older publication reusable again.
 
-A change event can name only a directory: a renamed `.bifrost`, or a renamed directory that holds an authored source. So the comparison runs in both directions, component by component, and never on string prefixes (`.bifrost2` does not touch `.bifrost`). One helper, `ChangedPaths` in `bifrost-core`, owns that relation. The carry proof and the MCP check that decides whether an update refreshes the global pack inputs both call it. The proof scans every authored path of the overlay and never stops at a count. If a row-backed read cannot finish (an open family, cancellation or a budget stop), the scan answers that a path is touched, so carry is refused.
+One source-input owner maintains the locator dependencies and the Authored-only anchor view used by queries. Eager inputs keep ordered dependency postings under the overlay's retention charge. Row-backed inputs keep their locator inventory in indexed catalog rows: a changed path selects only related locators through ancestor equality and descendant subtree bounds. Carried-source fallback anchors are compared like other fallbacks, so an unrelated declaration at a carried locator's path preserves the same publication allocation. The final-symbol path-query index remains Authored-only and does not prove carry.
 
-A changed spelling is certified when it is a member of the exact post-update workspace listing. Any other spelling (a deleted path, a directory, an ignored or omitted entry, or an alias) is compared a second time with case folded. A spelling with an existing symlink among its ancestors refuses carry for every authored path, because the project cannot say which file the link reached. The MCP check has no project view to certify against, so it compares every spelling both exactly and with case folded. An uncertified spelling also leaves the overlay pending, and the pending branch of the update then refreshes the activation.
+The shared `ChangedPaths` helper owns spelling certification and component-wise containment. Existing workspace bindings retain its exact and conservative case-folded protections: directory events, aliases and symlink-reached paths cannot carry a touched authored location. Unrelated absent paths still carry, and `src2` does not touch `src`. Fallback bindings require exact `ProjectFile` equality, which preserves case and symlink spelling and normalizes only lexical dot components, even on case-insensitive filesystems. Their candidate lookup therefore uses the same bounded binary path indexes for listed, deleted and other reported spellings. Ordinary listed saves do not scan the locator inventory. Request-owned source locators bind only to immutable carried entries, so workspace edits do not rebind them. An incomplete or cancelled binding lookup refuses carry.
 
-The retained publication state is in memory and bounded by the session's retention budget. It adds no persisted identity or schema.
+The retained publication state is in memory and bounded by the session's retention budget. The catalog stores original locators rather than resolved workspace anchors. The #13500 repair retires persisted derivatives of an old wrongly carried publication once through the workspace ICFG provider pair (class-set roots, field slots, summaries and surfaces) and policy substrate (policy units and evaluations). No binding digest is added to the active-model-set hash.
 
 A source block records whether its text came from the workspace or from a semantic model. Only workspace-origin blocks can make a request refresh workspace files. A model's authored location is not a workspace path, even when its spelling matches one.
 

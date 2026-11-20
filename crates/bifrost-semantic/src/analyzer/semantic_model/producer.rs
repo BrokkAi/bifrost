@@ -145,13 +145,45 @@ pub fn failed_artifact_production(
     )
 }
 
+/// Select the schema required by the declarations retained in a generated pack.
+/// Any signature with Some bounds, including Some([]), requires the bounds schema.
+pub fn required_schema_version(base: u32, shards: &[AuthoredShard]) -> u32 {
+    if shards.iter().any(|shard| match &shard.payload {
+        crate::analyzer::semantic_model::AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            ..
+        } => members
+            .iter()
+            .chain(
+                types
+                    .iter()
+                    .filter_map(|owner| owner.jvm_inventory.as_ref())
+                    .flat_map(|inventory| &inventory.additional_members),
+            )
+            .any(|member| {
+                member
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.bounds.is_some())
+            }),
+        _ => false,
+    }) {
+        base.max(
+            crate::analyzer::semantic_model::model::METHOD_TYPE_PARAMETER_BOUNDS_MIN_SCHEMA_VERSION,
+        )
+    } else {
+        base
+    }
+}
+
 #[doc(hidden)]
 pub fn finish_authored_pack_production(
     request: &ArtifactProductionRequest,
     artifact_sha256: &str,
     producer_name: &str,
     language: &str,
-    diagnostics: Vec<ProducerDiagnostic>,
+    mut diagnostics: Vec<ProducerDiagnostic>,
     suppressed_diagnostics: SuppressedDiagnostics,
     mut shards: Vec<AuthoredShard>,
 ) -> ArtifactProduction {
@@ -160,22 +192,28 @@ pub fn finish_authored_pack_production(
             selector.artifact_sha256 = Some(artifact_sha256.to_owned());
         }
     }
-    let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
+    let mut completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
         Completeness::Complete
     } else {
         Completeness::Partial
     };
     let carried_sources = carried_source_paths(&shards);
-    let pack = (!shards.is_empty()).then(|| AuthoredSemanticModelPack {
-        extraction: Some(crate::analyzer::semantic_model::ArtifactExtraction::single(
+    let mut pack = (!shards.is_empty()).then(|| {
+        AuthoredSemanticModelPack {
+        extraction: Some(crate::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
             request.artifact_kind,
-            artifact_sha256,
+            &[crate::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(
+                crate::analyzer::semantic_model::dependency::DependencyArtifactRole::Declarations,
+                request.artifact_kind, artifact_sha256)],
         )),
-        schema_version: if request.provenance.rust_artifact_approximation.is_some() {
-            crate::analyzer::semantic_model::model::RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION
-        } else {
-            crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
-        },
+        schema_version: required_schema_version(
+            if request.provenance.rust_artifact_approximation.is_some() {
+                crate::analyzer::semantic_model::model::RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION
+            } else {
+                crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
+            },
+            &shards,
+        ),
         pack_id: request.pack_id.clone(),
         version: request.pack_version.clone(),
         producer: Producer {
@@ -196,7 +234,23 @@ pub fn finish_authored_pack_production(
         rust_external_reexports_truncated: false,
         rust_external_reexports_glob_incomplete: false,
         shards,
+    }
     });
+    if let Some(authored) = &pack {
+        let errors = crate::analyzer::semantic_model::validate::check_authored_selectors(authored);
+        if !errors.is_empty() {
+            diagnostics.extend(errors.into_iter().map(|error| ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: error.code,
+                location: Some(error.path),
+                source_entry: None,
+                declaration: None,
+                message: error.message,
+            }));
+            pack = None;
+            completeness = Completeness::Partial;
+        }
+    }
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
         pack,
@@ -208,11 +262,8 @@ pub fn finish_authored_pack_production(
 
 impl crate::analyzer::semantic_model::ArtifactExtraction {
     pub fn from_artifact(kind: ExternalArtifactKind, artifact: &ExactArtifact) -> Self {
-        if artifact.source_entries().is_empty() {
-            Self::single(kind, artifact.sha256())
-        } else {
-            Self::source_set(kind, artifact.sha256())
-        }
+        Self::from_verified_slots(kind, &[crate::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(
+            crate::analyzer::semantic_model::dependency::DependencyArtifactRole::Declarations, kind, artifact.sha256())])
     }
 }
 

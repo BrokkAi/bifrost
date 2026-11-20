@@ -35,6 +35,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
 use brokk_bifrost_core::analyzer::model::AmbientUseRole;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCompleteness;
@@ -326,6 +327,8 @@ pub fn unused_imports_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> UnusedImportsFileResult {
+    // External callers such as LSP push diagnostics do not hold a request scope.
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let language = language_for_file(file);
     let support = unused_import_support(language);
     if support != UnusedImportSupport::Reports {

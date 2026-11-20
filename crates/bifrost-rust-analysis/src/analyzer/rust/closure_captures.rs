@@ -17,7 +17,7 @@ use brokk_bifrost_analysis::analyzer::lexical_definitions::{
 use brokk_bifrost_core::analyzer::model::Language;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest;
-use brokk_bifrost_rust::lexical_scope::{RustPatternName, rust_pattern_name_bounded};
+use brokk_bifrost_rust::lexical_scope::RustPatternName;
 use tree_sitter::Node;
 
 use crate::analyzer::rust::semantic::{is_rust_nested_execution_boundary, named_children};
@@ -31,6 +31,10 @@ pub(crate) struct RustFreeVariableReference<'tree> {
     pub declaration_range: Range<usize>,
     pub reference: Node<'tree>,
 }
+
+/// Classifies one binder name node, passing its work to the charge callback.
+pub(crate) type RustPatternNameFn<'f, 'tree, E> =
+    dyn Fn(Node<'tree>, &mut dyn FnMut(usize) -> Result<(), E>) -> Result<RustPatternName, E> + 'f;
 
 pub(crate) struct RustCallableFreeVariables<'tree> {
     /// Every reference to a binding declared outside `callable`, in walk order.
@@ -55,11 +59,18 @@ pub(crate) struct RustCallableFreeVariables<'tree> {
 /// with the entries a pattern classification walks. It is also called with `0`
 /// to give the caller a cancellation checkpoint after each lookup. It must
 /// fail when the caller must stop, and the error propagates.
+///
+/// `pattern_name` classifies the binder name of each resolved local, passing
+/// `charge` on. A caller that holds the file's `RustPlainScope` must pass its
+/// indexed `pattern_name`: the walk without an index scans every item of every
+/// enclosing scope for each reference, which made this pass quadratic in the
+/// file size (#12363).
 pub(crate) fn rust_callable_free_variables<'tree, E>(
     callable: Node<'tree>,
     body: Node<'tree>,
     prepared: &'tree PreparedSyntaxTree,
     forest: Option<&'tree EmbeddedSyntaxForest>,
+    pattern_name: &RustPatternNameFn<'_, 'tree, E>,
     charge: &mut dyn FnMut(usize) -> Result<(), E>,
 ) -> Result<RustCallableFreeVariables<'tree>, E> {
     let mut result = RustCallableFreeVariables {
@@ -85,7 +96,15 @@ pub(crate) fn rust_callable_free_variables<'tree, E>(
             result.saw_macro_invocation = true;
         }
         if matches!(node.kind(), "identifier" | "self") {
-            note_identifier(callable, node, prepared, forest, charge, &mut result)?;
+            note_identifier(
+                callable,
+                node,
+                prepared,
+                forest,
+                pattern_name,
+                charge,
+                &mut result,
+            )?;
         }
         if let Some(operands) = forest.and_then(|forest| forest.children(node.id())) {
             nodes.extend(operands.rev());
@@ -101,6 +120,7 @@ fn note_identifier<'tree, E>(
     node: Node<'tree>,
     prepared: &'tree PreparedSyntaxTree,
     forest: Option<&'tree EmbeddedSyntaxForest>,
+    pattern_name: &RustPatternNameFn<'_, 'tree, E>,
     charge: &mut dyn FnMut(usize) -> Result<(), E>,
     result: &mut RustCallableFreeVariables<'tree>,
 ) -> Result<(), E> {
@@ -179,12 +199,7 @@ fn note_identifier<'tree, E>(
     // Bare pattern names may denote value items, and a glob import can make
     // that distinction unknown. Match the lowerer: Unknown still creates a
     // tentative local, whose Values gap carries the uncertainty into captures.
-    match rust_pattern_name_bounded(
-        prepared.tree().root_node(),
-        source,
-        name_node,
-        &mut |entries| charge(entries),
-    )? {
+    match pattern_name(name_node, charge)? {
         RustPatternName::Binding | RustPatternName::Unknown => {}
         RustPatternName::ValueItem => return Ok(()),
     }

@@ -672,7 +672,10 @@ impl GoCallableMaterialization for WorkspaceSemanticOracle<'_> {
         };
         if activated_path != factory_path
             || activated_symbol != factory_symbol
-            || activated.shard.matched_evidence.artifact_sha256.as_deref() != Some(artifact_sha256)
+            || !activated
+                .shard
+                .matched_evidence
+                .contains_raw_sha256(artifact_sha256)
         {
             return Ok(None);
         }

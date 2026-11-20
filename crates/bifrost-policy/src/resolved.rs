@@ -854,6 +854,12 @@ pub struct ResolvedTaintBarrier {
     pub origins: Vec<EndpointOrigin>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedTaintGuardBarrier {
+    pub definition: TaintGuardBarrierSpec,
+    pub selector_path: PolicySelectorPath,
+}
+
 /// Finite, set-oriented taint input. It never contains a source/sink pair product.
 #[derive(Debug, Clone)]
 pub struct ResolvedTaintPolicySpec {
@@ -864,6 +870,7 @@ pub struct ResolvedTaintPolicySpec {
     pub sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
     pub sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
     pub barriers: Vec<ResolvedTaintBarrier>,
+    pub guard_barriers: Vec<ResolvedTaintGuardBarrier>,
     /// Framework entry points (#2692). Each is a full source-shaped endpoint
     /// whose `bind` names the tainted formal parameter of the *selected
     /// declaration* rather than a port of a selected call.
@@ -937,6 +944,7 @@ impl ResolvedTaintPolicySpec {
             sinks,
             sanitizers,
             barriers,
+            guard_barriers: Vec::new(),
             entry_points,
             transforms,
             external_models,
@@ -1032,7 +1040,15 @@ pub enum ResolvedTypestateBinding {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResolvedTypestateTransferSpec {
+    pub id: TypestateEventId,
+    pub selector_path: PolicySelectorPath,
+    pub from: TypestateCallBinding,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolvedTypestateAutomatonSpec {
+    pub transfers: Vec<ResolvedTypestateTransferSpec>,
     pub event_set: Option<TypestateEventSetSpec>,
     pub states: Vec<TypestateStateId>,
     pub initial: TypestateStateId,
@@ -1051,6 +1067,7 @@ impl ResolvedTypestateAutomatonSpec {
         self.accepting_states.dedup();
         self.error_states.sort();
         self.error_states.dedup();
+        self.transfers.sort_by(|left, right| left.id.cmp(&right.id));
         self.events.sort_by(|left, right| left.id.cmp(&right.id));
         self.transitions.sort_by(|left, right| {
             (&left.from, &left.on, &left.to).cmp(&(&right.from, &right.on, &right.to))
@@ -1235,6 +1252,19 @@ impl LoadedEndpoint {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedMatchGuardBarrier {
+    pub definition: ResolvedTaintGuardBarrier,
+    pub tokens: Box<[brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardRemovalToken]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchGuardLoadNote {
+    pub guard_id: TaintEntryId,
+    pub relation_id: Option<&'static str>,
+    pub message: String,
+}
+
 /// A validated policy after every reference and composition dependency is closed.
 #[derive(Debug, Clone)]
 pub struct LoadedPolicy {
@@ -1252,6 +1282,8 @@ pub struct LoadedPolicy {
     resolved_taint: Option<ResolvedTaintPolicySpec>,
     resolved_without_flow: Option<ResolvedTaintPolicySpec>,
     resolved_typestate: Option<ResolvedTypestatePolicySpec>,
+    match_guards: Vec<ResolvedMatchGuardBarrier>,
+    match_guard_load_notes: Vec<MatchGuardLoadNote>,
 }
 
 impl LoadedPolicy {
@@ -1382,7 +1414,27 @@ impl LoadedPolicy {
             resolved_taint,
             resolved_without_flow,
             resolved_typestate,
+            match_guards: Vec::new(),
+            match_guard_load_notes: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_match_guards(
+        mut self,
+        match_guards: Vec<ResolvedMatchGuardBarrier>,
+        match_guard_load_notes: Vec<MatchGuardLoadNote>,
+    ) -> Self {
+        self.match_guards = match_guards;
+        self.match_guard_load_notes = match_guard_load_notes;
+        self
+    }
+
+    pub fn match_guards(&self) -> &[ResolvedMatchGuardBarrier] {
+        &self.match_guards
+    }
+
+    pub fn match_guard_load_notes(&self) -> &[MatchGuardLoadNote] {
+        &self.match_guard_load_notes
     }
 
     pub fn definition(&self) -> &PolicyDefinition {
@@ -1751,6 +1803,37 @@ fn validate_loaded_policy_model(
     validate_precedence(precedence, dependencies, resolved_taint, resolved_typestate)
 }
 
+fn validate_resolved_guard_barriers(
+    authored: &PolicyGuardConfiguration,
+    resolved: &[ResolvedTaintGuardBarrier],
+    segments: TaintSetSegments,
+) -> Result<(), LoadedModelError> {
+    if authored.barriers.len() != resolved.len()
+        || contains_duplicates(resolved.iter().map(|guard| guard.definition.id.clone()))
+    {
+        return invalid("resolved guard barriers differ from the authored set");
+    }
+    for guard in &authored.barriers {
+        let Some(selected) = resolved
+            .iter()
+            .find(|selected| selected.definition.id == guard.id)
+        else {
+            return invalid("authored guard barrier is absent from the resolved plan");
+        };
+        let expected_path = selector_path(&guard_barrier_selector_path(
+            segments.guard_barriers,
+            &guard.id,
+        ))?;
+        if selected.selector_path != expected_path
+            || crate::canonical::guard_barrier_to_json(&selected.definition)
+                != crate::canonical::guard_barrier_to_json(guard)
+        {
+            return invalid("resolved guard barrier differs from its authored definition");
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_resolved_taint(
     definition: &PolicyDefinition,
@@ -1764,6 +1847,7 @@ fn validate_resolved_taint(
 ) -> Result<(), LoadedModelError> {
     let policy_id = &definition.metadata.id;
     let segments = definition.analysis.set_segments();
+    validate_resolved_guard_barriers(&authored.guards, &resolved.guard_barriers, segments)?;
     let mut authored_threat_models = authored.threat_models.clone();
     authored_threat_models.sort();
     authored_threat_models.dedup();
@@ -1953,6 +2037,11 @@ fn validate_resolved_taint(
                 );
             }
         }
+        validate_resolved_guard_barriers(
+            &authored_secondary.guards,
+            &secondary.guard_barriers,
+            WITHOUT_FLOW_SET_SEGMENTS,
+        )?;
         for sanitizer in &authored_secondary.sanitizers.entries {
             let identity = ResolvedEndpointIdentity::Local {
                 policy_id: policy_id.clone(),
@@ -2580,6 +2669,19 @@ fn validate_typestate_automaton(
     {
         return invalid("resolved typestate state graph differs from the authored graph");
     }
+    if resolved.transfers.len() != authored.transfers.len() {
+        return invalid("resolved state transfers differ from authored transfers");
+    }
+    for transfer in &authored.transfers {
+        let path = typestate_transfer_selector_path(&transfer.id);
+        if !resolved.transfers.iter().any(|candidate| {
+            candidate.id == transfer.id
+                && candidate.from == transfer.from
+                && candidate.selector_path.as_str() == path
+        }) {
+            return invalid("resolved state transfer differs from its authored declaration");
+        }
+    }
     if resolved.event_set != authored.event_set {
         return invalid("resolved typestate event set differs from the authored declaration");
     }
@@ -3044,7 +3146,12 @@ fn validate_authored_policy_selectors(
 ) -> Result<(), LoadedModelError> {
     match &definition.analysis {
         PolicyAnalysis::Match { spec } => {
-            validate_authored_selector_at("/analysis/selector", &spec.selector, selectors)?
+            validate_authored_selector_at("/analysis/selector", &spec.selector, selectors)?;
+            for guard in &spec.guards.barriers {
+                for (path, selector) in guard.selectors(TAINT_SET_SEGMENTS) {
+                    validate_authored_selector_at(&path, selector, selectors)?;
+                }
+            }
         }
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &spec.relational {
@@ -3079,6 +3186,11 @@ fn validate_authored_policy_selectors(
                     &sink.selector,
                     selectors,
                 )?;
+            }
+            for guard in &spec.guards.barriers {
+                for (path, selector) in guard.selectors(segments) {
+                    validate_authored_selector_at(&path, selector, selectors)?;
+                }
             }
             for sanitizer in &spec.sanitizers.entries {
                 validate_authored_selector_at(
@@ -3125,6 +3237,11 @@ fn validate_authored_policy_selectors(
             }
             if let Some(without) = &spec.without_flow {
                 let segments = WITHOUT_FLOW_SET_SEGMENTS;
+                for guard in &without.guards.barriers {
+                    for (path, selector) in guard.selectors(segments) {
+                        validate_authored_selector_at(&path, selector, selectors)?;
+                    }
+                }
                 for source in &without.sources.entries {
                     validate_authored_selector_at(
                         &taint_entry_selector_path(segments.sources, source.id.as_str()),
@@ -3168,6 +3285,13 @@ fn validate_authored_policy_selectors(
                         json_pointer_segment(subject.id.as_str())
                     ),
                     &subject.selector,
+                    selectors,
+                )?;
+            }
+            for transfer in &spec.automaton.transfers {
+                validate_authored_selector_at(
+                    &typestate_transfer_selector_path(&transfer.id),
+                    &transfer.selector,
                     selectors,
                 )?;
             }
@@ -3641,7 +3765,14 @@ fn expected_selector_paths(
 ) -> Result<Vec<PolicySelectorPath>, LoadedModelError> {
     let mut paths = Vec::new();
     match &definition.analysis {
-        PolicyAnalysis::Match { .. } => paths.push(selector_path("/analysis/selector")?),
+        PolicyAnalysis::Match { spec } => {
+            paths.push(selector_path("/analysis/selector")?);
+            for guard in &spec.guards.barriers {
+                for (path, _) in guard.selectors(TAINT_SET_SEGMENTS) {
+                    paths.push(selector_path(&path)?);
+                }
+            }
+        }
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &spec.relational {
                 for binding in &plan.bindings {
@@ -3657,6 +3788,11 @@ fn expected_selector_paths(
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
             let segments = definition.analysis.set_segments();
+            for guard in &spec.guards.barriers {
+                for (path, _) in guard.selectors(segments) {
+                    paths.push(selector_path(&path)?);
+                }
+            }
             extend_taint_paths(&mut paths, segments.sources, &spec.sources.entries)?;
             extend_taint_paths(&mut paths, segments.sinks, &spec.sinks.entries)?;
             extend_taint_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries)?;
@@ -3678,6 +3814,11 @@ fn expected_selector_paths(
             extend_taint_paths(&mut paths, segments.stores, &spec.store_reads)?;
             if let Some(without) = &spec.without_flow {
                 let segments = WITHOUT_FLOW_SET_SEGMENTS;
+                for guard in &without.guards.barriers {
+                    for (path, _) in guard.selectors(segments) {
+                        paths.push(selector_path(&path)?);
+                    }
+                }
                 extend_taint_paths(&mut paths, segments.sources, &without.sources.entries)?;
                 extend_taint_paths(&mut paths, segments.sanitizers, &without.sanitizers.entries)?;
                 for entry in &without.sanitizers.entries {
@@ -3701,6 +3842,11 @@ fn expected_selector_paths(
                 paths.push(selector_path(&format!(
                     "/analysis/subjects/entries/{}/selector",
                     json_pointer_segment(subject.id.as_str())
+                ))?);
+            }
+            for transfer in &spec.automaton.transfers {
+                paths.push(selector_path(&typestate_transfer_selector_path(
+                    &transfer.id,
                 ))?);
             }
             for event in &spec.automaton.events {

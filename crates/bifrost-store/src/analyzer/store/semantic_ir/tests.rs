@@ -684,11 +684,15 @@ mod row_fixture {
             },
             SemanticValueKind::ConstantString("  padded \t".into()),
             SemanticValueKind::ConstantString("   ".into()),
+            SemanticValueKind::Address,
+            SemanticValueKind::Address,
+            SemanticValueKind::Address,
         ];
         p0.values = value_kinds
             .into_iter()
             .enumerate()
             .map(|(index, kind)| SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: v(u32::try_from(index).unwrap()),
@@ -697,6 +701,19 @@ mod row_fixture {
                 evidence: ev(2),
             })
             .collect();
+        for (value, borrow) in p0
+            .values
+            .iter_mut()
+            .filter(|value| value.kind == SemanticValueKind::Address)
+            .zip([
+                crate::analyzer::semantic::ActualBorrowKind::Unknown,
+                crate::analyzer::semantic::ActualBorrowKind::Shared,
+                crate::analyzer::semantic::ActualBorrowKind::Mutable,
+                crate::analyzer::semantic::ActualBorrowKind::Raw,
+            ])
+        {
+            value.actual_borrow = borrow;
+        }
         p0.values[0].source = sm(3);
         p0.allocations = [
             AllocationKind::Object,
@@ -1631,6 +1648,28 @@ mod row_fixture {
                 None,
                 None,
             ),
+            guard(
+                11,
+                None,
+                GuardPredicate::ValueEquality {
+                    left: v(0),
+                    right: v(8),
+                    negated: true,
+                },
+                Some(arm(2, ControlEdgeKind::ConditionalTrue)),
+                Some(arm(3, ControlEdgeKind::ConditionalFalse)),
+            ),
+            guard(
+                12,
+                None,
+                GuardPredicate::ValueOrdering {
+                    left: v(0),
+                    right: v(10),
+                    relation: IntegerComparison::GreaterThan,
+                },
+                Some(arm(2, ControlEdgeKind::ConditionalTrue)),
+                Some(arm(3, ControlEdgeKind::ConditionalFalse)),
+            ),
         ];
         let switch_edge = |source: u32, target: u32, kind| SwitchEdgeParts {
             source_point: pt(source),
@@ -1974,6 +2013,7 @@ mod row_fixture {
         };
         p1.values = vec![
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: v(0),
@@ -1982,6 +2022,7 @@ mod row_fixture {
                 evidence: ev(0),
             },
             SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: v(1),
@@ -2347,6 +2388,16 @@ mod row_fixture {
                 p0.gaps.push(gap);
             }
         }
+        // Keep the older discharge variants covered as well as the new one.
+        p0.gaps.push(gap(
+            u32::try_from(p0.gaps.len()).unwrap(),
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unknown,
+            None,
+            SemanticGapDischarge::CreatingRealizationBindsCaptures,
+        ));
         Fixture {
             scope,
             parts: vec![p0, p1, p2, p3, p4],
@@ -3587,6 +3638,20 @@ fn guarded_semantic_ir_sparse_typed_rows_round_trip() {
         rusqlite::params![blob_id, record.anchor.start_byte, record.anchor.end_byte],
     )
     .unwrap();
+    // Exercise the table rebuild with populated base and candidate namespaces,
+    // including their four referencing obligation tables and foreign keys ON.
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    conn.execute_batch(include_str!(
+        "../../../../../bifrost-core/migrations/cache/0516-creating-realization-captures.sql"
+    ))
+    .unwrap();
+    assert_eq!(
+        super::decode::read_and_decode(&conn, blob_id, &fixture.scope)
+            .unwrap()
+            .unwrap()[0]
+            .gaps,
+        fixture.parts[0].gaps,
+    );
     let mut decoded = super::decode::read_guarded(&conn, blob_id, &fixture.scope).unwrap();
     assert_eq!(decoded.len(), 1);
     let decoded = decoded.remove(0);
@@ -3720,7 +3785,24 @@ fn candidate_macro_rows_have_one_guarded_reader() {
                                         "ALTER TABLE candidate_macro_semantic_ir_gaps_pre_m2 RENAME TO ",
                                     )
                             })));
+            // Test-only publication audits enumerate physical tables and
+            // compare raw rows; they never decode candidate IR for answers.
+            // `derived_rows` is the enumerator over the module-level list.
+            let publication_audit = (self
+                .file
+                .ends_with("/store/derived_publication_test_support.rs")
+                && matches!(self.function.as_str(), "" | "derived_rows")
+                && reference.starts_with("candidate_macro_semantic_ir_")
+                && reference
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'))
+                || (self
+                    .file
+                    .ends_with("/tests/suite_persistence/source_preserving_producer_upgrade.rs")
+                    && self.function == "rust_producer_upgrades_preserve_source"
+                    && reference == "candidate_macro_semantic_ir_candidates");
             let allowed = downgrade
+                || publication_audit
                 || (codec
                     && matches!(
                         self.function.as_str(),
@@ -3750,6 +3832,8 @@ fn candidate_macro_rows_have_one_guarded_reader() {
                             | "candidate_records_upgrade_from_real_m2_schema"
                             | "implicit_drop_discharge_migration_preserves_populated_gap_tables"
                             | "guarded_pattern_gap_upgrade_preserves_both_namespaces"
+                            | "guard_value_comparison_migration_preserves_legacy_rows"
+                            | "actual_borrow_migration_upgrades_a_populated_comparison_cache"
                     ));
             if !allowed {
                 self.violations

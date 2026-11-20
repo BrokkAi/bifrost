@@ -41,7 +41,6 @@ use crate::analyzer::store::model_catalog::{
     CatalogRowReader, CatalogRuntimeSourceReader, RequestRowReaderSource,
 };
 
-use crate::analyzer::JVM_SEMANTIC_PACK_LANGUAGES;
 use crate::analyzer::Language;
 use crate::analyzer::LanguageDialect;
 use crate::analyzer::semantic_pack_realm;
@@ -399,6 +398,16 @@ pub struct SemanticModelActivationExplanation {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_activation: Option<Box<crate::analyzer::semantic_model::HostActivationMetadata>>,
+
+    /// Best-effort external projection publication failures, visible to activation clients.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_publication_diagnostics",
+        serialize_with = "serialize_publication_diagnostics"
+    )]
+    pub publication_diagnostics: PublicationDiagnostics,
     pub explanations: Vec<SemanticModelActivationExplanation>,
     pub suppressed_explanations: usize,
     pub catalog_candidates: usize,
@@ -420,6 +429,53 @@ pub struct SemanticModelActivationReport {
     pub overlay_budget_exceeded: Option<SemanticModelOverlayBudgetExceeded>,
 }
 
+/// Shared runtime diagnostics for an activation and its report snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct PublicationDiagnostics(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl std::ops::Deref for PublicationDiagnostics {
+    type Target = std::sync::Mutex<Vec<String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PartialEq for PublicationDiagnostics {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        let left = self.lock().expect("publication diagnostics lock").clone();
+        let right = other.lock().expect("publication diagnostics lock").clone();
+        left == right
+    }
+}
+
+impl Eq for PublicationDiagnostics {}
+
+fn serialize_publication_diagnostics<S: serde::Serializer>(
+    diagnostics: &PublicationDiagnostics,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &*diagnostics.lock().expect("publication diagnostics lock"),
+        serializer,
+    )
+}
+
+fn deserialize_publication_diagnostics<'de, D>(
+    deserializer: D,
+) -> Result<PublicationDiagnostics, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let diagnostics = Vec::<String>::deserialize(deserializer)?;
+    Ok(PublicationDiagnostics(Arc::new(std::sync::Mutex::new(
+        diagnostics,
+    ))))
+}
+
 /// A database-local key is meaningful only together with its publishing database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogShardRowIdentity {
@@ -435,8 +491,9 @@ pub enum CatalogShardDatabase {
 
 #[derive(Debug, Clone)]
 pub struct ActiveSemanticModelShardMetadata {
-    /// One or more activation inputs are approximate.
-    pub approximate: bool,
+    /// One or more activation inputs are approximate, and why. The single
+    /// source of the approximate bit: [`Self::approximate`] is its view.
+    pub approximation: Option<crate::analyzer::semantic_model::ApproximationReasons>,
     /// This activation used the stdlib's assumed Rust version. The version is
     /// in matched_evidence.toolchain; an observed pin leaves this false even
     /// when dependency-artifact provenance is independently approximate.
@@ -468,6 +525,21 @@ pub struct ActiveSemanticModelShardMetadata {
 }
 
 impl ActiveSemanticModelShardMetadata {
+    /// Content digest plus audit revision: the member identity every model-set
+    /// key uses (#14077). `descriptor.semantic_sha256` stays the verified
+    /// content digest.
+    pub fn identity(&self) -> String {
+        brokk_bifrost_semantic::analyzer::semantic_model::artifact::shard_identity(
+            &self.descriptor.semantic_sha256,
+            self.manifest.provenance.revision.as_deref(),
+        )
+    }
+
+    /// The shard was selected without exact activation evidence.
+    pub fn approximate(&self) -> bool {
+        self.approximation.is_some()
+    }
+
     /// The extraction authority this activation grants. Readers use this,
     /// never the manifest's claim.
     pub fn extraction(&self) -> Option<&crate::analyzer::semantic_model::ArtifactExtraction> {
@@ -510,6 +582,18 @@ impl ActiveSemanticModelShard {
                     | CatalogPackSourceKind::PreShipped
                     | CatalogPackSourceKind::Embedded
             )
+    }
+
+    /// Resolver inventory providers are scoped for the JVM projection only.
+    /// Other realms retain their semantic pack identity.
+    pub fn inventory_provider_id(&self) -> String {
+        if semantic_pack_realm(&self.manifest.language) == "jvm" {
+            super::jvm_external_publication::jvm_external_provider_id(
+                &self.manifest.semantic_sha256,
+            )
+        } else {
+            self.manifest.semantic_sha256.clone()
+        }
     }
 
     /// Payload readers must make their dependency on decoded data explicit.
@@ -633,10 +717,20 @@ impl Default for ActivationExclusions {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedActiveSemanticModels {
+    host_activation: Arc<crate::analyzer::semantic_model::HostActivationContext>,
+    /// Activation-local content-keyed bits for composed-search table relevance.
+    pub search_fill_relevance: Arc<std::sync::Mutex<HashMap<String, bool>>>,
+    /// Pure digest of the immutable physical request-owned shard view.
+    pub request_view_digest: std::sync::OnceLock<[u8; 32]>,
+    pub preparation_failures: Vec<
+        brokk_bifrost_semantic::analyzer::semantic_model::dependency::RecordedPreparationFailure,
+    >,
     #[doc(hidden)]
     pub charge: brokk_bifrost_core::retention_budget::AllocationCharge,
+    #[cfg(any(test, feature = "test-support"))]
+    test_question_reader: Option<TestQuestionReader>,
     pub active_model_set_hash: String,
     #[doc(hidden)]
     pub source_reader: Option<Arc<CatalogRuntimeSourceReader>>,
@@ -646,8 +740,28 @@ pub struct ResolvedActiveSemanticModels {
     pub indexes: MatcherIndexes,
     pub extraction_gaps: Vec<Arc<ActivePackExtractionGap>>,
     pub extraction_gaps_by_declaration: HashMap<String, Vec<usize>>,
+    /// The manifest `semantic_sha256` of every active artifact extraction
+    /// whose accounting names each loss as a warning-grade, declaration-scoped
+    /// gap (`pack_is_activation_ready`, with no rejected source entry). A
+    /// partial pack listed here lost nothing about a declaration that no
+    /// extraction gap names. An activation built without accounting lists
+    /// none, which proves nothing.
+    pub packs_naming_every_loss: HashSet<String>,
     pub excluded_shards: ActivationExclusions,
     pub report: SemanticModelActivationReport,
+}
+
+// A test-only extra owner at the existing SQL row-reader boundary. It can fail
+// one question after binding while preserving real rows from another reader.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+struct TestQuestionReader(Arc<dyn CatalogRowReader + Send + Sync>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Debug for TestQuestionReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestQuestionReader")
+    }
 }
 
 pub struct RowOwners {
@@ -726,6 +840,17 @@ impl brokk_bifrost_core::retention_budget::SelfCharged for ResolvedActiveSemanti
 }
 
 impl ResolvedActiveSemanticModels {
+    pub fn with_host_activation(
+        mut self,
+        host: Arc<crate::analyzer::semantic_model::HostActivationContext>,
+    ) -> Self {
+        self.host_activation = host;
+        self
+    }
+    pub fn host_activation(&self) -> &Arc<crate::analyzer::semantic_model::HostActivationContext> {
+        &self.host_activation
+    }
+
     /// Construct an activation before installing its optional request owner.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -739,16 +864,23 @@ impl ResolvedActiveSemanticModels {
         report: SemanticModelActivationReport,
     ) -> Self {
         Self {
+            host_activation: Default::default(),
             active_model_set_hash,
+            #[cfg(any(test, feature = "test-support"))]
+            test_question_reader: None,
             source_reader,
             shards,
             indexes,
             extraction_gaps,
             extraction_gaps_by_declaration,
+            packs_naming_every_loss: HashSet::default(),
             excluded_shards,
             report,
             charge: Default::default(),
             request_source: None,
+            request_view_digest: Default::default(),
+            search_fill_relevance: Default::default(),
+            preparation_failures: Vec::new(),
         }
     }
 
@@ -773,6 +905,36 @@ impl ResolvedActiveSemanticModels {
             .is_none_or(|source| source.reads_through_activation())
             .then_some(0);
         shard_owner_index(shard, Some(0), request_index) == Some(0)
+    }
+
+    /// Admit request-owned inventory only after publication by this request.
+    /// Ownership is conservative: any request-owned shard naming an id gates it.
+    pub fn gate_inventory_providers(&self, providers: &mut Vec<String>) -> Option<FamilyOpen> {
+        let owned = self
+            .shards
+            .iter()
+            .filter(|shard| shard.request_owned())
+            .map(|shard| shard.inventory_provider_id())
+            .collect::<std::collections::HashSet<_>>();
+        if owned.is_empty() {
+            return None;
+        }
+        let bound = self
+            .request_source()
+            .ok_or_else(|| FamilyOpen::jvm("JVM inventory request owner unavailable"))
+            .and_then(|source| source.jvm_reader(self));
+        match bound {
+            Ok(owner) => {
+                providers.retain(|id| {
+                    !owned.contains(id.as_str()) || owner.certified_providers.contains(id)
+                });
+                None
+            }
+            Err(open) => {
+                providers.retain(|id| !owned.contains(id.as_str()));
+                Some(open)
+            }
+        }
     }
 
     pub fn shard_row_reader(
@@ -904,6 +1066,20 @@ impl ResolvedActiveSemanticModels {
         let through_activation = source
             .as_ref()
             .is_none_or(|source| source.reads_through_activation());
+        debug_assert!(
+            through_activation
+                || self.shards.iter().all(|shard| {
+                    shard_owner_index(shard, Some(0), Some(1)) != Some(1) || shard.decoded.is_none()
+                }),
+            "distinct request owner has decoded shards: {:?}",
+            self.shards
+                .iter()
+                .filter(|shard| {
+                    shard_owner_index(shard, Some(0), Some(1)) == Some(1) && shard.decoded.is_some()
+                })
+                .map(|shard| &shard.manifest.pack_id)
+                .collect::<Vec<_>>()
+        );
         let was_distinct = self
             .request_source
             .as_ref()
@@ -922,6 +1098,33 @@ impl ResolvedActiveSemanticModels {
         }
         self.request_source = source;
         Ok(())
+    }
+
+    /// Replace only the request source with its already-bound equivalent.
+    /// Unlike installation, freezing preserves the activation reader snapshot.
+    #[doc(hidden)]
+    pub fn with_frozen_request_source(&self, source: Arc<dyn RequestRowReaderSource>) -> Self {
+        assert_eq!(
+            source.reads_through_activation(),
+            self.request_source()
+                .is_none_or(|source| source.reads_through_activation())
+        );
+        let mut frozen = self.clone();
+        frozen.request_source = Some(source);
+        frozen
+    }
+
+    /// Add a row-question owner without changing the immutable selected model
+    /// set. Only fixture construction may install this failure-injection seam.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_with_question_reader(
+        &self,
+        reader: Arc<dyn CatalogRowReader + Send + Sync>,
+    ) -> Self {
+        let mut active = self.clone();
+        active.test_question_reader = Some(TestQuestionReader(reader));
+        active
     }
 
     pub fn request_source(&self) -> Option<&Arc<dyn RequestRowReaderSource>> {
@@ -1388,6 +1591,8 @@ impl ResolvedActiveSemanticModels {
         self.report
             .retained_bytes
             .saturating_add(self.excluded_shards.retained_bytes())
+            // The activation and its carried publication inputs each own a copy.
+            .saturating_add(brokk_bifrost_semantic::analyzer::semantic_model::dependency::preparation_failures_retained_bytes(&self.preparation_failures).saturating_mul(2))
     }
 
     pub fn types_with_id(&self, id: &str) -> SemanticModelMatch<TypeFact> {
@@ -2418,6 +2623,13 @@ pub fn python_artifact_applies_to_target(
     })
 }
 
+/// Whether a member of this PyPI shard applies only through the selected
+/// distribution artifact. A shard that installed-wheel evidence activated is
+/// bound to those exact bytes. A shard that a workspace pin activated (an
+/// artifact-less `pkg:pypi/<name>` row with a version, from a lock or
+/// requirements file) is bound to that name and version, which the owner
+/// accepted as exact evidence (#14581); its members apply the way a
+/// standard-library pack's do.
 pub fn python_shard_requires_distribution_artifact(
     shard: &ActiveSemanticModelShard,
     target: &UnmaterializedExternalTarget,
@@ -2429,6 +2641,10 @@ pub fn python_shard_requires_distribution_artifact(
                 .package
                 .as_ref()
                 .is_some_and(|package| package.name.starts_with("pkg:pypi/"))
+        })
+        && shard.matching_evidence.iter().any(|evidence| {
+            !evidence.verified_raw_artifacts.is_empty()
+                || evidence.production_input_digest.is_some()
         })
 }
 
@@ -2580,9 +2796,9 @@ fn receiver_first_actual_to_formal(
     Some(written.iter().map(|formal| formal + 1).collect())
 }
 
-/// Rows of one catalog question, in publication order, with the state of its
-/// JVM-family part. When `jvm_open` is set, JVM-family rows may be missing and
-/// the rows are only possible candidates; a single reader never sets it.
+/// Rows of one catalog question, in publication order, with any open part.
+/// Content gaps affect their declared languages; read failures and cancellation
+/// affect every language. Affected rows are only possible candidates.
 #[derive(Debug)]
 pub struct FamilyRows<R> {
     pub rows: R,
@@ -2598,11 +2814,9 @@ impl<R> FamilyRows<R> {
         }
     }
 
-    /// The open part seen by a consumer that keeps only `language`'s rows:
-    /// rows of a non-JVM language are complete either way.
+    /// The open part affecting a consumer that keeps only `language`'s rows.
     pub fn open_for_language(&self, language: &str) -> Option<FamilyOpen> {
-        self.jvm_open
-            .filter(|_| JVM_SEMANTIC_PACK_LANGUAGES.contains(&language))
+        self.jvm_open.filter(|open| open.covers(language))
     }
 
     pub fn map<S>(self, rows: impl FnOnce(R) -> S) -> FamilyRows<S> {
@@ -2708,7 +2922,19 @@ pub fn matcher_posting_admission(
         coordinate(hasher, value.toolchain.as_ref());
         option(hasher, value.target.as_deref());
         option(hasher, value.configuration.as_deref());
-        option(hasher, value.artifact_sha256.as_deref());
+        option(hasher, value.production_input_digest.as_deref());
+        for input in &value.verified_raw_artifacts {
+            hasher.field("raw-role", &[input.role as u8]);
+            hasher.field(
+                "raw-kind",
+                brokk_bifrost_semantic::analyzer::semantic_model::dependency::artifact_kind_name(
+                    input.kind,
+                )
+                .as_bytes(),
+            );
+            option(hasher, input.module.as_deref());
+            hasher.field("raw-sha256", &input.sha256);
+        }
     }
     fn digest(active: &[Arc<ActiveSemanticModelShard>], curated_only: bool) -> [u8; 32] {
         let mut hasher = CanonicalHasher::new(b"bifrost.matcher-posting-admission.v1");
@@ -2740,7 +2966,7 @@ pub fn matcher_posting_admission(
                 hasher.value(b"assumed-rust-toolchain");
             }
             hasher.value(&[
-                u8::from(shard.approximate),
+                u8::from(shard.approximate()),
                 u8::from(shard.extraction_deferred),
                 u8::from(shard.decoded.is_some()),
             ]);
@@ -2755,7 +2981,7 @@ pub fn matcher_posting_admission(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MatcherIndexes {
     admission: MatcherPostingAdmission,
     types_by_id: HashMap<String, Vec<RecordAddress>>,
@@ -3587,25 +3813,23 @@ pub fn merge_ordered_semantic_results<T>(
     rows: impl IntoIterator<Item = T>,
     compare: impl Fn(&T, &T) -> std::cmp::Ordering,
 ) -> Vec<T> {
+    ordered_semantic_results(decoded, rows, compare).collect()
+}
+
+/// Lazily merge source-ordered decoded and resident rows, retaining ties.
+pub fn ordered_semantic_results<T>(
+    decoded: impl IntoIterator<Item = T>,
+    rows: impl IntoIterator<Item = T>,
+    compare: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> impl Iterator<Item = T> {
     let mut decoded = decoded.into_iter().peekable();
     let mut rows = rows.into_iter().peekable();
-    let mut result = Vec::new();
-    loop {
-        let next = match (decoded.peek(), rows.peek()) {
-            (Some(left), Some(right)) => {
-                if compare(left, right).is_le() {
-                    decoded.next()
-                } else {
-                    rows.next()
-                }
-            }
-            (Some(_), None) => decoded.next(),
-            (None, Some(_)) => rows.next(),
-            (None, None) => break,
-        };
-        result.push(next.expect("one merge input is nonempty"));
-    }
-    result
+    std::iter::from_fn(move || match (decoded.peek(), rows.peek()) {
+        (Some(left), Some(right)) if compare(left, right).is_le() => decoded.next(),
+        (Some(_), Some(_)) | (None, Some(_)) => rows.next(),
+        (Some(_), None) => decoded.next(),
+        (None, None) => None,
+    })
 }
 
 /// Shared evidence selection for decoded postings and query-owned catalog rows.
@@ -3656,8 +3880,8 @@ fn resolve_ranked_records<T: Eq>(
                     && candidate.record.as_ref() == record.as_ref()
                     && !(candidate.shard.matched_evidence.ecosystem == "jdk"
                         && shard.matched_evidence.ecosystem == "jdk"
-                        && candidate.shard.matched_evidence.artifact_sha256
-                            != shard.matched_evidence.artifact_sha256)
+                        && candidate.shard.matched_evidence.verified_raw_artifacts
+                            != shard.matched_evidence.verified_raw_artifacts)
             })
         {
             records.push(ActivatedSemanticModelRecord {
@@ -3914,6 +4138,81 @@ pub fn resolve_procedure_records(
     }
 }
 
+macro_rules! owner_provider_member_rows {
+    () => {
+        r#"SELECT m.source_db,m.shard_key,m.record_id,m.record_json,0 AS origin,m.record_key AS position
+                      FROM active_catalog_declaration_members m
+                      WHERE m.source_db=:source AND m.shard_key=:shard AND m.owner_id=:owner
+                        AND json_extract(m.record_json,'$.guard') IS NULL
+                      UNION ALL
+                      SELECT t.source_db,t.shard_key,json_extract(extra.value,'$.id'),extra.value,1,CAST(extra.key AS INTEGER)
+                      FROM active_catalog_declaration_types t,
+                           json_each(t.record_json,'$.jvm_inventory.additional_members') extra
+                      WHERE t.source_db=:source AND t.shard_key=:shard AND t.record_id=:owner
+                        AND json_extract(extra.value,'$.guard') IS NULL
+                        AND json_extract(extra.value,'$.owner')=:owner
+                    "#
+    };
+}
+
+/// Provider members for one owner, in published inventory ordinal order.
+/// An open family cannot prove the member list complete.
+pub fn owner_provider_members(
+    active: &ResolvedActiveSemanticModels,
+    owner: &ActivatedSemanticModelRecord<TypeFact>,
+) -> Result<Vec<MemberFact>, FamilyOpen> {
+    if owner.shard.decoded.is_none() {
+        let identity = owner
+            .shard
+            .row_store
+            .expect("row-backed owner has catalog coordinates");
+        let source = match identity.database {
+            CatalogShardDatabase::Durable => "durable",
+            CatalogShardDatabase::Session => "session",
+        };
+        let records = crate::analyzer::store::model_catalog::semantic_catalog_question(
+            "OWNER_PROVIDER_MEMBERS",
+            &owner.record.id,
+            (active.shard_row_reader(&owner.shard)?.as_ref() as &dyn CatalogRowReader).raw_rows(
+                concat!(
+                    "SELECT source_db,shard_key,record_json FROM (",
+                    owner_provider_member_rows!(),
+                    ") ORDER BY origin,position"
+                ),
+                named_params! { ":source": source, ":shard": identity.shard_key,
+                ":owner": owner.record.id },
+                &active.shards,
+                rows::record_json::<MemberFact>,
+            ),
+        )?;
+        return Ok(records
+            .into_iter()
+            .map(|record| record.record.as_ref().clone())
+            .collect());
+    }
+    Ok(decoded_owner_provider_members(owner).cloned().collect())
+}
+
+fn decoded_owner_provider_members(
+    owner: &ActivatedSemanticModelRecord<TypeFact>,
+) -> impl Iterator<Item = &MemberFact> {
+    owner
+        .shard
+        .decoded()
+        .payload()
+        .declaration_facts()
+        .into_iter()
+        .flat_map(|(_, members, _)| members.iter().map(AsRef::as_ref))
+        .chain(
+            owner
+                .record
+                .jvm_inventory
+                .iter()
+                .flat_map(|inventory| &inventory.additional_members),
+        )
+        .filter(|member| member.owner == owner.record.id && member.guard.is_none())
+}
+
 /// Translate a resolver-selected provider row to its published record identity.
 /// Keep the publisher's owner-member order; overlay composition order is unrelated.
 /// `Err` means the owner's rows may be missing, so absence is not proven.
@@ -3924,7 +4223,7 @@ pub fn selected_external_descriptor(
     let owners = active.all_type_records_named(&selected.owner.owner_fqn);
     let jvm_open = owners.jvm_open;
     for owner in owners.rows {
-        if owner.shard.manifest.semantic_sha256 != selected.owner.provider_id.as_ref() {
+        if owner.shard.inventory_provider_id() != selected.owner.provider_id.as_ref() {
             continue;
         }
         if owner.shard.decoded.is_none() {
@@ -3937,24 +4236,20 @@ pub fn selected_external_descriptor(
                 CatalogShardDatabase::Session => "session",
             };
             let records = crate::analyzer::store::model_catalog::semantic_catalog_question(
-                "SELECTED_EXTERNAL_DESCRIPTOR", selected,
-                (active.shard_row_reader(&owner.shard)?.as_ref() as &dyn CatalogRowReader).raw_rows(
-                    r#"SELECT source_db,shard_key,record_id FROM (
-                      SELECT m.source_db,m.shard_key,m.record_id,0 AS origin,m.record_key AS position
-                      FROM active_catalog_declaration_members m
-                      WHERE m.source_db=:source AND m.shard_key=:shard AND m.owner_id=:owner
-                        AND json_extract(m.record_json,'$.guard') IS NULL
-                      UNION ALL
-                      SELECT t.source_db,t.shard_key,json_extract(extra.value,'$.id'),1,CAST(extra.key AS INTEGER)
-                      FROM active_catalog_declaration_types t,
-                           json_each(t.record_json,'$.jvm_inventory.additional_members') extra
-                      WHERE t.source_db=:source AND t.shard_key=:shard AND t.record_id=:owner
-                        AND json_extract(extra.value,'$.guard') IS NULL
-                        AND json_extract(extra.value,'$.owner')=:owner
-                    ) ORDER BY origin,position LIMIT 1 OFFSET :ordinal"#,
-                    named_params! { ":source": source, ":shard": identity.shard_key,
+                "SELECTED_EXTERNAL_DESCRIPTOR",
+                selected,
+                (active.shard_row_reader(&owner.shard)?.as_ref() as &dyn CatalogRowReader)
+                    .raw_rows(
+                        concat!(
+                            "SELECT source_db,shard_key,record_id FROM (",
+                            owner_provider_member_rows!(),
+                            ") ORDER BY origin,position LIMIT 1 OFFSET :ordinal"
+                        ),
+                        named_params! { ":source": source, ":shard": identity.shard_key,
                         ":owner": owner.record.id, ":ordinal": selected.ordinal },
-                    &active.shards, |row| row.get::<_, String>("record_id")),
+                        &active.shards,
+                        |row| row.get::<_, String>("record_id"),
+                    ),
             )?;
             return Ok(records.first().map(|record| {
                 (
@@ -3963,20 +4258,7 @@ pub fn selected_external_descriptor(
                 )
             }));
         }
-        let Some((_, members, _)) = owner.shard.decoded().payload().declaration_facts() else {
-            return Ok(None);
-        };
-        let member = members
-            .iter()
-            .map(AsRef::as_ref)
-            .chain(
-                owner
-                    .record
-                    .jvm_inventory
-                    .iter()
-                    .flat_map(|inventory| &inventory.additional_members),
-            )
-            .filter(|member| member.owner == owner.record.id && member.guard.is_none())
+        let member = decoded_owner_provider_members(&owner)
             .nth(usize::try_from(selected.ordinal).expect("provider ordinal fits usize"));
         return Ok(member.map(|member| {
             (
@@ -3986,6 +4268,60 @@ pub fn selected_external_descriptor(
         }));
     }
     jvm_open.map_or(Ok(None), Err)
+}
+
+/// The provider-inventory identity of one published member record, which is
+/// the inverse of [`selected_external_descriptor`]: the same owner row (the
+/// first one of the record's provider) and the same owner-member order, so
+/// `selected_external_descriptor` translates the result back to exactly this
+/// record. `Ok(None)` means the record is not a provider member of an owner
+/// named `owner_fqn` in its pack.
+pub fn external_member_identity_of_record(
+    active: &ResolvedActiveSemanticModels,
+    owner_fqn: &str,
+    pack_digest: &str,
+    record_id: &str,
+) -> Result<Option<crate::analyzer::resolution::ExternalMemberIdentity>, FamilyOpen> {
+    let owners = active.all_type_records_named(owner_fqn);
+    let jvm_open = owners.jvm_open;
+    let rows = owners.rows.collect::<Vec<_>>();
+    let Some(provider_id) = rows
+        .iter()
+        .find(|owner| owner.shard.manifest.semantic_sha256 == pack_digest)
+        .map(|owner| owner.shard.inventory_provider_id())
+    else {
+        return jvm_open.map_or(Ok(None), Err);
+    };
+    let Some(owner) = rows
+        .into_iter()
+        .find(|owner| owner.shard.inventory_provider_id() == provider_id)
+    else {
+        unreachable!("the record's own owner row has this provider id");
+    };
+    if owner.shard.manifest.semantic_sha256 != pack_digest {
+        // Another pack of the same provider comes first; its ordinals do not
+        // name this record.
+        return Ok(None);
+    }
+    let members = owner_provider_members(active, &owner)?;
+    let Some(ordinal) = members.iter().position(|member| member.id == record_id) else {
+        return Ok(None);
+    };
+    // One record must name one provider row; a repeated id would make the
+    // ordinal, and so the selected declaration, depend on row order.
+    assert!(
+        members[ordinal + 1..]
+            .iter()
+            .all(|member| member.id != record_id),
+        "record {record_id} of owner {owner_fqn} appears twice in its provider inventory"
+    );
+    Ok(Some(crate::analyzer::resolution::ExternalMemberIdentity {
+        owner: crate::analyzer::resolution::ExternalOwnerIdentity {
+            provider_id: provider_id.into(),
+            owner_fqn: owner_fqn.into(),
+        },
+        ordinal: u32::try_from(ordinal).expect("a provider member ordinal fits u32"),
+    }))
 }
 
 /// Type arguments bound by one exact external call selection, ordered by name.
@@ -4239,6 +4575,36 @@ impl UnmaterializedExternalTarget {
     ) -> Self {
         debug_assert_eq!(locator.role(), SemanticRole::Procedure);
         debug_assert!(is_unmaterialized_external_artifact_locator(&locator));
+        let member = member.into();
+        // Java model declarations use the JVM constructor marker. Preserve its
+        // callable kind even when a resolver supplied a synthetic method path.
+        let locator = if locator.language() == SemanticLanguage::Standard(Language::Java)
+            && member.as_ref() == "<init>"
+        {
+            let mut segments = locator.declaration().segments().to_vec();
+            let last = segments
+                .pop()
+                .expect("unmaterialized external locator has a member segment");
+            segments.push(
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::Constructor,
+                    member.clone(),
+                    last.anchor(),
+                    arity,
+                )
+                .expect("constructor marker is nonempty"),
+            );
+            SemanticLocator::new(
+                locator.mount(),
+                locator.path().clone(),
+                locator.language(),
+                DeclarationLocator::new(segments).expect("constructor declaration is nonempty"),
+                locator.role(),
+                locator.anchor(),
+            )
+        } else {
+            locator
+        };
         let owner_fqn = owner_fqn.into();
         debug_assert!(
             normalized_static_owner
@@ -4251,7 +4617,7 @@ impl UnmaterializedExternalTarget {
             unadmitted_receiver_deref: false,
             receiver_adjustments: Box::default(),
             owner_fqn,
-            member: member.into(),
+            member,
             arity,
             has_receiver,
             resolver_owned_call_shape: false,
@@ -4291,7 +4657,7 @@ impl UnmaterializedExternalTarget {
         debug_assert!(selected_jdk_artifact.as_ref().is_none_or(|evidence| {
             evidence.language == "java"
                 && evidence.ecosystem == "jdk"
-                && evidence.artifact_sha256.is_some()
+                && !evidence.verified_raw_artifacts.is_empty()
         }));
         target.selected_jdk_artifact = selected_jdk_artifact;
         target
@@ -4381,7 +4747,7 @@ impl UnmaterializedExternalTarget {
                 if evidence.language != "python"
                     || evidence.ecosystem != "python"
                     || evidence.package.is_none()
-                    || evidence.artifact_sha256.is_none()
+                    || evidence.verified_raw_artifacts.is_empty()
                     || manifest.is_empty()
                 {
                     return None;
@@ -4389,7 +4755,7 @@ impl UnmaterializedExternalTarget {
                 let mut artifact_key = b"bifrost.python-runtime-target.v2\0".to_vec();
                 for component in [
                     evidence.package.as_ref()?.name.as_bytes(),
-                    evidence.artifact_sha256.as_ref()?.as_bytes(),
+                    evidence.single_raw_sha256()?.as_bytes(),
                     manifest.as_bytes(),
                 ] {
                     artifact_key.extend_from_slice(&(component.len() as u64).to_le_bytes());
@@ -4640,7 +5006,7 @@ impl UnmaterializedExternalTarget {
     pub fn with_selected_jdk_for_test(mut self, evidence: SemanticModelActivationEvidence) -> Self {
         assert_eq!(self.language(), SemanticLanguage::Standard(Language::Java));
         assert_eq!(evidence.ecosystem, "jdk");
-        assert!(evidence.artifact_sha256.is_some());
+        assert!(!evidence.verified_raw_artifacts.is_empty());
         self.resolver_owned_call_shape = true;
         self.selected_jdk_artifact = Some(evidence);
         self

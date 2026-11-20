@@ -859,6 +859,7 @@ fn substitute_signature(
 ) -> Option<Signature> {
     let shadowed = signature.type_parameters.as_slice();
     Some(Signature {
+        bounds: None,
         type_parameters: signature.type_parameters.clone(),
         parameters: signature
             .parameters
@@ -1013,6 +1014,7 @@ fn map_factory_member(
         nullable: false,
     };
     let signature = Signature {
+        bounds: None,
         type_parameters: vec![key.clone(), value.clone()],
         parameters: vec![Parameter {
             name: Some("elems".to_owned()),
@@ -1037,6 +1039,8 @@ fn map_factory_member(
         return_type: Some(&returns),
     });
     Some(MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,

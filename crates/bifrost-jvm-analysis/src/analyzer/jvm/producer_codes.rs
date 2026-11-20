@@ -34,6 +34,7 @@ macro_rules! codes {
 }
 
 codes! {
+    JVM_INVENTORY_SEALED = "jvm.inventory.sealed" => Artifact,
     JAVA_ARCHIVE_ENTRY = "java.archive.entry" => Gap,
     JAVA_ARCHIVE_ENTRY_NAME = "java.archive.entry_name" => Gap,
     JAVA_ARCHIVE_ENTRY_READ = "java.archive.entry_read" => Gap,
@@ -51,6 +52,7 @@ codes! {
     JAVA_SOURCE_UNSUPPORTED_PARAMETER_TYPE = "java.source.unsupported_parameter_type" => Gap,
     JAVA_SOURCE_UNSUPPORTED_RETURN_TYPE = "java.source.unsupported_return_type" => Gap,
     JAVA_SOURCE_BINARY_CONFLICT = "java.source_binary_conflict" => Artifact,
+    AUXILIARY_SOURCE_DIAGNOSTICS = "java.source.auxiliary_diagnostics" => Gap,
     SCALA_ARCHIVE_ENTRY = "scala.archive.entry" => Gap,
     SCALA_ARCHIVE_ENTRY_NAME = "scala.archive.entry_name" => Gap,
     SCALA_ARCHIVE_ENTRY_READ = "scala.archive.entry_read" => Gap,

@@ -45,6 +45,8 @@
 //! with the query; all other facts come from the prepared trees and point
 //! resolver lookups.
 
+pub(crate) mod guard_stability;
+
 use brokk_bifrost_analysis::analyzer::semantic_model::alias_resolution::{
     AliasCursorContext, AliasExpansionFailure, AliasTypeCursor, normalize_alias_cursor,
 };
@@ -91,7 +93,9 @@ use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
 
 use brokk_bifrost_analysis::analyzer::languages::ExternalCalleeFileEvidence;
 
-use brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite;
+use brokk_bifrost_analysis::analyzer::languages::{ExternalCalleeSite, ImportedExternalCallee};
+use brokk_bifrost_analysis::analyzer::resolution::ExternalMemberIdentity;
+use brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
@@ -168,6 +172,18 @@ pub(crate) fn incomplete_proof(reason: &'static str) {
 
 pub(crate) fn operational_proof_stop(reason: &'static str, cause: DerivationExecutionCause) {
     record_proof_stop(reason, Some(cause));
+}
+
+// A failed input is distinct from an unsupported semantic proof. Keep its
+// typed read evidence so request-only proof reuse cannot freeze a transient
+// acquisition failure by interpreting its diagnostic text (#13871).
+pub(crate) fn unavailable_proof_input(reason: &'static str) {
+    brokk_bifrost_analysis::analyzer::i_analyzer::record_current_query_incomplete(
+        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+            reason.into(),
+        ),
+    );
+    operational_proof_stop(reason, DerivationExecutionCause::Provider);
 }
 
 pub(crate) fn selected_import_infos(
@@ -271,14 +287,14 @@ fn selected_import_infos_from_read(
             if cancellation.is_cancelled() {
                 operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
             } else {
-                operational_proof_stop(
-                    "selected_imports_unavailable",
-                    DerivationExecutionCause::Provider,
-                );
+                unavailable_proof_input("selected_imports_unavailable");
             }
             None
         }
-        Err(_) => {
+        Err(error) => {
+            analyzer.record_query_incomplete(
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(error),
+            );
             operational_proof_stop("store_error", DerivationExecutionCause::Provider);
             None
         }
@@ -291,13 +307,16 @@ fn record_proof_stop(reason: &'static str, cause: Option<DerivationExecutionCaus
     );
 }
 
-pub(crate) fn cargo_route_execution_cause(
+pub(crate) fn cargo_route_proof_stop(
+    reason: &'static str,
     error: &brokk_bifrost_rust::graph_support::RustCargoRouteError,
-) -> DerivationExecutionCause {
+) {
     use brokk_bifrost_rust::graph_support::RustCargoRouteError;
     match error {
-        RustCargoRouteError::Cancelled => DerivationExecutionCause::Cancelled,
-        RustCargoRouteError::Unavailable => DerivationExecutionCause::Provider,
+        RustCargoRouteError::Cancelled => {
+            operational_proof_stop(reason, DerivationExecutionCause::Cancelled);
+        }
+        RustCargoRouteError::Unavailable => unavailable_proof_input(reason),
     }
 }
 
@@ -493,10 +512,7 @@ pub(crate) fn normalized_receiver_application(
             if open.is_cancellation() {
                 operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
             } else {
-                operational_proof_stop(
-                    "alias_receiver_model_unavailable",
-                    DerivationExecutionCause::Provider,
-                );
+                unavailable_proof_input("alias_receiver_model_unavailable");
             }
             return None;
         }
@@ -586,9 +602,7 @@ pub(crate) fn observe_proof_resolution(resolution: &BoundedResolution<Definition
         BoundedResolution::Exceeded { .. } => {
             operational_proof_stop("exceeded", DerivationExecutionCause::Budget)
         }
-        BoundedResolution::Unavailable { .. } => {
-            operational_proof_stop("input unavailable", DerivationExecutionCause::Provider)
-        }
+        BoundedResolution::Unavailable { .. } => unavailable_proof_input("input unavailable"),
         BoundedResolution::Cancelled { .. } => {
             operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled)
         }
@@ -598,9 +612,7 @@ pub(crate) fn observe_proof_resolution(resolution: &BoundedResolution<Definition
             | DefinitionLookupStatus::NoDefinition
             | DefinitionLookupStatus::UnresolvableImportBoundary
             | DefinitionLookupStatus::Ambiguous => {}
-            DefinitionLookupStatus::Unavailable => {
-                operational_proof_stop("unavailable", DerivationExecutionCause::Provider)
-            }
+            DefinitionLookupStatus::Unavailable => unavailable_proof_input("unavailable"),
             DefinitionLookupStatus::Cancelled => {
                 operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled)
             }
@@ -617,145 +629,15 @@ pub(crate) fn observe_proof_resolution(resolution: &BoundedResolution<Definition
 }
 
 fn observe_incomplete_lookup(value: &DefinitionLookupOutcome) {
-    use brokk_bifrost_analysis::analyzer::resolution::{
-        ResolutionCompletion, model::ResolutionIncompleteReason as Native,
-    };
-    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupReason as Adapter;
     let mut observed = false;
     if let Some(evidence) = &value.incomplete_evidence {
-        if let ResolutionCompletion::Incomplete(reasons) = &evidence.completion {
-            for reason in reasons {
-                observed = true;
-                match reason {
-                    Native::Cancelled => {
-                        operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled)
-                    }
-                    Native::CyclicPrefixDependency(_) => operational_proof_stop(
-                        "resolution_cyclic_prefix_dependency",
-                        DerivationExecutionCause::Provider,
-                    ),
-                    Native::ReceiverBudgetExhausted(_) => operational_proof_stop(
-                        "resolution_receiver_budget_exhausted",
-                        DerivationExecutionCause::Budget,
-                    ),
-                    Native::TimeBudgetExceeded(_) => operational_proof_stop(
-                        "resolution_time_budget_exceeded",
-                        DerivationExecutionCause::Budget,
-                    ),
-                    // The selected boundary catalog's complete read closure is not certified here.
-                    Native::OpenBoundary { .. } => operational_proof_stop(
-                        "resolution_open_boundary",
-                        DerivationExecutionCause::Provider,
-                    ),
-                    // Saturation can choose a different conservative stop from branch
-                    // history; that history is not part of the lookup key.
-                    Native::CyclicExpansion(_) => operational_proof_stop(
-                        "resolution_cyclic_expansion",
-                        DerivationExecutionCause::Provider,
-                    ),
-                    Native::InconsistentPrecedence(_) => {
-                        // Provider until certified (#11510).
-                        operational_proof_stop(
-                            "resolution_inconsistent_precedence",
-                            DerivationExecutionCause::Provider,
-                        )
-                    }
-                    // No UnsupportedSemantic origin is certified (#11510).
-                    // The per-origin experiment published 0/42 Bat units; keep
-                    // the provenance machinery for separately reviewed stops.
-                    Native::UnsupportedSemantic(_) => operational_proof_stop(
-                        "resolution_unsupported_semantic",
-                        DerivationExecutionCause::Provider,
-                    ),
-                    Native::OverlayFrontierUnknown(_) => operational_proof_stop(
-                        "resolution_overlay_frontier_unknown",
-                        DerivationExecutionCause::Provider,
-                    ),
-                    Native::Unclassified(_) => operational_proof_stop(
-                        "resolution_unclassified",
-                        DerivationExecutionCause::Provider,
-                    ),
-                    Native::UnmountedFile { .. } => {
-                        // Provider until certified (#11510).
-                        operational_proof_stop(
-                            "resolution_unmounted_file",
-                            DerivationExecutionCause::Provider,
-                        )
-                    }
-                    Native::ReceiverSubclassObligation(_) => {
-                        // Provider until certified (#11510).
-                        operational_proof_stop(
-                            "resolution_receiver_subclass_obligation",
-                            DerivationExecutionCause::Provider,
-                        )
-                    }
-                }
-            }
-        }
-        for reason in &evidence.reasons {
+        for reason in evidence.incomplete_reads() {
             observed = true;
-            match reason {
-                Adapter::UnprojectedDefinition { .. } => {
-                    incomplete_proof("resolution_unprojected_definition")
-                }
-                Adapter::UnplacedDefinition => {
-                    operational_proof_stop("incomplete", DerivationExecutionCause::Provider)
-                }
-                Adapter::Execution(cause) => operational_proof_stop("incomplete", *cause),
-                Adapter::MacroExpansionContextRequired => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_macro_expansion_context_required",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-                Adapter::UnknownActivation => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_unknown_activation",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-                Adapter::MacroFragmentNoNamespace => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_macro_fragment_no_namespace",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-                Adapter::MacroModuleHeadUnbound => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_macro_module_head_unbound",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-                Adapter::UnprojectedTypeFrontier => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_unprojected_type_frontier",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-                Adapter::UnprovedClosedWorld => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_unproved_closed_world",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-                Adapter::LexicalBindingUnproven => {
-                    // Provider until certified (#11510).
-                    operational_proof_stop(
-                        "resolution_lexical_binding_unproven",
-                        DerivationExecutionCause::Provider,
-                    )
-                }
-            }
+            brokk_bifrost_analysis::analyzer::i_analyzer::record_proof_incomplete_on_current_contexts(reason);
         }
     }
     if !observed {
-        operational_proof_stop("incomplete", DerivationExecutionCause::Provider);
+        unavailable_proof_input("incomplete");
     }
 }
 
@@ -799,6 +681,14 @@ pub(crate) fn completed_proof<T>(
         )
     }) {
         operational_proof_stop("store_error", DerivationExecutionCause::Provider);
+    }
+    if scope.captured_read_incompleteness().iter().any(|reason| {
+        matches!(
+            reason.base_cause(),
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::InternalInvariant(_)
+        )
+    }) {
+        operational_proof_stop("internal_invariant", DerivationExecutionCause::Provider);
     }
     let stop = scope
         .captured_read_incompleteness()
@@ -946,7 +836,7 @@ pub struct RustCloneProof {
 pub(crate) fn rust_clone_source_unavailable(analyzer: &dyn IAnalyzer) -> RustCloneProof {
     let (verdict, receipt) = QueryReadReceipt::capture(analyzer, || {
         match completed_proof(analyzer, None, || {
-            operational_proof_stop("source_unavailable", DerivationExecutionCause::Provider);
+            unavailable_proof_input("source_unavailable");
             None::<()>
         }) {
             RustProofAttempt::Incomplete { reason, cause, .. } => {
@@ -1028,9 +918,19 @@ impl RustValueClass {
     }
 }
 
-// The final scalar replays only the selected type-level dereferences; no receiver
-// type tree is retained in the operation-owned call-shape memo.
-type RustModeledCallShape = (String, String, bool, usize, usize);
+// Keep only the typed member descriptor from successful resolver selection,
+// alongside its source/model read receipt in this query-local memo (#13916).
+// The descriptor alone is not proof: every result lookup revalidates it through
+// the shared matcher. No receiver tree or unused exact-call proof is retained.
+#[derive(Clone)]
+struct RustModeledCallShape {
+    owner: String,
+    member: String,
+    has_receiver: bool,
+    arity: usize,
+    receiver_steps: usize,
+    selected_external_descriptor: Option<ExternalMemberIdentity>,
+}
 type RustProofMemo<T> = RefCell<HashMap<(usize, usize), (T, QueryReadReceipt)>>;
 
 // Query-local evidence. Keep every agreeing callable's defining providers;
@@ -1044,7 +944,10 @@ struct RustModeledCallReturn {
 struct RustSource {
     file: ProjectFile,
     prepared: Arc<PreparedSyntaxTree>,
-    macro_inventory: brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory,
+    macro_inventory: Arc<brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory>,
+    _source_owner: brokk_bifrost_core::retention_budget::BudgetedValue<
+        brokk_bifrost_analysis::analyzer::usages::rust_source::PreparedRustSource,
+    >,
     expression_classes: RustProofMemo<RustValueClass>,
     modeled_call_shapes: RustProofMemo<Option<RustModeledCallShape>>,
     #[cfg(test)]
@@ -1139,6 +1042,15 @@ pub(crate) trait RustTypeProofResolver {
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome>;
 
+    fn external_call(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        site: &ResolvedReferenceSite,
+        callee_start_byte: usize,
+    ) -> Option<ImportedExternalCallee>;
+
     fn external_call_identity(
         &self,
         file: &ProjectFile,
@@ -1146,7 +1058,10 @@ pub(crate) trait RustTypeProofResolver {
         tree: &Tree,
         site: &ResolvedReferenceSite,
         callee_start_byte: usize,
-    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>;
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
+        self.external_call(file, source, tree, site, callee_start_byte)?
+            .external_callee_identity
+    }
 
     fn cancellation(&self) -> Option<&brokk_bifrost_core::cancellation::CancellationToken>;
 
@@ -1221,8 +1136,15 @@ impl<T: RustTypeProofResolver + ?Sized> RustTypeProofResolver for &T {
         (**self).resolve(query)
     }
 
-    fn external_call_identity(&self, file: &ProjectFile, source: &str, tree: &Tree, site: &ResolvedReferenceSite, callee_start_byte: usize) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
-        (**self).external_call_identity(file, source, tree, site, callee_start_byte)
+    fn external_call(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        site: &ResolvedReferenceSite,
+        callee_start_byte: usize,
+    ) -> Option<ImportedExternalCallee> {
+        (**self).external_call(file, source, tree, site, callee_start_byte)
     }
 
     fn cancellation(&self) -> Option<&brokk_bifrost_core::cancellation::CancellationToken> {
@@ -1298,11 +1220,34 @@ impl<'a> FactoryRustTypeProofResolver<'a> {
                     // The eager open this replaced recorded the same stop when
                     // the operation could not open, so a caller that maps the
                     // failure to None still leaves the proof incomplete.
-                    operational_proof_stop(
-                        "analyzer_unavailable",
-                        DerivationExecutionCause::Provider,
-                    );
-                    return Err(crate::analyzer::rust::native_points::RustDefinitionOperationOpenFailure::from_open_outcome(outcome));
+                    use crate::analyzer::rust::native_points::RustDefinitionOperationOpenFailure;
+                    if let Err(error) = &outcome {
+                        self.analyzer.record_query_incomplete(
+                            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(
+                                error.clone(),
+                            ),
+                        );
+                    }
+                    let failure = RustDefinitionOperationOpenFailure::from_open_outcome(outcome);
+                    match &failure {
+                        RustDefinitionOperationOpenFailure::Cancelled => {
+                            operational_proof_stop(
+                                "analyzer_unavailable",
+                                DerivationExecutionCause::Cancelled,
+                            );
+                        }
+                        RustDefinitionOperationOpenFailure::StoreError(_) => {
+                            operational_proof_stop(
+                                "analyzer_unavailable",
+                                DerivationExecutionCause::Provider,
+                            );
+                        }
+                        RustDefinitionOperationOpenFailure::Unavailable(_)
+                        | RustDefinitionOperationOpenFailure::Stale(_) => {
+                            unavailable_proof_input("analyzer_unavailable");
+                        }
+                    }
+                    return Err(failure);
                 }
             }
         }
@@ -1422,15 +1367,15 @@ impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
         self.factory().resolve(&mut operation, query)
     }
 
-    fn external_call_identity(
+    fn external_call(
         &self,
         file: &ProjectFile,
         source: &str,
         tree: &Tree,
         site: &ResolvedReferenceSite,
         callee_start_byte: usize,
-    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
-        resolve_external_call_identity(
+    ) -> Option<ImportedExternalCallee> {
+        resolve_external_call(
             self.analyzer,
             file,
             source,
@@ -1564,16 +1509,16 @@ impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_, '_>
         self.factory.resolve(&mut operation, query)
     }
 
-    fn external_call_identity(
+    fn external_call(
         &self,
         file: &ProjectFile,
         source: &str,
         tree: &Tree,
         site: &ResolvedReferenceSite,
         callee_start_byte: usize,
-    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
+    ) -> Option<ImportedExternalCallee> {
         let mut operation = self.operation.borrow_mut();
-        resolve_external_call_identity(
+        resolve_external_call(
             self.analyzer,
             file,
             source,
@@ -1623,6 +1568,34 @@ pub(crate) fn resolve_external_call_identity<'analyzer, 'factory, 'selection>(
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
+    resolve_external_call(
+        analyzer,
+        file,
+        source,
+        tree,
+        site,
+        callee_start_byte,
+        factory,
+        operation,
+        cancellation,
+    )?
+    .external_callee_identity
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_external_call<'analyzer, 'factory, 'selection>(
+    analyzer: &'analyzer dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    callee_start_byte: usize,
+    factory: &'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<
+        'analyzer,
+    >,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> Option<ImportedExternalCallee> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     crate::analyzer::rust::external_calls::resolve_exact_rust_external_call_with_operation(
@@ -1637,7 +1610,7 @@ pub(crate) fn resolve_external_call_identity<'analyzer, 'factory, 'selection>(
         factory,
         &mut *operation,
     )
-    .map(|(_, identity)| identity)
+    .map(|(proof, identity)| ImportedExternalCallee::proven(proof, identity))
     .or_else(|| {
         let file_evidence = ExternalCalleeFileEvidence::default();
         let external_site = ExternalCalleeSite {
@@ -1654,7 +1627,6 @@ pub(crate) fn resolve_external_call_identity<'analyzer, 'factory, 'selection>(
             factory,
             operation,
         )
-        .and_then(|callee| callee.external_callee_identity)
     })
 }
 
@@ -1714,7 +1686,7 @@ impl<'a> RustResultVariantProver<'a> {
         if rust_source.text() != source {
             // Within one snapshot the caller's text equals the prepared text, so a
             // mismatch means one side is stale: an operational state, not content.
-            operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+            unavailable_proof_input("source_mismatch");
             return None;
         }
         Some(Self {
@@ -1783,26 +1755,14 @@ fn standard_result_type_path<R: RustTypeProofResolver>(
     // `path` names the `Result` type itself: the owner of a variant path
     // (`std::result::Result` in `std::result::Result::Err`) or a whole type
     // path (`std::result::Result` in a return type).
+    // #13559: a spelling and an incomplete root answer do not identify the
+    // standard crate. C0a's shared Cargo/sysroot canonicalizer must restore
+    // qualified roots HERE using a complete selected crate receipt. Until
+    // then, even genuine qualified core/std paths stay unknown.
     match names.as_slice() {
         ["Result"] => {
             standard_result_prelude_name(proof, source, segments[0], "type", "Result")?;
             Some(())
-        }
-        [root @ ("std" | "core"), "result", "Result"] => {
-            let root_outcome = proof.resolve(source, segments[0])?;
-            (root_outcome.definitions.is_empty()
-                && root_outcome.lexical_definition.is_none()
-                && !root_outcome
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.claim.is_some())
-                && matches!(
-                    root_outcome.status,
-                    DefinitionLookupStatus::Incomplete
-                        | DefinitionLookupStatus::UnresolvableImportBoundary
-                )
-                && source.node_text(segments[0]) == Some(root))
-            .then_some(())
         }
         _ => None,
     }
@@ -1821,7 +1781,7 @@ impl<'a> RustTypeProof<'a, FactoryRustTypeProofResolver<'a>> {
             Some((rust, factory))
         })();
         let Some((rust, factory)) = initialized else {
-            operational_proof_stop("analyzer_unavailable", DerivationExecutionCause::Provider);
+            unavailable_proof_input("analyzer_unavailable");
             return None;
         };
         Some(Self {
@@ -1880,37 +1840,37 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
     }
 
     fn source(&self, file: &ProjectFile) -> Option<RustSource> {
-        let scope = AnalyzerQueryScope::new(self.analyzer);
-        let Some(prepared) = self.rust.prepared_syntax(scope.token(), file) else {
-            // Missing prepared syntax can be transient (#11408).
-            operational_proof_stop("source_unavailable", DerivationExecutionCause::Provider);
-            return None;
-        };
-        let macro_inventory = brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory::build(
-            prepared.tree(),
-            prepared.source(),
-            &|| {
-                !self
-                    .resolver
-                    .cancellation()
-                    .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
-            },
-        );
-        let macro_inventory = match macro_inventory {
-            Ok(inventory) => inventory,
-            Err(error) => {
-                debug_assert!(matches!(
-                    error,
-                    brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled
-                ));
-                operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
-                return None;
-            }
-        };
+        let source =
+            match brokk_bifrost_analysis::analyzer::usages::rust_source::request_rust_source(
+                self.analyzer,
+                file,
+                self.resolver.cancellation(),
+            ) {
+                Ok(Some(source)) => source,
+                Ok(None) => {
+                    self.analyzer.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(
+                            file.clone(),
+                        ),
+                    );
+                    operational_proof_stop(
+                        "source_unavailable",
+                        DerivationExecutionCause::Provider,
+                    );
+                    return None;
+                }
+                Err(brokk_bifrost_analysis::analyzer::usages::rust_source::SourceCancelled) => {
+                    operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
+                    return None;
+                }
+            };
+        let prepared = Arc::clone(&source.prepared);
+        let macro_inventory = Arc::clone(source.macro_inventory(prepared.tree()));
         Some(RustSource {
             macro_inventory,
             file: file.clone(),
             prepared,
+            _source_owner: source,
             expression_classes: RefCell::new(HashMap::new()),
             modeled_call_shapes: RefCell::new(HashMap::new()),
             #[cfg(test)]
@@ -2052,12 +2012,12 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         )
         .map_err(|error| {
             use brokk_bifrost_rust::graph_support::RustCargoRouteError;
-            operational_proof_stop(
+            cargo_route_proof_stop(
                 match error {
                     RustCargoRouteError::Cancelled => "Cancelled",
                     RustCargoRouteError::Unavailable => "Unavailable",
                 },
-                cargo_route_execution_cause(&error),
+                &error,
             );
             "native_trait_signature_unknown"
         })?;
@@ -2955,8 +2915,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         let Some(body) = rust_closure_like_body(closure) else {
             return RustValueClass::Unknown;
         };
-        let mut remaining = self.resolver.budget().max_scope_nodes;
-        let mut charge = |steps| {
+        let mut charge = |_steps| {
             if self
                 .resolver
                 .cancellation()
@@ -2965,22 +2924,29 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
                 return Err(());
             }
-            let Some(next) = remaining.checked_sub(steps) else {
-                operational_proof_stop(
-                    "closure_capture_scan_limit",
-                    DerivationExecutionCause::Budget,
-                );
-                return Err(());
-            };
-            remaining = next;
             Ok(())
         };
         let mut class = RustValueClass::Inert;
         let mut callables = vec![(closure, body)];
         while let Some((callable, body)) = callables.pop() {
-            let Ok(free) =
-                rust_callable_free_variables(callable, body, &source.prepared, None, &mut charge)
-            else {
+            let Ok(free) = rust_callable_free_variables(
+                callable,
+                body,
+                &source.prepared,
+                None,
+                // This query-time proof holds no plain scope index, so it
+                // keeps the walk and its cost of every enclosing scope's
+                // items per reference.
+                &|name, charge| {
+                    brokk_bifrost_rust::lexical_scope::rust_pattern_name_bounded(
+                        source.tree().root_node(),
+                        source.text(),
+                        name,
+                        &mut |entries| charge(entries),
+                    )
+                },
+                &mut charge,
+            ) else {
                 return RustValueClass::Unknown;
             };
             if free.unresolved {
@@ -3153,8 +3119,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             let Some(pattern) = binding.child_by_field_name("pattern") else {
                 return RustValueClass::Unknown;
             };
-            let mut remaining = self.resolver.budget().max_scope_nodes;
-            let mut charge = |steps| {
+            let mut charge = |_steps| {
                 if self
                     .resolver
                     .cancellation()
@@ -3163,14 +3128,6 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled);
                     return Err(());
                 }
-                let Some(next) = remaining.checked_sub(steps) else {
-                    operational_proof_stop(
-                        "binding_write_scan_limit",
-                        DerivationExecutionCause::Budget,
-                    );
-                    return Err(());
-                };
-                remaining = next;
                 Ok(())
             };
             for name in brokk_bifrost_rust::lexical_scope::rust_pattern_binding_identifiers(pattern)
@@ -3781,7 +3738,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         }
         let function = call_function_target(call.child_by_field_name("function")?);
         let arity = named_children(call.child_by_field_name("arguments")?).len();
-        let (owner, member, has_receiver, receiver_steps) = match function.kind() {
+        let (owner, member, has_receiver, receiver_steps, descriptor) = match function.kind() {
             "field_expression" => {
                 let (receiver, name) = rust_method_call_parts(function)?;
                 let owner = self.receiver_owner_bounded(source, receiver, depth - 1)?;
@@ -3828,7 +3785,13 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     u32::try_from(arity).ok()?,
                     Some(&application),
                 )?;
-                (owner.owner, member.to_owned(), true, owner.receiver_steps)
+                (
+                    owner.owner,
+                    member.to_owned(),
+                    true,
+                    owner.receiver_steps,
+                    owner.external_member_identity,
+                )
             }
             "identifier" | "scoped_identifier" => {
                 let name = function.child_by_field_name("name").unwrap_or(function);
@@ -3840,23 +3803,36 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     focus_start_byte: name.start_byte(),
                     focus_end_byte: name.end_byte(),
                 };
-                let identity = self.resolver.external_call_identity(
+                let selected = self.resolver.external_call(
                     &source.file,
                     source.text(),
                     source.tree(),
                     &site,
                     call.start_byte(),
                 )?;
+                let identity = selected.external_callee_identity?;
                 (
                     identity.owner_fqn().to_owned(),
                     identity.member().to_owned(),
                     false,
                     0,
+                    selected
+                        .exact_external_call
+                        .as_ref()
+                        .and_then(ExactExternalCallProof::external_member_identity)
+                        .cloned(),
                 )
             }
             _ => return None,
         };
-        Some((owner, member, has_receiver, arity, receiver_steps))
+        Some(RustModeledCallShape {
+            owner,
+            member,
+            has_receiver,
+            arity,
+            receiver_steps,
+            selected_external_descriptor: descriptor,
+        })
     }
 
     /// The result of a modeled `.clone()` call whose member selection landed on
@@ -3893,9 +3869,15 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         call: Node<'_>,
         depth: usize,
     ) -> Option<CloneSelection> {
-        let (owner, member, receiver, arity, receiver_steps) =
-            self.modeled_call_shape(source, call, depth)?;
-        if member != "clone" || !receiver || arity != 0 {
+        let RustModeledCallShape {
+            owner,
+            member,
+            has_receiver,
+            arity,
+            receiver_steps,
+            ..
+        } = self.modeled_call_shape(source, call, depth)?;
+        if member != "clone" || !has_receiver || arity != 0 {
             return Some(CloneSelection::NotCloneCall);
         }
         let snapshot = self.analyzer.active_semantic_model_snapshot()?;
@@ -3973,7 +3955,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         let source = self.source(file)?;
         if source.text() != exact_source {
             // The range belongs to other bytes; it would name another call.
-            operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+            unavailable_proof_input("source_mismatch");
             return None;
         }
         let call = source
@@ -4095,7 +4077,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 }
                 let receiver_steps = self
                     .modeled_call_shape(&source, call, depth)
-                    .map(|shape| shape.4)?;
+                    .map(|shape| shape.receiver_steps)?;
                 let as_written = receiver_steps == 0
                     && self
                         .selected_receiver_type(
@@ -4320,20 +4302,31 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         call: Node<'_>,
         depth: usize,
     ) -> Option<RustModeledCallReturn> {
-        let (owner, member, has_receiver, arity, receiver_steps) =
-            self.modeled_call_shape(source, call, depth)?;
+        let RustModeledCallShape {
+            owner,
+            member,
+            has_receiver,
+            arity,
+            receiver_steps,
+            selected_external_descriptor,
+        } = self.modeled_call_shape(source, call, depth)?;
         let overlay = self.analyzer.semantic_model_overlay_read().published()?;
         let parameter_count = u32::try_from(arity).ok()?;
-        let candidates = overlay.callable_for_application(
-            SemanticModelCallableKey::new(
-                Language::Rust.config_label(),
-                &owner,
-                &member,
-                has_receiver,
-                parameter_count,
-            ),
-            &SemanticModelCallApplication::positional(parameter_count),
-        );
+        let candidates =
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::selected_model_callable(
+                self.analyzer,
+                &overlay,
+                SemanticModelCallableKey::new(
+                    Language::Rust.config_label(),
+                    &owner,
+                    &member,
+                    has_receiver,
+                    parameter_count,
+                ),
+                selected_external_descriptor.as_ref(),
+                &SemanticModelCallApplication::positional(parameter_count),
+            )?
+            .matched;
         if let Some(callable) = candidates.unique() {
             let returned = self.modeled_callable_return_type(
                 source,
@@ -4696,8 +4689,12 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                         // A canonical carrier does not select its method: an
                         // earlier trait on a reference or smart pointer may
                         // own unwrap/expect and return a different type.
-                        let (selected_owner, selected_member, has_receiver, _, _) =
-                            self.modeled_call_shape(source, expression, depth)?;
+                        let RustModeledCallShape {
+                            owner: selected_owner,
+                            member: selected_member,
+                            has_receiver,
+                            ..
+                        } = self.modeled_call_shape(source, expression, depth)?;
                         if !has_receiver
                             || selected_owner != name
                             || !matches!(selected_member.as_str(), "unwrap" | "expect")
@@ -5078,6 +5075,9 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
     ) -> bool {
         let scope = AnalyzerQueryScope::new(self.analyzer);
         let span = node_range(invocation);
+        let mut special_dispatch_memos =
+            brokk_bifrost_analysis::analyzer::usages::call_relations::SpecialDispatchMemos::default(
+            );
         let dispatch = crate::analyzer::rust::format_macro_dispatch::dispatch(
             brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLanguageRequest {
                 analyzer: self.analyzer,
@@ -5090,6 +5090,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 member_selection: None,
                 cancellation: self.resolver.cancellation(),
                 work: Default::default(),
+                special_dispatch_memos: &mut special_dispatch_memos,
             },
             None,
         );
@@ -5508,6 +5509,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             return false;
         };
         if rust_source.text() != source.as_ref() {
+            unavailable_proof_input("source_mismatch");
             return false;
         }
         let Some(node) = rust_source
@@ -5691,6 +5693,7 @@ fn standard_drop_with_proof(
         return false;
     };
     if rust_source.text() != source {
+        unavailable_proof_input("source_mismatch");
         return false;
     }
     let Some(call) = rust_source
@@ -5749,6 +5752,7 @@ pub(crate) fn try_residual_drop_runs_no_user_code(
         return false;
     };
     if rust_source.text() != source.as_ref() {
+        unavailable_proof_input("source_mismatch");
         return false;
     }
     let Some(node) = rust_source
@@ -5860,7 +5864,7 @@ fn rust_expression_receiver_owner_with_proof<R: RustTypeProofResolver>(
 ) -> Option<RustReceiverOwner> {
     let rust_source = proof.source(file)?;
     if rust_source.text() != source {
-        operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+        unavailable_proof_input("source_mismatch");
         return None;
     }
     let receiver = rust_source
@@ -5913,7 +5917,7 @@ pub(crate) fn rust_method_receiver_owner_attempt_with_operation<'analyzer, 'fact
 ) -> RustProofAttempt<(RustReceiverOwner, usize)> {
     completed_proof(analyzer, cancellation, || {
         let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-            operational_proof_stop("analyzer_unavailable", DerivationExecutionCause::Provider);
+            unavailable_proof_input("analyzer_unavailable");
             return None;
         };
         let proof = RustTypeProof {
@@ -5992,7 +5996,7 @@ pub(crate) fn rust_nominal_receiver_application_with_operation<'analyzer, 'tree>
         let prove = |proof: &RustTypeProof<'_, _>| {
             let rust_source = proof.source(file)?;
             if rust_source.text() != source {
-                operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+                unavailable_proof_input("source_mismatch");
                 return None;
             }
             proof.nominal_type_owner(&rust_source, ty)
@@ -6021,7 +6025,7 @@ fn rust_method_receiver_owner_with_proof<R: RustTypeProofResolver>(
 ) -> Option<(RustReceiverOwner, usize)> {
     let rust_source = proof.source(file)?;
     if rust_source.text() != source {
-        operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+        unavailable_proof_input("source_mismatch");
         return None;
     }
     let name = rust_source
@@ -6264,6 +6268,7 @@ pub(crate) fn rust_std_builtin_call(
     let proof = RustTypeProof::new(analyzer)?;
     let rust_source = proof.source(file)?;
     if rust_source.text() != source.as_ref() {
+        unavailable_proof_input("source_mismatch");
         return None;
     }
     let node = rust_source
@@ -6287,6 +6292,7 @@ pub(crate) fn rust_std_direct_string_receiver(
         let proof = RustTypeProof::new(analyzer)?;
         let rust_source = proof.source(file)?;
         if rust_source.text() != source.as_ref() {
+            unavailable_proof_input("source_mismatch");
             return None;
         }
         let node = rust_source
@@ -7441,6 +7447,10 @@ mod tests {
 
     #[test]
     #[hardwon("#11786: an inactive cfg(any()) module made an unrelated alias lookup incomplete")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn inactive_alias_portable_diagnostic() {
         use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
         use brokk_bifrost_analysis::analyzer::store::advance_selected_rust_unit_summaries_generation_for_test;
@@ -8179,7 +8189,7 @@ mod tests {
                 DerivationExecutionCause::Cancelled,
             ),
             (
-                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ResolutionRounds),
                 DerivationExecutionCause::Budget,
             ),
         ] {
@@ -8751,11 +8761,12 @@ pub fn run() { let first = Item; let second = Item; }
                     .unwrap();
             }
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 approximate_standard_libraries: if pinned {
                     vec![]
                 } else {
-                    vec![ApproximateSemanticModelExpectation {
+                    vec![ApproximateSemanticModelExpectation { reasons: brokk_bifrost_semantic::analyzer::semantic_model::ApproximationReasons::only(brokk_bifrost_semantic::analyzer::semantic_model::ApproximationReason::TargetUnknown),
                         language: "rust".into(),
                         ecosystem: "cargo".into(),
                         selection: ApproximateStandardLibrarySelection::Pack(
@@ -8775,7 +8786,8 @@ pub fn run() { let first = Item; let second = Item; }
                     }),
                     target: None,
                     configuration: None,
-                    artifact_sha256: Some("a".repeat(64)),
+                    production_input_digest: None,
+verified_raw_artifacts: (Some("a".repeat(64))).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::RustdocJson, &sha256)).collect(),
                 }],
                 controls: ["bifrost.rust-stdlib", "test.std-deref-companion"]
                     .into_iter()
@@ -8814,10 +8826,10 @@ pub fn run() { let first = Item; let second = Item; }
                 .find(|shard| shard.manifest.pack_id == "bifrost.rust-stdlib");
             assert_eq!(stdlib.is_some(), include_stdlib, "{case}");
             if let Some(stdlib) = stdlib {
-                assert_eq!(stdlib.approximate, !pinned, "{case}");
+                assert_eq!(stdlib.approximate(), !pinned, "{case}");
             }
             if let Some(companion) = companion {
-                assert_eq!(companion.approximate, !pinned, "{case}");
+                assert_eq!(companion.approximate(), !pinned, "{case}");
                 assert_eq!(
                     companion
                         .matched_evidence
@@ -10978,6 +10990,98 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
     }
 
     #[test]
+    #[hardwon(
+        "#14209: a model could not say that an inherent member is declared on a blanket impl, so every call on a receiver with unknown type arguments stayed unresolved"
+    )]
+    fn recorded_blanket_impl_selects_inherent_member_for_unknown_receiver_arguments() {
+        use serde_json::json;
+        let source = "struct MyStruct; fn probe(p: std::fs::Partial<MyStruct>) { p.only(); }";
+        let partial = serde_json::from_value::<TypeRef>(
+            json!({"kind":"named","name":"std.fs.Partial","arguments":[{"kind":"unknown"}]}),
+        )
+        .unwrap();
+        let blanket = json!([{"kind":"type_parameter","name":"R"}]);
+        let specialized = json!([{"kind":"named","name":"u8"}]);
+        // Each case edits the `only` member: the impl arguments it records and
+        // whether the model claims the whole callable family.
+        for (impl_arguments, family_complete, selects) in [
+            (Some(&blanket), true, true),
+            (Some(&specialized), true, false),
+            (Some(&blanket), false, false),
+            (None, true, false),
+        ] {
+            let mut pack = opaque_receiver_pack();
+            pack["schema_version"] = json!(45);
+            let only = pack["shards"][0]["payload"]["members"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|member| member["name"] == "only")
+                .unwrap();
+            only["callable_family_complete"] = json!(family_complete);
+            if let Some(arguments) = impl_arguments {
+                only["inherent_impl_self_arguments"] = arguments.clone();
+            }
+            let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+            activate_model_pack(&fixture, pack, "fixture.rust-opaque-receiver", "std");
+            let analyzer = fixture.analyzer.analyzer();
+            let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+            let attempt = completed_proof(analyzer, None, || {
+                select_opaque_application(
+                    analyzer,
+                    &file,
+                    source,
+                    "p.only",
+                    "only",
+                    "std.fs.Partial",
+                    &partial,
+                )
+            });
+            let case =
+                format!("impl arguments {impl_arguments:?}, family complete {family_complete}");
+            if selects {
+                let RustProofAttempt::Complete(Some(selected)) = attempt else {
+                    panic!("a recorded blanket impl selects the member: {case}");
+                };
+                assert_eq!(selected.owner, "std.fs.Partial", "{case}");
+            } else {
+                assert!(
+                    matches!(
+                        attempt,
+                        RustProofAttempt::Incomplete {
+                            value: None,
+                            reason: "external_receiver_type_arguments_unknown",
+                            cause: None
+                        }
+                    ),
+                    "the member stays an incomplete selection: {case}"
+                );
+            }
+        }
+        // The compiler refuses evidence that cannot describe the owner.
+        let mut pack = opaque_receiver_pack();
+        pack["schema_version"] = json!(45);
+        let only = pack["shards"][0]["payload"]["members"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|member| member["name"] == "only")
+            .unwrap();
+        only["inherent_impl_self_arguments"] =
+            json!([{"kind":"type_parameter","name":"R"}, {"kind":"type_parameter","name":"S"}]);
+        let diagnostics = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect_err("two impl arguments cannot describe a one-parameter owner");
+        assert!(
+            format!("{diagnostics:?}").contains("declaration.inherent_impl_self_arguments_arity"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
     #[hardwon("#12038: an earlier reference trait must not become a later inherent member proof")]
     fn alias_receiver_reference_rival_refuses_inherent_selection() {
         use serde_json::json;
@@ -11300,6 +11404,67 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
     }
 
     #[test]
+    fn guard_interior_claims_are_test_only_affirmative_and_payload_sensitive() {
+        use crate::analyzer::semantic::partial_flow::guard_bindings::GuardInteriorMutability as Interior;
+        for claim in [None, Some("absent"), Some("present")] {
+            let fixture =
+                AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "fn run() {}")]);
+            let mut data = rust_type("widget.Data", "struct");
+            if let Some(kind) = claim {
+                data["value_semantics"] = serde_json::json!({"interior_mutability":{"kind":kind}});
+            }
+            let mut wrapper = rust_type("widget.Wrapper", "struct");
+            wrapper["type_parameters"] = serde_json::json!(["T"]);
+            wrapper["type_parameter_kinds"] = serde_json::json!(["type"]);
+            wrapper["value_semantics"] = serde_json::json!({"interior_mutability":{"kind":"depends_on_type_arguments","which":[0]}});
+            let pack = serde_json::json!({
+                "schema_version":45,"pack_id":"fixture.guard-interior","version":"1.0.0",
+                "producer":{"name":"test","version":"1.0.0"},"language":"rust","ecosystem":"cargo",
+                "compatibility":{"toolchains":[]},"provenance":{"source":"TEST ONLY: synthetic interior-mutability claim; no production facts"},
+                "license":"NOASSERTION","completeness":"complete","safety":{"generated_code_only":false,"review_required":false},
+                "shards":[{"id":"fixture.guard-types","activation":[{}],"payload":{"kind":"declaration_facts","types":[rust_type("widget","module"),data,wrapper],"members":[],"relations":[]}}]
+            });
+            activate_model_pack(&fixture, pack, "fixture.guard-interior", "widget");
+            let proof = RustTypeProof::new(fixture.analyzer.analyzer()).unwrap();
+            let data = TypeRef::Named {
+                name: "widget.Data".into(),
+                arguments: vec![],
+                nullable: false,
+            };
+            let expected = match claim {
+                Some("absent") => Interior::Absent,
+                Some("present") => Interior::Present,
+                _ => Interior::Unknown,
+            };
+            assert_eq!(proof.guard_type_ref_interior(&data, 20), expected);
+            let wrapped = TypeRef::Named {
+                name: "widget.Wrapper".into(),
+                arguments: vec![data.clone()],
+                nullable: false,
+            };
+            assert_eq!(proof.guard_type_ref_interior(&wrapped, 20), expected);
+            let reference = TypeRef::ByRef {
+                element: Box::new(data),
+                reference_kind: Default::default(),
+            };
+            assert_eq!(
+                proof.guard_type_ref_interior(&reference, 20),
+                expected,
+                "shared reference cannot erase a Present or Unknown payload"
+            );
+            let missing = TypeRef::Named {
+                name: "widget.Wrapper".into(),
+                arguments: vec![],
+                nullable: false,
+            };
+            assert_eq!(
+                proof.guard_type_ref_interior(&missing, 20),
+                Interior::Unknown
+            );
+        }
+    }
+
+    #[test]
     fn reviewed_inert_fact_is_refused_until_scope_admission_is_integrated() {
         let source = Arc::<str>::from("fn run() {}\n");
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", &source)]);
@@ -11358,12 +11523,14 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
         use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
         use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
         use brokk_bifrost_analysis::analyzer::store::rust_drop_inventory::RustDropInventorySubject;
+        use brokk_bifrost_core::domain_memo::DomainMemo as _;
         let fixture =
             AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "struct Local;")]);
         let store =
             brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
-        let memo =
-            crate::analyzer::rust::semantic::drop_inventory::RustDropInventoryMemo::default();
+        let memo = crate::analyzer::rust::semantic::drop_inventory::RustDropInventoryMemo::new(
+            store.retention_budget(),
+        );
         let subject = RustDropInventorySubject {
             owning_unit: StableDigest::from_array([1; 32]),
             module_path: "crate".into(),
@@ -11376,9 +11543,14 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
         let (attempt, receipt) = QueryReadReceipt::capture(fixture.analyzer.analyzer(), || {
             completed_proof(fixture.analyzer.analyzer(), None, || {
                 let answer = memo
-                    .retained_answer(&store, &Default::default(), &subject, &cancellation, || {
-                        panic!("cancelled scan must not read a row")
-                    })
+                    .retained_answer(
+                        &store,
+                        &Default::default(),
+                        &subject,
+                        None,
+                        &cancellation,
+                        || panic!("cancelled scan must not read a row"),
+                    )
                     .unwrap();
                 let cause = answer.expect_err("cancelled inventory carries its stop cause");
                 assert_eq!(cause, DerivationExecutionCause::Cancelled);
@@ -11408,6 +11580,56 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
                     cause: None,
                 })
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#12928: a Drop provider refusal became a store failure and hid the original SQL error"
+    )]
+    fn drop_provider_refusal_keeps_store_failures_distinct() {
+        use crate::analyzer::semantic::{SemanticBudget, SemanticProviderError, SemanticRequest};
+        use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, QueryReadReceipt};
+        use brokk_bifrost_analysis::analyzer::{QueryReadIncomplete, store::StoreError};
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "struct Local;")]);
+        for store_error in [None, Some(StoreError::corrupt("broken Drop publication"))] {
+            let scope =
+                AnalyzerQueryScope::capturing_read_incompleteness(fixture.analyzer.analyzer());
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let (_, receipt) = QueryReadReceipt::capture(fixture.analyzer.analyzer(), || {
+                completed_proof(fixture.analyzer.analyzer(), None, || {
+                    let error = match &store_error {
+                        Some(error) => crate::analyzer::rust::semantic::drop_store_failure(
+                            fixture.analyzer.analyzer(),
+                            error.clone(),
+                        ),
+                        None => SemanticProviderError::internal("provider unavailable"),
+                    };
+                    Some(crate::analyzer::rust::drop_inventory_answer_is_absent(
+                        &fixture.analyzer,
+                        Err(error),
+                        &SemanticRequest::new(&mut budget, &cancellation),
+                    ))
+                })
+            });
+            assert_eq!(scope.store_error(), store_error);
+            assert!(receipt.incomplete_reasons().iter().any(|reason| matches!(
+                reason.base_cause(),
+                QueryReadIncomplete::ProofStopped {
+                    reason: "drop_inventory_failed",
+                    cause: Some(DerivationExecutionCause::Provider)
+                }
+            )));
+            let errors = scope
+                .captured_read_incompleteness()
+                .into_iter()
+                .filter(|reason| {
+                    matches!(reason.base_cause(), QueryReadIncomplete::StoreFailure(_))
+                })
+                .count();
+            assert_eq!(errors, usize::from(store_error.is_some()));
+        }
     }
 
     #[test]
@@ -12080,7 +12302,8 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 },
             ),
             SemanticModelRuntimeOutcome::Ready { .. }
@@ -13090,6 +13313,88 @@ fn probe() { concrete(); unresolved(); ambiguous(); generic::<bool>(); nested();
                 "symbol": "std.process.Command.arg"
             }
         })
+    }
+
+    #[test]
+    #[hardwon(
+        "#13559: an extern crate renamed to core certified arbitrary Result drop glue as inert"
+    )]
+    fn extern_crate_rename_cannot_certify_standard_result_drop_glue() {
+        let mut observed = Vec::new();
+        for (name, prefix, path, dependency, expected_inert) in [
+            ("prelude", "", "Result", "other_crate='1'", true),
+            (
+                "qualified-core",
+                "",
+                "core::result::Result",
+                "other_crate='1'",
+                false,
+            ),
+            (
+                "qualified-std",
+                "",
+                "std::result::Result",
+                "other_crate='1'",
+                false,
+            ),
+            (
+                "use-alias",
+                "use other_crate as core;",
+                "core::result::Result",
+                "other_crate='1'",
+                false,
+            ),
+            (
+                "extern-alias",
+                "extern crate other_crate as core;",
+                "core::result::Result",
+                "other_crate='1'",
+                false,
+            ),
+            (
+                "cargo-rename",
+                "",
+                "core::result::Result",
+                "core={package='other_crate',version='1'}",
+                false,
+            ),
+        ] {
+            let text = format!("{prefix} fn root(value: {path}<i32, i32>) {{ let _ = value; }}");
+            let manifest = format!(
+                "[package]\nname='legacy_root_control'\nversion='0.1.0'\nedition='2021'\n[dependencies]\n{dependency}\n"
+            );
+            let fixture = AnalyzerFixture::new_for_language(
+                Language::Rust,
+                &[("Cargo.toml", &manifest), ("src/lib.rs", &text)],
+            );
+            let analyzer = fixture.analyzer.analyzer();
+            let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+            for phase in ["cold", "warm"] {
+                let _scope = AnalyzerQueryScope::new(analyzer);
+                let proof = RustTypeProof::new(analyzer).unwrap();
+                let source = proof.source(&file).unwrap();
+                let function = named_children(source.tree().root_node())
+                    .into_iter()
+                    .find(|node| node.kind() == "function_item")
+                    .unwrap();
+                let parameter = named_children(function.child_by_field_name("parameters").unwrap())
+                    .into_iter()
+                    .find(|node| node.kind() == "parameter")
+                    .unwrap();
+                let class = proof.type_class(
+                    &source,
+                    parameter.child_by_field_name("type").unwrap(),
+                    PROOF_DEPTH,
+                );
+                observed.push((name, phase, class, expected_inert));
+            }
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|(_, _, class, expected)| class.is_inert() == *expected),
+            "{observed:#?}"
+        );
     }
 }
 

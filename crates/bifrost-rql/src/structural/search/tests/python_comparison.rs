@@ -232,7 +232,7 @@ def check(value, left, right):
             .result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("runtime class")),
+            .any(|diagnostic| diagnostic.message().contains("runtime class")),
         "unresolved operand classes are visible as an incomplete diagnostic"
     );
 }
@@ -366,7 +366,7 @@ fn comparison_chains_are_selectable_and_role_queries_are_incomplete() {
                 .result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("comparison chains")),
+                .any(|diagnostic| diagnostic.message().contains("comparison chains")),
             "the missing pairwise roles must be reported for {query}: {:#?}",
             constrained.result.diagnostics
         );
@@ -432,7 +432,7 @@ fn comparison_chains_are_selectable_and_role_queries_are_incomplete() {
                 .result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("comparison chains"))
+                .any(|diagnostic| diagnostic.message().contains("comparison chains"))
         );
     }
 
@@ -461,9 +461,9 @@ fn comparison_chains_are_selectable_and_role_queries_are_incomplete() {
             .result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code
+            .any(|diagnostic| diagnostic.code()
                 == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
-                && diagnostic.message.contains("comparison chains"))
+                && diagnostic.message().contains("comparison chains"))
     );
     assert!(matches!(
         wildcard_result.result.completion(),
@@ -528,10 +528,10 @@ fn comparison_chains_are_selectable_and_role_queries_are_incomplete() {
             .result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code
+            .any(|diagnostic| diagnostic.code()
                 == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
                 && diagnostic
-                    .message
+                    .message()
                     .ends_with(&format!("at byte ranges {expected_ranges:?}"))),
         "both exact chain ranges must remain diagnosed: {:#?}",
         result.result.diagnostics
@@ -784,9 +784,8 @@ fn anchored_rendered_captures_obey_response_budget() {
             .result
             .diagnostics
             .iter()
-            .filter(
-                |diagnostic| diagnostic.code == CodeQueryDiagnosticCode::RenderedCapturesTruncated
-            )
+            .filter(|diagnostic| diagnostic.code()
+                == CodeQueryDiagnosticCode::RenderedCapturesTruncated)
             .count(),
         1
     );

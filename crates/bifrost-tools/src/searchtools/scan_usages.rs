@@ -3153,14 +3153,27 @@ pub(crate) fn scan_usage_reference_sites_by_location(
     cancellation: CancellationToken,
 ) -> Vec<ScanUsagesReferenceSites> {
     let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
+    scan_usage_reference_sites_by_location_with_context(
+        analyzer,
+        scope.token(),
+        params,
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+    )
+}
+
+/// The request-scoped form used by composed tools that share a query context.
+pub(crate) fn scan_usage_reference_sites_by_location_with_context(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    params: ScanUsagesByLocationParams,
+    context: &ScanUsagesExecutionContext,
+) -> Vec<ScanUsagesReferenceSites> {
     let targets = params
         .targets
         .into_iter()
         .enumerate()
         .map(|(index, target)| ScanUsageRequest::target(index, target))
         .collect();
-    let context = ScanUsagesExecutionContext::with_cancellation(cancellation);
     let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let (entries, scope) = HEAVY_SCAN_POOL.install(|| {
         attribution.run(|| {
@@ -3172,11 +3185,11 @@ pub(crate) fn scan_usage_reference_sites_by_location(
                 Vec::new(),
                 targets,
                 params.include_same_owner,
-                &context,
+                context,
             )
         })
     });
-    collect_scan_usages_reference_sites(analyzer, entries, scope, &context)
+    collect_scan_usages_reference_sites(analyzer, entries, scope, context)
 }
 
 fn collect_scan_usages_reference_sites(
@@ -3212,8 +3225,8 @@ fn collect_scan_usages_reference_sites(
             }
             let incomplete_reason = raw_reference_incomplete_reason(&classified);
             let files = raw_reference_files(&entry, &classified.files);
-            let input = match classified.input {
-                ScanUsagesInput::Target(target) => target,
+            let input = match &classified.input {
+                ScanUsagesInput::Target(target) => target.clone(),
                 ScanUsagesInput::Symbol(symbol) => {
                     unreachable!("location reference scan produced a symbol input: {symbol}")
                 }
@@ -3462,6 +3475,11 @@ pub struct UsageGraphIncompleteReason {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_path: Option<String>,
+    /// The usage ecosystem (`UsageEcosystem::as_str`) of the edge pass this
+    /// reason refused. Set only by a pass refusal; every edge of that ecosystem
+    /// is missing from the graph, and the edges of other passes stand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_ecosystem: Option<String>,
 }
 
 /// One possible caller whose reference did not become a drawn graph edge.
@@ -4261,6 +4279,7 @@ pub(crate) fn usage_graph_at_lines(
         edge_sites,
         BTreeMap::new(),
         incomplete,
+        &BTreeMap::new(),
     );
     if let Some(error) = _query.store_error() {
         return unavailable_usage_graph_result(
@@ -4330,7 +4349,7 @@ pub fn usage_graph_with_cancellation(
     )
 }
 
-fn usage_graph_with_passes(
+pub(crate) fn usage_graph_with_passes(
     analyzer: &dyn IAnalyzer,
     params: UsageGraphParams,
     passes: &[brokk_bifrost_analysis::analyzer::languages::EdgePassEntry],
@@ -4452,6 +4471,9 @@ fn usage_graph_with_passes(
     };
     let mut unavailable_passes = HashSet::default();
     let mut incomplete: BTreeSet<(String, String)> = BTreeSet::new();
+    // The pass each refusal reason in `incomplete` belongs to, so the reason
+    // carries its ecosystem as data.
+    let mut refused_ecosystems: BTreeMap<(String, String), &'static str> = BTreeMap::new();
     for entry in passes {
         if cancellation.is_cancelled() {
             return cancelled();
@@ -4467,7 +4489,7 @@ fn usage_graph_with_passes(
         }
         if let Some(failure) = entry.backend.input_failure(analyzer, &preflight_files) {
             unavailable_passes.insert(entry.id);
-            incomplete.insert((
+            let reason = (
                 "unavailable_canonical_facts".to_string(),
                 format!(
                     "{}: {}; files: {:?}",
@@ -4475,7 +4497,9 @@ fn usage_graph_with_passes(
                     failure.reason,
                     failure.files
                 ),
-            ));
+            );
+            refused_ecosystems.insert(reason.clone(), entry.ecosystem.as_str());
+            incomplete.insert(reason);
             continue;
         }
         // An excluded source contributes no edges and no declarations, so
@@ -4539,6 +4563,7 @@ fn usage_graph_with_passes(
                     BTreeMap::new(),
                     BTreeMap::new(),
                     incomplete,
+                    &refused_ecosystems,
                 );
             };
             catalog
@@ -5022,7 +5047,7 @@ fn usage_graph_with_passes(
                         failure,
                     ),
                 ) => {
-                    incomplete.insert((
+                    let reason = (
                         "unavailable_canonical_facts".to_string(),
                         format!(
                             "{}: {}; files: {:?}",
@@ -5030,7 +5055,9 @@ fn usage_graph_with_passes(
                             failure.reason,
                             failure.files
                         ),
-                    ));
+                    );
+                    refused_ecosystems.insert(reason.clone(), entry.ecosystem.as_str());
+                    incomplete.insert(reason);
                 }
                 None => {}
             }
@@ -5847,6 +5874,7 @@ fn usage_graph_with_passes(
         edge_sites,
         truncated_by_id,
         incomplete,
+        &refused_ecosystems,
     );
     result.scope_obligations = native_projections
         .iter()
@@ -5866,6 +5894,7 @@ fn usage_graph_with_passes(
                 brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportGapKind::OutsideWorkspace => ("relative_import_outside_workspace", "leaves the workspace"),
             };
             UsageGraphIncompleteReason {
+                refused_ecosystem: None,
                 discovery_error: None,
                 code: code.into(),
                 message: format!("{path}: relative import target {:?} {status}", gap.target),
@@ -5879,6 +5908,7 @@ fn usage_graph_with_passes(
         ) = &inventory.completion
     {
         result.incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             discovery_error: None,
             code: "source_inventory_incomplete".into(),
             message: format!("{reason:?}"),
@@ -5889,6 +5919,7 @@ fn usage_graph_with_passes(
         reasons.sort();
         reasons.dedup();
         result.incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             discovery_error: None,
             code: "source_inventory_incomplete".into(),
             message: format!("{reasons:?}"),
@@ -5983,6 +6014,7 @@ fn record_graph_domain_failures(
             .any(|reason| reason.code == "domain_discovery_failed" && reason.message == message)
         {
             result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                refused_ecosystem: None,
                 code: "domain_discovery_failed".into(),
                 message,
                 discovery_error: Some(failure.discovery_error),
@@ -6001,6 +6033,7 @@ fn record_graph_build_selection_unavailable(
 ) {
     if let Some(reason) = reason {
         result.incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             code: "build_selection_unavailable".into(),
             message: "Go build selection is unavailable; build directives could not be evaluated"
                 .into(),
@@ -6027,6 +6060,7 @@ fn record_graph_skipped_callers(
             GraphFileSkipReason::OutsideSelectedModules { module_path } => {
                 if missing_modules.insert(module_path.clone()) {
                     result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                        refused_ecosystem: None,
                         discovery_error: None,
                         code: "outside_selected_modules".into(),
                         message: "module has no packages in the selected tool context (#5664)"
@@ -6052,6 +6086,7 @@ fn record_graph_skipped_callers(
             }
             GraphFileSkipReason::Unplaced => {
                 result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                    refused_ecosystem: None,
                     discovery_error: None,
                     code: "unplaced_graph_caller".into(),
                     message: "requested file has no selected graph placement".into(),
@@ -6100,6 +6135,7 @@ fn push_unmatched_paths_reason(
         .map(|count| format!(" (+{count} more)"))
         .unwrap_or_default();
     incomplete_reasons.push(UsageGraphIncompleteReason {
+        refused_ecosystem: None,
         discovery_error: None,
         path: None,
         module_path: None,
@@ -6124,6 +6160,7 @@ fn unavailable_usage_graph_result(
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeSet::from([(reason_kind.to_string(), reason)]),
+        &BTreeMap::new(),
     )
 }
 
@@ -6134,6 +6171,7 @@ fn finalize_usage_graph_result(
     edge_sites: UsageGraphEdgeSites,
     mut truncated_by_id: BTreeMap<DeclarationId, usize>,
     mut incomplete: BTreeSet<(String, String)>,
+    refused_ecosystems: &BTreeMap<(String, String), &'static str>,
 ) -> UsageGraphResult {
     let mut nodes: Vec<UsageGraphNode> = catalog
         .nodes
@@ -6241,6 +6279,9 @@ fn finalize_usage_graph_result(
         .into_iter()
         .map(|(code, message)| UsageGraphIncompleteReason {
             discovery_error: None,
+            refused_ecosystem: refused_ecosystems
+                .get(&(code.clone(), message.clone()))
+                .map(|ecosystem| ecosystem.to_string()),
             code,
             message,
             path: None,
@@ -6249,6 +6290,7 @@ fn finalize_usage_graph_result(
         .collect::<Vec<_>>();
     if !truncated_symbols.is_empty() {
         incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             discovery_error: None,
             path: None,
             module_path: None,
@@ -6276,6 +6318,7 @@ fn finalize_usage_graph_result(
         Some(configurations) => configurations,
         None => {
             incomplete_reasons.push(UsageGraphIncompleteReason {
+                refused_ecosystem: None,
                 discovery_error: None,
                 path: None,
                 module_path: None,
@@ -6480,6 +6523,7 @@ fn finalize_selected_usage_graph_result(
             return None;
         }
         incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             discovery_error: None,
             code,
             message,
@@ -6489,6 +6533,7 @@ fn finalize_selected_usage_graph_result(
     }
     if !truncated_symbols.is_empty() {
         incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             discovery_error: None,
             path: None,
             module_path: None,
@@ -9754,6 +9799,15 @@ mod tests {
         struct CancellingProvider;
         static REQUEST: Mutex<Option<CancellationToken>> = Mutex::new(None);
         impl NativeWorkspaceGraphProvider for CancellingProvider {
+            // This fake has no source admission.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
             fn id(&self) -> EdgePassId {
                 EdgePassId::Java
             }
@@ -9831,6 +9885,15 @@ mod tests {
             calls: Mutex<Vec<Vec<String>>>,
         }
         impl NativeWorkspaceGraphProvider for NativeChain {
+            // This fake has no source admission.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
             fn id(&self) -> EdgePassId {
                 EdgePassId::Java
             }
@@ -9923,6 +9986,15 @@ mod tests {
         };
         struct UnavailableDependency;
         impl NativeWorkspaceGraphProvider for UnavailableDependency {
+            // This fake has no source admission.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
             fn id(&self) -> EdgePassId {
                 EdgePassId::Java
             }

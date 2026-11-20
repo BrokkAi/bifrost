@@ -76,6 +76,13 @@ pub use model::{
 
 pub mod js_ts_facts;
 
+#[doc(hidden)]
+pub mod internal_memo_partitions;
+
 pub mod memo_attribution;
 
 pub mod project_reads;
+
+pub mod derivation_cause;
+pub mod query_read_incomplete;
+pub mod store_error;

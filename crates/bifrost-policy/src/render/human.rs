@@ -4748,6 +4748,7 @@ const fn incomplete_reason(value: PolicyIncompleteReason) -> &'static str {
 
 const fn failure_reason(value: PolicyFailureReason) -> &'static str {
     match value {
+        PolicyFailureReason::EndpointRoleUnresolved => "endpoint_role_unresolved",
         PolicyFailureReason::InvalidExecutionPlan => "invalid_execution_plan",
         PolicyFailureReason::WorkspaceSnapshotUnavailable => "workspace_snapshot_unavailable",
         PolicyFailureReason::SourceReadFailed => "source_read_failed",

@@ -1679,7 +1679,9 @@ mod tests {
             _: &crate::ProjectFile,
             _: usize,
         ) -> Result<
-            Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+            crate::analyzer::semantic::SemanticArtifactSourceOutcome<
+                crate::analyzer::semantic::SemanticArtifactSourceSnapshot,
+            >,
             crate::analyzer::semantic::SemanticProviderError,
         > {
             unimplemented!()

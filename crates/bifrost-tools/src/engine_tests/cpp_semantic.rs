@@ -1637,6 +1637,7 @@ int caller() { return local_target(1); }
                 .expect("semantic-pack catalog");
             let cancellation = CancellationToken::new();
             let activation = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("crate version"),

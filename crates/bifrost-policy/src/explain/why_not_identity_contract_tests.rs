@@ -20,6 +20,7 @@ fn reversed_candidate_range_reports_the_callers_bounds() {
 #[test]
 fn unsupported_why_not_questions_keep_the_requested_question() {
     let fixture = Fixture::new();
+
     let nominated = candidate("Widget");
     with_policy(TYPESTATE_POLICY, |policy| {
         let error = explain_candidate(
@@ -115,8 +116,13 @@ fn flow_origins_publish_all_retained_references() {
         run.completion(),
         run.diagnostics()
     );
-    let explanation =
-        explain_finding(&run, &only_finding(&run), &ExplanationLimits::default()).unwrap();
+    let explanation = explain_finding(
+        &run,
+        &only_finding(&run),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .unwrap();
     let actual = root_child(&explanation, "origin").actual().unwrap();
     assert!(
         actual.contains("[evidence test:origin-alpha test:origin-beta]"),
@@ -166,8 +172,13 @@ fn a_registered_match_endpoint_is_named_in_the_why_answer() {
         })
         .evaluate(policy, &fixture.context(), &mut PolicyBudget::default())
         .unwrap();
-    let explanation =
-        explain_finding(&run, &only_finding(&run), &ExplanationLimits::default()).unwrap();
+    let explanation = explain_finding(
+        &run,
+        &only_finding(&run),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .unwrap();
     assert!(
         root_child(&explanation, "taint_origin")
             .expected()

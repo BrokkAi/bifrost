@@ -31,11 +31,17 @@ use super::{
     ProtocolEventOccurrence, ProtocolObservationPhase, TypestateAliasGuard,
     TypestateBindingContext, TypestateBindingMultiplicity, TypestateBindingPlan,
     TypestateBindingQuality, TypestateComposeFunction, TypestateComposeStep, TypestateSubjectId,
-    TypestateUncertainty, call_subject_map,
+    TypestateUncertainty, call_family_subject_map, call_subject_map,
 };
 
 const MAX_LOCAL_PATHS: usize = 1_024;
 const MAX_LOCAL_VISITS: usize = 4_096;
+
+type LocalObjectRelation = fn(
+    &mut OrderedRelationCache<'_>,
+    ProgramPointId,
+    ProgramPointId,
+) -> (TypestateComposeFunction, HopQuality);
 
 type BypassKey = (
     ExactProcedureIdentity,
@@ -373,7 +379,49 @@ impl<'a> TypestateOrderedRelations<'a> {
         activation_edge: Option<&ControlEdgeHandle>,
         request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
     ) -> Result<Option<(TypestateComposeFunction, HopQuality)>, SemanticProviderError> {
-        let (from, to) = endpoints;
+        self.object_segment_using(
+            procedure,
+            context,
+            tracked_formal,
+            activation_edge,
+            request,
+            (endpoints, |solve, from, to| solve.between(from, to)),
+        )
+    }
+
+    /// Transfer K already applied the continuation's bindings. Only this
+    /// transfer suffix omits them; ordinary object segments stay inclusive.
+    pub(crate) fn object_segment_after_start(
+        &mut self,
+        procedure: &ProcedureHandle,
+        context: &TypestateBindingContext,
+        tracked_formal: Option<&PartialFlowPort>,
+        endpoints: (&Endpoint, &Endpoint),
+        activation_edge: Option<&ControlEdgeHandle>,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<Option<(TypestateComposeFunction, HopQuality)>, SemanticProviderError> {
+        self.object_segment_using(
+            procedure,
+            context,
+            tracked_formal,
+            activation_edge,
+            request,
+            (endpoints, |solve, from, to| {
+                solve.between_after_start(from, to)
+            }),
+        )
+    }
+
+    fn object_segment_using(
+        &mut self,
+        procedure: &ProcedureHandle,
+        context: &TypestateBindingContext,
+        tracked_formal: Option<&PartialFlowPort>,
+        activation_edge: Option<&ControlEdgeHandle>,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        segment: ((&Endpoint, &Endpoint), LocalObjectRelation),
+    ) -> Result<Option<(TypestateComposeFunction, HopQuality)>, SemanticProviderError> {
+        let ((from, to), relation) = segment;
         let inert_drops = self.inert_drops(procedure, request)?;
         let key = procedure.exact_identity();
         let parts_entry = self.parts(procedure, Some(request))?;
@@ -489,7 +537,7 @@ impl<'a> TypestateOrderedRelations<'a> {
         ) {
             return Ok(None);
         }
-        let (mut function, quality) = solve.between(start, end);
+        let (mut function, quality) = relation(&mut solve, start, end);
         if !activation_quality.proven {
             function = TypestateComposeFunction::unproven_hop_loss().then(function);
         }
@@ -515,6 +563,22 @@ impl<'a> TypestateOrderedRelations<'a> {
             quality = quality.conjoin(stage_quality);
         }
         Ok(Some((function, quality)))
+    }
+
+    pub(crate) fn transfer_function(
+        &self,
+        source: TypestateSubjectId,
+        call: &CallSiteHandle,
+        context: &TypestateBindingContext,
+    ) -> (TypestateComposeFunction, HopQuality) {
+        bound_transfer_function(
+            self.protocol,
+            self.bindings,
+            source,
+            self.subject,
+            context,
+            call,
+        )
     }
 
     pub(crate) fn handoffs(
@@ -585,17 +649,33 @@ impl<'a> TypestateOrderedRelations<'a> {
             }
         }
         let mut handoffs = Vec::new();
-        for mut binding in crate::composition::project_call_handoffs(
-            call,
-            bindings,
-            candidate,
-            &reference_certified,
-            receiver_continuity_certified,
-        )
-        .map_err(SemanticProviderError::internal)?
-        .iter()
-        .filter(|binding| binding.exit == exit)
-        .cloned()
+        // An analyzed family accounts for selection; the singleton projection
+        // keeps conjoining the raw candidate evidence (#11296).
+        let projected = match dispatch
+            .available_value()
+            .and_then(DispatchResult::analyzed_family)
+        {
+            Some(family) => crate::composition::project_family_arm_handoffs(
+                call,
+                bindings,
+                candidate,
+                &reference_certified,
+                receiver_continuity_certified,
+                family,
+            ),
+            None => crate::composition::project_call_handoffs(
+                call,
+                bindings,
+                candidate,
+                &reference_certified,
+                receiver_continuity_certified,
+            ),
+        }
+        .map_err(SemanticProviderError::internal)?;
+        for mut binding in projected
+            .iter()
+            .filter(|binding| binding.exit == exit)
+            .cloned()
         {
             let (actual, formal) = candidate
                 .arguments
@@ -718,7 +798,17 @@ impl<'a> TypestateOrderedRelations<'a> {
             };
             let discharge_eligible = binding.quality.is_certain()
                 && binding.continuity == CallObjectContinuity::Reference;
-            let mapping = call_subject_map(
+            // A sealed family whose every arm this composition maps accounts
+            // for selection; each arm still passes its own exact map (#11296).
+            let map = if dispatch
+                .available_value()
+                .is_some_and(|dispatch| dispatch.analyzed_family().is_some())
+            {
+                call_family_subject_map
+            } else {
+                call_subject_map
+            };
+            let mapping = map(
                 dispatch,
                 bindings,
                 CallSubjectMapSelection {
@@ -869,34 +959,13 @@ impl<'a> OrderedRelationCache<'a> {
             .procedure
             .call_site_handle(call_id)
             .expect("a projected call port names its procedure's call");
-        let mut events: Vec<_> = self
-            .bindings
-            .event_bindings_at_call_site_all_contexts(&call)
-            .filter(|binding| {
-                binding.subject() == self.subject
-                    && binding.site().context() == &self.context
-                    && self.protocol.event(binding.event()).is_some_and(|event| {
-                        event.observation().occurrence
-                            == ProtocolEventOccurrence::Endpoint { phase }
-                    })
-            })
-            .collect();
-        events.sort_unstable_by_key(|event| (event.order(), event.id()));
-        let mut uncertain = false;
-        let steps = events
-            .into_iter()
-            .map(|event| {
-                if event.condition().is_some() {
-                    uncertain = true;
-                    TypestateComposeStep::Incomplete(TypestateUncertainty::IncompleteAnalysis)
-                } else {
-                    TypestateComposeStep::Event(event.id())
-                }
-            })
-            .collect();
-        (
-            TypestateComposeFunction::choice([steps]),
-            HopQuality::from_uncertain(uncertain),
+        bound_call_observations(
+            self.protocol,
+            self.bindings,
+            self.subject,
+            &self.context,
+            &call,
+            phase,
         )
     }
 
@@ -936,6 +1005,14 @@ impl<'a> OrderedRelationCache<'a> {
         }
     }
 
+    fn point_observations(&self, point: ProgramPointId) -> (TypestateComposeFunction, HopQuality) {
+        let handle = self
+            .procedure
+            .point_handle(point)
+            .expect("point belongs to procedure");
+        bound_point_observations(self.bindings, self.subject, &self.context, &handle)
+    }
+
     pub fn between(
         &mut self,
         from: ProgramPointId,
@@ -944,6 +1021,33 @@ impl<'a> OrderedRelationCache<'a> {
         if let Some(cached) = self.relations.get(&(from, to)) {
             return cached.clone();
         }
+        let result = self.walk_from(from, to, self.point_observations(from));
+        self.relations.insert((from, to), result.clone());
+        result
+    }
+
+    fn between_after_start(
+        &mut self,
+        from: ProgramPointId,
+        to: ProgramPointId,
+    ) -> (TypestateComposeFunction, HopQuality) {
+        self.walk_from(
+            from,
+            to,
+            (TypestateComposeFunction::identity(), HopQuality::CERTAIN),
+        )
+    }
+
+    // Keep the standalone incomplete alternative relative to this walk's
+    // input. Inclusive callers have not consumed their first observations;
+    // transfer suffix callers already consumed them in K. Prefixing the
+    // fallback with the first point would change legacy incomplete states.
+    fn walk_from(
+        &self,
+        from: ProgramPointId,
+        to: ProgramPointId,
+        observations: (TypestateComposeFunction, HopQuality),
+    ) -> (TypestateComposeFunction, HopQuality) {
         assert!(self.procedure.point_handle(from).is_some());
         assert!(self.procedure.point_handle(to).is_some());
 
@@ -951,12 +1055,14 @@ impl<'a> OrderedRelationCache<'a> {
             point: ProgramPointId,
             seen: Vec<ProgramPointId>,
             function: TypestateComposeFunction,
+            observations: (TypestateComposeFunction, HopQuality),
         }
 
         let mut pending = vec![Path {
             point: from,
             seen: Vec::new(),
             function: TypestateComposeFunction::identity(),
+            observations,
         }];
         let mut paths = Vec::new();
         let mut incomplete = false;
@@ -972,30 +1078,8 @@ impl<'a> OrderedRelationCache<'a> {
                 continue;
             }
             path.seen.push(path.point);
-            let handle = self
-                .procedure
-                .point_handle(path.point)
-                .expect("an edge of one procedure names its point");
-            let mut events: Vec<_> = self
-                .bindings
-                .event_bindings_at_program_point_all_contexts(&handle)
-                .filter(|event| {
-                    event.subject() == self.subject && event.site().context() == &self.context
-                })
-                .collect();
-            events.sort_unstable_by_key(|event| (event.order(), event.id()));
-            for event in events {
-                if event.condition().is_some() {
-                    incomplete = true;
-                    path.function = path.function.then(TypestateComposeFunction::incomplete(
-                        TypestateUncertainty::IncompleteAnalysis,
-                    ));
-                } else {
-                    path.function = path
-                        .function
-                        .then(TypestateComposeFunction::event(event.id()));
-                }
-            }
+            incomplete |= !path.observations.1.is_certain();
+            path.function = path.function.then(path.observations.0);
             if (!self.inert_drops.contains(&path.point)
                 && self.ordered.drop_points.contains(&path.point))
                 || self
@@ -1044,6 +1128,7 @@ impl<'a> OrderedRelationCache<'a> {
                     point: edge.target_point,
                     seen: path.seen.clone(),
                     function,
+                    observations: self.point_observations(edge.target_point),
                 });
             }
         }
@@ -1053,13 +1138,134 @@ impl<'a> OrderedRelationCache<'a> {
                 TypestateUncertainty::IncompleteAnalysis,
             ));
         }
-        let result = (
+        (
             TypestateComposeFunction::choice_functions(paths),
             HopQuality::from_uncertain(incomplete),
-        );
-        self.relations.insert((from, to), result.clone());
-        result
+        )
     }
+}
+
+fn bound_transfer_function(
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    source: TypestateSubjectId,
+    result: TypestateSubjectId,
+    context: &TypestateBindingContext,
+    call: &CallSiteHandle,
+) -> (TypestateComposeFunction, HopQuality) {
+    assert_ne!(
+        source, result,
+        "self-transfers stay on the subject's ordinary path"
+    );
+    let (before, quality) = bound_call_observations(
+        protocol,
+        bindings,
+        source,
+        context,
+        call,
+        ProtocolObservationPhase::BeforeCall,
+    );
+    let (after, result_quality) =
+        bound_transfer_observations(protocol, bindings, result, context, call);
+    (
+        before
+            .then(TypestateComposeFunction::copy_state(source, result))
+            .then(after),
+        quality.conjoin(result_quality),
+    )
+}
+
+fn bound_transfer_observations(
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    subject: TypestateSubjectId,
+    context: &TypestateBindingContext,
+    call: &CallSiteHandle,
+) -> (TypestateComposeFunction, HopQuality) {
+    let (stage, quality) = bound_call_observations(
+        protocol,
+        bindings,
+        subject,
+        context,
+        call,
+        ProtocolObservationPhase::AfterNormalReturn,
+    );
+    let point = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("transfer call exists")
+        .normal_continuation
+        .target()
+        .expect("transfer has normal continuation");
+    let handle = call
+        .procedure()
+        .point_handle(point)
+        .expect("continuation belongs to procedure");
+    let (events, point_quality) = bound_point_observations(bindings, subject, context, &handle);
+    (stage.then(events), quality.conjoin(point_quality))
+}
+
+fn bound_call_observations(
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    subject: TypestateSubjectId,
+    context: &TypestateBindingContext,
+    call: &CallSiteHandle,
+    phase: ProtocolObservationPhase,
+) -> (TypestateComposeFunction, HopQuality) {
+    let mut events: Vec<_> = bindings
+        .event_bindings_at_call_site_all_contexts(call)
+        .filter(|binding| {
+            binding.subject() == subject
+                && binding.site().context() == context
+                && protocol.event(binding.event()).is_some_and(|event| {
+                    event.observation().occurrence == ProtocolEventOccurrence::Endpoint { phase }
+                })
+        })
+        .collect();
+    events.sort_unstable_by_key(|event| (event.order(), event.id()));
+    let mut uncertain = false;
+    let steps = events
+        .into_iter()
+        .map(|event| {
+            if event.condition().is_some() {
+                uncertain = true;
+                TypestateComposeStep::Incomplete(TypestateUncertainty::IncompleteAnalysis)
+            } else {
+                TypestateComposeStep::Event(event.id())
+            }
+        })
+        .collect();
+    (
+        TypestateComposeFunction::choice([steps]),
+        HopQuality::from_uncertain(uncertain),
+    )
+}
+
+fn bound_point_observations(
+    bindings: &TypestateBindingPlan,
+    subject: TypestateSubjectId,
+    context: &TypestateBindingContext,
+    point: &crate::analyzer::semantic::ProgramPointHandle,
+) -> (TypestateComposeFunction, HopQuality) {
+    let mut events: Vec<_> = bindings
+        .event_bindings_at_program_point_all_contexts(point)
+        .filter(|event| event.subject() == subject && event.site().context() == context)
+        .collect();
+    events.sort_unstable_by_key(|event| (event.order(), event.id()));
+    let mut function = TypestateComposeFunction::identity();
+    let mut incomplete = false;
+    for event in events {
+        let step = if event.condition().is_some() {
+            incomplete = true;
+            TypestateComposeFunction::incomplete(TypestateUncertainty::IncompleteAnalysis)
+        } else {
+            TypestateComposeFunction::event(event.id())
+        };
+        function = function.then(step);
+    }
+    (function, HopQuality::from_uncertain(incomplete))
 }
 
 fn local_cfg_reaches(
@@ -1291,7 +1497,13 @@ fn formal_ownership_into_actual(
         return Ok(None);
     };
     let class = with_hook_verdict(workspace, |reuse| {
-        support.ownership_class_of_formal(workspace, procedure, *ordinal, actual, request, reuse)
+        support.ownership_class_of_formal(
+            workspace,
+            procedure,
+            crate::analyzer::semantic::ProcedurePortKind::Parameter { ordinal: *ordinal },
+            request,
+            reuse,
+        )
     })?;
     Ok((!request.stop_observed()).then_some(class))
 }
@@ -1558,8 +1770,9 @@ fn selected_reference_binding(
                 support.ownership_class_of_formal(
                     discovery.workspace(),
                     mapping.formal().procedure(),
-                    target_ordinal,
-                    actual,
+                    crate::analyzer::semantic::ProcedurePortKind::Parameter {
+                        ordinal: target_ordinal,
+                    },
                     request,
                     reuse,
                 )
@@ -2359,6 +2572,107 @@ fn selected_receiver_binding(
 /// Identify a Rust receiver for an authored normal-return event.
 /// The same selected handoff and subject map used by composition must prove
 /// the exact pre-call object in this query's call context.
+/// The source classification shared by typestate transfer consumers.
+#[derive(Debug, Clone)]
+pub enum TypestateTransferSource {
+    Certified(Box<crate::analyzer::semantic::AbstractObject>),
+    Uncertified,
+    NoSource,
+}
+
+/// Resolve the written source before effects; certification establishes object
+/// continuity, while the authored transfer supplies the state-copy contract.
+pub fn selected_transfer_source(
+    discovery: &crate::composition::WorkspaceCompositionDiscovery<'_>,
+    call: &CallSiteHandle,
+    from: super::TypestateEventPort,
+    context: &crate::analyzer::semantic::OracleCallContext,
+    request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<TypestateTransferSource, SemanticProviderError> {
+    use TypestateTransferSource::{Certified, NoSource, Uncertified};
+    let procedure = call.procedure();
+    let site = procedure
+        .semantics()
+        .call_site(call.id())
+        .expect("call exists");
+    let actual = match from {
+        super::TypestateEventPort::Receiver => site.receiver,
+        super::TypestateEventPort::Argument { ordinal } => {
+            let Some(argument) = site.arguments.get(ordinal as usize) else {
+                return Ok(Uncertified);
+            };
+            Some(argument.value)
+        }
+        super::TypestateEventPort::Result { .. } => {
+            unreachable!("a transfer source is a receiver or argument")
+        }
+    };
+    let Some(actual) = actual else {
+        return Ok(NoSource);
+    };
+    let observation = ValueAtPoint::new(
+        procedure.value_handle(actual).expect("source value exists"),
+        procedure
+            .point_handle(site.point)
+            .expect("call point exists"),
+        ObservationPhase::BeforeEffects,
+        context.clone(),
+    )
+    .expect("source and call share a procedure");
+    let points = discovery
+        .workspace()
+        .semantic_oracle_provider()
+        .pointees(&observation, request)?;
+    let Some(result) = points.available_value() else {
+        return Ok(Uncertified);
+    };
+    let [candidate] = result.objects().candidates() else {
+        return Ok(Uncertified);
+    };
+    if !points.is_complete()
+        || result.objects().coverage() != CandidateCoverage::Exhaustive
+        || !candidate.is_proven_complete()
+        || request.stop_observed()
+    {
+        return Ok(Uncertified);
+    }
+    let quality = TypestateBindingQuality::proven_unique();
+    let subject = BoundTypestateSubject::receiver_event_probe(candidate.value().clone(), quality);
+    let query = || MoveBindingQuery {
+        discovery,
+        procedure,
+        call: site,
+        context,
+        subject: &subject,
+        tracked_formal: None,
+        actual,
+    };
+    let certified = match from {
+        super::TypestateEventPort::Receiver => {
+            selected_receiver_binding(query(), request)? != CallObjectContinuity::Unknown
+                || selected_receiver_event_object(
+                    discovery,
+                    procedure,
+                    call,
+                    context,
+                    ProtocolObservationPhase::AfterNormalReturn,
+                    request,
+                )?
+                .is_some()
+        }
+        super::TypestateEventPort::Argument { .. } => {
+            selected_reference_binding(query(), request)?
+                || selected_move_binding(query(), request)?
+        }
+        super::TypestateEventPort::Result { .. } => unreachable!(),
+    };
+    Ok(if certified && !request.stop_observed() {
+        Certified(Box::new(candidate.value().clone()))
+    } else {
+        Uncertified
+    })
+}
+
 pub fn selected_receiver_event_object(
     discovery: &crate::composition::WorkspaceCompositionDiscovery<'_>,
     procedure: &ProcedureHandle,
@@ -2885,13 +3199,20 @@ fn guarded_local_bypass(
     Ok(saw_interference.then_some(CallBypass { exits }))
 }
 
-/// Return (exact subject transport, proven disjointness) for a call input.
-/// Unknown aliases establish neither property.
+/// Positive identity transport is the only authority supplied by one actual.
+/// Distinct direct pointees do not exclude access through fields or ambient state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CallActualContinuity {
+    Exact,
+    Unproven,
+}
+
+/// Classify identity transport without inferring whole-call noninterference.
 pub(crate) fn call_actual_continuity(
     workspace: &WorkspaceAnalyzer,
     query: MoveBindingQuery<'_, '_>,
     request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
-) -> Result<(bool, bool), SemanticProviderError> {
+) -> Result<CallActualContinuity, SemanticProviderError> {
     let MoveBindingQuery {
         discovery,
         procedure,
@@ -2925,7 +3246,7 @@ pub(crate) fn call_actual_continuity(
             request,
         )? != CallObjectContinuity::Unknown
     {
-        return Ok((true, false));
+        return Ok(CallActualContinuity::Exact);
     }
     let mut value = actual;
     let address = procedure
@@ -2960,7 +3281,7 @@ pub(crate) fn call_actual_continuity(
                 value = source;
             }
             _ => {
-                return Ok((false, false));
+                return Ok(CallActualContinuity::Unproven);
             }
         }
     }
@@ -2991,7 +3312,7 @@ pub(crate) fn call_actual_continuity(
                 request,
             )?)
     {
-        return Ok((true, false));
+        return Ok(CallActualContinuity::Exact);
     }
     if selected_reference_binding(
         MoveBindingQuery {
@@ -3005,7 +3326,7 @@ pub(crate) fn call_actual_continuity(
         },
         request,
     )? {
-        return Ok((true, false));
+        return Ok(CallActualContinuity::Exact);
     }
     if tracked_formal.is_some()
         && selected_move_binding(
@@ -3023,10 +3344,10 @@ pub(crate) fn call_actual_continuity(
     {
         // A whole temporary with one exact Parameter origin moves the
         // tracked formal too; direct ValueId equality is not required.
-        return Ok((true, false));
+        return Ok(CallActualContinuity::Exact);
     }
     if tracked_formal.is_some() {
-        return Ok((false, false));
+        return Ok(CallActualContinuity::Unproven);
     }
     let observation = ValueAtPoint::new(
         procedure
@@ -3041,7 +3362,7 @@ pub(crate) fn call_actual_continuity(
     .expect("call actual and point share a procedure");
     let answer = oracle.pointees(&observation, request)?;
     let Some(points) = answer.available_value() else {
-        return Ok((false, false));
+        return Ok(CallActualContinuity::Unproven);
     };
     let objects = points.objects();
     if !answer.is_complete()
@@ -3051,7 +3372,7 @@ pub(crate) fn call_actual_continuity(
             .iter()
             .all(|candidate| candidate.is_proven_complete())
     {
-        return Ok((false, false));
+        return Ok(CallActualContinuity::Unproven);
     }
     if matches!(objects.candidates(), [candidate] if candidate.value() == subject.object()) {
         // A singleton allocation site does not establish object continuity:
@@ -3072,17 +3393,14 @@ pub(crate) fn call_actual_continuity(
                 request,
             )?
         {
-            return Ok((true, false));
+            return Ok(CallActualContinuity::Exact);
         }
-        return Ok((false, false));
+        return Ok(CallActualContinuity::Unproven);
     }
-    Ok((
-        false,
-        objects
-            .candidates()
-            .iter()
-            .all(|candidate| candidate.value() != subject.object()),
-    ))
+    // Allocation inequality says nothing about the callee reaching the subject
+    // through a holder field, a global, or a capture. Only a whole-call proof
+    // could authorize a certain bypass, including for a call with no actuals.
+    Ok(CallActualContinuity::Unproven)
 }
 
 fn call_bypasses(
@@ -3103,14 +3421,13 @@ fn call_bypasses(
     } = query;
     let mut bypasses = HashMap::default();
     for call in &parts.call_sites {
-        let mut disjoint = true;
         let mut exact_handoff = false;
         for actual in call
             .receiver
             .into_iter()
             .chain(call.arguments.iter().map(|argument| argument.value))
         {
-            let (exact, separate) = call_actual_continuity(
+            let continuity = call_actual_continuity(
                 workspace,
                 MoveBindingQuery {
                     discovery,
@@ -3123,40 +3440,33 @@ fn call_bypasses(
                 },
                 request,
             )?;
-            exact_handoff |= exact;
-            disjoint &= separate;
+            exact_handoff = continuity == CallActualContinuity::Exact;
             if exact_handoff {
                 break;
             }
         }
         if !exact_handoff {
-            if !disjoint
-                && let Some(guarded) = guarded_local_bypass(
-                    &BypassQuery {
-                        workspace,
-                        discovery,
-                        procedure,
-                        parts,
-                        context,
-                        subject,
-                        subject_id,
-                        bindings,
-                        protocol,
-                        tracked_formal,
-                    },
-                    call,
-                    request,
-                )?
-            {
+            if let Some(guarded) = guarded_local_bypass(
+                &BypassQuery {
+                    workspace,
+                    discovery,
+                    procedure,
+                    parts,
+                    context,
+                    subject,
+                    subject_id,
+                    bindings,
+                    protocol,
+                    tracked_formal,
+                },
+                call,
+                request,
+            )? {
                 bypasses.insert(call.point, guarded);
                 continue;
             }
-            let quality = HopQuality::from_uncertain(!disjoint);
-            let function = if disjoint {
-                TypestateComposeFunction::identity()
-            } else {
-                TypestateComposeFunction::unproven_hop_loss()
-            };
+            let quality = HopQuality::UNCERTAIN;
+            let function = TypestateComposeFunction::unproven_hop_loss();
             let exits = [call.normal_continuation, call.exceptional_continuation]
                 .into_iter()
                 .filter_map(|continuation| continuation.target())
@@ -3232,7 +3542,29 @@ mod tests {
                 },
             )
             .unwrap();
+        // A same-FQN `com.example.res.Handle` from another provider is
+        // registered but never enabled, so it must not shadow the selected
+        // declaration. It is a whole pack rather than an unselected shard of
+        // the enabled variant pack: a partly selected curated JVM pack opens
+        // the JVM family because the provider-keyed projection carries no
+        // shard provenance (#10712), and the JVM catalog reader tests pin that.
+        let same_fqn = compile_source(
+            SourceFormat::Json,
+            include_bytes!("../../tests/fixtures/9432-java-handle-same-fqn.json"),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .register_session_pack(
+                &same_fqn,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:9432-java-handle-same-fqn".into(),
+                },
+            )
+            .unwrap();
         let mut activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -3243,7 +3575,8 @@ mod tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: vec![SemanticModelActivationControl {
                 scope: SemanticModelControlScope::Workspace,
@@ -3277,6 +3610,10 @@ mod tests {
             matches!(activated, SemanticModelRuntimeOutcome::Ready { .. }),
             "{activated:?}"
         );
+        // Product routes read inside a request scope (RQL execution and the
+        // policy evaluator install one); the JVM request source refuses reads
+        // outside one, so the test holds a scope for its reads.
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
         let mut budget = SemanticBudget::default();
         let artifact = workspace
             .materialize_program_semantics(
@@ -3705,6 +4042,548 @@ mod tests {
                 calls[1].point,
             ),
             "the local relation must not bypass the helper handoff"
+        );
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12769: composition transfer results missed return and continuation events"
+    )]
+    fn transferred_result_observations_once_and_legacy_incomplete() {
+        use crate::analyzer::semantic::*;
+        use crate::composition::{TypestateCompositionProvider, WorkspaceCompositionDiscovery};
+        use crate::dataflow::{DataflowEdge, DataflowOutput, DistributiveDataflowProblem};
+        use crate::inline_project::InlineTestProject;
+        use crate::taint::compose::{
+            ComposeLabels, CompositionProvider, ObjectAnchor, ObjectAnchorRole,
+        };
+        use crate::typestate::*;
+        use crate::value_flow::{ValueFlowCache, WorkspaceValueFlowProvider};
+        use brokk_bifrost_core::analyzer::model::Language;
+        let mut shapes = std::collections::BTreeSet::new();
+        for (source, exact_exit) in [
+            (
+                "fn touch(x: u32) -> u32 { x }\npub fn root(value: u32) { touch(value); }\n",
+                true,
+            ),
+            (
+                "fn touch(x: u32) -> u32 { x }\npub fn root(value: u32) { let out = touch(value); let later = 1; let _ = out; }\n",
+                false,
+            ),
+        ] {
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname=\"transfer-point\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+                )
+                .file("src/lib.rs", source)
+                .build();
+            let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+            let workspace = WorkspaceAnalyzer::build_persisted(
+                std::sync::Arc::new(filesystem),
+                crate::analyzer::AnalyzerConfig::default(),
+            )
+            .unwrap();
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("src/lib.rs"),
+                    &mut SemanticRequest::new(
+                        &mut SemanticBudget::default(),
+                        &CancellationToken::default(),
+                    ),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            // Exercise the valid IR boundary where a call continues directly
+            // at NormalExit. Rust currently inserts a separate continuation.
+            let artifact = if exact_exit {
+                let mut parts = artifact
+                    .procedures()
+                    .iter()
+                    .map(|procedure| {
+                        let handle = artifact.procedure_handle(procedure.id()).unwrap();
+                        workspace
+                            .stored_semantic_ir_procedure(&handle)
+                            .unwrap()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let selected = parts.iter_mut().find(|p| !p.call_sites.is_empty()).unwrap();
+                let exit = artifact
+                    .procedure_handle(selected.id)
+                    .unwrap()
+                    .semantics()
+                    .normal_exit_point();
+                let call = &mut selected.call_sites[0];
+                let old = call.normal_continuation.target().unwrap();
+                call.normal_continuation = ControlContinuation::Target(exit);
+                let call_id = call.id;
+                let mut continuations = Vec::new();
+                for point in &mut selected.points {
+                    let mut events = point.events.to_vec();
+                    events.retain(|event| {
+                        if matches!(event.effect, SemanticEffect::CallContinuation {call_site, kind:CallContinuationKind::Normal} if call_site==call_id) {
+                            continuations.push(event.clone()); false
+                        } else {true}
+                    });
+                    point.events = events.into_boxed_slice();
+                }
+                let exit_point = selected.points.iter_mut().find(|p| p.id == exit).unwrap();
+                continuations.extend(exit_point.events.iter().cloned());
+                exit_point.events = continuations.into_boxed_slice();
+                for edge in &mut selected.control_edges {
+                    if edge.source_point == call.point && edge.target_point == old {
+                        edge.target_point = exit;
+                    }
+                }
+                std::sync::Arc::new(
+                    SemanticArtifact::try_new(
+                        artifact.key().clone(),
+                        artifact.capabilities().clone(),
+                        parts,
+                    )
+                    .expect("direct-exit fixture IR validates"),
+                )
+            } else {
+                artifact
+            };
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|p| !p.call_sites().is_empty())
+                .unwrap();
+            let root = artifact.procedure_handle(procedure.id()).unwrap();
+            let call = root.call_site_handle(procedure.call_sites()[0].id).unwrap();
+
+            let row = root.semantics().call_site(call.id()).unwrap();
+            let point = row.normal_continuation.target().unwrap();
+            let exit = root.semantics().normal_exit_point();
+            let is_exit = point == exit;
+            shapes.insert(is_exit);
+            for before_call in [false, true] {
+                let object = |value| {
+                    AbstractObject::new(
+                        AccessPathRoot::Value(root.value_handle(value).unwrap()),
+                        ObjectCardinality::Singleton,
+                    )
+                    .unwrap()
+                };
+                let source_object = object(row.arguments[0].value);
+                let result_object = object(row.result.expect("call result"));
+                let class = TypestateSubjectClassKey::new("resource").unwrap();
+                let src = BoundTypestateSubjectSpec::new(
+                    class.clone(),
+                    source_object,
+                    TypestateBindingQuality::proven_unique(),
+                );
+                let dst = BoundTypestateSubjectSpec::new(
+                    class,
+                    result_object.clone(),
+                    TypestateBindingQuality::proven_unique(),
+                );
+                let src_key = src.key().clone();
+                let dst_key = dst.key().clone();
+                let occurrence = if is_exit {
+                    r#"{"type":"procedure_exit","kind":"normal"}"#
+                } else {
+                    r#"{"type":"endpoint","phase":"at_match"}"#
+                };
+                let text = r#"{
+          "schema_version":1,"states":["a","b","c"],"initial_state":"a","accepting_states":["a","b","c"],"error_states":[],
+          "events":[{"id":"returned","observation":{"occurrence":{"type":"endpoint","phase":"after_normal_return"}}},{"id":"point","observation":{"occurrence":OCCURRENCE}}],
+          "transitions":[{"from":"a","on":"returned","to":"b"},{"from":"b","on":"returned","to":"a"},{"from":"b","on":"point","to":"c"},{"from":"c","on":"point","to":"b"},{"from":"a","on":"point","to":"b"}],
+          "terminal_expectations":[{"id":"done","on":{"type":"event","observation":{"occurrence":OCCURRENCE}},"expected_states":["c"]}],
+          "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state","uncertainty":{"ambiguous_dispatch":"preserve_uncertainty","unknown_call":"preserve_uncertainty","external_call":"preserve_uncertainty","escape":"preserve_uncertainty","incomplete_analysis":"preserve_uncertainty"}}
+        }"#.replace("OCCURRENCE", occurrence);
+                let mut spec: serde_json::Value = serde_json::from_str(&text).unwrap();
+                spec["events"].as_array_mut().unwrap().extend([
+                serde_json::json!({"id":"source_after","observation":{"occurrence":{"type":"endpoint","phase":"after_normal_return"}}}),
+                serde_json::json!({"id":"source_before","observation":{"occurrence":{"type":"endpoint","phase":"before_call"}}}),
+                serde_json::json!({"id":"source_point","observation":{"occurrence":{"type":"endpoint","phase":"at_match"}}})
+            ]);
+                for from in ["a", "b", "c"] {
+                    spec["transitions"].as_array_mut().unwrap().extend([
+                        serde_json::json!({"from":from,"on":"source_after","to":"a"}),
+                        serde_json::json!({"from":from,"on":"source_before","to":"b"}),
+                        serde_json::json!({"from":from,"on":"source_point","to":"b"}),
+                    ]);
+                }
+                let text = spec.to_string();
+                let protocol = ProtocolSpec::from_json(text.as_bytes())
+                    .unwrap()
+                    .compile()
+                    .unwrap();
+                let context = TypestateBindingContext::root();
+                let point_site = TypestateObservationSite::program_point(
+                    root.point_handle(point).unwrap(),
+                    context.clone(),
+                );
+                let point_role = if is_exit {
+                    TypestateObjectRole::CurrentObject
+                } else {
+                    TypestateObjectRole::MatchedValue
+                };
+                let mut events = vec![
+                    TypestateEventBindingSpec::new(
+                        ProtocolEventKey::new("returned").unwrap(),
+                        dst_key.clone(),
+                        TypestateObservationSite::call_site(call.clone(), context.clone()),
+                        0,
+                        TypestateObjectRole::NormalReturn,
+                        TypestateBindingQuality::proven_unique(),
+                    ),
+                    TypestateEventBindingSpec::new(
+                        ProtocolEventKey::new("point").unwrap(),
+                        dst_key.clone(),
+                        point_site.clone(),
+                        0,
+                        point_role,
+                        TypestateBindingQuality::proven_unique(),
+                    ),
+                ];
+                events.push(TypestateEventBindingSpec::new(
+                    ProtocolEventKey::new("source_after").unwrap(),
+                    src_key.clone(),
+                    TypestateObservationSite::call_site(call.clone(), context.clone()),
+                    2,
+                    TypestateObjectRole::Argument,
+                    TypestateBindingQuality::proven_unique(),
+                ));
+                if before_call {
+                    events.push(TypestateEventBindingSpec::new(
+                        ProtocolEventKey::new("source_before").unwrap(),
+                        src_key.clone(),
+                        TypestateObservationSite::call_site(call.clone(), context.clone()),
+                        1,
+                        TypestateObjectRole::Argument,
+                        TypestateBindingQuality::proven_unique(),
+                    ));
+                }
+                if !is_exit {
+                    events.push(TypestateEventBindingSpec::new(
+                        ProtocolEventKey::new("source_point").unwrap(),
+                        src_key.clone(),
+                        point_site.clone(),
+                        1,
+                        TypestateObjectRole::MatchedValue,
+                        TypestateBindingQuality::proven_unique(),
+                    ));
+                }
+                let bindings = TypestateBindingPlan::try_new(
+                    &protocol,
+                    vec![src, dst],
+                    vec![],
+                    events,
+                    vec![TypestateTerminalBindingSpec::new(
+                        ProtocolExpectationKey::new("done").unwrap(),
+                        dst_key.clone(),
+                        point_site,
+                        point_role,
+                        TypestateBindingQuality::proven_unique(),
+                    )],
+                )
+                .unwrap()
+                .with_state_transfers(
+                    &protocol,
+                    vec![TypestateStateTransferSpec {
+                        call: call.clone(),
+                        source: Some(src_key.clone()),
+                        result: dst_key.clone(),
+                    }],
+                )
+                .unwrap();
+                let src = bindings
+                    .subjects()
+                    .iter()
+                    .find(|s| s.key() == &src_key)
+                    .unwrap();
+                let dst = bindings
+                    .subjects()
+                    .iter()
+                    .find(|s| s.key() == &dst_key)
+                    .unwrap();
+                let provider = TypestateCompositionProvider::new(
+                    WorkspaceCompositionDiscovery::new(
+                        &workspace,
+                        WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+                    ),
+                    SemanticExecutionBudget::new(8),
+                    crate::taint::compose::CompositionBudget {
+                        max_procedures: 8,
+                        max_hops: 128,
+                        max_callers_per_procedure: 8,
+                    },
+                    &protocol,
+                    &bindings,
+                    dst,
+                    context.clone(),
+                    usize::MAX,
+                );
+                let anchor = |p, role| {
+                    Endpoint::Object(Box::new(ObjectAnchor {
+                        procedure: root.durable_key(),
+                        site: ObjectAnchorSite::ProgramPoint(p),
+                        role,
+                        object: result_object.clone(),
+                    }))
+                };
+                let at = anchor(point, ObjectAnchorRole::CurrentObject);
+                let mut budget = SemanticBudget::default();
+                let cancellation = CancellationToken::default();
+                let mut request = SemanticRequest::new(&mut budget, &cancellation);
+                let copy_function = if exact_exit {
+                    let (function, quality) = bound_transfer_function(
+                        &protocol,
+                        &bindings,
+                        src.id(),
+                        dst.id(),
+                        &context,
+                        &call,
+                    );
+                    assert!(quality.is_certain());
+                    function
+                } else {
+                    let relation = provider
+                        .object_relation(&root.durable_key(), &at, &mut request)
+                        .unwrap();
+                    relation
+                        .predecessors
+                        .iter()
+                        .find(|p| matches!(&p.from,Endpoint::Object(a) if a.object==*src.object()))
+                        .expect("copy predecessor")
+                        .function
+                        .clone()
+                };
+                let initial = TypestateComposeFact::formal_entry(
+                    &bindings,
+                    src.id(),
+                    protocol.initial_state(),
+                );
+                let labels = TypestateComposeLabels::new(&protocol, &bindings);
+                let c = protocol
+                    .state_id(&ProtocolStateKey::new("c").unwrap())
+                    .unwrap();
+                let b = protocol
+                    .state_id(&ProtocolStateKey::new("b").unwrap())
+                    .unwrap();
+                let expected = if before_call { b } else { c };
+                let states = |fact: TypestateComposeFact| {
+                    fact.alternatives()
+                        .iter()
+                        .filter_map(|f| f.protocol_state())
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                assert_eq!(
+                    states(labels.apply(&copy_function, &initial)),
+                    [expected].into_iter().collect(),
+                    "exact continuation"
+                );
+                let bad_initial = TypestateComposeFact::formal_entry(&bindings, src.id(), b);
+                assert_eq!(
+                    states(labels.apply(&copy_function, &bad_initial)),
+                    [b].into_iter().collect(),
+                    "unconditional bad-return sibling"
+                );
+                let terminal = &provider.terminal_roots()[0].1;
+                let terminal_at = Endpoint::Object(Box::new(terminal.clone()));
+                if terminal_at != at {
+                    let later = provider
+                        .object_relation(&root.durable_key(), &terminal_at, &mut request)
+                        .unwrap();
+                    let suffix = later
+                        .predecessors
+                        .iter()
+                        .find(|p| p.from == at)
+                        .expect("continuation suffix");
+                    assert_eq!(
+                        states(labels.apply(
+                            &copy_function.clone().then(suffix.function.clone()),
+                            &initial
+                        )),
+                        [expected].into_iter().collect(),
+                        "terminal continuation"
+                    );
+                }
+                if !is_exit {
+                    let later = provider
+                        .object_relation(
+                            &root.durable_key(),
+                            &anchor(exit, ObjectAnchorRole::CurrentObject),
+                            &mut request,
+                        )
+                        .unwrap();
+                    let suffix = later
+                        .predecessors
+                        .iter()
+                        .find(|p| p.from == at)
+                        .expect("later terminal suffix");
+                    assert_eq!(
+                        states(labels.apply(
+                            &copy_function.clone().then(suffix.function.clone()),
+                            &initial
+                        )),
+                        [expected].into_iter().collect(),
+                        "intermediate continuation"
+                    );
+                }
+                #[derive(Default)]
+                struct Facts(Vec<TypestateFact>);
+                impl DataflowOutput<TypestateFact> for Facts {
+                    fn emit(&mut self, f: TypestateFact) -> bool {
+                        self.0.push(f);
+                        true
+                    }
+                }
+                let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+                let proof = ProofStatus::Proven;
+                let complete = EvidenceCompleteness::Complete;
+                let call_point = root.point_handle(row.point).unwrap();
+                let returned = root.point_handle(point).unwrap();
+                let mut out = Facts::default();
+                problem.normal_flow(
+                    DataflowEdge::new(
+                        IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal),
+                        None,
+                        &call_point,
+                        &returned,
+                        &proof,
+                        &complete,
+                    ),
+                    initial.alternatives()[0],
+                    &mut out,
+                );
+                if !is_exit {
+                    let input = std::mem::take(&mut out.0);
+                    for fact in input {
+                        problem.normal_flow(
+                            DataflowEdge::new(
+                                IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal),
+                                None,
+                                &returned,
+                                &returned,
+                                &proof,
+                                &complete,
+                            ),
+                            fact,
+                            &mut out,
+                        );
+                    }
+                }
+                let actual = out
+                    .0
+                    .iter()
+                    .filter(|f| f.subject() == Some(dst.id()))
+                    .filter_map(|f| f.protocol_state())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    actual,
+                    [expected].into_iter().collect(),
+                    "ICFG continuation"
+                );
+                let mut bad_out = Facts::default();
+                problem.normal_flow(
+                    DataflowEdge::new(
+                        IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal),
+                        None,
+                        &call_point,
+                        &returned,
+                        &proof,
+                        &complete,
+                    ),
+                    bad_initial.alternatives()[0],
+                    &mut bad_out,
+                );
+                if !is_exit {
+                    let input = std::mem::take(&mut bad_out.0);
+                    for fact in input {
+                        problem.normal_flow(
+                            DataflowEdge::new(
+                                IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal),
+                                None,
+                                &returned,
+                                &returned,
+                                &proof,
+                                &complete,
+                            ),
+                            fact,
+                            &mut bad_out,
+                        );
+                    }
+                }
+                let bad_states = bad_out
+                    .0
+                    .iter()
+                    .filter(|f| f.subject() == Some(dst.id()))
+                    .filter_map(|f| f.protocol_state())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    bad_states,
+                    [b].into_iter().collect(),
+                    "ICFG unconditional bad-return sibling"
+                );
+                if exact_exit {
+                    continue;
+                }
+                // A local cycle retains the legacy input-state fallback.
+                let mut parts = workspace
+                    .stored_semantic_ir_procedure(&root)
+                    .unwrap()
+                    .unwrap();
+                let mut cycle = parts.control_edges[0].clone();
+                cycle.source_point = point;
+                cycle.target_point = point;
+                let mut reachable_exit = cycle.clone();
+                reachable_exit.target_point = exit;
+                parts.control_edges = vec![cycle, reachable_exit];
+                let mut counterexample_spec: serde_json::Value =
+                    serde_json::from_str(&text).unwrap();
+                counterexample_spec["states"] = serde_json::json!(["a", "b"]);
+                counterexample_spec["accepting_states"] = serde_json::json!(["a", "b"]);
+                counterexample_spec["terminal_expectations"] = serde_json::json!([]);
+                counterexample_spec["transitions"] = serde_json::json!([
+                    {"from":"a","on":"returned","to":"b"},
+                    {"from":"a","on":"point","to":"b"},
+                    {"from":"b","on":"point","to":"b"}
+                ]);
+                let counterexample_text = counterexample_spec.to_string();
+                let counterexample = ProtocolSpec::from_json(counterexample_text.as_bytes())
+                    .unwrap()
+                    .compile()
+                    .unwrap();
+                let mut local = OrderedRelationCache::new(
+                    &parts,
+                    root.clone(),
+                    context,
+                    &bindings,
+                    &counterexample,
+                    dst.id(),
+                    Default::default(),
+                );
+                let impossible = if point == exit { row.point } else { exit };
+                let (function, _) = local.between(point, impossible);
+                let input = TypestateComposeFact::formal_entry(
+                    &bindings,
+                    dst.id(),
+                    protocol.initial_state(),
+                );
+                let fallback = TypestateComposeLabels::new(&counterexample, &bindings)
+                    .apply(&function, &input);
+                assert!(
+                    fallback
+                        .alternatives()
+                        .iter()
+                        .any(|f| f.protocol_state() == Some(protocol.initial_state())
+                            && !f.uncertainty().is_empty()),
+                    "legacy incomplete keeps A: {fallback:?}"
+                );
+            }
+        }
+        assert_eq!(
+            shapes,
+            [false, true].into_iter().collect(),
+            "both exact-exit and intermediate fixtures must run"
         );
     }
 }

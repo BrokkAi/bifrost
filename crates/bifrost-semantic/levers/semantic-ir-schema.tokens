@@ -17,3 +17,6 @@
 4318-pointer-memory-load-flow
 12128-rust-async-body-execution
 9925-poem-field-binders
+11269-guard-value-barriers
+13854-creating-realization-capture-proof
+11269-actual-borrow-identity

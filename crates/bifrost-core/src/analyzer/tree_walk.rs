@@ -343,42 +343,33 @@ pub fn try_walk_named_tree_preorder<'tree, Error>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoundedNamedTreeWalk {
+pub enum CancellableNamedTreeWalk {
     Complete { visited: usize },
-    Exceeded { visited: usize },
     Cancelled,
 }
 
-/// Visit named nodes in source-order preorder while applying the shared
-/// receiver/setup traversal budget and cancellation policy.
-pub fn walk_named_tree_preorder_bounded<'tree>(
+/// Visit named nodes in source-order preorder, stopping only on cancellation.
+/// Visiting syntax is work and never refuses (#13216).
+pub fn walk_named_tree_preorder_cancellable<'tree>(
     root: Node<'tree>,
     include_root: bool,
-    max_named_nodes: usize,
     cancellation: Option<&CancellationToken>,
     mut visit: impl FnMut(Node<'tree>),
-) -> BoundedNamedTreeWalk {
-    enum Stop {
-        Exceeded,
-        Cancelled,
-    }
+) -> CancellableNamedTreeWalk {
+    struct Cancelled;
 
     let mut visited = 0usize;
     let result = try_walk_named_tree_preorder(root, include_root, |node| {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Stop::Cancelled);
+            return Err(Cancelled);
         }
         visited = visited.saturating_add(1);
-        if visited > max_named_nodes {
-            return Err(Stop::Exceeded);
-        }
         visit(node);
         Ok(WalkControl::Continue)
     });
     match result {
-        Ok(()) => BoundedNamedTreeWalk::Complete { visited },
-        Err(Stop::Exceeded) => BoundedNamedTreeWalk::Exceeded { visited },
-        Err(Stop::Cancelled) => BoundedNamedTreeWalk::Cancelled,
+        Ok(()) => CancellableNamedTreeWalk::Complete { visited },
+        Err(Cancelled) => CancellableNamedTreeWalk::Cancelled,
     }
 }
 
@@ -757,6 +748,55 @@ pub fn root_node(mut node: Node<'_>) -> Node<'_> {
         node = parent;
     }
     node
+}
+
+/// Visit the inclusive path from a known physical root to a canonical node.
+///
+/// `root` must be the physical root obtained from the owning Tree, and both
+/// nodes must have that tree's ordinary coordinate context. In particular,
+/// normalize a possibly shifted input with `Node::parent` before supplying its
+/// parent as `target`; range containment cannot normalize shifted nodes.
+/// Equal-range wrappers remain distinct steps. The physical tree is checked
+/// before cancellation or a visitor can return early. A broken construction or
+/// unreachable target panics; only caller-supplied checks/visits can interrupt.
+/// No ancestor vector or Rust recursion is used.
+pub fn try_walk_ancestor_path<'tree, E, Check: FnMut() -> Result<(), E>>(
+    root: Node<'tree>,
+    target: Node<'tree>,
+    check: &mut Check,
+    mut visit: impl FnMut(Node<'tree>, &mut Check) -> Result<std::ops::ControlFlow<()>, E>,
+) -> Result<std::ops::ControlFlow<()>, E> {
+    assert_eq!(
+        root.into_raw().tree,
+        target.into_raw().tree,
+        "ancestor path has one physical owner"
+    );
+    assert!(
+        root.parent().is_none(),
+        "ancestor path starts at the physical root"
+    );
+    let mut node = root;
+    loop {
+        if node == target {
+            assert_eq!(
+                node.range(),
+                target.range(),
+                "ancestor target has canonical coordinates"
+            );
+        }
+        check()?;
+        if visit(node, check)?.is_break() {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+        if node == target {
+            return Ok(std::ops::ControlFlow::Continue(()));
+        }
+        let child = node
+            .child_with_descendant(target)
+            .expect("canonical target is reachable from its physical root");
+        assert_ne!(child, node, "ancestor descent makes progress");
+        node = child;
+    }
 }
 
 /// Unwrap expression wrappers that contain one named child.

@@ -21,6 +21,7 @@ use crate::cancellation::CancellationToken;
 use crate::dataflow::{SemanticInputStatus, SolverTermination, UnmodeledCallBehavior};
 use crate::hash::HashMap;
 use crate::inline_project::InlineTestProject;
+use crate::taint::compose::provider::ModelOutputRefusal;
 use crate::taint::output_product::{OutputProductError, OutputReportRow};
 use crate::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction,
@@ -314,6 +315,7 @@ enum FakeTarget {
 /// and a call has no fallback ports unless they are configured.
 #[derive(Default)]
 struct FakeGraph {
+    endpoint_projections: bool,
     handles: HashMap<DurableProcedureKey, ProcedureHandle>,
     flows: HashMap<DurableProcedureKey, Arc<ProcedurePartialFlows>>,
     barriers: bool,
@@ -335,6 +337,9 @@ struct FakeGraph {
     /// Interiors whose witness runs fail with this completeness, while the
     /// search's runs without witnesses still answer.
     witness_run_failures: HashMap<DurableProcedureKey, Completeness>,
+    /// Barrier replay failures must also affect runs without witnesses.
+    replay_run_failures: HashMap<DurableProcedureKey, Completeness>,
+    replayed_interiors: std::cell::RefCell<Vec<DurableProcedureKey>>,
     /// When set, witness runs after the first `n` fail with this completeness,
     /// so a later report pass fails where the main one answered.
     witness_runs_before_failure: Option<(usize, Completeness)>,
@@ -435,6 +440,10 @@ impl FakeGraph {
 }
 
 impl CompositionProvider for FakeGraph {
+    fn endpoint_projections_enabled(&self) -> bool {
+        self.endpoint_projections
+    }
+
     type Error = String;
     type Fact = TaintClassSet;
     type Function = TaintEdgeFunction;
@@ -607,6 +616,16 @@ impl CompositionProvider for FakeGraph {
         _request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error> {
         let handle = self.handles[procedure].clone();
+        if self.filtering.get() && !witnesses {
+            self.replayed_interiors.borrow_mut().push(procedure.clone());
+            if let Some(failure) = self.replay_run_failures.get(procedure) {
+                return Ok(InteriorFlows {
+                    procedure: handle,
+                    flows: Vec::new(),
+                    completeness: failure.clone(),
+                });
+            }
+        }
         if witnesses && let Some(failure) = self.witness_run_failures.get(procedure) {
             return Ok(InteriorFlows {
                 procedure: handle,
@@ -1357,6 +1376,136 @@ fn a_store_read_wakes_only_after_a_source_reaches_a_linked_write() {
             .iter()
             .any(|reason| matches!(reason, Incompleteness::StoreInventory { .. }))
     );
+}
+
+/// The store-read fixture of the test above, with value-type barriers on.
+fn barrier_store_graph(fixture: &Fixture, plan: &TaintAnalysisPlan) -> FakeGraph {
+    let origin = &fixture.procedures["origin"];
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call().id;
+    let relation = &fixture.first_relation["origin"];
+    let write = StoreWriteObservation {
+        procedure: origin.durable_key(),
+        owner: origin.clone(),
+        point: relation.point().id(),
+        phase: ValueFlowObservationPhase::AfterEffects,
+        carrier: ValueFlowCarrier::from(&relation.target),
+    };
+    let observation = InteriorObservation::Sink {
+        point: write.point,
+        phase: write.phase,
+        carrier: write.carrier.clone(),
+    };
+    let mut graph = FakeGraph::new(fixture);
+    graph.barriers = true;
+    graph.store_writes.push(write);
+    graph.store_links.insert(
+        (caller.durable_key(), result(call)),
+        StoreChannelLinks {
+            writes: vec![StoreChannelLink {
+                write: 0,
+                write_call: (origin.durable_key(), CallSiteId::new(77)),
+                read_call: (caller.durable_key(), call),
+                write_site: plan.sources()[0].origin().value_flow_key().site().clone(),
+                read_site: plan.sources()[0].origin().value_flow_key().site().clone(),
+                read_origin: plan.sources()[0].origin().clone(),
+                read_phase: ValueFlowObservationPhase::AfterEffects,
+                read_carrier: ValueFlowCarrier::from(&relation.target),
+                uncertain: false,
+            }],
+            incomplete: None,
+        },
+    );
+    graph.stored(origin, &[], &[]);
+    graph.stored(caller, &[result(call)], &[]);
+    graph.interior(
+        caller,
+        InteriorSeed::Port(result(call)),
+        sink_in(plan, caller),
+    );
+    graph.interior(
+        origin,
+        seed_of_source(plan, origin),
+        FakeTarget::Observe(observation),
+    );
+    graph
+}
+
+#[test]
+#[hardwon("#14275: barrier refinement dropped a Store-write interior path")]
+fn a_barrier_that_does_not_cover_a_store_write_path_keeps_the_finding() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["caller"], None);
+    let graph = barrier_store_graph(&fixture, &plan);
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert!(
+        graph
+            .replayed_interiors
+            .borrow()
+            .contains(&fixture.procedures["origin"].durable_key()),
+        "barrier replay must query the origin's Store-write interior"
+    );
+    assert!(
+        outcome.incompleteness.is_empty(),
+        "{:#?}",
+        outcome.incompleteness
+    );
+    assert_single_alpha_finding(&plan, &outcome.report);
+    assert!(outcome.report.is_complete());
+}
+
+#[test]
+#[hardwon("#14275: barrier refinement dropped a Store-write interior path")]
+fn a_barrier_that_covers_a_store_write_path_kills_the_finding() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["caller"], None);
+    let mut graph = barrier_store_graph(&fixture, &plan);
+    // Establish that the same Store-write path survives replay before the
+    // barrier covers it, so dropping all such paths cannot pass this test.
+    assert_single_alpha_finding(&plan, &compose(&plan, &graph, BUDGET).report);
+    graph.filtering.set(false);
+    graph.replayed_interiors.borrow_mut().clear();
+    graph
+        .blocked
+        .insert(fixture.procedures["origin"].durable_key());
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert!(
+        graph
+            .replayed_interiors
+            .borrow()
+            .contains(&fixture.procedures["origin"].durable_key()),
+        "barrier replay must query the origin's Store-write interior"
+    );
+    assert!(outcome.report.findings().is_empty());
+}
+
+#[test]
+#[hardwon("#14275: barrier refinement dropped a Store-write interior path")]
+fn an_unavailable_store_write_projection_under_barriers_stays_partial() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["caller"], None);
+    let mut graph = barrier_store_graph(&fixture, &plan);
+    let available = compose(&plan, &graph, BUDGET);
+    assert_single_alpha_finding(&plan, &available.report);
+    assert!(available.report.is_complete());
+    graph.filtering.set(false);
+    graph.replayed_interiors.borrow_mut().clear();
+    let origin = fixture.procedures["origin"].durable_key();
+    graph.replay_run_failures.insert(
+        origin.clone(),
+        Completeness::content("projection unavailable"),
+    );
+    graph.blocked.insert(origin);
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert!(
+        graph
+            .replayed_interiors
+            .borrow()
+            .contains(&fixture.procedures["origin"].durable_key()),
+        "barrier replay must query the origin's Store-write interior"
+    );
+    assert_eq!(outcome.report.findings().len(), 1);
+    assert!(!outcome.report.is_complete());
 }
 
 #[test]
@@ -3677,4 +3826,493 @@ fn returned_member_refusal_preserves_all_operational_contributors() {
         assert_eq!(graph.model_content_consults.get(), 1);
         assert!(outcome.report.findings().is_empty());
     }
+}
+
+// #12846: completing exact dispatch must not complete an undescribed member
+// read, and that refusal must not poison a scalar crossing of the same call.
+#[test]
+#[hardwon("#12846: projected hops bypassed returned-member refusal and became certain")]
+fn returned_member_hop_quality_is_demand_scoped_and_retained() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["caller"], &["caller"], None);
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call().id;
+    let member = PartialFlowPort::Heap {
+        root: Box::new(result(call)),
+        selectors: vec![HeapSelector::ConstantIndex("0".into())].into_boxed_slice(),
+        tail: AccessPathTail::Exact,
+    };
+    let sibling = PartialFlowPort::Heap {
+        root: Box::new(result(call)),
+        selectors: vec![HeapSelector::ConstantIndex("1".into())].into_boxed_slice(),
+        tail: AccessPathTail::Exact,
+    };
+    for (demand, modeled_output, preserves_member_contents, expected_certain) in [
+        (member.clone(), None, false, false),
+        (member.clone(), Some(result(call)), false, false),
+        (member.clone(), Some(sibling), true, false),
+        (
+            member.clone(),
+            Some(PartialFlowPort::CallResult {
+                call,
+                ordinal: Some(1),
+            }),
+            true,
+            false,
+        ),
+        (member.clone(), Some(result(call)), true, true),
+        (member.clone(), Some(member.clone()), false, true),
+        (result(call), None, false, true),
+    ] {
+        let expected_refusal = if !expected_certain
+            && !preserves_member_contents
+            && modeled_output.as_ref() == Some(&result(call))
+        {
+            "a modeled transfer has no member-path preservation proof for this component demand"
+        } else {
+            "a call model does not describe a returned member"
+        };
+        let mut graph = FakeGraph::new(&fixture);
+        graph.endpoint_projections = true;
+        graph.model_content_cause = Some(IncompleteCause::Content);
+        graph.filtering.set(true);
+        graph
+            .filtered_crossed
+            .insert(caller.durable_key(), vec![call].into_boxed_slice());
+        graph.stored(caller, std::slice::from_ref(&demand), &[]);
+        graph.interior(
+            caller,
+            seed_of_source(&plan, caller),
+            FakeTarget::Port(demand.clone()),
+        );
+        graph.interior(
+            caller,
+            InteriorSeed::Port(demand.clone()),
+            sink_in(&plan, caller),
+        );
+        graph.route(caller, call, vec![], Completeness::Complete);
+        graph.models.insert(
+            (caller.durable_key(), call),
+            CallModel {
+                transfers: if let Some(output) = modeled_output {
+                    vec![ModelTransfer {
+                        actual: argument(call, 0),
+                        output,
+                        function: TaintEdgeFunction::identity(plan.universe()),
+                        proven: true,
+                        unresolved_output_storage: false,
+                        preserves_member_contents,
+                    }]
+                } else {
+                    vec![]
+                },
+                endpoint_projections: true,
+                summary: None,
+                summary_target: None,
+                retains_dispatch: false,
+                writeback: Box::default(),
+                receiver_reads: Box::default(),
+                proven: true,
+                completeness: Completeness::Complete,
+                authored: None,
+            },
+        );
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert_eq!(
+            outcome.report.findings().len(),
+            1,
+            "{demand:?}: {outcome:#?}"
+        );
+        let finding = &outcome.report.findings()[0];
+        assert_eq!(
+            finding.origins().evidence()[0].has_certain_path(),
+            expected_certain,
+            "{demand:?}: {outcome:#?}"
+        );
+        let refusal = outcome.incompleteness.iter().any(|cause| {
+            matches!(cause,
+            Incompleteness::Model { call: owner, reason, .. }
+                if owner == &(caller.durable_key(), call)
+                    && reason.as_ref() == expected_refusal)
+        });
+        assert_eq!(
+            refusal, !expected_certain,
+            "a capped path carries the same-call Model reason"
+        );
+        let encoded =
+            OutputReportRow::encode(&plan, finding.key().sink().site(), &outcome.report).unwrap();
+        let decoded = OutputReportRow::decode_for_plan(&plan, encoded.clone()).unwrap();
+        assert_eq!(
+            decoded.findings[0].origins[0].certain_path,
+            expected_certain
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            encoded,
+            "the cap survives output replay"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "#12856: of two overlapping transfers, a describing one hid the other's refusal, then the refusal skipped it"
+)]
+fn returned_member_refusal_checks_every_overlapping_transfer() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["caller"], &["caller"], None);
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call().id;
+    let demand = PartialFlowPort::Heap {
+        root: Box::new(result(call)),
+        selectors: vec![HeapSelector::ConstantIndex("0".into())].into_boxed_slice(),
+        tail: AccessPathTail::Exact,
+    };
+    let transfers = [(result(call), true), (result(call), false)]
+        .into_iter()
+        .map(|(output, preserves_member_contents)| ModelTransfer {
+            actual: argument(call, 0),
+            output,
+            function: TaintEdgeFunction::identity(plan.universe()),
+            proven: true,
+            unresolved_output_storage: false,
+            preserves_member_contents,
+        })
+        .collect::<Vec<_>>();
+    let model = CallModel {
+        transfers,
+        endpoint_projections: true,
+        summary: None,
+        summary_target: None,
+        retains_dispatch: false,
+        writeback: Box::default(),
+        receiver_reads: Box::default(),
+        proven: true,
+        completeness: Completeness::Complete,
+        authored: None,
+    };
+    assert_eq!(
+        model.returned_member_refusal(&demand, true),
+        Some(ModelOutputRefusal::MissingMemberPreservation)
+    );
+
+    let mut graph = FakeGraph::new(&fixture);
+    graph.endpoint_projections = true;
+    graph.filtering.set(true);
+    graph
+        .filtered_crossed
+        .insert(caller.durable_key(), vec![call].into_boxed_slice());
+    graph.stored(caller, std::slice::from_ref(&demand), &[]);
+    graph.interior(
+        caller,
+        seed_of_source(&plan, caller),
+        FakeTarget::Port(demand.clone()),
+    );
+    graph.interior(
+        caller,
+        InteriorSeed::Port(demand.clone()),
+        sink_in(&plan, caller),
+    );
+    graph.route(caller, call, vec![], Completeness::Complete);
+    graph.models.insert((caller.durable_key(), call), model);
+    for certificate in [
+        IncompleteCause::Content,
+        IncompleteCause::Operational(OperationalCause::Cancelled),
+    ] {
+        graph.model_content_cause = Some(certificate);
+        let consults_before = graph.model_content_consults.get();
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert!(
+            !outcome.report.findings().is_empty(),
+            "the describing transfer still reaches the source"
+        );
+        assert!(!outcome.report.findings()[0].origins().evidence()[0].has_certain_path());
+        assert!(outcome.incompleteness.iter().any(|note| matches!(note,
+        Incompleteness::Model { call: owner, reason, .. }
+            if owner == &(caller.durable_key(), call)
+                && reason.as_ref() == "a modeled transfer has no member-path preservation proof for this component demand")));
+        assert!(graph.model_content_consults.get() > consults_before);
+        let refusal_causes = outcome.incompleteness.iter().filter_map(|note| match note {
+            Incompleteness::Model { cause, call: owner, reason }
+                if owner == &(caller.durable_key(), call)
+                    && reason.as_ref() == "a modeled transfer has no member-path preservation proof for this component demand" => Some(*cause),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(refusal_causes, vec![certificate], "{outcome:#?}");
+    }
+}
+
+#[test]
+#[hardwon("#12846: a location-valued sink bypassed the returned-member quality check")]
+fn projected_sink_crossing_keeps_returned_member_uncertainty() {
+    use crate::analyzer::semantic::{
+        AbstractLocation, AccessPath, AccessPathRoot, AccessSelector, IndexSelector, OracleLimits,
+    };
+    let fixture = fixture();
+    let base = fixture.plan(&["caller"], &["caller"], None);
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call();
+    let point = caller.point_handle(call.point).unwrap();
+    let value = caller.value_handle(call.result.unwrap()).unwrap();
+    let root = AccessPathRoot::Value(value);
+    let location = AbstractLocation::new(
+        AbstractObject::new(root.clone(), ObjectCardinality::Unknown).unwrap(),
+        AccessPath::bounded(
+            root,
+            vec![AccessSelector::Index(IndexSelector::Constant(0))],
+            AccessPathTail::Exact,
+            OracleLimits::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sink = ValueFlowSinkSpec::new(
+        ValueFlowEventKey::at_point(&point, 0, ValueFlowEventKind::Sink).unwrap(),
+        point,
+        ValueFlowObservationPhase::AfterEffects,
+        ValueFlowCarrier::Location(Box::new(location)),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let value_flow = ValueFlowPlan::try_new(
+        caller.clone(),
+        fixture.inputs.clone(),
+        Vec::new(),
+        base.value_flow()
+            .sources()
+            .map(|(_, spec)| spec.clone())
+            .collect::<Vec<_>>(),
+        vec![sink],
+    )
+    .unwrap();
+    let plan = TaintAnalysisPlan::new(
+        value_flow,
+        base.universe().clone(),
+        base.sources().to_vec(),
+        base.sinks().to_vec(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut graph = FakeGraph::new(&fixture);
+    graph.endpoint_projections = true;
+    graph.model_content_cause = Some(IncompleteCause::Content);
+    graph.filtering.set(true);
+    graph
+        .filtered_crossed
+        .insert(caller.durable_key(), vec![call.id].into_boxed_slice());
+    graph.stored(caller, &[], &[]);
+    graph.interior(
+        caller,
+        seed_of_source(&plan, caller),
+        sink_in(&plan, caller),
+    );
+    graph.route(caller, call.id, vec![], Completeness::Complete);
+    graph.models.insert(
+        (caller.durable_key(), call.id),
+        CallModel {
+            transfers: Vec::new(),
+            endpoint_projections: true,
+            summary: None,
+            summary_target: None,
+            retains_dispatch: false,
+            writeback: Box::default(),
+            receiver_reads: Box::default(),
+            proven: true,
+            completeness: Completeness::Complete,
+            authored: None,
+        },
+    );
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert_eq!(outcome.report.findings().len(), 1, "{outcome:#?}");
+    assert!(!outcome.report.findings()[0].origins().evidence()[0].has_certain_path());
+    assert!(outcome.incompleteness.iter().any(|note| matches!(note,
+        Incompleteness::Model {call: owner,reason,..}
+            if owner == &(caller.durable_key(), call.id)
+            && reason.as_ref() == "a call model does not describe a returned member")));
+}
+
+#[test]
+#[hardwon("#12846: reader-relative selectors lost the returned origin's prefix and alternatives")]
+fn returned_member_alias_demands_keep_prefixes_tails_and_each_origin() {
+    use super::provider::ModelOutputRefusal;
+    use super::search::returned_member_demands;
+    use crate::analyzer::semantic::{
+        AbstractLocation, AccessPath, AccessPathRoot, AccessSelector, OracleLimits,
+    };
+    let fixture = fixture();
+    let plan = fixture.plan(&["caller"], &["caller"], None);
+    let caller = &fixture.procedures["caller"];
+    let producer = fixture.helper_call();
+    let root = AccessPathRoot::Value(caller.value_handle(producer.result.unwrap()).unwrap());
+    let origin = |name: &str, tail| {
+        AbstractLocation::new(
+            AbstractObject::new(root.clone(), ObjectCardinality::Unknown).unwrap(),
+            AccessPath::bounded(
+                root.clone(),
+                vec![AccessSelector::Property(name.into())],
+                tail,
+                OracleLimits::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let relative = [HeapSelector::Property("inner".into())];
+    let alias = producer.arguments[0].value;
+    let mapped = returned_member_demands(
+        caller,
+        producer,
+        alias,
+        &relative,
+        AccessPathTail::Exact,
+        &[origin("outer", AccessPathTail::Exact)],
+    );
+    let port = |names: &[&str], tail| PartialFlowPort::Heap {
+        root: Box::new(result(producer.id)),
+        selectors: names
+            .iter()
+            .map(|name| HeapSelector::Property((*name).into()))
+            .collect(),
+        tail,
+    };
+    assert_eq!(
+        mapped,
+        vec![port(&["outer", "inner"], AccessPathTail::Exact)]
+    );
+    let mut model = CallModel {
+        transfers: vec![ModelTransfer {
+            actual: argument(producer.id, 0),
+            output: mapped[0].clone(),
+            function: TaintEdgeFunction::identity(plan.universe()),
+            proven: true,
+            unresolved_output_storage: false,
+            preserves_member_contents: false,
+        }],
+        endpoint_projections: true,
+        summary: None,
+        summary_target: None,
+        retains_dispatch: false,
+        writeback: Box::default(),
+        receiver_reads: Box::default(),
+        proven: true,
+        completeness: Completeness::Complete,
+        authored: None,
+    };
+    assert_eq!(model.returned_member_refusal(&mapped[0], true), None);
+    model.transfers[0].output = port(&["inner"], AccessPathTail::Exact);
+    assert_eq!(
+        model.returned_member_refusal(&mapped[0], true),
+        Some(ModelOutputRefusal::ReturnedMemberNotDescribed),
+        "an unrelated sibling cannot certify the alias"
+    );
+
+    let alternatives = returned_member_demands(
+        caller,
+        producer,
+        alias,
+        &relative,
+        AccessPathTail::Exact,
+        &[
+            origin("outer", AccessPathTail::Exact),
+            origin("other", AccessPathTail::Exact),
+        ],
+    );
+    assert_eq!(
+        alternatives,
+        vec![
+            port(&["outer", "inner"], AccessPathTail::Exact),
+            port(&["other", "inner"], AccessPathTail::Exact)
+        ]
+    );
+    model.transfers[0].output = mapped[0].clone();
+    assert_eq!(
+        alternatives
+            .iter()
+            .map(|demand| model.returned_member_refusal(demand, true))
+            .collect::<Vec<_>>(),
+        vec![None, Some(ModelOutputRefusal::ReturnedMemberNotDescribed)],
+        "every possible origin is checked, including the refused one"
+    );
+
+    assert_eq!(
+        returned_member_demands(
+            caller,
+            producer,
+            producer.result.unwrap(),
+            &relative,
+            AccessPathTail::Exact,
+            &[]
+        ),
+        vec![port(&["inner"], AccessPathTail::Exact)],
+        "an exact direct value keeps its own relative path"
+    );
+    assert_eq!(
+        returned_member_demands(
+            caller,
+            producer,
+            alias,
+            &[],
+            AccessPathTail::Exact,
+            &[origin("outer", AccessPathTail::Exact)]
+        ),
+        vec![port(&["outer"], AccessPathTail::Exact)],
+        "the alias prefix itself remains a member demand for a whole reader"
+    );
+    assert!(
+        returned_member_demands(
+            caller,
+            producer,
+            producer.result.unwrap(),
+            &[],
+            AccessPathTail::Exact,
+            &[]
+        )
+        .is_empty(),
+        "a scalar crossing has no member demand"
+    );
+    let summarized_origin = returned_member_demands(
+        caller,
+        producer,
+        alias,
+        &relative,
+        AccessPathTail::Exact,
+        &[origin("outer", AccessPathTail::Summary)],
+    );
+    assert_eq!(
+        summarized_origin,
+        vec![port(&["outer"], AccessPathTail::Summary)],
+        "never append a reader suffix after the origin's unknown boundary"
+    );
+    model.transfers[0].output = port(&["outer", "inner"], AccessPathTail::Exact);
+    model.transfers[0].preserves_member_contents = true;
+    assert_eq!(
+        model.returned_member_refusal(&summarized_origin[0], true),
+        Some(ModelOutputRefusal::ReturnedMemberNotDescribed),
+        "a narrower transfer cannot describe outer.*.inner"
+    );
+    model.transfers[0].output = port(&["outer"], AccessPathTail::Exact);
+    model.transfers[0].preserves_member_contents = false;
+    assert_eq!(
+        model.returned_member_refusal(&summarized_origin[0], true),
+        Some(ModelOutputRefusal::MissingMemberPreservation)
+    );
+    model.transfers[0].preserves_member_contents = true;
+    assert_eq!(
+        model.returned_member_refusal(&summarized_origin[0], true),
+        None,
+        "a whole-prefix-preserving transfer can describe every suffix"
+    );
+    assert_eq!(
+        returned_member_demands(
+            caller,
+            producer,
+            alias,
+            &relative,
+            AccessPathTail::Summary,
+            &[origin("outer", AccessPathTail::Exact)]
+        ),
+        vec![port(&["outer", "inner"], AccessPathTail::Summary)],
+        "a reader's unknown suffix stays after its own known selectors"
+    );
 }

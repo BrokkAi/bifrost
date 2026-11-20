@@ -2252,6 +2252,9 @@ impl RetainedSize for PolicyPackDecision {
 /// Intrinsic shipped models alone do not add this optional review (#2493).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyPackActivationReview {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_activation:
+        Option<brokk_bifrost_analysis::analyzer::semantic_model::HostActivationMetadata>,
     document_path: String,
     dependency_mode: PolicyDependencyPackActivationMode,
     ecosystems: Vec<String>,
@@ -2270,6 +2273,12 @@ struct PolicyCatalogIdentity {
 }
 
 impl PolicyPackActivationReview {
+    pub(crate) fn set_host_activation(
+        &mut self,
+        metadata: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationMetadata,
+    ) {
+        self.host_activation = Some(metadata);
+    }
     pub(crate) fn set_catalogs(&mut self, catalogs: Vec<ResolvedCatalogIdentity>) {
         self.catalogs = catalogs
             .into_iter()
@@ -2295,6 +2304,7 @@ impl PolicyPackActivationReview {
         decisions.truncate(MAX_PACK_ACTIVATION_DECISIONS);
         super::finding::tighten_vec(&mut decisions);
         Self {
+            host_activation: None,
             document_path,
             dependency_mode,
             ecosystems,
@@ -2335,6 +2345,9 @@ impl PolicyPackActivationReview {
 impl RetainedSize for PolicyPackActivationReview {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
+            .saturating_add(self.host_activation.as_ref().map_or(0, |host| {
+                host.inventory_sha256.capacity() + host.approval_identity.capacity()
+            }))
             .saturating_add(self.document_path.capacity())
             .saturating_add(
                 self.ecosystems
@@ -2475,8 +2488,10 @@ impl PolicyReportDocument {
     // #11532: FINAL 21, assigned above master b56a4fbf3a schema 20.
     // #12111: schema 22 adds typed retention omission dimensions and removes the batch finding cap.
     // #12936: refusal omissions exclude native non-UTF-8 sites, declared by a flag.
-    // Draft working version; verify above master and every Ready PR before Ready.
-    pub const SCHEMA_VERSION: u32 = 23;
+    // #11997 assigned schema 24 above #13037's 23. The endpoint-role
+    // inconclusive/unresolved reporting in this batch is the next change, so
+    // it keeps schema 25, strictly above every landed version.
+    pub const SCHEMA_VERSION: u32 = 25;
 
     #[cfg(test)]
     pub(crate) fn try_new(

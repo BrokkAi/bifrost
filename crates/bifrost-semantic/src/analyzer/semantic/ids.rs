@@ -87,6 +87,12 @@ impl brokk_bifrost_core::retention_budget::RetainedBytes for StableDigest {
     }
 }
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for SourceSpan {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 impl StableDigest {
     pub const fn from_array(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -886,7 +892,11 @@ impl SemanticRole {
 pub const RUST_FIELD_MEMBER_PATH: &str = "__bifrost__/rust-field-members";
 
 /// A remappable source-facing semantic locator. It is not a cache-validity key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `Debug` omits the mount: its digest depends on the workspace root, so the
+/// same code under two roots would otherwise render different diagnostic text
+/// wherever a locator is nested in a Debug-printed value (#13775).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticLocator {
     mount: WorkspaceMountId,
     path: WorkspaceRelativePath,
@@ -894,6 +904,18 @@ pub struct SemanticLocator {
     declaration: DeclarationLocator,
     role: SemanticRole,
     anchor: SourceAnchor,
+}
+
+impl std::fmt::Debug for SemanticLocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SemanticLocator")
+            .field("path", &self.path)
+            .field("language", &self.language)
+            .field("declaration", &self.declaration)
+            .field("role", &self.role)
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SemanticLocator {
@@ -1320,6 +1342,19 @@ impl LengthDelimitedDigest {
 }
 
 pub(crate) struct SemanticDigestHasher(LengthDelimitedDigest);
+
+/// Fingerprint a Hash value without allocating a serialized copy. Values
+/// containing instance-scoped handles remain instance-scoped; this is not a
+/// portable encoding for persisted or public identities.
+#[doc(hidden)]
+pub fn semantic_value_fingerprint<T: std::hash::Hash + ?Sized>(
+    domain: &[u8],
+    value: &T,
+) -> StableDigest {
+    let mut digest = SemanticDigestHasher::new(domain);
+    value.hash(&mut digest);
+    digest.finish_digest()
+}
 
 impl SemanticDigestHasher {
     pub(crate) fn new(domain: &[u8]) -> Self {

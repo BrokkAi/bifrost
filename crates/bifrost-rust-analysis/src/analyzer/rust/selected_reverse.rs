@@ -327,6 +327,13 @@ impl RustReverseProjection<'_, '_> {
         // own doubt through its row's `proof`, so an incomplete binding on a
         // retained site leaves the inventory complete and the site unproven.
         if answer.search.completion() != &ResolutionCompletion::Complete {
+            reasons.extend(
+                answer
+                    .open_sites
+                    .iter()
+                    .cloned()
+                    .map(EdgeIncompleteReason::InverseIndexOpenSite),
+            );
             reasons.push(EdgeIncompleteReason::InverseIndexResolutionIncomplete);
             if matches!(
                 answer.search.completion(),
@@ -337,6 +344,16 @@ impl RustReverseProjection<'_, '_> {
                     ))
             ) {
                 reasons.push(EdgeIncompleteReason::TimeBudgetExceeded);
+            }
+            if matches!(
+                answer.search.completion(),
+                ResolutionCompletion::Incomplete(completion_reasons)
+                    if completion_reasons.iter().any(|reason| matches!(
+                        reason,
+                        crate::analyzer::resolution::ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
+                    ))
+            ) {
+                reasons.push(EdgeIncompleteReason::ReceiverBudgetExhausted);
             }
         }
         let mut edges = Vec::with_capacity(answer.search.source_sites().len());
@@ -856,7 +873,7 @@ mod tests {
                 (
                     Some("src/second.rs"),
                     Some(ReferenceOmission::ReceiverBudget(
-                        ReceiverBudgetLimit::ScopeNodes,
+                        ReceiverBudgetLimit::ResolutionRounds,
                     )),
                 ),
                 (
@@ -961,7 +978,7 @@ mod tests {
                 complete.work.examined_candidates
             );
             for (result, file, lane, expected_count) in [
-                (&bounded, "src/second.rs", "scope_nodes", Some(1)),
+                (&bounded, "src/second.rs", "resolution_rounds", Some(1)),
                 (&time_bounded, "src/third.rs", "time_budget", None),
             ] {
                 let stopped_file = fixture.file(file);

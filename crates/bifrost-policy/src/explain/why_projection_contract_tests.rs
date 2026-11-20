@@ -19,8 +19,13 @@ fn flow_and_taint_roots_name_directional_endpoints() {
         ),
     ] {
         let run = path_run(&fixture, policy, FakePath::proved());
-        let explanation =
-            explain_finding(&run, &only_finding(&run), &ExplanationLimits::default()).unwrap();
+        let explanation = explain_finding(
+            &run,
+            &only_finding(&run),
+            NO_MODELS,
+            &ExplanationLimits::default(),
+        )
+        .unwrap();
         assert_eq!(
             explanation.root().expected(),
             Some(
@@ -37,6 +42,7 @@ fn flow_and_taint_roots_name_directional_endpoints() {
 #[test]
 fn a_truncated_retained_path_leaves_witness_coverage_unknown() {
     let fixture = Fixture::new();
+
     let run = path_run(
         &fixture,
         FLOW_POLICY,
@@ -46,8 +52,13 @@ fn a_truncated_retained_path_leaves_witness_coverage_unknown() {
         },
     );
     assert!(!run.findings()[0].witnesses_truncated());
-    let explanation =
-        explain_finding(&run, &only_finding(&run), &ExplanationLimits::default()).unwrap();
+    let explanation = explain_finding(
+        &run,
+        &only_finding(&run),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .unwrap();
     assert_eq!(
         root_child(&explanation, "retained_witnesses").outcome(),
         ExplanationOutcome::Unknown
@@ -93,8 +104,13 @@ fn proof_preserves_multiple_reason_labels_with_separators() {
             .evaluate(policy, &fixture.context(), &mut PolicyBudget::default())
             .unwrap()
     });
-    let explanation =
-        explain_finding(&run, &only_finding(&run), &ExplanationLimits::default()).unwrap();
+    let explanation = explain_finding(
+        &run,
+        &only_finding(&run),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .unwrap();
     assert_eq!(
         root_child(&explanation, "path_proof").actual(),
         Some("proven: exact_call_target, dataflow_witness")
@@ -131,8 +147,13 @@ fn obligation_names_assertion_group_and_partition_coverage() {
         .unwrap();
         run.set_obligations(&[obligation], false, 0, &PolicyBudget::default())
             .unwrap();
-        let explanation =
-            explain_finding(&run, &finding.id(), &ExplanationLimits::default()).unwrap();
+        let explanation = explain_finding(
+            &run,
+            &finding.id(),
+            NO_MODELS,
+            &ExplanationLimits::default(),
+        )
+        .unwrap();
         let node = root_child(&explanation, "absence_requires_exhaustive_coverage");
         assert_eq!(
             node.expected(),

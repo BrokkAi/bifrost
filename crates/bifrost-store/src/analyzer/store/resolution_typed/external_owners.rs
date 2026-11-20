@@ -4,6 +4,7 @@ use super::super::resolution_operation::nominal_rules::{
 };
 use super::*;
 use crate::analyzer::resolution::ExternalOwnerIdentity;
+use crate::analyzer::store::AnalyzerStore;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     DeclarationTypeRole, ResolutionMemberAccess, ResolutionMemberKind,
     ResolutionMemberQualifierCompatibility, ResolutionNamespace,
@@ -18,18 +19,40 @@ pub(in crate::analyzer::store) const INTRINSIC_MEMBER_OWNER_INDEXED_SQL: &str =
 pub(in crate::analyzer::store) fn intrinsic_member_inventory_for_owner(
     connection: &rusqlite::Connection,
     owner: &ExternalOwnerIdentity,
+    generation: i64,
 ) -> StoreResult<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>> {
     let Some(inventory) =
         crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
     else {
         return Ok(None);
     };
-    let indexed: bool = connection.query_row(
-        jvm_external_owner_relations().owner_indexed,
-        rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
-        |row| row.get(0),
-    )?;
+    let (indexed, current) = intrinsic_member_owner_indexed(connection, owner, generation)?;
+    if !current && owner.provider_id.as_ref() != "jvm-intrinsic" {
+        return Err(StoreError::stale_resolution(
+            "JVM provider inventory changed during the request",
+        ));
+    }
     Ok((!indexed).then_some(inventory))
+}
+
+fn intrinsic_member_owner_indexed(
+    connection: &rusqlite::Connection,
+    owner: &ExternalOwnerIdentity,
+    generation: i64,
+) -> StoreResult<(bool, bool)> {
+    let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+        jvm_external_owner_relations().owner_indexed,
+        3,
+    );
+    Ok(connection.query_row(
+        &guarded,
+        rusqlite::params![
+            owner.provider_id.as_ref(),
+            owner.owner_fqn.as_ref(),
+            generation
+        ],
+        |row| Ok((row.get(0)?, row.get(2)?)),
+    )?)
 }
 
 struct ExternalOwnerScopes {
@@ -61,6 +84,72 @@ fn decode_external_member_visibility(label: &str) -> StoreResult<DeclaredVisibil
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    pub(super) fn external_inventory_generation(&self) -> StoreResult<i64> {
+        let reader = if let Some(models) = &self.external_models {
+            super::super::jvm_external_publication::request_jvm_inventory_reader(models)
+                .map_err(|open| StoreError::new(open.reason))?
+        } else {
+            None
+        };
+        let captured = reader
+            .as_ref()
+            .and_then(|reader| reader.inventory_generation);
+        let shared = self.external_inventory_generation.as_ref().or_else(|| {
+            reader
+                .as_ref()
+                .and_then(|reader| reader.inventory_clock.as_ref())
+        });
+        let clock = match shared {
+            Some(clock) => clock.snapshot(),
+            None => super::super::jvm_external_publication::JvmInventoryRequestClock::captured(
+                match captured {
+                    Some(generation) => generation,
+                    // Proof preparation shares the selected provider snapshot, never an independent reader.
+                    None => AnalyzerStore::jvm_external_inventory_generation_in_snapshot(
+                        self.selection.connection(),
+                    )?,
+                },
+            ),
+        }
+        .with_source_generation(captured);
+        Ok(clock.generation())
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn validate_external_signature_memo(&self) -> StoreResult<()> {
+        if let Some(proof) = self.external_signature_memo_proof.get() {
+            proof.validate_cached(self.selection.connection())?;
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn capture_external_signature_memo_proof(&self) -> StoreResult<()> {
+        if self.external_signature_memo_proof.get().is_none() {
+            let proof = super::super::jvm_external_publication::JvmInventoryMemoProof::capture(
+                self.selection.connection(),
+                &self.external_providers,
+                self.external_inventory_generation()?,
+            )?;
+            self.external_signature_memo_proof.set(Some(proof));
+        }
+        Ok(())
+    }
+
+    fn external_inventory_unavailable(&self) -> TypedFactReadOutcome {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        let reason = self.context_identities.named_semantic(
+            CanonicalHasher::new(b"jvm-provider-inventory-changed:v1").finish(),
+            "JVMProviderPublicationUnavailable",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            "JVM provider inventory changed during the request",
+        );
+        TypedFactReadOutcome::exhausted(ResolutionCompletion::incomplete([
+            ResolutionIncompleteReason::UnsupportedSemantic(reason),
+        ]))
+    }
+
     fn external_owner_adapter(
         &self,
         owner: &ExternalOwnerIdentity,
@@ -75,6 +164,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         receiver_reasons: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<SemanticId>>> {
+        self.validate_external_signature_memo()?;
         // This exemption still requires Java's exact argument-conversion proof.
         // TypeParameter (also nested) is nonground: see java_known_ground_type,
         // crates/bifrost-jvm-analysis/src/analyzer/jvm/external.rs:4337.
@@ -127,6 +217,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         reasons: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<SemanticId>>> {
+        self.validate_external_signature_memo()?;
         let memo = self.external_signatures.borrow();
         let independent = !definitions.is_empty()
             && definitions.iter().all(|definition| {
@@ -149,6 +240,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         Ok(Some(selected))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn external_callable_result_type_identities(
         &self,
         definitions: &[SemanticId],
@@ -242,6 +334,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         if self.external_owner_adapter(owner).is_none() {
             return Ok(Some(None));
         }
+        let generation = self.external_inventory_generation()?;
         self.read_statement(cancellation, |connection| {
             let Some(inventory) =
                 crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
@@ -250,11 +343,12 @@ impl SelectedResolutionTypedSource<'_, '_> {
             };
             // Preserve the inventory read's own publication check, and make
             // its exact answer available to the root shadow check.
-            let indexed: bool = connection.query_row(
-                jvm_external_owner_relations().owner_indexed,
-                rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
-                |row| row.get(0),
-            )?;
+            let (indexed, current) = intrinsic_member_owner_indexed(connection, owner, generation)?;
+            if !current && owner.provider_id.as_ref() != "jvm-intrinsic" {
+                // Do not turn an evicted indexed owner into an intrinsic fallback.
+                // The guarded relation readers carry the unavailable completion.
+                return Ok(Some(None));
+            }
             self.intrinsic_owner_indexed.borrow_mut().insert_bounded(
                 (owner.provider_id.to_string(), owner.owner_fqn.to_string()),
                 indexed,
@@ -271,6 +365,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         visitor: &mut TypedFactPageVisitor<'_, T>,
         decode: impl Fn(&ExternalOwnerIdentity, SemanticId, &Row<'_>) -> StoreResult<T>,
     ) -> StoreResult<TypedFactReadOutcome> {
+        let generation = self.external_inventory_generation()?;
         let providers = serde_json::to_string(&self.external_providers)
             .map_err(|error| StoreError::new(error.to_string()))?;
         for &definition in definitions {
@@ -294,29 +389,45 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     return cancelled();
                 }
                 let Some(page) = self.read_statement(cancellation, |conn| {
-                    let mut statement = conn.prepare_cached(sql(adapter))?;
+                    let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+                        sql(adapter),
+                        6,
+                    );
+                    let mut statement = conn.prepare_cached(&guarded)?;
+                    let guard_column = statement.column_count() - 1;
                     let mut rows = statement.query(rusqlite::params![
                         owner.provider_id.as_ref(),
                         owner.owner_fqn.as_ref(),
                         cursor,
                         visitor.maximum_rows() as i64,
-                        providers
+                        providers,
+                        generation
                     ])?;
                     let mut page = Vec::new();
                     while let Some(row) = rows.next()? {
+                        if !row.get::<_, bool>(guard_column)? {
+                            return Ok(Some((page, false)));
+                        }
+                        if row.get::<_, Option<i64>>(0)?.is_none() {
+                            break;
+                        }
                         if cancellation.is_cancelled() {
                             break;
                         }
                         cursor = row.get(0)?;
                         page.push(decode(&owner, definition, row)?);
                     }
-                    Ok(Some(page))
+                    Ok(Some((page, true)))
                 })?
                 else {
                     return cancelled();
                 };
                 if cancellation.is_cancelled() {
                     return cancelled();
+                }
+                let (page, current) = page;
+                if !current {
+                    return Ok(self.external_inventory_unavailable());
                 }
                 if page.is_empty() {
                     break;
@@ -343,6 +454,18 @@ impl SelectedResolutionTypedSource<'_, '_> {
         &self,
         owner: &ExternalOwnerIdentity,
     ) -> StoreResult<bool> {
+        self.external_owner_type_is_indexed_with_memo_proof(owner)
+            .map(super::super::jvm_external_publication::JvmInventoryMemoValue::into_value)
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    pub(in crate::analyzer::store) fn external_owner_type_is_indexed_with_memo_proof(
+        &self,
+        owner: &ExternalOwnerIdentity,
+    ) -> StoreResult<super::super::jvm_external_publication::JvmInventoryMemoValue<bool>> {
+        use super::super::jvm_external_publication::{
+            JvmInventoryMemoProof, JvmInventoryMemoValue,
+        };
         // Only a selected inventory provider can close an owner, and the
         // scope query is restricted to those providers. Answer without a
         // read for every other destination, which is every destination when
@@ -354,26 +477,186 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 .any(|provider| provider == owner.provider_id.as_ref())
             || !self.external_owner_family_is_enumerated(owner)
         {
-            return Ok(false);
+            return Ok(JvmInventoryMemoValue::new(
+                false,
+                JvmInventoryMemoProof::Immutable,
+            ));
         }
         let providers = serde_json::to_string(&self.external_providers)
             .map_err(|error| StoreError::new(error.to_string()))?;
-        let mut statement = self
-            .selection
-            .connection()
-            .prepare_cached(jvm_external_owner_relations().owner_scopes)?;
+        let generation = self.external_inventory_generation()?;
+        let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_memo_sql(
+            jvm_external_owner_relations().owner_scopes,
+            6,
+            7,
+            8,
+        );
+        let mut statement = self.selection.connection().prepare_cached(&guarded)?;
         let mut rows = statement.query(rusqlite::params![
             owner.provider_id.as_ref(),
             owner.owner_fqn.as_ref(),
             -1,
             1,
-            providers
+            providers,
+            generation,
+            serde_json::to_string(&[owner.provider_id.as_ref()])
+                .expect("provider identity serializes"),
+            super::super::jvm_external_publication::jvm_external_projection_identity()
         ])?;
-        let Some(row) = rows.next()? else {
-            return Ok(false);
-        };
+        let row = rows
+            .next()?
+            .expect("the generation guard always returns a row");
+        if !row.get::<_, bool>(6)? {
+            return Err(StoreError::stale_resolution(
+                "JVM provider inventory changed during the request",
+            ));
+        }
+        let proof = JvmInventoryMemoProof::from_sealed(row.get(7)?, generation);
+        if row.get::<_, Option<i64>>(0)?.is_none() {
+            return Ok(JvmInventoryMemoValue::new(false, proof));
+        }
         let scopes = decode_external_owner_scopes(owner, row, true)?;
-        Ok(scopes.types_complete && scopes.supertypes_complete)
+        Ok(JvmInventoryMemoValue::new(
+            scopes.types_complete && scopes.supertypes_complete,
+            proof,
+        ))
+    }
+
+    /// The model-declared counterpart of `external_owner_has_no_static_value`:
+    /// `None` when no active model declares `fqn`. Otherwise every type of the
+    /// supertype closure must carry a positive `jvm_inventory` claim for its
+    /// static values and supertypes from a shard that independently enumerates
+    /// it (the authority `external_owner_family_is_enumerated` applies), and none may declare a static value named `name`.
+    pub(in crate::analyzer::store) fn model_owner_has_no_static_value(
+        &self,
+        fqn: &str,
+        name: &str,
+    ) -> Option<bool> {
+        use crate::analyzer::semantic_model::{MemberKind, TypeRef};
+        let models = self.external_models.as_ref()?;
+        if models.types_named(fqn).records.is_empty() {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![fqn.to_owned()];
+        while let Some(owner) = pending.pop() {
+            if owner == "java.lang.Object" || !seen.insert(owner.clone()) {
+                continue;
+            }
+            let types = models.types_named(&owner);
+            // Only a record's own positive inventory claim, from a shard with
+            // enumeration authority, closes the owner's static values and
+            // supertypes; absence of either is unknown.
+            if types.records.is_empty()
+                || !types.records.iter().any(|candidate| {
+                    candidate
+                        .shard
+                        .independently_enumerates_jvm_owner(&candidate.record)
+                        && candidate
+                            .record
+                            .jvm_inventory
+                            .as_ref()
+                            .is_some_and(|inventory| {
+                                inventory.values_complete && inventory.supertypes_complete
+                            })
+                })
+            {
+                return Some(false);
+            }
+            if models
+                .members_named(&owner, name)
+                .records
+                .iter()
+                .any(|member| {
+                    member.record.is_static
+                        && matches!(
+                            member.record.member_kind,
+                            MemberKind::Field
+                                | MemberKind::Property
+                                | MemberKind::Constant
+                                | MemberKind::Static
+                        )
+                })
+            {
+                return Some(false);
+            }
+            for candidate in &types.records {
+                if candidate
+                    .record
+                    .jvm_inventory
+                    .as_ref()
+                    .is_some_and(|inventory| {
+                        inventory.additional_members.iter().any(|member| {
+                            member.name == name
+                                && member.is_static
+                                && matches!(
+                                    member.member_kind,
+                                    MemberKind::Field
+                                        | MemberKind::Property
+                                        | MemberKind::Constant
+                                        | MemberKind::Static
+                                )
+                        })
+                    })
+                {
+                    return Some(false);
+                }
+                for edge in &candidate.record.hierarchy {
+                    match &edge.target {
+                        TypeRef::Named { name, .. } => pending.push(name.clone()),
+                        _ => return Some(false),
+                    }
+                }
+            }
+        }
+        Some(true)
+    }
+
+    /// Whether this owner's static values are enumerated completely, through
+    /// every supertype, and none is named `name` (JLS 7.5.4 imports inherited
+    /// static members too). False means a static import of this owner may supply
+    /// a field `name`: the owner or a supertype is not enumerated, or declares
+    /// one. `java.lang.Object` has no static member and needs no inventory.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    pub(in crate::analyzer::store) fn external_owner_has_no_static_value(
+        &self,
+        owner: &ExternalOwnerIdentity,
+        name: &str,
+    ) -> StoreResult<bool> {
+        if !self.is_jvm_external_provider(&owner.provider_id)
+            || !self
+                .external_providers
+                .iter()
+                .any(|provider| provider == owner.provider_id.as_ref())
+            || !self.external_owner_family_is_enumerated(owner)
+        {
+            return Ok(false);
+        }
+        let providers = serde_json::to_string(&self.external_providers)
+            .map_err(|error| StoreError::new(error.to_string()))?;
+        let mut statement = self.selection.connection().prepare_cached(
+            "WITH RECURSIVE closure(owner_fqn) AS (\
+                SELECT ?1 \
+                UNION \
+                SELECT edge.supertype_fqn FROM jvm_external_owner_supertypes edge \
+                JOIN closure ON edge.owner_fqn=closure.owner_fqn \
+                WHERE edge.provider_id IN (SELECT value FROM json_each(?3)) \
+                  AND edge.supertype_fqn<>'java.lang.Object') \
+             SELECT NOT EXISTS(SELECT 1 FROM closure WHERE NOT EXISTS(\
+                        SELECT 1 FROM jvm_external_owners inventory \
+                        WHERE inventory.owner_fqn=closure.owner_fqn \
+                          AND inventory.values_complete=1 AND inventory.supertypes_complete=1 \
+                          AND inventory.provider_id IN (SELECT value FROM json_each(?3)))) \
+                AND NOT EXISTS(SELECT 1 FROM jvm_external_owner_members member \
+                        JOIN closure ON member.owner_fqn=closure.owner_fqn \
+                        WHERE member.provider_id IN (SELECT value FROM json_each(?3)) \
+                          AND member.member_name=?2 AND member.is_static=1 \
+                          AND member.member_kind IN ('field','property','constant','static'))",
+        )?;
+        Ok(statement.query_row(
+            rusqlite::params![owner.owner_fqn.as_ref(), name, providers],
+            |row| row.get(0),
+        )?)
     }
 
     fn external_owner_family_is_enumerated(&self, owner: &ExternalOwnerIdentity) -> bool {
@@ -386,7 +669,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         if !models
             .shards()
             .iter()
-            .any(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref())
+            .any(|shard| shard.inventory_provider_id() == owner.provider_id.as_ref())
         {
             return true;
         }
@@ -395,7 +678,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .records
             .iter()
             .any(|candidate| {
-                candidate.shard.manifest.semantic_sha256 == owner.provider_id.as_ref()
+                candidate.shard.inventory_provider_id() == owner.provider_id.as_ref()
                     && candidate
                         .shard
                         .independently_enumerates_jvm_owner(&candidate.record)
@@ -477,6 +760,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn visit_external_member_owners(
         &self,
         definitions: &[SemanticId],
@@ -538,6 +822,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn visit_external_member_owners_for_definitions(
         &self,
         definitions: &[SemanticId],
@@ -548,6 +833,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .selection
             .shared_name_table()
             .interner(self.selection.connection());
+        let generation = self.external_inventory_generation()?;
         let providers = serde_json::to_string(&self.external_providers)
             .map_err(|error| StoreError::new(error.to_string()))?;
         for &definition in definitions {
@@ -594,26 +880,47 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 }
                 continue;
             }
-            let Some(row) = self.read_statement(cancellation, |conn| {
-                let mut statement = conn.prepare_cached(adapter.member_by_definition)?;
+            let Some((row, current)) = self.read_statement(cancellation, |conn| {
+                let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+                    adapter.member_by_definition,
+                    5,
+                );
+                let mut statement = conn.prepare_cached(&guarded)?;
+                let guard_column = statement.column_count() - 1;
                 let mut rows = statement.query(rusqlite::params![
                     owner.provider_id.as_ref(),
                     owner.owner_fqn.as_ref(),
                     ordinal,
-                    providers
+                    providers,
+                    generation
                 ])?;
-                rows.next()?
-                    .map(|row| {
-                        self.decode_external_member_owner(&owner, owner_definition, row, &names)
-                    })
-                    .transpose()
-                    .map(Some)
+                let row = rows
+                    .next()?
+                    .expect("guarded query always returns its proof row");
+                if !row.get::<_, bool>(guard_column)? {
+                    return Ok(Some((None, false)));
+                }
+                if row.get::<_, Option<u32>>(0)?.is_none() {
+                    return Ok(Some((None, true)));
+                }
+                Ok(Some((
+                    Some(self.decode_external_member_owner(
+                        &owner,
+                        owner_definition,
+                        row,
+                        &names,
+                    )?),
+                    true,
+                )))
             })?
             else {
                 return cancelled();
             };
             if cancellation.is_cancelled() {
                 return cancelled();
+            }
+            if !current {
+                return Ok(self.external_inventory_unavailable());
             }
             if let Some(row) = row {
                 debug_assert_eq!(row.row().definition(), definition);
@@ -746,6 +1053,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         ))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn visit_external_supertypes(
         &self,
         definitions: &[SemanticId],
@@ -778,7 +1086,13 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 Ok(SelectedTypedRow::external_owner(
                     owner.clone(),
                     LoweredSupertypeProperty::external(
-                        definition, reference, reference, ordinal, target,
+                        // This adapter reads the JVM binary inventory.
+                        Language::Java,
+                        definition,
+                        reference,
+                        reference,
+                        ordinal,
+                        target,
                     )
                     .with_external_arguments(row.get::<_, Option<String>>(3)?.as_deref())
                     .map_err(|error| {
@@ -818,12 +1132,38 @@ pub(super) struct ExternalSignatureMemo {
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    /// An ordinary catalog identity cannot belong to the model-owned
+    /// external signature arena. Prove this disjointness from the same
+    /// selected catalog authority, not from an empty memo or integer range.
+    fn ordinary_external_absence(
+        &self,
+        identities: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::analyzer::resolution::TypedFactInventoryEvidence> {
+        use crate::analyzer::resolution::TypedFactInventoryEvidence;
+        for &identity in identities {
+            if !matches!(
+                self.authority
+                    .semantic_catalog_provenance(identity, cancellation)?,
+                Some(Some(
+                    crate::analyzer::resolution::SelectedSemanticProvenance::FragmentLocal(_)
+                ))
+            ) {
+                return Ok(TypedFactInventoryEvidence::Unestablished);
+            }
+        }
+        Ok(TypedFactInventoryEvidence::Established(
+            ResolutionCompletion::Complete,
+        ))
+    }
+
     fn external_signature_rows<T>(
         &self,
         rows: Vec<T>,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, T>,
     ) -> StoreResult<TypedFactReadOutcome> {
+        self.validate_external_signature_memo()?;
         Ok(match Self::page_out(&rows, cancellation, visitor)? {
             PageOutcome::Exhausted => {
                 TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
@@ -835,11 +1175,50 @@ impl SelectedResolutionTypedSource<'_, '_> {
         })
     }
 
+    fn read_external_signature_type_owners(
+        &self,
+        names: &str,
+        providers: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<(String, String)>>> {
+        self.read_statement(cancellation, |connection| {
+            let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+                jvm_external_owner_relations().signature_type_owners,
+                3,
+            );
+            let mut statement = connection.prepare_cached(&guarded)?;
+            let guard_column = statement.column_count() - 1;
+            let mut cursor = statement.query(rusqlite::params![
+                names,
+                providers,
+                self.external_inventory_generation()?
+            ])?;
+            let mut owners = Vec::new();
+            while let Some(row) = cursor.next()? {
+                if !row.get::<_, bool>(guard_column)? {
+                    return Err(StoreError::stale_resolution(
+                        "JVM provider inventory changed during the request",
+                    ));
+                }
+                if row.get::<_, Option<i64>>(guard_column - 1)?.is_none() {
+                    break;
+                }
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                owners.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            }
+            Ok(Some(owners))
+        })
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn materialize_external_declaration_types(
         &self,
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<TypedFactReadOutcome> {
+        self.validate_external_signature_memo()?;
         use crate::analyzer::resolution::{
             LoweredCallableParameterApplicability, LoweredCallableParameterProperty,
             LoweredCallableResultTypeProperty,
@@ -876,16 +1255,33 @@ impl SelectedResolutionTypedSource<'_, '_> {
             }
         }
         if !requested.is_empty() {
+            self.capture_external_signature_memo_proof()?;
             let coordinates = serde_json::to_string(&requested.keys().collect::<Vec<_>>())
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let providers = serde_json::to_string(&self.external_providers)
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let rows = self.read_statement(cancellation, |connection| {
-                let mut statement = connection
-                    .prepare_cached(jvm_external_owner_relations().declaration_signatures)?;
-                let mut cursor = statement.query([coordinates, providers])?;
+                let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+                    jvm_external_owner_relations().declaration_signatures,
+                    3,
+                );
+                let mut statement = connection.prepare_cached(&guarded)?;
+                let guard_column = statement.column_count() - 1;
+                let mut cursor = statement.query(rusqlite::params![
+                    coordinates,
+                    providers,
+                    self.external_inventory_generation()?
+                ])?;
                 let mut rows = Vec::new();
                 while let Some(row) = cursor.next()? {
+                    if !row.get::<_, bool>(guard_column)? {
+                        return Err(StoreError::stale_resolution(
+                            "JVM provider inventory changed during the request",
+                        ));
+                    }
+                    if row.get::<_, Option<i64>>(guard_column - 1)?.is_none() {
+                        break;
+                    }
                     if cancellation.is_cancelled() {
                         return Ok(None);
                     }
@@ -1008,19 +1404,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     .map_err(|error| StoreError::new(error.to_string()))?;
                 let providers = serde_json::to_string(&self.external_providers)
                     .map_err(|error| StoreError::new(error.to_string()))?;
-                let owners = self.read_statement(cancellation, |connection| {
-                    let mut statement = connection
-                        .prepare_cached(jvm_external_owner_relations().signature_type_owners)?;
-                    let mut cursor = statement.query([names, providers])?;
-                    let mut owners = Vec::new();
-                    while let Some(row) = cursor.next()? {
-                        if cancellation.is_cancelled() {
-                            return Ok(None);
-                        }
-                        owners.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
-                    }
-                    Ok(Some(owners))
-                })?;
+                let owners =
+                    self.read_external_signature_type_owners(&names, &providers, cancellation)?;
                 let Some(owners) = owners else {
                     return cancelled();
                 };
@@ -1267,7 +1652,10 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .flatten()
             .cloned()
             .collect();
-        self.external_signature_rows(rows, cancellation, visitor)
+        let inventory = self.ordinary_external_absence(owners, cancellation)?;
+        Ok(self
+            .external_signature_rows(rows, cancellation, visitor)?
+            .with_inventory_evidence(inventory))
     }
 
     pub(super) fn visit_external_declaration_types(
@@ -1285,7 +1673,10 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .iter()
             .filter_map(|definition| memo.declarations.get(definition).cloned())
             .collect();
-        self.external_signature_rows(rows, cancellation, visitor)
+        let inventory = self.ordinary_external_absence(definitions, cancellation)?;
+        Ok(self
+            .external_signature_rows(rows, cancellation, visitor)?
+            .with_inventory_evidence(inventory))
     }
 
     pub(super) fn visit_external_declaration_types_for_slots(
@@ -1304,7 +1695,10 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     .cloned()
             })
             .collect();
-        self.external_signature_rows(rows, cancellation, visitor)
+        let inventory = self.ordinary_external_absence(slots, cancellation)?;
+        Ok(self
+            .external_signature_rows(rows, cancellation, visitor)?
+            .with_inventory_evidence(inventory))
     }
 
     pub(super) fn visit_external_callable_signatures(
@@ -1842,6 +2236,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<crate::analyzer::resolution::JavaInheritanceDeclaration>>> {
+        self.validate_external_signature_memo()?;
         use crate::analyzer::resolution::fact_source::JvmDeclarationPackage;
         use crate::analyzer::resolution::{
             JavaInheritanceDeclaration, JavaInheritanceDeclarationKind,
@@ -1877,16 +2272,33 @@ impl SelectedResolutionTypedSource<'_, '_> {
             }
         }
         if !requested.is_empty() {
+            self.capture_external_signature_memo_proof()?;
             let coordinates = serde_json::to_string(&requested.keys().collect::<Vec<_>>())
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let providers = serde_json::to_string(&self.external_providers)
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let rows = self.read_statement(cancellation, |connection| {
-                let mut statement = connection
-                    .prepare_cached(jvm_external_owner_relations().inheritance_declarations)?;
-                let mut cursor = statement.query([coordinates, providers])?;
+                let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+                    jvm_external_owner_relations().inheritance_declarations,
+                    3,
+                );
+                let mut statement = connection.prepare_cached(&guarded)?;
+                let guard_column = statement.column_count() - 1;
+                let mut cursor = statement.query(rusqlite::params![
+                    coordinates,
+                    providers,
+                    self.external_inventory_generation()?
+                ])?;
                 let mut rows = Vec::new();
                 while let Some(row) = cursor.next()? {
+                    if !row.get::<_, bool>(guard_column)? {
+                        return Err(StoreError::stale_resolution(
+                            "JVM provider inventory changed during the request",
+                        ));
+                    }
+                    if row.get::<_, Option<i64>>(guard_column - 1)?.is_none() {
+                        break;
+                    }
                     if cancellation.is_cancelled() {
                         return Ok(None);
                     }
@@ -1955,6 +2367,10 @@ mod tests {
 
     #[test]
     #[hardwon("#6214: package-private JVM members were stored as \"package\" and failed to decode")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn published_package_private_member_and_nested_type_decode_from_inventory() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let types: Vec<TypeFact> = serde_json::from_value(serde_json::json!([{
@@ -1976,7 +2392,7 @@ mod tests {
 
         let conn = store.read_conn().unwrap();
         let mut statement = conn.prepare(
-            "SELECT member_name, visibility FROM jvm_external_owner_members WHERE provider_id='provider' AND owner_fqn='example.Owner' ORDER BY ordinal",
+            "SELECT member_name, visibility FROM jvm_external_owner_members WHERE provider_id=(SELECT provider_id FROM jvm_external_provider_publications WHERE semantic_sha256='provider') AND owner_fqn='example.Owner' ORDER BY ordinal",
         ).unwrap();
         let rows = statement
             .query_map([], |row| {
@@ -1995,6 +2411,424 @@ mod tests {
                 ("ordinary".to_owned(), DeclaredVisibility::PackagePrivate),
                 ("Nested".to_owned(), DeclaredVisibility::PackagePrivate),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod inventory_generation_tests {
+    use super::*;
+    use crate::analyzer::store::jvm_external_publication::{
+        JvmExternalProjection, jvm_external_provider_id,
+    };
+    use crate::analyzer::store::resolution_selection::{
+        SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+        tests::qualifier_completion_gap_fixture,
+    };
+    use rusqlite::types::Value;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12245: evicted JVM declarations and owner authority returned complete answers"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn evicted_member_signature_and_inheritance_reads_are_unavailable() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let provider = jvm_external_provider_id("definition-fixture");
+        let owner = ExternalOwnerIdentity {
+            provider_id: Arc::from(provider.as_str()),
+            owner_fqn: Arc::from("java.lang.Object"),
+        };
+        assert!(
+            crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
+                .is_some()
+        );
+        let projection = JvmExternalProjection {
+            provider_id: provider.clone(),
+            semantic_sha256: "definition-fixture".into(),
+            source_identity: "fixture".into(),
+            owners: vec![vec![
+                Value::Text(provider.clone()),
+                Value::Text(owner.owner_fqn.to_string()),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("[]".into()),
+            ]],
+            members: vec![vec![
+                Value::Text(provider.clone()),
+                Value::Text(owner.owner_fqn.to_string()),
+                Value::Integer(0),
+                Value::Text("toString".into()),
+                Value::Text("method".into()),
+                Value::Text("public".into()),
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Null,
+                Value::Text("[]".into()),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("[]".into()),
+            ]],
+            supertypes: Vec::new(),
+        };
+        store
+            .publish_jvm_external_projection(|| Ok(Some(projection)), || false)
+            .unwrap();
+        let competing_provider = jvm_external_provider_id("competing-definition");
+        let competing = JvmExternalProjection {
+            provider_id: competing_provider.clone(),
+            semantic_sha256: "competing-definition".into(),
+            source_identity: "fixture".into(),
+            owners: vec![vec![
+                Value::Text(competing_provider.clone()),
+                Value::Text(owner.owner_fqn.to_string()),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("[]".into()),
+            ]],
+            members: Vec::new(),
+            supertypes: Vec::new(),
+        };
+        store
+            .publish_jvm_external_projection(|| Ok(Some(competing)), || false)
+            .unwrap();
+        let generation = store.jvm_external_inventory_generation().unwrap();
+        let cancellation = CancellationToken::new();
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &languages,
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("fixture must select");
+        };
+        let typed = SelectedResolutionTypedSource::new_on_demand(&selection)
+            .with_external_providers(vec![provider.clone()])
+            .with_external_inventory_generation(&store, Some(generation));
+        let names = selection
+            .shared_name_table()
+            .interner(selection.connection());
+        let present = typed
+            .context_identities
+            .external_member_semantic(&owner, 0, &names);
+        let absent = typed
+            .context_identities
+            .external_member_semantic(&owner, 99, &names);
+        let read = |definition| {
+            let mut count = 0;
+            let mut sink = |page: &[_]| {
+                count += page.len();
+                Ok(true)
+            };
+            let outcome = typed
+                .visit_external_member_owners_for_definitions(
+                    &[definition],
+                    &cancellation,
+                    &mut TypedFactPageVisitor::new(&mut sink),
+                )
+                .unwrap();
+            (count, outcome)
+        };
+        let (count, outcome) = read(absent);
+        assert_eq!(count, 0);
+        assert_eq!(outcome.evidence(), &ResolutionCompletion::Complete);
+        assert_eq!(read(present).0, 1);
+        assert!(
+            intrinsic_member_inventory_for_owner(selection.connection(), &owner, generation)
+                .unwrap()
+                .is_none()
+        );
+        let member: String = selection.connection().query_row("SELECT member_name FROM jvm_external_owner_members WHERE provider_id=?1 AND ordinal=0", [&provider], |row| row.get(0)).unwrap();
+        assert_eq!(member, "toString");
+        // Exercise each declaration reader with a cold memo before eviction.
+        let fresh = || {
+            SelectedResolutionTypedSource::new_on_demand(&selection)
+                .with_context_identities(typed.context_identities.clone())
+                .with_external_providers(vec![owner.provider_id.to_string()])
+                .with_external_inventory_generation(&store, Some(generation))
+        };
+        let control = fresh();
+        let missing_owner = ExternalOwnerIdentity {
+            provider_id: owner.provider_id.clone(),
+            owner_fqn: Arc::from("example.Missing"),
+        };
+        assert!(control.external_owner_type_is_indexed(&owner).unwrap());
+        assert!(
+            !control
+                .external_owner_type_is_indexed(&missing_owner)
+                .unwrap()
+        );
+        assert_eq!(
+            control
+                .selected_jvm_declaration_owner(&owner.owner_fqn, &cancellation)
+                .unwrap(),
+            Some(Some(owner.clone()))
+        );
+        let ambiguous = SelectedResolutionTypedSource::new_on_demand(&selection)
+            .with_external_providers(vec![owner.provider_id.to_string(), competing_provider])
+            .with_external_inventory_generation(&store, Some(generation));
+        assert_eq!(
+            ambiguous
+                .selected_jvm_declaration_owner(&owner.owner_fqn, &cancellation)
+                .unwrap(),
+            Some(None)
+        );
+        let owner_consumer = |source: &dyn SelectedTypedFactSource| {
+            crate::analyzer::resolution::fact_resolution::fixture_support::selected_jvm_owner_semantic(source, &owner.owner_fqn, &cancellation)
+        };
+        assert_eq!(owner_consumer(&ambiguous).unwrap(), None);
+        let metadata = super::super::super::resolution_operation::native_units::selected_jvm_external_member_metadata(selection.connection(), &owner, 0, generation).unwrap();
+        assert_eq!(metadata.member_name, "toString");
+
+        assert_eq!(
+            control
+                .materialize_external_declaration_types(&[present], &cancellation)
+                .unwrap()
+                .evidence(),
+            &ResolutionCompletion::Complete
+        );
+        assert!(control.external_signatures.borrow().signatures[&present].is_some());
+        assert_eq!(
+            control
+                .external_inheritance_declarations(&[present], &cancellation)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        let requested_names = serde_json::to_string(&[owner.owner_fqn.as_ref()]).unwrap();
+        let requested_providers = serde_json::to_string(&[owner.provider_id.as_ref()]).unwrap();
+        assert_eq!(
+            control
+                .read_external_signature_type_owners(
+                    &requested_names,
+                    &requested_providers,
+                    &cancellation
+                )
+                .unwrap()
+                .unwrap(),
+            vec![(owner.owner_fqn.to_string(), owner.provider_id.to_string())]
+        );
+        // No inventory change: a genuinely absent signature is complete.
+        assert_eq!(
+            control
+                .materialize_external_declaration_types(&[absent], &cancellation)
+                .unwrap()
+                .evidence(),
+            &ResolutionCompletion::Complete
+        );
+        store
+            .conn
+            .execute(move |conn| -> StoreResult<()> {
+                conn.execute(
+                    "DELETE FROM jvm_external_provider_publications WHERE provider_id=?1",
+                    [provider],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // These exact request-local answers were fully acquired from the
+        // sealed provider before eviction, so their snapshot proof survives.
+        assert_eq!(
+            control
+                .materialize_external_declaration_types(&[present], &cancellation)
+                .unwrap()
+                .evidence(),
+            &ResolutionCompletion::Complete
+        );
+        assert_eq!(
+            control
+                .external_inheritance_declarations(&[present], &cancellation)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        let stale = fresh();
+        assert!(
+            stale
+                .external_owner_type_is_indexed(&owner)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            stale
+                .external_owner_type_is_indexed(&missing_owner)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            stale
+                .jvm_external_owner_is_indexed(&owner)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        // Ambiguity permits the caller's ordinary no-owner result; generation
+        // drift must instead propagate unavailable resolution to its caller.
+        assert!(
+            owner_consumer(&ambiguous)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+
+        assert!(
+            stale
+                .selected_jvm_declaration_owner(&owner.owner_fqn, &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            ambiguous
+                .selected_jvm_declaration_owner(&owner.owner_fqn, &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(super::super::super::resolution_operation::native_units::selected_jvm_external_member_metadata(selection.connection(), &owner, 0, generation).unwrap_err().is_stale_resolution());
+
+        assert!(
+            stale
+                .materialize_external_declaration_types(&[present], &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            stale
+                .external_inheritance_declarations(&[present], &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            stale
+                .read_external_signature_type_owners(
+                    &requested_names,
+                    &requested_providers,
+                    &cancellation
+                )
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(stale.external_signatures.borrow().signatures.is_empty());
+        assert!(stale.external_signatures.borrow().inheritance.is_empty());
+        let failure =
+            intrinsic_member_inventory_for_owner(selection.connection(), &owner, generation)
+                .err()
+                .expect("evicted inventory must be stale");
+        assert!(failure.is_stale_resolution(), "{failure:?}");
+        let (count, outcome) = read(present);
+        assert_eq!(count, 0);
+        assert!(matches!(
+            outcome.evidence(),
+            ResolutionCompletion::Incomplete(_)
+        ));
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12245: legacy signature and inheritance memos carried mutable inventory across generation changes"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn legacy_signature_memos_do_not_carry_acquired_absence() {
+        use crate::analyzer::semantic_model::{MemberFact, TypeFact};
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let types: Vec<TypeFact> = serde_json::from_value(serde_json::json!([{
+            "id":"owner", "name":"example.Legacy", "type_kind":"class", "visibility":"public",
+            "locator":{"kind":"artifact","path":"legacy.jar","symbol":"example.Legacy"}
+        }]))
+        .unwrap();
+        let members: Vec<MemberFact> = serde_json::from_value(serde_json::json!([{
+            "id":"method", "owner":"owner", "name":"call", "member_kind":"method", "visibility":"public",
+            "locator":{"kind":"artifact","path":"legacy.jar","symbol":"example.Legacy.call"}
+        }])).unwrap();
+        store
+            .publish_jvm_external_inventory_facts(
+                "legacy-signature-memo".into(),
+                &types,
+                &members,
+                true,
+            )
+            .unwrap();
+        let provider = jvm_external_provider_id("legacy-signature-memo");
+        let generation = store.jvm_external_inventory_generation().unwrap();
+        let cancellation = CancellationToken::new();
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &languages,
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("fixture must select");
+        };
+        let typed = SelectedResolutionTypedSource::new_on_demand(&selection)
+            .with_external_providers(vec![provider.clone()])
+            .with_external_inventory_generation(&store, Some(generation));
+        let owner = ExternalOwnerIdentity {
+            provider_id: Arc::from(provider.as_str()),
+            owner_fqn: Arc::from("example.Legacy"),
+        };
+        let names = selection
+            .shared_name_table()
+            .interner(selection.connection());
+        let definition = typed
+            .context_identities
+            .external_member_semantic(&owner, 0, &names);
+        assert_eq!(
+            typed
+                .materialize_external_declaration_types(&[definition], &cancellation)
+                .unwrap()
+                .evidence(),
+            &ResolutionCompletion::Complete
+        );
+        assert!(typed.external_signatures.borrow().signatures[&definition].is_none());
+        assert_eq!(
+            typed
+                .external_inheritance_declarations(&[definition], &cancellation)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        store.conn.execute(move |conn| -> StoreResult<()> {
+            assert_eq!(conn.execute("UPDATE jvm_external_owner_members SET signature_present=1 WHERE provider_id=?1", [provider])?, 1);
+            Ok(())
+        }).unwrap();
+        assert!(store.jvm_external_inventory_generation().unwrap() > generation);
+        assert!(
+            typed
+                .materialize_external_declaration_types(&[definition], &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            typed
+                .external_inheritance_declarations(&[definition], &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert!(
+            typed
+                .external_receiver_argument_reasons(&[definition], &[], &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
         );
     }
 }

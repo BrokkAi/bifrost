@@ -97,6 +97,10 @@ WHERE mount.storage_language='rust' AND placement.scope_surface_ordinal IS NOT N
     #[hardwon(
         "#4990+#4995: Rust point readers repeated live alignment and dependency closure per lookup"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_module_placement_readers_seek_materialized_selection_rows() {
         use brokk_bifrost_analysis::CancellationToken;
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL;
@@ -669,6 +673,10 @@ DELETE FROM temp.selected_resolution_transient_placements;
     /// and the attribute pass must be the same for 12 and 24 of them.
     #[test]
     #[hardwon("#11546: the unplacing worklist must follow the changed edges, never the workspace")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_placement_unplacing_work_follows_the_changed_edges_not_the_workspace() {
         use brokk_bifrost_analysis::CancellationToken;
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL;

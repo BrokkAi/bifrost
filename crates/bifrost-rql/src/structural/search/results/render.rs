@@ -74,6 +74,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::PathSegment { .. }
                 | CodeQueryResultValue::StateEvent { .. }
                 | CodeQueryResultValue::BindingInitializerCall { .. }
+                | CodeQueryResultValue::FieldWrite { .. }
+                | CodeQueryResultValue::FieldRead { .. }
                 | CodeQueryResultValue::FlowRelation { .. }
                 | CodeQueryResultValue::ControlRelation { .. }
                 | CodeQueryResultValue::BranchRelation { .. }
@@ -1186,6 +1188,36 @@ impl CodeQueryResult {
                             ));
                         }
                     }
+                    CodeQueryResultValue::FieldWrite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [field_write; {}; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.member_fq_name,
+                            value.proof,
+                            value.completeness,
+                        ));
+                        out.push_str(&format!(
+                            "  in {}, point {}, strong update {}\n",
+                            value.enclosing, value.program_point_id, value.strong_update,
+                        ));
+                    }
+                    CodeQueryResultValue::FieldRead { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [field_read; {}; {}; {}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.member_fq_name,
+                            value.proof,
+                            value.completeness,
+                        ));
+                        out.push_str(&format!(
+                            "  in {}, point {}\n",
+                            value.enclosing, value.program_point_id,
+                        ));
+                    }
                     CodeQueryResultValue::BindingInitializerCall { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [binding initializer call; {}; establishment={}] site_ast_id={}\n",
@@ -1583,7 +1615,7 @@ impl CodeQueryResult {
             out.push_str(&format!(
                 "{}: {}\n",
                 diagnostic.presentation_label(),
-                diagnostic.message
+                diagnostic.message()
             ));
         }
         out

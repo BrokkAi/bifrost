@@ -47,6 +47,62 @@ pub fn publishes_dependency_evidence(language: crate::analyzer::Language) -> boo
         .any(|(_, publishing)| *publishing == language)
 }
 
+/// The caller declares how a selected evidence read reaches its capture.
+pub trait EvidenceReadRecorder {
+    fn record(&self, key: crate::analyzer::read_ledger::ReadKey);
+    fn refuse_reuse(&self);
+}
+
+/// Admission and reconciliation publish their own certified products; they
+/// are not query reads and must not attribute publication inputs to a query.
+pub struct NonQueryEvidenceReadRecorder;
+impl EvidenceReadRecorder for NonQueryEvidenceReadRecorder {
+    fn record(&self, _key: crate::analyzer::read_ledger::ReadKey) {}
+    fn refuse_reuse(&self) {}
+}
+
+// Rust binds the derived and acquired digests in one versioned string. Hash
+// that whole content identity so neither component, nor presence, is lost.
+fn evidence_digest(identity: &str) -> crate::analyzer::semantic::ids::StableDigest {
+    crate::analyzer::semantic::ids::StableDigest::sha256(identity.as_bytes())
+}
+
+/// Resolve the rows and their content identity in the same selection read.
+pub(super) fn selected_set(
+    conn: &Connection,
+    snapshot: &WorkspaceSnapshotId,
+    recorder: &dyn EvidenceReadRecorder,
+) -> Result<Option<(i64, String)>> {
+    use crate::analyzer::read_ledger::{
+        FactSubject, LookupKind, LookupQuestion, ReadKey, WorkspaceFactFamily,
+    };
+    let selected = conn.prepare_cached(
+        "SELECT selection.set_id, inputs.input_digest FROM dependency_evidence_selections AS selection JOIN dependency_evidence_sets AS inputs USING(set_id) WHERE selection.workspace_id=?1 AND selection.lang=?2 AND selection.generation=?3 AND selection.revision=?4",
+    )?.query_row(
+        params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    ).optional()?;
+    if let Some((_, identity)) = &selected {
+        let language = PUBLISHING_LANGUAGES
+            .iter()
+            .find(|(key, _)| *key == snapshot.lang)
+            .expect("selected dependency evidence has a publishing language")
+            .1;
+        recorder.record(ReadKey::lookup(
+            LookupKind::WorkspaceFact,
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::SelectedDependencyEvidence,
+                language,
+                subject: FactSubject::Whole,
+            },
+            evidence_digest(identity),
+        ));
+    } else {
+        recorder.refuse_reuse();
+    }
+    Ok(selected)
+}
+
 fn supports_language(language: &str) -> bool {
     PUBLISHING_LANGUAGES.iter().any(|(key, _)| *key == language)
 }
@@ -82,16 +138,20 @@ fn prepare_selected(
     )
 }
 
-pub(super) fn publish_with_acquired(
+fn is_overlay_identity(identity: &str) -> bool {
+    identity.starts_with("overlay:")
+}
+
+struct PreparedDiskIdentity {
+    digest: String,
+    incomplete: Option<brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
+}
+
+fn prepare_disk_input_identity(
     tx: &Transaction<'_>,
     snapshot: &WorkspaceSnapshotId,
-    acquired: &brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
-) -> Result<()> {
-    if !supports_language(&snapshot.lang) {
-        return Ok(());
-    }
-    let acquired = (snapshot.lang == "rust").then_some(acquired);
-    let limits = DependencyFileEvidenceLimits::default();
+    acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
+) -> Result<PreparedDiskIdentity> {
     let mut hash = CanonicalHasher::new(PRODUCER);
     let mut acquired_valid = true;
     let mut acquired_refs = 0usize;
@@ -150,13 +210,53 @@ pub(super) fn publish_with_acquired(
         }
         incomplete = Some(view);
     }
-    let acquired = incomplete.as_ref().or(acquired);
-    let digest = if let Some(acquired) = acquired {
-        let acquired_digest = super::rust_acquired_cargo_config::persist(tx, snapshot, acquired)?;
+    let effective = incomplete.as_ref().or(acquired);
+    let digest = if let Some(view) = effective {
+        let acquired_digest = view.digest();
         super::rust_acquired_cargo_config::bound_digest(&digest, &acquired_digest)
     } else {
         digest
     };
+    Ok(PreparedDiskIdentity { digest, incomplete })
+}
+
+pub(super) fn disk_evidence_identity_matches(
+    tx: &Transaction<'_>,
+    previous: &WorkspaceSnapshotId,
+    acquired: &brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
+) -> Result<bool> {
+    if !supports_language(&previous.lang) {
+        return Ok(true);
+    }
+    let Some((_, prev_identity)) = selected_set(tx, previous, &NonQueryEvidenceReadRecorder)?
+    else {
+        return Ok(false);
+    };
+    if is_overlay_identity(&prev_identity) {
+        return Ok(false);
+    }
+    let next =
+        prepare_disk_input_identity(tx, previous, (previous.lang == "rust").then_some(acquired))?;
+    Ok(prev_identity == next.digest)
+}
+
+pub(super) fn publish_with_acquired(
+    tx: &Transaction<'_>,
+    snapshot: &WorkspaceSnapshotId,
+    acquired: &brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
+) -> Result<()> {
+    if !supports_language(&snapshot.lang) {
+        return Ok(());
+    }
+    let acquired_opt = (snapshot.lang == "rust").then_some(acquired);
+    let limits = DependencyFileEvidenceLimits::default();
+    let prepared = prepare_disk_input_identity(tx, snapshot, acquired_opt)?;
+    let effective_acquired = prepared.incomplete.as_ref().or(acquired_opt);
+    if let Some(view) = effective_acquired {
+        let persisted_digest = super::rust_acquired_cargo_config::persist(tx, snapshot, view)?;
+        debug_assert_eq!(persisted_digest, view.digest());
+    }
+    let digest = prepared.digest;
     let existing = tx.query_row("SELECT set_id FROM dependency_evidence_sets WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND input_digest=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,digest], |r| r.get::<_,i64>(0)).optional()?;
     let set_id = if let Some(id) = existing {
         id
@@ -175,12 +275,37 @@ pub(super) fn publish_with_acquired(
             &selected,
             &presence,
             &limits,
-            acquired,
+            effective_acquired,
         );
         evidence.gaps.extend(gaps);
         insert_set(tx, snapshot, &digest, &evidence, &selected)?
     };
-    tx.execute("INSERT INTO dependency_evidence_selections VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,lang,generation,revision) DO UPDATE SET set_id=excluded.set_id", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,snapshot.revision,set_id])?;
+    let inserted = tx.execute(
+        "INSERT INTO dependency_evidence_selections(workspace_id,lang,generation,revision,set_id) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,lang,generation,revision) DO NOTHING",
+        params![
+            snapshot.workspace_id.as_str(),
+            snapshot.lang,
+            snapshot.generation.0,
+            snapshot.revision,
+            set_id
+        ],
+    )?;
+    if inserted == 0 {
+        let existing_identity: String = tx.query_row(
+            "SELECT inputs.input_digest FROM dependency_evidence_selections AS selection JOIN dependency_evidence_sets AS inputs USING(set_id) WHERE selection.workspace_id=?1 AND selection.lang=?2 AND selection.generation=?3 AND selection.revision=?4",
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang,
+                snapshot.generation.0,
+                snapshot.revision
+            ],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            existing_identity, digest,
+            "dependency evidence selection for {snapshot:?} already exists with different content identity"
+        );
+    }
     if snapshot.lang == "rust" {
         super::rust_acquired_cargo_config::reclaim(tx, snapshot)?;
     }
@@ -497,9 +622,12 @@ struct CargoOverlayInputs {
 }
 impl ScopedDependencyEvidence {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn acquired_rust_configuration(
         &self,
+        recorder: &dyn EvidenceReadRecorder,
     ) -> Result<Option<brokk_bifrost_rust::cargo_config::RustCargoConfiguration>> {
+        recorder.refuse_reuse();
         let Some(cargo) = &self.cargo else {
             return Ok(None);
         };
@@ -536,19 +664,24 @@ impl ScopedDependencyEvidence {
             .map_or(&[], |cargo| cargo.external_reads.as_ref())
     }
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn locations(
         &self,
+        recorder: &dyn EvidenceReadRecorder,
     ) -> Result<
         Vec<(
             String,
             crate::analyzer::semantic_model::DependencyEvidenceLocation,
         )>,
     > {
+        recorder.refuse_reuse();
         let conn = self.store.read_conn()?;
         read_locations(&conn, self.set_id)
     }
     #[doc(hidden)]
-    pub fn read(&self) -> Result<DependencyFileEvidence> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    pub fn read(&self, recorder: &dyn EvidenceReadRecorder) -> Result<DependencyFileEvidence> {
+        recorder.refuse_reuse();
         let conn = self.store.read_conn()?;
         read_set(&conn, self.set_id)
     }
@@ -582,6 +715,10 @@ pub fn publish_overlay(
 }
 
 #[doc(hidden)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 pub fn publish_overlay_with_rust_refresh(
     store: &Arc<AnalyzerStore>,
     snapshots: &WorkspaceSnapshots,
@@ -825,9 +962,11 @@ fn read_locations(
 }
 impl AnalyzerStore {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn dependency_file_locations(
         &self,
         snapshots: &WorkspaceSnapshots,
+        recorder: &dyn EvidenceReadRecorder,
     ) -> Result<
         Vec<(
             String,
@@ -836,13 +975,42 @@ impl AnalyzerStore {
     > {
         let conn = self.read_conn_for_workspace(snapshots)?;
         let mut result = Vec::new();
+        if !snapshots
+            .values()
+            .any(|snapshot| supports_language(&snapshot.lang))
+        {
+            recorder.refuse_reuse();
+        }
         for snapshot in snapshots.values().filter(|s| supports_language(&s.lang)) {
-            let set = conn.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,snapshot.revision], |r|r.get::<_,i64>(0)).optional()?;
+            let set = selected_set(&conn, snapshot, recorder)?.map(|(set, _)| set);
             if let Some(set) = set {
                 result.extend(read_locations(&conn, set)?);
             }
         }
         Ok(result)
+    }
+    /// Current selected evidence content, for receipt verification.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    pub fn selected_dependency_evidence_digest(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+        language: crate::analyzer::Language,
+        recorder: &dyn EvidenceReadRecorder,
+    ) -> Result<Option<crate::analyzer::semantic::ids::StableDigest>> {
+        let Some((key, _)) = PUBLISHING_LANGUAGES
+            .iter()
+            .find(|(_, lang)| *lang == language)
+        else {
+            return Ok(None);
+        };
+        let Some(snapshot) = snapshots.get(*key) else {
+            return Ok(None);
+        };
+        let conn = self.read_conn_for_workspace(snapshots)?;
+        Ok(
+            selected_set(&conn, snapshot, recorder)?
+                .map(|(_, identity)| evidence_digest(&identity)),
+        )
     }
     /// Read `language`'s selected static dependency evidence.
     ///
@@ -851,10 +1019,12 @@ impl AnalyzerStore {
     /// published has no snapshot at all, and skipping it reported a complete
     /// empty answer (#8357).
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn dependency_file_evidence(
         &self,
         snapshots: &WorkspaceSnapshots,
         language: crate::analyzer::Language,
+        recorder: &dyn EvidenceReadRecorder,
     ) -> Result<DependencyFileEvidence> {
         let (key, _) = PUBLISHING_LANGUAGES
             .iter()
@@ -874,12 +1044,13 @@ impl AnalyzerStore {
             ..DependencyFileEvidence::default()
         };
         let Some(snapshot) = snapshots.get(*key) else {
+            recorder.refuse_reuse();
             return Ok(missing(format!(
                 "no {key} workspace input revision is selected"
             )));
         };
         let conn = self.read_conn_for_workspace(snapshots)?;
-        let set = conn.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,snapshot.revision], |r|r.get::<_,i64>(0)).optional()?;
+        let set = selected_set(&conn, snapshot, recorder)?.map(|(set, _)| set);
         let Some(set) = set else {
             return Ok(missing(
                 "selected revision has no static dependency publication".into(),
@@ -1024,27 +1195,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(SUPPORT.0.load(std::sync::atomic::Ordering::Relaxed), 1);
-        store.conn.execute(move |conn| -> Result<()> {
-            let tx=conn.transaction()?;
-            let old_id:i64=tx.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3", params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision], |row|row.get(0))?;
-            let mut old=CanonicalHasher::new(b"bifrost.static-dependency-evidence.v6");
-            old.field("path", b"Cargo.toml");
-            old.field("oid", git2::Oid::hash_object(git2::ObjectType::Blob, OVERLAY.as_bytes()).unwrap().to_string().as_bytes());
-            old.field("presence", &[1]);
-            tx.execute("UPDATE dependency_evidence_sets SET input_digest=?1 WHERE set_id=?2", params![lower_hex_string(&old.finish()),old_id])?;
-            // The source revision is identical. Only the current producer differs.
-            publish_with_acquired(&tx, &snapshot, &Default::default())?;
-            let fresh_id:i64=tx.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3", params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision], |row|row.get(0))?;
-            assert_ne!(old_id,fresh_id);
-            tx.commit()?;
-            Ok(())
-        }).unwrap();
+        let old_id = store
+            .conn
+            .execute(move |conn| -> Result<i64> {
+                let tx = conn.transaction()?;
+                let old_id: i64 = tx.query_row(
+                    "SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3",
+                    params![snapshot.workspace_id.as_str(), snapshot.generation.0, snapshot.revision],
+                    |row| row.get(0),
+                )?;
+                let mut old = CanonicalHasher::new(b"bifrost.static-dependency-evidence.v6");
+                old.field("path", b"Cargo.toml");
+                old.field(
+                    "oid",
+                    git2::Oid::hash_object(git2::ObjectType::Blob, OVERLAY.as_bytes())
+                        .unwrap()
+                        .to_string()
+                        .as_bytes(),
+                );
+                old.field("presence", &[1]);
+                tx.execute(
+                    "UPDATE dependency_evidence_sets SET input_digest=?1 WHERE set_id=?2",
+                    params![lower_hex_string(&old.finish()), old_id],
+                )?;
+                tx.commit()?;
+                Ok(old_id)
+            })
+            .unwrap();
+        // The source inputs are identical. Only the current producer differs,
+        // so the publisher allocates a new revision rather than rewriting the old one.
+        let fresh_snapshot = store
+            .sync_workspace_inputs_for_workspace(
+                &WorkspaceId("b".repeat(64)),
+                "rust",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[WorkspaceConfigurationInput::new(
+                    "Cargo.toml".into(),
+                    OVERLAY.as_bytes().into(),
+                )],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_ne!(fresh_snapshot.revision, snapshot.revision);
+        let fresh_id = store
+            .conn
+            .execute(move |conn| -> Result<i64> {
+                conn.query_row(
+                    "SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3",
+                    params![
+                        fresh_snapshot.workspace_id.as_str(),
+                        fresh_snapshot.generation.0,
+                        fresh_snapshot.revision
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_ne!(old_id, fresh_id);
         assert_eq!(SUPPORT.0.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
     #[hardwon("4fe7c7de1924: a small overlay retains the replaced disk file's byte-cap gap")]
     fn small_overlay_clears_replaced_disk_acquisition_limit_gap() {
+        struct OverlayReadRecorder(std::cell::Cell<usize>);
+        impl EvidenceReadRecorder for OverlayReadRecorder {
+            fn record(&self, key: crate::analyzer::read_ledger::ReadKey) {
+                panic!("overlay lease identity must not become a read key: {key:?}");
+            }
+            fn refuse_reuse(&self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
         static SUPPORT: OverlayEvidenceSupport =
             OverlayEvidenceSupport(std::sync::atomic::AtomicUsize::new(0));
         let _support =
@@ -1090,7 +1320,7 @@ mod tests {
                 .unwrap();
             let snapshots = WorkspaceSnapshots::from_iter([("rust".into(), snapshot)]);
             let before = store
-                .dependency_file_evidence(&snapshots, Language::Rust)
+                .dependency_file_evidence(&snapshots, Language::Rust, &NonQueryEvidenceReadRecorder)
                 .unwrap();
             assert_eq!(before.gaps.len(), 1);
             assert_eq!(before.gaps[0].kind, DependencyEvidenceGapKind::Limit);
@@ -1107,7 +1337,9 @@ mod tests {
             let publication = publish_overlay(&store, &snapshots, &project, Language::Rust)
                 .unwrap()
                 .expect("configuration overlay must publish evidence");
-            let after = publication.read().unwrap();
+            let recorder = OverlayReadRecorder(std::cell::Cell::new(0));
+            let after = publication.read(&recorder).unwrap();
+            assert_eq!(recorder.0.get(), 1, "overlay evidence must refuse reuse");
             admitted += paths.len();
             assert_eq!(
                 SUPPORT.0.load(std::sync::atomic::Ordering::Relaxed),

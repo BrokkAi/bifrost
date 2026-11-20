@@ -854,6 +854,8 @@ impl FindingIncompleteReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyFailureReason {
+    /// A selector role bound nothing while its own discovery was partial, so the run checked nothing.
+    EndpointRoleUnresolved,
     InvalidExecutionPlan,
     WorkspaceSnapshotUnavailable,
     SourceReadFailed,
@@ -4149,6 +4151,7 @@ const ROOT_DIAGNOSTIC_LABELS: &[&str] = &[
     "endpoint_dominance_undecidable",
     "evaluation_failure",
     "empty_selection",
+    "guard_removal_vocabulary_note",
     "unknown_verdict_fail_closed",
     "batch_finding_limit",
     "report_retention_budget",
@@ -4895,6 +4898,9 @@ pub enum PolicyDiagnosticCode {
     /// selection is still a correct verdict -- but the report says the
     /// selection was empty instead of looking identical to a proven-clean run.
     EmptySelection,
+    /// A Match `:guard-barriers` entry referenced a relation without a
+    /// registered removal vocabulary or an unknown removal kind at load time.
+    GuardRemovalVocabularyNote,
     /// The policy declared `(on-unknown :verdict fail-closed)` and its run
     /// could not reach a verdict, so the blocked verdict gates as a failure
     /// and this diagnostic names the unknowns that blocked it (#2506).
@@ -4927,6 +4933,7 @@ impl PolicyDiagnosticCode {
             Self::InternalError { .. } => "internal_error",
             Self::EvaluationFailure => "evaluation_failure",
             Self::EmptySelection => "empty_selection",
+            Self::GuardRemovalVocabularyNote => "guard_removal_vocabulary_note",
             Self::UnknownVerdictFailClosed => "unknown_verdict_fail_closed",
             Self::BatchFindingLimit => "batch_finding_limit",
             Self::ReportRetentionBudget => "report_retention_budget",
@@ -8619,7 +8626,9 @@ pub(crate) fn completion_allows_diagnostic(
 ) -> bool {
     (matches!(completion, PolicyRunCompletion::Failed { .. })
         && diagnostic.impact == PolicyDiagnosticImpact::RunIncomplete
-        && matches!(diagnostic.code, PolicyDiagnosticCode::InternalError { .. }))
+        && (matches!(diagnostic.code, PolicyDiagnosticCode::InternalError { .. })
+            || matches!(completion, PolicyRunCompletion::Failed { reasons }
+                if reasons.contains(&PolicyFailureReason::EndpointRoleUnresolved))))
         || completion_allows_diagnostic_impact(completion, diagnostic.impact)
 }
 

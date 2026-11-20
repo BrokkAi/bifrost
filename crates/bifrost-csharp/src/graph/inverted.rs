@@ -22,7 +22,9 @@ use crate::graph::extractor::{
     is_declaration_name, is_unqualified_method_group_value, member_access_name,
     member_access_receiver,
 };
-use crate::graph::membership_scope::{DoubtMemo, Doubted, MembershipScopedSource, SiteDoubt};
+use crate::graph::membership_scope::{
+    DoubtMemo, Doubted, MembershipScopedSource, Obligation, SiteAdmission, SiteMark,
+};
 use crate::graph::resolver::{
     CSharpBuiltinValueArguments, UnqualifiedMethodGroupResolution, argument_count,
     class_unit_for_fq_name, collection_target_element_type_node, extension_visibility_site_key,
@@ -83,7 +85,7 @@ pub fn scan_file(
         graph,
         csharp: &membership,
         membership: &membership,
-        site_doubt: SiteDoubt::default(),
+        site_mark: SiteMark::default(),
         file,
         source: input.source,
         class_ranges: ClassRangeIndex::build(graph.index, file),
@@ -107,7 +109,7 @@ struct CsScan<'a> {
     membership: &'a MembershipScopedSource<'a>,
     /// Doubt admitted before the node now being recorded: an edge whose
     /// derivation admitted more is not proven.
-    site_doubt: SiteDoubt,
+    site_mark: SiteMark,
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
@@ -219,7 +221,10 @@ impl CsScan<'_> {
     /// declaration of `callee`: a member only an invisible copy declares is
     /// no edge, and one only an unproven copy declares is unproven inbound.
     fn record(&mut self, callee: String, node: Node<'_>) {
-        if self.site_doubt.tripped(self.membership) {
+        if matches!(
+            self.membership.admit_site(self.site_mark),
+            SiteAdmission::Withdrawn
+        ) {
             self.record_unproven_callee(callee, node);
             return;
         }
@@ -362,7 +367,9 @@ impl CsScan<'_> {
                             explicit_generic_arity,
                         );
                         if found.open.is_some() {
-                            membership.add_doubt();
+                            membership.record(Obligation::NoExtensionMember {
+                                receiver_type: format!("{receiver_types:?}"),
+                            });
                         }
                         let mut extensions = found
                             .candidates
@@ -428,7 +435,7 @@ fn walk(
                 bindings.enter_scope();
             }
             seed_declaration(node, token, ctx, bindings);
-            ctx.site_doubt = ctx.membership.site();
+            ctx.site_mark = ctx.membership.site();
             record_reference(node, token, ctx, bindings);
             if enters_scope {
                 TreeWalkAction::DescendWithExit

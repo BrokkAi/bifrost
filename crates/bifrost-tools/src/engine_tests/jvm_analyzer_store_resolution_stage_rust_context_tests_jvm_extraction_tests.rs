@@ -94,6 +94,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bundled_capsule_context_plans_scale_with_dense_and_mixed_answers_under_both_statistics_states()
      {
         for statistics in PlannerStatisticsState::BOTH {

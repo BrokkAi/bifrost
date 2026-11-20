@@ -497,12 +497,12 @@ impl JdkSourceArchivePackProducer {
             pack: Some(AuthoredSemanticModelPack {
                 extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
 schema_version:
-                    brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                    brokk_bifrost_analysis::analyzer::semantic_model::CLASS_FINALITY_MIN_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),
                 producer: Producer {
                     name: "bifrost-jdk-source-zip".to_owned(),
-                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                    version: super::jvm_pack_producer_version().to_owned(),
                 },
                 language: "java".to_owned(),
                 ecosystem: request.ecosystem.clone(),

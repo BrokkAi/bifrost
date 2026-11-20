@@ -3672,7 +3672,17 @@ reach:
 `treat-may-as-finding` publishes explicit may evidence from assertion rows as
 findings with `certainty: possible`, retaining the reasons. Flow and taint
 already publish possible findings under every verdict; this spelling does not
-change their publication or hide findings under the other verdicts. Unsupported
+change their publication or hide findings under the other verdicts. A row is
+explicit may evidence when it models a `may` or `possible` relation, or when a
+binding's `filter` names an undecided label of a field with `eq` or `in` and the
+row holds that label. For example, `(filter :where ((verdict in [proven open])) ...)`
+over `branch-relations` keeps proven rows as definite findings and publishes
+each `open` row as a possible finding at its own location, with the row's
+reason (such as `verdict=open: unknown_scalar`). An undecided label the filter does
+not name, including one that only passed `is-not-null`, leaves the row decided.
+The filter must apply to the binding's whole row set: a policy that names an
+undecided label in a filter inside a `union` branch or another nested query, or
+that projects the selected field away afterwards, is rejected at load. Unsupported
 relations, budget-truncated aggregates, and unmet absence obligations do not
 become possible findings. Unmet coverage obligations still make the run
 `inconclusive`, so under `--on-inconclusive unreliable` its exit status is

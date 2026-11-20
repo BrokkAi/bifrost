@@ -14,6 +14,7 @@ pub enum RootSourceHorizon {
 }
 
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn root_source_horizon(
     ready: &ReadySelectedResolution<'_, '_>,
     endpoint: &EndpointSignature,

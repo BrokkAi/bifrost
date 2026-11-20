@@ -14,6 +14,7 @@ use crate::analyzer::semantic_model::model::CallableValuesFamily;
 use crate::analyzer::semantic_model::validate::is_canonical_relative_path;
 use crate::analyzer::store::SemanticPackActivationSourceKind;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::*;
+use brokk_bifrost_semantic::analyzer::semantic_model::dependency::JvmDependencyGap;
 use brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen;
 use rusqlite::Connection;
 use rusqlite::params;
@@ -21,7 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -393,7 +394,22 @@ pub fn read_go_source_from_connection(
                FROM active_catalog_selectors
                WHERE manifest_digest = ?1
                  AND shard_id = ?2
-                 AND artifact_sha256 = ?3)",
+                 AND artifact_sha256 = ?3)
+             -- A generated selector binds the composite production input
+             -- digest; the raw source digest is one recorded input slot of
+             -- the production that this shard's own selector names. The shard is
+             -- already known to be published and active.
+             OR EXISTS(
+               SELECT 1
+               FROM catalog_selectors AS selector
+               JOIN catalog_generated_productions AS production
+                 ON production.input_digest = selector.production_input_digest
+                AND production.manifest_digest = selector.manifest_digest
+               JOIN catalog_production_inputs AS input
+                 ON input.production_digest = production.production_digest
+               WHERE selector.manifest_digest = ?1
+                 AND selector.shard_id = ?2
+                 AND lower(hex(input.sha256)) = ?3)",
             params![
                 request.manifest_digest,
                 request.shard_id,
@@ -814,15 +830,56 @@ pub fn open_active_reader_connection(
     Ok(connection)
 }
 
-/// Validation witness for a prepared pinned-reader connection. File identities
-/// are process-local witnesses, never persisted cache identities.
+/// Validation witness for a prepared pinned-reader connection. Stat-only
+/// object identities allow WAL checkpoints without opening foreign descriptors
+/// whose close would release SQLite's process-owned POSIX locks. The reader's
+/// SQLite connection keeps its inode alive, preventing reuse while guarded by
+/// this witness. SQLite's HAS_MOVED check also verifies both database files
+/// it actually opened. VFS implementations without that control (including
+/// Windows) retain the stat/schema checks and cannot detect a replacement
+/// restored between the two path samples. These identities are never persisted.
+/// In-place overwrite of a live SQLite database is unsupported.
 #[derive(Clone)]
 pub struct PinnedReaderValidation {
-    files: Vec<(
-        PathBuf,
-        Option<brokk_bifrost_core::content_digest::FileIdentity>,
-    )>,
+    files: Vec<PinnedReaderFile>,
     versions: (i64, i64),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PinnedReaderFile {
+    path: PathBuf,
+    /// None when the path was missing or not a regular file at capture. Such
+    /// a capture never matches, so preparation drops the handle and retries.
+    witness: Option<PinnedFileWitness>,
+}
+
+/// What identifies a pinned catalog file across a WAL checkpoint: its volume
+/// and, when the filesystem supplies a file index, its object identity. Size
+/// and timestamps are excluded because a checkpoint changes them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PinnedFileWitness {
+    volume: Option<u64>,
+    object: Option<(u64, u64)>,
+}
+
+/// Stat a pinned catalog path without opening it. `Ok(None)` means the path
+/// is missing or not a regular file, which can never be the pinned database.
+fn pinned_file_witness(path: &Path) -> Result<Option<PinnedFileWitness>, CatalogError> {
+    let identity = match brokk_bifrost_core::content_digest::file_identity(path) {
+        Ok(identity) => identity,
+        // A removed catalog file is a witness mismatch, not a failure: the
+        // stale connection is discarded and preparation retries.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CatalogError::Integrity(format!(
+                "stat pinned reader database {path:?}: {error}"
+            )));
+        }
+    };
+    Ok(identity.map(|identity| PinnedFileWitness {
+        volume: identity.volume(),
+        object: identity.object_identity(),
+    }))
 }
 
 impl PinnedReaderValidation {
@@ -851,25 +908,12 @@ impl PinnedReaderValidation {
 
     fn capture_files(
         paths: impl IntoIterator<Item = PathBuf>,
-    ) -> Result<
-        Vec<(
-            PathBuf,
-            Option<brokk_bifrost_core::content_digest::FileIdentity>,
-        )>,
-        CatalogError,
-    > {
+    ) -> Result<Vec<PinnedReaderFile>, CatalogError> {
         paths
             .into_iter()
             .map(|path| {
-                let metadata = std::fs::metadata(&path).map_err(|error| {
-                    CatalogError::Integrity(format!(
-                        "stat pinned reader database {path:?}: {error}"
-                    ))
-                })?;
-                Ok((
-                    path,
-                    brokk_bifrost_core::content_digest::file_identity(&metadata),
-                ))
+                let witness = pinned_file_witness(&path)?;
+                Ok(PinnedReaderFile { path, witness })
             })
             .collect()
     }
@@ -888,26 +932,57 @@ impl PinnedReaderValidation {
 
     /// A false result discards the prepared connection before starting a read.
     pub fn matches(&self, connection: &Connection) -> Result<bool, CatalogError> {
-        if Self::versions(connection)? != self.versions {
-            return Ok(false);
-        }
-        for (path, recorded) in &self.files {
-            // Unsupported platforms/files have unknown identity. In that case
-            // user_version is the only available validation witness.
-            if let Some(recorded) = recorded {
-                let current = std::fs::metadata(path).map_err(|error| {
-                    CatalogError::Integrity(format!(
-                        "stat pinned reader database {path:?}: {error}"
-                    ))
-                })?;
-                if brokk_bifrost_core::content_digest::file_identity(&current).as_ref()
-                    != Some(recorded)
-                {
-                    return Ok(false);
+        // These are exactly the schemas whose file witnesses capture records.
+        for (schema, operation) in [
+            (c"main", "validate SQLite-opened main catalog object"),
+            (c"session", "validate SQLite-opened session catalog object"),
+        ] {
+            let mut moved: std::ffi::c_int = 0;
+            // SAFETY: the connection outlives this call, schema names are static,
+            // and HAS_MOVED writes one C int without retaining its pointer.
+            // SQLite checks its own descriptor; no foreign descriptor is opened.
+            let status = unsafe {
+                rusqlite::ffi::sqlite3_file_control(
+                    connection.handle(),
+                    schema.as_ptr(),
+                    rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                    std::ptr::from_mut(&mut moved).cast(),
+                )
+            };
+            match status {
+                rusqlite::ffi::SQLITE_OK if moved != 0 => return Ok(false),
+                rusqlite::ffi::SQLITE_OK | rusqlite::ffi::SQLITE_NOTFOUND => {}
+                status => {
+                    return Err(CatalogError::sqlite(
+                        operation,
+                        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(status), None),
+                    ));
                 }
             }
         }
-        Ok(true)
+        for file in &self.files {
+            // Always stat the path, so an inaccessible catalog path is reported
+            // even when no object witness exists. A path that is now missing
+            // or not a regular file never matches. The volume is compared even
+            // when the filesystem supplies no file index, so a move to another
+            // volume is caught; a witness appearing or disappearing counts as a
+            // different file. With no object witness on either side,
+            // user_version remains the last validation witness.
+            let Some(recorded) = file.witness else {
+                return Ok(false);
+            };
+            if pinned_file_witness(&file.path)? != Some(recorded) {
+                return Ok(false);
+            }
+        }
+        // Sample versions last: a migration during path validation must not
+        // leave an earlier compatible schema sample as the admission witness.
+        self.schema_matches(connection)
+    }
+
+    /// Recheck both schema versions after the caller pins its read snapshots.
+    pub fn schema_matches(&self, connection: &Connection) -> Result<bool, CatalogError> {
+        Ok(Self::versions(connection)? == self.versions)
     }
 }
 
@@ -942,11 +1017,30 @@ pub fn prepare_validated_pinned_reader_connection(
         };
         let before =
             PinnedReaderValidation::capture_files([root.join("catalog.db"), session_path])?;
+        #[cfg(test)]
+        pinned_validation_tests::between_validation_captures();
         let connection = prepare_pinned_reader_connection_once(root, session_catalog)?;
+        #[cfg(test)]
+        pinned_validation_tests::after_reader_open();
         let after = PinnedReaderValidation::capture(&connection)?;
         // Comparing paths as well as file identities also detects replacement of
         // the session catalog while preparation was outside its owner lock.
         if before == after.files && after.matches(&connection)? {
+            // The read-only open fenced the main schema before preparation.
+            // A concurrent migration can advance it before this capture.
+            let main_version = after.versions.0;
+            if main_version > CATALOG_SCHEMA_VERSION {
+                return Err(CatalogError::CatalogTooNew {
+                    found: main_version,
+                    supported: CATALOG_SCHEMA_VERSION,
+                });
+            }
+            if main_version < CATALOG_SCHEMA_VERSION {
+                return Err(CatalogError::ReadOnlySchema {
+                    found: main_version,
+                    required: CATALOG_SCHEMA_VERSION,
+                });
+            }
             return Ok((connection, after));
         }
         // Drop the suspect handle before retrying the complete preparation.
@@ -1051,8 +1145,8 @@ impl OwnedCatalogRows {
 
 /// Bindings use names because catalog questions are shared by both readers.
 pub trait CatalogRowReader: Send + Sync {
-    /// Missing coordinates admitted for this request; never selection records.
-    fn jvm_unresolved_coordinates(&self) -> &[String] {
+    /// Unknown dependency content admitted for this request, with closed causes.
+    fn jvm_dependency_gaps(&self) -> &[JvmDependencyGap] {
         &[]
     }
 
@@ -1070,12 +1164,30 @@ pub struct ReaderBinding(pub [u8; 32]);
 
 #[derive(Clone)]
 pub struct RequestRowReader {
+    /// Analysis-owned extension, retained only by this request reader entry.
+    pub derivation_extension: Arc<std::sync::OnceLock<Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Request-owned providers whose inventory was certified in this request.
+    pub certified_providers: std::collections::HashSet<String>,
+    pub inventory_generation: Option<i64>,
+    /// Verified own publications after certification, shared only by clones
+    /// of this OuterRequest's ReaderDerivationMemo entry.
+    pub inventory_clock: Option<Arc<super::jvm_external_publication::JvmInventoryPublicationClock>>,
     pub reader: Arc<dyn CatalogRowReader + Send + Sync>,
     pub binding: ReaderBinding,
 }
 
 /// The owner of a request's JVM-family catalog rows (#9559). It never creates a request.
 pub trait RequestRowReaderSource: std::fmt::Debug + Send + Sync {
+    /// Publish activated external providers before readiness. Sources without
+    /// external projections have nothing to publish.
+    fn publish_activation(
+        &self,
+        _activation: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+        _cancellation: &CancellationToken,
+    ) -> Result<(), CatalogError> {
+        Ok(())
+    }
+
     fn identity(&self) -> Option<[u8; 32]> {
         None
     }
@@ -1108,6 +1220,9 @@ impl RequestRowReaderSource for RefusingRowReaderSource {
         &self,
         _activation: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
     ) -> Result<RequestRowReader, FamilyOpen> {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!("jvm_request_owner open reason={}", self.reason.reason)
+        });
         Err(self.reason)
     }
 }
@@ -1142,6 +1257,10 @@ impl RequestRowReaderSource for ActivationRowReaderSource {
         _activation: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
     ) -> Result<RequestRowReader, FamilyOpen> {
         Ok(RequestRowReader {
+            derivation_extension: Default::default(),
+            certified_providers: Default::default(),
+            inventory_generation: None,
+            inventory_clock: None,
             reader: self.reader.clone(),
             binding: self.binding,
         })
@@ -1696,12 +1815,12 @@ mod semantic_row_plan_tests {
             INSERT INTO catalog_pack_shards(manifest_digest,shard_id) VALUES(printf('%064d',1),'s');
             INSERT INTO catalog_semantic_rows_indexed_shards(shard_key,manifest_digest,shard_id,index_version) VALUES(1,printf('%064d',1),'s',4);
             WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<256)
-            INSERT INTO catalog_declaration_types(record_key,shard_key,record_id,record_json)
-            SELECT v,1,'Type'||v,'{"type_kind":"trait"}' FROM n;
+            INSERT INTO catalog_declaration_types(record_key,shard_key,record_id,authored_path,record_json)
+            SELECT v,1,'Type'||v,'src/source'||v||'.rs','{"type_kind":"trait"}' FROM n;
             INSERT INTO catalog_declaration_names(shard_key,record_key,name,language,namespace,identity_name)
             SELECT 1,record_key,record_id,'rust','type',1 FROM catalog_declaration_types;
-            INSERT INTO catalog_declaration_members(record_key,shard_key,record_id,owner_id,name,language,record_json)
-            SELECT record_key,1,'member'||record_key,'Owner'||record_key,'name'||record_key,'rust','{}' FROM catalog_declaration_types;
+            INSERT INTO catalog_declaration_members(record_key,shard_key,record_id,owner_id,name,language,authored_path,record_json)
+            SELECT record_key,1,'member'||record_key,'Owner'||record_key,'name'||record_key,'rust','src/source'||record_key||'.rs','{}' FROM catalog_declaration_types;
             INSERT INTO catalog_member_aliases(shard_key,member_key,alias)
             SELECT 1,record_key,'alias'||record_key FROM catalog_declaration_members;
             INSERT INTO catalog_declaration_relations(shard_key,origin,record_id,from_id,to_id,relation_kind)
@@ -1710,6 +1829,91 @@ mod semantic_row_plan_tests {
             SELECT 1,'rust','path'||record_key,'symbol'||record_key,'Owner'||record_key,'name'||record_key,0,0,0,0,
               json_object('id','sum'||record_key,'model_id','pack.sum'||record_key) FROM catalog_declaration_types;
         "#.replace("v<256", &format!("v<{records}"))).unwrap();
+    }
+
+    #[test]
+    fn semantic_source_locator_candidates_match_changed_path_containment() {
+        use brokk_bifrost_core::analyzer::changed_paths::ChangedPaths;
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        use std::collections::BTreeSet;
+        use std::path::Path;
+        let durable = open_session_semantic_catalog().unwrap();
+        let session = open_session_semantic_catalog().unwrap();
+        for catalog in [&durable, &session] {
+            seed(&catalog.connection);
+            for table in ["catalog_declaration_types", "catalog_declaration_members"] {
+                catalog.connection.execute(&format!("UPDATE {table} SET authored_path='src/source17.rs/nested.rs' WHERE record_key=18"), []).unwrap();
+                catalog.connection.execute(&format!("UPDATE {table} SET authored_path='src2/source17.rs' WHERE record_key=19"), []).unwrap();
+            }
+        }
+        rows::attach_session_rows(&durable.connection, &session).unwrap();
+        for source in ["durable", "session"] {
+            rows::select_active_shard_source(
+                &durable.connection,
+                &format!("{:064}", 1),
+                "s",
+                source,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        for (sql, table) in [
+            (
+                statements::SOURCE_TYPES_TOUCHING_PATH,
+                "active_catalog_declaration_types",
+            ),
+            (
+                statements::SOURCE_MEMBERS_TOUCHING_PATH,
+                "active_catalog_declaration_members",
+            ),
+        ] {
+            let protected = durable
+                .connection
+                .prepare(&format!("SELECT DISTINCT authored_path FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<BTreeSet<_>>>()
+                .unwrap();
+            for changed in [
+                "src",
+                "src/source17.rs",
+                "src/source17.rs/nested.rs/child.rs",
+                "src2",
+                "src3",
+            ] {
+                let change = ChangedPaths::literal([Path::new(changed)]);
+                let expected = protected
+                    .iter()
+                    .filter(|path| change.touches(Path::new(path)))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let ancestors = serde_json::to_string(
+                    &Path::new(changed)
+                        .ancestors()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let actual = durable
+                    .connection
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map(
+                        rusqlite::named_params! {
+                            ":ancestors": &ancestors,
+                            ":descendant_start": &format!("{changed}/"),
+                            ":descendant_end": &format!("{changed}0"),
+                        },
+                        |row| row.get::<_, String>("authored_path"),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()
+                    .unwrap();
+                assert_eq!(actual, expected, "{table}: {changed}");
+            }
+        }
     }
 
     #[test]
@@ -1853,6 +2057,17 @@ mod semantic_row_plan_tests {
                         "{state}: requested IDs must be decoded once: {plan:?}"
                     );
                 }
+                if ["semantic_source_type_paths", "semantic_source_member_paths"]
+                    .contains(&query.name.as_str())
+                {
+                    assert!(
+                        plan.iter().all(|line| line != "SCAN r"
+                            && !line.starts_with("SCAN r ")
+                            && !line.contains("MATERIALIZE active_catalog_declaration_")),
+                        "{state} {}: locator paths must seek the existing path indexes: {plan:?}",
+                        query.name
+                    );
+                }
                 // A dotted name runs these once per dot boundary, so a scan
                 // here multiplies by every policy locator (#10397).
                 if [
@@ -1897,6 +2112,83 @@ mod semantic_row_plan_tests {
                     .prepare(sql)
                     .unwrap_or_else(|error| panic!("{name}: {error}"));
             }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: the relation reads filtered every relation row of every active shard, about 10 ms a statement"
+    )]
+    fn overlay_relation_reads_return_the_rows_of_the_in_list_form_in_both_statistics_states() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        // The shipped form before the plan fix, kept here as the oracle.
+        let old_from = "SELECT r.* FROM active_catalog_declaration_relations AS r \
+                        WHERE r.from_id IN (SELECT value FROM json_each(:owner_ids));";
+        let old_to = "SELECT r.* FROM active_catalog_declaration_relations AS r \
+                      WHERE r.to_id IN (SELECT value FROM json_each(:raw_targets));";
+        for state in PlannerStatisticsState::BOTH {
+            let durable = open_session_semantic_catalog().unwrap();
+            let session = open_session_semantic_catalog().unwrap();
+            seed(&durable.connection);
+            seed(&session.connection);
+            for connection in [&durable.connection, &session.connection] {
+                // Several relations per endpoint, two kinds, and a shared target.
+                connection
+                    .execute_batch(
+                        "INSERT INTO catalog_declaration_relations(shard_key,origin,record_id,from_id,to_id,relation_kind)
+                         SELECT 1,'relation_fact','extra'||record_key,record_id,'Base'||(record_key%7),'extends'
+                         FROM catalog_declaration_types;",
+                    )
+                    .unwrap();
+            }
+            rows::attach_session_rows(&durable.connection, &session).unwrap();
+            for source in ["durable", "session"] {
+                rows::select_active_shard_source(
+                    &durable.connection,
+                    &format!("{:064}", 1),
+                    "s",
+                    source,
+                )
+                .unwrap();
+            }
+            state.install(&durable.connection);
+            let read = |sql: &str, ids: &str| {
+                let mut statement = durable.connection.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                let mut rows = statement
+                    .query_map([ids], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map(|values| format!("{values:?}"))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows.sort();
+                rows
+            };
+            let mut checked_rows = 0;
+            for (old, new, prefix) in [
+                (old_from, statements::OVERLAY_RELATIONS_FROM, "Type"),
+                (old_to, statements::OVERLAY_RELATIONS_TO, "Base"),
+            ] {
+                for ids in [
+                    r#"[]"#.to_owned(),
+                    format!(r#"["{prefix}17"]"#),
+                    format!(r#"["{prefix}17","{prefix}17","{prefix}3"]"#),
+                    format!(r#"["{prefix}999","{prefix}5","{prefix}6"]"#),
+                    format!(r#"["{prefix}999"]"#),
+                ] {
+                    let expected = read(old, &ids);
+                    assert_eq!(read(new, &ids), expected, "{state} {prefix} {ids}");
+                    checked_rows += expected.len();
+                }
+            }
+            assert!(
+                checked_rows > 0,
+                "{state}: the fixture must return relation rows"
+            );
         }
     }
 
@@ -1977,6 +2269,429 @@ mod semantic_row_plan_tests {
 #[cfg(test)]
 mod pinned_validation_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CaptureHooks {
+        before_open: Box<dyn FnMut()>,
+        after_open: Box<dyn FnMut()>,
+    }
+
+    thread_local! {
+        static BETWEEN_VALIDATION_CAPTURES: RefCell<Option<CaptureHooks>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(super) fn between_validation_captures() {
+        BETWEEN_VALIDATION_CAPTURES.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                (hook.before_open)();
+            }
+        });
+    }
+
+    pub(super) fn after_reader_open() {
+        BETWEEN_VALIDATION_CAPTURES.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                (hook.after_open)();
+            }
+        });
+    }
+
+    /// `db::open` uses `SQLITE_OPEN_NOFOLLOW`, which refuses a symlink in any
+    /// path component. The macOS temporary directory sits under `/var`, a
+    /// symlink to `/private/var`, so create test roots in the canonical
+    /// temporary directory, as product callers open from a canonical root.
+    fn canonical_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
+    fn with_capture_hook<T>(hook: impl FnMut() + 'static, read: impl FnOnce() -> T) -> T {
+        with_capture_hooks(hook, || {}, read)
+    }
+
+    fn with_capture_hooks<T>(
+        before_open: impl FnMut() + 'static,
+        after_open: impl FnMut() + 'static,
+        read: impl FnOnce() -> T,
+    ) -> T {
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BETWEEN_VALIDATION_CAPTURES.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        BETWEEN_VALIDATION_CAPTURES.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(CaptureHooks {
+                before_open: Box::new(before_open),
+                after_open: Box::new(after_open),
+            });
+        });
+        let _reset = ResetHook;
+        read()
+    }
+
+    #[test]
+    #[hardwon("#14393: a WAL checkpoint was mistaken for replacement during reader preparation")]
+    fn pinned_preparation_accepts_concurrent_checkpoint() {
+        let root = canonical_tempdir();
+        let writer = db::open(root.path(), CatalogOpenMode::ReadWrite).unwrap();
+        writer
+            .execute_batch("CREATE TABLE checkpoint_probe(value BLOB); VACUUM; PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let path = root.path().join("catalog.db");
+        // None on a filesystem with no file index; the checkpoint must still
+        // be accepted, and the witness (if any) must stay the same.
+        let object = brokk_bifrost_core::content_digest::file_identity(&path)
+            .unwrap()
+            .unwrap()
+            .object_identity();
+        let schema: i64 = writer
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let session = Mutex::new(None);
+        let prepared = with_capture_hook(
+            move || {
+                let before = std::fs::metadata(&path).unwrap().len();
+                writer
+                    .execute("INSERT INTO checkpoint_probe VALUES(zeroblob(8192))", [])
+                    .unwrap();
+                let checkpoint: (i64, i64, i64) = writer
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(checkpoint, (0, 0, 0));
+                assert!(std::fs::metadata(&path).unwrap().len() > before);
+                assert_eq!(
+                    object,
+                    brokk_bifrost_core::content_digest::file_identity(&path)
+                        .unwrap()
+                        .unwrap()
+                        .object_identity()
+                );
+                assert_eq!(
+                    writer
+                        .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    schema
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+            || prepare_validated_pinned_reader_connection(root.path(), &session),
+        );
+        let (reader, witness) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => panic!(
+                "unchanged catalog object/schema refused after {} checkpoint windows: {error:?}",
+                calls.load(Ordering::SeqCst)
+            ),
+        };
+        assert!(witness.matches(&reader).unwrap());
+        let rows: i64 = reader
+            .query_row("SELECT count(*) FROM checkpoint_probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, i64::try_from(calls.load(Ordering::SeqCst)).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_preparation_refuses_replacement_between_captures() {
+        let root = canonical_tempdir();
+        drop(db::open(root.path(), CatalogOpenMode::ReadWrite).unwrap());
+        let path = root.path().join("catalog.db");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let session = Mutex::new(None);
+        let prepared = with_capture_hook(
+            move || {
+                let original = brokk_bifrost_core::content_digest::file_identity(&path)
+                    .unwrap()
+                    .unwrap()
+                    .object_identity()
+                    .unwrap();
+                let replacement = tempfile::tempdir_in(path.parent().unwrap()).unwrap();
+                drop(db::open(replacement.path(), CatalogOpenMode::ReadWrite).unwrap());
+                std::fs::rename(replacement.path().join("catalog.db"), &path).unwrap();
+                assert_ne!(
+                    original,
+                    brokk_bifrost_core::content_digest::file_identity(&path)
+                        .unwrap()
+                        .unwrap()
+                        .object_identity()
+                        .unwrap()
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+            || prepare_validated_pinned_reader_connection(root.path(), &session),
+        );
+        assert!(matches!(prepared, Err(CatalogError::Unavailable)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon("#14393: restored pathname samples admitted a different SQLite-opened database")]
+    fn pinned_preparation_refuses_restored_path_with_different_open_file() {
+        let root = canonical_tempdir();
+        let other = canonical_tempdir();
+        for (directory, value) in [(root.path(), "A"), (other.path(), "B")] {
+            let writer = db::open(directory, CatalogOpenMode::ReadWrite).unwrap();
+            writer
+                .execute_batch("CREATE TABLE object_probe(value TEXT); PRAGMA journal_mode=DELETE")
+                .unwrap();
+            writer
+                .execute("INSERT INTO object_probe VALUES(?1)", [value])
+                .unwrap();
+        }
+        let session = Mutex::new(None);
+        assert_restored_path_refused(
+            root.path(),
+            &session,
+            root.path().join("catalog.db"),
+            other.path().join("catalog.db"),
+            |reader| {
+                reader
+                    .query_row("SELECT value FROM object_probe", [], |r| r.get(0))
+                    .unwrap()
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon("#14393: restored session path samples admitted a different attached database")]
+    fn pinned_preparation_refuses_restored_session_with_different_open_file() {
+        let root = canonical_tempdir();
+        drop(db::open(root.path(), CatalogOpenMode::ReadWrite).unwrap());
+        let session_a = open_session_semantic_catalog().unwrap();
+        let session_b = open_session_semantic_catalog().unwrap();
+        for (catalog, value) in [(&session_a, "A"), (&session_b, "B")] {
+            catalog
+                .connection
+                .execute_batch("CREATE TABLE object_probe(value TEXT); PRAGMA journal_mode=DELETE")
+                .unwrap();
+            catalog
+                .connection
+                .execute("INSERT INTO object_probe VALUES(?1)", [value])
+                .unwrap();
+        }
+        let path = session_a.path.clone();
+        let path_b = session_b.path.clone();
+        let session = Mutex::new(Some(session_a));
+        assert_restored_path_refused(root.path(), &session, path, path_b, |reader| {
+            reader
+                .query_row("SELECT value FROM session.object_probe", [], |r| r.get(0))
+                .unwrap()
+        });
+    }
+
+    #[cfg(unix)]
+    fn assert_restored_path_refused(
+        root: &std::path::Path,
+        session: &Mutex<Option<SessionSemanticCatalog>>,
+        path: PathBuf,
+        path_b: PathBuf,
+        probe: impl FnOnce(&Connection) -> String,
+    ) {
+        let saved_a = path.with_file_name("saved-a.db");
+        let original = brokk_bifrost_core::content_digest::file_identity(&path)
+            .unwrap()
+            .unwrap()
+            .object_identity();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let prepared = with_capture_hooks(
+            {
+                let path = path.clone();
+                let saved_a = saved_a.clone();
+                let path_b = path_b.clone();
+                move || {
+                    std::fs::rename(&path, &saved_a).unwrap();
+                    std::fs::rename(&path_b, &path).unwrap();
+                }
+            },
+            move || {
+                std::fs::rename(&path, &path_b).unwrap();
+                std::fs::rename(&saved_a, &path).unwrap();
+                assert_eq!(
+                    original,
+                    brokk_bifrost_core::content_digest::file_identity(&path)
+                        .unwrap()
+                        .unwrap()
+                        .object_identity()
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+            || prepare_validated_pinned_reader_connection(root, session),
+        );
+        match prepared {
+            Err(CatalogError::Unavailable) => {}
+            Err(error) => panic!("unexpected restored-path refusal: {error:?}"),
+            Ok((reader, _)) => {
+                let opened = probe(&reader);
+                panic!("pathname restored to A but reader admitted database {opened}");
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    #[hardwon("#14393: preparation adopted a catalog schema migrated after the open fence")]
+    fn pinned_preparation_refuses_schema_migration_after_open() {
+        let root = canonical_tempdir();
+        let writer = db::open(root.path(), CatalogOpenMode::ReadWrite).unwrap();
+        let session = Mutex::new(None);
+        let prepared = with_capture_hooks(
+            || {},
+            move || {
+                writer
+                    .pragma_update(None, "user_version", CATALOG_SCHEMA_VERSION + 1)
+                    .unwrap();
+                let checkpoint: (i64, i64, i64) = writer
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(checkpoint, (0, 0, 0));
+            },
+            || prepare_validated_pinned_reader_connection(root.path(), &session),
+        );
+        match prepared {
+            Err(CatalogError::CatalogTooNew { found, supported }) => {
+                assert_eq!(found, CATALOG_SCHEMA_VERSION + 1);
+                assert_eq!(supported, CATALOG_SCHEMA_VERSION);
+            }
+            Err(error) => panic!("unexpected schema-fence refusal: {error:?}"),
+            Ok((reader, _)) => {
+                let version: i64 = reader
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap();
+                panic!("prepared reader adopted unsupported catalog schema {version}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_preparation_refuses_truncation_between_captures() {
+        let root = canonical_tempdir();
+        drop(db::open(root.path(), CatalogOpenMode::ReadWrite).unwrap());
+        let path = root.path().join("catalog.db");
+        let session = Mutex::new(None);
+        let prepared = with_capture_hook(
+            move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap()
+            },
+            || prepare_validated_pinned_reader_connection(root.path(), &session),
+        );
+        assert!(matches!(
+            prepared,
+            Err(CatalogError::ReadOnlySchema { found: 0, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon("#14393: foreign descriptor closes released SQLite's process-owned locks")]
+    fn pinned_validation_preserves_writer_lock() {
+        const CHILD_PATH: &str = "BIFROST_14393_LOCK_PROBE_DATABASE";
+        const TEST: &str = "analyzer::store::model_catalog::pinned_validation_tests::pinned_validation_preserves_writer_lock";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let probe = Connection::open(path).unwrap();
+            probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+            match probe.execute_batch("BEGIN IMMEDIATE") {
+                Err(error) => assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                ),
+                Ok(()) => {
+                    probe.execute_batch("ROLLBACK").unwrap();
+                    panic!("reader validation released another connection's writer lock");
+                }
+            }
+            return;
+        }
+        let root = canonical_tempdir();
+        drop(db::open(root.path(), CatalogOpenMode::ReadWrite).unwrap());
+        let path = root.path().join("catalog.db");
+        let writer = Connection::open(&path).unwrap();
+        // A rollback-journal writer holds POSIX locks on the main database.
+        // WAL writer locks live in -shm, a different inode from this witness.
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN IMMEDIATE")
+            .unwrap();
+        let session = Mutex::new(None);
+        let (reader, witness) =
+            prepare_validated_pinned_reader_connection(root.path(), &session).unwrap();
+        assert!(witness.matches(&reader).unwrap());
+        drop(witness);
+        drop(reader);
+        // SQLite also tracks locks inside the process; a second process is
+        // required to observe whether the actual kernel lock survived.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .output()
+            .unwrap();
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14393: a catalog path that became a directory matched a pinned witness recorded without a file index"
+    )]
+    fn pinned_witness_without_file_index_refuses_a_non_regular_path() {
+        // The SQLite files stay untouched, so HAS_MOVED and user_version pass and
+        // only the witness loop of PinnedReaderValidation::matches can refuse.
+        // No standard test filesystem lacks file indexes, so the main entry's
+        // recorded witness drops its object identity to stand in for one, and
+        // its recorded path points at a separate file that becomes a directory.
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("catalog.db");
+        let session = root.path().join("session.db");
+        let connection = Connection::open(&main).unwrap();
+        connection
+            .execute("ATTACH ?1 AS session", [session.to_str().unwrap()])
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA main.user_version=7; PRAGMA session.user_version=3")
+            .unwrap();
+        let mut validation = PinnedReaderValidation::capture(&connection).unwrap();
+        assert!(validation.matches(&connection).unwrap());
+        let alias = root.path().join("replaced.db");
+        std::fs::write(&alias, b"catalog").unwrap();
+        let mut recorded = pinned_file_witness(&alias).unwrap().unwrap();
+        recorded.object = None;
+        let entry = validation
+            .files
+            .iter_mut()
+            .find(|file| file.path == main.canonicalize().unwrap() || file.path == main)
+            .expect("main catalog entry");
+        entry.path = alias.clone();
+        entry.witness = Some(recorded);
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::create_dir(&alias).unwrap();
+        assert!(!validation.matches(&connection).unwrap());
+        // A removed path is a mismatch too, never an error, so the stale
+        // connection is discarded and preparation retries.
+        std::fs::remove_dir(&alias).unwrap();
+        assert!(!validation.matches(&connection).unwrap());
+    }
 
     #[test]
     fn pinned_validation_checks_versions_and_file_replacement() {

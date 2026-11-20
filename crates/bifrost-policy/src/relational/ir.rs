@@ -488,6 +488,14 @@ pub enum IrRelationOp {
     Source {
         binding: RowBindingName,
         schema: IrSchema,
+        /// The `(field, label)` pairs where the binding's own query filter
+        /// names an undecided label of a visible row field with `eq` or `in`.
+        /// A filter withholds a row whose tested field holds an undecided
+        /// label unless a predicate names that label, so a row carrying one of
+        /// these pairs was selected explicitly as an undecided candidate: it is
+        /// may evidence, not a decided row (#14547). Presence tests and
+        /// undecided labels the filter does not name select nothing.
+        undecided_selections: Vec<(String, String)>,
     },
     Project {
         input: IrRelationId,

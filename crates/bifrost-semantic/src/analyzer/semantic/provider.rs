@@ -543,6 +543,8 @@ impl SemanticBudgetExceeded {
         self.limit
     }
 
+    /// A known minimum for SourceBytes: a capped reader may stop before it
+    /// knows the full source length. Other dimensions report the attempted census.
     pub const fn attempted(self) -> usize {
         self.attempted
     }
@@ -552,7 +554,7 @@ impl fmt::Display for SemanticBudgetExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "semantic resident `{}` (`{}`) {} {} against limit {}",
+            "semantic resident `{}` (`{}`) {} {}{} against limit {}",
             self.dimension.public_lane().label(),
             self.dimension.label(),
             if matches!(
@@ -562,6 +564,11 @@ impl fmt::Display for SemanticBudgetExceeded {
                 "peak"
             } else {
                 "attempted"
+            },
+            if self.dimension == SemanticBudgetDimension::SourceBytes {
+                "at least "
+            } else {
+                ""
             },
             self.attempted,
             self.limit
@@ -797,6 +804,28 @@ impl SemanticBudget {
         // admission is refunded independently of pool occupancy.
         self.ledger = self.ledger.with_used(used);
         self.refund_artifact_grants(refunded_artifacts);
+    }
+
+    /// Refund exactly one tracked artifact allocation that no holder will keep,
+    /// for example a re-acquired artifact rejected because its source moved.
+    pub fn release_artifact_allocation(&mut self, artifact: &Arc<SemanticArtifact>) {
+        self.reconcile_residency();
+        let key = (artifact.key().fingerprint(), Arc::as_ptr(artifact) as usize);
+        if Arc::make_mut(&mut self.resident_artifacts)
+            .remove(&key)
+            .is_none()
+        {
+            return;
+        }
+        let work = artifact.work();
+        let used = self.ledger.used();
+        assert!(
+            SemanticBudgetDimension::ALL
+                .iter()
+                .all(|dimension| work.get(*dimension) <= used.get(*dimension))
+        );
+        self.ledger = self.ledger.with_used(used.saturating_sub(work));
+        self.refund_artifact_grants(work);
     }
 
     /// Associate admitted census with its allocation without pinning it.
@@ -1066,6 +1095,17 @@ impl SemanticBudget {
         self.record_refusal(exceeded, std::panic::Location::caller());
     }
 
+    /// Record a refused provider admission with the evidence its bounded read
+    /// actually established. Successful probes do not enter the resident ledger.
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn note_admission_refusal(&self, exceeded: SemanticBudgetExceeded) {
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::SourceBytes);
+        assert!(exceeded.attempted() > exceeded.limit());
+        self.note_refusal_origin(SemanticRefusalOrigin::UnitResident);
+        self.record_refusal(exceeded, std::panic::Location::caller());
+    }
+
     /// Observe one lowering body, including staging clones that are discarded.
     /// Cost: one small Arc/Mutex and two shared registry references per opted
     /// body; each admission inspects those existing registries under one lock.
@@ -1173,6 +1213,19 @@ impl SemanticBudget {
             self.refusals.clear_poison();
             poisoned.into_inner()
         })
+    }
+
+    /// Probe optional retained metadata without recording a refusal or its origin.
+    pub fn admission_fits(&self, work: SemanticWork) -> bool {
+        self.ledger
+            .with_used(self.resident())
+            .check_without_recording(work)
+            .is_ok()
+            && self.shared_summary_expansion_limit.is_none_or(|limit| {
+                summary_expansion_count(self.resident())
+                    .saturating_add(summary_expansion_count(work))
+                    <= limit
+            })
     }
 
     fn check_admission_without_recording(
@@ -2372,14 +2425,14 @@ impl SemanticBudget {
     /// Every semantic artifact is lowered under this budget, so its contents
     /// depend only on source content and producer identity. Parse-time and
     /// on-demand publication must use the same producer budget.
+    ///
+    /// No work dimension is bounded, so production is never refused because
+    /// a work count grew with a large file; only cancellation stops it
+    /// (#12363). Retaining the finished artifact still needs its owner's
+    /// admission. Transient structures built while lowering, such as the Rust
+    /// embedded-syntax forest, are not charged to any memory admission.
     pub fn producer() -> Self {
-        let mut limits = SemanticWork::uniform(usize::MAX);
-        // NestedEntries stays bounded as a whole until #12363 makes the
-        // embedded forest linear. Suffix reparsing uses 15,808/56,192/210,688
-        // bytes for 64/128/256 operands; nesting at depth 64 parses 40,000
-        // bytes and retains 10,207 nodes through overlapping operand trees.
-        limits.nested_entries = SemanticWork::default_limits().nested_entries;
-        Self::new(limits).expect("producer semantic limits are positive")
+        Self::new(SemanticWork::uniform(usize::MAX)).expect("producer semantic limits are positive")
     }
 }
 
@@ -3089,6 +3142,10 @@ impl<'a> SemanticRequest<'a> {
         self
     }
 
+    pub(crate) fn refusal_mark(&self) -> Option<&SemanticBudgetRefusalMark> {
+        self.refusal_mark.as_ref()
+    }
+
     /// Observe complete artifacts materialized by this request and its staged
     /// descendants.
     pub fn with_artifact_collector(mut self, collector: &SemanticArtifactCollector) -> Self {
@@ -3258,6 +3315,58 @@ impl<'a> SemanticRequest<'a> {
         self.execution
             .as_ref()
             .map_or(Ok(()), |execution| execution.try_charge_traversal(steps))
+    }
+}
+
+/// A source acquisition preserves a proven refusal separately from an absent
+/// provider. Source-byte attempted counts are known minima from bounded reads.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum SemanticArtifactSourceOutcome<T> {
+    Held(T),
+    Refused(SemanticBudgetExceeded),
+    Unavailable,
+}
+
+impl<T> SemanticArtifactSourceOutcome<T> {
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> SemanticArtifactSourceOutcome<U> {
+        match self {
+            Self::Held(value) => SemanticArtifactSourceOutcome::Held(map(value)),
+            Self::Refused(exceeded) => SemanticArtifactSourceOutcome::Refused(exceeded),
+            Self::Unavailable => SemanticArtifactSourceOutcome::Unavailable,
+        }
+    }
+
+    /// Convert a source probe without recording a refusal. Request consumers
+    /// acquiring uncharged source must use `on_budget` instead; the held-source
+    /// acquisition already records its own admission refusal.
+    pub fn held_or_refused(self) -> Result<Option<T>, SemanticProviderError> {
+        match self {
+            Self::Held(value) => Ok(Some(value)),
+            Self::Refused(_) => Ok(None),
+            Self::Unavailable => Err(SemanticProviderError::invalid_identity(
+                "selected source has no provider context",
+            )),
+        }
+    }
+
+    /// Record an actual source admission refusal without charging a successful
+    /// probe. The consumer separately owns the source's live resident hold.
+    #[track_caller]
+    pub fn on_budget(
+        self,
+        budget: &SemanticBudget,
+    ) -> Result<Result<T, SemanticBudgetExceeded>, SemanticProviderError> {
+        match self {
+            Self::Held(value) => Ok(Ok(value)),
+            Self::Refused(exceeded) => {
+                budget.note_admission_refusal(exceeded);
+                Ok(Err(exceeded))
+            }
+            Self::Unavailable => Err(SemanticProviderError::invalid_identity(
+                "selected source has no provider context",
+            )),
+        }
     }
 }
 
@@ -3469,13 +3578,13 @@ pub trait ProgramSemanticsProvider: Send + Sync {
     /// Capture the file's current atomic source snapshot and derive its complete
     /// semantic artifact identity without parsing or lowering procedures.
     ///
-    /// `None` means the current snapshot exceeds `max_source_bytes`; source
-    /// access and identity failures remain operational errors.
+    /// A refusal carries the bounded reader's proven minimum source size.
+    /// An unavailable provider is distinct from a size refusal.
     fn current_artifact_source(
         &self,
         file: &ProjectFile,
         max_source_bytes: usize,
-    ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError>;
+    ) -> Result<SemanticArtifactSourceOutcome<SemanticArtifactSourceSnapshot>, SemanticProviderError>;
 
     /// Exact physical storage namespace selected by this provider's adapter
     /// for `file`. This must come from the same adapter that owns the semantic
@@ -3499,7 +3608,11 @@ pub trait ProgramSemanticsProvider: Send + Sync {
         max_source_bytes: usize,
     ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
         self.current_artifact_source(file, max_source_bytes)
-            .map(|snapshot| snapshot.map(|snapshot| snapshot.key().clone()))
+            .and_then(|snapshot| {
+                snapshot
+                    .map(|snapshot| snapshot.key().clone())
+                    .held_or_refused()
+            })
     }
 
     /// Prepare one exact file snapshot, derive its identity, and lower it as
@@ -3579,6 +3692,21 @@ pub trait ProgramSemanticsProvider: Send + Sync {
         ))
     }
 
+    /// The partial flows of an already selected candidate-macro alternate, whose
+    /// guarded arena is the artifact of `procedure`. Publications do not store
+    /// them: the owner solves them on first use and reuses the result (#10379).
+    /// `None` when the artifact carries no prepared arena.
+    fn selected_candidate_alternate_flows(
+        &self,
+        _file: &ProjectFile,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<ProcedurePartialFlows>>, SemanticProviderError> {
+        Err(SemanticProviderError::internal(
+            "selected candidate alternate flows are unavailable".to_owned(),
+        ))
+    }
+
     /// Prepare validated guarded alternatives without selecting executable semantics.
     fn stored_candidate_macro_artifact(
         &self,
@@ -3641,8 +3769,9 @@ impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
         &self,
         _file: &ProjectFile,
         _max_source_bytes: usize,
-    ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError> {
-        Ok(None)
+    ) -> Result<SemanticArtifactSourceOutcome<SemanticArtifactSourceSnapshot>, SemanticProviderError>
+    {
+        Ok(SemanticArtifactSourceOutcome::Unavailable)
     }
 
     fn materialize(
@@ -5866,6 +5995,7 @@ impl fmt::Debug for MemoDependencyGuard {
 #[derive(Debug)]
 pub enum MemoDependencyRefusal {
     MissingDependency,
+    SourceAdmission(SemanticBudgetExceeded),
     Provider(SemanticProviderError),
 }
 

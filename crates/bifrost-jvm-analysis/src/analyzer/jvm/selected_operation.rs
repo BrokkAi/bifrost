@@ -33,9 +33,7 @@ pub(crate) struct SelectedJvmRecipe<'a, A: LanguageAdapter> {
 impl<'a, A: LanguageAdapter> SelectedJvmRecipe<'a, A> {
     pub(crate) fn new(inner: &'a TreeSitterAnalyzer<A>) -> Result<Self> {
         let selected = ["java", "kotlin", "scala"].map(str::to_owned);
-        let snapshots = inner
-            .analyzer_store()
-            .workspace_snapshots_for_current_languages(inner.workspace_id(), &selected)?;
+        let snapshots = inner.selected_workspace_snapshots_for_current_languages(&selected)?;
         Ok(Self { inner, snapshots })
     }
 
@@ -195,4 +193,28 @@ pub(crate) fn replay_root_presence<A: LanguageAdapter>(
         .jvm_selected_root_presence(root, &cancellation)
         .ok()
         .map(|presence| presence.read_digest())
+}
+
+pub(crate) struct HierarchyReadCapture<'a, A: LanguageAdapter>(
+    pub(crate) &'a TreeSitterAnalyzer<A>,
+    pub(crate) &'a dyn Fn(),
+);
+
+impl<A: LanguageAdapter>
+    brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmHierarchyReadReceipts
+    for HierarchyReadCapture<'_, A>
+{
+    type Receipt = brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+
+    fn capture<T>(&mut self, read: impl FnOnce() -> T) -> (T, Self::Receipt) {
+        brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture(self.0, || {
+            let result = read();
+            (self.1)();
+            result
+        })
+    }
+
+    fn replay(&mut self, receipt: &Self::Receipt) {
+        receipt.replay(self.0);
+    }
 }

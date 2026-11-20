@@ -12,6 +12,11 @@ pub enum ExecutionCause {
     ConfiguredCap,
     /// A refused budget charge. A rerun from the same state repeats it.
     BudgetRefusal,
+    /// An input this request pinned but a later request cannot verify, such
+    /// as a JVM dependency selection read through explicitly configured jars
+    /// (#14322). The request reads one snapshot of it, so the answer holds for
+    /// the rest of that request and for no other.
+    RequestPinned,
     /// Any other execution dependence: a provider or store failure, a fixed
     /// work limit, a deadline, a cancellation, a generation change. Finer causes
     /// are later, additive work.
@@ -43,15 +48,27 @@ impl ReuseVerdict {
         matches!(self, Self::Content)
     }
 
+    /// Whether the answer holds for the rest of the request that computed it:
+    /// it is content, or it depends only on inputs that request pinned.
+    pub const fn holds_for_request(self) -> bool {
+        matches!(
+            self,
+            Self::Content | Self::ExecutionDependent(ExecutionCause::RequestPinned)
+        )
+    }
+
     /// The verdict the ambient execution-dependence counts imply: `budget` of
-    /// the `execution` dependences were refused budget charges.
-    pub const fn from_counts(execution: usize, budget: usize) -> Self {
+    /// the `execution` dependences were refused budget charges and `pinned`
+    /// were request-pinned inputs.
+    pub const fn from_counts(execution: usize, budget: usize, pinned: usize) -> Self {
         if execution == 0 {
             Self::Content
-        } else if budget == execution {
-            Self::ExecutionDependent(ExecutionCause::BudgetRefusal)
-        } else {
+        } else if budget.saturating_add(pinned) < execution {
             Self::ExecutionDependent(ExecutionCause::Other)
+        } else if pinned > 0 {
+            Self::ExecutionDependent(ExecutionCause::RequestPinned)
+        } else {
+            Self::ExecutionDependent(ExecutionCause::BudgetRefusal)
         }
     }
 
@@ -211,10 +228,11 @@ impl<T> CarriesReuseVerdict for Judged<T> {
 mod tests {
     use super::*;
 
-    const ALL: [ReuseVerdict; 4] = [
+    const ALL: [ReuseVerdict; 5] = [
         ReuseVerdict::Content,
         ReuseVerdict::ExecutionDependent(ExecutionCause::ConfiguredCap),
         ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal),
+        ReuseVerdict::ExecutionDependent(ExecutionCause::RequestPinned),
         ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
     ];
 

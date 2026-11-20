@@ -126,8 +126,6 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 
-    use brokk_bifrost_analysis::analyzer::usages::test_support::assert_scope_budget_exceeded;
-
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
     use brokk_bifrost_core::analyzer::query_token::QueryScope;
@@ -210,84 +208,6 @@ object Caller {
         (fixture, file, SOURCE, tree)
     }
 
-    fn deep_wide_factory_source(width: usize, depth: usize) -> String {
-        let mut source = String::from(
-            r#"
-class Service
-object Factory {
-  def makeService(): Service = new Service()
-}
-object Caller {
-  def use(): Unit = {
-"#,
-        );
-        for index in 0..width {
-            source.push_str(&format!("    val sibling{index} = {index}\n"));
-        }
-        for _ in 0..depth {
-            source.push_str("    {\n");
-        }
-        source.push_str("      Factory.makeService()\n");
-        for _ in 0..depth {
-            source.push_str("    }\n");
-        }
-        source.push_str(
-            r#"  }
-}
-"#,
-        );
-        source
-    }
-
-    #[test]
-    fn bounded_scala_factory_lookup_reports_scope_budget_without_partial_result() {
-        let (fixture, file, source, tree) = factory_fixture();
-        let budget = ReceiverAnalysisBudget::tiny();
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_scala_type_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            source,
-            Some(&tree),
-            &expression_site(&file, source, "Factory.makeService()"),
-            budget,
-            None,
-        );
-
-        assert_scope_budget_exceeded(&outcome, budget);
-    }
-
-    #[test]
-    fn bounded_scala_deep_wide_lookup_stops_at_exact_small_scope_budget() {
-        let source = deep_wide_factory_source(128, 128);
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Scala, &[("Receiver.scala", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
-        let tree = parse_tree_for_language(&file, Language::Scala, &source)
-            .expect("deep and wide Scala syntax tree");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 48,
-            ..ReceiverAnalysisBudget::default()
-        };
-
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_scala_type_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            &source,
-            Some(&tree),
-            &expression_site(&file, &source, "Factory.makeService()"),
-            budget,
-            None,
-        );
-
-        assert_scope_budget_exceeded(&outcome, budget);
-    }
-
     #[test]
     fn bounded_scala_deep_alias_chain_is_iterative() {
         const ALIASES: usize = 2_048;
@@ -308,10 +228,7 @@ object Caller {
         let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
         let tree = parse_tree_for_language(&file, Language::Scala, &source)
             .expect("deep Scala alias-chain syntax tree");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 200_000,
-            ..ReceiverAnalysisBudget::default()
-        };
+        let budget = ReceiverAnalysisBudget::default();
         let target = format!("service{}", ALIASES - 1);
 
         let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
@@ -330,7 +247,7 @@ object Caller {
         let BoundedResolution::Complete { value, work } = outcome else {
             panic!("iterative Scala alias lookup must complete: {outcome:#?}");
         };
-        assert!(work.scope_nodes < budget.max_scope_nodes, "{work:#?}");
+        assert!(work.scope_nodes > 0, "{work:#?}");
         assert_eq!(
             value.status,
             brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved,

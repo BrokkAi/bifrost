@@ -93,6 +93,7 @@ pub(super) fn assignment_relation_expansions<'a>(
         expansions.extend(
             super::initializer_relations::initializer_relation_expansions(
                 workspace,
+                semantic,
                 flow_state_cache,
                 cancellation,
                 diagnostics,
@@ -237,6 +238,10 @@ fn ordinary_assignment_relation_expansions<'a>(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: Some(rel_path_string(procedure.file())),
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
     if !(self_selected && self_supported || swap_selected && swap_supported) {
@@ -290,6 +295,10 @@ fn ordinary_assignment_relation_expansions<'a>(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: Some(rel_path_string(procedure.file())),
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -352,7 +361,7 @@ fn ordinary_assignment_relation_expansions<'a>(
             .collect();
     }
 
-    let Some(outcome) = semantic.materialized_outcome(procedure.file()) else {
+    let Ok(outcome) = semantic.materialized_outcome(procedure.file()) else {
         let expansions = unavailable_expansions(
             procedure,
             &candidates.rows,
@@ -634,6 +643,7 @@ fn dead_write_expansions<'a>(
     };
     let derivation = semantic
         .materialized_outcome(procedure.file())
+        .ok()
         .and_then(|outcome| {
             debug_assert_eq!(
                 outcome
@@ -997,6 +1007,10 @@ fn overwritten_unread_expansions<'a>(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: Some(rel_path_string(procedure.file())),
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
         return Vec::new();
     }
@@ -1082,6 +1096,10 @@ fn overwritten_unread_expansions<'a>(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: Some(rel_path_string(procedure.file())),
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -1093,7 +1111,7 @@ fn overwritten_unread_expansions<'a>(
     if candidates.rows.is_empty() {
         return Vec::new();
     }
-    let Some(outcome) = semantic.materialized_outcome(procedure.file()) else {
+    let Ok(outcome) = semantic.materialized_outcome(procedure.file()) else {
         let expansions = candidates
             .rows
             .into_iter()
@@ -1253,7 +1271,8 @@ fn overwritten_unread_expansions<'a>(
                     incomplete_reasons.extend(reasons.iter().cloned());
                     let cause = reasons.iter().find_map(|reason| match reason {
                         brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::Cancelled => Some(DerivationExecutionCause::Cancelled),
-                        brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::BudgetExhausted { .. } => Some(DerivationExecutionCause::Budget),
+                        brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::BudgetExhausted { .. }
+                        | brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. } => Some(DerivationExecutionCause::Budget),
                         _ => None,
                     });
                     if request.refusal_count() > 0 {
@@ -1296,6 +1315,10 @@ fn overwritten_unread_expansions<'a>(
                             ),
                             exhausted_roots: Vec::new(),
                             withheld_rows_path: Some(rel_path_string(procedure.file())),
+                            step_index: None,
+                            step_op: None,
+                            no_rows_reason: None,
+                            cause_codes: Vec::new(),
                         }),
                         cause,
                     ));
@@ -1568,6 +1591,7 @@ fn write_liveness_open_reason(
         | PropertyProviderUnavailable
         | PropertyProviderFailed { .. }
         | PropertyAnalysisPartial { .. }
+        | PropertySnapshotBudgetExhausted { .. }
         | PropertyReaching { .. } => {
             unreachable!("dead-write proof returned a nonbinding reason: {reason:?}")
         }
@@ -2552,6 +2576,15 @@ fn rhs_reads<'a>(
             SameEvaluationAnswer::Outside => {}
             SameEvaluationAnswer::Open { reasons } => return Err(reasons),
         }
+    }
+    // A read used only as the base of a memory access (an implicit `this`
+    // receiver, say) is part of the evaluation but is not the assigned
+    // value. Decide that from the IR's value dependence, not the spelling.
+    if reads.len() > 1 {
+        let events = reads.iter().map(|read| read.event).collect::<Vec<_>>();
+        let carried =
+            derivation.reads_carried_into(&procedure.handle, establishment.event, &events);
+        reads.retain(|read| carried.contains(&read.event));
     }
     Ok(reads)
 }

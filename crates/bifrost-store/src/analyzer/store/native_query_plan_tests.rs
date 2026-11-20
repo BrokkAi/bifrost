@@ -235,6 +235,8 @@ pub mod shared_support {
         conn: &rusqlite::Connection,
     ) -> crate::analyzer::store::Result<()> {
         use crate::analyzer::store::{go_unit_summaries, surface_relations};
+        crate::analyzer::store::rust_crates::derivation::prepare_tables(conn)?;
+        crate::analyzer::store::rust_crates::derivation::register_export_functions(conn)?;
         surface_relations::create_surface_views(conn, surface_relations::PYTHON_RELATIONS)?;
         go_unit_summaries::install_go_summary_surface_views(conn)
     }
@@ -336,6 +338,10 @@ pub mod shared_support {
                 super::super::csharp_demand::TYPE_WITH_EXPLICIT_BASES,
             ),
             (
+                "csharp_demand::TYPE_INHERITANCE_OWNER",
+                super::super::csharp_demand::TYPE_INHERITANCE_OWNER,
+            ),
+            (
                 "csharp_namespaces::ORDINARY_CANDIDATES",
                 super::super::csharp_namespaces::ORDINARY_CANDIDATES,
             ),
@@ -372,6 +378,10 @@ pub mod shared_support {
             (
                 "rust_crate_derivation::SQL_RUST_CRATE_MEMBER_IDENTITY",
                 crate::analyzer::store::rust_crates::derivation::SQL_RUST_CRATE_MEMBER_IDENTITY,
+            ),
+            (
+                "go_unit_summaries::UNIT_INSTANCE_SQL",
+                crate::analyzer::store::go_unit_summaries::UNIT_INSTANCE_SQL,
             ),
             ("imports::SCOPE_NAMED", imports::SCOPE_NAMED),
             ("imports::AT_SITE", imports::AT_SITE),
@@ -522,6 +532,19 @@ pub mod shared_support {
         assert!(
             missing.is_empty(),
             "production SQL constants missing from the plan registry: {missing:?}"
+        );
+        registry.statements.extend(
+            crate::analyzer::store::rust_crates::derivation::sql_pins()
+                .into_iter()
+                .filter(|(name, _, _)| {
+                    matches!(
+                        *name,
+                        "rust_binding_path_complete"
+                            | "rust_binding_import_complete"
+                            | "rust_crate_derivation_sql_cr_gaps_9"
+                    )
+                })
+                .map(|(name, sql, _)| (name.to_owned(), sql.to_owned())),
         );
         registry
     }

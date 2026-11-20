@@ -59,7 +59,7 @@ impl Liveness {
         if !abs_path.is_file() {
             return Ok(None);
         }
-        gitblob::working_tree_file_oid(&abs_path).map(Some)
+        gitblob::working_tree_file_oid(&abs_path)
     }
 
     /// Resolve a set of analyzer files to the blob identity their bytes have
@@ -748,6 +748,11 @@ impl LivePathMap {
 }
 
 pub struct LiveSnapshot {
+    lossy_identities: OnceLock<HashMap<String, Option<ProjectFile>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    identity_renders: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    path_inspections: std::sync::atomic::AtomicUsize,
     oid_to_paths: HashMap<Oid, Vec<ProjectFile>>,
     path_to_state: HashMap<ProjectFile, PathState>,
     additional_mounts: HashMap<ProjectFile, BTreeSet<String>>,
@@ -924,8 +929,62 @@ impl LiveSnapshot {
         self.oid_to_paths.contains_key(&oid)
     }
 
+    /// Combine exact membership with the lazily captured lossy identities.
+    pub fn rendered_identity_matches(&self, key: &str, file: &ProjectFile) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        self.path_inspections.fetch_add(1, AtomicOrdering::Relaxed);
+        // A valid relative filesystem name can render as an absolute key
+        // (for example a leading literal backslash on Unix). Such a key is
+        // corrupt for this lookup; never pass it to the asserting constructor.
+        if Path::new(key).is_absolute() {
+            return false;
+        }
+        let lossy = self.lossy_identities.get_or_init(|| {
+            let mut identities = HashMap::default();
+            for identity in self.path_to_state.keys() {
+                let bytes = identity.rel_path().as_os_str().as_encoded_bytes();
+                if !bytes.contains(&b'\\') && std::str::from_utf8(bytes).is_ok() {
+                    continue;
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                self.identity_renders.fetch_add(1, AtomicOrdering::Relaxed);
+                identities
+                    .entry(rel_path_string(identity))
+                    .and_modify(|identity| *identity = None)
+                    .or_insert_with(|| Some(identity.clone()));
+            }
+            identities
+        });
+        // Only an unchanged spelling belongs to the exact side. A lossy
+        // identity is counted once, through the index, even on Windows.
+        let exact_file = file.with_rel_path(key);
+        let exact = self.path_to_state.contains_key(&exact_file)
+            && exact_file.rel_path().as_os_str().as_encoded_bytes() == key.as_bytes();
+        match (exact, lossy.get(key)) {
+            (true, None) => exact_file == *file,
+            (false, Some(Some(identity))) => identity == file,
+            (false, None) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn identity_render_count_for_test(&self) -> usize {
+        self.identity_renders.load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_path_inspections_for_test(&self) -> usize {
+        self.path_inspections
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn all_paths(&self) -> impl Iterator<Item = &ProjectFile> {
-        self.path_to_state.keys()
+        self.path_to_state.keys().inspect(|_| {
+            #[cfg(any(test, feature = "test-support"))]
+            self.path_inspections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
     }
 
     /// Stat-validate a handful of result paths; return the stale ones.
@@ -973,7 +1032,9 @@ fn build_snapshot(
         let Some(stat) = FileStat::from_path(&abs) else {
             continue;
         };
-        let oid = gitblob::resolve_index_entry_oid(workdir, &entry)?;
+        let Some(oid) = gitblob::resolve_index_entry_oid(workdir, &entry)? else {
+            continue;
+        };
         let file = ProjectFile::new(root.clone(), PathBuf::from(rel));
         oid_to_paths.entry(oid).or_default().push(file.clone());
         path_to_state.insert(
@@ -1012,6 +1073,11 @@ fn build_snapshot(
 
     oid_to_paths.retain(|_, paths| !paths.is_empty());
     Ok(LiveSnapshot {
+        lossy_identities: OnceLock::new(),
+        #[cfg(any(test, feature = "test-support"))]
+        identity_renders: AtomicUsize::new(0),
+        #[cfg(any(test, feature = "test-support"))]
+        path_inspections: std::sync::atomic::AtomicUsize::new(0),
         oid_to_paths,
         overlay_files: overlay_files_of(&path_to_state),
         path_to_state,
@@ -1056,6 +1122,11 @@ fn snapshot_from_path_states(
         live_states.insert(file.clone(), live_state);
     }
     LiveSnapshot {
+        lossy_identities: OnceLock::new(),
+        #[cfg(any(test, feature = "test-support"))]
+        identity_renders: AtomicUsize::new(0),
+        #[cfg(any(test, feature = "test-support"))]
+        path_inspections: std::sync::atomic::AtomicUsize::new(0),
         oid_to_paths,
         overlay_files: overlay_files_of(&live_states),
         path_to_state: live_states,
@@ -1470,7 +1541,9 @@ mod tests {
         let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
 
         assert!(
-            repo.statuses(None).unwrap().is_empty(),
+            brokk_bifrost_core::gitblob::worktree_statuses(&repo, None)
+                .unwrap()
+                .is_empty(),
             "Git must treat the transformed worktree as clean"
         );
         let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();

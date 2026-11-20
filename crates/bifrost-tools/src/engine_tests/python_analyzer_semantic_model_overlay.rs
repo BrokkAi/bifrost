@@ -24,6 +24,7 @@ mod python_extraction_tests {
             "member.io-base-exit",
             "__exit__",
             Some(Signature {
+                bounds: None,
                 type_parameters: Vec::new(),
                 parameters: Vec::new(),
                 returns: Some(TypeRef::Named {

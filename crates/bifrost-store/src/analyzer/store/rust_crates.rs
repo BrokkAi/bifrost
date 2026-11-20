@@ -1,4 +1,7 @@
 //! Content-addressed Cargo crate reconciliation with query-local SQL scheduling.
+#[path = "rust_package_routes.rs"]
+mod package_routes;
+
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -69,17 +72,22 @@ pub mod derivation;
 
 type CrateKey = [u8; 32];
 
-/// The version of the crate-row derivation itself: the statements under
-/// `store/rust_crate_*.sql`, the module route walk, the order
+/// The version of the crate-row derivation rules themselves: the statements
+/// under `store/rust_crate_*.sql`, the module route walk, the order
 /// `derive_exports` runs them in, and the dependency waves, which decide which
 /// dependencies each crate is derived with. It is the Rust crate derivation
 /// lever (#11570), one change name per line in
-/// `levers/rust-crate-derivation.tokens`, hashed into every topology digest and
-/// stored as raw bytes in `rust_crate_reconciliations.derivation_identity`, so a
-/// store built under an earlier rule set re-derives its crate rows although its
-/// inputs are unchanged. Add a line whenever those rules change.
+/// `levers/rust-crate-derivation.tokens`. Add a line whenever those rules change.
 ///
-/// The digest also folds in the Rust analysis epoch, which versions the
+/// `derivation_identity` composes it with the Rust resolution bundle epoch, the
+/// producer of the per-file resolution facts the derivation reads (#13383). The
+/// composite is hashed into every topology digest and stored as raw bytes in
+/// `rust_crate_reconciliations.derivation_identity`, so a store built under
+/// earlier rules or an earlier bundle re-derives its crate rows although its
+/// revision is unchanged. The source facts are covered by the selected
+/// generation instead.
+///
+/// The topology digest also folds in the Rust analysis epoch, which versions the
 /// per-blob payloads the derivation reads. Keeping the two apart is the point:
 /// rotating the epoch for a consumer-side change would make every Rust blob
 /// dirty and force a full reparse of a warm store.
@@ -104,7 +112,7 @@ pub fn derivation_identity_before_last_token() -> [u8; 32] {
             brokk_bifrost_core::lever_file!("rust-crate-derivation.tokens"),
         )
     });
-    *OLDER
+    compose_derivation_identity(*OLDER)
 }
 /// Set by `crate_topology_digests_follow_the_derivation_identity` and
 /// `warm_derivation_identity_rotation_replaces_same_revision_versions` so that a
@@ -123,7 +131,19 @@ pub fn derivation_identity() -> [u8; 32] {
     {
         return version;
     }
-    rust_crate_derivation_identity()
+    compose_derivation_identity(rust_crate_derivation_identity())
+}
+
+fn compose_derivation_identity(rules: [u8; 32]) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    use brokk_bifrost_core::analyzer::model::Language;
+    let mut hash = CanonicalHasher::new(b"bifrost-rust-crate-derivation:v1");
+    hash.field("derivation-rules", &rules);
+    hash.field(
+        "resolution-producer",
+        super::resolution::resolution_bundle_epoch(Language::Rust).as_bytes(),
+    );
+    hash.finish()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -184,6 +204,7 @@ CREATE TEMP TABLE IF NOT EXISTS rust_schedule_dependencies(
 CREATE INDEX IF NOT EXISTS temp.rust_schedule_dependencies_dependency ON rust_schedule_dependencies(dependency_key);
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_previous(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_unavailable(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_reached(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_detached(topology_id INTEGER PRIMARY KEY) STRICT;
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_blocked(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
@@ -206,6 +227,7 @@ const RUST_READY_WAVE_SQL: &str = "INSERT INTO temp.rust_schedule_wave
    AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_blocked AS blocked WHERE blocked.crate_key = target.crate_key)
    AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_dependencies AS edge
        WHERE edge.crate_key = target.crate_key AND edge.dependency_key IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_unavailable AS unavailable WHERE unavailable.crate_key = edge.dependency_key)
          AND NOT EXISTS (SELECT 1 FROM temp.rust_schedule_live AS live WHERE live.crate_key = edge.dependency_key))";
 
 const RUST_FORCE_COMPONENT_SQL: &str = "SELECT component.component_id
@@ -227,14 +249,6 @@ const RUST_FORCE_COMPONENT_SQL: &str = "SELECT component.component_id
 
 fn stage_crate(conn: &Connection, ordinal: i64, item: &PreparedCrate) -> Result<()> {
     let target = &item.target;
-    super::rust_feature_projections::stage(
-        conn,
-        &item.key,
-        &target.manifest_path,
-        &target.configuration_directory,
-        target.features_complete,
-        &target.feature_projection,
-    )?;
     conn.prepare_cached("INSERT INTO temp.rust_schedule_targets
         (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version,inventory_error,features_complete)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)")?.execute( params![ordinal, item.key.as_slice(), stable_path(&target.manifest_path), stable_path(&target.root_path), target_kind(target.kind), target.name, edition(target.edition), serde_json::to_string(&target.cfg_atoms).expect("cfg string sets serialize"), serde_json::to_string(&target.features).expect("feature string sets serialize"), target.inventory_complete, item.manifest_version, item.inventory_error, target.features_complete])?;
@@ -315,6 +329,7 @@ fn read_staged_crate(conn: &Connection, id: i64, forced: bool) -> Result<Prepare
         forced,
         dependencies,
         target: RustCrateTarget {
+            root_unavailable: None,
             manifest_path: PathBuf::from(manifest),
             root_path: PathBuf::from(root),
             kind: match kind.as_str() {
@@ -464,6 +479,75 @@ struct ItemMacroDecision {
     no_route: bool,
 }
 
+/// Private RAII owner for one Rust crate derivation pass's dedicated
+/// read-only-main, writable-TEMP connection.
+///
+/// Uses `temp_store = MEMORY` via `open_readonly_temp_connection`, counts
+/// against `ReaderPool` concurrency without touching any pooled reader or
+/// its #13416 selection memo, and closes before publication on every exit.
+struct DedicatedCrateDerivationConnection<'a> {
+    conn: Connection,
+    // Dropped after `conn` so SQLite closes before releasing the slot.
+    _permit: super::ReaderConcurrencyPermit<'a>,
+}
+
+impl<'a> DedicatedCrateDerivationConnection<'a> {
+    fn open(store: &'a AnalyzerStore) -> Result<Self> {
+        let permit = store.readers.acquire_concurrency_permit();
+        let conn = crate::cache_db::open_readonly_temp_connection(&store.readers.source)
+            .map_err(StoreError::new)?;
+        super::resolution_lexical::register_resolution_identity_functions(&conn)?;
+        register_point_export_functions(&conn)?;
+        conn.pragma_update(
+            None,
+            "mmap_size",
+            crate::cache_db::DERIVATION_MMAP_SIZE_BYTES,
+        )?;
+        Ok(Self {
+            conn,
+            _permit: permit,
+        })
+    }
+
+    /// Single TEMP-schema setup boundary for the pass (create, clear, and
+    /// future #13024 validation).
+    fn prepare_pass_temp(&self, _store: &AnalyzerStore) -> Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        _store
+            .workspace_selection_counters
+            .view_creations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::ensure_revisioned_workspace_views(&self.conn)?;
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
+             DELETE FROM temp.rust_schedule_live;",
+        )?;
+        derivation::prepare_tables(&self.conn)?;
+        Ok(())
+    }
+
+    fn begin_pinned_snapshot_and_select(
+        &self,
+        store: &AnalyzerStore,
+        snapshots: &WorkspaceSnapshots,
+    ) -> Result<rusqlite::Transaction<'_>> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Force an initial read on `main` so SQLite acquires one physical
+        // WAL snapshot before materializing selection and holds it through
+        // the pass.
+        tx.prepare_cached("SELECT 1 FROM main.sqlite_schema LIMIT 1")?
+            .query_row([], |_| Ok(()))
+            .optional()?;
+        #[cfg(any(test, feature = "test-support"))]
+        store
+            .workspace_selection_counters
+            .selection_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.apply_workspace_selection_in_tx(&tx, None, snapshots)?;
+        Ok(tx)
+    }
+}
+
 impl AnalyzerStore {
     /// Reconcile every Rust crate in the workspace.
     ///
@@ -488,6 +572,10 @@ impl AnalyzerStore {
     /// nothing therefore walks no crate. A missing marker, as after a first
     /// build, an epoch rotation or a failed pass, runs the full pass.
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn reconcile_rust_crates_unless_current(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -598,6 +686,13 @@ impl AnalyzerStore {
     /// summary rows, so a failed pass is an error for the caller: nothing
     /// falls back to older rows.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-support"),
+        expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )
+    )]
     pub fn reconcile_rust_unit_summaries(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -622,6 +717,10 @@ impl AnalyzerStore {
     /// Integration tests use the same member, export and dependency assertions
     /// as the automatic unit-test check after reconciliation.
     #[cfg(feature = "test-support")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn assert_rust_summary_differential_for_test(&self) {
         let conn = self
             .read_conn()
@@ -682,11 +781,81 @@ impl AnalyzerStore {
             return self.reconcile_rust_crates(snapshot);
         }
         let scope = self.rust_crate_reconcile_scope(snapshot, previous.revision, changed_paths)?;
+        if matches!(scope, CrateReconcileScope::Reached { .. }) {
+            self.relink_meaning_preserving_manifests(snapshot)?;
+        }
         self.reconcile_rust_crates_in_scope(snapshot, scope)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reconcile_rust_crates_scoped_for_test(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        scope: CrateReconcileScope,
+    ) -> Result<super::unit_summaries::UnitSummaryReconciliation> {
+        self.reconcile_rust_crates_in_scope(snapshot, scope)
+    }
+
+    /// An edit that keeps a manifest's identity (a comment, metadata or a
+    /// profile) publishes the new bytes as a new file version but derives no
+    /// crate, so each open crate and package-route row still names the
+    /// superseded version. Publish successor intervals with the current binding
+    /// so earlier snapshots retain the manifest version they selected.
+    fn relink_meaning_preserving_manifests(&self, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+        let snapshot = snapshot.clone();
+        self.execute_selection_publication(move |conn| -> Result<()> {
+            let tx = conn.transaction()?;
+            let _owner = super::sealed_families::Scope::new(
+                &tx,
+                super::sealed_families::Owner::CrateTopology,
+            );
+            let bindings = params![
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.0,
+                snapshot.revision
+            ];
+            let crates = tx.prepare_cached(SQL_RELINK_CRATE_MANIFESTS)?
+                .query_map(bindings, |row| Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (key, opened, topology, manifest) in crates {
+                end_open_crate_version(&tx, &snapshot, &key, opened)?;
+                tx.prepare_cached(SQL_RUST_CRATE_VERSIONS_17)?.execute(params![
+                    snapshot.workspace_id.as_str(), snapshot.generation.0, key,
+                    snapshot.revision, manifest, topology
+                ])?;
+            }
+            let packages = tx.prepare_cached(SQL_RELINK_PACKAGE_ROUTE_MANIFESTS)?
+                .query_map(bindings, |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (id, opened, manifest) in packages {
+                assert!(opened <= snapshot.revision, "cannot relink a later package publication");
+                // This schema rejects empty intervals. A binding first published
+                // at this very revision can be replaced without changing history.
+                if opened == snapshot.revision {
+                    tx.prepare_cached("UPDATE rust_package_route_versions SET manifest_file_version_id=?2 WHERE route_set_id=?1 AND valid_until IS NULL")?.execute(params![id, manifest])?;
+                    continue;
+                }
+                assert_eq!(tx.prepare_cached("UPDATE rust_package_route_versions SET valid_until=?2 WHERE route_set_id=?1 AND valid_until IS NULL")?.execute(params![id, snapshot.revision])?, 1);
+                tx.prepare_cached("INSERT INTO rust_package_route_versions(workspace_id,generation,manifest_path,manifest_file_version_id,valid_from,derivation_identity,input_digest,output_digest)
+                    SELECT workspace_id,generation,manifest_path,?2,?3,derivation_identity,input_digest,output_digest FROM rust_package_route_versions WHERE route_set_id=?1")?.execute(params![id, manifest, snapshot.revision])?;
+                let successor = tx.last_insert_rowid();
+                tx.prepare_cached("INSERT INTO rust_package_unavailable_targets SELECT ?2,unit_key,target_kind,target_name,declared_root,normalized_workspace_root,configuration_digest,reason FROM rust_package_unavailable_targets WHERE route_set_id=?1")?.execute(params![id, successor])?;
+                tx.prepare_cached("INSERT INTO rust_package_target_claims SELECT ?2,unit_key,rel_path FROM rust_package_target_claims WHERE route_set_id=?1")?.execute(params![id, successor])?;
+            }
+            #[cfg(any(test, debug_assertions, feature = "test-support"))]
+            drop(_owner);
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Resolve changed paths to their placements and path-set dependencies.
     #[doc(hidden)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn rust_crate_reconcile_scope(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -843,6 +1012,10 @@ impl AnalyzerStore {
         })
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn reconcile_rust_crates_in_scope(
         &self,
         snapshot: &WorkspaceSnapshotId,
@@ -870,6 +1043,7 @@ impl AnalyzerStore {
             broad_targets,
             manifest_paths,
             manifest_map,
+            mut target_map,
         ) = {
             let conn = self.read_conn_for_workspace(&snapshots)?;
             #[cfg(any(test, feature = "test-support"))]
@@ -893,8 +1067,13 @@ impl AnalyzerStore {
                     &manifests,
                 )
                 .map_err(StoreError::new)?;
-            let configuration = super::rust_acquired_cargo_config::configuration(&conn, snapshot)?
-                .unwrap_or_else(RustCargoConfiguration::unknown_acquired);
+            // Reconciliation is certified publication, withdrawn on acquired changes.
+            let configuration = super::rust_acquired_cargo_config::configuration(
+                &conn,
+                snapshot,
+                &super::dependency_file_evidence::NonQueryEvidenceReadRecorder,
+            )?
+            .unwrap_or_else(RustCargoConfiguration::unknown_acquired);
             let epoch: String = conn
                 .prepare_cached(SQL_ANALYSIS_EPOCHS_4)?
                 .query_row([], |row| row.get(0))?;
@@ -975,6 +1154,14 @@ impl AnalyzerStore {
                     Vec::new()
                 }
             };
+            let mut target_map = package_routes::TargetMap {
+                boundaries: manifest_paths.clone(),
+                manifests: manifest_versions
+                    .iter()
+                    .map(|(p, v)| (p.clone(), (*v, manifest_map[p].content_oid)))
+                    .collect(),
+                ..Default::default()
+            };
             let libraries: HashMap<_, _> = targets
                 .iter()
                 .filter(|target| target.kind == RustCallerTargetKind::Library)
@@ -982,8 +1169,35 @@ impl AnalyzerStore {
                 .collect();
             let crates = targets
                 .into_iter()
-                .map(|target| {
+                .filter_map(|target| {
                     let key = crate_key(&target);
+                    target_map.owners.insert(key, target.manifest_path.clone());
+                    let atoms =
+                        brokk_bifrost_rust::selected_context::merge_rust_configuration_atoms(
+                            &target.cfg_atoms,
+                            &target.features,
+                        );
+                    let mut configuration = Sha256::new();
+                    hash_cell(
+                        &mut configuration,
+                        stable_path(&target.root_path).as_bytes(),
+                    );
+                    hash_cell(
+                        &mut configuration,
+                        serde_json::to_string(&atoms)
+                            .expect("cfg atoms serialize")
+                            .as_bytes(),
+                    );
+                    hash_cell(
+                        &mut configuration,
+                        &[
+                            u8::from(target.features_complete),
+                            u8::from(target.inventory_complete),
+                        ],
+                    );
+                    target_map
+                        .configurations
+                        .insert(key, configuration.finalize().into());
                     let dependencies = target
                         .dependencies
                         .iter()
@@ -999,13 +1213,19 @@ impl AnalyzerStore {
                             )
                         })
                         .collect();
-                    PreparedCrate {
+                    let item = PreparedCrate {
                         key,
                         inventory_error: target.inventory_error.clone(),
                         forced: false,
                         manifest_version: manifest_versions.get(&target.manifest_path).copied(),
                         dependencies,
                         target,
+                    };
+                    if item.target.root_unavailable.is_some() {
+                        target_map.unavailable.push(item);
+                        None
+                    } else {
+                        Some(item)
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1019,8 +1239,34 @@ impl AnalyzerStore {
                 broad_targets,
                 manifest_paths,
                 manifest_map,
+                target_map,
             )
         };
+        {
+            let conn = self.read_conn_for_workspace(&snapshots)?;
+            for item in &target_map.unavailable {
+                let gap = item
+                    .target
+                    .root_unavailable
+                    .as_ref()
+                    .expect("unavailable target");
+                let mut claimed = BTreeSet::new();
+                if let Some(root) = &gap.normalized_root {
+                    let atoms =
+                        brokk_bifrost_rust::selected_context::merge_rust_configuration_atoms(
+                            &item.target.cfg_atoms,
+                            &item.target.features,
+                        );
+                    let cfg = serde_json::to_string(&atoms).expect("cfg atoms serialize");
+                    let (rows, _) = self.walk_crate_modules(&conn, stable_path(root), &cfg)?;
+                    for row in rows {
+                        claimed.extend(row.path.into_iter().map(PathBuf::from));
+                        claimed.extend(row.path_candidates.into_iter().map(PathBuf::from));
+                    }
+                }
+                target_map.claims.insert(item.key, claimed);
+            }
+        }
         // The case-fold keys of the selected Rust paths, for the module
         // candidates that match a selected file only by case. It lives for this
         // pass, beside the selected paths it is built from.
@@ -1037,9 +1283,30 @@ impl AnalyzerStore {
         let schedule = Connection::open_in_memory()?;
         schedule.execute_batch(unit_schedule::SCHEMA_SQL)?;
         schedule.execute_batch(RUST_SCHEDULE_SCHEMA_SQL)?;
+        // These exact typed target facts also publish the package carrier below.
+        // They have no topology to wait for; an ordinary missing dependency
+        // remains blocked. The private scheduler connection owns this set for
+        // precisely this reconciliation, just like rust_schedule_live.
+        for unit in &target_map.unavailable {
+            schedule
+                .prepare_cached("INSERT INTO temp.rust_schedule_unavailable VALUES(?1)")?
+                .execute([unit.key.as_slice()])?;
+        }
         super::rust_feature_projections::prepare(&schedule)?;
         // Targets are an input query result only until their normalized rows
         // have been staged. No target or topology arena survives into waves.
+        let staged_features = crates
+            .iter()
+            .map(|item| super::rust_feature_projections::StagedFeatureRow {
+                key: &item.key,
+                manifest_path: &item.target.manifest_path,
+                configuration_directory: &item.target.configuration_directory,
+                features_complete: item.target.features_complete,
+                packages: &item.target.feature_projection,
+            })
+            .collect::<Vec<_>>();
+        super::rust_feature_projections::stage(&schedule, &staged_features)?;
+        drop(staged_features);
         for (ordinal, item) in crates.into_iter().enumerate() {
             stage_crate(&schedule, ordinal as i64, &item)?;
         }
@@ -1305,6 +1572,70 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             }
         }
         drop(waves_timing);
+        let mut detached_roots = Vec::new();
+        {
+            let schedule = schedule.lock().unwrap();
+            let source = self.read_conn_for_workspace(&snapshots)?;
+            // Carrying the identical topology also carries its exact previous
+            // ownership claims. Re-read structured source rows only for changed
+            // units or a missing prior projection, in this one statement.
+            let live = schedule
+                .prepare_cached(
+                    "SELECT live.topology_id, previous.crate_key IS NOT NULL
+                 FROM temp.rust_schedule_live live
+                 LEFT JOIN temp.rust_schedule_previous previous
+                   ON previous.crate_key=live.crate_key AND previous.topology_id=live.topology_id",
+                )?
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let selected = serde_json::to_string(&live).expect("topology identities serialize");
+            let mut claims = source.prepare_cached(SQL_TARGET_MAP_CLAIMS)?;
+            for row in claims.query_map(
+                params![
+                    selected,
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.0,
+                    from_revision.unwrap_or(snapshot.revision),
+                    derivation_identity()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, [u8; 32]>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )? {
+                let (key, kind, name, path) = row?;
+                if kind == "detached" {
+                    detached_roots.push((key, PathBuf::from(name)));
+                } else {
+                    target_map
+                        .claims
+                        .entry(key)
+                        .or_default()
+                        .extend(path.map(PathBuf::from));
+                }
+            }
+        }
+        target_map.claimed_paths = target_map
+            .claims
+            .values()
+            .flat_map(|paths| paths.iter().cloned())
+            .collect();
+        {
+            let schedule = schedule.lock().unwrap();
+            for (key, path) in detached_roots {
+                if target_map.suppresses_detached(&path) {
+                    schedule
+                        .prepare_cached("DELETE FROM temp.rust_schedule_live WHERE crate_key=?1")?
+                        .execute([key.as_slice()])?;
+                }
+            }
+        }
         let detached_timing = crate::profiling::scope("rust_crates.reconcile.detached");
         // Seed previous placements of reached crates as well as new files: an
         // edit can leave a previously placed file detached without creating it.
@@ -1315,8 +1646,32 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             conn.prepare_cached("CREATE TEMP TABLE IF NOT EXISTS rust_schedule_paths(path TEXT PRIMARY KEY) WITHOUT ROWID")?.execute( [])?;
             conn.prepare_cached("DELETE FROM temp.rust_schedule_paths")?
                 .execute([])?;
-            if from_revision.is_some() {
+            if let Some(previous_revision) = from_revision {
                 let source = self.read_conn_for_workspace(&snapshots)?;
+                target_map.reseed_released_admissions(
+                    &source,
+                    &conn,
+                    snapshot,
+                    previous_revision,
+                    &paths,
+                )?;
+                let mut previous_claims = source.prepare_cached("SELECT DISTINCT claim.rel_path FROM rust_package_route_versions package JOIN rust_package_unavailable_targets target USING(route_set_id) JOIN rust_package_target_claims claim ON claim.route_set_id=target.route_set_id AND claim.unit_key=target.unit_key WHERE package.workspace_id=?1 AND package.generation=?2 AND package.valid_from<=?3 AND (package.valid_until IS NULL OR ?3<package.valid_until)")?;
+                for path in previous_claims.query_map(
+                    params![
+                        snapshot.workspace_id.as_str(),
+                        snapshot.generation.0,
+                        previous_revision
+                    ],
+                    |row| row.get::<_, String>(0),
+                )? {
+                    let path = path?;
+                    if !target_map.suppresses_detached(Path::new(&path)) {
+                        conn.prepare_cached(
+                            "INSERT OR IGNORE INTO temp.rust_schedule_paths VALUES(?1)",
+                        )?
+                        .execute([path])?;
+                    }
+                }
                 // Created files may have no previous topology to seed them.
                 for path in &created {
                     conn.prepare_cached(
@@ -1415,6 +1770,9 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             .map(|error| (error.path.clone(), error.diagnostic.clone()))
             .collect();
         for path in detached_paths {
+            if target_map.suppresses_detached(Path::new(&path)) {
+                continue;
+            }
             // A reached detached root may have been deleted; retiring its old
             // version is enough, and no new topology can be derived for it.
             if paths
@@ -1455,6 +1813,7 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                     }
                 };
             let target = RustCrateTarget {
+                root_unavailable: None,
                 manifest_path: root_path.clone(),
                 root_path: root_path.clone(),
                 kind: RustCallerTargetKind::Detached,
@@ -1474,11 +1833,13 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                 let schedule = schedule.lock().unwrap();
                 super::rust_feature_projections::stage(
                     &schedule,
-                    &crate_key(&target),
-                    &target.manifest_path,
-                    &target.configuration_directory,
-                    target.features_complete,
-                    &target.feature_projection,
+                    &[super::rust_feature_projections::StagedFeatureRow {
+                        key: &crate_key(&target),
+                        manifest_path: &target.manifest_path,
+                        configuration_directory: &target.configuration_directory,
+                        features_complete: target.features_complete,
+                        packages: &target.feature_projection,
+                    }],
                 )?;
             }
             let item = PreparedCrate {
@@ -1539,21 +1900,30 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                      WHERE features.unit_key=live.crate_key)",
             )?;
             let mut rows = statement.query([])?;
+            let mut carried: Vec<([u8; 32], PathBuf)> = Vec::new();
             while let Some(row) = rows.next()? {
                 let key = crate_key_from_row(row.get(0)?)?;
                 let path: String = source.prepare_cached(
                     "SELECT crate_name FROM rust_crate_topologies WHERE topology_id=?1 AND target_kind='detached'")?
                     .query_row([row.get::<_, i64>(1)?], |row| row.get(0))?;
-                let path = Path::new(&path);
-                super::rust_feature_projections::stage(
-                    &schedule,
-                    &key,
-                    path,
-                    &detached_configuration_directory(),
-                    true,
-                    &[],
-                )?;
+                carried.push((key, PathBuf::from(path)));
             }
+            drop(rows);
+            drop(statement);
+            let configuration_directory = detached_configuration_directory();
+            let staged = carried
+                .iter()
+                .map(
+                    |(key, path)| super::rust_feature_projections::StagedFeatureRow {
+                        key,
+                        manifest_path: path,
+                        configuration_directory: &configuration_directory,
+                        features_complete: true,
+                        packages: &[],
+                    },
+                )
+                .collect::<Vec<_>>();
+            super::rust_feature_projections::stage(&schedule, &staged)?;
         }
         drop(detached_timing);
         let close_timing = crate::profiling::scope("rust_crates.reconcile.close_versions");
@@ -1586,6 +1956,12 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             .query_row([], |row| row.get(0))?;
         #[cfg(any(test, feature = "test-support"))]
         let counter = self.crate_statement_counter.lock().unwrap().clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let feature_counter = self
+            .feature_publication_statement_counter
+            .lock()
+            .unwrap()
+            .clone();
         self.execute_selection_publication(move |conn| -> Result<()> {
             let tx = conn.transaction()?;
             let _owner = super::sealed_families::Scope::new(
@@ -1629,12 +2005,45 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                         from_revision
                     ])?,
             };
+            target_map.publish(&tx, &snapshot, &paths)?;
+            #[cfg(debug_assertions)]
+            {
+                let scheduled = schedule
+                    .prepare_cached("SELECT crate_key FROM temp.rust_schedule_unavailable")?
+                    .query_map([], |row| row.get::<_, [u8; 32]>(0))?
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                let published = tx
+                    .prepare_cached(
+                        "SELECT target.unit_key FROM rust_package_route_versions package
+                     JOIN rust_package_unavailable_targets target USING(route_set_id)
+                     WHERE package.workspace_id=?1 AND package.generation=?2
+                       AND package.valid_from<=?3
+                       AND (package.valid_until IS NULL OR ?3<package.valid_until)",
+                    )?
+                    .query_map(
+                        params![
+                            snapshot.workspace_id.as_str(),
+                            snapshot.generation.0,
+                            snapshot.revision
+                        ],
+                        |row| row.get::<_, [u8; 32]>(0),
+                    )?
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                debug_assert_eq!(
+                    scheduled, published,
+                    "scheduled unavailable targets equal the atomically published carrier"
+                );
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            let feature_trace = StatementTrace::new(&tx, feature_counter);
             super::rust_feature_projections::publish(
                 &tx,
                 &schedule,
                 &snapshot,
                 &feature_input_digest,
             )?;
+            #[cfg(any(test, feature = "test-support"))]
+            drop(feature_trace);
             #[cfg(any(test, feature = "test-support"))]
             drop(trace);
             #[cfg(any(test, debug_assertions, feature = "test-support"))]
@@ -1776,11 +2185,10 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                 stable_path(&item.target.root_path)
             )
         });
-        let mut conn = self.read_conn_for_workspace(snapshots)?;
-        conn.use_derivation_mmap()?;
-        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT;
-            DELETE FROM temp.rust_schedule_live;")?;
-        conn.cleanup_before_checkin("DELETE FROM temp.rust_schedule_live");
+        let dedicated = DedicatedCrateDerivationConnection::open(self)?;
+        dedicated.prepare_pass_temp(self)?;
+        let snapshot_tx = dedicated.begin_pinned_snapshot_and_select(self, snapshots)?;
+        let conn = &dedicated.conn;
         if let Some(schedule) = schedule {
             let schedule = schedule.lock().unwrap();
             let mut query = schedule.prepare_cached(
@@ -1797,8 +2205,7 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             }
         }
         #[cfg(any(test, feature = "test-support"))]
-        let trace =
-            StatementTrace::new(&conn, self.crate_statement_counter.lock().unwrap().clone());
+        let trace = StatementTrace::new(conn, self.crate_statement_counter.lock().unwrap().clone());
         debug_assert!(
             conn.prepare_cached(LIVE_SURFACE_SQL)?
                 .query_row([item.key.as_slice()], |_| Ok(()))
@@ -1806,7 +2213,7 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                 .is_none(),
             "a crate is published only after its own derivation returns"
         );
-        debug_assert_crate_functions(&conn);
+        debug_assert_crate_functions(conn);
         let atoms = brokk_bifrost_rust::selected_context::merge_rust_configuration_atoms(
             &item.target.cfg_atoms,
             &item.target.features,
@@ -1820,7 +2227,7 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
                     target_kind(item.target.kind)
                 )
             });
-            self.walk_crate_modules(&conn, stable_path(&item.target.root_path), &cfg)?
+            self.walk_crate_modules(conn, stable_path(&item.target.root_path), &cfg)?
         };
         let mut path_probes = HashSet::new();
         path_probes.insert(brokk_bifrost_rust::cargo_routes::rust_case_fold_key(
@@ -1911,7 +2318,7 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             hash_cell(&mut digest, error.as_bytes());
         }
         let listing_complete = match Self::rust_source_listing_failures_on(
-            &conn,
+            conn,
             &snapshots["rust"],
             super::rust_source_listing_derivation_identity(),
         )? {
@@ -2157,15 +2564,12 @@ SELECT targets.unit_id FROM temp.rust_schedule_next AS next
             .optional()?;
         let derived = existing
             .is_none()
-            .then(|| {
-                derivation::derive_exports(&conn, item, &modules, &gaps, &gate_decisions, &cfg)
-            })
+            .then(|| derivation::derive_exports(conn, item, &modules, &gaps, &gate_decisions, &cfg))
             .transpose()?;
         #[cfg(any(test, feature = "test-support"))]
         drop(trace);
-        conn.prepare_cached("DELETE FROM temp.rust_schedule_live")?
-            .execute([])?;
-        drop(conn);
+        drop(snapshot_tx);
+        drop(dedicated);
         let snapshot = snapshots["rust"].clone();
         let key = item.key;
         let manifest_version = item.manifest_version;
@@ -2885,8 +3289,12 @@ impl AnalyzerStore {
             .filter_map(|path| Path::new(path).parent().and_then(Path::parent))
             .max_by_key(|path| path.components().count())
             .unwrap_or(Path::new(""));
+        // Kind-2 consumers record their derived answer, not its internal inputs.
         if let Some(configuration) = super::rust_acquired_cargo_config::configuration_at_directory(
-            conn, snapshot, directory,
+            conn,
+            snapshot,
+            &super::dependency_file_evidence::NonQueryEvidenceReadRecorder,
+            directory,
         )? {
             return Ok(Ok(configuration));
         }
@@ -3036,6 +3444,28 @@ pub(super) const SQL_RUST_CRATE_RECONCILIATION_RECORD: &str =
      VALUES(?1, ?2, ?3, ?4)
      ON CONFLICT(workspace_id, generation) DO UPDATE
      SET revision = excluded.revision, derivation_identity = excluded.derivation_identity";
+pub(super) const SQL_RELINK_CRATE_MANIFESTS: &str =
+    "SELECT version.crate_key,version.valid_from,version.topology_id,current.file_version_id
+     FROM rust_crate_versions version
+     JOIN workspace_file_versions superseded ON superseded.file_version_id=version.manifest_file_version_id
+     JOIN workspace_file_versions current
+       ON current.workspace_id=superseded.workspace_id AND current.lang=superseded.lang
+      AND current.generation=superseded.generation AND current.input_kind=superseded.input_kind
+      AND current.rel_path=superseded.rel_path AND current.valid_from<=?3
+      AND (current.valid_until IS NULL OR ?3<current.valid_until)
+     WHERE version.workspace_id=?1 AND version.generation=?2 AND version.lang='rust' AND version.valid_until IS NULL
+       AND current.file_version_id<>superseded.file_version_id";
+pub(super) const SQL_RELINK_PACKAGE_ROUTE_MANIFESTS: &str =
+    "SELECT version.route_set_id,version.valid_from,current.file_version_id
+     FROM rust_package_route_versions version
+     JOIN workspace_file_versions superseded ON superseded.file_version_id=version.manifest_file_version_id
+     JOIN workspace_file_versions current
+       ON current.workspace_id=superseded.workspace_id AND current.lang=superseded.lang
+      AND current.generation=superseded.generation AND current.input_kind=superseded.input_kind
+      AND current.rel_path=superseded.rel_path AND current.valid_from<=?3
+      AND (current.valid_until IS NULL OR ?3<current.valid_until)
+     WHERE version.workspace_id=?1 AND version.generation=?2 AND version.valid_until IS NULL
+       AND current.file_version_id<>superseded.file_version_id";
 pub(super) const SQL_RUST_CRATE_RECONCILIATION_ADVANCE: &str =
     "UPDATE rust_crate_reconciliations SET revision = ?3
      WHERE workspace_id = ?1 AND generation = ?2 AND derivation_identity = ?4 AND revision = ?5";
@@ -3043,6 +3473,32 @@ pub(super) const SQL_ANALYSIS_EPOCHS_4: &str =
     "SELECT epoch FROM analysis_epochs WHERE lang = 'rust'";
 pub(super) const SQL_RUST_CRATE_MODULES_5: &str =
     "SELECT rel_path FROM rust_crate_container_sources WHERE topology_id = ?1";
+// Selected topologies are scalar identities, not retained source data. The
+// previous carrier supplies unchanged units' claims; an absent projection falls
+// back to the same structured module rows used for changed units.
+const SQL_TARGET_MAP_CLAIMS: &str = "WITH live AS MATERIALIZED (
+ SELECT topology.topology_id,topology.crate_key,topology.target_kind,topology.crate_name,
+        json_extract(selected.value,'$[1]') AS carried
+ FROM json_each(?1) selected
+ JOIN rust_crate_topologies topology ON topology.topology_id=json_extract(selected.value,'$[0]')
+), prior AS MATERIALIZED (
+ SELECT claim.unit_key,claim.rel_path FROM rust_package_route_versions package
+ JOIN rust_package_target_claims claim USING(route_set_id)
+ JOIN live ON live.crate_key=claim.unit_key AND live.carried=1 AND live.target_kind<>'detached'
+ WHERE package.workspace_id=?2 AND package.generation=?3 AND package.derivation_identity=?5
+   AND package.valid_from<=?4 AND (package.valid_until IS NULL OR ?4<package.valid_until)
+), unprojected AS MATERIALIZED (
+ SELECT live.* FROM live WHERE live.target_kind<>'detached'
+   AND NOT EXISTS(SELECT 1 FROM prior WHERE prior.unit_key=live.crate_key)
+)
+ SELECT live.crate_key,live.target_kind,live.crate_name,prior.rel_path
+ FROM live JOIN prior ON prior.unit_key=live.crate_key
+ UNION ALL
+ SELECT live.crate_key,live.target_kind,live.crate_name,source.rel_path
+ FROM unprojected live LEFT JOIN rust_crate_container_sources source ON source.topology_id=live.topology_id
+ UNION ALL
+ SELECT live.crate_key,live.target_kind,live.crate_name,NULL FROM live WHERE live.target_kind='detached'";
+
 /// The live crate set this workspace generation already derived, with each
 /// crate's topology and export surface.
 ///
@@ -3240,6 +3696,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
     pins.extend(derivation::sql_pins());
     pins.extend(unit_schedule::sql_pins());
     pins.extend([
+        ("rust_crate_target_map_claims", SQL_TARGET_MAP_CLAIMS, 5),
         ("rust_crate_schedule_ready", RUST_READY_WAVE_SQL, 0),
         ("rust_crate_schedule_force", RUST_FORCE_COMPONENT_SQL, 0),
         ("rust_crate_schedule_staged_target", STAGED_TARGET_SQL, 1),
@@ -3286,6 +3743,82 @@ pub fn prepare_pin_context(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#13400: an intentionally unavailable dependency forced unrelated healthy crates incomplete"
+    )]
+    fn unavailable_dependency_never_hides_an_unpublished_dependency() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(RUST_SCHEDULE_SCHEMA_SQL).unwrap();
+        let owner = [1u8; 32];
+        let unavailable = [2u8; 32];
+        let failed = [3u8; 32];
+        conn.execute(
+            "INSERT INTO temp.rust_schedule_targets(unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,features_complete,pending)
+             VALUES(1,?1,'Cargo.toml','src/lib.rs','lib','consumer','2021','[]','[]',1,1,1)",
+            [owner.as_slice()],
+        ).unwrap();
+        for (ordinal, key) in [unavailable, failed].into_iter().enumerate() {
+            conn.execute(
+                "INSERT INTO temp.rust_schedule_dependencies VALUES(?1,?2,?3,'normal',?4)",
+                params![
+                    owner.as_slice(),
+                    ordinal as i64,
+                    format!("dependency{ordinal}"),
+                    key.as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO temp.rust_schedule_unavailable VALUES(?1)",
+            [unavailable.as_slice()],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(RUST_READY_WAVE_SQL, []).unwrap(),
+            0,
+            "a separate unclassified missing dependency still blocks"
+        );
+        conn.execute(
+            "INSERT INTO temp.rust_schedule_live VALUES(?1,1,?2)",
+            params![failed.as_slice(), [0u8; 32].as_slice()],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(RUST_READY_WAVE_SQL, []).unwrap(),
+            1,
+            "a known unavailable dependency does not require a topology"
+        );
+        assert_eq!(
+            conn.query_row("SELECT forced FROM temp.rust_schedule_wave", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM temp.rust_schedule_dependencies WHERE dependency_key=?1",
+                [unavailable.as_slice()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "readiness retains the dependency edge"
+        );
+        conn.execute_batch(
+            "DELETE FROM temp.rust_schedule_wave; DELETE FROM temp.rust_schedule_unavailable;",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(RUST_READY_WAVE_SQL, []).unwrap(),
+            0,
+            "missing publication is not inferred to be intentionally unavailable"
+        );
+    }
 
     #[test]
     #[hardwon(
@@ -3463,7 +3996,10 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                Some((version, Vec::new())),
+                Some(crate::analyzer::store::RustListingInput::new(
+                    version,
+                    Vec::new(),
+                )),
             )
             .unwrap();
         store.reconcile_rust_crates_unless_current(&first).unwrap();
@@ -3471,8 +4007,10 @@ mod tests {
         let second = store
             .publish_rust_source_listing(
                 &first,
-                version,
-                vec![("src/link.rs".into(), "symlink".into())],
+                crate::analyzer::store::RustListingInput::new(
+                    version,
+                    vec![("src/link.rs".into(), "symlink".into())],
+                ),
                 Default::default(),
             )
             .unwrap();
@@ -3877,5 +4415,179 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, expected, "cfg pair {first:?}, {second:?}");
         }
+    }
+
+    #[test]
+    fn dedicated_crate_derivation_owner_is_destroyed_on_success_error_and_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&dir.path().join("cache.sqlite")).unwrap();
+        let snapshots = WorkspaceSnapshots::default();
+
+        // Success path: open, prepare TEMP, pin snapshot, verify readonly-main + MEMORY TEMP, drop.
+        {
+            let dedicated = DedicatedCrateDerivationConnection::open(&store).unwrap();
+            assert_eq!(
+                store.readers.state.lock().unwrap().holders.len(),
+                1,
+                "dedicated connection must count against ReaderPool concurrency"
+            );
+            assert_eq!(
+                store.readers.idle_len(),
+                0,
+                "dedicated connection must not populate or touch the ordinary reader pool"
+            );
+            let temp_store: i64 = dedicated
+                .conn
+                .query_row("PRAGMA temp_store", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(temp_store, 2, "dedicated connection must use MEMORY TEMP");
+            assert!(
+                dedicated
+                    .conn
+                    .execute("CREATE TABLE main.should_fail(x INTEGER)", [])
+                    .is_err(),
+                "dedicated connection must keep main read-only"
+            );
+            dedicated.prepare_pass_temp(&store).unwrap();
+            let tx = dedicated
+                .begin_pinned_snapshot_and_select(&store, &snapshots)
+                .unwrap();
+            drop(tx);
+        }
+        assert_eq!(store.readers.state.lock().unwrap().holders.len(), 0);
+        assert_eq!(store.readers.idle_len(), 0);
+        assert_eq!(store.active_readers.idle_len(), 0);
+
+        // Error and panic-unwind paths release both the connection and the concurrency slot.
+        let err_result: Result<()> = (|| {
+            let dedicated = DedicatedCrateDerivationConnection::open(&store)?;
+            assert_eq!(store.readers.state.lock().unwrap().holders.len(), 1);
+            dedicated.prepare_pass_temp(&store)?;
+            let _tx = dedicated.begin_pinned_snapshot_and_select(&store, &snapshots)?;
+            dedicated
+                .conn
+                .execute("SELECT * FROM nonexistent_table_for_error_test", [])?;
+            Ok(())
+        })();
+        assert!(err_result.is_err());
+        assert_eq!(store.readers.state.lock().unwrap().holders.len(), 0);
+        assert_eq!(store.readers.idle_len(), 0);
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dedicated = DedicatedCrateDerivationConnection::open(&store).unwrap();
+            assert_eq!(store.readers.state.lock().unwrap().holders.len(), 1);
+            dedicated.prepare_pass_temp(&store).unwrap();
+            panic!("simulated unwind during crate derivation");
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(store.readers.state.lock().unwrap().holders.len(), 0);
+        assert_eq!(store.readers.idle_len(), 0);
+    }
+
+    #[test]
+    fn dedicated_crate_derivation_pins_snapshot_against_concurrent_publication_and_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&dir.path().join("cache.sqlite")).unwrap();
+        let workspace = super::super::WorkspaceId::for_root(dir.path());
+        let workspace_str = workspace.as_str().to_string();
+        let snapshot = WorkspaceSnapshotId {
+            workspace_id: workspace.clone(),
+            lang: "rust".into(),
+            generation: super::super::GenerationId(1),
+            revision: 1,
+        };
+        let snapshots = WorkspaceSnapshots::from_iter([("rust".into(), snapshot.clone())]);
+
+        let oid_gen1 = "11".repeat(20);
+        let oid_gen2 = "22".repeat(20);
+        let proj_digest = "aa".repeat(32);
+
+        // Seed generation 1, revision 1 with one blob and one file version.
+        store.conn.execute({
+            let oid_gen1 = oid_gen1.clone();
+            let workspace_str = workspace_str.clone();
+            let proj_digest = proj_digest.clone();
+            move |conn| {
+                conn.execute_batch(&format!(
+                    "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('rust', 'test', 1)
+                     ON CONFLICT(lang) DO UPDATE SET generation=excluded.generation;
+                     INSERT INTO blobs(id, blob_oid, lang, generation, parse_variant)
+                     VALUES(101, '{oid_gen1}', 'rust', 1, x'');
+                     INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+                     VALUES('{workspace_str}', 'rust', 1, 1);
+                     INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+                     VALUES('{workspace_str}', 'rust', 1, 1);
+                     INSERT INTO workspace_file_versions(workspace_id, lang, generation, input_kind, projection_digest, valid_from, valid_until, rel_path, blob_oid, file_present)
+                     VALUES('{workspace_str}', 'rust', 1, 'source', '{proj_digest}', 1, NULL, 'src/lib.rs', '{oid_gen1}', NULL);",
+                ))
+                .unwrap();
+            }
+        });
+
+        let read_pass_rows = |conn: &Connection| -> Vec<(String, String, i64)> {
+            conn.prepare(
+                "SELECT f.rel_path, b.blob_oid, b.generation
+                 FROM temp.selected_workspace_file_versions AS f
+                 JOIN blobs AS b ON b.blob_oid = f.blob_oid AND b.lang = f.lang AND b.parse_variant = x''
+                 ORDER BY f.rel_path, b.blob_oid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+
+        // Control run without interference.
+        let expected = {
+            let dedicated = DedicatedCrateDerivationConnection::open(&store).unwrap();
+            dedicated.prepare_pass_temp(&store).unwrap();
+            let _tx = dedicated
+                .begin_pinned_snapshot_and_select(&store, &snapshots)
+                .unwrap();
+            read_pass_rows(&dedicated.conn)
+        };
+        assert_eq!(expected, vec![("src/lib.rs".to_string(), oid_gen1, 1)]);
+
+        // Concurrent publication + GC during the pass:
+        // Start the dedicated pass and pin its WAL snapshot before interference.
+        let dedicated = DedicatedCrateDerivationConnection::open(&store).unwrap();
+        dedicated.prepare_pass_temp(&store).unwrap();
+        let tx = dedicated
+            .begin_pinned_snapshot_and_select(&store, &snapshots)
+            .unwrap();
+
+        // Another connection publishes generation 2, revision 2 and runs GC to delete generation 1.
+        store.conn.execute(move |conn| {
+            conn.execute_batch(&format!(
+                "UPDATE analysis_epochs SET generation = 2 WHERE lang = 'rust';
+                 INSERT INTO blobs(id, blob_oid, lang, generation, parse_variant)
+                 VALUES(102, '{oid_gen2}', 'rust', 2, x'');
+                 INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+                 VALUES('{workspace_str}', 'rust', 2, 2);
+                 INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+                 VALUES('{workspace_str}', 'rust', 2, 2);
+                 INSERT INTO workspace_file_versions(workspace_id, lang, generation, input_kind, projection_digest, valid_from, valid_until, rel_path, blob_oid, file_present)
+                 VALUES('{workspace_str}', 'rust', 2, 'source', '{proj_digest}', 2, NULL, 'src/lib.rs', '{oid_gen2}', NULL);",
+            ))
+            .unwrap();
+        });
+        let reclaimed = store.reclaim_stale_generations(10_000).unwrap();
+        assert!(reclaimed > 0, "GC must reclaim stale generation 1 rows");
+
+        // The in-flight dedicated pass must still observe the exact generation 1 rows.
+        let observed = read_pass_rows(&dedicated.conn);
+        assert_eq!(observed, expected);
+
+        drop(tx);
+        drop(dedicated);
+
+        // After the pass releases its snapshot, a new pass sees generation 1 was GC'd.
+        let after = DedicatedCrateDerivationConnection::open(&store).unwrap();
+        after.prepare_pass_temp(&store).unwrap();
+        let _after_tx = after
+            .begin_pinned_snapshot_and_select(&store, &snapshots)
+            .unwrap();
+        assert!(read_pass_rows(&after.conn).is_empty());
     }
 }

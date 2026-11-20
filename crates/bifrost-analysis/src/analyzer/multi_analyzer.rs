@@ -87,6 +87,29 @@ pub trait LanguageAnalyzer:
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&SharedWorkspaceFileListing>,
     ) -> Box<dyn LanguageAnalyzer>;
+    /// The same listing-owner predicate used by the delegate's update.
+    /// Tree-sitter wrappers override this to use their indexed generation,
+    /// whose membership may precede the fan-out's store-context membership.
+    fn ignore_inputs_verified(&self) -> bool {
+        let analyzer = self.analyzer();
+        analyzer
+            .generation_membership()
+            .listing()
+            .is_ok_and(|listing| analyzer.project().listing_ignore_inputs_verified(listing))
+    }
+    fn update_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&SharedWorkspaceFileListing>,
+    ) -> (
+        Box<dyn LanguageAnalyzer>,
+        super::read_verification::UpdateEffects,
+    ) {
+        (
+            LanguageAnalyzer::update(self, changed_files, listing),
+            super::read_verification::UpdateEffects::AllMayHaveChanged("unreported delegate"),
+        )
+    }
     /// Whether listing evidence changed even without a relevant source edit.
     fn listing_changed(&self, _listing: Option<&SharedWorkspaceFileListing>) -> bool {
         false
@@ -94,8 +117,7 @@ pub trait LanguageAnalyzer:
     fn should_receive_changed_file(&self, language: Language, file: &ProjectFile) -> bool {
         language_for_file(file) == language
             || self.analyzer().is_analyzed(file)
-            || is_language_configuration_input(language, file)
-            || is_language_signature_input(language, file)
+            || self.is_configuration_input(file)
             || self.read_configuration_file(file)
     }
     /// Whether this snapshot read `file` as configuration while answering
@@ -103,6 +125,14 @@ pub trait LanguageAnalyzer:
     /// tsconfig reached through `extends`, for example). A change to such a
     /// file can leave the snapshot's cached state stale.
     fn read_configuration_file(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+    /// Whether an update must treat `file` as a configuration input even when
+    /// ignore rules keep it out of the selection: the analyzer's own
+    /// configuration names, its signature inputs, and the inputs its selected
+    /// configuration includes. The one predicate behind every membership
+    /// decision, outer and inner.
+    fn is_configuration_input(&self, _file: &ProjectFile) -> bool {
         false
     }
     fn update_all_with_progress(
@@ -153,6 +183,10 @@ impl AnalyzerDelegate {
         LanguageAnalyzer::program_semantics_provider(self.inner.as_ref())
     }
 
+    pub(crate) fn is_configuration_input(&self, file: &ProjectFile) -> bool {
+        LanguageAnalyzer::is_configuration_input(self.inner.as_ref(), file)
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self {
             inner: LanguageAnalyzer::clone_with_project(self.inner.as_ref(), project),
@@ -179,16 +213,6 @@ impl AnalyzerDelegate {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         LanguageAnalyzer::test_detection_provider(self.inner.as_ref())
-    }
-
-    pub(crate) fn update(
-        &self,
-        changed_files: &BTreeSet<ProjectFile>,
-        listing: Option<&SharedWorkspaceFileListing>,
-    ) -> Self {
-        Self {
-            inner: LanguageAnalyzer::update(self.inner.as_ref(), changed_files, listing),
-        }
     }
 
     fn should_receive_changed_file(&self, language: Language, file: &ProjectFile) -> bool {
@@ -260,6 +284,7 @@ pub struct WorkspaceBuildContext {
     #[cfg(any(test, feature = "test-support"))]
     startup_oid_batches: Option<Arc<AtomicUsize>>,
     requested_languages: Option<BTreeSet<Language>>,
+    not_selected_languages: Result<BTreeMap<Language, Option<StoreError>>, StoreError>,
     pub(crate) activation_catalog:
         Arc<std::sync::Mutex<Option<crate::analyzer::packs_document::WorkspaceActivationCatalog>>>,
 }
@@ -271,19 +296,126 @@ impl WorkspaceBuildContext {
         store_context: AnalyzerStoreContext,
         requested_languages: Option<BTreeSet<Language>>,
     ) -> Self {
+        let requested_languages = requested_languages.filter(|languages| !languages.is_empty());
+        let not_selected_languages = Self::not_selected_languages(
+            project.as_ref(),
+            store_context.membership.as_deref(),
+            requested_languages.as_ref(),
+        );
         Self {
             project,
             config,
             store_context,
             #[cfg(any(test, feature = "test-support"))]
             startup_oid_batches: None,
-            requested_languages: requested_languages.filter(|languages| !languages.is_empty()),
+            requested_languages,
+            not_selected_languages,
             activation_catalog: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
+    fn not_selected_languages(
+        project: &dyn Project,
+        membership: Option<&crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+        requested: Option<&BTreeSet<Language>>,
+    ) -> Result<BTreeMap<Language, Option<StoreError>>, StoreError> {
+        let Some(requested) = requested else {
+            return Ok(BTreeMap::new());
+        };
+        let membership = membership.unwrap_or_else(|| {
+            crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::unavailable()
+                .as_ref()
+        });
+        let listing = membership
+            .listing()
+            .map_err(|_| membership.listing_failure())?;
+        let candidates = listing
+            .0
+            .iter()
+            .map(language_for_file)
+            .filter(|language| *language != Language::None && !requested.contains(language))
+            .collect::<BTreeSet<_>>();
+        Ok(candidates
+            .into_iter()
+            .filter_map(|language| {
+                // File tools retain configured exclusions in the listing. Source
+                // scope belongs to the Project, and metadata alone is not source.
+                match project.analyzable_files_from(&listing.0, language) {
+                    Ok(files) if files.is_empty() => None,
+                    Ok(_) => Some((language, None)),
+                    Err(error) => {
+                        Some((
+                            language,
+                            Some(StoreError::from(error).context(format!(
+                                "identifying unselected {language:?} source scope"
+                            ))),
+                        ))
+                    }
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn require_workspace_languages(
+        &self,
+        languages: &[Language],
+    ) -> Result<(), StoreError> {
+        let classification = self.not_selected_languages.as_ref().map_err(Clone::clone)?;
+        let not_selected = classification
+            .keys()
+            .copied()
+            .filter(|language| languages.contains(language))
+            .collect::<BTreeSet<_>>();
+        if not_selected.is_empty() {
+            return Ok(());
+        }
+        let error = StoreError::workspace_languages_not_selected(&not_selected);
+        let scope_errors = classification
+            .iter()
+            .filter(|(language, _)| not_selected.contains(*language))
+            .filter_map(|(language, error)| error.as_ref().map(|error| (*language, error)))
+            .collect::<BTreeMap<_, _>>();
+        Err(if scope_errors.is_empty() {
+            error
+        } else {
+            error.context(format!(
+                "source scope could not be certified: {scope_errors:?}"
+            ))
+        })
+    }
+
+    pub(crate) fn require_import_source_selection(
+        &self,
+        seed_files: Option<&[ProjectFile]>,
+    ) -> Result<(), StoreError> {
+        let languages = seed_files.map_or_else(
+            || Language::ANALYZABLE.to_vec(),
+            |files| files.iter().map(workspace_language_for_file).collect(),
+        );
+        self.require_workspace_languages(&languages)
+            .inspect_err(|error| {
+                crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                    QueryReadIncomplete::StoreFailure(error.clone()),
+                );
+            })
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut context = self.clone();
+        if context.requested_languages.is_some() {
+            // A request view can add or remove source languages independently
+            // of the generation whose persisted heads the delegates retain.
+            let membership =
+                crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::capture(
+                    project.as_ref(),
+                    self.retention_budget(),
+                );
+            context.not_selected_languages = Self::not_selected_languages(
+                project.as_ref(),
+                Some(membership.as_ref()),
+                context.requested_languages.as_ref(),
+            );
+        }
         context.project = project;
         context
     }
@@ -555,6 +687,11 @@ impl WorkspaceBuildContext {
     ) -> Arc<Self> {
         let mut next = self.clone();
         next.store_context.workspace_listing_complete = membership.listing().is_ok();
+        next.not_selected_languages = Self::not_selected_languages(
+            next.project.as_ref(),
+            Some(&membership),
+            next.requested_languages.as_ref(),
+        );
         next.store_context.membership = Some(membership);
         next.store_context.workspace_snapshot = None;
         Arc::new(next)
@@ -746,8 +883,6 @@ impl MultiAnalyzer {
         without_project_reads(|| {
             // Maintenance inputs have no query owner, even on a request thread.
             let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
-            let carried_context =
-                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let project = self
                 .build_context
                 .as_ref()
@@ -772,11 +907,59 @@ impl MultiAnalyzer {
                     return failed;
                 }
             };
-            let membership =
-                crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
+            let membership = match project {
+                Some(project) => {
+                    crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::observe(
+                        listing,
+                        project,
+                        self.snapshot_caches.retention_budget(),
+                    )
+                }
+                None => crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
                     listing,
                     self.snapshot_caches.retention_budget(),
-                );
+                ),
+            };
+            self.rebuild_with_membership(progress, membership)
+        })
+    }
+
+    pub(crate) fn with_generation_membership(
+        &self,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Self {
+        let mut next = self.clone();
+        next.build_context = self
+            .build_context
+            .as_ref()
+            .map(|context| context.with_membership(Arc::clone(&membership)));
+        next.delegates = self
+            .delegates
+            .iter()
+            .map(|(language, delegate)| {
+                (
+                    *language,
+                    delegate.with_generation_membership(Arc::clone(&membership)),
+                )
+            })
+            .collect();
+        next
+    }
+
+    pub(crate) fn rebuild_with_membership(
+        &self,
+        progress: Option<BuildProgress>,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Self {
+        if let Some(error) = membership.selection_error() {
+            let mut failed = self.failed_update(error.into(), &BTreeSet::new());
+            failed.full_refresh_pending = true;
+            return failed;
+        }
+        without_project_reads(|| {
+            let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
+            let carried_context =
+                brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let build_context = self
                 .build_context
                 .as_ref()
@@ -1935,6 +2118,37 @@ impl TypeHierarchyProvider for MultiAnalyzer {
 /// from Go sources alone -- and it is also right for C#, whose types no other
 /// realm can extend.
 impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
+    fn member_owner_selections(
+        &self,
+        member: &CodeUnit,
+        receiver: brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape,
+        concrete_self: Option<&crate::analyzer::usages::member_family::ResolvedMemberSelf>,
+        call_site: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+    ) -> crate::analyzer::usages::member_family::MemberOwnerSelections {
+        crate::analyzer::languages::language_support_for_hook(
+            language_for_file(member.source()),
+            "workspace_member_owner_selections",
+        )
+        .map(|support| {
+            support.workspace_member_owner_selections(
+                self,
+                member,
+                receiver,
+                concrete_self,
+                call_site,
+            )
+        })
+        .unwrap_or_else(|| {
+            self.member_family_provider_for_code_unit(member)
+                .map(|provider| {
+                    provider.member_owner_selections(member, receiver, concrete_self, call_site)
+                })
+                .unwrap_or_else(
+                    crate::analyzer::usages::member_family::MemberOwnerSelections::unsupported,
+                )
+        })
+    }
+
     fn member_family_capability(
         &self,
         member: &CodeUnit,
@@ -2227,6 +2441,29 @@ impl CodeUnitIndex for MultiAnalyzer {
         )
     }
 
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        use brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome;
+        crate::analyzer::i_analyzer::capture_lookup_answer(self, || {
+            let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
+            let mut units = Vec::new();
+            // Preserve the full inventory's delegate order, including claimed extensions.
+            for (language, delegate) in &self.delegates {
+                let Some(group) = grouped.get(language) else {
+                    continue;
+                };
+                match delegate.analyzer().declarations_for_files_answer(group) {
+                    LookupOutcome::Found(answer) => units.extend(answer),
+                    LookupOutcome::Incomplete(reason) => return LookupOutcome::Incomplete(reason),
+                    LookupOutcome::NotFound => unreachable!("an inventory always has a set answer"),
+                }
+            }
+            LookupOutcome::Found(units)
+        })
+    }
+
     fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
         self.delegates
             .values()
@@ -2485,6 +2722,14 @@ impl IAnalyzer for MultiAnalyzer {
         );
     }
 
+    fn configuration_external_inputs_unchanged(&self) -> bool {
+        self.delegates.values().all(|delegate| {
+            delegate
+                .analyzer()
+                .configuration_external_inputs_unchanged()
+        })
+    }
+
     fn certify_selected_configuration(
         &self,
         language: Language,
@@ -2515,6 +2760,52 @@ impl IAnalyzer for MultiAnalyzer {
             .declaration_candidates_for_question(file, question)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn selected_receiver_proofs_after_transfer_batch_for_test(
+        &self,
+        file: &ProjectFile,
+        questions: &[crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion],
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Vec<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>>,
+    > {
+        let Some(delegate) = self.delegate_for_file(file) else {
+            self.refuse_read_reuse();
+            return Ok(vec![None; questions.len()]);
+        };
+        delegate
+            .analyzer()
+            .selected_receiver_proofs_after_transfer_batch_for_test(file, questions, cancellation)
+    }
+
+    fn selected_receiver_proof_read(
+        &self,
+        file: &ProjectFile,
+        question: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+    > {
+        let Some(delegate) = self.delegate_for_file(file) else {
+            self.refuse_read_reuse();
+            return Ok(None);
+        };
+        delegate
+            .analyzer()
+            .selected_receiver_proof_read(file, question, cancellation)
+    }
+
+    fn certify_selected_source_file(
+        &self,
+        expected: &crate::analyzer::store::resolution_operation::SelectedSourceFileCertificate<'_>,
+    ) -> bool {
+        let Some(delegate) = self.delegate_for_file(expected.file) else {
+            self.record_unattributed_read();
+            return false;
+        };
+        delegate.analyzer().certify_selected_source_file(expected)
+    }
+
     fn selected_parse_variant(
         &self,
         file: &ProjectFile,
@@ -2526,6 +2817,12 @@ impl IAnalyzer for MultiAnalyzer {
             Some(delegate) => delegate.analyzer().selected_parse_variant(file),
             None => None,
         }
+    }
+
+    fn require_workspace_languages(&self, languages: &[Language]) -> Result<(), StoreError> {
+        self.build_context.as_ref().map_or(Ok(()), |context| {
+            context.require_workspace_languages(languages)
+        })
     }
 
     fn dynamic_import_sources(
@@ -2546,10 +2843,23 @@ impl IAnalyzer for MultiAnalyzer {
                 })
                 .collect::<Vec<_>>()
         });
+        context.require_import_source_selection(seed_files)?;
+        let mut snapshots = crate::analyzer::store::WorkspaceSnapshots::default();
+        for delegate in self.delegates.values() {
+            if let Some(selected) = delegate.analyzer().selected_workspace_snapshots_for_reads() {
+                for (language, snapshot) in selected.iter() {
+                    let previous = snapshots.insert(language.clone(), snapshot.clone());
+                    assert!(
+                        previous.is_none_or(|previous| previous == *snapshot),
+                        "language delegates selected different snapshots for {language}"
+                    );
+                }
+            }
+        }
         context
             .store_context
             .store
-            .read_dynamic_import_sources(&context.store_context.workspace_id, seed_paths.as_deref())
+            .read_dynamic_import_sources(&snapshots, seed_paths.as_deref())
     }
 
     fn loop_candidates_for(
@@ -2819,6 +3129,16 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates
             .values()
             .for_each(|delegate| delegate.analyzer().begin_query(context));
+        // Delegates hold the same project view, so the request lists the
+        // workspace once, whichever delegate a consumer reaches (#13799). The
+        // index cell stays the first delegate's; only the listings are shared.
+        let mut cells = self
+            .delegates
+            .values()
+            .filter_map(|delegate| delegate.analyzer().workspace_file_index_cell());
+        if let Some(first) = cells.next() {
+            cells.for_each(|cell| cell.share_listing_with(&first));
+        }
         // Readers retain selected snapshots and weak owners, never an analyzer/project cycle.
         let readers = self
             .delegates
@@ -2995,8 +3315,13 @@ impl IAnalyzer for MultiAnalyzer {
         );
     }
 
-    fn record_budget_dependences(&self, count: usize) {
-        crate::analyzer::i_analyzer::record_budget_dependence(
+    fn record_attributed_dependences(
+        &self,
+        record: crate::analyzer::i_analyzer::AttributeDependences,
+        count: usize,
+    ) {
+        crate::analyzer::i_analyzer::record_attributed_dependence(
+            record,
             count,
             || IAnalyzer::read_ledger_attached(self),
             || {
@@ -3091,6 +3416,23 @@ impl IAnalyzer for MultiAnalyzer {
                     .any(|registered| Arc::ptr_eq(registered, context))
             },
             |context| context.semantic_model_overlay_override_for_current_thread(),
+        )
+    }
+
+    fn active_query_host_activation_context(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::HostActivationContext>>> {
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::registered_query_context_value(
+            |context| {
+                contexts
+                    .iter()
+                    .any(|registered| Arc::ptr_eq(registered, context))
+            },
+            |context| context.host_activation_override_for_current_thread(),
         )
     }
 
@@ -3193,9 +3535,10 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     /// The first delegate's cell — the same delegate `project()` answers from,
-    /// so the memoized listing describes exactly the workspace this analyzer
+    /// so the memoized index describes exactly the workspace this analyzer
     /// reports. `begin_query` propagates to every delegate, so it is active
-    /// whenever this analyzer's own scope is.
+    /// whenever this analyzer's own scope is, and it points every delegate's
+    /// cell at the first one's workspace listings.
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.delegates
             .values()
@@ -3303,9 +3646,29 @@ impl IAnalyzer for MultiAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         supplied_listing: Option<&SharedWorkspaceFileListing>,
     ) -> Self {
-        if self.full_refresh_pending {
-            return self.update_all_with_progress(None);
+        IAnalyzer::update_with_listing_report(self, changed_files, supplied_listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        supplied_listing: Option<&SharedWorkspaceFileListing>,
+    ) -> (Self, super::read_verification::UpdateEffects) {
+        use super::read_verification::UpdateEffects;
+        if self.build_context.is_none() && self.delegates.is_empty() {
+            return (self.clone(), UpdateEffects::no_changes());
         }
+        if self.full_refresh_pending {
+            return (
+                self.update_all_with_progress(None),
+                UpdateEffects::AllMayHaveChanged("full delegate refresh"),
+            );
+        }
+        // The membership effect is decided once, after membership_update: an
+        // incremental update describes every membership difference as a path of
+        // the changed set (reported or folded in), so the delegates' per-path
+        // effects cover it; a rebuild may change anything.
+        let mut effects = UpdateEffects::no_changes();
         let pending_changes = if supplied_listing.is_some() {
             changed_files.clone()
         } else {
@@ -3321,10 +3684,15 @@ impl IAnalyzer for MultiAnalyzer {
             let carried_context =
                 brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let mut delegates = self.delegates.clone();
-            if supplied_listing.is_none()
-                && let Some(context) = &self.build_context
-            {
-                context.project.revalidate_symlink_omissions(changed_files);
+            if supplied_listing.is_none() {
+                if let Some(context) = &self.build_context {
+                    context.project.revalidate_symlink_omissions(changed_files);
+                } else if let Some(delegate) = self.delegates.values().next() {
+                    delegate
+                        .analyzer()
+                        .project()
+                        .revalidate_symlink_omissions(changed_files);
+                }
             }
             // The one listing read of this update: it names the live languages and
             // reaches every delegate, so none of them walks the workspace again.
@@ -3366,6 +3734,10 @@ impl IAnalyzer for MultiAnalyzer {
             };
             // WorkspaceAnalyzer supplies already resolved paths. A direct
             // IAnalyzer update owns that step before sharing its listing too.
+            let before_points = listing
+                .as_ref()
+                .and_then(|listing| self.project().membership_point_observation(listing))
+                .map(|proof| proof.lineage);
             let resolved_files = match (supplied_listing, &mut listing) {
                 (None, Some(listing)) => {
                     match brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
@@ -3373,9 +3745,9 @@ impl IAnalyzer for MultiAnalyzer {
                         changed_files,
                         listing,
                         &|file| {
-                            self.delegates.keys().any(|language| {
-                                super::is_language_configuration_input(*language, file)
-                            })
+                            self.delegates
+                                .values()
+                                .any(|delegate| delegate.is_configuration_input(file))
                         },
                     ) {
                         Ok(files) => {
@@ -3393,12 +3765,50 @@ impl IAnalyzer for MultiAnalyzer {
                 }
                 _ => changed_files.clone(),
             };
+            let mut resolved_files = resolved_files;
+            let membership = self
+                .generation_membership()
+                .listing()
+                .ok()
+                .filter(|old| {
+                    supplied_listing.is_some()
+                        && listing.as_ref().is_some_and(|new| {
+                            Arc::ptr_eq(&old.0, &new.0) && Arc::ptr_eq(&old.1, &new.1)
+                        })
+                })
+                .map(|_| Arc::clone(self.generation_membership()))
+                .unwrap_or_else(|| {
+                    crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::observe_update(
+                        self.generation_membership(),
+                        before_points,
+                        listing.clone(),
+                        &resolved_files,
+                        self.project(),
+                        self.snapshot_caches.retention_budget(),
+                    )
+                });
+            if let Some(error) = membership.selection_error() {
+                listing_read_error = Some(std::io::Error::from(error).into());
+                return self.clone();
+            }
+            if crate::analyzer::tree_sitter_analyzer::membership_update(
+                self.generation_membership(),
+                &membership,
+                &resolved_files,
+                self.project(),
+                &|file| {
+                    self.delegates
+                        .values()
+                        .any(|delegate| delegate.is_configuration_input(file))
+                },
+            )
+            .apply(&mut resolved_files)
+            .is_err()
+            {
+                effects = UpdateEffects::AllMayHaveChanged("membership rebuild");
+                return self.rebuild_with_membership(None, membership);
+            }
             let changed_files = &resolved_files;
-            let membership =
-                crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
-                    listing.clone(),
-                    self.snapshot_caches.retention_budget(),
-                );
             let build_context = self
                 .build_context
                 .as_ref()
@@ -3422,7 +3832,7 @@ impl IAnalyzer for MultiAnalyzer {
                 delegates.insert(language, delegate);
             }
 
-            let updated: Vec<(Language, AnalyzerDelegate, bool)> = delegates
+            let updated: Vec<(Language, AnalyzerDelegate, bool, UpdateEffects)> = delegates
                 .iter()
                 .collect::<Vec<_>>()
                 .into_par_iter()
@@ -3433,7 +3843,8 @@ impl IAnalyzer for MultiAnalyzer {
                                 // Construction indexed the complete current language
                                 // file set, including this delta. Applying it again is
                                 // redundant and can schedule avoidable store GC work.
-                                return (*language, delegate.clone(), false);
+                                return (*language, delegate.clone(), false,
+                                    UpdateEffects::AllMayHaveChanged("new language delegate"));
                             }
                             let relevant: BTreeSet<ProjectFile> = changed_files
                                 .iter()
@@ -3457,27 +3868,41 @@ impl IAnalyzer for MultiAnalyzer {
                                     *language,
                                 )
                                 .unwrap_or(true);
+                            // Hard-won: #13641: a delegate whose hiding omission
+                            // disappeared must run its update to rebuild.
+                            let clears_omission = delegate
+                                .analyzer()
+                                .workspace_fact_indexes()
+                                .iter()
+                                .any(|index| index.hiding_omission_hidden())
+                                && !crate::analyzer::tree_sitter_analyzer::listing_may_withdraw_proof(
+                                    delegate.analyzer().project(),
+                                    listing.as_ref(),
+                                    *language,
+                                )
+                                .unwrap_or(true);
                             if relevant.is_empty()
                                 && !delegate.inner.listing_changed(listing.as_ref())
                                 && !withdraws_proof
+                                && !clears_omission
+                                && delegate.inner.ignore_inputs_verified()
                             {
-                                (*language, delegate.clone(), false)
+                                (*language, delegate.clone(), false, UpdateEffects::no_changes())
                             } else {
-                                (
-                                    *language,
-                                    delegate.with_generation_membership(Arc::clone(&membership)).update(&relevant, listing.as_ref()),
-                                    true,
-                                )
+                                let prepared = delegate.with_generation_membership(Arc::clone(&membership));
+                                let (inner, report) = prepared.inner.update_report(&relevant, listing.as_ref());
+                                (*language, AnalyzerDelegate { inner }, true, report)
                             }
                         })
                     })
                 })
                 .collect();
             let any_delegate_changed =
-                !missing_languages.is_empty() || updated.iter().any(|(_, _, changed)| *changed);
+                !missing_languages.is_empty() || updated.iter().any(|(_, _, changed, _)| *changed);
             let delegates = updated
                 .into_iter()
-                .map(|(language, delegate, _)| {
+                .map(|(language, delegate, _, report)| {
+                    effects.combine(report);
                     (
                         language,
                         delegate.with_generation_membership(Arc::clone(&membership)),
@@ -3490,6 +3915,11 @@ impl IAnalyzer for MultiAnalyzer {
                 })
                 .collect::<BTreeMap<_, _>>();
             let retired_delegate = delegates.len() < self.delegates.len() + missing_languages.len();
+            if retired_delegate {
+                effects.combine(UpdateEffects::AllMayHaveChanged(
+                    "retired language delegate",
+                ));
+            }
             if any_delegate_changed || retired_delegate {
                 return Self::new_with_build_context(
                     delegates,
@@ -3543,7 +3973,10 @@ impl IAnalyzer for MultiAnalyzer {
         if context.store_error().is_some() {
             updated.pending_updates = pending_changes;
         }
-        updated
+        if updated.has_update_failure() {
+            effects = UpdateEffects::AllMayHaveChanged("delegate update failure");
+        }
+        (updated, effects)
     }
 
     fn update_all(&self) -> Self {
@@ -4753,6 +5186,37 @@ pub mod test_support;
 impl brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority
     for MultiAnalyzer
 {
+    fn basis(
+        &self,
+        question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
+        answer: [u8; 32],
+    ) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis> {
+        IAnalyzer::external_selection_authorities(self)
+            .into_iter()
+            .find(|authority| {
+                authority
+                    .questions()
+                    .iter()
+                    .any(|candidate| candidate.digest == question.digest)
+            })?
+            .basis(question, answer)
+    }
+    fn answer_under_basis(
+        &self,
+        question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
+        basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+    ) -> Option<[u8; 32]> {
+        IAnalyzer::external_selection_authorities(self)
+            .into_iter()
+            .find(|authority| {
+                authority
+                    .questions()
+                    .iter()
+                    .any(|candidate| candidate.digest == question.digest)
+            })?
+            .answer_under_basis(question, basis)
+    }
+
     fn questions(
         &self,
     ) -> Vec<brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion> {

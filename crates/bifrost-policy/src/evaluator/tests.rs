@@ -1958,6 +1958,36 @@ fn cvss_overlay_hash_uses_canonical_labels_and_utc_time() {
 }
 
 #[test]
+fn step_produced_no_rows_advisory_is_dropped_from_policy_diagnostics() {
+    let empty_step = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::StepProducedNoRows,
+        impact: CodeQueryDiagnosticImpact::Advisory,
+        branch: Vec::new(),
+        language: "workspace",
+        message: "step `filter` rejected all 1 input row(s)".to_string(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+        step_index: Some(1),
+        step_op: Some("filter".to_string()),
+        no_rows_reason: Some(
+            brokk_bifrost_rql::structural::CodeQueryStepNoRowsReason::AllInputsFiltered,
+        ),
+        cause_codes: Vec::new(),
+    });
+    let adapted = adapt_query_diagnostics(&[empty_step], 8, 64);
+    assert!(adapted.diagnostics.is_empty());
+    assert!(!adapted.truncated);
+    assert!(!adapted.adaptation_failed);
+}
+
+#[test]
 fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive() {
     let broad = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
         has_non_utf8_refusal: false,
@@ -1974,6 +2004,10 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
         message: "broad query".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     });
     assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
     assert!(incomplete_reasons(&CodeQueryCompletion::Complete).is_empty());
@@ -2081,6 +2115,10 @@ fn rejected_query_diagnostic_fails_without_hiding_later_valid_diagnostics() {
         message: "x".repeat(4_097),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     });
     let valid = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
         has_non_utf8_refusal: false,
@@ -2097,6 +2135,10 @@ fn rejected_query_diagnostic_fails_without_hiding_later_valid_diagnostics() {
         message: "later valid diagnostic".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     });
 
     let execution = adapt_match_execution(
@@ -2262,6 +2304,10 @@ fn bounded_row_predicate_diagnostic_remains_typed_incomplete() {
         message: message.clone(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: Some("fixture.rs".into()),
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
         call_relation_facts: None,
         uses_omissions: Vec::new(),
     });
@@ -2316,6 +2362,10 @@ fn retained_query_diagnostics_are_a_function_of_the_set_raised() {
             message: message.to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         })
     };
     // Refusal subjects preserve that same set and admission at every evidence
@@ -2482,7 +2532,7 @@ fn rejected_detailed_row_does_not_hide_later_positive_candidates() {
         BindingOutputClass::DirectOnly,
         results.iter().map(UnitRowItem::project).collect(),
         evidence.iter().map(UnitRowEvidence::project).collect(),
-        &query_diagnostics,
+        query_diagnostics.semantic(),
     );
 
     assert!(adapted.conversion_failed);
@@ -3292,6 +3342,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
                 argument_identity: None,
                 caller_parameter_identity: None,
                 receiver: None,
+                receiver_site: None,
                 arguments: Vec::new(),
             }),
         },
@@ -3499,7 +3550,7 @@ fn proven_call_without_a_stable_caller_identity_is_name_based_but_keeps_strong_a
         &policy_id,
         UnitRowItem::project(&item),
         UnitRowEvidence::project(&evidence),
-        &detailed.result.diagnostics,
+        detailed.result.diagnostics.semantic(),
         &mut ordinals,
         &mut HashMap::new(),
     )
@@ -3565,7 +3616,7 @@ fn class_declaration_finding_id(source: &str, name: &str, weak: bool) -> PolicyF
         &policy_id,
         UnitRowItem::project(&item),
         evidence,
-        &detailed.result.diagnostics,
+        detailed.result.diagnostics.semantic(),
         &mut HashMap::new(),
         &mut HashMap::new(),
     )
@@ -3633,6 +3684,10 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         message: "branch-local ambiguity".to_string(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     });
 
     let projected = |branch| UnitRowProvenance::project(&provenance(branch));
@@ -4453,7 +4508,9 @@ fn budget_telemetry_keeps_refusals_outside_the_diagnostic_cap() {
         has_non_utf8_refusal: false,
         refusal_sites: Default::default(),
         uses_omissions: Vec::new(),
-        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
+            brokk_bifrost_rql::DiagnosticExecutionCause::Budget,
+        ),
         code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
@@ -4462,6 +4519,10 @@ fn budget_telemetry_keeps_refusals_outside_the_diagnostic_cap() {
         source: None,
         related: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
         exhausted_roots: vec![CodeQueryExhaustedRoot {
             path: ".".to_string(),
             procedure: None,
@@ -4712,6 +4773,10 @@ fn raw_rql_typestate_partial_outside_root_is_explicitly_evaluation_scoped() {
         message: "raw typestate partial".into(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     });
     let adapted = adapt_query_diagnostic(&diagnostic, 8, &mut PolicyDiagnostics::new()).unwrap();
     assert_eq!(
@@ -4812,6 +4877,7 @@ fn call_path_certificate_preserves_contributing_branch_ambiguity() {
             }],
         }],
         coverage: CallPathCoverage::Complete,
+        operational_causes: Vec::new(),
         truncated: false,
     };
     assert!(certificate.validate());
@@ -4894,6 +4960,10 @@ fn call_path_certificate_preserves_contributing_branch_ambiguity() {
                 message: "another contributing query branch is ambiguous".into(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             });
             let candidate = adapt_match_candidate(
                 &PolicyId::new("test.call-path-branch-certainty").unwrap(),
@@ -5049,6 +5119,10 @@ fn diagnostic_causes_preserve_product_execution_metadata_before_loss() {
                     message: message.clone(),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                     call_relation_facts: None,
                 })
             };
@@ -5442,7 +5516,7 @@ fn procedure_source_owner_provenance_uses_the_cross_file_target() {
             .iter()
             .map(UnitRowEvidence::project)
             .collect(),
-        &detailed.result.diagnostics,
+        detailed.result.diagnostics.semantic(),
     );
     assert!(!evaluated.conversion_failed, "{evaluated:?}");
     assert_eq!(evaluated.candidates.len(), 1, "{detailed:?}");
@@ -5552,4 +5626,237 @@ fn refusal_render_counts_distinct_nonportable_utf8_sites() {
     assert_eq!(result.diagnostics, repeated.diagnostics);
     assert!(!result.truncated);
     assert!(result.budget_refusals.is_empty());
+}
+
+#[test]
+fn match_guard_vocabulary_resolution_and_advisory_load_notes() {
+    use crate::PolicySourceIdentity;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::AnalyzerConfig;
+    use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::{
+        GuardRemovalToken, GuardRemovalVocabulary,
+    };
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestPointerKind {
+        Alias,
+        Lifecycle,
+    }
+    struct TestPointerVocab;
+    impl GuardRemovalVocabulary for TestPointerVocab {
+        fn producer_id(&self) -> &'static str {
+            "rust-pointer-findings"
+        }
+        fn resolve(&self, name: &str) -> Option<GuardRemovalToken> {
+            match name {
+                "alias" => Some(GuardRemovalToken::new(
+                    self.producer_id(),
+                    TestPointerKind::Alias,
+                )),
+                "lifecycle" => Some(GuardRemovalToken::new(
+                    self.producer_id(),
+                    TestPointerKind::Lifecycle,
+                )),
+                _ => None,
+            }
+        }
+        fn names(&self) -> Vec<&'static str> {
+            vec!["alias", "lifecycle"]
+        }
+    }
+
+    let policy_source = r#"(policy
+        :id "test.pointer-guard-vocab" :name "Pointer guard" :message "Pointer access"
+        :severity warning :analysis (analysis :type match
+            :selector (rql (rust-pointer-findings (procedure-of (language rust (function)))))
+            :guard-barriers [(guard-barrier :id checked
+                :predicate (comparison-guard :relation equality :operand either)
+                :clean-when true :removes [alias bogus])]))"#;
+
+    // 1. Without any registered vocabulary: load-time note, empty tokens, Advisory note on run.
+    let unreg = policy_registry("test:unreg-vocab", policy_source);
+    let unreg_policy = unreg.policies().next().unwrap();
+    assert_eq!(unreg_policy.match_guard_load_notes().len(), 1);
+    assert!(
+        unreg_policy.match_guard_load_notes()[0]
+            .message
+            .contains("no registered removal vocabulary")
+    );
+    assert!(unreg_policy.match_guards()[0].tokens.is_empty());
+
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn ok() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let budget = PolicyBudget::default();
+    let evaluated = evaluate_match_policy_candidates(
+        unreg_policy,
+        &flow_state,
+        workspace.analyzer(),
+        Some(&workspace),
+        &budget,
+        None,
+    );
+    assert_eq!(evaluated.completion, PolicyRunCompletion::Complete);
+    assert!(evaluated.diagnostics.iter().any(|d| {
+        d.code() == &PolicyDiagnosticCode::GuardRemovalVocabularyNote
+            && d.severity() == PolicyDiagnosticSeverity::Note
+            && d.impact() == PolicyDiagnosticImpact::Advisory
+    }));
+
+    // 2. With registered vocabulary: `alias` resolves with checked downcast, `bogus` emits note.
+    let mut reg = PolicyRegistry::new_without_workspace(
+        Arc::new(crate::TaintCatalogRegistry::new_without_workspace(
+            Default::default(),
+        )),
+        Default::default(),
+    )
+    .with_guard_vocabulary(Arc::new(TestPointerVocab));
+    reg.register_policy_bytes(
+        PolicySourceIdentity::new("test:reg-vocab"),
+        policy_source.as_bytes(),
+    )
+    .expect("valid policy");
+    let reg_policy = reg.policies().next().unwrap();
+    assert_eq!(reg_policy.match_guard_load_notes().len(), 1);
+    assert!(
+        reg_policy.match_guard_load_notes()[0]
+            .message
+            .contains("bogus")
+    );
+    assert_eq!(reg_policy.match_guards()[0].tokens.len(), 1);
+    let token = &reg_policy.match_guards()[0].tokens[0];
+    assert_eq!(token.producer_id(), "rust-pointer-findings");
+    assert_eq!(
+        token.downcast::<TestPointerKind>("rust-pointer-findings"),
+        Some(&TestPointerKind::Alias)
+    );
+    assert_eq!(token.downcast::<TestPointerKind>("other-producer"), None);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13672: an optional guard compiler error dropped unrelated pointer findings"
+)]
+fn pointer_findings_survive_optional_guard_binding_failure() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::CompiledGuardBindings;
+    use brokk_bifrost_analysis::analyzer::semantic::{CancellationToken, ProcedureHandle};
+    struct FailedGuards;
+    impl brokk_bifrost_rql::MatchGuardBindingSource for FailedGuards {
+        fn bindings_for_procedure(
+            &self,
+            _: &WorkspaceAnalyzer,
+            _: &CancellationToken,
+            _: &ProcedureHandle,
+        ) -> Result<CompiledGuardBindings, String> {
+            Err("test-only selected guard unavailable".into())
+        }
+    }
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn run() -> usize { let p: *const usize; { let n: usize = 42; p = &n; } unsafe { *p } }")
+        .build();
+    let workspace = project.workspace_analyzer(Default::default());
+    let query =
+        CodeQuery::from_sexp("(rust-pointer-findings (procedure-of (language rust (function))))")
+            .unwrap();
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let baseline =
+        brokk_bifrost_rql::structural::search::execute_code_query_detailed_eager_index_workspace(
+            &workspace,
+            &flow,
+            &query,
+            Default::default(),
+            None,
+        );
+    assert!(!baseline.result.results.is_empty(), "{baseline:#?}");
+    let resources = brokk_bifrost_rql::SemanticFlowResources::from_workspace_state(&flow)
+        .with_guard_bindings(Some(Arc::new(FailedGuards)));
+    let guarded =
+        brokk_bifrost_rql::structural::search::execute_code_query_detailed_eager_index_workspace(
+            &workspace,
+            resources,
+            &query,
+            Default::default(),
+            None,
+        );
+    assert_eq!(
+        serde_json::to_value(&baseline.result.results).unwrap(),
+        serde_json::to_value(&guarded.result.results).unwrap()
+    );
+    assert!(
+        guarded
+            .result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message()
+                .contains("test-only selected guard unavailable")),
+        "{guarded:#?}"
+    );
+    assert_ne!(
+        guarded.result.completion(),
+        brokk_bifrost_rql::structural::CodeQueryCompletion::Complete
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13672: discarded Match guard compilers hid incomplete selector discovery"
+)]
+fn match_guard_selector_gaps_survive_compiler_transport() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::{
+        GuardRemovalToken, GuardRemovalVocabulary,
+    };
+    struct Vocabulary;
+    impl GuardRemovalVocabulary for Vocabulary {
+        fn producer_id(&self) -> &'static str {
+            "rust-pointer-findings"
+        }
+        fn resolve(&self, name: &str) -> Option<GuardRemovalToken> {
+            (name == "alias").then(|| GuardRemovalToken::new(self.producer_id(), ()))
+        }
+        fn names(&self) -> Vec<&'static str> {
+            vec!["alias"]
+        }
+    }
+    let source = r#"(policy :id "test.match-guard-gap" :name "Guard gap" :message "Pointer access" :severity warning
+        :analysis (analysis :type match
+          :selector (rql (rust-pointer-findings (procedure-of (language rust (function)))))
+          :guard-barriers [(guard-barrier :id checked
+            :predicate (call-guard :selector (rql (resolved-call :resolves-to "Missing.allowed" :proof exact (call-bindings (call-shape (language rust (call :callee "allowed")))))) :operand (argument :index 0))
+            :clean-when true :removes [alias])]))"#;
+    let mut registry = PolicyRegistry::new_without_workspace(
+        Arc::new(crate::TaintCatalogRegistry::new_without_workspace(
+            Default::default(),
+        )),
+        Default::default(),
+    )
+    .with_guard_vocabulary(Arc::new(Vocabulary));
+    registry
+        .register_policy_bytes(
+            crate::PolicySourceIdentity::new("test:match-guard-gap"),
+            source.as_bytes(),
+        )
+        .unwrap();
+    let policy = registry.policies().next().unwrap();
+    let project = InlineTestProject::with_language(Language::Rust).file("src/lib.rs", "pub fn run(flag: bool) -> usize { if flag {} let p: *const usize; { let n: usize = 42; p = &n; } unsafe { *p } }").build();
+    let workspace = project.workspace_analyzer(Default::default());
+    let evaluated = evaluate_match_policy_candidates(
+        policy,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        workspace.analyzer(),
+        Some(&workspace),
+        &PolicyBudget::default(),
+        None,
+    );
+    assert!(
+        evaluated
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("IncompleteGuardSelector")),
+        "{evaluated:#?}"
+    );
+    assert_ne!(evaluated.completion, PolicyRunCompletion::Complete);
 }

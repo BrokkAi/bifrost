@@ -1,0 +1,4 @@
+(policy :schema-version 1 :id "test.flow-progress" :name "Flow progress" :message "flow" :severity warning
+ :analysis (analysis :type flow :mode may :call-modeling (call-modeling :unmodeled paranoid)
+ :origins (endpoint-set :entries [(origin :id input :display-name "source" :selector (rql :schema-version 1 (language java (call :callee (name "source")))) :bind return-value)])
+ :observations (endpoint-set :entries [(observation :id output :display-name "sink" :selector (rql :schema-version 1 (language java (call :callee (name "sink")))) :observed-operand (argument :index 0))])))

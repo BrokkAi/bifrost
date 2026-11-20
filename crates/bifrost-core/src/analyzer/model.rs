@@ -365,6 +365,14 @@ pub fn semantic_pack_realm(language: &str) -> &str {
 }
 
 impl LanguageDialect {
+    /// Whether the first static call or construction of a type runs that
+    /// type's initializer, so a call into the type can execute code that no
+    /// call-site target names (JLS 12.4.1). A callee-body summary does not
+    /// cover that code.
+    pub const fn initializes_type_on_first_use(self) -> bool {
+        matches!(self, Self::Standard(Language::Java))
+    }
+
     /// Every canonical artifact dialect, including the non-analyzable sentinel.
     pub const ALL: [Self; 16] = [
         Self::Standard(Language::None),

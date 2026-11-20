@@ -295,6 +295,7 @@ mod python_extraction_tests {
         let workspace = project.workspace_analyzer(config.clone());
         let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: Vec::new(),
@@ -383,5 +384,65 @@ mod python_extraction_tests {
         assert!(outcome.runtime.is_none(), "{outcome:#?}");
         assert!(!outcome.diagnostic_refresh_required, "{outcome:#?}");
         assert!(!outcome.complete(), "{outcome:#?}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d7fe60a0f678: failure-only preparation must withdraw a previously published Python overlay"
+    )]
+    fn failed_preparation_with_prior_overlay_withdraws_it() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("main.py", "value = 1\n")
+            .build();
+        let stdlib_root = project.root().join(".env/stdlib");
+        std::fs::create_dir_all(&stdlib_root).expect("create stdlib root");
+        std::fs::write(stdlib_root.join("good.py"), b"class Greeter:\n    pass\n")
+            .expect("write stdlib artifact good.py");
+        let mut config = AnalyzerConfig::default();
+        config.python.environment = Some(PythonEnvironmentConfig {
+            implementation: "cpython".to_owned(),
+            version: "3.12.0".to_owned(),
+            platform: "linux".to_owned(),
+            standard_library_root: PathBuf::from(".env/stdlib"),
+            bundled_stub_roots: Vec::new(),
+            distribution_roots: Vec::new(),
+            limits: PythonEnvironmentLimits::default(),
+        });
+        let workspace = project.workspace_analyzer(config.clone());
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let run = || {
+            workspace.activate_dependency_packs(
+                &config,
+                &[DependencyPackEcosystem::Python],
+                DependencyPackWorkspaceContext {
+                    catalog: &catalog,
+                    persistence: None,
+                    activation: &request,
+                    limits: DependencyPackLimits::default(),
+                    cancellation: &cancellation,
+                },
+            )
+        };
+        let initial = run();
+        assert!(initial.runtime.is_some(), "{initial:#?}");
+        assert!(workspace.analyzer().semantic_model_overlay().is_some());
+        std::fs::remove_file(stdlib_root.join("good.py")).unwrap();
+        std::fs::write(stdlib_root.join("broken.py"), [0xff, 0xfe, 0x00]).unwrap();
+        let failed = run();
+        let preparation = failed.ecosystems[0].preparation.as_ref().unwrap();
+        assert!(!preparation.complete, "{preparation:#?}");
+        assert!(preparation.evidence.is_empty(), "{preparation:#?}");
+        assert!(failed.diagnostic_refresh_required, "{failed:#?}");
+        assert!(!failed.complete(), "{failed:#?}");
+        assert!(workspace.analyzer().semantic_model_overlay().is_none());
     }
 }

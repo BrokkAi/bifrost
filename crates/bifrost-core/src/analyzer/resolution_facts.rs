@@ -526,12 +526,16 @@ labelled_enum! {
         // never takes the first result's type. Appended last: the persisted kind
         // code is this enum's index.
         TargetCallableLaterResultType => "target_callable_later_result_type",
-        // Bind a callable/constructor by member name without invoking it. The
-        // reference namespace chooses the member family. The ExpressionValue
+        // Bind Java method/constructor references and C# member names while
+        // invocation semantics are unmodeled. The reference namespace chooses
+        // the member family. The ExpressionValue
         // output carries binding completion only, never the callable's return
         // type or an inferred functional-interface type. No CallFact is needed.
-        // Append only: the persisted codec is this vocabulary's index.
-        NonInvokingMemberReference => "non_invoking_member_reference",
+        // Append only: the persisted codec is this vocabulary's index. The
+        // variant was renamed, but its persisted label and serde name stay the
+        // original `non_invoking_member_reference`.
+        #[serde(rename = "non_invoking_member_reference")]
+        BindingOnlyMemberReference => "non_invoking_member_reference",
         // A Scala term written without an argument list. This records the
         // source selection shape only: binding, evaluation, implicit
         // application, and eta conversion remain separate obligations.
@@ -664,10 +668,37 @@ labelled_enum! {
         /// language wrapper; otherwise preserve the written head. Kinds are
         /// append-only because their ordinals are persisted vocabulary codes.
         ConditionalPayload => "conditional_payload",
+        /// Rust default binding modes. A pattern binder takes a component of
+        /// the matched value; when the matched value is itself a reference,
+        /// the binder takes that component behind one more reference layer.
+        /// This is the component row: its input is the component and its
+        /// tuple is the borrowed-reference `AddressOf` tuple `(1, 1, ToRuntime
+        /// { addressable: false })`, which the evaluator applies only when the
+        /// matched value is a reference. Every component row is paired with
+        /// one `BindingModeScrutinee` row into the same output. Kinds are
+        /// append-only because their ordinals are persisted vocabulary codes.
+        BindingMode => "binding_mode",
+        /// Name the matched value of a `BindingMode` output. Its solved
+        /// reference indirection decides whether the component's reference
+        /// layer applies, and it adds the matched value's completion to the
+        /// output, never the matched value itself (delta 0, `ToNoValue`). Like
+        /// `IndexOperand` and `ElementOperand` it is a completion-carrying
+        /// input that is not a value producer, but it is not an operand gate:
+        /// `is_operand_gate` selects rows that the language operand-gate
+        /// evaluator checks against an already computed output, whereas this
+        /// row is read by the binding-mode evaluator before the output has a
+        /// value.
+        BindingModeScrutinee => "binding_mode_scrutinee",
     }
 }
 
 impl ResolutionTypeTransferKind {
+    /// The rows of a Rust default-binding-mode output: the component and the
+    /// matched-value row the evaluator reads together.
+    pub const fn is_binding_mode(self) -> bool {
+        matches!(self, Self::BindingMode | Self::BindingModeScrutinee)
+    }
+
     pub const fn is_operand_gate(self) -> bool {
         matches!(self, Self::IndexOperand | Self::ElementOperand)
     }
@@ -827,6 +858,79 @@ pub struct ResolutionMacroTypeCandidateFact {
     pub output: ResolutionTypeSlotId,
     pub path: Vec<String>,
     pub elements: Vec<ResolutionTypeSlotId>,
+}
+
+/// A type written in a function shape, as a type-expression frontier plus the
+/// reference layers written around it (`&T` is the identity slot of `T` with
+/// one layer), the same split `ResolutionTypeArgumentFact` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionFunctionShapeTypeFact {
+    pub slot: ResolutionTypeSlotId,
+    pub indirection_delta: i8,
+    pub reference_indirection_delta: i8,
+}
+
+/// The parenthesized function-family bound written on one type: the bound of a
+/// type parameter (`F: FnMut(A) -> B`, inline or in a where clause) or of an
+/// `impl Fn(A)` / `dyn Fn(A)` type.
+///
+/// This is syntax, not authority. `trait_head` is the identity slot of the
+/// bound's written trait path; a consumer treats the shape as a function
+/// family only when that slot resolves to the standard `Fn`, `FnMut` or
+/// `FnOnce` trait, so a user trait that happens to be named `Fn` never
+/// qualifies. The parameter and result slots are ordinary declared-type
+/// lowerings, so an unresolved `A`, `B` or `Self::Item` keeps its own gaps.
+///
+/// An owner carries at most one shape. Two function-family bounds on one owner
+/// publish none, and a bound that is not written as a parenthesized function
+/// trait (a supertrait that implies `Fn`, a bare `fn(A)` pointer) publishes
+/// none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionFunctionShapeFact {
+    /// The identity slot of the bounded type parameter, `impl` type or `dyn` type.
+    pub owner: ResolutionTypeSlotId,
+    /// The identity slot of the bound's written trait path.
+    pub trait_head: ResolutionTypeSlotId,
+    /// The written parameter types, in source order.
+    pub parameters: Vec<ResolutionFunctionShapeTypeFact>,
+    /// The written `-> T`; absent when the bound writes no result.
+    pub result: Option<ResolutionFunctionShapeTypeFact>,
+}
+
+/// One identifier binder of a closure's parameter list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionClosureBinderFact {
+    /// The binder's value-declaration site; `slot` is a declared-value slot of it.
+    pub declaration: ResolutionSiteId,
+    pub slot: ResolutionTypeSlotId,
+    /// Whether the parameter is written `|x: T|`. The annotation is the
+    /// binder's type; an unannotated binder carries an `InferredType` gap on
+    /// its declaration site instead.
+    pub annotated: bool,
+}
+
+/// A closure expression written as a call argument, with the slots a
+/// contextual signature fills. A closure is not a declaration: it owns no
+/// definition, catalog node or callable signature, and only the evaluator
+/// step that reads a formal's function shape reads these rows.
+///
+/// `value` is the closure's own expression value slot, the input of the
+/// argument's `Argument` transfer. It stays untyped, so argument applicability
+/// is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionClosureLiteralFact {
+    pub value: ResolutionTypeSlotId,
+    /// True only when every parameter is an identifier binder, so that
+    /// `parameters` is the closure's whole parameter list in order. A
+    /// destructuring pattern, `_`, a macro or malformed syntax makes it false
+    /// and publishes no binder: nothing may be filled from an incomplete row.
+    pub complete: bool,
+    pub parameters: Vec<ResolutionClosureBinderFact>,
+    /// The declared-value slot of an explicit `-> T`.
+    pub result: Option<ResolutionTypeSlotId>,
+    /// One `ReturnValue` slot per value-producing exit: the body's tail and
+    /// each `return expr` that belongs to this closure.
+    pub returns: Vec<ResolutionTypeSlotId>,
 }
 
 /// One edge from a structural type syntax slot to a component type syntax
@@ -1496,6 +1600,9 @@ labelled_enum! {
         /// admitted by the JVM language rules participate in lookup. This edge
         /// confers neither nominal subtype proof nor protected members.
         ImplicitInterfaceMembers => "implicit_interface_members",
+        /// An authored nominal parent whose class/interface role requires the
+        /// selected target declaration. Never use this raw role for ordering.
+        AuthoredNominalParent => "authored_nominal_parent",
     }
 }
 
@@ -1636,6 +1743,21 @@ pub struct ResolutionExternAliasFact {
     pub site: ResolutionSiteId,
     pub scope: ResolutionScopeId,
     pub name: ResolutionNameId,
+}
+
+/// Exact source-owned root lookup purpose; this is not a nominal edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionImplicitRootCandidateFact {
+    pub definition: ResolutionSiteId,
+    pub reference: ResolutionSiteId,
+    pub frontier: ResolutionTypeSlotId,
+}
+
+/// Authored declaration modifiers, independent of root selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionDeclarationModifierFact {
+    pub definition: ResolutionSiteId,
+    pub partial: bool,
 }
 
 /// Source evidence only: identity remains unresolved until selected-compilation
@@ -2544,6 +2666,8 @@ pub struct FileResolutionFacts {
     pub import_route_segments: Vec<ResolutionImportRouteSegmentFact>,
     pub root_imports: Vec<ResolutionRootImportFact>,
     pub extern_aliases: Vec<ResolutionExternAliasFact>,
+    pub implicit_root_candidates: Vec<ResolutionImplicitRootCandidateFact>,
+    pub declaration_modifiers: Vec<ResolutionDeclarationModifierFact>,
     pub csharp_friend_attributes: Vec<ResolutionCSharpFriendAttributeFact>,
     pub compilation_imports: Vec<ResolutionCompilationImportFact>,
     pub root_import_segments: Vec<ResolutionRootImportSegmentFact>,
@@ -2585,6 +2709,8 @@ pub struct FileResolutionFacts {
     pub type_productions: Vec<ResolutionTypeProductionFact>,
     pub binary_operations: Vec<ResolutionBinaryOperationFact>,
     pub macro_type_candidates: Vec<ResolutionMacroTypeCandidateFact>,
+    pub function_shapes: Vec<ResolutionFunctionShapeFact>,
+    pub closure_literals: Vec<ResolutionClosureLiteralFact>,
     pub declared_type_arguments: Vec<ResolutionDeclaredTypeArgumentFact>,
     pub type_arguments: Vec<ResolutionTypeArgumentFact>,
     pub generic_type_alias_parameters: Vec<ResolutionGenericTypeAliasParameterFact>,
@@ -2840,21 +2966,28 @@ impl FileResolutionFacts {
     }
 
     /// Intern an already-normalized spelling into this file's name table.
+    ///
+    /// An empty spelling is not a name: it arrives from a MISSING or zero-width
+    /// token under parser error recovery, from empty backticks, or from an
+    /// empty string literal. It returns `None` and the caller records the
+    /// producer's missing-name gap.
     pub fn intern_name<S: BuildHasher>(
         &mut self,
         known_names: &mut HashMap<String, ResolutionNameId, S>,
         spelling: &str,
-    ) -> ResolutionNameId {
-        assert!(!spelling.is_empty(), "resolution names need a spelling");
+    ) -> Option<ResolutionNameId> {
+        if spelling.is_empty() {
+            return None;
+        }
         if let Some(id) = known_names.get(spelling) {
-            return *id;
+            return Some(*id);
         }
         let id = ResolutionNameId::try_from_index(self.names.len())
             .expect("resolution name count exceeds u32");
         let spelling = spelling.to_owned();
         known_names.insert(spelling.clone(), id);
         self.names.push(ResolutionNameFact { id, spelling });
-        id
+        Some(id)
     }
 
     /// Append the Cartesian product of root import sites and requested names.
@@ -2992,6 +3125,8 @@ impl FileResolutionFacts {
             && self.import_route_segments.is_empty()
             && self.root_imports.is_empty()
             && self.extern_aliases.is_empty()
+            && self.implicit_root_candidates.is_empty()
+            && self.declaration_modifiers.is_empty()
             && self.csharp_friend_attributes.is_empty()
             && self.compilation_imports.is_empty()
             && self.root_import_segments.is_empty()
@@ -3287,6 +3422,8 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.import_route_segments))
             .saturating_add(rows(&self.root_imports))
             .saturating_add(rows(&self.extern_aliases))
+            .saturating_add(rows(&self.implicit_root_candidates))
+            .saturating_add(rows(&self.declaration_modifiers))
             .saturating_add(rows(&self.csharp_friend_attributes))
             .saturating_add(
                 self.csharp_friend_attributes
@@ -3427,6 +3564,55 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.reference_enumeration_gaps))
             .saturating_add(rows(&self.gaps))
     }
+}
+
+/// Publish an absolute synthetic type lookup without deciding any hierarchy role.
+/// Language producers supply and validate their own root spelling and occurrence.
+pub fn publish_absolute_synthetic_type_reference(
+    facts: &mut FileResolutionFacts,
+    owner: ResolutionSiteId,
+    reference: ResolutionSiteId,
+    name: ResolutionNameId,
+    prefix: &[ResolutionNameId],
+) -> ResolutionTypeSlotId {
+    assert_eq!(
+        facts.sites[reference.index()].kind,
+        ResolutionSiteKind::SyntheticReference
+    );
+    facts.identifiers.push(PositionedIdentifierFact {
+        site: reference,
+        name,
+        role: ResolutionIdentifierRole::Reference,
+        namespace: ResolutionNamespace::Type,
+        qualifier: None,
+    });
+    facts.reference_owners.push(ResolutionReferenceOwnerFact {
+        reference,
+        owner: Some(owner),
+    });
+    let slot = facts.allocate_type_slot(reference, ResolutionTypeSlotRole::TargetTypeIdentity);
+    facts.binding_projections.push(BindingProjectionFact {
+        reference,
+        output: slot,
+        kind: BindingProjectionKind::TargetTypeIdentity,
+    });
+    facts.root_references.push(ResolutionRootReferenceFact {
+        reference,
+        root_scope: facts.scopes[0].id,
+        anchor: ResolutionRootImportAnchor::Absolute,
+        prefix_reference: None,
+        owner_continued: false,
+    });
+    facts
+        .root_reference_segments
+        .extend(prefix.iter().enumerate().map(|(position, &name)| {
+            ResolutionRootReferenceSegmentFact {
+                reference,
+                position: u32::try_from(position).expect("implicit superclass route fits u32"),
+                name,
+            }
+        }));
+    slot
 }
 
 #[cfg(test)]

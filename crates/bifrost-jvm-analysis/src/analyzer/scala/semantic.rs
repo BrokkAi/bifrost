@@ -278,6 +278,7 @@ impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (specs, initial_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)?.into_lowering_input()
@@ -709,6 +710,8 @@ type ScalaLoweringError = ProcedureLoweringError;
 type EdgeTarget = ControlTarget;
 
 type Work<'tree> = ProcedureWork<'tree>;
+type WorkStack<'stack, 'tree> = dyn brokk_bifrost_semantic::analyzer::semantic::lowering::WorkSink<Work<'tree>, Context = ()>
+    + 'stack;
 
 #[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
@@ -845,7 +848,7 @@ impl ScalaCallFrame {
         builder: &mut ProcedureCfgBuilder,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
         call_site: CallSiteId,
     ) -> Result<(), ScalaLoweringError> {
         context
@@ -893,7 +896,7 @@ impl<'tree, 'targets, 'catalog> ProcedureWorkHandler<'tree>
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         self.session.record_statement_entry(builder, node, entry)?;
         self.statement(builder, node, entry, next, scope, stack)
@@ -906,7 +909,7 @@ impl<'tree, 'targets, 'catalog> ProcedureWorkHandler<'tree>
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         self.expression(builder, node, entry, next, scope, stack)
     }
@@ -918,7 +921,7 @@ impl<'tree, 'targets, 'catalog> ProcedureWorkHandler<'tree>
         entry: ProgramPointId,
         targets: ConditionTargets,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         self.condition(
             builder,
@@ -1757,7 +1760,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         when_true: EdgeTarget,
         when_false: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         // A folded literal keeps exactly one arm, so an `if (false)` body is
         // never reachable and the shared kill on the join is the honest
@@ -2121,7 +2124,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         match node.kind() {
             "block" | "indented_block" | "template_body" | "with_template_body" => {
@@ -2165,7 +2168,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         match node.kind() {
             "block" | "indented_block" | "template_body" | "with_template_body" => {
@@ -2470,7 +2473,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let condition = required_runtime_field(node, "condition")?;
         let consequence = required_field(node, "consequence")?;
@@ -2562,7 +2565,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let condition = required_runtime_field(node, "condition")?;
         let body = required_field(node, "body")?;
@@ -2620,7 +2623,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let body = required_field(node, "body")?;
         let condition = required_field(node, "condition")?;
@@ -2663,7 +2666,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let subject = required_field(node, "value")?;
         let body = required_field(node, "body")?;
@@ -2698,7 +2701,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         next: EdgeTarget,
         scope: ScopeFrameId,
         unmatched_detail: &str,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let unmatched = self
             .session
@@ -2838,7 +2841,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let body = required_field(node, "body")?;
         let children = named_children(node);
@@ -3000,7 +3003,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let body = required_field(node, "body")?;
         let enumerators = required_runtime_field(node, "enumerators")?;
@@ -3157,7 +3160,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let value = required_field(node, "value")?;
         if contains_token(node, "lazy") {
@@ -3393,7 +3396,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let left = required_field(node, "left").or_else(|_| required_field(node, "target"))?;
         let right = required_field(node, "right").or_else(|_| required_field(node, "value"))?;
@@ -3652,7 +3655,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let object = required_field(node, "value")?;
         let field = required_field(node, "field")?;
@@ -3843,7 +3846,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let terminal = self.session.add_node_point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
@@ -3871,7 +3874,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let access = self.session.add_node_point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
@@ -3926,7 +3929,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         builder: &mut ProcedureCfgBuilder,
         invoke: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
         source: ValueId,
         source_node: Node<'tree>,
         target_type: Option<&[String]>,
@@ -3962,7 +3965,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         builder: &mut ProcedureCfgBuilder,
         invoke: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
         source: ValueId,
         source_node: Node<'tree>,
         kind: &SelectedAdaptationKind,
@@ -4020,7 +4023,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         builder: &mut ProcedureCfgBuilder,
         invoke: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
         source: ValueId,
         source_node: Node<'tree>,
         procedure: ProcedureId,
@@ -4183,7 +4186,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         invoke: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
         payload: ValueId,
         result: ValueId,
         source_node: Node<'tree>,
@@ -4308,7 +4311,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let source = self.expression_value(builder, value, expression_value_kind(value))?;
         let target = self.expression_value(builder, node, expression_value_kind(node))?;
@@ -4330,7 +4333,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         node: Node<'tree>,
         entry: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let argument = first_runtime_named_child(node);
         let terminal = if argument.is_some() {
@@ -5133,7 +5136,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         node: Node<'tree>,
         entry: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let argument = first_runtime_named_child(node)
             .ok_or_else(|| missing_field(node, "exception expression"))?;
@@ -5169,7 +5172,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         node: Node<'tree>,
         entry: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let terminal = self.session.add_node_point(builder, node, Vec::new())?;
         self.session
@@ -5191,7 +5194,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         if let Some((base_node, index_node)) = self.array_index_access(node) {
             return self.array_element_load(
@@ -5429,7 +5432,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let arguments = node
             .child_by_field_name("arguments")
@@ -5487,7 +5490,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let left = required_field(node, "left")?;
         let right = required_runtime_field(node, "right")?;
@@ -5591,7 +5594,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         next: EdgeTarget,
         scope: ScopeFrameId,
         operands: &[Node<'tree>],
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let terminal = self.session.add_node_point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
@@ -5626,7 +5629,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         right: Node<'tree>,
         target: ValueId,
         kind: ValueFlowKind,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let terminal = self.session.add_node_point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
@@ -5681,7 +5684,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let children = runtime_expression_children(node);
         let operator = children
@@ -5711,7 +5714,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let operand =
             first_runtime_named_child(node).ok_or_else(|| missing_field(node, "prefix operand"))?;
@@ -5773,7 +5776,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         callable_kind: CallableReferenceKind,
         argument_nodes: &[Node<'tree>],
         evaluations: &[Node<'tree>],
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let frame = ScalaCallFrame::prepare(self, builder, source_node, function)?;
         let invoke = frame.invoke;
@@ -5898,7 +5901,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         if children.is_empty() {
             return self.session.add_target_edge(builder, entry, next);
@@ -5932,7 +5935,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         if children.is_empty() {
             return self.session.add_target_edge(builder, entry, next);
@@ -5965,7 +5968,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         from: ProgramPointId,
         scope: ScopeFrameId,
         kind: CompletionKind,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let route = builder
             .resolve_completion(scope, &CompletionRequest::new(kind, None))
@@ -5986,7 +5989,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         from: ProgramPointId,
         scope: ScopeFrameId,
         value: ValueId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let Some((route, effect)) =
             brokk_bifrost_analysis::analyzer::semantic::cfg::resolve_abrupt_throw(
@@ -6011,7 +6014,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         builder: &mut ProcedureCfgBuilder,
         from: ProgramPointId,
         route: &CompletionRoute,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), ScalaLoweringError> {
         let mut plan = CleanupRoutePlanner::new(route);
         while let Some(step) = plan.next(

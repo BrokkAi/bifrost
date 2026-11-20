@@ -8,9 +8,14 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+mod availability;
 pub(crate) mod export_walk;
 mod output_supplement;
 mod route_questions;
+pub use availability::{
+    RustUnavailableUnitCause, RustUnitAvailability, rust_file_unit_availability,
+    rust_name_unit_availability, rust_unit_availability,
+};
 pub use route_questions::{
     RUST_ADDED_EDGE_TARGET_SQL, RustSelectedUnitsPublication, rust_added_edge_targets_path,
     rust_broad_file_units, rust_broad_placement_rows, rust_crate_name_units, rust_file_units,
@@ -2587,23 +2592,7 @@ fn write_rust_summary_rows(
                 "{}: Rust declaration identity must be exactly shared or fragment-local: module={module_path:?}, namespace={namespace:?}, name={name:?}, shared={shared_identity:?}, local={local_identity_digest:?}",
                 unit.label
             );
-            let mut statement = conn.prepare_cached(
-                "SELECT placement.member_ordinal, site.source_site
-                     FROM rust_unit_summary_placements AS placement
-                     JOIN resolution_unit_summary_members AS members
-                       ON members.summary_id = placement.summary_id
-                      AND members.member_ordinal = placement.member_ordinal
-                     JOIN resolution_semantic_sites AS site
-                       ON site.blob_id = members.blob_id
-                      AND site.semantic_role = 'definition'
-                     JOIN resolution_semantic_catalog AS catalog
-                       ON catalog.blob_id = site.blob_id
-                      AND catalog.local_key = site.semantic_key
-                      AND ((?3 IS NOT NULL AND catalog.shared_identity = ?3)
-                        OR (?4 IS NOT NULL AND catalog.identity_digest = ?4))
-                     WHERE placement.summary_id = ?1 AND placement.module_path = ?2
-                     ORDER BY placement.member_ordinal, site.source_site",
-            )?;
+            let mut statement = conn.prepare_cached(declaration_placement_sites_sql())?;
             let mut declarations = statement
                 .query_map(
                     params![
@@ -2662,22 +2651,7 @@ fn write_rust_summary_rows(
                 .collect::<HashSet<_>>();
             if distinct_sites.len() != 1 {
                 let candidates = conn
-                    .prepare_cached(
-                        "SELECT placement.member_ordinal, site.source_site,
-                                    catalog.shared_identity, hex(catalog.identity_digest)
-                             FROM rust_unit_summary_placements AS placement
-                             JOIN resolution_unit_summary_members AS members
-                               ON members.summary_id = placement.summary_id
-                              AND members.member_ordinal = placement.member_ordinal
-                             JOIN resolution_semantic_sites AS site
-                               ON site.blob_id = members.blob_id
-                              AND site.semantic_role = 'definition'
-                             JOIN resolution_semantic_catalog AS catalog
-                               ON catalog.blob_id = site.blob_id
-                              AND catalog.local_key = site.semantic_key
-                             WHERE placement.summary_id = ?1 AND placement.module_path = ?2
-                             ORDER BY placement.member_ordinal, site.source_site",
-                    )?
+                    .prepare_cached(placement_site_candidates_sql())?
                     .query_map(params![summary_id, module_path], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
@@ -2807,7 +2781,7 @@ fn write_rust_summary_rows(
     Ok(rows_written)
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum RustClosureDomain {
     Public,
     Crate(String),
@@ -2817,7 +2791,7 @@ enum RustClosureDomain {
     },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct RustClosureBindingKey {
     member_ordinal: i64,
     module_path: String,
@@ -2962,18 +2936,22 @@ fn rust_closure_intersection(
     target.intersect(edge)
 }
 
-/// The closure's bindings in key order, with the same keys grouped by module
-/// path. An import route asks for the bindings of one target module, the
+/// The closure's bindings indexed by key, with ordered binding IDs grouped by
+/// module path. An import route asks for the bindings of one target module, the
 /// fixpoint asks once per import per round, and attaching provider edges asks
 /// twice per import, so that question reads the module's group instead of
 /// scanning every binding of the unit: the scan made the Rust unit-summary
 /// reconcile of this repository's own crates quadratic in the writer thread
 /// (#5990, #6357). Each group keeps key order, so iterating a group
-/// visits the same bindings in the same order as filtering `by_key` would.
+/// visits the same bindings in the same order as the original ordered map.
+/// Point lookup hashes the full key. Module traversal reads dense IDs directly,
+/// without hashing or comparing the strings again. Everything here belongs to
+/// one derivation and is dropped after its rows are written.
 #[derive(Default)]
 struct RustClosureBindings {
-    by_key: BTreeMap<RustClosureBindingKey, RustClosureBinding>,
-    by_module: HashMap<String, BTreeSet<RustClosureBindingKey>>,
+    by_key: HashMap<RustClosureBindingKey, u32>,
+    by_module: HashMap<String, Vec<u32>>,
+    bindings: Vec<RustClosureBinding>,
 }
 
 impl RustClosureBindings {
@@ -2985,11 +2963,15 @@ impl RustClosureBindings {
             .get(module_path)
             .into_iter()
             .flatten()
-            .map(|key| &self.by_key[key])
+            .map(|&id| &self.bindings[id as usize])
     }
 
     fn values(&self) -> impl Iterator<Item = &RustClosureBinding> {
-        self.by_key.values()
+        // Hash iteration never determines row order. Keys are unique and their
+        // total order is exactly the original BTreeMap's traversal order.
+        let mut bindings = self.bindings.iter().collect::<Vec<_>>();
+        bindings.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        bindings.into_iter()
     }
 }
 
@@ -3001,9 +2983,16 @@ fn rust_closure_insert_binding(
     owner_unit_key: [u8; 32],
     first_import: Option<(i64, i64)>,
 ) -> (i64, bool) {
-    if let Some(binding) = bindings.by_key.get(&key) {
-        return (binding.route_ordinal, false);
-    }
+    let entry = match bindings.by_key.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            return (
+                bindings.bindings[*entry.get() as usize].route_ordinal,
+                false,
+            );
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => entry,
+    };
+    let key = entry.key();
     let route_ordinal = *next_route_ordinal;
     *next_route_ordinal += 1;
     let binding = RustClosureBinding {
@@ -3013,15 +3002,79 @@ fn rust_closure_insert_binding(
         route_ordinal,
         first_import,
     };
-    assert!(
-        bindings
-            .by_module
-            .entry(key.module_path.clone())
-            .or_default()
-            .insert(key.clone())
-    );
-    assert!(bindings.by_key.insert(key, binding).is_none());
+    let id = u32::try_from(bindings.bindings.len()).expect("too many Rust closure bindings");
+    let module = bindings
+        .by_module
+        .entry(key.module_path.clone())
+        .or_default();
+    // IDs have insertion order, not key order. Keep the module index sorted by
+    // the unchanged key Ord so candidate discovery assigns the same routes and
+    // first imports. Only successful insertion compares keys; visits use IDs.
+    let position = module
+        .binary_search_by(|&id| bindings.bindings[id as usize].key.cmp(key))
+        .expect_err("vacant binding key is already in its module index");
+    module.insert(position, id);
+    bindings.bindings.push(binding);
+    entry.insert(id);
     (route_ordinal, true)
+}
+
+/// Read a module's placed declaration sites from the base rows, starting with the
+/// (summary_id, module_path) attribute key. The compatibility view starts with
+/// placements, whose primary key cannot seek module_path before statistics exist.
+/// Also bound the primary key by the inverse of the generated module_path:
+/// the root can be stored as '' or 'crate', and every other path is unchanged.
+/// SQLite may prefer that key for the ordered UNION arms even without statistics.
+/// Keep the view's container and selected-unplaced restrictions here as well.
+pub(crate) const PLACEMENT_SITES_SQL: &str = "SELECT placement.member_ordinal, site.source_site,
+        catalog.shared_identity, catalog.identity_digest
+ FROM main.rust_resolution_unit_summary_placement_attributes AS attributes
+ CROSS JOIN main.resolution_unit_summary_placements AS placement
+   ON placement.summary_id = attributes.summary_id
+  AND placement.container_path = attributes.container_path
+  AND placement.member_ordinal = attributes.member_ordinal
+ CROSS JOIN main.resolution_unit_summary_members AS members
+   ON members.summary_id = placement.summary_id
+  AND members.member_ordinal = placement.member_ordinal
+ CROSS JOIN main.resolution_semantic_catalog AS catalog
+   ON catalog.blob_id = members.blob_id
+ CROSS JOIN main.resolution_semantic_sites AS site
+   ON site.blob_id = catalog.blob_id
+  AND site.semantic_role = 'definition' AND site.semantic_key = catalog.local_key
+ WHERE attributes.summary_id = ?1 AND attributes.module_path = ?2
+   AND attributes.container_path IN (?2, CASE ?2 WHEN 'crate' THEN '' ELSE ?2 END)
+   AND EXISTS (SELECT 1 FROM main.resolution_unit_summary_containers AS container
+               WHERE container.summary_id = placement.summary_id
+                 AND container.container_path = placement.container_path)
+   AND NOT EXISTS (SELECT 1 FROM temp.selected_rust_unplaced_placements AS unplaced
+                   WHERE unplaced.summary_id = placement.summary_id
+                     AND unplaced.container_path = placement.container_path
+                     AND unplaced.member_ordinal = placement.member_ordinal)";
+
+pub(crate) fn declaration_placement_sites_sql() -> &'static str {
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        // Separate the disjoint catalog identity forms so each arm seeks its
+        // unique (blob_id, identity) constraint even without planner statistics.
+        format!(
+            "SELECT member_ordinal, source_site FROM ({PLACEMENT_SITES_SQL})
+             WHERE ?3 IS NOT NULL AND shared_identity = ?3
+             UNION ALL
+             SELECT member_ordinal, source_site FROM ({PLACEMENT_SITES_SQL})
+             WHERE ?4 IS NOT NULL AND identity_digest = ?4
+             ORDER BY member_ordinal, source_site"
+        )
+    });
+    SQL.as_str()
+}
+
+pub(crate) fn placement_site_candidates_sql() -> &'static str {
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "SELECT member_ordinal, source_site, shared_identity, hex(identity_digest)
+             FROM ({PLACEMENT_SITES_SQL}) ORDER BY member_ordinal, source_site"
+        )
+    });
+    SQL.as_str()
 }
 
 /// The effective bindings of another unit at one module, which a closure consumer reads. Only
@@ -3034,6 +3087,7 @@ pub(crate) const CLOSURE_BINDINGS_IN_MODULE_SQL: &str =
         visibility_kind, visibility_crate_root, visibility_module_path,
         target_unit_key, target_identity_id, target_module_path, target_name
  FROM rust_resolution_unit_summary_effective_bindings
+ INDEXED BY rust_resolution_unit_summary_effective_bindings_module_name
  WHERE summary_id = ?1 AND module_path = ?2
  ORDER BY name, namespace, target_unit_key, target_module_path, target_name,
           visibility_kind, visibility_crate_root, visibility_module_path";
@@ -3043,6 +3097,7 @@ pub(crate) const CLOSURE_BINDINGS_NAMED_SQL: &str = "SELECT DISTINCT module_path
         visibility_kind, visibility_crate_root, visibility_module_path,
         target_unit_key, target_identity_id, target_module_path, target_name
  FROM rust_resolution_unit_summary_effective_bindings
+ INDEXED BY rust_resolution_unit_summary_effective_bindings_module_name
  WHERE summary_id = ?1 AND module_path = ?2 AND name = ?3
  ORDER BY name, namespace, target_unit_key, target_module_path, target_name,
           visibility_kind, visibility_crate_root, visibility_module_path";
@@ -4846,6 +4901,7 @@ fn check_rust_summary_selection(conn: &Connection, snapshot: &WorkspaceSnapshotI
 
 impl AnalyzerStore {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_summary_binding_completeness_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -4883,6 +4939,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_summary_module_candidate_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -4918,6 +4975,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_summary_binding_surface_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -5031,6 +5089,7 @@ impl AnalyzerStore {
     /// Rust relevance and usage candidate selection; it stays demand-shaped
     /// and does not build a workspace-wide reverse index in the analyzer.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_summary_importing_file_paths(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -5087,6 +5146,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_summary_package_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -5233,6 +5293,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_cargo_file_owner_rows(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -5257,6 +5318,7 @@ impl AnalyzerStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_summary_cargo_route_rows(
         &self,
         snapshots: &WorkspaceSnapshots,

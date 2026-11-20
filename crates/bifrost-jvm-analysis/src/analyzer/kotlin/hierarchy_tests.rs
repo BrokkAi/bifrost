@@ -168,7 +168,7 @@ fn ancestor_is_cached(analyzer: &KotlinAnalyzer, owner: &CodeUnit) -> bool {
         .direct_ancestors
         .read(
             &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
-            |cache, _| cache.get(owner).ok_or(()),
+            |cells, _| cells.shared_entry(owner).ok_or(()),
         )
         .is_ok()
 }

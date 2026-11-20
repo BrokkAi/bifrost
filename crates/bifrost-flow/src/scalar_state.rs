@@ -2433,6 +2433,8 @@ fn decided_refinement(
         | GuardPredicate::InstanceOf { .. }
         | GuardPredicate::ExactClass { .. }
         | GuardPredicate::HasMember { .. }
+        | GuardPredicate::ValueEquality { .. }
+        | GuardPredicate::ValueOrdering { .. }
         | GuardPredicate::Opaque { .. } => GuardRefinement::Undecided,
     }
 }

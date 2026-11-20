@@ -815,6 +815,27 @@ pub struct PlatformInventoryMethod {
     pub returns: &'static str,
 }
 
+/// Language rules for an interface's lookup-only member root.
+/// This inventory supplies no nominal inheritance or protected-access proof.
+#[derive(Debug)]
+pub struct ImplicitInterfaceMembers {
+    pub owner: &'static str,
+    pub simple_name: &'static str,
+    /// Some is a fixed language inventory. None requires exact selected
+    /// public instance method authority; it never grants an unknown member.
+    pub methods: Option<&'static [PlatformInventoryMethod]>,
+    pub declaration: Option<ImplicitMemberDeclarationRules>,
+}
+
+/// Optional declaration synthesis supplied by a language specification.
+/// Without this rule a lookup root retains the selected member's real owner
+/// and modifiers. Java's implicit interface declarations use this rule.
+#[derive(Debug)]
+pub struct ImplicitMemberDeclarationRules {
+    pub visibility: crate::analyzer::structural::resolution::DeclaredVisibility,
+    pub is_abstract: bool,
+}
+
 /// One declared parameter type of a nominal-family member, resolved and
 /// erased (JLS 4.6) from the declaration's own type node.
 ///

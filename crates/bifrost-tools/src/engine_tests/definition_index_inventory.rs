@@ -441,6 +441,10 @@ fn fail_blob_writes<A: LanguageAdapter>(analyzer: &TreeSitterAnalyzer<A>, lang: 
         .execute(move |connection| connection.execute_batch(&sql).unwrap());
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn inventory_states<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
 ) -> BTreeMap<String, Option<String>> {
@@ -457,6 +461,10 @@ fn inventory_states<A: LanguageAdapter>(
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn java_inventory_excludes_configuration_inputs_and_finds_duplicate_sources() {
     let files = [
         ("a/Shared.java", "package pkg; public class Shared {}"),
@@ -592,6 +600,10 @@ fn unpublished_blob_and_incomplete_package_facts_withhold_the_inventory() {
 }
 
 /// The open source version of a path: its id and the revision that opened it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn open_version<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
     rel_path: &str,
@@ -606,6 +618,10 @@ fn open_version<A: LanguageAdapter>(
     .unwrap()
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn name_row_count<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
     file_version_id: i64,
@@ -763,7 +779,7 @@ fn legacy_null_inventory_state_is_refilled_in_place_by_a_digest_equal_sync() {
 #[hardwon(
     "#10325: re-persisting a mounted blob cascaded away its name rows while the file stayed known"
 )]
-fn repersisting_a_mounted_blob_withdraws_the_names_until_a_full_sync_refills_them() {
+fn repairing_a_mounted_blob_withdraws_the_names_until_a_full_sync_refills_them() {
     let (_temp, go) = project(Language::Go, GO);
     commit_all(go.root(), &["a/util.go", "b/util.go", "main.go"]);
     let analyzer = listed(persisted(Arc::clone(&go), GoAdapter));
@@ -779,6 +795,23 @@ fn repersisting_a_mounted_blob_withdraws_the_names_until_a_full_sync_refills_the
     // The same bytes are mounted at both util paths, so one blob is shared.
     let file = ProjectFile::new(go.root().to_path_buf(), "a/util.go");
     analyzer.persist_live_blobs(std::slice::from_ref(&file));
+    assert!(all_known(&analyzer), "{:?}", inventory_states(&analyzer));
+    assert_eq!(go_make_candidates(&analyzer, go.root()).unwrap(), before);
+    assert!(
+        versions
+            .iter()
+            .all(|(_, (id, _))| name_row_count(&analyzer, *id) > 0)
+    );
+    // Canonical repair still withdraws every inventory sharing the source.
+    let source = go.read_source(&file).unwrap();
+    let state = parsed_fixture_state(&GoAdapter, "a/util.go", &source);
+    crate::engine_tests::repair_parsed_source(
+        analyzer.analyzer_store(),
+        &BlobKey::unvaried(blob_oid(&source), "go"),
+        &GoAdapter,
+        &state,
+    )
+    .unwrap();
     let states = inventory_states(&analyzer);
     assert_eq!(
         states["a/util.go"].as_deref(),
@@ -1076,6 +1109,7 @@ fn listing_omissions_that_can_hide_a_source_make_the_inventory_unknown() {
     let omission = |path: &str, reason| WorkspaceFileOmission {
         path: PathBuf::from(path),
         reason,
+        bounded: None,
     };
     let provable = |analyzer: &TreeSitterAnalyzer<JavaAdapter>| {
         index_candidates(
@@ -1191,6 +1225,7 @@ fn a_listing_proof_names_only_the_snapshots_its_own_sync_published() {
     project.set_omissions(vec![WorkspaceFileOmission {
         path: PathBuf::from("pkg/Hidden.java"),
         reason: WorkspaceFileOmissionReason::WalkError,
+        bounded: None,
     }]);
     let failed = persisted(Arc::new(project.clone()), JavaAdapter).update_all();
     assert!(all_known(&failed));
@@ -1284,6 +1319,10 @@ fn an_unresolved_anchor_state_is_refilled_in_place_by_a_digest_equal_sync() {
     assert!(all_known(&healed), "{:?}", inventory_states(&healed));
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn state_of<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
     lang: &str,
@@ -1472,6 +1511,57 @@ fn an_update_does_not_grant_again_a_withdrawn_c_reading_listing_proof() {
     );
 }
 
+/// A proof withdrawn for a reason other than an omission must survive the
+/// rebuild that an omission's disappearance triggers: the rebuild recomputes
+/// the state as a cold build does, and the unvalidated header is still there.
+#[test]
+fn a_non_omission_withdrawal_stays_withdrawn_when_an_omission_clears() {
+    let long_line = format!(
+        "struct Outer {{ struct Inner {{ int x; }} inner; }};\nint {} = 0;\n",
+        "x".repeat(20_000)
+    );
+    let files = [
+        (
+            "main.c",
+            "#include \"shared.h\"\nint main(void) { return 0; }\n",
+        ),
+        ("shared.h", long_line.as_str()),
+    ];
+    let (_temp, project) = omitting_project(Language::Cpp, &files);
+    let analyzer =
+        CppAnalyzer::new_with_config(Arc::new(project.clone()), AnalyzerConfig::default())
+            .update_all();
+    let inner = analyzer.inner();
+    let inner_key = |a: &CppAnalyzer| {
+        index_candidates(a.inner(), "cpp:c", IndexFamily::DefinitionExact, b"Inner")
+    };
+    assert_eq!(inner_key(&analyzer), None, "no omission, yet withdrawn");
+    assert!(!inner.hiding_omission_hidden());
+    assert_eq!(
+        inner_key(&analyzer.update(&BTreeSet::new())),
+        None,
+        "an empty update stays withdrawn"
+    );
+
+    project.set_omissions(vec![hiding_omission()]);
+    let hidden = analyzer.update(&BTreeSet::new());
+    assert!(hidden.inner().hiding_omission_hidden());
+    assert_eq!(inner_key(&hidden), None);
+
+    project.clear_omissions();
+    let cleared = hidden.update(&BTreeSet::new());
+    assert_eq!(
+        inner_key(&cleared),
+        None,
+        "the other cause keeps it withdrawn, as cold does"
+    );
+    assert!(
+        !cleared.inner().hiding_omission_hidden(),
+        "the rebuild recorded no omission, so the next update does not rebuild again"
+    );
+    assert_eq!(inner_key(&cleared.update(&BTreeSet::new())), None);
+}
+
 #[test]
 #[hardwon(
     "#10325: an omission-only listing change kept a non-Rust listing proof, so the inventory proved absence"
@@ -1486,6 +1576,7 @@ fn an_omission_only_update_withdraws_a_java_listing_proof() {
     project.set_omissions(vec![WorkspaceFileOmission {
         path: PathBuf::from("hidden"),
         reason: WorkspaceFileOmissionReason::SymlinkToDirectory,
+        bounded: None,
     }]);
     let updated = analyzer.update(&BTreeSet::new());
     assert_eq!(
@@ -1502,11 +1593,88 @@ fn an_omission_only_update_withdraws_a_java_listing_proof() {
     );
 }
 
+fn hiding_omission() -> WorkspaceFileOmission {
+    WorkspaceFileOmission {
+        path: PathBuf::from("hidden"),
+        reason: WorkspaceFileOmissionReason::SymlinkToDirectory,
+        bounded: None,
+    }
+}
+
+fn hidden_answer<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+) -> Option<Vec<DefinitionIndexCandidate>> {
+    index_candidates(analyzer, "java", IndexFamily::DefinitionExact, b"Hidden")
+}
+
+#[test]
+#[hardwon("#13641: a hiding omission that disappeared left the update's listing proof withdrawn")]
+fn an_omission_that_disappears_restores_the_proof_a_cold_build_grants() {
+    let (_temp, project) = omitting_project(Language::Java, &JAVA[..1]);
+    let alpha = ProjectFile::new(project.root().to_path_buf(), JAVA[0].0);
+    let analyzer = persisted(Arc::new(project.clone()), JavaAdapter).update_all();
+    assert_eq!(hidden_answer(&analyzer), Some(Vec::new()));
+
+    project.set_omissions(vec![hiding_omission()]);
+    let hidden = analyzer.update(&BTreeSet::new());
+    assert_eq!(
+        hidden_answer(&hidden),
+        None,
+        "the omission withdraws the proof"
+    );
+    assert_eq!(
+        hidden_answer(&hidden.update(&BTreeSet::new())),
+        None,
+        "a persisting omission stays withdrawn"
+    );
+
+    project.clear_omissions();
+    let cold = persisted(Arc::new(project.clone()), JavaAdapter).update_all();
+    assert_eq!(
+        hidden_answer(&cold),
+        Some(Vec::new()),
+        "a cold build grants the proof"
+    );
+
+    let cleared = hidden.update(&BTreeSet::new());
+    assert_eq!(
+        hidden_answer(&cleared),
+        hidden_answer(&cold),
+        "an empty update agrees with cold"
+    );
+    assert_eq!(
+        hidden_answer(&cleared.update(&BTreeSet::new())),
+        hidden_answer(&cold),
+        "settled"
+    );
+
+    let with_edit = hidden.update(&BTreeSet::from([alpha]));
+    assert_eq!(
+        hidden_answer(&with_edit),
+        hidden_answer(&cold),
+        "an update with a changed file agrees with cold"
+    );
+
+    project.set_omissions(vec![hiding_omission()]);
+    let born_hidden = persisted(Arc::new(project.clone()), JavaAdapter).update_all();
+    assert_eq!(hidden_answer(&born_hidden), None);
+    project.clear_omissions();
+    assert_eq!(
+        hidden_answer(&born_hidden.update(&BTreeSet::new())),
+        hidden_answer(&cold),
+        "a build-time omission that clears recovers"
+    );
+}
+
 /// A file version published before its blob waits as `blob_pending`; the blob's
 /// publication must promote it in the same transaction, including the
 /// selected-content publication.
 #[test]
 #[hardwon("#10325: selected parsed-content publication never promoted a blob_pending file version")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn selected_content_publication_promotes_a_version_that_waited_for_its_blob() {
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let source = "class Owner { void run() {} }\n";
@@ -1564,6 +1732,9 @@ fn selected_content_publication_promotes_a_version_that_waited_for_its_blob() {
         parsed_fixture_state(&JavaAdapter, "Owner.java", source),
     )
     .unwrap();
+    store
+        .ensure_prepared_resolution_epochs(std::slice::from_ref(&parsed))
+        .unwrap();
     let outcome = store
         .publish_selected_parsed_content(
             &snapshot,
@@ -1583,6 +1754,10 @@ const GO_MOD_OLD: &str = "module example.com/old\n\ngo 1.21\n";
 const GO_MOD_NEW: &str = "module example.com/new\n\ngo 1.21\n";
 const GO_FOO: &str = "package pkg\n\nfunc Foo() {}\n";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
 fn stored_names<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
     rel_path: &str,

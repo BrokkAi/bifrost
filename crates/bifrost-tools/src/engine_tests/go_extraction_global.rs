@@ -847,13 +847,12 @@ mod go_extraction_tests_global {
         use brokk_bifrost_analysis::analyzer::resolution::selected_context::go_global_support_1::go_mount_context;
 
         #[test]
-        fn root_bridge_extension_preserves_inventory_and_relation_evidence_at_exact_work_boundary()
-        {
+        fn root_bridge_extension_preserves_inventory_and_relation_evidence_and_counts_one_step_per_bridge()
+         {
             use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
             for count in [0_u32, 1, 128] {
-                // One step per added bridge, so a budget of the bridge count is
-                // exactly enough and the boundary sits there.
-                for limit in [count as usize, count as usize + 1] {
+                // One scope step per added bridge. Steps are work and never refuse.
+                {
                     let mut source = go_mount_context(0);
                     let target = go_mount_context(1);
                     let reason = ResolutionIncompleteReason::UnsupportedSemantic(
@@ -897,13 +896,8 @@ mod go_extraction_tests_global {
                     let source_fragment = source.fragment();
                     let table = GoMountTable::from(vec![source.clone(), target]);
                     let lookup = table.lookup();
-                    let session = ResolutionSession::bounded(
-                        ReceiverAnalysisBudget {
-                            max_scope_nodes: limit,
-                            ..ReceiverAnalysisBudget::default()
-                        },
-                        None,
-                    );
+                    let session =
+                        ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
                     let result = table
                         .context(vec![source])
                         .unwrap()
@@ -914,7 +908,7 @@ mod go_extraction_tests_global {
                             &lookup,
                         )
                         .unwrap();
-                    let context = result.expect("a budget of one step per added bridge is enough");
+                    let context = result.expect("bridge extension never refuses");
                     // The target mount carries neither a relation nor evidence of
                     // its own, so the sparse set keeps only the source.
                     assert_eq!(context.mounts.len(), 1);
@@ -1507,6 +1501,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_target_key_selected_query_cost_across_blobs() {
             use brokk_bifrost_analysis::analyzer::store::{AnalyzerStore, PersistBatchTargets};
             use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
@@ -1653,6 +1651,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_target_keys_match_full_units_and_selected_anchor() {
             use brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal;
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoTargetKeys;
@@ -1740,6 +1742,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_target_keys_keep_equal_rows_and_refuse_broken_hydration() {
             use brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal;
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoTargetKeys;
@@ -1821,6 +1827,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_unresolved_route_boundary_shapes() {
             use brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal;
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoUnresolvedRoute;
@@ -1942,6 +1952,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_unresolved_route_selected_blob_plan() {
             use rusqlite::StatementStatus;
             let fixture = GoRootResolutionOperationFixture::with_sources([
@@ -1990,6 +2004,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_target_nomination_uses_keyed_semantic_site_search() {
             use rusqlite::StatementStatus;
             let fixture = GoRootResolutionOperationFixture::with_sources([
@@ -2345,6 +2363,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_hierarchy_lookup_blobs_and_selection_coverage() {
             use brokk_bifrost_analysis::analyzer::resolution::fact_source::TypedFactPageVisitor;
             use brokk_bifrost_analysis::analyzer::resolution::model::{SemanticId, SharedNameId};
@@ -2521,6 +2543,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_selected_type_support_is_local_and_role_filtered() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoTypeSupport;
@@ -2567,6 +2593,10 @@ mod go_extraction_tests_global {
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "#7509: a bridged Go interface alias (a grouped spec on master) skipped the typed interface proof and stayed Open"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_alias_type_support_uses_typed_interface_evidence_with_or_without_bridge() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
@@ -2655,6 +2685,10 @@ mod go_extraction_tests_global {
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "#7509: sole-spec Go alias bridge missed its parser Field declaration"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_alias_bridge_reaches_its_selected_field_unit() {
             let fixture = GoRootResolutionOperationFixture::with_sources([
@@ -2803,6 +2837,10 @@ mod go_extraction_tests_global {
         #[hardwon(
             "#8751: review found a parenthesized interface-literal alias target made direct subtypes falsely Complete"
         )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_alias_interface_literal_wrappers_are_definite() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -2902,6 +2940,10 @@ mod go_extraction_tests_global {
         #[hardwon(
             "#8852: review found a pointer-to-interface alias was classified as the interface"
         )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_pointer_and_partial_interface_aliases_stay_open() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -2973,6 +3015,10 @@ mod go_extraction_tests_global {
         #[test]
         #[hardwon(
             "#8852: review found an unprojected deep alias literal let a named interface's subtypes close without its embedder"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_unprojected_alias_literals_keep_inverse_open() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
@@ -3055,6 +3101,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_embedded_interface_literal_stays_open() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             let fixture = GoRootResolutionOperationFixture::with_sources([
@@ -3102,6 +3152,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_direct_supertypes_confirm_selected_struct_and_interface_embeddings() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             let (fixture, context) = go_hierarchy_store();
@@ -3133,6 +3187,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_forward_supertypes_confirm_structural_targets_and_inherited_interfaces() {
             use brokk_bifrost_analysis::analyzer::resolution::ResolutionTypeRef;
             use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::go_methods::GoMethodSatisfaction;
@@ -3389,6 +3447,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_forward_census_refuses_recovered_and_sourceless_peers() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             for variant in ["recovered", "sourceless"] {
@@ -3460,6 +3522,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_forward_satisfaction_closes_clean_named_inventory_but_not_inline_alias() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             for alias in [0, 1, 2, 3, 4] {
@@ -3560,6 +3626,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_forward_empty_scan_selected_interface_shapes() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             let provider = "package provider; type T struct{}; func (T) M(){}; type E interface{}; type EC interface{/* comment */}; type F interface{E}; type P interface{(E)}; type Q interface{missing.X}; type A = E; type FA interface{A}; type C interface{~int | ~string}; type Comparable interface{comparable}; type U interface{M(); missing.X}; type I interface{M()}";
@@ -3645,6 +3715,10 @@ mod go_extraction_tests_global {
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_forward_empty_scan_excludes_own_method_with_unresolved_embedding() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             let fixture = GoRootResolutionOperationFixture::with_sources([
@@ -3724,6 +3798,10 @@ mod go_extraction_tests_global {
         #[test]
         #[hardwon(
             "#7509: go_direct_subtypes listed the queried interface as its own direct subtype"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_direct_subtypes_confirm_embedded_and_combined_method_receivers() {
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -3969,6 +4047,10 @@ mod go_extraction_tests_global {
         #[hardwon(
             "#7509: go_native_method_family listed the queried method in its own Implements and ImplementedBy"
         )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_native_method_family_confirms_both_directions_and_source_roles() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -4100,6 +4182,10 @@ mod go_extraction_tests_global {
         #[hardwon(
             "#7509: anonymous interface method family returned a closed empty implementor set"
         )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_anonymous_interface_method_family_probe() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -4212,6 +4298,10 @@ mod go_extraction_tests_global {
         #[test]
         #[hardwon(
             "#7509: native Go Implements missed promoted receivers and returned a complete negative"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_method_family_closes_promoted_receiver_forms() {
             use brokk_bifrost_analysis::analyzer::resolution::ResolutionTypeRef;
@@ -4344,7 +4434,7 @@ type aliasPointerMixed struct { *MixedAlias }
                         &bounded,
                     )
                     .unwrap();
-                assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+                assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::TotalWork));
                 assert!(stopped.implements.methods.is_empty(), "{stopped:?}");
                 assert!(!stopped.implements.is_complete(), "{stopped:?}");
                 assert!(
@@ -4461,6 +4551,10 @@ type aliasPointerMixed struct { *MixedAlias }
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_alias_embeddings_follow_chains_and_fail_closed() {
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -4659,6 +4753,10 @@ type aliasPointerMixed struct { *MixedAlias }
 
         #[test]
         #[hardwon("#5658: Go alias summaries materialized occurrence arenas for unrelated blobs")]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn native_query_plan_go_alias_rows_are_identical() {
             let fixture = GoRootResolutionOperationFixture::with_sources([
                 "package consumer; import provider \"example.test/root/provider\"; type Alias = provider.Item; type Local = Alias; type Slice = []int; type Unknown = missing.Type",
@@ -4873,6 +4971,10 @@ type aliasPointerMixed struct { *MixedAlias }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn selected_go_package_member_mount_queries_seek_in_both_statistics_states() {
             use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::explain_pin;
 
@@ -5456,7 +5558,7 @@ type aliasPointerMixed struct { *MixedAlias }
                 result.unwrap()
             });
             let probe = probe.unwrap();
-            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::TotalWork));
             assert!(reads.execution_dependences() > 0, "stop must enter receipt");
             assert!(
                 answer.open.iter().any(|reason| matches!(
@@ -5493,7 +5595,7 @@ type aliasPointerMixed struct { *MixedAlias }
                 });
                 result.expect("public hierarchy walk ran")
             });
-            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::TotalWork));
             assert!(
                 reads.unattributed_reads() > 0,
                 "the public walk must retain captured census reads"
@@ -5803,7 +5905,7 @@ type aliasPointerMixed struct { *MixedAlias }
             let _scope = AnalyzerQueryScope::new(&go);
             let probe = GoFamilyPositiveStopProbe::arm_inverse();
             let (family, reads) = capture_query_reads(&go, || go.member_family(&interface, None));
-            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::TotalWork));
             assert!(
                 reads.execution_dependences() > 0,
                 "stop must enter typed receipt"
@@ -5823,7 +5925,7 @@ type aliasPointerMixed struct { *MixedAlias }
                 virtual_dispatch_implementor_targets(&go, &interface, &CancellationToken::new());
             assert_eq!(
                 second_probe.fired_limit(),
-                Some(ReceiverBudgetLimit::ScopeNodes)
+                Some(ReceiverBudgetLimit::TotalWork)
             );
             assert!(
                 matches!(dispatch, ImplementorTargets::Unproven { .. }),
@@ -5862,7 +5964,7 @@ type aliasPointerMixed struct { *MixedAlias }
             let _scope = AnalyzerQueryScope::new(&go);
             let probe = GoStrictPositiveStopProbe::arm();
             let (family, reads) = capture_query_reads(&go, || go.member_family(&interface, None));
-            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::TotalWork));
             assert!(reads.execution_dependences() > 0, "{reads:?}");
             assert_eq!(
                 family.reason,

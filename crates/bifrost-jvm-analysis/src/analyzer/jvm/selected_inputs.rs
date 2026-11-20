@@ -9,12 +9,18 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::project::{Project, ProjectSourceSnapshot};
 
-use super::dependency_discovery::{MAX_BUILD_METADATA_BYTES, is_discovery_manifest};
+#[cfg(test)]
+use super::dependency_discovery::DiscoveryInputs;
+
+use super::dependency_discovery::{
+    LiveDiscoveryInputs, MAX_BUILD_METADATA_BYTES, is_discovery_manifest,
+};
 
 #[derive(Debug)]
 pub(crate) struct SelectedInputs {
     files: Arc<BTreeSet<ProjectFile>>,
     file_set_digest: [u8; 32],
+    omissions_digest: [u8; 32],
     manifests: BTreeMap<PathBuf, ManifestCapture>,
 }
 
@@ -170,45 +176,74 @@ fn digest(files: &BTreeSet<ProjectFile>) -> [u8; 32] {
     hash.finish()
 }
 
+fn omissions_digest(
+    omissions: &[brokk_bifrost_core::analyzer::project::WorkspaceFileOmission],
+) -> [u8; 32] {
+    let mut entries = omissions
+        .iter()
+        .map(|item| (&item.path, format!("{:?}", item.reason)))
+        .collect::<Vec<_>>();
+    entries.sort();
+    let mut hash = CanonicalHasher::new(b"jvm-manifest-omissions:v1");
+    for (path, reason) in entries {
+        hash.field("path", path.as_os_str().as_encoded_bytes());
+        hash.field("reason", reason.as_bytes());
+    }
+    hash.finish()
+}
+
+#[cfg(test)]
+fn capture(project: &dyn Project) -> io::Result<SelectedInputs> {
+    let scope = super::dependency_discovery::manifest_scope(project, &Default::default());
+    Ok(capture_listing(&scope, scope.files_with_omissions()?))
+}
+
 /// Capture the listing and the bytes of every manifest discovery reads.
 /// Other dependency inputs, such as `buildSrc` sources, are fenced by the
 /// listing only: metadata discovery never reads them, and the build tools
 /// that do read them from disk themselves, which keeps tool modes
 /// uncertified.
-pub(crate) fn capture(project: &dyn Project) -> io::Result<SelectedInputs> {
-    let files = project.all_files_shared()?;
-    let mut manifests = BTreeMap::new();
-    for file in files.iter().filter(|file| is_discovery_manifest(file)) {
-        manifests.insert(file.rel_path().to_path_buf(), read_manifest(project, file));
-    }
-    for path in [
-        "pom.xml",
-        "settings.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "gradle.properties",
-        "gradle.lockfile",
-        "gradle/libs.versions.toml",
-        "gradle/wrapper/gradle-wrapper.properties",
-        ".mvn/maven.config",
-        ".mvn/jvm.config",
-        ".mvn/extensions.xml",
-        ".mvn/wrapper/maven-wrapper.properties",
-    ] {
-        let path = PathBuf::from(path);
-        if !files.contains(&ProjectFile::new(
-            project.root().to_path_buf(),
-            path.clone(),
-        )) {
-            manifests.insert(path, ManifestCapture::Absent);
+pub(crate) fn capture_listing(
+    scope: &LiveDiscoveryInputs<'_>,
+    listing: brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+) -> SelectedInputs {
+    scope.capture_boundary(|| {
+        let project = scope.project;
+        let (files, omissions) = listing;
+        let mut manifests = BTreeMap::new();
+        for file in files.iter().filter(|file| is_discovery_manifest(file)) {
+            manifests.insert(file.rel_path().to_path_buf(), read_manifest(project, file));
         }
-    }
-    Ok(SelectedInputs {
-        file_set_digest: digest(&files),
-        files,
-        manifests,
+        for path in [
+            "pom.xml",
+            "settings.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradle.properties",
+            "gradle.lockfile",
+            "gradle/libs.versions.toml",
+            "gradle/wrapper/gradle-wrapper.properties",
+            ".mvn/maven.config",
+            ".mvn/jvm.config",
+            ".mvn/extensions.xml",
+            ".mvn/wrapper/maven-wrapper.properties",
+        ] {
+            let path = PathBuf::from(path);
+            if !files.contains(&ProjectFile::new(
+                project.root().to_path_buf(),
+                path.clone(),
+            )) {
+                manifests.insert(path, ManifestCapture::Absent);
+            }
+        }
+        SelectedInputs {
+            file_set_digest: digest(&files),
+            omissions_digest: omissions_digest(&omissions),
+            files,
+            manifests,
+        }
     })
 }
 
@@ -244,36 +279,52 @@ impl SelectedInputs {
         }
     }
 
-    pub(crate) fn validate(&self, project: &dyn Project) -> Result<(), CaptureDrift> {
-        let current = project
-            .authoritative_files()
-            .map_err(|error| CaptureDrift::Read(PathBuf::from("."), error))?;
-        for (path, capture) in &self.manifests {
-            if matches!(capture, ManifestCapture::Absent)
-                && current.iter().any(|file| file.rel_path() == path)
-            {
-                return Err(CaptureDrift::Absence(path.clone()));
-            }
-        }
-        if digest(&current) != self.file_set_digest {
-            return Err(CaptureDrift::FileSet(PathBuf::from(".")));
-        }
-        for (path, capture) in &self.manifests {
-            if matches!(capture, ManifestCapture::Absent) {
-                continue;
-            }
-            let file = ProjectFile::new(project.root().to_path_buf(), path.clone());
-            let unchanged = match (capture, read_manifest(project, &file)) {
-                (ManifestCapture::Present(captured), ManifestCapture::Present(current)) => {
-                    captured.oid() == current.oid()
+    pub(crate) fn validate_scope(
+        &self,
+        scope: &LiveDiscoveryInputs<'_>,
+    ) -> Result<(), CaptureDrift> {
+        scope.capture_boundary(|| {
+            let project = scope.project;
+            let (current, omissions) = scope
+                .authoritative_listing()
+                .map_err(|error| CaptureDrift::Read(PathBuf::from("."), error))?;
+            for (path, capture) in &self.manifests {
+                if matches!(capture, ManifestCapture::Absent)
+                    && current.iter().any(|file| file.rel_path() == path)
+                {
+                    return Err(CaptureDrift::Absence(path.clone()));
                 }
-                (ManifestCapture::Unread, ManifestCapture::Unread) => true,
-                _ => false,
-            };
-            if !unchanged {
-                return Err(CaptureDrift::Manifest(path.clone()));
             }
-        }
-        Ok(())
+            if digest(&current) != self.file_set_digest
+                || omissions_digest(&omissions) != self.omissions_digest
+            {
+                return Err(CaptureDrift::FileSet(PathBuf::from(".")));
+            }
+            for (path, capture) in &self.manifests {
+                if matches!(capture, ManifestCapture::Absent) {
+                    continue;
+                }
+                let file = ProjectFile::new(project.root().to_path_buf(), path.clone());
+                let unchanged = match (capture, read_manifest(project, &file)) {
+                    (ManifestCapture::Present(captured), ManifestCapture::Present(current)) => {
+                        captured.oid() == current.oid()
+                    }
+                    (ManifestCapture::Unread, ManifestCapture::Unread) => true,
+                    _ => false,
+                };
+                if !unchanged {
+                    return Err(CaptureDrift::Manifest(path.clone()));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    fn validate(&self, project: &dyn Project) -> Result<(), CaptureDrift> {
+        self.validate_scope(&super::dependency_discovery::manifest_scope(
+            project,
+            &Default::default(),
+        ))
     }
 }

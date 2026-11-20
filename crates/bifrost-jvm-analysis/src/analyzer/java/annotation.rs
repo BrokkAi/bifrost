@@ -530,16 +530,19 @@ fn external_route_resolution(
     let recorder = QueryGapRecorder::new(java);
     let fq_name = route.join(".");
     let declared = external.get(&recorder, &fq_name);
-    if declared.is_none()
-        && let Some(owner) =
+    if declared.is_none() {
+        if let Some(owner) =
             (1..route.len()).find_map(|length| external.get(&recorder, &route[..length].join(".")))
-    {
-        return JavaAnnotationTypeResolution::gap(
-            Status::Incomplete,
-            format!(
-                "external type {owner:?} owns a prefix of annotation route {fq_name}; its inherited member types are unproven"
-            ),
-        );
+        {
+            return JavaAnnotationTypeResolution::gap(
+                Status::Incomplete,
+                format!(
+                    "external type {owner:?} owns a prefix of annotation route {fq_name}; its inherited member types are unproven"
+                ),
+            );
+        }
+        // Neither the route nor a prefix of it is declared: a final miss.
+        external.record_all_gaps(&recorder);
     }
     let artifact = match declared {
         Some(declared) if declared.kind() != JvmExternalTypeKind::Annotation => {

@@ -1180,6 +1180,8 @@ pub struct RustIncludeEdgeFact {
     /// The invocation's start byte, which is where the reader takes the host's
     /// lexical package and picks the bindings in scope.
     pub include_start: usize,
+    /// Exact invocation in the shared source arena. NULL/None is unknown.
+    pub invocation_occurrence_id: Option<SourceOccurrenceId>,
     /// The host import bindings whose scope contains `include_start`, in the
     /// order route composition applies them.
     pub host_bindings: Vec<RustIncludeHostBindingFact>,
@@ -1716,8 +1718,15 @@ pub struct RustMacroInputToken {
 /// later consumers rather than silently reflecting a projection's choices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RustItemSourceFacts {
+    /// Canonical primary impl declarations with proven native lexical attachments.
+    /// An absent attachment is unknown, including every macro-replayed impl.
+    pub native_impl_scopes: Vec<(
+        SourceDeclarationId,
+        crate::analyzer::resolution_facts::ResolutionScopeId,
+    )>,
     /// Boundaries collected from the completed primary source tree.
     pub impl_census_boundaries: Vec<RustImplCensusBoundary>,
+    pub macro_arguments: Vec<RustMacroAttributeSourceFact>,
     pub contexts: Vec<RustSourceContextFact>,
     pub syntax: Vec<RustItemSyntaxFact>,
     pub generics: Vec<RustDeclarationGenericsSourceFact>,
@@ -1732,10 +1741,47 @@ pub struct RustItemSourceFacts {
     pub import_contexts: Vec<RustItemImportContextFact>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Attributes inspected by a macro contract at one source census boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustMacroAttributeSourceFact {
+    pub boundary_ordinal: usize,
+    pub path: Vec<String>,
+    pub from_cfg_attr: bool,
+    pub keys: Vec<RustMacroArgumentKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustMacroArgumentKey {
+    Ident(String),
+    Unparsed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustImplCensusBoundary {
     pub kind: RustImplCensusBoundaryKind,
     pub start_byte: usize,
+    /// Macro boundaries only: the invoked path as written, one entry per
+    /// segment with raw-identifier prefixes removed. Empty for every other
+    /// kind, and for a macro path the grammar could not split.
+    pub macro_path: Vec<String>,
+    /// Macro boundaries only: the path starts with `::`.
+    pub macro_absolute: bool,
+    /// Macro boundaries only: a visible `use`, glob or attributed `use` may
+    /// bind the terminal macro name at this invocation. True when unsure.
+    pub macro_shadow_possible: bool,
+}
+
+impl RustImplCensusBoundary {
+    /// A boundary that carries no macro path.
+    pub fn without_macro_path(kind: RustImplCensusBoundaryKind, start_byte: usize) -> Self {
+        Self {
+            kind,
+            start_byte,
+            macro_path: Vec::new(),
+            macro_absolute: false,
+            macro_shadow_possible: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1773,6 +1819,24 @@ impl RustItemSourceFacts {
                     .saturating_mul(std::mem::size_of::<RustImplCensusBoundary>()),
             )
             .saturating_add(
+                self.impl_census_boundaries
+                    .iter()
+                    .map(|boundary| {
+                        boundary
+                            .macro_path
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<String>())
+                            .saturating_add(
+                                boundary
+                                    .macro_path
+                                    .iter()
+                                    .map(String::capacity)
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
                 self.contexts
                     .iter()
                     .map(|context| {
@@ -1782,6 +1846,41 @@ impl RustItemSourceFacts {
                             .saturating_mul(std::mem::size_of::<usize>())
                     })
                     .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.macro_arguments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RustMacroAttributeSourceFact>()),
+            )
+            .saturating_add(
+                self.macro_arguments
+                    .iter()
+                    .map(|attribute| {
+                        attribute
+                            .path
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<String>())
+                            .saturating_add(
+                                attribute.path.iter().map(String::capacity).sum::<usize>(),
+                            )
+                            .saturating_add(
+                                attribute
+                                    .keys
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<RustMacroArgumentKey>()),
+                            )
+                            .saturating_add(
+                                attribute
+                                    .keys
+                                    .iter()
+                                    .map(|key| match key {
+                                        RustMacroArgumentKey::Ident(key) => key.capacity(),
+                                        RustMacroArgumentKey::Unparsed => 0,
+                                    })
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
             )
             .saturating_add(macro_inputs)
             .saturating_add(

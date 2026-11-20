@@ -22,10 +22,10 @@ use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
 
 use brokk_bifrost_core::CancellationToken;
 use brokk_bifrost_core::analyzer::capabilities::{
-    AdditionalFileDependencies, DescendantIndexScope, FileDependencyFacts, ImportAnalysisProvider,
-    ImportGraphBindingSurface, ImportGraphInputDigests, ImportReachability,
-    ImportResolutionDependencies, ImportedFileEdgeFacts, ImportedFileEdgeTargets,
-    TypeHierarchyProvider,
+    AdditionalFileDependencies, CSharpCompilationMembershipOpenCause, DescendantIndexScope,
+    FileDependencyFacts, ImportAnalysisProvider, ImportGraphBindingSurface,
+    ImportGraphInputDigests, ImportReachability, ImportResolutionDependencies,
+    ImportedFileEdgeFacts, ImportedFileEdgeTargets, TypeHierarchyProvider,
 };
 use brokk_bifrost_core::analyzer::fq_name::FqName;
 use brokk_bifrost_core::analyzer::model::{
@@ -66,20 +66,90 @@ pub struct MembershipScopedSource<'a> {
     /// Request-lifetime direct ancestors derived through this view, with
     /// whether the derivation admitted doubt.
     direct_ancestors: Arc<CaptureScopedMemo<Mutex<DirectAncestors>>>,
-    /// Declarations admitted although their membership is unproven. An
-    /// `AtomicUsize` for the same `Sync` reason as `answers`.
-    doubt: Arc<AtomicUsize>,
+    /// Optional evidence that compilation membership is open for this view.
+    /// Without attached evidence, enumeration is not logged; this does not
+    /// establish that the actual compilation membership is complete.
+    open_cause: Option<CSharpCompilationMembershipOpenCause>,
+    /// Append-only request log of what the resolution assumed about the
+    /// compilation. A `Mutex` for the same `Sync` reason as `answers`.
+    log: Arc<CaptureScopedMemo<Mutex<Vec<LogEntry>>>>,
+    /// Count of doubt events: one per gating obligation logged live and one per
+    /// memo hit that replays gating obligations. Kept only so diagnostics that
+    /// print the count stay byte-identical to the former doubt counter.
+    events: Arc<AtomicUsize>,
     /// Query-owned filtered type lists shared by the source accessors.
     static_types: CaptureScopedMemo<OnceLock<std::sync::Arc<Vec<CodeUnit>>>>,
     usage_static_types: CaptureScopedMemo<OnceLock<std::sync::Arc<Vec<CodeUnit>>>>,
 }
 
-/// A derived value and whether deriving it admitted a declaration of
-/// unproven membership. Built only by [`MembershipScopedSource::doubted`].
+/// One assumption a resolution made about the compilation's contents. Every
+/// variant names the declaration, namespace or file the assumption is about.
+/// Diagnostics print the complete list through `Debug`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Obligation {
+    /// A candidate declared in `file` was admitted although the reference's
+    /// compilation is not proven to contain `file`.
+    CandidateMembership { file: ProjectFile },
+    /// A name lookup read the declarations of `namespace` for `name` (the empty
+    /// name asks about the namespace as a whole) from an open compilation.
+    EnumeratedNamespaceTier { namespace: String, name: String },
+    /// The members called `name` of `type_fq` were read from indexed parts that
+    /// an omitted file could extend.
+    EnumeratedTypeMembers { type_fq: String, name: String },
+    /// The resolution assumed no extension member applies to `receiver_type`.
+    NoExtensionMember { receiver_type: String },
+    /// A fact read under conditional compilation in `file`.
+    ConditionalCompilation { file: ProjectFile },
+}
+
+impl Obligation {
+    /// Whether the single admission gate withdraws a site for this obligation.
+    ///
+    /// Only an unproven candidate and an open extension lookup withdraw a
+    /// site. The `Enumerated*` and conditional-compilation obligations are
+    /// logged but do not gate: nothing discharges them yet, and gating them
+    /// without a structural discharge would withdraw sites whose answers are
+    /// kept today.
+    fn gates(&self) -> bool {
+        matches!(
+            self,
+            Self::CandidateMembership { .. } | Self::NoExtensionMember { .. }
+        )
+    }
+}
+
+/// One request-log entry: an obligation logged live, or the shared obligations
+/// of a memoized derivation replayed by a memo hit. A replay stores one `Arc`
+/// clone, so nested memo reuse does not copy obligations. The log is
+/// positional (a site is withdrawn by anything gating after its mark), so
+/// replays are never deduplicated in the log itself.
+enum LogEntry {
+    Live(Obligation),
+    Replay(Arc<[Obligation]>),
+}
+
+impl LogEntry {
+    fn gates(&self) -> bool {
+        match self {
+            Self::Live(obligation) => obligation.gates(),
+            Self::Replay(obligations) => obligations.iter().any(Obligation::gates),
+        }
+    }
+
+    fn obligations(&self) -> std::slice::Iter<'_, Obligation> {
+        match self {
+            Self::Live(obligation) => std::slice::from_ref(obligation).iter(),
+            Self::Replay(obligations) => obligations.iter(),
+        }
+    }
+}
+
+/// A derived value and the obligations deriving it logged. Built only by
+/// [`MembershipScopedSource::doubted`].
 #[derive(Clone, Debug)]
 pub struct Doubted<T> {
     value: T,
-    doubted: bool,
+    obligations: Arc<[Obligation]>,
 }
 
 impl<T> Doubted<T> {
@@ -87,28 +157,35 @@ impl<T> Doubted<T> {
         &self.value
     }
 
+    /// Whether any logged obligation withdraws a site that uses the value.
     pub fn doubted(&self) -> bool {
-        self.doubted
+        self.obligations.iter().any(Obligation::gates)
+    }
+
+    pub fn obligations(&self) -> &[Obligation] {
+        &self.obligations
     }
 
     pub fn into_parts(self) -> (T, bool) {
-        (self.value, self.doubted)
+        let doubted = self.doubted();
+        (self.value, doubted)
     }
 }
 
 impl<T> Doubted<Option<T>> {
-    /// `None` when the derivation produced no value; the doubt it admitted
-    /// was already counted when it ran.
+    /// `None` when the derivation produced no value; the obligations it logged
+    /// were already recorded when it ran.
     pub fn transpose(self) -> Option<Doubted<T>> {
-        let doubted = self.doubted;
-        self.value.map(|value| Doubted { value, doubted })
+        let obligations = self.obligations;
+        self.value.map(|value| Doubted { value, obligations })
     }
 }
 
 /// A per-scan cache of derivations through a [`MembershipScopedSource`].
 ///
-/// A hit replays the doubt its derivation admitted when it was computed, so
-/// a doubtful answer stays unproven at every site that reuses it.
+/// A hit replays the obligations its derivation logged when it was computed,
+/// so an answer reached through them stays unproven at every site that reuses
+/// it.
 pub struct DoubtMemo<K, V>(HashMap<K, Doubted<V>>);
 
 impl<K, V> Default for DoubtMemo<K, V> {
@@ -118,12 +195,10 @@ impl<K, V> Default for DoubtMemo<K, V> {
 }
 
 impl<K: std::hash::Hash + Eq, V> DoubtMemo<K, V> {
-    /// The cached answer for `key`, replaying its doubt into `membership`.
+    /// The cached answer for `key`, replaying its obligations into `membership`.
     pub fn get(&self, key: &K, membership: &MembershipScopedSource<'_>) -> Option<&V> {
         let entry = self.0.get(key)?;
-        if entry.doubted {
-            membership.add_doubt();
-        }
+        membership.replay(&entry.obligations);
         Some(&entry.value)
     }
 
@@ -154,15 +229,22 @@ impl<K: std::hash::Hash + Eq, V> DoubtMemo<K, V> {
     }
 }
 
-/// The doubt count when one reference site started. A site is proven only
-/// while no derivation for it admitted doubt.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SiteDoubt(usize);
+/// The log position when one reference site started. The obligations logged
+/// after it are the site's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteMark(usize);
 
-impl SiteDoubt {
-    pub fn tripped(self, membership: &MembershipScopedSource<'_>) -> bool {
-        membership.doubt() > self.0
-    }
+/// The single admission decision for one reference site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiteAdmission {
+    /// Nothing the site relied on withdraws it.
+    Proven,
+    /// Every obligation was discharged while membership is open: keep the
+    /// answer and report the run incomplete with this cause. Nothing
+    /// discharges obligations yet, so `admit_site` does not return this.
+    StableUnderOpenMembership(CSharpCompilationMembershipOpenCause),
+    /// Undischarged obligations withdraw the site.
+    Withdrawn,
 }
 
 /// Direct ancestors by type, with the doubt each derivation admitted.
@@ -171,7 +253,21 @@ type DirectAncestors = DoubtMemo<CodeUnit, Vec<CodeUnit>>;
 type VisibilityAnswers<K> = HashMap<K, Option<CSharpCompilationVisibility>>;
 
 impl<'a> MembershipScopedSource<'a> {
+    /// A view with no open cause, so it logs no `Enumerated*` obligation.
+    /// Finding the cause needs the recording
+    /// `compilation_membership_completeness()` read, which adds a workspace
+    /// read to the request; it belongs with the code that lets the cause
+    /// affect an answer, not here.
     pub fn new(inner: &'a dyn CSharpSource, reference: &ProjectFile) -> Self {
+        Self::with_open_cause(inner, reference, None)
+    }
+
+    /// A view that treats compilation membership as open for `open_cause`.
+    pub fn with_open_cause(
+        inner: &'a dyn CSharpSource,
+        reference: &ProjectFile,
+        open_cause: Option<CSharpCompilationMembershipOpenCause>,
+    ) -> Self {
         let read_capability = inner.read_capability();
         Self {
             inner,
@@ -180,7 +276,9 @@ impl<'a> MembershipScopedSource<'a> {
             answers: Arc::default(),
             type_identities: Arc::default(),
             direct_ancestors: Arc::default(),
-            doubt: Arc::default(),
+            open_cause,
+            log: Arc::default(),
+            events: Arc::default(),
             static_types: CaptureScopedMemo::default(),
             usage_static_types: CaptureScopedMemo::default(),
         }
@@ -192,35 +290,148 @@ impl<'a> MembershipScopedSource<'a> {
         self.inner
     }
 
-    /// Number of unproven-membership declarations (and failed membership reads)
-    /// admitted so far, for diagnostics. Proof gates read doubt through
-    /// [`Self::doubted`] and [`SiteDoubt`], never by comparing counts.
+    /// Number of doubt events so far (unproven-membership declarations, failed
+    /// membership reads, open extension lookups and replayed doubtful memo
+    /// hits), for diagnostics. Proof gates use [`Self::admit_site`], never
+    /// counts.
     pub fn doubt(&self) -> usize {
-        self.doubt.load(Ordering::Relaxed)
+        self.events.load(Ordering::Relaxed)
     }
 
-    /// Record doubt from an open source surface whose derivation is measured
-    /// by the caller's `DoubtMemo`.
-    pub(super) fn add_doubt(&self) {
-        self.doubt.fetch_add(1, Ordering::Relaxed);
+    /// Why compilation membership is open for this request.
+    pub fn open_cause(&self) -> Option<CSharpCompilationMembershipOpenCause> {
+        self.open_cause
     }
 
-    /// Run `derive` and record whether it admitted doubt. This is the only
-    /// way to build a [`Doubted`], so a [`DoubtMemo`] cannot hold an answer
-    /// whose doubt was never measured.
-    pub fn doubted<T>(&self, derive: impl FnOnce() -> T) -> Doubted<T> {
-        let before = self.doubt();
-        let value = derive();
-        Doubted {
-            value,
-            doubted: self.doubt() > before,
+    /// Every obligation logged so far.
+    pub fn obligations(&self) -> Vec<Obligation> {
+        self.since(0)
+    }
+
+    fn with_log<R>(&self, f: impl FnOnce(&mut Vec<LogEntry>) -> R) -> R {
+        self.log
+            .read(&self.read_capability.memo_attribution(), |log_memo| {
+                f(&mut log_memo.lock().expect("obligation log poisoned"))
+            })
+    }
+
+    /// Number of request-log entries: a live obligation or a whole replay is
+    /// one entry.
+    pub fn log_len(&self) -> usize {
+        self.with_log(|log| log.len())
+    }
+
+    /// The obligations logged since entry `mark`, replays expanded, in order.
+    fn since(&self, mark: usize) -> Vec<Obligation> {
+        self.with_log(|log| {
+            log[mark..]
+                .iter()
+                .flat_map(LogEntry::obligations)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Log `obligation` as a doubt event if it gates.
+    pub(crate) fn record(&self, obligation: Obligation) {
+        if obligation.gates() {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+        self.with_log(|log| log.push(LogEntry::Live(obligation)));
+    }
+
+    /// Log an enumeration of the compilation's declarations. A no-op under
+    /// complete membership, where the index is the whole compilation.
+    fn record_enumeration(&self, obligation: impl FnOnce() -> Obligation) {
+        if self.open_cause.is_some() {
+            self.record(obligation());
         }
     }
 
-    /// Start measuring one reference site: a hit whose derivation admits
-    /// doubt after this point is not proven.
-    pub fn site(&self) -> SiteDoubt {
-        SiteDoubt(self.doubt())
+    fn log_children(&self, parent: &CodeUnit) {
+        self.record_enumeration(|| {
+            if parent.is_class() {
+                Obligation::EnumeratedTypeMembers {
+                    type_fq: parent.fq_name(),
+                    name: String::new(),
+                }
+            } else {
+                Obligation::EnumeratedNamespaceTier {
+                    namespace: parent.fq_name(),
+                    name: String::new(),
+                }
+            }
+        });
+    }
+
+    fn log_type_members(&self, type_fq: &str, name: &str) {
+        self.record_enumeration(|| Obligation::EnumeratedTypeMembers {
+            type_fq: type_fq.to_owned(),
+            name: name.to_owned(),
+        });
+    }
+
+    fn log_namespace(&self, namespace: &str, name: &str) {
+        self.record_enumeration(|| Obligation::EnumeratedNamespaceTier {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        });
+    }
+
+    /// Re-log the obligations a memoized derivation logged when it ran. The
+    /// whole replay is one doubt event when any of them gates.
+    fn replay(&self, obligations: &Arc<[Obligation]>) {
+        if obligations.is_empty() {
+            return;
+        }
+        if obligations.iter().any(Obligation::gates) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+        self.with_log(|log| log.push(LogEntry::Replay(Arc::clone(obligations))));
+    }
+
+    /// Run `derive` and record the obligations it logged. This is the only way
+    /// to build a [`Doubted`], so a [`DoubtMemo`] cannot hold an answer whose
+    /// obligations were never measured.
+    pub fn doubted<T>(&self, derive: impl FnOnce() -> T) -> Doubted<T> {
+        let before = self.log_len();
+        let value = derive();
+        let mut obligations = Vec::new();
+        self.with_log(|log| {
+            let mut seen = HashSet::default();
+            for obligation in log[before..].iter().flat_map(LogEntry::obligations) {
+                if seen.insert(obligation) {
+                    obligations.push(obligation.clone());
+                }
+            }
+        });
+        Doubted {
+            value,
+            obligations: obligations.into(),
+        }
+    }
+
+    /// Start measuring one reference site: the obligations logged after this
+    /// point belong to it.
+    pub fn site(&self) -> SiteMark {
+        SiteMark(self.log_len())
+    }
+
+    /// Decide whether the site that began at `mark` is proven.
+    ///
+    /// This is the one admission decision for usage hits, the inverted index
+    /// and definition lookups. Axiom: the full compilation is a valid C#
+    /// program, as the closure proof of unqualified calls already assumes.
+    /// Hidden projects with other LangVersion or target-framework settings are
+    /// not modeled.
+    pub fn admit_site(&self, mark: SiteMark) -> SiteAdmission {
+        self.with_log(|log| {
+            if log[mark.0..].iter().any(LogEntry::gates) {
+                SiteAdmission::Withdrawn
+            } else {
+                SiteAdmission::Proven
+            }
+        })
     }
 
     /// The membership of `unit`'s file for the reference, `None` for a
@@ -266,11 +477,17 @@ impl<'a> MembershipScopedSource<'a> {
                 if unit.is_class() {
                     self.admit_unproven_part(unit);
                 } else {
-                    self.add_doubt();
+                    self.record_candidate(unit);
                 }
                 true
             }
         }
+    }
+
+    fn record_candidate(&self, unit: &CodeUnit) {
+        self.record(Obligation::CandidateMembership {
+            file: unit.source().clone(),
+        });
     }
 
     /// Doubt for an unproven type part unless its type identity has a
@@ -303,7 +520,7 @@ impl<'a> MembershipScopedSource<'a> {
                     }
                 };
                 if answer != Some(CSharpCompilationVisibility::Visible) {
-                    self.add_doubt();
+                    self.record_candidate(part);
                 }
             },
         )
@@ -352,7 +569,7 @@ impl<'a> MembershipScopedSource<'a> {
                     } else if proven.contains(&identity(unit)) {
                         false
                     } else {
-                        self.add_doubt();
+                        self.record_candidate(unit);
                         true
                     }
                 }
@@ -366,6 +583,10 @@ impl<'a> MembershipScopedSource<'a> {
     /// resolved to, and a transitive walk visits one part per type, so a
     /// type's descendants are those of all its parts.
     fn physical_parts(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.record_enumeration(|| Obligation::EnumeratedTypeMembers {
+            type_fq: code_unit.fq_name(),
+            name: String::new(),
+        });
         let mut parts = crate::graph_support::partial_type_parts(self.inner, code_unit);
         if !parts.contains(code_unit) {
             parts.push(code_unit.clone());
@@ -415,7 +636,7 @@ impl<'a> MembershipScopedSource<'a> {
             Some(Some(CSharpCompilationVisibility::NotVisible)) => false,
             Some(Some(CSharpCompilationVisibility::Unresolved) | None) => {
                 if !raw.is_empty() {
-                    self.add_doubt();
+                    self.record_candidate(part);
                 }
                 true
             }
@@ -522,6 +743,17 @@ impl CodeUnitIndex for MembershipScopedSource<'_> {
         )
     }
 
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        use brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome;
+        match self.inner.declarations_for_files_answer(files) {
+            LookupOutcome::Found(units) => LookupOutcome::Found(self.admit_vec(units)),
+            outcome => outcome,
+        }
+    }
+
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
         self.admit_vec(self.inner.get_all_declarations())
     }
@@ -600,18 +832,22 @@ impl CodeUnitIndex for MembershipScopedSource<'_> {
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.log_children(code_unit);
         self.admit_vec(self.inner.direct_children(code_unit))
     }
 
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.log_children(code_unit);
         self.admit_vec(self.inner.get_direct_children(code_unit))
     }
 
     fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.log_children(code_unit);
         self.admit_vec(self.inner.direct_children_in_file(code_unit))
     }
 
     fn get_members_in_class(&self, class_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.log_children(class_unit);
         self.admit_vec(self.inner.get_members_in_class(class_unit))
     }
 
@@ -1111,6 +1347,7 @@ impl CSharpSource for MembershipScopedSource<'_> {
     }
 
     fn member_candidates_for_owner(&self, owner_fqn: &str, name: &str) -> BTreeSet<CodeUnit> {
+        self.log_type_members(owner_fqn, name);
         self.admit_btree(self.inner.member_candidates_for_owner(owner_fqn, name))
     }
 
@@ -1121,6 +1358,7 @@ impl CSharpSource for MembershipScopedSource<'_> {
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
+        self.log_type_members(owner_fqn, name);
         self.admit_rows(self.inner.member_candidates_for_owner_limited(
             owner_fqn,
             name,
@@ -1130,6 +1368,7 @@ impl CSharpSource for MembershipScopedSource<'_> {
     }
 
     fn workspace_namespace_exists(&self, namespace: &str) -> bool {
+        self.log_namespace(namespace, "");
         self.inner.workspace_namespace_exists(namespace)
     }
 
@@ -1146,6 +1385,7 @@ impl CSharpSource for MembershipScopedSource<'_> {
         parent: &CodeUnit,
         keep: &dyn Fn(&CodeUnit) -> bool,
     ) -> Vec<CodeUnit> {
+        self.log_children(parent);
         self.admit_vec(
             self.inner
                 .direct_children(parent)
@@ -1388,6 +1628,7 @@ impl BoundedDefinitionLookup for MembershipScopedLookup<'_, '_> {
     }
 
     fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        self.source.log_namespace(package, simple);
         self.source
             .admit_vec(self.inner.types_in_package(package, simple))
     }
@@ -1407,6 +1648,7 @@ impl BoundedDefinitionLookup for MembershipScopedLookup<'_, '_> {
         normalized_owner_fqn: &str,
         name: &str,
     ) -> Vec<CodeUnit> {
+        self.source.log_type_members(owner_fqn, name);
         self.source.admit_vec(self.inner.members_for_owner_name(
             owner_fqn,
             normalized_owner_fqn,
@@ -1415,6 +1657,7 @@ impl BoundedDefinitionLookup for MembershipScopedLookup<'_, '_> {
     }
 
     fn members_for_owner(&self, owner: &CodeUnit, name: &str) -> Vec<CodeUnit> {
+        self.source.log_type_members(&owner.fq_name(), name);
         self.source
             .admit_vec(self.inner.members_for_owner(owner, name))
     }
@@ -1425,6 +1668,7 @@ impl BoundedDefinitionLookup for MembershipScopedLookup<'_, '_> {
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.source.log_namespace(fqn, "");
         self.source.admit_vec(self.inner.fqn_direct_children(fqn))
     }
 
@@ -1433,6 +1677,7 @@ impl BoundedDefinitionLookup for MembershipScopedLookup<'_, '_> {
     }
 
     fn package_exists(&self, package: &str) -> bool {
+        self.source.log_namespace(package, "");
         self.inner.package_exists(package)
     }
 

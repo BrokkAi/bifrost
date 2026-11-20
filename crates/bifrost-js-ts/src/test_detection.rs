@@ -177,8 +177,16 @@ fn collect_js_ts_assertions(
 ) -> Vec<TestAssertionSignal> {
     let mut assertions = Vec::new();
     walk_named_tree_preorder(body, true, |node| {
-        if node.kind() == "call_expression"
-            && let Some(assertion) = js_ts_assertion_signal(node, source, weights)
+        let shape = match node.kind() {
+            "call_expression" => js_ts_call_assertion(node, source),
+            // A chai property assertion such as `expect(x).to.be.true` is a
+            // member expression with no call. A member that is the callee of
+            // a call belongs to that call, so no chain is read twice.
+            "member_expression" if !is_call_callee(node) => js_ts_property_assertion(node, source),
+            _ => None,
+        };
+        if let Some(shape) = shape
+            && let Some(assertion) = js_ts_assertion_signal(node, shape, source, weights)
         {
             assertions.push(assertion);
         }
@@ -189,64 +197,348 @@ fn collect_js_ts_assertions(
     assertions
 }
 
-fn js_ts_assertion_signal(
-    call: Node<'_>,
-    source: &str,
-    weights: &TestAssertionWeights,
-) -> Option<TestAssertionSignal> {
+/// An assertion chain read from the syntax tree, before it is classified.
+struct JsTsAssertionShape<'tree, 'src> {
+    /// `expect` for Jest, Vitest and chai's expect and should styles; `assert`
+    /// for node:assert and chai's assert.
+    root: &'static str,
+    matcher: &'src str,
+    actual: Node<'tree>,
+    expected: Option<Node<'tree>>,
+}
+
+/// What a chain starts from, once its chain words are stripped.
+enum JsTsAssertionRoot<'tree> {
+    /// `expect(actual)` or chai's `actual.should`.
+    Subject(Node<'tree>),
+    /// The `assert` namespace, which takes the actual value as an argument.
+    Assert,
+}
+
+fn js_ts_call_assertion<'tree, 'src>(
+    call: Node<'tree>,
+    source: &'src str,
+) -> Option<JsTsAssertionShape<'tree, 'src>> {
     let function = call.child_by_field_name("function")?;
-    if function.kind() != "member_expression" {
-        return None;
-    }
-    let matcher = node_text(function.child_by_field_name("property")?, source);
-    let mut object = function.child_by_field_name("object")?;
-    while object.kind() == "member_expression" {
-        let modifier = object.child_by_field_name("property")?;
-        if !matches!(node_text(modifier, source), "not" | "resolves" | "rejects") {
-            return None;
-        }
-        object = object.child_by_field_name("object")?;
-    }
     let arguments = call.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
     let mut args = arguments
         .named_children(&mut cursor)
         .filter(|n| !n.is_extra());
-    let (root, actual, expected) = match object.kind() {
-        "call_expression" => {
-            let callee = object.child_by_field_name("function")?;
-            if callee.kind() != "identifier" || node_text(callee, source) != "expect" {
-                return None;
+    match function.kind() {
+        // node:assert's default export, `assert(value, message)`, is `assert.ok`.
+        "identifier" if node_text(function, source) == "assert" => Some(JsTsAssertionShape {
+            root: "assert",
+            matcher: "ok",
+            actual: args.next()?,
+            expected: None,
+        }),
+        "member_expression" => {
+            let matcher = node_text(function.child_by_field_name("property")?, source);
+            let object = function.child_by_field_name("object")?;
+            match js_ts_assertion_root(object, source)? {
+                JsTsAssertionRoot::Subject(actual) => Some(JsTsAssertionShape {
+                    root: "expect",
+                    matcher,
+                    actual,
+                    expected: args.next(),
+                }),
+                JsTsAssertionRoot::Assert => Some(JsTsAssertionShape {
+                    root: "assert",
+                    matcher,
+                    actual: args.next()?,
+                    expected: args.next(),
+                }),
             }
-            let actual_args = object.child_by_field_name("arguments")?;
-            let mut actual_cursor = actual_args.walk();
-            let actual = actual_args
-                .named_children(&mut actual_cursor)
-                .find(|n| !n.is_extra())?;
-            ("expect", actual, args.next())
         }
-        "identifier" if node_text(object, source) == "assert" => {
-            ("assert", args.next()?, args.next())
-        }
-        _ => return None,
+        _ => None,
+    }
+}
+
+fn js_ts_property_assertion<'tree, 'src>(
+    member: Node<'tree>,
+    source: &'src str,
+) -> Option<JsTsAssertionShape<'tree, 'src>> {
+    let matcher = node_text(member.child_by_field_name("property")?, source);
+    if !JS_TS_CHAI_PROPERTY_MATCHERS.contains(&matcher) {
+        return None;
+    }
+    // `assert.ok` read as a value is not an assertion, so only a subject counts.
+    let JsTsAssertionRoot::Subject(actual) =
+        js_ts_assertion_root(member.child_by_field_name("object")?, source)?
+    else {
+        return None;
     };
+    Some(JsTsAssertionShape {
+        root: "expect",
+        matcher,
+        actual,
+        expected: None,
+    })
+}
+
+/// Walk from the object of a matcher down through chain words to the root of
+/// the assertion: `expect(actual)`, `actual.should` or `assert`.
+///
+/// A chai word such as `property(...)` or `length` makes the rest of the
+/// chain assert on another value. The subject is then the chain expression
+/// up to the outermost such word, which selects that value; it is never a
+/// literal or a copy of the expected operand, so operand classification does
+/// not compare the original value with the expected one.
+fn js_ts_assertion_root<'tree>(
+    mut object: Node<'tree>,
+    source: &str,
+) -> Option<JsTsAssertionRoot<'tree>> {
+    // Set once the walk passes a chai matcher; only a chai subject chains
+    // that way, never the `assert` namespace.
+    let mut past_matcher = false;
+    let mut changed_subject = None;
+    loop {
+        match object.kind() {
+            "member_expression" => {
+                let property = node_text(object.child_by_field_name("property")?, source);
+                let inner = object.child_by_field_name("object")?;
+                if property == "should" {
+                    return Some(JsTsAssertionRoot::Subject(changed_subject.unwrap_or(inner)));
+                }
+                // A property assertion returns the assertion too, as in
+                // `expect(x).to.be.true.and.equal(y)`; the property is read
+                // as an assertion of its own when the walk visits it.
+                if JS_TS_CHAI_PROPERTY_MATCHERS.contains(&property) {
+                    past_matcher = true;
+                } else if !is_js_ts_chain_word(property) {
+                    return None;
+                }
+                if is_js_ts_chai_subject_change(property) {
+                    changed_subject.get_or_insert(object);
+                }
+                object = inner;
+            }
+            "call_expression" => {
+                let callee = object.child_by_field_name("function")?;
+                // Every chai assertion returns the assertion, so a chain can
+                // go on after a called matcher, as in
+                // `expect(x).to.be.a("number").and.equal(y)`. The inner call
+                // is an assertion of its own, read when the walk visits it.
+                if callee.kind() == "member_expression" {
+                    let property = node_text(callee.child_by_field_name("property")?, source);
+                    if !is_js_ts_chai_called_matcher(property) {
+                        return None;
+                    }
+                    if is_js_ts_chai_subject_change(property) {
+                        changed_subject.get_or_insert(object);
+                    }
+                    past_matcher = true;
+                    object = callee.child_by_field_name("object")?;
+                    continue;
+                }
+                if callee.kind() != "identifier" || node_text(callee, source) != "expect" {
+                    return None;
+                }
+                let arguments = object.child_by_field_name("arguments")?;
+                let mut cursor = arguments.walk();
+                let actual = arguments
+                    .named_children(&mut cursor)
+                    .find(|n| !n.is_extra())?;
+                return Some(JsTsAssertionRoot::Subject(
+                    changed_subject.unwrap_or(actual),
+                ));
+            }
+            "identifier" if !past_matcher && node_text(object, source) == "assert" => {
+                return Some(JsTsAssertionRoot::Assert);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_call_callee(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
+    })
+}
+
+/// Words that join a chain without choosing the assertion: Jest's promise
+/// modifiers, `not` (the classification ignores negation, as it does for
+/// Jest), and chai's language chains and its `deep`, `own`, `nested`, `any`,
+/// `all`, `ordered` and `itself` flags. `a`, `an`, `include`,
+/// `contain`, `length` and `lengthOf` are also chai methods, which the matcher
+/// table reads when one ends a chain; in the middle of a chain they are
+/// chainable, as in `expect(a).to.have.length.above(n)`.
+fn is_js_ts_chain_word(word: &str) -> bool {
+    matches!(
+        word,
+        "not"
+            | "resolves"
+            | "rejects"
+            | "to"
+            | "be"
+            | "been"
+            | "is"
+            | "that"
+            | "which"
+            | "and"
+            | "has"
+            | "have"
+            | "with"
+            | "at"
+            | "of"
+            | "same"
+            | "but"
+            | "does"
+            | "still"
+            | "also"
+            | "deep"
+            | "own"
+            | "nested"
+            | "any"
+            | "all"
+            | "ordered"
+            | "itself"
+            | "a"
+            | "an"
+            | "include"
+            | "includes"
+            | "contain"
+            | "contains"
+            | "length"
+            | "lengthOf"
+    )
+}
+
+/// A chai word after which the chain asserts on another value: a property,
+/// the length, or the error a function throws.
+fn is_js_ts_chai_subject_change(word: &str) -> bool {
+    matches!(
+        word,
+        "property"
+            | "ownProperty"
+            | "haveOwnProperty"
+            | "ownPropertyDescriptor"
+            | "haveOwnPropertyDescriptor"
+            | "length"
+            | "lengthOf"
+            | "throw"
+            | "throws"
+            | "Throw"
+    )
+}
+
+/// A chai method or equality matcher, whose call returns the assertion for a
+/// chain to continue.
+fn is_js_ts_chai_called_matcher(name: &str) -> bool {
+    JS_TS_CHAI_METHOD_MATCHERS.contains(&name)
+        || matches!(name, "equal" | "equals" | "eq" | "eql" | "eqls")
+}
+
+/// Chai's assertions that are properties, with no call: `expect(x).to.be.true`.
+const JS_TS_CHAI_PROPERTY_MATCHERS: &[&str] = &[
+    "ok",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "NaN",
+    "exist",
+    "empty",
+    "arguments",
+    "Arguments",
+    "extensible",
+    "sealed",
+    "frozen",
+    "finite",
+];
+
+/// Chai's core assertion methods, other than equality, which is classified by
+/// its operands. Plugin matchers are not listed.
+const JS_TS_CHAI_METHOD_MATCHERS: &[&str] = &[
+    "a",
+    "an",
+    "include",
+    "includes",
+    "contain",
+    "contains",
+    "above",
+    "gt",
+    "greaterThan",
+    "least",
+    "gte",
+    "below",
+    "lt",
+    "lessThan",
+    "most",
+    "lte",
+    "within",
+    "instanceof",
+    "instanceOf",
+    "property",
+    "ownProperty",
+    "haveOwnProperty",
+    "ownPropertyDescriptor",
+    "haveOwnPropertyDescriptor",
+    "length",
+    "lengthOf",
+    "match",
+    "matches",
+    "string",
+    "key",
+    "keys",
+    "throw",
+    "throws",
+    "Throw",
+    "respondTo",
+    "respondsTo",
+    "satisfy",
+    "satisfies",
+    "closeTo",
+    "approximately",
+    "members",
+    "oneOf",
+    "change",
+    "changes",
+    "increase",
+    "increases",
+    "decrease",
+    "decreases",
+];
+
+fn js_ts_assertion_signal(
+    node: Node<'_>,
+    shape: JsTsAssertionShape<'_, '_>,
+    source: &str,
+    weights: &TestAssertionWeights,
+) -> Option<TestAssertionSignal> {
+    let JsTsAssertionShape {
+        root,
+        matcher,
+        actual,
+        expected,
+    } = shape;
 
     let mut operands = None;
     let mut kind = match (root, matcher) {
-        ("expect", "toBe" | "toEqual" | "toStrictEqual")
+        (
+            "expect",
+            "toBe" | "toEqual" | "toStrictEqual" | "equal" | "equals" | "eq" | "eql" | "eqls",
+        )
         | ("assert", "strictEqual" | "equal" | "deepEqual") => {
             operands = Some((actual, expected?));
             CommonTestAssertionKind::Meaningful
         }
-        ("expect", "toBeTruthy") | ("assert", "ok" | "isTrue") if actual.kind() == "true" => {
+        ("expect", "toBeTruthy" | "ok" | "true") | ("assert", "ok" | "isTrue")
+            if actual.kind() == "true" =>
+        {
             CommonTestAssertionKind::ConstantTruth
         }
-        ("expect", "toBeFalsy") | ("assert", "isFalse") if actual.kind() == "false" => {
+        ("expect", "toBeFalsy" | "false") | ("assert", "isFalse") if actual.kind() == "false" => {
             CommonTestAssertionKind::ConstantTruth
         }
-        ("expect", "toBeNull" | "toBeUndefined" | "toBeDefined")
+        (
+            "expect",
+            "toBeNull" | "toBeUndefined" | "toBeDefined" | "null" | "undefined" | "exist",
+        )
         | ("assert", "isNotNull" | "isNull") => CommonTestAssertionKind::NullnessOnly,
-        ("expect", "toBeTruthy" | "toBeFalsy") => CommonTestAssertionKind::Meaningful,
+        ("expect", "toBeTruthy" | "toBeFalsy" | "ok") => CommonTestAssertionKind::Meaningful,
         (
             "expect",
             "toThrow"
@@ -258,6 +550,15 @@ fn js_ts_assertion_signal(
             | "toMatchInlineSnapshot",
         )
         | ("assert", "ok" | "isTrue" | "isFalse") => CommonTestAssertionKind::Meaningful,
+        // An uncalled chain reaches here only through `js_ts_property_assertion`,
+        // which admits property matchers alone, so an unfinished
+        // `expect(x).to.be.a` is not an assertion.
+        ("expect", name)
+            if JS_TS_CHAI_PROPERTY_MATCHERS.contains(&name)
+                || JS_TS_CHAI_METHOD_MATCHERS.contains(&name) =>
+        {
+            CommonTestAssertionKind::Meaningful
+        }
         _ => return None,
     };
     let mut oversized = None;
@@ -303,7 +604,7 @@ fn js_ts_assertion_signal(
             "snapshot-assertion".to_string(),
         )
     } else if root == "expect"
-        && matches!(matcher, "toBeTruthy" | "toBeFalsy")
+        && matches!(matcher, "toBeTruthy" | "toBeFalsy" | "ok")
         && matches!(kind, CommonTestAssertionKind::Meaningful)
     {
         (
@@ -329,8 +630,8 @@ fn js_ts_assertion_signal(
         shallow,
         meaningful,
         reasons: vec![reason],
-        excerpt: collapse_whitespace(node_text(call, source)),
-        start_byte: call.start_byte(),
+        excerpt: collapse_whitespace(node_text(node, source)),
+        start_byte: node.start_byte(),
     })
 }
 

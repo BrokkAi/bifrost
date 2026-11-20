@@ -61,6 +61,7 @@ fn embedded_policies_accept_the_full_batch_capacity_without_python_models() {
         project.path(),
         &inputs,
         &options,
+        &Default::default(),
         &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("a full batch is legal");
@@ -90,6 +91,7 @@ fn embedded_policies_accept_the_full_batch_capacity_without_python_models() {
             project.path(),
             &too_many,
             &options,
+            &Default::default(),
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests()
         )
         .is_err()

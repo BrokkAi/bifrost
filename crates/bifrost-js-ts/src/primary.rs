@@ -244,6 +244,8 @@ impl<'source> JsTsParsedFile<'source> {
             let component_props = crate::graph::receiver_analysis::jsx_binding_props_source(
                 definition,
                 self.source_text,
+                // Syntax capture has no request to cancel.
+                None,
             )
             .map(|props| match props {
                 crate::graph::receiver_analysis::JsxPropsSource::Type(node) => {

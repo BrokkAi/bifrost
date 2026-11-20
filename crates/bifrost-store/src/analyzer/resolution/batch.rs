@@ -30,7 +30,7 @@ use super::engine::{
     select_paths_with_cancellation_evidence, select_paths_with_lazy_access,
     select_paths_with_lazy_candidate_filter,
 };
-use super::fact_source::{DeclarationAccessDecision, SelectedTypedRow};
+use super::fact_source::{DeclarationAccessDecision, DeclarationAccessRow, SelectedTypedRow};
 use super::local_identity::{ResolutionSemanticIdentity, SelectedResolutionMountOrdinal};
 use super::model::{
     BindingFragmentId, BindingNodeId, DerivationKey, EndpointSignature, ExactCompletionAccumulator,
@@ -63,6 +63,12 @@ pub(super) trait BatchSelectionAccess {
         reference: SemanticId,
         path: &mut super::PartialPath,
     ) -> StoreResult<Option<bool>>;
+
+    fn prepare_candidates(
+        &mut self,
+        reference: SemanticId,
+        definitions: &[SemanticId],
+    ) -> StoreResult<Option<HashMap<SemanticId, DeclarationAccessRow>>>;
 
     fn lookup(
         &mut self,
@@ -183,6 +189,28 @@ impl FactReferenceSiteMetadata {
             go_package_qualifier: false,
             callable_receiver_origin,
         }
+    }
+
+    /// Fixture constructor for language hooks that classify reference
+    /// metadata; production metadata comes only from recorded source rows.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn for_hook_test(
+        namespace: ResolutionNamespace,
+        site_kind: ResolutionSiteKind,
+        unqualified: bool,
+        callable_receiver_origin: Option<ResolutionCallableReceiverOrigin>,
+    ) -> Self {
+        Self::new(
+            ResolutionSiteId::new(1),
+            namespace,
+            site_kind,
+            0,
+            1,
+            unqualified,
+            None,
+            callable_receiver_origin,
+        )
     }
 
     /// The requested namespace for a source-owned Go spelling-scope lookup.
@@ -2846,6 +2874,15 @@ pub trait BatchResolutionFragmentSource {
         }
     }
 
+    /// Content-only identity for retained proof observations across checkouts.
+    fn proof_identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.identity_content_digest(key, cancellation)
+    }
+
     /// The selection this source is currently answering under.
     ///
     /// An answer read from this source is a function of the question and of
@@ -3537,6 +3574,14 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         self.session
             .or_else(|| self.base.candidate_admission_session())
+    }
+
+    fn proof_identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.base.proof_identity_content_digest(key, cancellation)
     }
 
     fn identity_content_digest(
@@ -5336,6 +5381,14 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
     fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
         self.resolution_session
             .or_else(|| self.base.candidate_admission_session())
+    }
+
+    fn proof_identity_content_digest(
+        &self,
+        key: super::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<[u8; 32]>> {
+        self.base.proof_identity_content_digest(key, cancellation)
     }
 
     fn identity_content_digest(
@@ -13041,8 +13094,38 @@ fn select_seed_answers(
             .as_mut()
             .and_then(|provider| provider.selection_access());
         if let Some(access) = access.as_deref_mut() {
+            let definitions = seed
+                .completed
+                .iter()
+                .map(|candidate| candidate.target)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let decisions = access.prepare_candidates(reference, &definitions)?;
+            if decisions.is_none() {
+                cancelled = true;
+            }
+            let decisions = decisions.unwrap_or_default();
             let mut retained = Vec::with_capacity(seed.completed.len());
             for mut candidate in seed.completed {
+                if let Some(row) = decisions.get(&candidate.target) {
+                    match row.decision {
+                        DeclarationAccessDecision::Denied => continue,
+                        DeclarationAccessDecision::Unknown => {
+                            candidate.definitive_cutoff = false;
+                            let reason = row
+                                .activation_reason
+                                .expect("uncertain candidate admission supplies its normal reason");
+                            candidate.path = candidate.path.with_additional_completion(
+                                &ResolutionCompletion::incomplete([
+                                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                                ]),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
                 match access.qualify_path(reference, &mut candidate.path)? {
                     Some(true) => retained.push(candidate),
                     Some(false) => {}
@@ -16719,11 +16802,8 @@ mod tests {
             [fixture.first_reference, fixture.second_reference]
                 .map(|reference| reference_seed(&fixture.source, ResolutionQuery::new(reference))),
         );
-        for max_scope_nodes in [0, 1, ReceiverAnalysisBudget::default().max_scope_nodes] {
-            let budget = ReceiverAnalysisBudget {
-                max_scope_nodes,
-                ..ReceiverAnalysisBudget::default()
-            };
+        {
+            let budget = ReceiverAnalysisBudget::default();
             let cancellation = CancellationToken::new();
             let eager_session = ResolutionSession::bounded(budget, Some(&cancellation));
             let frame_session = ResolutionSession::bounded(budget, Some(&cancellation));
@@ -16995,15 +17075,19 @@ mod tests {
                 .unwrap();
         let work = baseline_session.finish(()).work();
         assert!(work.scope_nodes > 0 && work.resolution_rounds > 0);
-        for scope_limit in [work.scope_nodes, work.scope_nodes - 1, 0] {
-            let budget = ReceiverAnalysisBudget {
-                max_scope_nodes: scope_limit,
-                max_summary_expansions: work.summary_expansions,
-                max_resolution_rounds: work.resolution_rounds,
-                ..ReceiverAnalysisBudget::default()
-            };
-            let eager_session = ResolutionSession::bounded(budget, Some(&cancellation));
-            let frame_session = ResolutionSession::bounded(budget, Some(&cancellation));
+        let total = work.charged_total();
+        for total_limit in [total, total - 1, 0] {
+            let budget = ReceiverAnalysisBudget::default();
+            let eager_session = ResolutionSession::bounded_with_total_work(
+                budget,
+                total_limit,
+                Some(&cancellation),
+            );
+            let frame_session = ResolutionSession::bounded_with_total_work(
+                budget,
+                total_limit,
+                Some(&cancellation),
+            );
             let eager = BatchResolutionEngine::maybe_bounded(&fixture.source, Some(&eager_session))
                 .resolve_seeded_reference_requests(
                     &requests,
@@ -17025,7 +17109,7 @@ mod tests {
                 frame_session.finish(()).work(),
                 eager_session.finish(()).work()
             );
-            if scope_limit == work.scope_nodes {
+            if total_limit == total {
                 assert_eq!(actual, baseline);
                 assert!(matches!(
                     frame_session.finish(()),
@@ -17041,7 +17125,7 @@ mod tests {
                 assert!(matches!(
                     frame_session.finish(()),
                     BoundedResolution::Exceeded {
-                        limit: ReceiverBudgetLimit::ScopeNodes,
+                        limit: ReceiverBudgetLimit::TotalWork,
                         ..
                     }
                 ));
@@ -17682,11 +17766,9 @@ mod tests {
         let cache_paths = CandidatePathStore::default();
         let mut cache = ForwardCandidateArtifactCache::default();
         let caller = CancellationToken::new();
-        let stopped_session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let stopped_session = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            0,
             Some(&caller),
         );
         let mut work = 0_usize;
@@ -17708,7 +17790,7 @@ mod tests {
         assert!(matches!(
             stopped_session.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::TotalWork,
                 work: ReceiverAnalysisWork {
                     setup_nodes: 0,
                     summary_expansions: 0,
@@ -17719,11 +17801,9 @@ mod tests {
             }
         ));
 
-        let exact_session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 3,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let exact_session = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            3,
             Some(&caller),
         );
         let mut exact_work = 0_usize;
@@ -17755,11 +17835,9 @@ mod tests {
             }
         ));
 
-        let warm_session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 2,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let warm_session = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            2,
             Some(&caller),
         );
         let mut warm_work = 0_usize;
@@ -17817,11 +17895,9 @@ mod tests {
         let requests = [BatchCandidateRequest::new(0, endpoint)];
         let caller = CancellationToken::new();
 
-        let stopped = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 2,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let stopped = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            2,
             Some(&caller),
         );
         let mut work = 0_usize;
@@ -17845,7 +17921,7 @@ mod tests {
         assert!(matches!(
             stopped.finish(()),
             BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
+                limit: ReceiverBudgetLimit::TotalWork,
                 work: ReceiverAnalysisWork {
                     setup_nodes: 0,
                     summary_expansions: 0,
@@ -17856,11 +17932,9 @@ mod tests {
             }
         ));
 
-        let exact = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 4,
-                ..ReceiverAnalysisBudget::default()
-            },
+        let exact = ResolutionSession::bounded_with_total_work(
+            ReceiverAnalysisBudget::default(),
+            4,
             Some(&caller),
         );
         let mut retry_work = 0_usize;

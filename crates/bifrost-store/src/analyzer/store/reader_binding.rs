@@ -135,6 +135,11 @@ impl ReaderBinding {
             .is_some_and(|lease| lease.schema.matches(conn, budget))
     }
 
+    /// The schema this binding was captured under, for the owner's loan.
+    pub(crate) fn schema_lease(&self) -> Option<&SchemaLease> {
+        self.lease.as_ref().map(|lease| &lease.schema)
+    }
+
     /// A pause ends the transaction even if a later resume recreates an
     /// otherwise equal selected snapshot. A scope or direct stage write inside
     /// the transaction changes what its reads see without ending it, so the

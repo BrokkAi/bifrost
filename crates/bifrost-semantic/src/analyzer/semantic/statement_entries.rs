@@ -210,10 +210,12 @@ pub fn unavailable(reason: &'static str) -> StatementAssessments {
 
 /// Stable labels shared with the analyzer's literal classifier inventory.
 pub mod reason {
-    pub const CANCELLED: &str = "cancelled";
-    pub const CONTROL_BUDGET_EXHAUSTED: &str = "control_budget_exhausted";
-    pub const CONTROL_EVIDENCE_INCOMPLETE: &str = "control_evidence_incomplete";
-    pub const CONTROL_FRONTIER_INCOMPLETE: &str = "control_frontier_incomplete";
+    // The classification table owns these labels, so a rename cannot leave
+    // an emitted label unclassified.
+    pub use brokk_bifrost_core::analyzer::derivation_cause::reason::{
+        CANCELLED, CONTROL_BUDGET_EXHAUSTED, CONTROL_EVIDENCE_INCOMPLETE,
+        CONTROL_FRONTIER_INCOMPLETE,
+    };
 }
 
 /// Points reachable from entry using only proven control edges. Candidate

@@ -104,6 +104,7 @@ fn digest(bytes: Vec<u8>, column: &str) -> Result<StableDigest> {
 impl AnalyzerStore {
     /// Locate one exact selected local struct or enum. Ambiguous crate mounts
     /// cannot choose an owning crate and therefore cannot make a negative proof.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_copy_absence_question(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -146,10 +147,12 @@ impl AnalyzerStore {
     /// calls this same method; a missing selected unit gives no comparison.
     /// Existing rows are scanned under SQL cancellation/deadline controls;
     /// each visit is observed work, not a refusing semantic work quota.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_copy_absence_answer(
         &self,
         snapshots: &WorkspaceSnapshots,
         question: &LookupQuestion,
+        selected_stdlib_revision: Option<&str>,
         cancellation: &CancellationToken,
         mut charge_row: impl FnMut(),
     ) -> Result<Option<(RustCopyAbsence, usize)>> {
@@ -185,6 +188,10 @@ impl AnalyzerStore {
             hasher.field("census_version", &census_version.to_be_bytes());
             hasher.field("config", config_digest.as_bytes());
             hasher.field("producer", producer_digest.as_bytes());
+            hasher.field(
+                "selected_stdlib_revision",
+                selected_stdlib_revision.unwrap_or_default().as_bytes(),
+            );
             let mut header = 0;
             let mut row_count = 0usize;
             let mut reason: Option<(u8, RustCopyAbsenceReason)> = None;
@@ -251,10 +258,16 @@ impl AnalyzerStore {
                             put(3, RustCopyAbsenceReason::ModuleUniverseOpen);
                         }
                     }
-                    2 => put(
-                        2,
-                        RustCopyAbsenceReason::Boundary(row.get::<_, i64>(4)? as u8),
-                    ),
+                    2 => {
+                        let kind = row.get::<_, i64>(4)?;
+                        // Only a macro boundary (kind 0) can be certified item-free.
+                        if kind != 0
+                            || !super::rust_drop_inventory::RustCensusMacroBoundary::from_row(row)?
+                                .is_item_free(selected_stdlib_revision)
+                        {
+                            put(2, RustCopyAbsenceReason::Boundary(kind as u8));
+                        }
+                    }
                     3 => {
                         let trait_present = row.get::<_, i64>(4)? != 0;
                         let pairs: i64 = row.get(5)?;

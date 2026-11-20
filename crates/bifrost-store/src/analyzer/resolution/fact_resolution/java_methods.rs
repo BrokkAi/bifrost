@@ -30,6 +30,23 @@ static JAVA_OBJECT_METHOD_LOOKUP_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>>
     });
 
 impl FactReadSession<'_> {
+    pub(super) fn java_concrete_super_method(
+        &mut self,
+        targets: &[SemanticId],
+    ) -> StoreResult<Option<bool>> {
+        let Some(declarations) = self.java_declarations(targets)? else {
+            return Ok(None);
+        };
+        // JLS 15.12.3 rejects `I.super.m()` when m is a static interface
+        // method. A static class method reached through `C.super` is legal
+        // but has no receiver for this proof to seed, so every static target
+        // keeps the call's gap.
+        Ok(Some(matches!((targets, declarations.as_slice()),
+            ([target], [declaration]) if *target == declaration.definition && matches!(
+                declaration.kind,
+                JavaInheritanceDeclarationKind::Method { is_abstract: Some(false), is_static: false, .. }))))
+    }
+
     pub(super) fn java_declarations(
         &mut self,
         definitions: &[SemanticId],
@@ -356,7 +373,7 @@ impl FactEvaluation<'_, '_> {
                     .iter()
                     .map(|row| row.get(self.session).row())
                     .filter(|row| {
-                        row.source_kind() == Some(ResolutionSupertypeKind::ImplicitSuperclass)
+                        matches!(classify_supertype_kind(row.source_kind(), crate::analyzer::resolution::SupertypeKindEvidence::ProducerClassified), SupertypeClassification::Classified(Some(ClassifiedSupertypeKind::ImplicitSuperclass)))
                     })
                     .map(|row| row.reference()),
             );
@@ -558,7 +575,7 @@ impl FactEvaluation<'_, '_> {
             if owner.hierarchy_depth == 0 {
                 continue;
             }
-            if let Some((_, rules)) = self.implicit_interface_member_rules(owner) {
+            if let Some((_, rules)) = self.implicit_member_declaration_rules(owner) {
                 debug_assert_eq!(rules.visibility, DeclaredVisibility::Public);
                 debug_assert!(rules.is_abstract);
                 // JLS 9.2 declares this member directly on the interface.
@@ -1579,12 +1596,37 @@ impl FactEvaluation<'_, '_> {
             let Some(rows) = self.accept_session_read(read) else {
                 return Ok(None);
             };
+            match self.normalized_nominal_parent_targets(current, &rows) {
+                None => return Ok(None),
+                Some(NormalizedNominalParents::Open) => {
+                    known = false;
+                    continue;
+                }
+                Some(NormalizedNominalParents::Parents(parents)) => {
+                    pending.extend(parents);
+                    continue;
+                }
+                Some(NormalizedNominalParents::ProducerClassified) => {}
+            }
             for row in rows {
                 let (kind, frontier) = {
                     let row = row.get(self.session).row();
-                    (row.source_kind(), row.frontier())
+                    (
+                        classify_supertype_kind(
+                            row.source_kind(),
+                            super::super::SupertypeKindEvidence::ProducerClassified,
+                        ),
+                        row.frontier(),
+                    )
                 };
-                if kind == Some(ResolutionSupertypeKind::SelfType) {
+                let kind = match kind {
+                    SupertypeClassification::Classified(kind) => kind,
+                    SupertypeClassification::Open(_) => {
+                        known = false;
+                        continue;
+                    }
+                };
+                if kind == Some(ClassifiedSupertypeKind::SelfType) {
                     continue;
                 }
                 self.demand_slot(frontier);
@@ -1599,7 +1641,7 @@ impl FactEvaluation<'_, '_> {
                 });
                 match resolved {
                     Some(supertype) => pending.push(supertype),
-                    None if kind == Some(ResolutionSupertypeKind::ImplicitSuperclass) => {}
+                    None if kind == Some(ClassifiedSupertypeKind::ImplicitSuperclass) => {}
                     None => known = false,
                 }
             }

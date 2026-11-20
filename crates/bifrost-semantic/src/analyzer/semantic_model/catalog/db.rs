@@ -12,7 +12,7 @@ use crate::analyzer::semantic_model::catalog::CatalogOpenMode;
 use brokk_bifrost_core::sqlite_template;
 
 pub(in crate::analyzer::semantic_model::catalog) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 30;
+pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 31;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
 const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
 const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
@@ -98,6 +98,8 @@ pub(in crate::analyzer::semantic_model::catalog) const ASSEMBLY_TYPE_FORWARDS_SQ
 
 const OPEN_SCHEMA_VERSION_BOUND_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0029-open-schema-version-bound.sql");
+const PRODUCTION_INPUTS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0031-production-inputs.sql");
 const SHARD_VALIDATION_CENSUS_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0030-shard-validation-census.sql");
 
@@ -139,12 +141,21 @@ static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| 
             ASSEMBLY_TYPE_FORWARDS_SQL.as_bytes(),
             OPEN_SCHEMA_VERSION_BOUND_SQL.as_bytes(),
             SHARD_VALIDATION_CENSUS_SQL.as_bytes(),
+            PRODUCTION_INPUTS_SQL.as_bytes(),
         ],
     )
 });
 
 #[doc(hidden)]
 pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogError> {
+    open_for_supported_version(root, mode, CURRENT_CATALOG_VERSION)
+}
+
+fn open_for_supported_version(
+    root: &Path,
+    mode: CatalogOpenMode,
+    supported: i64,
+) -> Result<Connection, CatalogError> {
     // The catalog is the other database a Bifrost process can open first, and
     // the memory-statistics knob is only settable before the first connection.
     brokk_bifrost_core::cache_db::disable_sqlite_memory_statistics();
@@ -175,7 +186,7 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
     }
     let mut connection = {
         let _scope = brokk_bifrost_core::profiling::scope("semantic_pack.catalog.sqlite_open");
-        Connection::open_with_flags(&path, flags)
+        brokk_bifrost_core::cache_db::open_owned_sqlite(&path, flags)
             .map_err(|error| CatalogError::sqlite("open catalog", error))?
     };
     brokk_bifrost_core::cache_db::sql_profile::install_catalog_durable(&connection);
@@ -188,12 +199,7 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
     let version: i64 =
         retry_initialization(|| connection.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .map_err(|error| CatalogError::sqlite("read catalog schema version", error))?;
-    if version > CURRENT_CATALOG_VERSION {
-        return Err(CatalogError::CatalogTooNew {
-            found: version,
-            supported: CURRENT_CATALOG_VERSION,
-        });
-    }
+    refuse_newer_catalog(version, supported)?;
     {
         let _scope = brokk_bifrost_core::profiling::scope("semantic_pack.catalog.configure");
         match mode {
@@ -208,9 +214,21 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
     Ok(connection)
 }
 
+// Keep the version fence before writer configuration or migration. Older readers
+// use their compiled supported version and must never open a newer catalog.
+fn refuse_newer_catalog(version: i64, supported: i64) -> Result<(), CatalogError> {
+    if version > supported {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported,
+        });
+    }
+    Ok(())
+}
+
 /// Create an empty current-schema catalog at `path` through the ordinary path.
 fn build_fresh_catalog(path: &Path) -> Result<(), CatalogError> {
-    let mut connection = Connection::open_with_flags(
+    let mut connection = brokk_bifrost_core::cache_db::open_owned_sqlite(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
@@ -342,7 +360,8 @@ fn migrate(
     migrate_pack_manifest_objects(connection, root)?;
     migrate_manifest_schema(connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL)?;
     migrate_manifest_schema(connection, 29, OPEN_SCHEMA_VERSION_BOUND_SQL)?;
-    migrate_manifest_schema(connection, 30, SHARD_VALIDATION_CENSUS_SQL)
+    migrate_manifest_schema(connection, 30, SHARD_VALIDATION_CENSUS_SQL)?;
+    migrate_manifest_schema(connection, 31, PRODUCTION_INPUTS_SQL)
 }
 
 fn migrate_catalog_through_payload_families(
@@ -1859,6 +1878,7 @@ fn check_migration_foreign_keys(
 // Rebuild the actual pre-27 table and remove manifest objects, rather than
 // merely lowering user_version on a database that already has object links.
 pub fn restore_version_26_fixture(connection: &Connection) {
+    connection.execute_batch("DROP TABLE catalog_production_inputs; DROP INDEX catalog_selectors_production_input; ALTER TABLE catalog_selectors DROP COLUMN production_input_digest;").unwrap();
     let root = Path::new(connection.path().unwrap()).parent().unwrap();
     let foreign_keys: bool = connection
         .pragma_query_value(None, "foreign_keys", |row| row.get(0))
@@ -2114,7 +2134,33 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#13703: a semantic-pack catalog's SQLite files were unregistered, so hashing them dropped its locks"
+    )]
+    fn an_open_catalog_is_a_registered_live_store() {
+        let temp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let _connection = open(&root, CatalogOpenMode::ReadWrite).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = root.join(format!("{CATALOG_DB_FILE_NAME}{suffix}"));
+            assert!(file.exists(), "{}", file.display());
+            assert!(
+                brokk_bifrost_core::cache_db::is_open_store_file(&file),
+                "{}",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#4604: catalog template builders rejected macOS's symlinked temp root")]
     fn a_catalog_seeded_from_the_template_matches_a_catalog_built_by_migration() {
+        if !brokk_bifrost_core::analyzer::project::rerun_test_with_symlinked_tempdir(
+            "analyzer::semantic_model::catalog::db::tests::a_catalog_seeded_from_the_template_matches_a_catalog_built_by_migration",
+            "BIFROST_ISSUE_4604_CATALOG_TEMPLATE_CHILD",
+        ) {
+            return;
+        }
         let temp = TempDir::new().unwrap();
         // The template builders open with SQLITE_OPEN_NOFOLLOW, which rejects a
         // symlink anywhere in the path, and production passes canonical paths.
@@ -3100,6 +3146,73 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    #[hardwon("#4604: the version fence test opened a raw macOS temp root with NOFOLLOW")]
+    fn version_30_reader_refuses_production_input_schema_before_writes() {
+        if !brokk_bifrost_core::analyzer::project::rerun_test_with_symlinked_tempdir(
+            "analyzer::semantic_model::catalog::db::tests::version_30_reader_refuses_production_input_schema_before_writes",
+            "BIFROST_ISSUE_4604_VERSION_FENCE_CHILD",
+        ) {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        // Match production's storage::prepare_root: resolve the directory,
+        // leaving the database filename subject to SQLite's NOFOLLOW check.
+        let root = temp.path().canonicalize().unwrap();
+        let connection = open(&root, CatalogOpenMode::ReadWrite).unwrap();
+        let version = connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, 31);
+        drop(connection);
+        let path = root.join(CATALOG_DB_FILE_NAME);
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            open_for_supported_version(&root, CatalogOpenMode::ReadWrite, 30),
+            Err(CatalogError::CatalogTooNew {
+                found: 31,
+                supported: 30
+            })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon("#4604: canonical temp roots must leave the database symlink protection intact")]
+    fn canonical_temp_root_does_not_allow_a_symlinked_database() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let real_parent = parent.join("private");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = parent.join("var");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let raw_root = linked_parent.join("catalog");
+        // The public catalog opener prepares its root before calling db::open.
+        let root = super::super::storage::prepare_root(&raw_root).unwrap();
+        drop(open(&root, CatalogOpenMode::ReadWrite).unwrap());
+        assert!(matches!(
+            open(&raw_root, CatalogOpenMode::ReadOnly),
+            Err(CatalogError::Sqlite {
+                source: rusqlite::Error::SqliteFailure(error, _),
+                ..
+            }) if error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+        ));
+        let path = root.join(CATALOG_DB_FILE_NAME);
+        let target = root.join("target.db");
+        std::fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        for mode in [CatalogOpenMode::ReadOnly, CatalogOpenMode::ReadWrite] {
+            assert!(matches!(
+                open(&root, mode),
+                Err(CatalogError::Sqlite {
+                    source: rusqlite::Error::SqliteFailure(error, _),
+                    ..
+                }) if error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+            ));
+        }
     }
 
     #[test]

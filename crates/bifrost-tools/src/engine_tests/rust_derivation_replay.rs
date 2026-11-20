@@ -107,7 +107,7 @@ mod tests {
 
     const PRODUCTION_NESTED_KINDS: [&str; 4] = [
         "derivation:rust_selected_units_known:v1",
-        "derivation:rust_unit_inputs:v2",
+        "derivation:rust_unit_inputs:v3",
         "derivation:rust_unit_naming:v1",
         "derivation:rust_unit_dependents:v1",
     ];
@@ -507,7 +507,7 @@ mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "40457c5a8974: RustUnitInputs token meaning changed without a version bump"
     )]
-    fn rust_unit_inputs_v2_persisted_validation() {
+    fn rust_unit_inputs_v3_persisted_validation() {
         use brokk_bifrost_analysis::analyzer::derivation_host::ReplayResult;
         use brokk_bifrost_semantic::analyzer::semantic::derivation::{
             DerivationKindId, DerivationQuestion,
@@ -549,10 +549,10 @@ mod tests {
                 .unwrap()
                 .derivations()
         }
-        let kind = DerivationKindId("derivation:rust_unit_inputs:v2");
+        let kind = DerivationKindId("derivation:rust_unit_inputs:v3");
         let ReplayResult::Identity(identity) = host(&base).replay(base.analyzer(), kind, &question)
         else {
-            panic!("v2 replay")
+            panic!("v3 replay")
         };
         let read = ReadKey::Lookup {
             kind: LookupKind::Derivation(kind),
@@ -561,7 +561,7 @@ mod tests {
             ),
             digest: identity.0,
         };
-        let key = production_receipt_key("unit-inputs-v2");
+        let key = production_receipt_key("unit-inputs-v3");
         base.store()
             .unwrap()
             .publish_policy_units(vec![PolicyUnitRow {
@@ -599,42 +599,51 @@ mod tests {
         let count = host(&head).counters(kind).recomputed - before;
         eprintln!("RustUnitInputs recomputes in warm request: {count}");
         assert_eq!(count, 1);
-        // Historical ledgers decode, but v1 has no registered computation and
+        // Historical ledgers decode, but retired kinds have no computation and
         // cannot certify a consumer even if its digest equals today's output.
-        let old = ReadKey::Lookup {
-            kind: LookupKind::Derivation(DerivationKindId("derivation:rust_unit_inputs:v1")),
-            question: brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion::Derivation(
-                question.clone(),
-            ),
-            digest: identity.0,
-        };
-        let old_key = production_receipt_key("unit-inputs-v1");
-        base.store()
-            .unwrap()
-            .publish_policy_units(vec![PolicyUnitRow {
-                seed_parse_variant: None,
-                key: old_key.clone(),
-                product_kind: "rows".into(),
-                product: "{\"rows\":[]}".into(),
-                read_set_digest: *read_set_digest(std::slice::from_ref(&old))
-                    .digest()
-                    .as_bytes(),
-                reads: vec![old],
-                snapshots: vec![[1; 32]],
-            }])
-            .unwrap();
-        let old_loaded = base
-            .store()
-            .unwrap()
-            .policy_units_for_keys(&[old_key])
-            .unwrap()
-            .remove(0)
-            .unwrap();
-        assert_ne!(
-            verify(&base, &head, &old_loaded.reads),
-            ReadVerdict::Unchanged
-        );
-        // A consumer whose historical ledger misses must recompute with v2.
+        for retired in [
+            "derivation:rust_unit_inputs:v1",
+            "derivation:rust_unit_inputs:v2",
+        ] {
+            let old = ReadKey::Lookup {
+                kind: LookupKind::Derivation(DerivationKindId(retired)),
+                question: brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion::Derivation(
+                    question.clone(),
+                ),
+                digest: identity.0,
+            };
+            let old_key = production_receipt_key(retired);
+            base.store()
+                .unwrap()
+                .publish_policy_units(vec![PolicyUnitRow {
+                    seed_parse_variant: None,
+                    key: old_key.clone(),
+                    product_kind: "rows".into(),
+                    product: "{\"rows\":[]}".into(),
+                    read_set_digest: *read_set_digest(std::slice::from_ref(&old))
+                        .digest()
+                        .as_bytes(),
+                    reads: vec![old],
+                    snapshots: vec![[1; 32]],
+                }])
+                .unwrap();
+            let old_loaded = base
+                .store()
+                .unwrap()
+                .policy_units_for_keys(&[old_key])
+                .unwrap()
+                .remove(0)
+                .unwrap();
+            assert_ne!(
+                verify(&base, &head, &old_loaded.reads),
+                ReadVerdict::Unchanged
+            );
+            assert_eq!(
+                host(&head).counters(DerivationKindId(retired)).recomputed,
+                0
+            );
+        }
+        // A consumer whose historical ledger misses must recompute with v3.
         let before = host(&head).counters(kind).recomputed;
         assert_eq!(
             host(&head).replay(head.analyzer(), kind, &question),
@@ -711,6 +720,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn rust_derivation_reads_survive_policy_storage_and_replay() {
         let project = project();
         let base = listed_analyzer(&project);
@@ -890,6 +903,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn recipe_less_route_recording_refuses_policy_publication() {
         use brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventoryOutcome;
@@ -1072,6 +1089,7 @@ mod tests {
         listing_project.set_omissions(vec![WorkspaceFileOmission {
             path: PathBuf::from("core/src/lib.rs"),
             reason: WorkspaceFileOmissionReason::NotSupplied,
+            bounded: None,
         }]);
         let head = base.update(&BTreeSet::new());
         assert_eq!(listing_project.all_files().unwrap(), visible_files_before);
@@ -1223,7 +1241,7 @@ mod tests {
         let left = fixture.file("app/src/left.rs");
         let right = fixture.file("app/src/right.rs");
         let derivations = delegate.snapshot_caches().unwrap().derivations();
-        let inputs_kind = DerivationKindId("derivation:rust_unit_inputs:v2");
+        let inputs_kind = DerivationKindId("derivation:rust_unit_inputs:v3");
         let inputs_before = derivations.counters(inputs_kind);
         let ledger = Arc::new(ReadLedger::new());
         let base_answer = {

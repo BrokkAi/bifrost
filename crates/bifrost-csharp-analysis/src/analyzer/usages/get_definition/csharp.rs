@@ -24,6 +24,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::analyzer::CSharpAnalyzer;
 
+use brokk_bifrost_csharp::graph::membership_scope::{SiteAdmission, SiteMark};
 use brokk_bifrost_csharp::graph::resolver::CSharpInitializerOwnerLookups;
 
 use brokk_bifrost_csharp::graph::resolver::CSharpInitializerOwnerTarget;
@@ -746,7 +747,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
 
         if unresolved_ancestry {
-            session.mark_scope_incomplete();
+            session.mark_unavailable("csharp_unresolved_ancestry");
             None
         } else {
             Some(false)
@@ -1106,7 +1107,7 @@ pub(crate) fn resolve_csharp(
         site,
         &outcome,
     );
-    let evidence = if constructor_evidence.exact_external_call.is_some() {
+    let mut evidence = if constructor_evidence.exact_external_call.is_some() {
         constructor_evidence
     } else {
         csharp_external_member_evidence(
@@ -1119,6 +1120,66 @@ pub(crate) fn resolve_csharp(
             &outcome,
         )
     };
+    if outcome.status == DefinitionLookupStatus::Resolved
+        && let [target] = outcome.definitions.as_slice()
+        && target.is_function()
+        && definitions
+            .signature_metadata(target)
+            .iter()
+            .any(|metadata| {
+                metadata
+                    .callable_arity()
+                    .is_some_and(|arity| arity.is_repeated())
+            })
+        && let Some(tree) = tree
+        && let Some(mut node) = csharp_smallest_named_node_covering(
+            definitions,
+            tree.root_node(),
+            site.focus_start_byte,
+            site.focus_end_byte,
+        )
+    {
+        loop {
+            if !definitions.scope_step() {
+                break;
+            }
+            if matches!(
+                node.kind(),
+                "invocation_expression" | "object_creation_expression"
+            ) {
+                let callee = node
+                    .child_by_field_name("function")
+                    .or_else(|| node.child_by_field_name("type"));
+                if callee.is_none_or(|callee| {
+                    callee.start_byte() > site.focus_start_byte
+                        || callee.end_byte() < site.focus_end_byte
+                }) {
+                    break;
+                }
+                let fixed = with_declaration_node(
+                    definitions.csharp,
+                    target,
+                    |formal_source, declaration| {
+                        crate::analyzer::csharp::call_conversion::source_normal_array_invocation(
+                            node,
+                            source,
+                            declaration,
+                            formal_source,
+                        )
+                    },
+                )
+                .flatten();
+                if let Some(fixed) = fixed {
+                    evidence.fixed_array_source = Some((target.clone(), fixed));
+                }
+                break;
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            node = parent;
+        }
+    }
     CSharpDefinitionResolution { outcome, evidence }
 }
 
@@ -1266,7 +1327,11 @@ fn resolve_csharp_in_session(
         site,
         preserve_using_alias,
     );
-    let outcome = hold_to_compilation_membership(analyzer, definitions, file, outcome);
+    // Whether additions to the compilation could change this answer is
+    // computed but unused: nothing discharges obligations yet, so no answer
+    // is retained under open membership.
+    let (outcome, _additions) =
+        hold_to_compilation_membership(analyzer, definitions, file, outcome);
     hold_to_compilation_inventory(analyzer, definitions, file, source, tree, site, outcome)
 }
 
@@ -1286,7 +1351,7 @@ fn hold_to_compilation_membership(
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     mut outcome: DefinitionLookupOutcome,
-) -> DefinitionLookupOutcome {
+) -> (DefinitionLookupOutcome, AdditionStability) {
     let mut doubt = Vec::new();
     let root = analyzer.project().root();
     let mut removed = Vec::new();
@@ -1335,7 +1400,9 @@ fn hold_to_compilation_membership(
     if failed {
         doubt.push("compilation membership could not be read".to_owned());
     }
-    if definitions.scoped.doubt() > 0 {
+    // The whole request is one site: the mark is the start of the log.
+    let admission = definitions.scoped.admit_site(SiteMark::default());
+    if matches!(admission, SiteAdmission::Withdrawn) {
         doubt.push(format!(
             "{} shared-resolver lookups admitted declarations of unproven compilation membership",
             definitions.scoped.doubt()
@@ -1369,7 +1436,28 @@ fn hold_to_compilation_membership(
             message: doubt.join("; "),
         });
     }
-    outcome
+    let additions = match admission {
+        SiteAdmission::StableUnderOpenMembership(cause) if doubt.is_empty() => {
+            AdditionStability::Stable(cause)
+        }
+        SiteAdmission::Proven if doubt.is_empty() && definitions.scoped.open_cause().is_none() => {
+            AdditionStability::Closed
+        }
+        _ => AdditionStability::Unproven,
+    };
+    (outcome, additions)
+}
+
+/// What an omitted or hidden file could do to a definition answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdditionStability {
+    /// Compilation membership is complete and nothing withdrew the answer.
+    Closed,
+    /// Membership is open but every obligation was discharged: no addition
+    /// can retarget the answer.
+    Stable(brokk_bifrost_core::analyzer::capabilities::CSharpCompilationMembershipOpenCause),
+    /// An addition could change the answer.
+    Unproven,
 }
 
 /// Hold an answer to an open compilation inventory (#8822).
@@ -7756,8 +7844,6 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
 
-    use brokk_bifrost_analysis::analyzer::usages::test_support::assert_scope_budget_exceeded;
-
     use brokk_bifrost_core::analyzer::model::Language;
 
     use brokk_bifrost_core::analyzer::model::Range;
@@ -10213,19 +10299,13 @@ public class Consumer
             limit: ReceiverBudgetLimit::SummaryExpansions, work,
         } if work.summary_expansions == 1));
 
-        let session = ResolutionSession::bounded(
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
-                ..budget
-            },
-            None,
-        );
+        let session = ResolutionSession::bounded_with_total_work(budget, 2, None);
         let definitions =
             CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
         assert_eq!(definitions.parent_of(analyzer, &work), Some(root.clone()));
         assert_eq!(definitions.parent_of(analyzer, &work), None);
         assert!(matches!(session.finish(()), BoundedResolution::Exceeded {
-            limit: ReceiverBudgetLimit::ScopeNodes, work,
+            limit: ReceiverBudgetLimit::TotalWork, work,
         } if work.scope_nodes == 1 && work.summary_expansions == 1));
 
         let session = ResolutionSession::bounded(budget, None);
@@ -10257,26 +10337,6 @@ public class Consumer
     }
 
     #[test]
-    fn bounded_definition_lookup_stops_at_scope_budget() {
-        let (fixture, file, source, tree, site) = member_fixture();
-        let budget = ReceiverAnalysisBudget::tiny();
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_csharp_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            budget,
-            None,
-        );
-
-        assert_scope_budget_exceeded(&outcome, budget);
-    }
-
-    #[test]
     fn very_wide_active_path_stops_before_materializing_siblings() {
         const SIBLING_COUNT: usize = 25_000;
 
@@ -10304,24 +10364,6 @@ public class Consumer
             AnalyzerFixture::new_for_language(Language::CSharp, &[("Provider.cs", "class P {}")]);
         let csharp =
             resolve_analyzer::<CSharpAnalyzer>(fixture.analyzer.analyzer()).expect("C# analyzer");
-
-        let budget = ReceiverAnalysisBudget::tiny();
-        let budget_session = ResolutionSession::bounded(budget, None);
-        let budget_definitions =
-            CSharpDefinitionProvider::bounded(csharp, &budget_session, &any_reference(csharp));
-        let mut budget_visits = 0usize;
-        csharp_visit_bounded_active_path(&budget_definitions, block, cutoff_start, |_| {
-            budget_visits += 1;
-            true
-        });
-        assert_eq!(budget_visits, 1, "only the charged root may be visited");
-        assert!(matches!(
-            budget_session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
 
         let cancellation = CancellationToken::cancel_after_checks_for_test(2);
         let cancel_session =
@@ -10376,26 +10418,6 @@ public class Product
         assert!(!provider_batch.complete);
         assert_eq!(provider_batch.inspected, 3);
         assert!(provider_batch.rows.is_empty());
-
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 3,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let session = ResolutionSession::bounded(budget, None);
-        let definitions =
-            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
-        assert!(
-            definitions
-                .members_for_owner_name("Demo.Product", "Work")
-                .is_empty()
-        );
-        assert!(matches!(
-            session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
     }
 
     #[test]
@@ -10430,24 +10452,6 @@ public class Product
         assert_eq!(direct.inspected, 3);
         assert_eq!(csharp.full_hydration_count_for_test(), 0);
 
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 4,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let session = ResolutionSession::bounded(budget, None);
-        let definitions =
-            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
-        let file = ProjectFile::new(fixture.project_root(), "GlobalA.cs");
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        assert!(definitions.using_namespaces(token, &file).is_empty());
-        assert!(matches!(
-            session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
-        ));
         assert_eq!(csharp.full_hydration_count_for_test(), 0);
     }
 
@@ -10501,13 +10505,17 @@ namespace Demo
             unknown_definitions.attribute_class_is_applicable(token, &unknown),
             None
         );
-        assert!(matches!(
-            unknown_session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
-        ));
+        let unknown_outcome = unknown_session.finish(());
+        assert!(
+            matches!(
+                unknown_outcome,
+                BoundedResolution::Unavailable {
+                    reason: "csharp_unresolved_ancestry",
+                    ..
+                }
+            ),
+            "{unknown_outcome:?}"
+        );
     }
 
     /// The definition answers for the reference `name` inside the first

@@ -7,8 +7,6 @@ use crate::code_quality::sanitize_table_cell;
 
 use brokk_bifrost_core::analyzer::test_paths;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
-
 use brokk_bifrost_analysis::analyzer::parser_language_for_path;
 
 use crate::diff_analysis::is_regular_file_mode;
@@ -391,7 +389,7 @@ fn classify_google_api_key(
 }
 
 pub fn report_secret_like_code(
-    analyzer: &dyn IAnalyzer,
+    root: &Path,
     params: ReportSecretLikeCodeParams,
 ) -> ReportSecretLikeCodeResult {
     let findings_cap = if params.max_findings > 0 {
@@ -405,7 +403,7 @@ pub fn report_secret_like_code(
         DEFAULT_SECRET_MAX_COMMITS as usize
     };
 
-    let report = match GitContext::open(analyzer.project().root()) {
+    let report = match GitContext::open(root) {
         Ok(ctx) => scan_repository(
             &ctx,
             commit_cap,
@@ -1497,9 +1495,6 @@ mod tests {
 
     use crate::code_quality::secret_like_code::*;
 
-    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
-
-    use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
     use brokk_bifrost_core::test_support::write_file;
     use git2::Signature;
     use tempfile::TempDir;
@@ -1508,24 +1503,6 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
         (temp, repo)
-    }
-
-    fn build_analyzer(root: &Path) -> WorkspaceAnalyzer {
-        let project =
-            brokk_bifrost_core::analyzer::project::TestProject::from_root_with_inferred_languages(
-                root.to_path_buf(),
-            )
-            .unwrap_or_else(|_| {
-                brokk_bifrost_core::analyzer::project::TestProject::new(
-                    root.to_path_buf(),
-                    brokk_bifrost_core::analyzer::model::Language::Java,
-                )
-            });
-        WorkspaceAnalyzer::build_ephemeral_footgun(
-            std::sync::Arc::new(project),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build")
     }
 
     fn commit_all(repo: &Repository, message: &str) {
@@ -2126,10 +2103,8 @@ token: "abcd123"
             "String token = \"ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIK\";\n",
         );
         commit_all(&repo, "seed secrets");
-        let analyzer = build_analyzer(temp.path());
-
         let result = report_secret_like_code(
-            analyzer.analyzer(),
+            temp.path(),
             ReportSecretLikeCodeParams {
                 max_findings: 20,
                 max_commits: 20,

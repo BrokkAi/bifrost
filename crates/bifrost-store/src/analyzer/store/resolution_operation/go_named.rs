@@ -1082,6 +1082,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Return this caller's complete, source-less standard/dependency import
     /// targets. The vector is request-owned and bounded by this file's imports.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_selected_external_imports(
         &self,
         context_id: i64,
@@ -1148,6 +1149,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// source file. A caller may match these to a semantic model by exact
     /// import path; no path-derived package name is supplied here.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_selected_unresolved_imports(
         &self,
         context_id: i64,
@@ -1245,6 +1247,7 @@ impl SelectedResolutionOperation<'_, '_> {
         self.go_file_import_context_with_role(context_id, path, &source_role, cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_source_role_for_mount(
         &self,
         context_id: i64,
@@ -1301,6 +1304,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Q2 uses the nearest structurally selected module root, including when
     /// no package row was published for this particular file.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_graph_file_exclusion_for_domain(
         &self,
         base: &[u8; 32],
@@ -1365,6 +1369,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Classify an absent selected placement using publication evidence only.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_graph_file_exclusion(
         &self,
         context_id: i64,
@@ -1425,6 +1430,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_package_stage_unit_for_path(
         &self,
         context_id: i64,
@@ -1656,6 +1662,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// operation. A request that prepares many Go files calls this once before
     /// its per-file loop; a single file is the one-element batch. Returns false
     /// when cancelled.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn prefetch_go_import_inputs(
         &self,
         context_id: i64,
@@ -1688,6 +1695,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// One statement for the bindings of all listed mounts (staged rows first,
     /// then ordinary rows, as the single-file reader merged them) and one for
     /// their selected import rows.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn load_go_import_inputs(
         &self,
         context_id: i64,
@@ -2005,6 +2013,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_import_binding_context_for_selection(
         &self,
         context_id: i64,
@@ -2357,6 +2366,10 @@ impl SelectedResolutionOperation<'_, '_> {
     /// the positioned lexical prefix. Local values and types remain blockers.
     #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn go_eager_qualified_import_context(
         &self,
         context: SelectedResolutionContextSet,

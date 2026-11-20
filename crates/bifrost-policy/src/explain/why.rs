@@ -11,6 +11,7 @@ use crate::finding::{
     PolicyRunCompletion, PolicySourceLocation,
 };
 use crate::finding_identity::PolicyFindingId;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayStatus;
 use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
 
 use super::model::{
@@ -24,6 +25,9 @@ const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 
 /// Explain why one retained finding exists, choosing the adapter from the
 /// evidence the finding carries.
+///
+/// `semantic_models` is the activation this run was evaluated under; the run
+/// does not record it, so the caller must supply it.
 ///
 /// This is the entry point a host calls. It dispatches on the finding's own
 /// evidence variant rather than on the run's analysis type, because the
@@ -53,8 +57,10 @@ const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 pub fn explain_finding(
     run: &PolicyRun,
     finding_id: &PolicyFindingId,
+    semantic_models: &SemanticModelOverlayStatus,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    let limits = &limits.under_semantic_models(semantic_models);
     let finding = find_finding(run, finding_id)?;
     match finding.evidence() {
         PolicyFindingEvidence::Match { .. } => explain_match_finding(run, finding_id, limits),
@@ -109,7 +115,7 @@ fn find_finding<'a>(
 /// - [`ExplainError::FindingNotFound`] when the run retains no finding with
 ///   this identity.
 /// - [`ExplainError::BudgetExhausted`] when `limits` cannot hold even a root.
-pub fn explain_match_finding(
+pub(crate) fn explain_match_finding(
     run: &PolicyRun,
     finding_id: &PolicyFindingId,
     limits: &ExplanationLimits,

@@ -104,6 +104,25 @@ pub struct MacroDefinitionInventory {
 }
 
 impl MacroDefinitionInventory {
+    /// Inventory buffers and the Tree clone's control storage. The source
+    /// holder accounts for the shared native tree backing separately.
+    pub fn retained_structure_bytes(&self) -> usize {
+        let names = |entries: &HashMap<String, Vec<(usize, usize)>>| {
+            entries.capacity() * (std::mem::size_of::<(String, Vec<(usize, usize)>)>() + 1)
+                + entries
+                    .iter()
+                    .map(|(name, ranges)| {
+                        name.capacity() + ranges.capacity() * std::mem::size_of::<(usize, usize)>()
+                    })
+                    .sum::<usize>()
+        };
+        std::mem::size_of::<Self>()
+            + names(&self.exports)
+            + self.textual.capacity()
+                * (std::mem::size_of::<(usize, HashMap<String, Vec<(usize, usize)>>)>() + 1)
+            + self.textual.values().map(names).sum::<usize>()
+    }
+
     pub fn build(
         tree: &tree_sitter::Tree,
         source: &str,
@@ -190,48 +209,69 @@ pub struct ExportedMacroDefinitions<'tree> {
 impl<'tree> ExportedMacroDefinitions<'tree> {
     /// Filter macro definitions discovered during the file's charged syntax walk.
     pub fn from_candidates(candidates: Vec<Node<'tree>>, source: &str) -> Self {
+        Self::from_candidates_with_roots(
+            candidates,
+            source,
+            brokk_bifrost_core::analyzer::tree_walk::root_node,
+            &mut || Ok::<_, std::convert::Infallible>(()),
+        )
+        .unwrap_or_else(|never| match never {})
+    }
+
+    /// Assemble the same definition-bearing coverage from already-owned nodes.
+    /// `root_of` supplies each candidate's captured physical owner in order.
+    /// Filtering compacts the original node buffer in place, so adding owner
+    /// metadata does not require a second definition buffer during assembly.
+    pub fn from_candidates_with_roots<E>(
+        mut candidates: Vec<Node<'tree>>,
+        source: &str,
+        mut root_of: impl FnMut(Node<'tree>) -> Node<'tree>,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
         let mut textual: HashMap<usize, Vec<Node<'tree>>> = HashMap::default();
-        for node in &candidates {
+        let mut roots = Vec::new();
+        for node in candidates.iter().copied() {
+            let root = root_of(node);
+            assert_physical_owner(node, root);
+            check()?;
             if node.kind() == "macro_definition"
                 && let Some(parent) = node.parent()
             {
-                textual.entry(parent.id()).or_default().push(*node);
-            }
-        }
-        let mut roots = Vec::new();
-        for node in &candidates {
-            let mut root = *node;
-            while let Some(parent) = root.parent() {
-                root = parent;
+                textual.entry(parent.id()).or_default().push(node);
             }
             if !roots.contains(&root.id()) {
                 roots.push(root.id());
             }
         }
         let mut cfg_cache = HashMap::default();
-        let definitions = candidates
-            .into_iter()
-            .filter(|node| {
-                node.kind() == "macro_definition"
-                    && !crate::ownership::has_macro_ancestor(*node)
-                    && node.child_by_field_name("name").is_some_and(|name| {
-                        !name.is_missing()
-                            && !name.is_error()
-                            && crate::declarations::rust_item_has_simple_attribute(
-                                *node,
-                                source,
-                                "macro_export",
-                            )
-                    })
-                    && macro_definition_is_unconditionally_active(*node, source, &mut cfg_cache)
-            })
-            .collect();
-        Self {
-            definitions,
+        let mut retained = 0;
+        for index in 0..candidates.len() {
+            check()?;
+            let node = candidates[index];
+            if node.kind() == "macro_definition"
+                && !crate::ownership::has_macro_ancestor_bounded(node, &mut |_| check())?
+                && node.child_by_field_name("name").is_some_and(|name| {
+                    !name.is_missing()
+                        && !name.is_error()
+                        && crate::declarations::rust_item_has_simple_attribute(
+                            node,
+                            source,
+                            "macro_export",
+                        )
+                })
+                && macro_definition_is_unconditionally_active(node, source, &mut cfg_cache, check)?
+            {
+                candidates[retained] = node;
+                retained += 1;
+            }
+        }
+        candidates.truncate(retained);
+        Ok(Self {
+            definitions: candidates,
             inventory: None,
             textual,
             roots,
-        }
+        })
     }
 
     /// Bind a complete candidate inventory even when the file has no definitions.
@@ -251,12 +291,24 @@ impl<'tree> ExportedMacroDefinitions<'tree> {
         source: &str,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Self, crate::graph_support::RustCargoRouteError> {
+        Self::from_root_checked(root, source, &mut || {
+            if keep_going() {
+                Ok(())
+            } else {
+                Err(crate::graph_support::RustCargoRouteError::Cancelled)
+            }
+        })
+    }
+
+    fn from_root_checked<E>(
+        root: Node<'tree>,
+        source: &str,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
         use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, try_walk_named_tree_preorder};
         let mut candidates = Vec::new();
         try_walk_named_tree_preorder(root, true, |node| {
-            if !keep_going() {
-                return Err(crate::graph_support::RustCargoRouteError::Cancelled);
-            }
+            check()?;
             if node.kind() == "macro_definition" {
                 candidates.push(node);
             }
@@ -275,9 +327,7 @@ impl<'tree> ExportedMacroDefinitions<'tree> {
             roots: vec![root.id()],
         };
         try_walk_named_tree_preorder(root, true, |node| {
-            if !keep_going() {
-                return Err(crate::graph_support::RustCargoRouteError::Cancelled);
-            }
+            check()?;
             let parent = (node.id() != root.id()).then(|| node.parent()).flatten();
             if matches!(node.kind(), "macro_invocation" | "token_tree")
                 || crate::lexical_scope::rust_cfg_condition_with_parent(node, parent, source)
@@ -306,89 +356,114 @@ impl<'tree> ExportedMacroDefinitions<'tree> {
         Ok(result)
     }
 
-    fn textual_named(
+    fn covers_root(&self, root: Node<'tree>) -> bool {
+        if let Some(inventory) = self.inventory {
+            root.id() == inventory.tree.root_node().id()
+        } else {
+            self.roots.contains(&root.id())
+        }
+    }
+
+    fn visit_textual_named<E>(
         &self,
         scope: Node<'tree>,
         name: &str,
         source: &str,
-    ) -> Option<Vec<Node<'tree>>> {
-        use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+        check: &mut impl FnMut() -> Result<(), E>,
+        visit: &mut impl FnMut(Node<'tree>) -> Result<std::ops::ControlFlow<()>, E>,
+    ) -> Result<std::ops::ControlFlow<()>, E> {
         if let Some(inventory) = self.inventory {
-            let mut root = scope;
-            while let Some(parent) = root.parent() {
-                root = parent;
-            }
-            if root.id() != inventory.tree.root_node().id() {
-                return None;
-            }
-            return Some(
-                inventory
-                    .textual
-                    .get(&scope.id())
-                    .and_then(|names| names.get(strip_raw_identifier_prefix(name)))
-                    .into_iter()
-                    .flatten()
-                    .map(|range| inventory.node(*range))
-                    .collect(),
-            );
-        }
-        let mut root = scope;
-        while let Some(parent) = root.parent() {
-            root = parent;
-        }
-        if !self.roots.contains(&root.id()) {
-            return None;
-        }
-        Some(
-            self.textual
+            for range in inventory
+                .textual
                 .get(&scope.id())
+                .and_then(|names| {
+                    names.get(
+                        brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                            name,
+                        ),
+                    )
+                })
                 .into_iter()
                 .flatten()
-                .copied()
-                .filter(|node| {
-                    node.child_by_field_name("name").is_some_and(|declared| {
-                        crate::imports::rust_binding_name_matches(
-                            rust_node_text(declared, source),
-                            name,
-                        )
-                    })
-                })
-                .collect(),
-        )
+            {
+                check()?;
+                if visit(inventory.node(*range))?.is_break() {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+        } else {
+            for node in self.textual.get(&scope.id()).into_iter().flatten().copied() {
+                check()?;
+                if node.child_by_field_name("name").is_some_and(|declared| {
+                    crate::imports::rust_binding_name_matches(
+                        rust_node_text(declared, source),
+                        name,
+                    )
+                }) && visit(node)?.is_break()
+                {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
     }
 
+    #[cfg(test)]
     fn unique_named(&self, name: &str, source: &str) -> Option<Node<'tree>> {
+        self.unique_named_while(name, source, &mut || Ok::<_, std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    fn unique_named_while<E>(
+        &self,
+        name: &str,
+        source: &str,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Option<Node<'tree>>, E> {
+        check()?;
         if let Some(inventory) = self.inventory {
-            let ranges = inventory.exports.get(name)?;
-            return (ranges.len() == 1).then(|| inventory.node(ranges[0]));
+            let Some(ranges) = inventory.exports.get(name) else {
+                return Ok(None);
+            };
+            return Ok((ranges.len() == 1).then(|| inventory.node(ranges[0])));
         }
-        let mut candidates = self.definitions.iter().copied().filter(|node| {
-            node.child_by_field_name("name")
-                .is_some_and(|node| rust_node_text(node, source) == name)
-        });
-        let definition = candidates.next()?;
-        candidates.next().is_none().then_some(definition)
+        let mut found = None;
+        for node in self.definitions.iter().copied() {
+            check()?;
+            if node
+                .child_by_field_name("name")
+                .is_some_and(|declared| rust_node_text(declared, source) == name)
+            {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(node);
+            }
+        }
+        Ok(found)
     }
 }
 
-fn macro_definition_is_unconditionally_active(
+fn macro_definition_is_unconditionally_active<E>(
     mut node: Node<'_>,
     source: &str,
     cfg_cache: &mut HashMap<usize, crate::lexical_scope::RustCfgCondition>,
-) -> bool {
+    check: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
     while node.kind() != "source_file" {
+        check()?;
         let condition = cfg_cache
             .entry(node.id())
             .or_insert_with(|| crate::lexical_scope::rust_cfg_condition(node, source));
         if *condition != crate::lexical_scope::RustCfgCondition::Always {
-            return false;
+            return Ok(false);
         }
         let Some(parent) = crate::syntax::parent_outside_attributes(node) else {
-            return true;
+            return Ok(true);
         };
         node = parent;
     }
-    true
+    Ok(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,63 +572,237 @@ pub fn match_local_macro_invocation_with_definitions<'tree>(
     )
 }
 
-/// Same-file evidence that a macro name is not supplied solely by the
-/// standard prelude. Conditional declarations remain possible shadows.
-/// Imports use the parser's binding projection: grouped `self`, globs and
-/// unnamed imports do not bind a macro under the requested name.
-pub fn macro_invocation_is_locally_bound<'tree>(
+/// Assert supplied physical ownership before even an export fast path can win.
+fn assert_physical_owner(node: Node<'_>, root: Node<'_>) {
+    assert_eq!(
+        node.into_raw().tree,
+        root.into_raw().tree,
+        "macro node has its supplied physical owner"
+    );
+    assert!(
+        root.parent().is_none(),
+        "macro ownership uses a physical root"
+    );
+}
+
+fn macro_lookup_roots<'tree>(
     invocation: Node<'tree>,
-    source: &str,
-    exported_definitions: &ExportedMacroDefinitions<'tree>,
+    context: Node<'tree>,
+) -> (Node<'tree>, Node<'tree>) {
+    use brokk_bifrost_core::analyzer::tree_walk::root_node;
+    let root = root_node(invocation);
+    let context_root = if context.id() == invocation.id() {
+        root
+    } else if context.into_raw().tree == invocation.into_raw().tree && invocation.id() != root.id()
+    {
+        // Preserve a shifted root supplied as the context itself. Descendants
+        // normalize to the same ordinary owning root as the invocation.
+        if context.id() == root.id() {
+            context
+        } else {
+            root
+        }
+    } else {
+        root_node(context)
+    };
+    (root, context_root)
+}
+
+/// Outside-in traversal of the exact old two-segment lexical sequence.
+fn walk_macro_scopes<'tree, E, Check: FnMut() -> Result<(), E>>(
+    invocation: Node<'tree>,
+    invocation_root: Node<'tree>,
     lexical_context: Node<'tree>,
-) -> bool {
+    lexical_root: Node<'tree>,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
+    check: &mut Check,
+    mut visit: impl FnMut(
+        Node<'tree>,
+        Option<&ExportedMacroDefinitions<'tree>>,
+        &mut Check,
+    ) -> Result<std::ops::ControlFlow<()>, E>,
+) -> Result<(), E> {
+    use brokk_bifrost_core::analyzer::tree_walk::try_walk_ancestor_path;
+    assert_physical_owner(invocation, invocation_root);
+    if lexical_context.id() != invocation.id() {
+        assert_physical_owner(lexical_context, lexical_root);
+    }
+    check()?;
+    // A root input yielded no old iterator item, including no context segment.
+    let Some(parent) = invocation.parent() else {
+        return Ok(());
+    };
+    if lexical_context.id() != invocation.id() {
+        let covered = exported.filter(|inventory| inventory.covers_root(lexical_root));
+        if let Some(context_parent) = lexical_context.parent()
+            && try_walk_ancestor_path(lexical_root, context_parent, check, |scope, check| {
+                visit(scope, covered, check)
+            })?
+            .is_break()
+        {
+            return Ok(());
+        }
+        check()?;
+        // Include the original context itself, with its original coordinate
+        // context. Only its ancestors were normalized by the parent call.
+        if visit(lexical_context, covered, check)?.is_break() {
+            return Ok(());
+        }
+    }
+    let covered = exported.filter(|inventory| inventory.covers_root(invocation_root));
+    match try_walk_ancestor_path(invocation_root, parent, check, |scope, check| {
+        visit(scope, covered, check)
+    })? {
+        std::ops::ControlFlow::Break(()) | std::ops::ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
+fn visit_scope_definitions<'tree, E>(
+    scope: Node<'tree>,
+    covered: Option<&ExportedMacroDefinitions<'tree>>,
+    name: &str,
+    source: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    visit: &mut impl FnMut(Node<'tree>) -> Result<std::ops::ControlFlow<()>, E>,
+) -> Result<std::ops::ControlFlow<()>, E> {
+    if let Some(inventory) = covered {
+        return inventory.visit_textual_named(scope, name, source, check, visit);
+    }
+    let mut cursor = scope.walk();
+    for node in scope.named_children(&mut cursor) {
+        check()?;
+        if node.kind() == "macro_definition" && visit(node)?.is_break() {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+    }
+    Ok(std::ops::ControlFlow::Continue(()))
+}
+
+fn textual_definition_in_scope<'tree, E>(
+    invocation: Node<'tree>,
+    scope: Node<'tree>,
+    covered: Option<&ExportedMacroDefinitions<'tree>>,
+    name: &str,
+    source: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let flow = visit_scope_definitions(scope, covered, name, source, check, &mut |item| {
+        if item.kind() == "macro_definition"
+            && item.end_byte() <= invocation.start_byte()
+            && item.child_by_field_name("name").is_some_and(|declared| {
+                crate::imports::rust_binding_name_matches(rust_node_text(declared, source), name)
+            })
+        {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(flow.is_break())
+}
+
+/// Same-file evidence using already-known physical roots. The caller chooses
+/// a real cancellation check or an explicit Infallible policy; both execute
+/// this single selection algorithm. Root membership retains its old meaning.
+pub fn macro_invocation_is_locally_bound_with_roots<'tree, E, Check: FnMut() -> Result<(), E>>(
+    invocation: Node<'tree>,
+    invocation_root: Node<'tree>,
+    source: &str,
+    exported: &ExportedMacroDefinitions<'tree>,
+    lexical_context: Node<'tree>,
+    lexical_root: Node<'tree>,
+    check: &mut Check,
+) -> Result<bool, E> {
     use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+    assert_physical_owner(invocation, invocation_root);
+    if lexical_context.id() != invocation.id() {
+        assert_physical_owner(lexical_context, lexical_root);
+    }
+    check()?;
     let Some(name) =
         crate::declarations::rust_unqualified_macro_invocation_name(invocation, source)
     else {
-        return false;
+        return Ok(false);
     };
     let name = strip_raw_identifier_prefix(name);
-    if exported_definitions.inventory.is_some_and(|inventory| {
+    if exported.inventory.is_some_and(|inventory| {
         inventory.exports.contains_key(name) || inventory.exports.contains_key(&format!("r#{name}"))
-    }) || exported_definitions.definitions.iter().any(|definition| {
-        definition
+    }) {
+        return Ok(true);
+    }
+    for definition in &exported.definitions {
+        check()?;
+        if definition
             .child_by_field_name("name")
             .is_some_and(|declared| {
                 strip_raw_identifier_prefix(rust_node_text(declared, source)) == name
             })
-    }) {
-        return true;
+        {
+            return Ok(true);
+        }
     }
-    if macro_invocation_has_textual_definition(
+    let mut bound = false;
+    walk_macro_scopes(
         invocation,
-        source,
-        Some(exported_definitions),
+        invocation_root,
         lexical_context,
-    ) {
-        return true;
-    }
-    macro_lexical_scopes(invocation, lexical_context).any(|scope| {
-        let mut cursor = scope.walk();
-        scope.named_children(&mut cursor).any(|item| {
-            crate::format_args::rust_logging_macro("log", name).is_none()
-                && item.kind() == "use_declaration"
-                && crate::imports::rust_imports_with_visibility_from_use_declaration(item, source)
-                    .iter()
-                    .any(|import| {
-                        !import.module_self
+        lexical_root,
+        Some(exported),
+        check,
+        |scope, covered, check| {
+            if textual_definition_in_scope(invocation, scope, covered, name, source, check)? {
+                bound = true;
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            if crate::format_args::rust_logging_macro("log", name).is_none() {
+                let mut cursor = scope.walk();
+                for item in scope.named_children(&mut cursor) {
+                    check()?;
+                    if item.kind() != "use_declaration" {
+                        continue;
+                    }
+                    for import in crate::imports::rust_imports_with_visibility_from_use_declaration(
+                        item, source,
+                    ) {
+                        check()?;
+                        if !import.module_self
                             && crate::imports::rust_import_binding_name(&import.info)
                                 .named()
                                 .is_some_and(|bound| {
                                     crate::imports::rust_binding_name_matches(bound, name)
                                 })
-                    })
-        })
-    })
+                        {
+                            bound = true;
+                            return Ok(std::ops::ControlFlow::Break(()));
+                        }
+                    }
+                }
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(bound)
 }
 
-/// Textual macro_rules bindings precede path/prelude resolution, including
-/// conditional definitions whose absence the identity proof cannot establish.
+pub fn macro_invocation_is_locally_bound<'tree>(
+    invocation: Node<'tree>,
+    source: &str,
+    exported: &ExportedMacroDefinitions<'tree>,
+    lexical_context: Node<'tree>,
+) -> bool {
+    let (root, context_root) = macro_lookup_roots(invocation, lexical_context);
+    macro_invocation_is_locally_bound_with_roots(
+        invocation,
+        root,
+        source,
+        exported,
+        lexical_context,
+        context_root,
+        &mut || Ok::<_, std::convert::Infallible>(()),
+    )
+    .unwrap_or_else(|never| match never {})
+}
+
+/// Textual macro bindings also shadow when their cfg makes absence unknown.
 fn macro_invocation_has_textual_definition<'tree>(
     invocation: Node<'tree>,
     source: &str,
@@ -565,26 +814,26 @@ fn macro_invocation_has_textual_definition<'tree>(
     else {
         return false;
     };
-    macro_lexical_scopes(invocation, lexical_context).any(|scope| {
-        let cached = exported.and_then(|inventory| inventory.textual_named(scope, name, source));
-        let mut cursor = scope.walk();
-        let items = cached.unwrap_or_else(|| {
-            scope
-                .named_children(&mut cursor)
-                .filter(|item| item.kind() == "macro_definition")
-                .collect()
-        });
-        items.into_iter().any(|item| {
-            item.kind() == "macro_definition"
-                && item.end_byte() <= invocation.start_byte()
-                && item.child_by_field_name("name").is_some_and(|declared| {
-                    crate::imports::rust_binding_name_matches(
-                        rust_node_text(declared, source),
-                        name,
-                    )
-                })
-        })
-    })
+    let (root, context_root) = macro_lookup_roots(invocation, lexical_context);
+    let mut found = false;
+    walk_macro_scopes(
+        invocation,
+        root,
+        lexical_context,
+        context_root,
+        exported,
+        &mut || Ok::<_, std::convert::Infallible>(()),
+        |scope, covered, check| {
+            found = textual_definition_in_scope(invocation, scope, covered, name, source, check)?;
+            Ok(if found {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            })
+        },
+    )
+    .unwrap_or_else(|never| match never {});
+    found
 }
 
 /// Whether the invocation's terminal macro name is `matches`, in any path shape.
@@ -599,20 +848,6 @@ pub fn invocation_names_matches(invocation: Node<'_>, source: &str) -> bool {
                 name, source,
             )) == "matches"
         })
-}
-
-/// Fragment scopes precede the real source scope that contains their anchor.
-fn macro_lexical_scopes<'tree>(
-    invocation: Node<'tree>,
-    lexical_context: Node<'tree>,
-) -> impl Iterator<Item = Node<'tree>> {
-    let mut parent = invocation.parent();
-    let mut outer_context = (lexical_context.id() != invocation.id()).then_some(lexical_context);
-    std::iter::from_fn(move || {
-        let scope = parent?;
-        parent = scope.parent().or_else(|| outer_context.take());
-        Some(scope)
-    })
 }
 
 fn match_local_macro_invocation_using_definitions<'tree>(
@@ -632,50 +867,94 @@ fn match_local_macro_invocation_using_definitions<'tree>(
 fn local_macro_definition<'tree>(
     invocation: Node<'tree>,
     source: &str,
-    exported_definitions: Option<&ExportedMacroDefinitions<'tree>>,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
     lexical_context: Node<'tree>,
 ) -> Option<Node<'tree>> {
+    let (root, context_root) = macro_lookup_roots(invocation, lexical_context);
+    local_macro_definition_with_roots(
+        invocation,
+        root,
+        source,
+        exported,
+        lexical_context,
+        context_root,
+        &mut || Ok::<_, std::convert::Infallible>(()),
+    )
+    .unwrap_or_else(|never| match never {})
+}
+
+fn local_macro_definition_with_roots<'tree, E, Check: FnMut() -> Result<(), E>>(
+    invocation: Node<'tree>,
+    root: Node<'tree>,
+    source: &str,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
+    lexical_context: Node<'tree>,
+    lexical_root: Node<'tree>,
+    check: &mut Check,
+) -> Result<Option<Node<'tree>>, E> {
+    assert_physical_owner(invocation, root);
+    if lexical_context.id() != invocation.id() {
+        assert_physical_owner(lexical_context, lexical_root);
+    }
+    check()?;
     let textual_name =
         crate::declarations::rust_unqualified_macro_invocation_name(invocation, source);
-    let name = textual_name.or_else(|| crate_root_macro_invocation_name(invocation, source))?;
-    let mut root = invocation;
-    // Match through the same original-coordinate scopes as explicit imports.
-    for scope in macro_lexical_scopes(invocation, lexical_context) {
-        let mut cursor = scope.walk();
-        let cached =
-            exported_definitions.and_then(|inventory| inventory.textual_named(scope, name, source));
-        let items = cached.unwrap_or_else(|| {
-            scope
-                .named_children(&mut cursor)
-                .filter(|item| item.kind() == "macro_definition")
-                .collect()
-        });
-        let definition = items
-            .into_iter()
-            .filter(|child| {
-                textual_name.is_some()
-                    && child.kind() == "macro_definition"
-                    && child.end_byte() <= invocation.start_byte()
-                    && child
-                        .child_by_field_name("name")
-                        .is_some_and(|node| rust_node_text(node, source) == name)
-            })
-            .max_by_key(|node| node.start_byte());
-        if let Some(definition) = definition {
-            if crate::lexical_scope::rust_cfg_condition(definition, source)
-                != crate::lexical_scope::RustCfgCondition::Always
-            {
-                return None;
+    let Some(name) = textual_name.or_else(|| crate_root_macro_invocation_name(invocation, source))
+    else {
+        return Ok(None);
+    };
+    let mut winner = None;
+    let mut saw_scopes = false;
+    walk_macro_scopes(
+        invocation,
+        root,
+        lexical_context,
+        lexical_root,
+        exported,
+        check,
+        |scope, covered, check| {
+            saw_scopes = true;
+            let mut local: Option<Node<'tree>> = None;
+            let flow =
+                visit_scope_definitions(scope, covered, name, source, check, &mut |child| {
+                    if textual_name.is_some()
+                        && child.kind() == "macro_definition"
+                        && child.end_byte() <= invocation.start_byte()
+                        && child
+                            .child_by_field_name("name")
+                            .is_some_and(|declared| rust_node_text(declared, source) == name)
+                        && local.is_none_or(|previous| child.start_byte() >= previous.start_byte())
+                    {
+                        local = Some(child);
+                    }
+                    Ok(std::ops::ControlFlow::Continue(()))
+                })?;
+            assert!(flow.is_continue(), "winner selection exhausts each scope");
+            if local.is_some() {
+                winner = local;
             }
-            return Some(definition);
-        }
-        root = scope;
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    if let Some(definition) = winner {
+        check()?;
+        // A nearer conditional winner suppresses outer and exported definitions.
+        return Ok(
+            (crate::lexical_scope::rust_cfg_condition(definition, source)
+                == crate::lexical_scope::RustCfgCondition::Always)
+                .then_some(definition),
+        );
     }
-    if let Some(exported_definitions) = exported_definitions {
-        exported_definitions.unique_named(name, source)
+    if let Some(exported) = exported {
+        return exported.unique_named_while(name, source, check);
+    }
+    let fallback_root = if saw_scopes && lexical_context.id() != invocation.id() {
+        lexical_root
     } else {
-        ExportedMacroDefinitions::from_root(root, source).unique_named(name, source)
-    }
+        root
+    };
+    ExportedMacroDefinitions::from_root_checked(fallback_root, source, check)?
+        .unique_named_while(name, source, check)
 }
 
 /// A matched arm can authorize ordinary item replay even if an unselected
@@ -2710,68 +2989,7 @@ fn match_separator(
 }
 
 fn identifier_like(node: MacroInputNode<'_>) -> bool {
-    let spelling = node.text().trim();
-    spelling != "_"
-        && (identifier_kind_like(node.kind())
-            || matches!(
-                spelling,
-                "abstract"
-                    | "as"
-                    | "async"
-                    | "await"
-                    | "become"
-                    | "box"
-                    | "break"
-                    | "const"
-                    | "continue"
-                    | "crate"
-                    | "default"
-                    | "do"
-                    | "dyn"
-                    | "else"
-                    | "enum"
-                    | "extern"
-                    | "false"
-                    | "final"
-                    | "fn"
-                    | "for"
-                    | "gen"
-                    | "if"
-                    | "impl"
-                    | "in"
-                    | "let"
-                    | "loop"
-                    | "macro"
-                    | "match"
-                    | "mod"
-                    | "move"
-                    | "mut"
-                    | "override"
-                    | "priv"
-                    | "pub"
-                    | "raw"
-                    | "ref"
-                    | "return"
-                    | "safe"
-                    | "Self"
-                    | "self"
-                    | "static"
-                    | "struct"
-                    | "super"
-                    | "trait"
-                    | "true"
-                    | "try"
-                    | "type"
-                    | "typeof"
-                    | "union"
-                    | "unsafe"
-                    | "unsized"
-                    | "use"
-                    | "virtual"
-                    | "where"
-                    | "while"
-                    | "yield"
-            ))
+    crate::syntax::rust_token_is_identifier(node.kind(), node.text().trim())
 }
 
 fn identifier_kind_like(kind: &str) -> bool {
@@ -4076,6 +4294,70 @@ mod tests {
         assert_eq!(exported.kind(), "macro_definition");
         assert!(exports.unique_named("no", source).is_none());
         assert!(exports.unique_named("absent", source).is_none());
+    }
+
+    #[test]
+    fn rooted_fragment_scopes_keep_physical_coverage_and_typed_cancellation() {
+        let source = "#[macro_export] macro_rules! pick { () => {outer}; } fn run() { outer!({ macro_rules! pick { () => {inner}; } pick!(); }); }";
+        let primary = parse(source);
+        let root = primary.root_node();
+        let outer = named_descendant(root, "macro_invocation").unwrap();
+        let context = crate::declarations::rust_macro_invocation_arguments(outer).unwrap();
+        let start = source.find("outer!({").unwrap() + "outer!(".len();
+        let end = source.rfind("});").unwrap() + 1;
+        let fragment = parse_bound_fragment(
+            &MacroBinding {
+                name: "e".into(),
+                fragment: MacroFragmentKind::Expr,
+                start_byte: start,
+                end_byte: end,
+                repetition_path: Vec::new(),
+                ident_role: None,
+            },
+            source,
+        )
+        .unwrap();
+        let invocation = named_descendant(fragment.root_node(), "macro_invocation").unwrap();
+        let exports = ExportedMacroDefinitions::from_root(root, source);
+        assert!(!exports.covers_root(fragment.root_node()));
+        let mut polls = 0;
+        let winner = local_macro_definition_with_roots(
+            invocation,
+            fragment.root_node(),
+            source,
+            Some(&exports),
+            context,
+            root,
+            &mut || {
+                polls += 1;
+                Ok::<_, usize>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(winner.into_raw().tree, fragment.root_node().into_raw().tree);
+        assert!(rust_node_text(winner, source).contains("inner"));
+        // Every check cutpoint must return the typed interruption, never a
+        // partially accumulated outer winner or an absent-binding verdict.
+        for stop in 0..polls {
+            let mut checked = 0;
+            assert_eq!(
+                local_macro_definition_with_roots(
+                    invocation,
+                    fragment.root_node(),
+                    source,
+                    Some(&exports),
+                    context,
+                    root,
+                    &mut || {
+                        let index = checked;
+                        checked += 1;
+                        if index == stop { Err(stop) } else { Ok(()) }
+                    }
+                ),
+                Err(stop)
+            );
+        }
     }
 
     #[test]
@@ -5903,33 +6185,56 @@ pub enum StandardMacroLexicalEffect {
     Unknown,
 }
 
-/// Audited expansion shapes at ITEM_FREE_MACRO_STDLIB_REVISION:
-/// print/eprint create a block with an I/O formatting call; println/eprintln
-/// delegate their empty arm to those macros and otherwise create the same block.
-/// assert is a compiler expression (rustc_builtin_macros/src/assert.rs).
-/// assert_eq/assert_ne create block-wrapped match expressions; all locals stay
-/// in the match arms. debug_assert/debug_assert_eq/debug_assert_ne create an if
-/// expression whose block invokes the corresponding hygienic assertion macro.
-/// An item inside an argument block remains inside that block, not this scope.
+/// Audited expansion shapes at ITEM_FREE_MACRO_STDLIB_REVISION; the member
+/// table is rust_item_free_macro_candidate. An item inside an argument block
+/// remains inside that block, not this scope.
 pub fn standard_macro_lexical_effect(
     identity: &StandardMacroIdentity,
     selected_stdlib_revision: &str,
 ) -> StandardMacroLexicalEffect {
-    let StandardMacroIdentity::Standard { owner, member } = identity else {
-        return StandardMacroLexicalEffect::Unknown;
-    };
-    if selected_stdlib_revision == ITEM_FREE_MACRO_STDLIB_REVISION
-        && rust_item_free_macro_candidate(member)
-        && rust_standard_macro_in_crate(owner.as_str(), member)
-    {
+    if crate::format_args::rust_std_macro_expands_to_no_items(identity, selected_stdlib_revision) {
         StandardMacroLexicalEffect::NoItemsIntroduced
     } else {
         StandardMacroLexicalEffect::Unknown
     }
 }
 
-/// A syntax candidate only; identity and selected-library audit are required
-/// before any consumer can use the guarded alternate.
+/// The audit table: the one place the item-free members live. The only
+/// name-only caller is the lowering-time guard pre-filter, which has no resolver;
+/// every admission goes through rust_std_macro_expands_to_no_items. A syntax
+/// candidate only: identity and selected-library audit are required before any
+/// consumer can use the guarded alternate.
+///
+/// Every member below was read at ITEM_FREE_MACRO_STDLIB_REVISION (#11532 for the
+/// first ten, #13259 for the rest). A member qualifies only if every arm and
+/// every owner (std, core, alloc) expands to no items.
+/// - print/eprint create a block with an I/O formatting call; println/eprintln
+///   delegate their empty arm to those macros and otherwise create the same block.
+/// - assert is a compiler expression (rustc_builtin_macros/src/assert.rs).
+/// - assert_eq/assert_ne create block-wrapped match expressions; all locals stay
+///   in the match arms.
+/// - debug_assert/debug_assert_eq/debug_assert_ne create an if expression whose
+///   block invokes the corresponding hygienic assertion macro.
+/// - format (alloc) is `must_use({ fmt::format(format_args!(..)) })`: a call
+///   around a block holding one expression.
+/// - vec (alloc) has three arms: `Vec::new()`, `from_elem(e, n)`, and the list
+///   arm `box_assume_init_into_vec_unsafe(write_box_via_move(Box::new_uninit(),
+///   [..]))`, a call chain with no `let` and no `unsafe` block (the source
+///   comment says so because an unsafe block would wrap the operands).
+/// - dbg (std) has three arms: zero arguments is an eprintln call; one argument
+///   is `match $val { tmp => { eprintln!(..); tmp } }`, whose only binding is a
+///   match-arm pattern; several arguments are a tuple of single-argument dbg
+///   calls. No arm declares an item.
+/// - write (core) is `$dst.write_fmt(format_args!(..))`; its fallback arm is
+///   compile_error!, which produces no expansion. writeln (core) is the same
+///   with format_args_nl!, its empty arm delegates to write!, and its fallback
+///   is compile_error!.
+/// - panic is a compiler built-in (core_panic and std_panic) that expands to
+///   panic_2015 or panic_2021 by the caller's edition. Every arm of core's
+///   panic_2015/panic_2021 and std's panic_2015 (std's 2021 arm re-exports
+///   core's) is a call or a block of one call statement
+///   (panicking::panic, panic_str_2015, panic_display, panic_fmt,
+///   rt::begin_panic, rt::panic_display, rt::panic_fmt over const_format_args!).
 pub fn rust_item_free_macro_candidate(member: &str) -> bool {
     matches!(
         member,
@@ -5943,6 +6248,12 @@ pub fn rust_item_free_macro_candidate(member: &str) -> bool {
             | "debug_assert"
             | "debug_assert_eq"
             | "debug_assert_ne"
+            | "format"
+            | "vec"
+            | "dbg"
+            | "write"
+            | "writeln"
+            | "panic"
     )
 }
 

@@ -5,9 +5,9 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic::AbstractObjectIdentity;
 use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::source::SourcePointsToResult;
 
-use brokk_bifrost_core::analyzer::tree_walk::BoundedNamedTreeWalk;
+use brokk_bifrost_core::analyzer::tree_walk::CancellableNamedTreeWalk;
 
-use brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder_bounded;
+use brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder_cancellable;
 
 use crate::analyzer::usages::get_definition::java::JavaResolutionSession;
 
@@ -31,8 +31,6 @@ use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupType;
 
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
-
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
 
 use brokk_bifrost_analysis::analyzer::usages::receiver_query::*;
 
@@ -122,40 +120,17 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             check_cancelled(cancellation)?;
             let line_starts = compute_line_starts(&source);
             check_cancelled(cancellation)?;
-            if ledger.charge_setup(line_starts.len()).is_err() {
-                return Ok(setup_budget_report(
-                    operation,
-                    file,
-                    Language::Java,
-                    range,
-                    &source,
-                    ledger.work(),
-                ));
-            }
-            let setup_nodes = match walk_named_tree_preorder_bounded(
+            ledger.charge_setup(line_starts.len());
+            let setup_nodes = match walk_named_tree_preorder_cancellable(
                 tree.root_node(),
                 true,
-                ledger.remaining_budget().max_scope_nodes,
                 cancellation,
                 |_| {},
             ) {
-                BoundedNamedTreeWalk::Complete { visited } => visited,
-                BoundedNamedTreeWalk::Exceeded { visited } => {
-                    let _ = ledger.charge_setup(visited);
-                    return Ok(setup_budget_report(
-                        operation,
-                        file,
-                        Language::Java,
-                        range,
-                        &source,
-                        ledger.work(),
-                    ));
-                }
-                BoundedNamedTreeWalk::Cancelled => return Err(ReceiverQueryError::Cancelled),
+                CancellableNamedTreeWalk::Complete { visited } => visited,
+                CancellableNamedTreeWalk::Cancelled => return Err(ReceiverQueryError::Cancelled),
             };
-            ledger
-                .charge_setup(setup_nodes)
-                .expect("completed setup traversal fits its supplied receiver budget");
+            ledger.charge_setup(setup_nodes);
             self.prepared_java_files.borrow_mut().insert(
                 file.clone(),
                 PreparedJavaReceiverFile {
@@ -177,8 +152,8 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             cancellation,
             ledger,
         )? {
-            CompatibilityOutcome::Complete(Some(node)) => node,
-            CompatibilityOutcome::Complete(None) => {
+            Some(node) => node,
+            None => {
                 let mut report = unsupported_report(
                     operation,
                     file,
@@ -189,22 +164,6 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                 );
                 report.work = ledger.work();
                 return Ok(report);
-            }
-            CompatibilityOutcome::Exceeded(limit) => {
-                return Ok(budget_report(
-                    operation,
-                    site(file, Language::Java, range, &prepared.source, "query", None),
-                    ledger.work(),
-                    limit,
-                ));
-            }
-            CompatibilityOutcome::Unavailable(reason) => {
-                return Ok(unavailable_report(
-                    operation,
-                    site(file, Language::Java, range, &prepared.source, "query", None),
-                    ledger.work(),
-                    reason,
-                ));
             }
         };
         let query_node = match operation {
@@ -927,20 +886,7 @@ fn java_resolution_outcome_at<T>(
             work: ReceiverAnalysisWork::default(),
         };
     }
-    // Preprocessing charges one scope step. Its refusal is a budget stop like
-    // any other, so it marks this run's captures.
-    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-        0,
-        budget.max_scope_nodes,
-    )
-    .try_allow(1)
-    .is_err()
-    {
-        return BoundedResolution::Exceeded {
-            work: ReceiverAnalysisWork::default(),
-            limit: ReceiverBudgetLimit::ScopeNodes,
-        };
-    }
+    // Preprocessing charges one scope step; work never refuses (#13216).
     let preprocessing_work = ReceiverAnalysisWork {
         scope_nodes: 1,
         ..ReceiverAnalysisWork::default()
@@ -962,9 +908,7 @@ fn java_resolution_outcome_at<T>(
             work: preprocessing_work,
         };
     }
-    let mut compatibility_budget = budget;
-    compatibility_budget.max_scope_nodes -= 1;
-    let session = JavaResolutionSession::bounded(definitions, compatibility_budget, cancellation);
+    let session = JavaResolutionSession::bounded(definitions, budget, cancellation);
     prepend_java_preprocessing_work(resolve(&session, &site))
 }
 
@@ -1020,9 +964,7 @@ fn java_parent_node<'tree>(
     ledger: &mut ReceiverWorkLedger,
 ) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
     check_cancelled(cancellation)?;
-    if let Err(limit) = charge_scope_step(ledger) {
-        return Ok(CompatibilityOutcome::Exceeded(limit));
-    }
+    charge_scope_step(ledger);
     Ok(CompatibilityOutcome::Complete(node.parent()))
 }
 
@@ -1073,9 +1015,7 @@ fn current_receiver_owners(
     let mut owners = Vec::new();
     for candidate in points_to.object_candidates() {
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         let AbstractObjectIdentity::ProcedurePort(port) = candidate.value().identity() else {
             continue;
         };
@@ -1086,9 +1026,7 @@ fn current_receiver_owners(
             analyzer.project().root().to_path_buf(),
             port.procedure().artifact().key().path().as_path(),
         );
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         let byte = port
             .procedure()
             .semantics()
@@ -1105,9 +1043,7 @@ fn current_receiver_owners(
         let Some(mut owner) = analyzer.enclosing_code_unit(&file, &range) else {
             continue;
         };
-        if let Err(limit) = charge_scope_step(ledger) {
-            return Ok(CompatibilityOutcome::Exceeded(limit));
-        }
+        charge_scope_step(ledger);
         while !owner.is_class() {
             check_cancelled(cancellation)?;
             if let Err(limit) = charge_summary_step(ledger) {
@@ -1116,9 +1052,7 @@ fn current_receiver_owners(
             let Some(parent) = analyzer.parent_of(&owner) else {
                 break;
             };
-            if let Err(limit) = charge_scope_step(ledger) {
-                return Ok(CompatibilityOutcome::Exceeded(limit));
-            }
+            charge_scope_step(ledger);
             owner = parent;
         }
         if owner.is_class() && !owners.contains(&owner) {

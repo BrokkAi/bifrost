@@ -254,7 +254,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted,
-                            Incompleteness::Operational(DerivationExecutionCause::Provider),
+                            Incompleteness::Operational(DerivationExecutionCause::Budget),
                             exceeded.to_string(),
                         );
                     }
@@ -294,7 +294,7 @@ impl TypestateQueryState {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
-                            Incompleteness::Operational(DerivationExecutionCause::Provider),
+                            Incompleteness::Operational(DerivationExecutionCause::Budget),
                             "typestate finding or witness reconstruction budget was exhausted"
                                 .to_string(),
                         );
@@ -376,7 +376,7 @@ impl TypestateQueryState {
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
-                        Incompleteness::Operational(DerivationExecutionCause::Provider),
+                        Incompleteness::Operational(DerivationExecutionCause::Budget),
                         format!(
                             "typestate finding retention omitted at least {} finding(s)",
                             report.omitted()
@@ -516,7 +516,7 @@ impl TypestateQueryState {
         push_deduplicated_diagnostic(
             &mut self.diagnostics,
             code,
-            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            super::context_error_incompleteness(&error),
             error.to_string(),
         );
     }
@@ -537,7 +537,7 @@ impl TypestateQueryState {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    Incompleteness::Operational(DerivationExecutionCause::Budget),
                     format!("typestate semantic input exceeded its budget: {exceeded}"),
                 );
             }
@@ -594,7 +594,7 @@ impl TypestateQueryState {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::TypestateWitnessTruncated,
-                Incompleteness::Operational(DerivationExecutionCause::Provider),
+                Incompleteness::Operational(DerivationExecutionCause::Budget),
                 format!("typestate witness projection truncated {count} witness(es)"),
             );
         }
@@ -602,6 +602,14 @@ impl TypestateQueryState {
 }
 
 impl SemanticTypestateFindingValue {
+    /// Retained witness steps own program-point and call-site artifact handles.
+    pub(super) fn retains_semantic_artifact(&self) -> bool {
+        self.finding
+            .witnesses()
+            .iter()
+            .any(|witness| witness.witness().step_count() != 0)
+    }
+
     pub(super) fn key(&self) -> &str {
         &self.public.id
     }

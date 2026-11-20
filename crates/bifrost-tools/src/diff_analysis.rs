@@ -1,6 +1,7 @@
 use brokk_bifrost_analysis::analyzer::correspondence::declarations::DeclarationCorrespondence;
 use brokk_bifrost_core::analyzer::project::{
-    AsProject, SharedWorkspaceFileListing, WorkspaceFileOmission, WorkspaceFileOmissionReason,
+    AsProject, BoundedTreeOmission, SharedWorkspaceFileListing, WorkspaceFileOmission,
+    WorkspaceFileOmissionReason,
 };
 
 use brokk_bifrost_analysis::analyzer::correspondence::declarations::DeclarationCorrespondenceBuilder;
@@ -80,6 +81,7 @@ use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::project::Project;
 
 use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
+mod bounded_listing;
 use brokk_bifrost_core::analyzer::project::BifrostIgnoreMatcher;
 use git2::{
     Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, TreeWalkMode,
@@ -781,16 +783,12 @@ pub(crate) struct PreparedDiff {
     pub(crate) target: Snapshot,
     pub(crate) file_changes: Vec<FileChange>,
     changed_lines: BTreeMap<String, ChangedLines>,
+    /// For a working-tree target: its changes against the base tree, when they
+    /// describe its listing exactly. `None` keeps the root Unknown omission.
+    worktree_overlay: Option<WorktreeOverlay>,
 }
 
 impl PreparedDiff {
-    /// Target coordinates use the postimage path, including for renames.
-    pub(crate) fn target_line_changed(&self, path: &str, line: usize) -> bool {
-        self.changed_lines
-            .get(path)
-            .is_some_and(|lines| lines.new.contains(&line))
-    }
-
     pub(crate) fn at_root(
         root: &Path,
         params: DiffEndpointParams,
@@ -861,7 +859,8 @@ impl PreparedDiff {
         } else {
             resolution_repo
         };
-        let (file_changes, changed_lines) = diff_metadata(&repository.repo, base, target)?;
+        let (file_changes, changed_lines, worktree_overlay) =
+            diff_metadata(&repository.repo, base, target)?;
         let immutable_repository = if base.is_immutable() != target.is_immutable() {
             Some(open_repository(root, options, true)?)
         } else {
@@ -877,6 +876,7 @@ impl PreparedDiff {
             target,
             file_changes,
             changed_lines,
+            worktree_overlay,
         })
     }
 
@@ -889,6 +889,51 @@ impl PreparedDiff {
         &self,
     ) -> &brokk_bifrost_core::retention_budget::RetentionBudget {
         &self.retention_budget
+    }
+
+    /// The bounded image of the target endpoint holding `paths` and what
+    /// their languages need. A working-tree image records its listing as the
+    /// base tree plus the base-to-worktree changes the diff already computed.
+    fn materialize_target(&self, paths: &[String]) -> Result<RevisionImage, String> {
+        let repository = self.repository_for(self.target);
+        let image = RevisionImage::materialize(
+            &repository.repo,
+            repository.checkout_for(self.target),
+            self.target,
+            Some(paths),
+            &repository.alternate_object_dirs,
+            self.shared_cache(),
+            Some(&self.retention_budget),
+        )?;
+        let (
+            RevisionImage::Worktree {
+                root,
+                files,
+                live_delegate,
+                live_inventory,
+                ..
+            },
+            Some(overlay),
+        ) = (&image, &self.worktree_overlay)
+        else {
+            return Ok(image);
+        };
+        // The overlay is relative to the base tree, which an immutable base
+        // reads through the isolated object database.
+        let base_repository = self.repository_for(self.base);
+        let base_tree = snapshot_tree(&base_repository.repo, self.base)?.id();
+        let objects = Arc::new(RevisionObjectDatabase::new(
+            &base_repository.repo,
+            &base_repository.alternate_object_dirs,
+        ));
+        let built = bounded_tree_omissions(base_tree, files, overlay, &objects);
+        Ok(RevisionImage::Worktree {
+            root: root.clone(),
+            files: files.clone(),
+            omissions: Arc::new(built),
+            live_delegate: Arc::clone(live_delegate),
+            live_inventory: Arc::clone(live_inventory),
+        })
     }
 
     fn repository_for(&self, snapshot: Snapshot) -> &DiffRepository {
@@ -1036,6 +1081,312 @@ pub(crate) fn analyze_prepared_symbol_changes(
     )
 }
 
+/// What the persisted Rust listing certificate and the resolver say about the
+/// bounded commit images of `base` and `target`, rendered as text. Test support
+/// for goldens: it builds the images and their analyzers the way `analyze_diff`
+/// does, reads the certificates back from the analyzers' stores, calls
+/// `between_build_and_probe`, then asks each image's resolver (found through
+/// the registry a store-side reader uses) about each probe path, one at a time
+/// and as one batch. The callback lets a test damage the object database after
+/// the images exist, as a pruned object would.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn describe_bounded_listing(
+    root: &Path,
+    base: &str,
+    target: Option<&str>,
+    file_probes: &[&str],
+    dir_probes: &[&str],
+    between_build_and_probe: impl FnOnce(),
+) -> Result<String, String> {
+    describe_listing(
+        root,
+        base,
+        target,
+        file_probes,
+        dir_probes,
+        |_, _, _| Ok(String::new()),
+        between_build_and_probe,
+    )
+}
+
+/// [`describe_bounded_listing`] with each endpoint also describing what a
+/// whole-image export of its commit omits.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn describe_bounded_listing_with_whole_image(
+    root: &Path,
+    base: &str,
+    target: Option<&str>,
+    file_probes: &[&str],
+    dir_probes: &[&str],
+    between_build_and_probe: impl FnOnce(),
+) -> Result<String, String> {
+    describe_listing(
+        root,
+        base,
+        target,
+        file_probes,
+        dir_probes,
+        describe_whole_image_omissions,
+        between_build_and_probe,
+    )
+}
+
+/// The shared body; `per_endpoint` adds text to each endpoint's block, after
+/// its bounded certificate and before its resolver answers.
+#[cfg(any(test, feature = "test-support"))]
+fn describe_listing(
+    root: &Path,
+    base: &str,
+    target: Option<&str>,
+    file_probes: &[&str],
+    dir_probes: &[&str],
+    per_endpoint: impl Fn(&PreparedDiff, Snapshot, [u8; 32]) -> Result<String, String>,
+    between_build_and_probe: impl FnOnce(),
+) -> Result<String, String> {
+    use brokk_bifrost_analysis::analyzer::store::{
+        bounded_listing_resolver, rust_source_listing_derivation_identity,
+    };
+    use brokk_bifrost_core::analyzer::project::ListingUnknown;
+    use std::fmt::Write;
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024);
+    let prepared = PreparedDiff::at_root(
+        root,
+        DiffEndpointParams {
+            base: Some(base.to_string()),
+            target: target.map(str::to_string),
+        },
+        &DiffAnalysisOptions::default(),
+        &CancellationToken::default(),
+        &budget,
+    )?;
+    let (_, base_paths, target_paths) = symbol_change_paths(&prepared);
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let answers = |result: Result<Vec<String>, ListingUnknown>| match result {
+        Ok(paths) => format!("{paths:?}"),
+        Err(_) => "Err(ListingUnknown)".to_string(),
+    };
+    let identity = rust_source_listing_derivation_identity();
+    // Each endpoint's analyzer and image stay alive until the end, so its
+    // registration does too.
+    let mut endpoints = Vec::new();
+    for (label, snapshot, paths) in [
+        ("base", prepared.base, &base_paths),
+        ("target", prepared.target, &target_paths),
+    ] {
+        let image = if snapshot == prepared.target {
+            prepared.materialize_target(paths)?
+        } else {
+            let repository = prepared.repository_for(snapshot);
+            RevisionImage::materialize(
+                &repository.repo,
+                repository.checkout_for(snapshot),
+                snapshot,
+                Some(paths),
+                &repository.alternate_object_dirs,
+                prepared.shared_cache(),
+                Some(&prepared.retention_budget),
+            )?
+        };
+        let analyzer = build_revision_analyzer_with_budget(
+            &image,
+            prepared.shared_cache(),
+            &prepared.retention_budget,
+        )?;
+        let mut text = format!("{label} endpoint:\n");
+        let rust = analyzer
+            .analyzer()
+            .selected_workspace_snapshots_for_reads()
+            .and_then(|snapshots| snapshots.get("rust").cloned());
+        if let Some(rust) = &rust {
+            let store = analyzer
+                .workspace()
+                .store()
+                .ok_or("the endpoint analyzer has no store")?;
+            let complete = store
+                .rust_source_listing_complete(rust, identity)
+                .map_err(|error| error.to_string())?;
+            let mut failures = store
+                .rust_source_listing_failures(rust, identity)
+                .map_err(|error| error.to_string())?
+                .ok_or("no Rust listing certificate at the endpoint snapshot")?;
+            failures.sort();
+            let record = store
+                .rust_source_listing_bounded_record(rust, identity)
+                .map_err(|error| error.to_string())?;
+            writeln!(text, "  certificate complete: {complete}").unwrap();
+            writeln!(text, "  failure rows:").unwrap();
+            for (path, reason) in &failures {
+                writeln!(text, "    {path:?}: {reason:?}").unwrap();
+            }
+            match &record {
+                Some(record) => {
+                    writeln!(text, "  bounded tree: {}", hex(&record.tree)).unwrap();
+                    writeln!(text, "  materialized digest: {}", hex(&record.digest)).unwrap();
+                    for (heading, paths) in [
+                        ("materialized paths:", &record.materialized),
+                        ("overlay_present:", &record.overlay_present),
+                        ("overlay_absent:", &record.overlay_absent),
+                    ] {
+                        if heading != "materialized paths:" && paths.is_empty() {
+                            continue;
+                        }
+                        writeln!(text, "  {heading}").unwrap();
+                        for path in paths {
+                            writeln!(text, "    {path}").unwrap();
+                        }
+                    }
+                }
+                None => writeln!(text, "  bounded record: none").unwrap(),
+            }
+        } else {
+            writeln!(text, "  no Rust workspace snapshot").unwrap();
+        }
+        text.push_str(&per_endpoint(&prepared, snapshot, identity)?);
+        endpoints.push((text, rust, analyzer, image));
+    }
+    between_build_and_probe();
+    let mut out = String::new();
+    let mut resolvers = Vec::new();
+    for (mut text, rust, _analyzer, _image) in endpoints {
+        let resolver = rust.as_ref().and_then(bounded_listing_resolver);
+        match &resolver {
+            None => writeln!(text, "  resolver: none registered (root Unknown)").unwrap(),
+            Some(resolver) => {
+                writeln!(text, "  resolver: registered").unwrap();
+                writeln!(text, "  omitted_files, one probe at a time:").unwrap();
+                for probe in file_probes {
+                    writeln!(
+                        text,
+                        "    {probe}: {}",
+                        answers(resolver.omitted_files(&[probe]))
+                    )
+                    .unwrap();
+                }
+                writeln!(
+                    text,
+                    "  omitted_files, one batch: {}",
+                    answers(resolver.omitted_files(file_probes))
+                )
+                .unwrap();
+                writeln!(text, "  dirs_with_omissions, one probe at a time:").unwrap();
+                for probe in dir_probes {
+                    writeln!(
+                        text,
+                        "    {probe}: {}",
+                        answers(resolver.dirs_with_omissions(&[probe]))
+                    )
+                    .unwrap();
+                }
+                writeln!(
+                    text,
+                    "  dirs_with_omissions, one batch: {}",
+                    answers(resolver.dirs_with_omissions(dir_probes))
+                )
+                .unwrap();
+            }
+        }
+        out.push_str(&text);
+        resolvers.push(resolver);
+    }
+    if let [Some(base), Some(target)] = resolvers.as_slice() {
+        writeln!(
+            out,
+            "changed_paths base to target: {}",
+            answers(base.changed_paths(target.as_ref()))
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "changed_paths base to itself: {}",
+            answers(base.changed_paths(base.as_ref()))
+        )
+        .unwrap();
+    }
+    Ok(out)
+}
+
+/// What a whole-image export of `snapshot` omits and what its Rust listing
+/// certificate says, rendered for the golden. A worktree snapshot has no
+/// commit image to export, so it renders nothing. Kept out of
+/// [`describe_bounded_listing`]: the export cannot hold two paths that differ
+/// only by case on a case-insensitive volume, so only cases that need it ask.
+#[cfg(any(test, feature = "test-support"))]
+fn describe_whole_image_omissions(
+    prepared: &PreparedDiff,
+    snapshot: Snapshot,
+    identity: [u8; 32],
+) -> Result<String, String> {
+    use std::fmt::Write;
+    let mut text = String::new();
+    if snapshot == Snapshot::Worktree {
+        return Ok(text);
+    }
+    let repository = prepared.repository_for(snapshot);
+    let whole = RevisionImage::materialize(
+        &repository.repo,
+        repository.checkout_for(snapshot),
+        snapshot,
+        None,
+        &repository.alternate_object_dirs,
+        prepared.shared_cache(),
+        Some(&prepared.retention_budget),
+    )?;
+    let (project, _) = whole.project();
+    let (_, omissions) = project
+        .all_files_with_omissions()
+        .map_err(|error| error.to_string())?;
+    writeln!(text, "  whole-image omissions:").unwrap();
+    let mut reasons = omissions
+        .iter()
+        .map(|omission| (omission.path.clone(), omission.reason))
+        .collect::<Vec<_>>();
+    reasons.sort_by(|left, right| left.0.cmp(&right.0));
+    for (path, reason) in reasons {
+        writeln!(
+            text,
+            "    {:?}: {reason:?}",
+            path.to_string_lossy().replace('\\', "/")
+        )
+        .unwrap();
+    }
+    let whole_analyzer = build_revision_analyzer_with_budget(
+        &whole,
+        prepared.shared_cache(),
+        &prepared.retention_budget,
+    )?;
+    let whole_rust = whole_analyzer
+        .analyzer()
+        .selected_workspace_snapshots_for_reads()
+        .and_then(|snapshots| snapshots.get("rust").cloned());
+    if let Some(rust) = whole_rust {
+        let store = whole_analyzer
+            .workspace()
+            .store()
+            .ok_or("the whole-image analyzer has no store")?;
+        let complete = store
+            .rust_source_listing_complete(&rust, identity)
+            .map_err(|error| error.to_string())?;
+        let mut failures = store
+            .rust_source_listing_failures(&rust, identity)
+            .map_err(|error| error.to_string())?
+            .ok_or("no whole-image Rust listing certificate")?;
+        failures.sort();
+        writeln!(text, "  whole-image certificate complete: {complete}").unwrap();
+        writeln!(text, "  whole-image failure rows: {failures:?}").unwrap();
+    } else {
+        writeln!(text, "  whole-image: no Rust workspace snapshot").unwrap();
+    }
+    Ok(text)
+}
+
 fn symbol_change_paths(prepared: &PreparedDiff) -> (Vec<String>, Vec<String>, Vec<String>) {
     let file_changes = &prepared.file_changes;
     let changed_paths: Vec<String> = file_changes
@@ -1077,7 +1428,7 @@ fn analyze_prepared_symbol_changes_from_images(
         let _phase = prepared
             .shared_cache()
             .map(|cache| cache.enter_phase("building the base revision analyzer"));
-        build_revision_analyzer_with_budget(
+        build_symbol_revision_analyzer_with_budget(
             &base_image,
             prepared.shared_cache(),
             &prepared.retention_budget,
@@ -1088,7 +1439,7 @@ fn analyze_prepared_symbol_changes_from_images(
         let _phase = prepared
             .shared_cache()
             .map(|cache| cache.enter_phase("building the target revision analyzer"));
-        build_revision_analyzer_with_budget(
+        build_symbol_revision_analyzer_with_budget(
             &target_image,
             prepared.shared_cache(),
             &prepared.retention_budget,
@@ -1301,18 +1652,9 @@ fn analyze_prepared_diff_scoped(
         target_paths,
         image: base_image,
     } = materialize_prepared_diff_base(prepared)?;
-    let target_repository = prepared.repository_for(prepared.target);
     let target_image = {
         let _scope = profiling::scope("diff_exact.materialize_target");
-        RevisionImage::materialize(
-            &target_repository.repo,
-            target_repository.checkout_for(prepared.target),
-            prepared.target,
-            Some(&target_paths),
-            &target_repository.alternate_object_dirs,
-            prepared.shared_cache(),
-            Some(&prepared.retention_budget),
-        )?
+        prepared.materialize_target(&target_paths)?
     };
     analyze_prepared_diff_from_images(
         prepared,
@@ -1738,17 +2080,26 @@ pub fn changed_buffer_ranges(
         .collect()
 }
 
+/// A diff's file changes, changed lines, and, for a working-tree target, the
+/// overlay that describes its listing against the base tree.
+type DiffMetadata = (
+    Vec<FileChange>,
+    BTreeMap<String, ChangedLines>,
+    Option<WorktreeOverlay>,
+);
+
 fn diff_metadata(
     repo: &Repository,
     base: Snapshot,
     target: Snapshot,
-) -> Result<(Vec<FileChange>, BTreeMap<String, ChangedLines>), String> {
+) -> Result<DiffMetadata, String> {
     let base_tree = snapshot_tree(repo, base)?;
     let mut opts = DiffOptions::new();
     let mut diff = match target {
         Snapshot::Commit(_) | Snapshot::Tree(_) => {
             let target_tree = snapshot_tree(repo, target)?;
             repo.diff_tree_to_tree(Some(&base_tree), Some(&target_tree), Some(&mut opts))
+                .map_err(|err| format!("diff failed: {err}"))
         }
         Snapshot::Worktree => {
             // `git diff <base>` semantics: staged and unstaged changes combined,
@@ -1758,11 +2109,19 @@ fn diff_metadata(
             opts.include_untracked(true)
                 .recurse_untracked_dirs(true)
                 .show_untracked_content(true);
-            repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))
+            brokk_bifrost_core::gitblob::diff_tree_to_workdir_with_index(
+                repo,
+                Some(&base_tree),
+                Some(&mut opts),
+            )
         }
-    }
-    .map_err(|err| format!("diff failed: {err}"))?;
+    }?;
     let _ = diff.find_similar(None);
+    // The same deltas describe the worktree endpoint's listing against the
+    // base tree; no second status walk.
+    let overlay = (target == Snapshot::Worktree)
+        .then(|| worktree_overlay(&diff))
+        .flatten();
 
     let mut changes = Vec::new();
     for delta in diff.deltas() {
@@ -1864,7 +2223,7 @@ fn diff_metadata(
             .or(a.old_path.as_deref())
             .cmp(&b.path.as_deref().or(b.old_path.as_deref()))
     });
-    Ok((changes, changed_lines))
+    Ok((changes, changed_lines, overlay))
 }
 
 fn snapshot_tree(repo: &Repository, snapshot: Snapshot) -> Result<git2::Tree<'_>, String> {
@@ -1890,6 +2249,9 @@ fn snapshot_tree(repo: &Repository, snapshot: Snapshot) -> Result<git2::Tree<'_>
 /// path-restricted ones (`materialize`, `materialize_symbols`) name the diff's
 /// own changed paths plus what `export_snapshot_files` adds for name resolution
 /// and newly-referenced packages, and write every byte of them.
+/// A symbol-only worktree image names only its selected paths and ambient
+/// identity manifests; it deliberately has no view stamp or live delegate
+/// because symbol pairing never resolves dependencies.
 /// `materialize_file_dependencies` names the whole selected ecosystem, because
 /// a file graph that omits a file reads its absence as absence, but writes only
 /// the analyzers' configuration inputs: every other named path is created empty
@@ -1898,6 +2260,7 @@ fn snapshot_tree(repo: &Repository, snapshot: Snapshot) -> Result<git2::Tree<'_>
 /// claims to analyze, with the blob id that identifies it.
 pub(crate) enum RevisionImage {
     Snapshot {
+        identity: brokk_bifrost_core::analyzer::project::ImmutableTreeIdentity,
         temp: RevisionTempDir,
         files: Vec<PathBuf>,
         omissions: Arc<Vec<WorkspaceFileOmission>>,
@@ -1917,7 +2280,66 @@ pub(crate) enum RevisionImage {
     Worktree {
         root: PathBuf,
         files: Vec<PathBuf>,
+        /// The root Unknown, until `PreparedDiff::materialize_target` replaces
+        /// it with the bounded-tree record of a path-restricted image.
+        omissions: Arc<Vec<WorkspaceFileOmission>>,
+        live_delegate: Arc<FilesystemProject>,
+        live_inventory: Arc<BTreeSet<ProjectFile>>,
     },
+    SymbolOnlyWorktree {
+        root: PathBuf,
+        files: Vec<PathBuf>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RevisionImageBuildError {
+    SymbolOnlyWorktreeCannotResolve,
+    Analyzer(String),
+}
+
+impl std::fmt::Display for RevisionImageBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SymbolOnlyWorktreeCannotResolve => formatter
+                .write_str("symbol-only worktree images cannot resolve calls or file dependencies"),
+            Self::Analyzer(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for RevisionImageBuildError {}
+
+impl From<RevisionImageBuildError> for String {
+    fn from(error: RevisionImageBuildError) -> Self {
+        error.to_string()
+    }
+}
+
+impl RevisionImage {
+    fn require_dependency_resolution(&self) -> Result<(), RevisionImageBuildError> {
+        if matches!(self, Self::SymbolOnlyWorktree { .. }) {
+            return Err(RevisionImageBuildError::SymbolOnlyWorktreeCannotResolve);
+        }
+        Ok(())
+    }
+}
+
+/// Exercise the worktree materialization boundary from host integration tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn worktree_revision_project_for_test(root: &Path) -> Result<Arc<dyn Project>, String> {
+    let repo = Repository::discover(root).map_err(|error| error.to_string())?;
+    let image = RevisionImage::materialize(
+        &repo,
+        ImageCheckout::of_root(&repo),
+        Snapshot::Worktree,
+        None,
+        &[],
+        None,
+        None,
+    )?;
+    Ok(image.project().0)
 }
 
 /// Where a revision image's root sits in the live working tree, which decides
@@ -1933,7 +2355,7 @@ enum ImageCheckout<'a> {
     Unplaced,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<'a> ImageCheckout<'a> {
     /// The checkout of an image whose root is `repo`'s working-tree root.
     fn of_root(repo: &'a Repository) -> Self {
@@ -1948,9 +2370,153 @@ struct TreeInventory<'a> {
     checkout: ImageCheckout<'a>,
 }
 
+/// What a snapshot image knows about the revision tree it was cut from.
+enum ImageListing<'a> {
+    /// The image enumerated the whole tree, so every omission is an exact row.
+    Whole(TreeInventory<'a>),
+    /// The image holds some files of the tree. Walking the whole tree for exact
+    /// rows would make a bounded request scale with the repository, so it
+    /// records the tree and what it materialized (`bounded_tree_omissions`).
+    Bounded { tree: Oid },
+}
+
+/// The listing omission of an image that cannot say what it left out.
+fn root_unknown_omissions() -> Vec<WorkspaceFileOmission> {
+    vec![WorkspaceFileOmission {
+        path: PathBuf::new(),
+        reason: WorkspaceFileOmissionReason::Unknown,
+        bounded: None,
+    }]
+}
+
+/// The base-to-worktree changes of a working-tree endpoint, from the diff that
+/// `diff_metadata` already computes: paths the worktree holds that the base
+/// tree lacks or changed, and base-tree paths it deleted. Sorted and unique.
+/// Ignored files are not in the diff, as the worktree listing excludes them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorktreeOverlay {
+    present: Vec<String>,
+    absent: Vec<String>,
+}
+
+/// The overlay the deltas of a base-to-worktree diff describe, or `None` when
+/// they do not describe the worktree's listing exactly: a symbolic link, a
+/// gitlink or submodule change, a non-regular mode or nested repository, a
+/// type change, a conflict, or a path that is not UTF-8. The caller then keeps
+/// the root Unknown omission instead of claiming nothing else is missing.
+fn worktree_overlay(diff: &git2::Diff<'_>) -> Option<WorktreeOverlay> {
+    let regular = |file: &git2::DiffFile<'_>| {
+        !file.exists()
+            || matches!(
+                file.mode(),
+                git2::FileMode::Blob
+                    | git2::FileMode::BlobGroupWritable
+                    | git2::FileMode::BlobExecutable
+            )
+    };
+    let mut present = BTreeSet::new();
+    let mut absent = BTreeSet::new();
+    for delta in diff.deltas() {
+        if !regular(&delta.old_file()) || !regular(&delta.new_file()) {
+            return None;
+        }
+        let old = delta.old_file().path().map(|path| path.to_str());
+        let new = delta.new_file().path().map(|path| path.to_str());
+        let (old, new) = (
+            old.map(|path| path.map(str::to_string)),
+            new.map(|path| path.map(str::to_string)),
+        );
+        // `Some(None)` is a path that is not UTF-8.
+        if matches!(old, Some(None)) || matches!(new, Some(None)) {
+            return None;
+        }
+        let (old, new) = (old.flatten(), new.flatten());
+        match delta.status() {
+            git2::Delta::Added | git2::Delta::Untracked | git2::Delta::Copied => {
+                present.insert(new?);
+            }
+            git2::Delta::Modified => {
+                present.insert(new?);
+            }
+            git2::Delta::Deleted => {
+                absent.insert(old?);
+            }
+            git2::Delta::Renamed => {
+                absent.insert(old?);
+                present.insert(new?);
+            }
+            _ => return None,
+        }
+    }
+    // A path deleted and re-added (a rename onto a deleted path) is present.
+    absent.retain(|path| !present.contains(path));
+    Some(WorktreeOverlay {
+        present: present.into_iter().collect(),
+        absent: absent.into_iter().collect(),
+    })
+}
+
+/// The listing omissions of a bounded image: one typed `BoundedTree` row that
+/// names the tree `tree` and the `files` the image holds, answered lazily
+/// through a resolver on `objects`. A working-tree endpoint passes its
+/// `overlay`: `tree` is then the comparison's base tree. When the record
+/// cannot be built, because a materialized path is not UTF-8 or the object
+/// database cannot read the tree, the row is the root Unknown, which says
+/// anything may be missing.
+fn bounded_tree_omissions(
+    tree: Oid,
+    files: &[PathBuf],
+    overlay: &WorktreeOverlay,
+    objects: &Arc<RevisionObjectDatabase>,
+) -> Vec<WorkspaceFileOmission> {
+    let unknown = root_unknown_omissions;
+    let mut paths = Vec::with_capacity(files.len());
+    for file in files {
+        if file.to_str().is_none() {
+            return unknown();
+        }
+        paths.push(brokk_bifrost_core::path_utils::workspace_relative_slash_path(file));
+    }
+    let record = BoundedTreeOmission::with_overlay(
+        tree,
+        paths,
+        overlay.present.iter().cloned(),
+        overlay.absent.iter().cloned(),
+    );
+    debug_assert!(
+        objects
+            .with_repository(|repo| {
+                repo.find_tree(tree).is_ok_and(|root| {
+                    record.materialized().iter().all(|path| {
+                        root.get_path(Path::new(path)).is_ok()
+                            || record.overlay_present().contains(path)
+                    })
+                })
+            })
+            .unwrap_or(false),
+        "every materialized path of a bounded image is an entry of its tree {tree} or its overlay"
+    );
+    let sets = bounded_listing::BoundedSets {
+        tree,
+        materialized: Arc::clone(record.materialized()),
+        overlay_present: Arc::clone(record.overlay_present()),
+        overlay_absent: Arc::clone(record.overlay_absent()),
+        digest: record.digest(),
+    };
+    match bounded_listing::GitTreeResolver::open(Arc::clone(objects), sets) {
+        Ok(resolver) => vec![WorkspaceFileOmission {
+            path: PathBuf::new(),
+            reason: WorkspaceFileOmissionReason::BoundedTree,
+            bounded: Some(Arc::new(record.with_resolver(Arc::new(resolver)))),
+        }],
+        Err(_) => unknown(),
+    }
+}
+
 /// The entries of `tree` that a revision image supplying `files` cannot
 /// represent or leaves out, as listing omissions.
 fn revision_tree_omissions(
+    repo: &Repository,
     inventory: TreeInventory<'_>,
     files: &[PathBuf],
 ) -> Result<Vec<WorkspaceFileOmission>, String> {
@@ -1963,6 +2529,7 @@ fn revision_tree_omissions(
             omissions.push(WorkspaceFileOmission {
                 path: PathBuf::from(parent),
                 reason: WorkspaceFileOmissionReason::NonUtf8GitPath,
+                bounded: None,
             });
             return TreeWalkResult::Skip;
         };
@@ -1971,8 +2538,12 @@ fn revision_tree_omissions(
         }
         let path = PathBuf::from(format!("{parent}{name}"));
         let reason = if entry.filemode() == 0o120000 {
-            // The immutable image does not resolve link targets.
-            WorkspaceFileOmissionReason::UnreadableSymlink
+            brokk_bifrost_core::gitblob::resolve_git_tree_symlink(
+                repo,
+                tree,
+                &format!("{parent}{name}"),
+            )
+            .omission_reason()
         } else if entry.kind() == Some(ObjectType::Commit) {
             // A gitlink (submodule). The working-tree listing never initializes
             // or fetches one, so an uninitialized gitlink contributes no source
@@ -2008,7 +2579,11 @@ fn revision_tree_omissions(
             // (a Rust source or manifest for the Rust listing) loses it.
             WorkspaceFileOmissionReason::NotSupplied
         };
-        omissions.push(WorkspaceFileOmission { path, reason });
+        omissions.push(WorkspaceFileOmission {
+            path,
+            reason,
+            bounded: None,
+        });
         TreeWalkResult::Ok
     })
     .map_err(|error| {
@@ -2032,45 +2607,47 @@ impl RevisionImage {
     /// or not its bytes were written to `temp`; the object database serves the
     /// rest.
     fn snapshot(
+        tree: &git2::Tree<'_>,
         temp: RevisionTempDir,
         written: Vec<(PathBuf, Oid)>,
         named_only: Vec<(PathBuf, Oid)>,
         repo: &Repository,
         alternate_object_dirs: &[PathBuf],
-        inventory: Option<TreeInventory<'_>>,
+        listing: ImageListing<'_>,
     ) -> Result<Self, String> {
         let files: Vec<PathBuf> = written
             .iter()
             .chain(named_only.iter())
             .map(|(path, _)| path.clone())
             .collect();
+        let objects = Arc::new(RevisionObjectDatabase::new(repo, alternate_object_dirs));
         // A successful export already read every materialized blob. Named-only
         // blobs are checked by the analyzer's normal source-read/refusal path.
         // A whole-revision or file-dependency image already enumerated its tree,
         // so walking it again for the entries it could not represent, or left
-        // out, costs no more than the export did. A path-restricted image names
-        // a few files of the revision; its listing is incomplete by
-        // construction, and walking the whole tree would make a bounded
-        // request scale with the repository, so it keeps one Unknown omission.
-        let omissions = match inventory {
-            Some(inventory) => revision_tree_omissions(inventory, &files)?,
-            None => vec![WorkspaceFileOmission {
-                path: PathBuf::new(),
-                reason: WorkspaceFileOmissionReason::Unknown,
-            }],
+        // out, costs no more than the export did.
+        let omissions = match listing {
+            ImageListing::Whole(inventory) => revision_tree_omissions(repo, inventory, &files)?,
+            ImageListing::Bounded { tree } => {
+                bounded_tree_omissions(tree, &files, &WorktreeOverlay::default(), &objects)
+            }
         };
-        let objects = RevisionObjectDatabase::new(repo, alternate_object_dirs);
         if let Some((_, oid)) = named_only.first() {
             objects.probe(*oid)?;
         }
         let object_blobs = Arc::new(RevisionBlobIdentities::new(Vec::new(), named_only.clone()));
         Ok(Self::Snapshot {
+            identity: brokk_bifrost_core::analyzer::project::ImmutableTreeIdentity::from_tree(
+                tree,
+                &files.iter().cloned().collect(),
+                &omissions,
+            ),
             temp,
             files,
             omissions: Arc::new(omissions),
             blobs: Arc::new(RevisionBlobIdentities::new(written, named_only)),
             object_blobs,
-            objects: Arc::new(objects),
+            objects,
         })
     }
 
@@ -2101,33 +2678,39 @@ impl RevisionImage {
                 let temp = RevisionTempDir::new(&oid.to_string())?;
                 match paths {
                     Some(paths) => {
-                        let exported = export_snapshot_files(
+                        let tree = snapshot_tree(repo, snapshot)?;
+                        let exported = export_snapshot_files_from_tree(
                             repo,
-                            snapshot,
+                            &tree,
                             temp.path(),
                             paths,
                             cache,
                             budget,
+                            |rel, oid| export_snapshot_blob(repo, temp.path(), rel, oid),
                         )?;
                         Self::snapshot(
+                            &tree,
                             temp,
                             exported,
                             Vec::new(),
                             repo,
                             alternate_object_dirs,
-                            None,
+                            ImageListing::Bounded {
+                                tree: snapshot_tree(repo, snapshot)?.id(),
+                            },
                         )
                     }
                     None => {
                         let tree = snapshot_tree(repo, snapshot)?;
                         let exported = export_complete_tree(repo, &tree, temp.path())?;
                         Self::snapshot(
+                            &tree,
                             temp,
                             exported,
                             Vec::new(),
                             repo,
                             alternate_object_dirs,
-                            Some(TreeInventory {
+                            ImageListing::Whole(TreeInventory {
                                 tree: &tree,
                                 checkout,
                             }),
@@ -2137,27 +2720,43 @@ impl RevisionImage {
             }
             Snapshot::Worktree => {
                 let root = worktree_root(repo)?;
+                let live_delegate = Arc::new(FilesystemProject::new(&root).map_err(|err| {
+                    format!("unable to open working tree {}: {err}", root.display())
+                })?);
+                // The file set's root must match the live delegate's canonical
+                // root. On macOS the working tree is under the /var ->
+                // /private/var symlink, so the raw workdir spelling differs
+                // from the root `FilesystemProject::new` records.
+                let root = live_delegate.root().to_path_buf();
                 let files = match paths {
                     Some(paths) => worktree_files(
+                        repo,
                         &root,
                         paths,
                         budget.expect("worktree materialization requires owner budget"),
                     )?,
-                    None => {
-                        let project = FilesystemProject::new(&root).map_err(|err| {
+                    None => live_delegate
+                        .all_files()
+                        .map_err(|err| {
                             format!("unable to list working tree {}: {err}", root.display())
-                        })?;
-                        project
-                            .all_files()
-                            .map_err(|err| {
-                                format!("unable to list working tree {}: {err}", root.display())
-                            })?
-                            .into_iter()
-                            .map(|file| file.rel_path().to_path_buf())
-                            .collect()
-                    }
+                        })?
+                        .into_iter()
+                        .map(|file| file.rel_path().to_path_buf())
+                        .collect(),
                 };
-                Ok(Self::Worktree { root, files })
+                let live_inventory = live_delegate.all_files_shared().map_err(|err| {
+                    format!(
+                        "unable to capture working tree inventory {}: {err}",
+                        root.display()
+                    )
+                })?;
+                Ok(Self::Worktree {
+                    root,
+                    files,
+                    omissions: Arc::new(root_unknown_omissions()),
+                    live_delegate,
+                    live_inventory,
+                })
             }
         }
     }
@@ -2178,20 +2777,25 @@ impl RevisionImage {
         match snapshot {
             Snapshot::Commit(oid) | Snapshot::Tree(oid) => {
                 let temp = RevisionTempDir::new(&oid.to_string())?;
-                let exported = export_snapshot_symbol_files(repo, snapshot, temp.path(), paths)?;
+                let tree = snapshot_tree(repo, snapshot)?;
+                let exported =
+                    export_snapshot_symbol_files_from_tree(repo, &tree, temp.path(), paths)?;
                 Self::snapshot(
+                    &tree,
                     temp,
                     exported,
                     Vec::new(),
                     repo,
                     alternate_object_dirs,
-                    None,
+                    ImageListing::Bounded {
+                        tree: snapshot_tree(repo, snapshot)?.id(),
+                    },
                 )
             }
             Snapshot::Worktree => {
                 let root = worktree_root(repo)?;
                 let files = worktree_symbol_files(&root, paths)?;
-                Ok(Self::Worktree { root, files })
+                Ok(Self::SymbolOnlyWorktree { root, files })
             }
         }
     }
@@ -2224,12 +2828,13 @@ impl RevisionImage {
                     alternate_object_dirs,
                 )?;
                 Self::snapshot(
+                    &tree,
                     temp,
                     exported.configuration_inputs,
                     exported.sources,
                     repo,
                     alternate_object_dirs,
-                    Some(TreeInventory {
+                    ImageListing::Whole(TreeInventory {
                         tree: &tree,
                         checkout,
                     }),
@@ -2240,6 +2845,9 @@ impl RevisionImage {
                 let project = FilesystemProject::new(&root).map_err(|err| {
                     format!("unable to list working tree {}: {err}", root.display())
                 })?;
+                // Match the live delegate's canonical root; see the whole-image
+                // materializer for the macOS /var -> /private/var reason.
+                let root = project.root().to_path_buf();
                 let files = project
                     .all_files()
                     .map_err(|err| {
@@ -2249,7 +2857,20 @@ impl RevisionImage {
                     .map(|file| file.rel_path().to_path_buf())
                     .filter(|path| file_dependency_tree_path(path, languages))
                     .collect();
-                Ok(Self::Worktree { root, files })
+                let live_delegate = Arc::new(project);
+                let live_inventory = live_delegate.all_files_shared().map_err(|err| {
+                    format!(
+                        "unable to capture working tree inventory {}: {err}",
+                        root.display()
+                    )
+                })?;
+                Ok(Self::Worktree {
+                    root,
+                    files,
+                    omissions: Arc::new(root_unknown_omissions()),
+                    live_delegate,
+                    live_inventory,
+                })
             }
         }
     }
@@ -2257,13 +2878,31 @@ impl RevisionImage {
     pub(crate) fn root(&self) -> &Path {
         match self {
             Self::Snapshot { temp, .. } => temp.path(),
-            Self::Worktree { root, .. } => root,
+            Self::Worktree { root, .. } | Self::SymbolOnlyWorktree { root, .. } => root,
         }
     }
 
     pub(crate) fn files(&self) -> &[PathBuf] {
         match self {
-            Self::Snapshot { files, .. } | Self::Worktree { files, .. } => files,
+            Self::Snapshot { files, .. }
+            | Self::Worktree { files, .. }
+            | Self::SymbolOnlyWorktree { files, .. } => files,
+        }
+    }
+
+    /// The resolver of this image's bounded-tree omission, when it recorded one.
+    fn bounded_listing_resolver(
+        &self,
+    ) -> Option<Arc<dyn brokk_bifrost_core::analyzer::project::BoundedListingResolver>> {
+        let (Self::Snapshot { omissions, .. } | Self::Worktree { omissions, .. }) = self else {
+            return None;
+        };
+        let mut bounded = omissions
+            .iter()
+            .filter_map(|omission| omission.bounded.as_ref());
+        match (bounded.next(), bounded.next()) {
+            (Some(record), None) => record.resolver().cloned(),
+            _ => None,
         }
     }
 
@@ -2275,9 +2914,14 @@ impl RevisionImage {
     /// both answers for it and sees the uncommitted edits this image must
     /// respect, and its bytes are the files on disk.
     fn project(&self) -> (Arc<dyn Project>, Option<Arc<RevisionBlobIdentities>>) {
+        // Worktree bytes are read from disk, unlike an immutable revision's
+        // listed snapshot. Always allocate a fresh view id, even when the host
+        // has a watched or manually updated workspace. No certification of
+        // these mutable bytes may be reused by a subsequent materialization.
         let files = FileSetProject::new(self.root().to_path_buf(), self.files().iter().cloned());
         match self {
             Self::Snapshot {
+                identity,
                 blobs,
                 object_blobs,
                 objects,
@@ -2287,6 +2931,10 @@ impl RevisionImage {
                 Arc::new(RevisionImageProject {
                     project_reads:
                         brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
+                    view_stamp:
+                        brokk_bifrost_core::analyzer::project::ProjectViewStamp::immutable_content(
+                            identity,
+                        ),
                     files,
                     omissions: Arc::clone(omissions),
                     objects: Arc::clone(objects),
@@ -2296,22 +2944,47 @@ impl RevisionImage {
                 }),
                 Some(Arc::clone(blobs)),
             ),
-            Self::Worktree { .. } => (Arc::new(files), None),
+            Self::Worktree {
+                omissions,
+                live_delegate,
+                live_inventory,
+                ..
+            } => (
+                Arc::new(
+                    files
+                        .with_omissions(Arc::clone(omissions))
+                        .with_live_delegate(Arc::clone(live_delegate), Arc::clone(live_inventory)),
+                ),
+                None,
+            ),
+            Self::SymbolOnlyWorktree { .. } => (Arc::new(files), None),
         }
     }
 
-    fn hardlink_subset(whole: &Self, temp: RevisionTempDir, linked: Vec<(PathBuf, Oid)>) -> Self {
+    /// The scoped target image of `tree`, built from the whole target image
+    /// `whole` by hardlinking `linked`. It holds some files of the tree, so it
+    /// records a bounded-tree omission, not the exact rows of `whole`.
+    fn hardlink_subset(
+        whole: &Self,
+        tree: &git2::Tree<'_>,
+        temp: RevisionTempDir,
+        linked: Vec<(PathBuf, Oid)>,
+    ) -> Self {
         let Self::Snapshot { objects, .. } = whole else {
             unreachable!("a scoped target image requires an immutable whole image");
         };
-        let files = linked.iter().map(|(path, _)| path.clone()).collect();
+        let files: Vec<PathBuf> = linked.iter().map(|(path, _)| path.clone()).collect();
+        let omissions =
+            bounded_tree_omissions(tree.id(), &files, &WorktreeOverlay::default(), objects);
         Self::Snapshot {
+            identity: brokk_bifrost_core::analyzer::project::ImmutableTreeIdentity::from_tree(
+                tree,
+                &files.iter().cloned().collect(),
+                &omissions,
+            ),
             temp,
             files,
-            omissions: Arc::new(vec![WorkspaceFileOmission {
-                path: PathBuf::new(),
-                reason: WorkspaceFileOmissionReason::Unknown,
-            }]),
+            omissions: Arc::new(omissions),
             blobs: Arc::new(RevisionBlobIdentities::new(linked, Vec::new())),
             object_blobs: Arc::new(RevisionBlobIdentities::new(Vec::new(), Vec::new())),
             objects: Arc::clone(objects),
@@ -2331,7 +3004,7 @@ fn materialize_target_scope_from_whole_image(
     let whole_root = whole_target.root().to_path_buf();
     let whole_blobs = match &whole_target.image {
         RevisionImage::Snapshot { blobs, .. } => Arc::clone(blobs),
-        RevisionImage::Worktree { .. } => {
+        RevisionImage::Worktree { .. } | RevisionImage::SymbolOnlyWorktree { .. } => {
             unreachable!("a scoped target image requires an immutable whole image")
         }
     };
@@ -2372,6 +3045,7 @@ fn materialize_target_scope_from_whole_image(
     )?;
     Ok(RevisionImage::hardlink_subset(
         &whole_target.image,
+        &tree,
         temp,
         linked,
     ))
@@ -2730,9 +3404,7 @@ pub fn worktree_paths_match_head(
         let pathspec = prefix.join(rel_path).to_string_lossy().replace('\\', "/");
         options.pathspec(pathspec);
     }
-    let statuses = repository
-        .statuses(Some(&mut options))
-        .map_err(|err| format!("unable to read the work tree status: {err}"))?;
+    let statuses = brokk_bifrost_core::gitblob::worktree_statuses(&repository, Some(&mut options))?;
     Ok(statuses
         .iter()
         .all(|entry| entry.status() == git2::Status::CURRENT))
@@ -2760,9 +3432,7 @@ pub fn worktree_tracked_content_is_tree(
     if !prefix.as_os_str().is_empty() {
         options.pathspec(prefix.to_string_lossy().replace('\\', "/"));
     }
-    let statuses = repository
-        .statuses(Some(&mut options))
-        .map_err(|err| format!("unable to read the work tree status: {err}"))?;
+    let statuses = brokk_bifrost_core::gitblob::worktree_statuses(&repository, Some(&mut options))?;
     Ok(statuses
         .iter()
         .all(|entry| entry.status() == git2::Status::CURRENT))
@@ -2821,6 +3491,24 @@ fn fs_dir_file_paths(root: &Path, dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The workspace-relative paths of the submodules (gitlinks) the Git index
+/// holds. A submodule's files are not in the base tree, which holds only the
+/// gitlink, so a bounded worktree image never materializes them: they stay
+/// omitted and the image fails closed.
+fn worktree_gitlinks(repo: &Repository, root: &Path) -> Result<Vec<PathBuf>, String> {
+    let prefix = workspace_prefix(repo, root)?;
+    Ok(repo
+        .index()
+        .map_err(|error| format!("unable to read the Git index: {error}"))?
+        .iter()
+        .filter(|entry| entry.mode == 0o160000)
+        .filter_map(|entry| {
+            let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
+            path.strip_prefix(&prefix).ok().map(Path::to_path_buf)
+        })
+        .collect())
+}
+
 /// Collect the changed paths that actually exist as regular files on disk,
 /// plus everything [`symbol_identity_ancestor_paths_fs`] and
 /// [`worktree_import_expansion_targets`] add for the same reasons
@@ -2829,6 +3517,7 @@ fn fs_dir_file_paths(root: &Path, dir: &Path) -> Vec<PathBuf> {
 /// A path deleted in the working tree still appears in the diff but has no
 /// file to analyze, so it is skipped the same way a missing tree entry is.
 fn worktree_files(
+    repo: &Repository,
     root: &Path,
     paths: &[String],
     budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
@@ -2852,6 +3541,8 @@ fn worktree_files(
             }
         }
     }
+    let gitlinks = worktree_gitlinks(repo, root)?;
+    present.retain(|path| !gitlinks.iter().any(|gitlink| path.starts_with(gitlink)));
     Ok(present.into_iter().collect())
 }
 
@@ -3343,6 +4034,19 @@ impl RevisionObjectDatabase {
     }
 
     fn read_blob(&self, oid: Oid) -> Result<Vec<u8>, String> {
+        self.with_repository(|repo| {
+            let odb = repo
+                .odb()
+                .map_err(|error| format!("unable to open revision object database: {error}"))?;
+            odb.read(oid)
+                .map(|object| object.data().to_vec())
+                .map_err(|error| format!("unable to read revision blob {oid}: {error}"))
+        })?
+    }
+
+    /// Run `read` on a handle borrowed from the pool, and return the handle.
+    /// The lock is held only for the borrow and the return, never for `read`.
+    fn with_repository<T>(&self, read: impl FnOnce(&Repository) -> T) -> Result<T, String> {
         let repo = match self
             .idle
             .lock()
@@ -3352,19 +4056,12 @@ impl RevisionObjectDatabase {
             Some(repo) => repo,
             None => self.open()?,
         };
-        let read = (|| {
-            let odb = repo
-                .odb()
-                .map_err(|error| format!("unable to open revision object database: {error}"))?;
-            odb.read(oid)
-                .map(|object| object.data().to_vec())
-                .map_err(|error| format!("unable to read revision blob {oid}: {error}"))
-        })();
+        let result = read(&repo);
         self.idle
             .lock()
             .expect("revision object database mutex poisoned")
             .push(repo);
-        read
+        Ok(result)
     }
 
     fn open(&self) -> Result<Repository, String> {
@@ -3402,6 +4099,7 @@ impl RevisionObjectDatabase {
 /// the object database if their private copy disappears; files represented only
 /// by placeholders are read directly from the object database.
 struct RevisionImageProject {
+    view_stamp: brokk_bifrost_core::analyzer::project::ProjectViewStamp,
     project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
     files: FileSetProject,
     omissions: Arc<Vec<WorkspaceFileOmission>>,
@@ -3418,6 +4116,29 @@ struct RevisionImageProject {
 }
 
 impl Project for RevisionImageProject {
+    fn retained_ignore_observation(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation {
+        use brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation;
+        match self.bifrost_ignore.get() {
+            None => RetainedIgnoreObservation::NotListed,
+            Some(Ok(_)) => RetainedIgnoreObservation::Ok,
+            Some(Err(cause)) => RetainedIgnoreObservation::Failed(cause.clone()),
+        }
+    }
+
+    fn listing_ignore_inputs_verified(
+        &self,
+        _listing: &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+    ) -> bool {
+        // The file set and ignore rules are pinned to one immutable revision.
+        true
+    }
+
+    fn view_stamp(&self) -> Option<brokk_bifrost_core::analyzer::project::ProjectViewStamp> {
+        Some(self.view_stamp.clone())
+    }
+
     fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -3786,16 +4507,6 @@ impl Drop for RevisionTempDir {
 /// Export the changed files plus ambient ancestor manifests used to establish
 /// their package/crate identity. Callable discovery needs this bounded image,
 /// but does not resolve imported callees.
-fn export_snapshot_symbol_files(
-    repo: &Repository,
-    snapshot: Snapshot,
-    root: &Path,
-    paths: &[String],
-) -> Result<Vec<(PathBuf, Oid)>, String> {
-    let tree = snapshot_tree(repo, snapshot)?;
-    export_snapshot_symbol_files_from_tree(repo, &tree, root, paths)
-}
-
 fn export_snapshot_symbol_files_from_tree(
     repo: &Repository,
     tree: &git2::Tree,
@@ -3853,20 +4564,6 @@ where
 /// `cache` is the repository's shared analyzer cache, which the import-expansion
 /// analyzer built below reads and writes; see
 /// [`snapshot_import_expansion_targets`].
-fn export_snapshot_files(
-    repo: &Repository,
-    snapshot: Snapshot,
-    root: &Path,
-    paths: &[String],
-    cache: Option<&SharedAnalyzerCache>,
-    budget: Option<&brokk_bifrost_core::retention_budget::RetentionBudget>,
-) -> Result<Vec<(PathBuf, Oid)>, String> {
-    let tree = snapshot_tree(repo, snapshot)?;
-    export_snapshot_files_from_tree(repo, &tree, root, paths, cache, budget, |rel, oid| {
-        export_snapshot_blob(repo, root, rel, oid)
-    })
-}
-
 fn export_snapshot_files_from_tree<F>(
     repo: &Repository,
     tree: &git2::Tree,
@@ -4651,6 +5348,10 @@ pub(crate) fn build_analyzer(
 pub(crate) struct RevisionAnalyzer {
     workspace: WorkspaceAnalyzer,
     _projection: Option<WorkspaceProjectionLease>,
+    /// Lets store-side readers of a bounded image's Rust listing certificate
+    /// reach the image's resolver (`bounded_listing_resolver`) for as long as
+    /// the analysis lives.
+    _bounded_listing: Option<brokk_bifrost_analysis::analyzer::store::BoundedListingRegistration>,
 }
 
 fn build_with_revision_projection(
@@ -4683,7 +5384,7 @@ impl RevisionAnalyzer {
         // workspace's own picture of itself.
         let cache = match image {
             RevisionImage::Snapshot { .. } => cache,
-            RevisionImage::Worktree { .. } => None,
+            RevisionImage::Worktree { .. } | RevisionImage::SymbolOnlyWorktree { .. } => None,
         };
         let (workspace, projection) =
             build_with_revision_projection(image.root(), cache, || match blobs {
@@ -4711,9 +5412,21 @@ impl RevisionAnalyzer {
                     ),
                 },
             })?;
+        let bounded_listing = image.bounded_listing_resolver().and_then(|resolver| {
+            let snapshots = workspace
+                .analyzer()
+                .selected_workspace_snapshots_for_reads()?;
+            let rust = snapshots.get("rust")?.clone();
+            Some(
+                brokk_bifrost_analysis::analyzer::store::register_bounded_listing_resolver(
+                    rust, resolver,
+                ),
+            )
+        });
         Ok(Self {
             workspace,
             _projection: projection,
+            _bounded_listing: bounded_listing,
         })
     }
 
@@ -4749,6 +5462,7 @@ impl RevisionAnalyzer {
         Ok(Self {
             workspace,
             _projection: projection,
+            _bounded_listing: None,
         })
     }
 
@@ -4772,18 +5486,35 @@ pub(crate) fn build_revision_analyzer(
     image: &RevisionImage,
     cache: Option<&SharedAnalyzerCache>,
     budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
-) -> Result<RevisionAnalyzer, String> {
-    RevisionAnalyzer::build_with_budget(image, cache, None, budget)
-        .map_err(|error| format!("Failed to build diff endpoint analyzer: {error}"))
+) -> Result<RevisionAnalyzer, RevisionImageBuildError> {
+    image.require_dependency_resolution()?;
+    RevisionAnalyzer::build_with_budget(image, cache, None, budget).map_err(|error| {
+        RevisionImageBuildError::Analyzer(format!(
+            "Failed to build diff endpoint analyzer: {error}"
+        ))
+    })
 }
 
 fn build_revision_analyzer_with_budget(
     image: &RevisionImage,
     cache: Option<&SharedAnalyzerCache>,
     budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+) -> Result<RevisionAnalyzer, RevisionImageBuildError> {
+    image.require_dependency_resolution()?;
+    RevisionAnalyzer::build_with_budget(image, cache, None, budget).map_err(|error| {
+        RevisionImageBuildError::Analyzer(format!(
+            "Failed to build diff endpoint analyzer: {error}"
+        ))
+    })
+}
+
+fn build_symbol_revision_analyzer_with_budget(
+    image: &RevisionImage,
+    cache: Option<&SharedAnalyzerCache>,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<RevisionAnalyzer, String> {
     RevisionAnalyzer::build_with_budget(image, cache, None, budget)
-        .map_err(|error| format!("Failed to build diff endpoint analyzer: {error}"))
+        .map_err(|error| format!("Failed to build diff symbol analyzer: {error}"))
 }
 
 /// Build the file-dependency view of one revision image, restricted to the
@@ -4796,9 +5527,13 @@ pub(crate) fn build_file_dependency_analyzer(
     cache: Option<&SharedAnalyzerCache>,
     languages: &BTreeSet<Language>,
     budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
-) -> Result<RevisionAnalyzer, String> {
-    RevisionAnalyzer::build_with_budget(image, cache, Some(languages), budget)
-        .map_err(|error| format!("Failed to build file-dependency analyzer: {error}"))
+) -> Result<RevisionAnalyzer, RevisionImageBuildError> {
+    image.require_dependency_resolution()?;
+    RevisionAnalyzer::build_with_budget(image, cache, Some(languages), budget).map_err(|error| {
+        RevisionImageBuildError::Analyzer(format!(
+            "Failed to build file-dependency analyzer: {error}"
+        ))
+    })
 }
 
 /// The omit mode reads syntax products directly for languages whose declaration
@@ -4934,7 +5669,15 @@ fn omit_endpoint(
                 continue;
             },
         };
-        let parsed = adapter.parse_file(&file, &source, &tree);
+        let parsed = {
+            let _phase = profiling::scope("diff_omit.declaration_projection");
+            brokk_bifrost_core::profile_count!("diff_omit.projection_calls", 1);
+            brokk_bifrost_core::profile_count!(
+                "diff_omit.projection_source_bytes",
+                source.len() as u64
+            );
+            adapter.parse_declaration_projection(&file, &source, &tree)
+        };
         for unit in parsed.declarations() {
             if unit.is_synthetic() {
                 continue;
@@ -5849,6 +6592,7 @@ fn ensure_unambiguous_diff_attribution(analyzer: &dyn IAnalyzer, graph: &mut Usa
     if let Some(error) = query.store_error() {
         graph.complete = false;
         graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+            refused_ecosystem: None,
             discovery_error: None,
             path: None,
             module_path: None,
@@ -5865,6 +6609,7 @@ fn ensure_unambiguous_diff_attribution(analyzer: &dyn IAnalyzer, graph: &mut Usa
     }
     graph.complete = false;
     graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+        refused_ecosystem: None,
         discovery_error: None,
         path: None,
         module_path: None,
@@ -5906,6 +6651,7 @@ fn refuse_uncertain_moved_correspondence(
             }
             graph.complete = false;
             graph.incomplete_reasons.push(UsageGraphIncompleteReason {
+                refused_ecosystem: None,
             discovery_error: None,
             path: None, module_path: None,
                 code: "unknown_declaration_correspondence".into(),
@@ -5918,17 +6664,60 @@ fn refuse_uncertain_moved_correspondence(
     }
 }
 
-/// Whether a usage graph was never built: it is incomplete and holds no
-/// declaration, or its call pass was refused for lack of canonical facts. Such a
-/// graph is not a graph with no edges. A graph that is incomplete for another
-/// reason (a source inventory, a truncated callee) is present: its edges stand.
-fn graph_is_absent(graph: &UsageGraphResult) -> bool {
-    !graph.complete
-        && ((graph.nodes.is_empty() && graph.edges.is_empty())
-            || graph
-                .incomplete_reasons
-                .iter()
-                .any(|reason| reason.code == "unavailable_canonical_facts"))
+/// What a usage graph never built. A graph that is incomplete and holds no
+/// declaration, or that carries an `unavailable_canonical_facts` reason naming
+/// no pass, is absent as a whole. A reason that names a refused pass (its
+/// `refused_ecosystem`) makes only that ecosystem's edges absent: the other
+/// passes' nodes and edges stand. Such an ecosystem is not a graph with no
+/// edges. A graph that is incomplete for another reason (a source inventory, a
+/// truncated callee) is present: its edges stand.
+#[derive(Default)]
+struct GraphAbsence<'g> {
+    whole: bool,
+    ecosystems: BTreeSet<&'g str>,
+    /// Incomplete for a reason no refused pass explains, so any edge may be
+    /// missing from it.
+    unexplained_incomplete: bool,
+}
+
+impl<'g> GraphAbsence<'g> {
+    fn of(graph: &'g UsageGraphResult) -> Self {
+        let mut absence = Self::default();
+        if graph.complete {
+            return absence;
+        }
+        absence.whole = graph.nodes.is_empty() && graph.edges.is_empty();
+        absence.unexplained_incomplete = graph.incomplete_reasons.is_empty()
+            || graph.incomplete_reasons.iter().any(|reason| {
+                reason.code != "unavailable_canonical_facts" || reason.refused_ecosystem.is_none()
+            });
+        for reason in graph
+            .incomplete_reasons
+            .iter()
+            .filter(|reason| reason.code == "unavailable_canonical_facts")
+        {
+            match reason.refused_ecosystem.as_deref() {
+                Some(ecosystem) => {
+                    absence.ecosystems.insert(ecosystem);
+                }
+                None => absence.whole = true,
+            }
+        }
+        absence
+    }
+
+    /// Whether an edge of the graph's present passes could be missing from it:
+    /// the absence proof a line-scoped added or removed relation requires.
+    fn may_miss_edges(&self) -> bool {
+        self.whole || self.unexplained_incomplete
+    }
+
+    /// An edge belongs to the pass of its `language`, which is the ecosystem of
+    /// its target; a pass resolves only references to its own ecosystem's
+    /// declarations, so an edge never spans two ecosystems.
+    fn hides(&self, edge: &UsageGraphEdge) -> bool {
+        self.whole || self.ecosystems.contains(edge.language.as_str())
+    }
 }
 
 /// Compare the two scoped usage graphs and group the differences by caller.
@@ -5972,17 +6761,19 @@ fn diff_call_edges(
     let mut deltas: HashMap<CallerKey, CalleeDelta> = HashMap::new();
     let mut deps: BTreeMap<SymbolKey, CommitSymbol> = BTreeMap::new();
     // A graph that is absent (refused, unavailable, cancelled) holds no edge at
-    // all, so against it every edge of the other side would read as added or
-    // removed. An absent graph classifies nothing; `DiffCallAnalysis` reports the
+    // all, or none of a refused pass's ecosystem, so against it every such edge
+    // of the other side would read as added or removed. An absent graph or pass
+    // classifies nothing; `DiffCallAnalysis` reports the
     // result incomplete. A graph that is present but incomplete still holds its
     // proven edges, and keeps the classification below (#2584).
-    let absent = graph_is_absent(before) || graph_is_absent(after);
+    let absence = [GraphAbsence::of(before), GraphAbsence::of(after)];
+    let absent = |edge: &UsageGraphEdge| absence.iter().any(|side| side.hides(edge));
     for (key, edge) in &new {
         // An added relation requires an absence proof on the before side;
         // a proven positive after edge alone cannot establish that delta.
-        if absent
+        if absent(edge)
             || old.contains_key(key)
-            || (scope == DiffCallEdges::ChangedLines && !before.complete)
+            || (scope == DiffCallEdges::ChangedLines && absence[0].may_miss_edges())
         {
             continue;
         }
@@ -6003,9 +6794,9 @@ fn diff_call_edges(
         }
     }
     for (key, edge) in &old {
-        if absent
+        if absent(edge)
             || new.contains_key(key)
-            || (scope == DiffCallEdges::ChangedLines && !after.complete)
+            || (scope == DiffCallEdges::ChangedLines && absence[1].may_miss_edges())
         {
             continue;
         }
@@ -7451,7 +8242,9 @@ mod tests {
         )
         .unwrap();
 
+        let repo = Repository::init(dir.path()).unwrap();
         let files = worktree_files(
+            &repo,
             dir.path(),
             &["a.ts".to_string()],
             &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
@@ -7486,7 +8279,9 @@ mod tests {
         )
         .unwrap();
 
+        let repo = Repository::init(dir.path()).unwrap();
         let files = worktree_files(
+            &repo,
             dir.path(),
             &["a.ts".to_string()],
             &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
@@ -7785,7 +8580,7 @@ mod tests {
             params(),
             cancelled,
         );
-        assert!(super::graph_is_absent(&before) && !super::graph_is_absent(&after));
+        assert!(super::GraphAbsence::of(&before).whole && !super::GraphAbsence::of(&after).whole);
         for scope in [
             crate::diff_analysis::DiffCallEdges::ChangedFiles,
             crate::diff_analysis::DiffCallEdges::ChangedLines,
@@ -7798,6 +8593,191 @@ mod tests {
                 scope,
             );
             assert!(diff.deltas.is_empty(), "{scope:?}: {:?}", diff.deltas.len());
+            assert!(matches!(
+                crate::diff_analysis::DiffCallAnalysis::from_graphs(scope, &before, &after).status,
+                crate::diff_analysis::DiffCallStatus::Incomplete
+            ));
+        }
+    }
+
+    /// One refused pass hid the call deltas of every language: the whole graph
+    /// read as absent. The refusal names its ecosystem, so only that pass's edges
+    /// are withheld and the other passes still classify.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13232: one refused language pass dropped every language's call deltas"
+    )]
+    fn a_refused_pass_withholds_only_its_own_languages_call_deltas() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+        use brokk_bifrost_analysis::analyzer::languages::{
+            EdgePassEntry, EdgePassId, LanguageEdgeFailure, LanguageGraphBackend,
+            NativeWorkspaceGraphProvider,
+        };
+        use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
+        use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+        struct RefusedRust;
+        impl NativeWorkspaceGraphProvider for RefusedRust {
+            // This fake refuses the whole pass through input_failure; it models no source-admission refusal.
+            fn excluded_sources(
+                &self,
+                _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+            > {
+                Ok(Vec::new())
+            }
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Rust
+            }
+            fn input_failure(
+                &self,
+                _analyzer: &dyn IAnalyzer,
+                request_files: &[ProjectFile],
+            ) -> Option<LanguageEdgeFailure> {
+                Some(LanguageEdgeFailure {
+                    reason: "canonical Rust facts are unavailable for live files",
+                    files: request_files.to_vec(),
+                })
+            }
+            fn project(
+                &self,
+                _analyzer: &dyn IAnalyzer,
+                _admitted_callers: &[ProjectFile],
+                _cancellation: &CancellationToken,
+            ) -> brokk_bifrost_analysis::analyzer::store::Result<
+                SelectedWorkspaceUsageGraphProjectionOutcome,
+            > {
+                unreachable!("a reported input failure must stop the projection")
+            }
+        }
+        static REFUSED_RUST: RefusedRust = RefusedRust;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = test_repo::init_repo(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        let files = [
+            PathBuf::from("Cargo.toml"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("a.ts"),
+        ];
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"mixed\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let write = |rust_callee: &str, ts_callee: &str| {
+            fs::write(
+                root.join("src/lib.rs"),
+                format!(
+                    "fn old() -> usize {{ 1 }}\nfn new() -> usize {{ 2 }}\npub fn rust_caller() -> usize {{ {rust_callee}() }}\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                root.join("a.ts"),
+                format!(
+                    "function helper(): number {{ return 1; }}\nfunction helper2(): number {{ return 2; }}\nexport function ts_caller(): number {{ return {ts_callee}(); }}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let params = || crate::searchtools::UsageGraphParams {
+            include_same_owner: false,
+            include_tests: true,
+            paths: None,
+            depth: 1,
+        };
+        let graph = |passes: &[EdgePassEntry]| {
+            let analyzer = build_analyzer(
+                &root,
+                &files,
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            crate::searchtools::usage_graph_with_passes(
+                analyzer.analyzer(),
+                params(),
+                passes,
+                &CancellationToken::default(),
+            )
+        };
+        write("old", "helper");
+        let before = graph(&brokk_bifrost_analysis::analyzer::languages::edge_passes());
+        // The Rust pass is refused on the target side only, so the Rust edge
+        // that the base has is missing there without having been removed.
+        write("new", "helper2");
+        let mut passes = brokk_bifrost_analysis::analyzer::languages::edge_passes();
+        passes.retain(|entry| entry.id != EdgePassId::Rust);
+        passes.push(EdgePassEntry {
+            id: EdgePassId::Rust,
+            ecosystem: UsageEcosystem::Rust,
+            languages: vec![Language::Rust],
+            backend: LanguageGraphBackend::Native(&REFUSED_RUST),
+        });
+        let after = graph(&passes);
+
+        assert!(
+            before.edges.iter().any(|edge| edge.language == "rust"),
+            "the base holds a Rust edge: {:?}",
+            before.edges
+        );
+        assert!(
+            after.incomplete_reasons.iter().any(|reason| {
+                reason.code == "unavailable_canonical_facts"
+                    && reason.refused_ecosystem.as_deref() == Some("rust")
+            }),
+            "{:?}",
+            after.incomplete_reasons
+        );
+        assert!(after.edges.iter().all(|edge| edge.language != "rust"));
+        // Only the full-file scope: a line-scoped delta also needs each graph
+        // complete apart from refusals, and this unrooted graph over a bare
+        // directory carries an unrelated incomplete inventory.
+        {
+            let scope = crate::diff_analysis::DiffCallEdges::ChangedFiles;
+            let diff = super::diff_call_edges(
+                &before,
+                &after,
+                &Default::default(),
+                &Default::default(),
+                scope,
+            );
+            let deltas: Vec<_> = diff
+                .deltas
+                .iter()
+                .map(|((from, language), delta)| {
+                    (
+                        language.as_str(),
+                        from.as_str(),
+                        delta
+                            .added
+                            .iter()
+                            .map(|c| c.to.as_str())
+                            .collect::<Vec<_>>(),
+                        delta
+                            .removed
+                            .iter()
+                            .map(|c| c.to.as_str())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            assert!(
+                deltas.iter().all(|(language, ..)| *language != "rust"),
+                "{scope:?}: a refused pass classifies nothing: {deltas:?}"
+            );
+            assert!(
+                deltas
+                    .iter()
+                    .any(|(language, _, added, removed)| *language == "js_ts"
+                        && added.iter().any(|to| to.ends_with("helper2"))
+                        && removed.iter().any(|to| to.ends_with("helper"))),
+                "{scope:?}: the surviving pass keeps its deltas: {deltas:?}"
+            );
             assert!(matches!(
                 crate::diff_analysis::DiffCallAnalysis::from_graphs(scope, &before, &after).status,
                 crate::diff_analysis::DiffCallStatus::Incomplete
@@ -8457,7 +9437,8 @@ mod tests {
         // ecosystem; only a Rust source or manifest among them would make the
         // Rust listing incomplete (#10670 review: an unrelated README failed
         // every bounded image). A path-restricted image names a few files and
-        // keeps one Unknown omission without walking the whole tree.
+        // records one BoundedTree omission (the tree and what it holds)
+        // without walking the whole tree; it stays incomplete.
         let rust = BTreeSet::from([Language::Rust]);
         let manifest_only = ["Cargo.toml".to_owned()];
         let listing_complete = |image: &RevisionImage| {
@@ -8499,7 +9480,7 @@ mod tests {
                     None,
                 ),
                 false,
-                Some(("omitted.rs", WorkspaceFileOmissionReason::UnreadableSymlink)),
+                Some(("omitted.rs", WorkspaceFileOmissionReason::Symlink)),
             ),
             (
                 RevisionImage::materialize(
@@ -8549,7 +9530,7 @@ mod tests {
                     Some(&budget),
                 ),
                 false,
-                Some(("", WorkspaceFileOmissionReason::Unknown)),
+                Some(("", WorkspaceFileOmissionReason::BoundedTree)),
             ),
         ] {
             let image = image.unwrap();
@@ -8567,6 +9548,56 @@ mod tests {
             }
             assert_eq!(listing_complete(&image), complete);
         }
+
+        // The other two bounded recording sites record the same typed row, and
+        // its resolver sees what the image left out: README.md is in the tree
+        // and not in either image.
+        let omitted_by = |image: &RevisionImage| {
+            let (project, _) = image.project();
+            let (_, omissions) = project.all_files_with_omissions().unwrap();
+            assert_eq!(omissions.len(), 1, "{omissions:?}");
+            assert_eq!(
+                omissions[0].reason,
+                WorkspaceFileOmissionReason::BoundedTree
+            );
+            let resolver = image.bounded_listing_resolver().expect("a resolver");
+            resolver
+                .omitted_files(&["Cargo.toml", "README.md"])
+                .unwrap()
+        };
+        let symbols = RevisionImage::materialize_symbols(
+            &repo,
+            Snapshot::Commit(commit),
+            &manifest_only,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(omitted_by(&symbols), ["README.md"]);
+        let whole = RevisionImage::materialize(
+            &repo,
+            ImageCheckout::of_root(&repo),
+            Snapshot::Commit(commit),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let cargo = repo
+            .find_commit(commit)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_name("Cargo.toml")
+            .unwrap()
+            .id();
+        let scoped = RevisionImage::hardlink_subset(
+            &whole,
+            &tree,
+            RevisionTempDir::new("scoped").unwrap(),
+            vec![(PathBuf::from("Cargo.toml"), cargo)],
+        );
+        assert_eq!(omitted_by(&scoped), ["README.md"]);
 
         // A historical gitlink whose path is now a regular file is
         // uninitialized: no child Git metadata can live under a file.
@@ -8778,6 +9809,95 @@ mod tests {
                 .iter()
                 .map(|call| call.to.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #13703. libgit2 reads untracked content for a work-tree diff, and
+    /// closing a descriptor on a live store's `-shm` drops this process's
+    /// SQLite locks. A store at an arbitrary path in the work tree is not
+    /// ignored by git, so the diff must be told about it. The parent opens the
+    /// store and diffs, a child writer then writes and exits, the parent writes
+    /// again, and a fresh connection must find an intact store.
+    #[test]
+    #[hardwon("#13703: libgit2 untracked-content reads opened a live non-ignored store")]
+    fn a_worktree_diff_leaves_a_live_unignored_store_alone() {
+        const CHILD_DB: &str = "BIFROST_13703_DIFF_CHILD_DB";
+        let insert_blob = |conn: &rusqlite::Connection, oid: &str| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+                [oid],
+            )
+            .unwrap();
+        };
+        if let Some(db_path) = std::env::var_os(CHILD_DB) {
+            let conn =
+                brokk_bifrost_core::cache_db::open_unified_connection(Path::new(&db_path)).unwrap();
+            insert_blob(&conn, "3333333333333333333333333333333333333333");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = test_repo::init_repo(&root);
+        fs::write(root.join("a.txt"), "base\n").unwrap();
+        test_repo::commit_all(&repo, "base");
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+        fs::write(root.join("notes.txt"), "untracked\n").unwrap();
+
+        let db_path = root.join("arbitrary-store.db");
+        let parent = brokk_bifrost_core::cache_db::open_unified_connection(&db_path).unwrap();
+        insert_blob(&parent, "1111111111111111111111111111111111111111");
+        let (changes, _, _) = crate::diff_analysis::diff_metadata(
+            &repo,
+            crate::diff_analysis::Snapshot::Commit(head),
+            crate::diff_analysis::Snapshot::Worktree,
+        )
+        .unwrap();
+        let paths = changes
+            .iter()
+            .filter_map(|change| change.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["notes.txt".to_string()],
+            "the live store and its sidecars are not untracked content"
+        );
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diff_analysis::tests::a_worktree_diff_leaves_a_live_unignored_store_alone",
+                "--nocapture",
+            ])
+            .env(CHILD_DB, &db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child writer failed: {output:?}"
+        );
+        insert_blob(&parent, "4444444444444444444444444444444444444444");
+        let fresh = rusqlite::Connection::open(&db_path).unwrap();
+        let report: Vec<String> = fresh
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(report, vec!["ok".to_string()]);
+        let blobs: i64 = fresh
+            .query_row(
+                "SELECT count(*) FROM blobs WHERE blob_oid IN (?1, ?2)",
+                [
+                    "3333333333333333333333333333333333333333",
+                    "4444444444444444444444444444444444444444",
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            blobs, 2,
+            "the child's and the parent's later writes survive"
         );
     }
 

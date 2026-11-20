@@ -244,11 +244,7 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
     use brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind;
-
-    use brokk_bifrost_analysis::analyzer::usages::test_support::assert_scope_budget_exceeded;
 
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
@@ -555,19 +551,6 @@ public class Caller
                 "DeepParentheses.cs",
                 &source,
                 &expression,
-                ReceiverAnalysisBudget::tiny(),
-                None,
-            ),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == ReceiverAnalysisBudget::tiny().max_scope_nodes
-        ));
-        assert!(matches!(
-            bounded_expression_lookup(
-                "DeepParentheses.cs",
-                &source,
-                &expression,
                 ReceiverAnalysisBudget::default(),
                 Some(64),
             ),
@@ -610,7 +593,6 @@ public class Caller
             .expect("alternating C# tree");
         let site = full_expression_site(&file, &thread_source, &thread_expression);
         let deep_budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 200_000,
             max_summary_expansions: 1_024,
             ..ReceiverAnalysisBudget::default()
         };
@@ -645,22 +627,6 @@ public class Caller
             "{work:#?}"
         );
 
-        assert!(matches!(
-            bounded_expression_lookup(
-                "Alternating.cs",
-                &source,
-                &expression,
-                ReceiverAnalysisBudget {
-                    max_scope_nodes: 128,
-                    ..ReceiverAnalysisBudget::default()
-                },
-                None,
-            ),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == 128
-        ));
         assert!(matches!(
             bounded_expression_lookup(
                 "Alternating.cs",
@@ -721,38 +687,6 @@ public class Consumer
                 .any(|diagnostic| diagnostic.kind == "ambiguous_type"),
             "{outcome:#?}"
         );
-    }
-
-    #[test]
-    fn bounded_type_lookup_reports_scope_budget_without_partial_result() {
-        let source = r#"
-namespace Demo;
-public class Product {}
-public class Consumer
-{
-    public void Run(Product product) { product.ToString(); }
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &[("Budget.cs", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "Budget.cs");
-        let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
-        let site = full_expression_site(&file, source, "product.ToString()");
-        let budget = ReceiverAnalysisBudget::tiny();
-
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_csharp_type_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            budget,
-            None,
-        );
-
-        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]

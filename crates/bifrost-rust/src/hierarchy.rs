@@ -29,6 +29,11 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_utils::rel_path_string;
 use std::mem::size_of;
 
+mod owner_selection;
+pub use owner_selection::{
+    RustOwnerSelection, RustOwnerSelectionReason, rust_member_owner_selections,
+};
+
 /// The canonical, source-owned inputs to Rust hierarchy resolution for one
 /// mounted file. These rows are content-addressed; `declaration_units` is the
 /// placement-dependent bridge that retains every source declaration link to a
@@ -44,6 +49,9 @@ pub struct RustHierarchySourceFacts {
     pub declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
     pub module_names: HashMap<SourceDeclarationId, String>,
     pub imports: Vec<SourceImportFact>,
+    /// Exact impl syntax coordinates, used only to inspect cfg and
+    /// attribute admission at query time. Identity remains the declaration id.
+    pub impl_spans: HashMap<SourceDeclarationId, (usize, usize)>,
 }
 
 impl RustHierarchySourceFacts {
@@ -116,6 +124,10 @@ impl RustHierarchySourceFacts {
                     .map(SourceImportFact::allocated_retained_bytes)
                     .fold(0usize, usize::saturating_add),
             )
+            .saturating_add(brokk_bifrost_core::hash::allocated_table_slot_bytes::<(
+                SourceDeclarationId,
+                (usize, usize),
+            )>(self.impl_spans.capacity()))
     }
 }
 

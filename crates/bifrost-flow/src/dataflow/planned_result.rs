@@ -19,6 +19,12 @@ pub struct PlannedDataflowCompletion {
     domain_complete: bool,
 }
 
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for PlannedDataflowCompletion {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        self.termination.budget_verdict()
+    }
+}
+
 impl PlannedDataflowCompletion {
     pub const fn new(
         input_status: IcfgInputStatus,

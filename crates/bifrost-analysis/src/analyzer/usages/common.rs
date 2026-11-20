@@ -191,8 +191,20 @@ impl MemoCompletionReceipt {
         analyzer: &dyn crate::analyzer::IAnalyzer,
         build: impl FnOnce() -> V,
     ) -> (V, Self) {
+        Self::capture_for_owner(None, analyzer, build)
+    }
+
+    fn capture_for_owner<V>(
+        _owner: Option<QueryMemoOwner>,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        build: impl FnOnce() -> V,
+    ) -> (V, Self) {
         let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
         let value = build();
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(owner) = _owner {
+            inject_memo_fill_reason_for_test(owner, analyzer);
+        }
         let mut receipt = Self::default();
         for reason in scope.captured_read_incompleteness() {
             if reason.is_execution_dependent() {
@@ -202,13 +214,6 @@ impl MemoCompletionReceipt {
             }
         }
         (value, receipt)
-    }
-
-    fn include_read_channels(
-        &mut self,
-        channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
-    ) {
-        self.operational |= channels.execution_dependences > 0 || channels.budget_dependences > 0;
     }
 
     /// [`Self::retained_heap_bytes`] with every owned buffer rounded to its
@@ -245,12 +250,8 @@ impl MemoCompletionReceipt {
         Result<std::sync::Arc<crate::analyzer::semantic::partial_flow::ProcedurePartialFlows>, E>,
         Self,
     ) {
-        let (value, mut receipt) = Self::capture(analyzer, || {
-            let value = build(request);
-            #[cfg(any(test, feature = "test-support"))]
-            inject_memo_fill_reason_for_test(_owner, analyzer);
-            value
-        });
+        let (value, mut receipt) =
+            Self::capture_for_owner(Some(_owner), analyzer, || build(request));
         use crate::analyzer::semantic::partial_flow::PartialFlowOutcome;
         receipt.operational |= request.stop_observed()
             || value.as_ref().is_ok_and(|flows| {
@@ -277,19 +278,30 @@ impl MemoCompletionReceipt {
     }
 }
 
-// Inspect the existing capture before sharing it; preserve its read-key Arc so
-// ReplayingMemo still recognizes the fill it has already forwarded.
-fn complete_memo_entry<V>(
-    entry: crate::analyzer::workspace_authority::ReplayingMemoEntry<
-        CompletedMemoValue<V>,
-        crate::analyzer::ReadKey,
-    >,
-) -> crate::analyzer::workspace_authority::ReplayingMemoEntry<
+type CompletedValueEntry<V> = crate::analyzer::workspace_authority::ReplayingMemoEntry<
     CompletedMemoValue<V>,
     crate::analyzer::ReadKey,
-> {
+>;
+
+// Inspect the existing capture before sharing it; preserve its read-key Arc so
+// ReplayingMemo still recognizes the fill it has already forwarded.
+fn complete_memo_entry<V>(entry: CompletedValueEntry<V>) -> CompletedValueEntry<V> {
+    // Core owns captured admission, including explicit reuse refusal with
+    // no typed incompleteness or execution count (#11997).
+    let execution_dependent = entry.execution_dependent();
     let (mut value, reads) = entry.into_parts();
-    value.receipt.include_read_channels(reads.channels);
+    value.receipt.operational |= execution_dependent;
+    crate::analyzer::workspace_authority::ReplayingMemoEntry::from_parts(value, reads)
+}
+
+fn complete_request_local_memo_entry<V>(entry: CompletedValueEntry<V>) -> CompletedValueEntry<V> {
+    // A query-owned memo may reuse a value whose proof refused product reuse:
+    // every hit replays that refusal, so no consumer can retain the value as a
+    // product. An execution dependence or store failure still describes this
+    // run and must not be memoized.
+    let execution_dependent = entry.bound_to_execution();
+    let (mut value, reads) = entry.into_parts();
+    value.receipt.operational |= execution_dependent;
     crate::analyzer::workspace_authority::ReplayingMemoEntry::from_parts(value, reads)
 }
 
@@ -319,6 +331,17 @@ pub enum MemoValueAdmission<V> {
         >,
     ),
     Unretained(V),
+}
+
+fn reads_require_operational_rollback<K>(
+    receipt: &MemoCompletionReceipt,
+    reads: &brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads<K>,
+) -> bool {
+    // A request-pinned input is not an operational failure: the request that
+    // read it keeps what it filled (#14322).
+    !receipt.reusable()
+        || reads.channels.bound_to_execution()
+        || !reads.channels.explicit_verdict.holds_for_request()
 }
 
 /// Bridge the core weighted capture to the same typed receipt used by query
@@ -370,8 +393,15 @@ where
             .saturating_add(receipt.retained_heap_bytes());
         Ok::<_, E>((CompletedMemoValue { value, receipt }, value_bytes))
     })?;
+    // Core owns captured admission, including explicit reuse refusal with
+    // no typed incompleteness or execution count (#11997).
+    let execution_dependent = entry.execution_dependent();
     let (mut value, reads) = entry.into_parts();
-    value.receipt.include_read_channels(reads.channels);
+    // #12820: refusal denies shared reuse, but successful request-local
+    // artifacts remain necessary to this answer. Operational failures still
+    // discard partially filled state.
+    let rollback_required = reads_require_operational_rollback(&value.receipt, &reads);
+    value.receipt.operational |= execution_dependent;
     if value.receipt.reusable() {
         let entry = std::sync::Arc::new(
             crate::analyzer::workspace_authority::ReplayingMemoEntry::from_parts_weighted(
@@ -383,6 +413,9 @@ where
         rollback.0 = None;
         Ok(MemoValueAdmission::Admitted(entry))
     } else {
+        if !rollback_required {
+            rollback.0 = None;
+        }
         Ok(MemoValueAdmission::Unretained(value.value))
     }
 }
@@ -413,6 +446,46 @@ pub(crate) fn query_reentrant_memo_value<K: Clone + Eq + std::hash::Hash, V>(
     build: impl FnOnce() -> V,
     retain: impl FnOnce(&V) -> bool,
 ) -> impl std::ops::Deref<Target = V> {
+    query_reentrant_memo_value_with_admission(
+        memo,
+        analyzer,
+        key,
+        build,
+        retain,
+        complete_memo_entry,
+    )
+}
+
+/// [`query_reentrant_memo_value`] for a memo the caller owns for one query.
+///
+/// A fill that refused product reuse remains memoized here, while every hit
+/// replays that refusal into its consumer. This keeps request-local work
+/// cached without making an unrecorded-input answer reusable across requests.
+pub(crate) fn query_reentrant_request_local_memo_value<K: Clone + Eq + std::hash::Hash, V>(
+    memo: &QueryReadMemo<K, V>,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    key: &K,
+    build: impl FnOnce() -> V,
+    retain: impl FnOnce(&V) -> bool,
+) -> impl std::ops::Deref<Target = V> {
+    query_reentrant_memo_value_with_admission(
+        memo,
+        analyzer,
+        key,
+        build,
+        retain,
+        complete_request_local_memo_entry,
+    )
+}
+
+fn query_reentrant_memo_value_with_admission<K: Clone + Eq + std::hash::Hash, V>(
+    memo: &QueryReadMemo<K, V>,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    key: &K,
+    build: impl FnOnce() -> V,
+    retain: impl FnOnce(&V) -> bool,
+    complete: impl FnOnce(CompletedValueEntry<V>) -> CompletedValueEntry<V>,
+) -> impl std::ops::Deref<Target = V> {
     let guard = memo
         .read(
             &crate::analyzer::workspace_authority::memo_attribution(analyzer),
@@ -425,7 +498,7 @@ pub(crate) fn query_reentrant_memo_value<K: Clone + Eq + std::hash::Hash, V>(
                 {
                     return Ok::<_, std::convert::Infallible>(value);
                 }
-                let value = std::sync::Arc::new(complete_memo_entry(capture.build(|| {
+                let value = std::sync::Arc::new(complete(capture.build(|| {
                     let (value, receipt) = MemoCompletionReceipt::capture(analyzer, build);
                     CompletedMemoValue { value, receipt }
                 })));
@@ -522,6 +595,27 @@ macro_rules! memo_owners {
         pub enum QueryMemoOwner { $($owner),+ }
         impl QueryMemoOwner {
             pub const ALL: &[Self] = &[$(Self::$owner),+];
+
+            /// Profiling only (`memo.<owner>.hit`): a request was served from
+            /// this owner's memo.
+            pub fn count_hit(self) {
+                match self {
+                    $(Self::$owner => brokk_bifrost_core::profile_count!(
+                        concat!("memo.", stringify!($owner), ".hit"),
+                        1
+                    )),+
+                }
+            }
+
+            /// Profiling only (`memo.<owner>.miss`): this owner's memo was filled.
+            pub fn count_miss(self) {
+                match self {
+                    $(Self::$owner => brokk_bifrost_core::profile_count!(
+                        concat!("memo.", stringify!($owner), ".miss"),
+                        1
+                    )),+
+                }
+            }
         }
     };
 }
@@ -538,6 +632,7 @@ memo_owners!(
     GoDefinition,
     NonreturnDiscovery,
     PythonDefinition,
+    PythonDefinitionAnswer,
     PythonType,
     RequestRead,
     CompositionPartialFlow,
@@ -582,6 +677,9 @@ impl QueryMemoOwner {
             Self::PythonDefinition => {
                 "crates/bifrost-python-analysis/src/analyzer/usages/get_definition/python.rs::native_definition_batch_memo_completion_conformance"
             }
+            Self::PythonDefinitionAnswer => {
+                "crates/bifrost-python-analysis/src/analyzer/python/native_request/definition_lookup.rs::request_definition_answer_memo_completion_conformance"
+            }
             Self::PythonType => {
                 "crates/bifrost-python-analysis/src/analyzer/python/type_flow.rs::native_type_request_memo_completion_conformance"
             }
@@ -612,6 +710,7 @@ impl QueryMemoOwner {
             | Self::GoDefinition
             | Self::NonreturnDiscovery
             | Self::PythonDefinition
+            | Self::PythonDefinitionAnswer
             | Self::PythonType
             | Self::CompositionPartialFlow
             | Self::InertDropProof => true,
@@ -659,10 +758,53 @@ pub fn with_memo_fill_reason_for_test<T>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static MEMO_TEST_REFUSAL: std::cell::RefCell<Option<QueryMemoOwner>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make the next fill of `owner` on this thread refuse reuse, as a production
+/// refusal source (an unrecorded read) would, without any incompleteness. The
+/// hook is consumed once and never substitutes a product.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn with_memo_fill_refusal_for_test<T>(owner: QueryMemoOwner, build: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MEMO_TEST_REFUSAL.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    MEMO_TEST_REFUSAL.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(owner).is_none(),
+            "memo test refusals cannot nest"
+        );
+    });
+    let _reset = Reset;
+    let value = build();
+    MEMO_TEST_REFUSAL.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "{owner:?} did not fill on the refusing thread"
+        )
+    });
+    value
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn inject_memo_fill_reason_for_test(
     owner: QueryMemoOwner,
     analyzer: &dyn crate::analyzer::IAnalyzer,
 ) {
+    MEMO_TEST_REFUSAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if *slot == Some(owner) {
+            slot.take();
+            analyzer.refuse_read_reuse();
+        }
+    });
     MEMO_TEST_REASON.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot
@@ -670,7 +812,7 @@ fn inject_memo_fill_reason_for_test(
             .is_some_and(|(expected, _)| *expected == owner)
         {
             let (_, reason) = slot.take().expect("matching injection exists");
-            analyzer.record_query_incomplete(reason);
+            crate::analyzer::i_analyzer::record_captured_read_incomplete_for_test(reason);
         }
     });
 }
@@ -771,7 +913,7 @@ pub fn assert_memo_owner_conformance_for_test<S, V: std::fmt::Debug + PartialEq>
         let hit_reasons = hit.captured_read_incompleteness();
         assert_eq!(
             first, second,
-            "{owner:?}: current answer and retry/hit disagree"
+            "{owner:?}: current answer and retry/hit disagree ({reason:?})"
         );
         if keep {
             assert_eq!(
@@ -805,18 +947,52 @@ pub fn assert_memo_owner_conformance_for_test<S, V: std::fmt::Debug + PartialEq>
     }
 }
 
-/// Only shared completion admission can create a retained receipt. Products
-/// with a required QueryMemoReads field therefore cannot retain rejected fills.
+/// Request-local state may remain usable when its computation refused reuse.
+/// Its capture still replays every read and completion to later consumers, but
+/// a refused state never supplies a receipt for admission into a shared memo.
+#[doc(hidden)]
+pub struct RequestReadState(RequestReadDisposition);
+
+enum RequestReadDisposition {
+    Admitted(QueryMemoReads),
+    Refused(QueryMemoReads),
+}
+
+impl RequestReadState {
+    pub fn replay(&self, analyzer: &dyn crate::analyzer::IAnalyzer) {
+        match &self.0 {
+            RequestReadDisposition::Admitted(reads) => replay_memo_reads(reads, analyzer),
+            RequestReadDisposition::Refused(reads) => {
+                analyzer.refuse_read_reuse();
+                replay_memo_reads(reads, analyzer);
+            }
+        }
+    }
+
+    pub fn admitted(&self) -> Option<&QueryMemoReads> {
+        match &self.0 {
+            RequestReadDisposition::Admitted(reads) => Some(reads),
+            RequestReadDisposition::Refused(_) => None,
+        }
+    }
+}
+
+/// Only shared completion admission can create a reusable receipt. Successful
+/// current-only computations keep their request state but supply no such receipt.
 #[doc(hidden)]
 #[must_use = "a memo fill must be admitted or discarded"]
 pub struct MemoAdmission {
-    reads: Option<QueryMemoReads>,
+    state: RequestReadState,
+    rollback_required: bool,
 }
 
 impl MemoAdmission {
     #[must_use]
     pub fn admitted(self) -> Option<QueryMemoReads> {
-        self.reads
+        match self.state.0 {
+            RequestReadDisposition::Admitted(reads) => Some(reads),
+            RequestReadDisposition::Refused(_) => None,
+        }
     }
 }
 
@@ -828,17 +1004,27 @@ pub fn capture_memo_reads<T>(
     let mut memo = crate::analyzer::workspace_authority::ReplayingMemo::default();
     let mut value = None;
     let mut reusable = false;
+    let mut rollback_required = false;
     memo.read_mut(
         &crate::analyzer::workspace_authority::memo_attribution(analyzer),
         |slot, capture| {
-            let entry = std::sync::Arc::new(complete_memo_entry(capture.build(|| {
-                let (_, receipt) = MemoCompletionReceipt::capture(analyzer, || {
-                    value = Some(build());
-                    #[cfg(any(test, feature = "test-support"))]
-                    inject_memo_fill_reason_for_test(_owner, analyzer);
-                });
+            let entry = capture.build(|| {
+                let (_, receipt) =
+                    MemoCompletionReceipt::capture_for_owner(Some(_owner), analyzer, || {
+                        value = Some(build());
+                    });
                 CompletedMemoValue { value: (), receipt }
-            })));
+            });
+            let (completed, reads) = entry.into_parts();
+            // #12820: refusal denies shared reuse, but successful request-local
+            // contexts and bound publications remain necessary to this answer.
+            // Operational failures still discard every partially filled state.
+            rollback_required = reads_require_operational_rollback(&completed.receipt, &reads);
+            let entry = std::sync::Arc::new(complete_memo_entry(
+                crate::analyzer::workspace_authority::ReplayingMemoEntry::from_parts(
+                    completed, reads,
+                ),
+            ));
             reusable = entry.value().receipt.reusable();
             *slot = Some(std::sync::Arc::clone(&entry));
             Ok::<_, std::convert::Infallible>(entry)
@@ -848,33 +1034,40 @@ pub fn capture_memo_reads<T>(
     (
         value.expect("request builder ran"),
         MemoAdmission {
-            reads: reusable.then_some(QueryMemoReads { memo }),
+            state: RequestReadState(if reusable {
+                RequestReadDisposition::Admitted(QueryMemoReads { memo })
+            } else {
+                RequestReadDisposition::Refused(QueryMemoReads { memo })
+            }),
+            rollback_required,
         },
     )
 }
 
-/// Register rollback before a mutable fill begins. Shared admission drives
-/// rollback, including writes made before an operational early return. Replay
-/// prior completion before calling the builder, including its early errors.
+/// Roll back operationally failed fills, including writes made before an
+/// early return. Successful current-only fills retain their request-local state
+/// and replay refusal to every later consumer instead of admitting reuse.
 #[doc(hidden)]
 pub fn capture_mutable_memo_reads<S, T>(
     owner: QueryMemoOwner,
     analyzer: &dyn crate::analyzer::IAnalyzer,
     state: &mut S,
-    previous: Option<&QueryMemoReads>,
+    previous: Option<&RequestReadState>,
     discard: impl FnOnce(&mut S),
     build: impl FnOnce(&mut S) -> T,
-) -> (T, Option<QueryMemoReads>) {
+) -> (T, Option<RequestReadState>) {
     let (value, admission) = capture_memo_reads(owner, analyzer, || {
         if let Some(previous) = previous {
-            replay_memo_reads(previous, analyzer);
+            previous.replay(analyzer);
         }
         build(state)
     });
-    let reads = admission.admitted();
-    if reads.is_none() {
+    let reads = if admission.rollback_required {
         discard(state);
-    }
+        None
+    } else {
+        Some(admission.state)
+    };
     (value, reads)
 }
 
@@ -935,7 +1128,8 @@ pub(crate) fn memo_read_bytes(reads: &QueryMemoReads) -> usize {
 
 /// [`memo_read_bytes`] with every owned buffer rounded to its allocation, for
 /// pure evictable caches. The dispatch session keeps the requested-byte form.
-pub(crate) fn allocated_memo_read_bytes(reads: &QueryMemoReads) -> usize {
+#[doc(hidden)]
+pub fn allocated_memo_read_bytes(reads: &QueryMemoReads) -> usize {
     reads.memo.account(|slot| {
         slot.as_ref().map_or(0, |entry| {
             entry.value().receipt.allocated_heap_bytes()
@@ -977,8 +1171,17 @@ mod memo_read_tests {
                 }
                 assert_eq!(fills.get(), 4);
                 for _ in 0..2 {
-                    let build = || { analyzer.record_budget_dependences(1); fills.set(fills.get() + 1); fills.get() };
+                    let before = fills.get();
+                    let build = || {
+                        // The budget count attributes an existing execution
+                        // stop; annotate-only input is not a refusal (#13430).
+                        analyzer.mark_execution_dependent();
+                        analyzer.record_budget_dependences(1);
+                        fills.set(fills.get() + 1);
+                        fills.get()
+                    };
                     assert_eq!(*$call(&memo, &analyzer, &0, build $(, $extra)*), fills.get());
+                    assert_eq!(fills.get(), before + 1, "a budget-stopped fill must retry");
                 }
                 assert_eq!(fills.get(), 6);
                 let stable = QueryReadIncomplete::ProofStopped { reason: "not_found", cause: None };
@@ -1011,6 +1214,43 @@ mod memo_read_tests {
         |_| true
     );
     memo_completion_case!(result_memo_completion, result_value);
+
+    #[test]
+    #[hardwon("#13575: a product reuse refusal made a request-local expression memo rebuild")]
+    fn request_local_memo_reuses_a_refused_fill_and_replays_its_refusal() {
+        let analyzer = MultiAnalyzer::default();
+        let memo = query_read_memo::<u8, usize>();
+        let fills = std::cell::Cell::new(0);
+        let (first, first_reads) = capture_query_reads(&analyzer, || {
+            *query_reentrant_request_local_memo_value(
+                &memo,
+                &analyzer,
+                &0,
+                || {
+                    fills.set(fills.get() + 1);
+                    analyzer.refuse_read_reuse();
+                    7
+                },
+                |_| true,
+            )
+        });
+        assert_eq!(first, 7);
+        assert_eq!(fills.get(), 1);
+        assert!(first_reads.reuse_refused());
+
+        let (hit, hit_reads) = capture_query_reads(&analyzer, || {
+            *query_reentrant_request_local_memo_value(
+                &memo,
+                &analyzer,
+                &0,
+                || panic!("a request-local refused fill was rebuilt"),
+                |_| true,
+            )
+        });
+        assert_eq!(hit, 7);
+        assert_eq!(fills.get(), 1);
+        assert!(hit_reads.reuse_refused());
+    }
 
     #[test]
     #[hardwon(
@@ -1136,7 +1376,7 @@ mod memo_read_tests {
                 owner,
                 &analyzer,
                 &mut state,
-                Some(&receipt),
+                Some(&RequestReadState(RequestReadDisposition::Admitted(receipt))),
                 Vec::clear,
                 |_| Err::<(), ()>(()),
             );
@@ -1144,14 +1384,16 @@ mod memo_read_tests {
             assert_eq!(state, vec![37]);
             let next = next.expect("deterministic prior state remains admitted");
             let hit = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
-            let (_, reads) = capture_query_reads(&analyzer, || replay_memo_reads(&next, &analyzer));
+            let (_, reads) = capture_query_reads(&analyzer, || next.replay(&analyzer));
             assert_eq!(reads.keys(), vec![key], "{owner:?}");
             assert_eq!(hit.captured_read_incompleteness(), vec![gap], "{owner:?}");
         }
     }
 
     #[test]
-    #[hardwon("#11234: refusing a receipt left operationally filled mutable products retained")]
+    #[hardwon(
+        "#11234: refusing a receipt left operationally filled mutable products retained; #11997: explicit reuse refusal was ignored"
+    )]
     fn registered_memo_owners_obey_shared_admission_and_rollback() {
         use crate::analyzer::read_ledger::DerivationExecutionCause;
         use crate::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
@@ -1198,6 +1440,32 @@ mod memo_read_tests {
             );
             assert!(receipt.is_none(), "{owner:?}");
             assert!(state.is_empty(), "{owner:?}");
+            // A request-scoped advisory has no incomplete-read reason or
+            // execution count. #12820: explicit refusal denies admission but
+            // preserves the successful state needed by this request.
+            let (_, receipt) = capture_mutable_memo_reads(
+                owner,
+                &analyzer,
+                &mut state,
+                None,
+                Vec::clear,
+                |state| {
+                    state.push(2);
+                    analyzer.refuse_read_reuse();
+                },
+            );
+            let receipt = receipt.expect("successful current-only state survives");
+            assert!(
+                receipt.admitted().is_none(),
+                "{owner:?}: explicit reuse refusal"
+            );
+            assert_eq!(state, vec![2], "{owner:?}: current request needs its state");
+            let (_, later) = capture_query_reads(&analyzer, || receipt.replay(&analyzer));
+            assert!(
+                later.reuse_refused(),
+                "{owner:?}: a later consumer must refuse"
+            );
+            state.clear();
             let (answer, receipt) = capture_mutable_memo_reads(
                 owner,
                 &analyzer,
@@ -1213,7 +1481,7 @@ mod memo_read_tests {
             let receipt = receipt.expect("complete fill admitted");
             for _ in 0..2 {
                 let hit = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
-                replay_memo_reads(&receipt, &analyzer);
+                receipt.replay(&analyzer);
                 assert!(hit.captured_read_incompleteness().is_empty(), "{owner:?}");
                 assert_eq!(state, vec![3]);
             }
@@ -1222,7 +1490,7 @@ mod memo_read_tests {
 
     #[test]
     #[hardwon(
-        "#11234: truncated producer heads must recompute instead of becoming stable memo hits"
+        "#11234: truncated producer heads must recompute instead of becoming stable memo hits; #11997: complete heads ignored explicit reuse refusal"
     )]
     fn weighted_partial_flow_memo_rejects_operational_heads() {
         use crate::analyzer::semantic::partial_flow::{PartialFlowOutcome, ProcedurePartialFlows};
@@ -1234,12 +1502,15 @@ mod memo_read_tests {
             sync::Arc,
         };
         let analyzer = MultiAnalyzer::default();
-        for outcome in [
-            PartialFlowOutcome::Truncated,
-            PartialFlowOutcome::ExceededBudget,
-            PartialFlowOutcome::Error,
-            PartialFlowOutcome::Complete,
+        for (outcome, refuse_reuse) in [
+            (PartialFlowOutcome::Truncated, false),
+            (PartialFlowOutcome::ExceededBudget, false),
+            (PartialFlowOutcome::Error, false),
+            (PartialFlowOutcome::Complete, false),
+            (PartialFlowOutcome::Complete, true),
         ] {
+            let retained = outcome == PartialFlowOutcome::Complete && !refuse_reuse;
+            let operational = outcome != PartialFlowOutcome::Complete;
             let memo = ReplayingMemo::new(RefCell::new(HashMap::new()));
             let fills = Cell::new(0);
             let derived = Cell::new(false);
@@ -1260,6 +1531,9 @@ mod memo_read_tests {
                         |_| {
                             fills.set(fills.get() + 1);
                             derived.set(true);
+                            if refuse_reuse {
+                                analyzer.refuse_read_reuse();
+                            }
                             Ok::<_, std::convert::Infallible>(Arc::new(ProcedurePartialFlows::new(
                                 outcome,
                                 Some("original producer cause".into()),
@@ -1289,30 +1563,16 @@ mod memo_read_tests {
                     Ok(entry) => Arc::clone(&entry),
                     Err(head) => head,
                 };
-                assert_eq!(derived.get(), outcome == PartialFlowOutcome::Complete);
+                assert_eq!(derived.get(), !operational);
                 assert_eq!(head.outcome, outcome);
                 assert_eq!(head.detail.as_deref(), Some("original producer cause"));
                 assert_eq!(
                     memo.account(|map| usize::from(!map.borrow().is_empty())) != 0,
-                    outcome == PartialFlowOutcome::Complete,
+                    retained,
                 );
             }
-            assert_eq!(
-                discards.get(),
-                if outcome == PartialFlowOutcome::Complete {
-                    0
-                } else {
-                    2
-                }
-            );
-            assert_eq!(
-                fills.get(),
-                if outcome == PartialFlowOutcome::Complete {
-                    1
-                } else {
-                    2
-                }
-            );
+            assert_eq!(discards.get(), if operational { 2 } else { 0 });
+            assert_eq!(fills.get(), if retained { 1 } else { 2 });
         }
     }
 

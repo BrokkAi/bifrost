@@ -397,6 +397,10 @@ fn diagnostic(
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }),
         CodeQueryDiagnosticCode::from_execution_reason(
             CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,

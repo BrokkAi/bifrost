@@ -508,9 +508,9 @@ pub fn evidence_binds_runtime_artifact(
                 .package
                 .as_ref()
                 .is_some_and(|package| package.name == artifact)
-                && evidence.artifact_sha256.as_deref() == Some(digest)
+                && evidence.contains_raw_sha256(digest)
         }
-        _ => evidence.package.is_none() && evidence.artifact_sha256.is_none(),
+        _ => evidence.package.is_none() && evidence.verified_raw_artifacts.is_empty(),
     }
 }
 

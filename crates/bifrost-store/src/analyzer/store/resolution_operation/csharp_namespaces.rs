@@ -96,6 +96,7 @@ impl PackagePlanRules for CSharpNamespaceRules<'_, '_, '_, '_> {
 }
 
 impl CSharpNamespaceRules<'_, '_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_lookups(
         &self,
         source: &CSharpNamespaceLevel,
@@ -338,6 +339,7 @@ pub fn probe_namespace_members(
         snapshot,
         &certified,
         &operation.ready.context_identities,
+        operation.ready.csharp_services()?,
     )?;
     let Some(callers) = units.placements(caller)? else {
         return Ok(None);

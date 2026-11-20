@@ -41,7 +41,9 @@ mod strict_positive_stop_probe {
             .is_none_or(|selection| result.selections.contains(&selection))
             && ARMED.replace(false)
         {
-            assert!(!session.scope_steps(usize::MAX));
+            session.mark_exceeded(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
+            );
             let BoundedResolution::Exceeded { limit, .. } = session.finish(()) else {
                 panic!("strict positive probe did not latch a stop");
             };
@@ -117,7 +119,9 @@ mod hierarchy_preparation_stop_probe {
     }
     pub(super) fn fire(session: &ResolutionSession) {
         if ARMED.replace(false) {
-            assert!(!session.scope_steps(usize::MAX));
+            session.mark_exceeded(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
+            );
             let BoundedResolution::Exceeded { limit, .. } = session.finish(()) else {
                 panic!("hierarchy preparation probe did not latch a stop");
             };
@@ -193,7 +197,9 @@ mod forward_proof_stop_probe {
 
     pub(super) fn fire_after_complete_embeddings(session: &ResolutionSession) {
         if ARMED.replace(false) {
-            assert!(!session.scope_steps(usize::MAX));
+            session.mark_exceeded(
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::TotalWork,
+            );
             let BoundedResolution::Exceeded { limit, .. } = session.finish(()) else {
                 panic!("forward proof probe did not latch a budget stop");
             };
@@ -524,6 +530,7 @@ enum GoAliasTerminal {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_hierarchy_method_identity(
         &self,
         context_id: i64,
@@ -567,6 +574,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Visit each finalized inverse selection while its proof is still current,
     /// before a later proof can consume the remaining allowance.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn visit_go_native_method_family(
         &self,
         context_id: i64,
@@ -1125,6 +1133,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .map(|result| result.outcome))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_receiver_lookup_nominations(
         &self,
         context_id: i64,
@@ -1473,6 +1482,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     /// Confirm inverse embedding nominations with the forward proof.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_embedding_subtypes(
         &self,
         context_id: i64,
@@ -1764,6 +1774,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Direct embedded descendants and interface implementers in the selected Go context.
     /// A structural subtype edge requires the value type (form 0) to satisfy
     /// the interface. Pointer-inclusive matching belongs to method families.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_direct_subtypes(
         &self,
         context_id: i64,
@@ -2036,6 +2047,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Follow a selected reference through aliases to a selected declaration
     /// or an exactly typed primitive terminal.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_alias_chain_terminal(
         &self,
         context_id: i64,
@@ -2105,6 +2117,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Scan once for a walk/context/role; callers retain this value and the
     /// read receipt captured around the call for other roots in that walk.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_forward_empty_interface_scan(
         &self,
         context_id: i64,
@@ -2278,6 +2291,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// unique mounted, ready, recovery-free Go publication. A caller may pass
     /// one exact package or ask for the whole selected context universe.
     /// `None` means certified; `Some` is explicit incomplete evidence.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_forward_package_census(
         &self,
         context_id: i64,
@@ -2403,6 +2417,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// The selected scan belongs to this walk, context, and role. The caller
     /// replays its receipt and polls the same session before reusing it.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_direct_supertypes_with_scan(
         &self,
         context_id: i64,
@@ -2778,6 +2793,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(answer)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn go_direct_embeddings(
         &self,
         context_id: i64,
@@ -3049,6 +3065,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Check the selected declaration and its source role without enumerating
     /// any other type. A missing selected declaration is not a negative proof
     /// about an incomplete workspace selection.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn go_type_supports(
         &self,
         context_id: i64,

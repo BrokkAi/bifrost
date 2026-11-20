@@ -166,6 +166,7 @@ pub struct TaintSetSegments {
     pub sinks: &'static str,
     pub sanitizers: &'static str,
     pub barriers: &'static str,
+    pub guard_barriers: &'static str,
     pub entry_points: &'static str,
     pub transforms: &'static str,
     pub external_models: &'static str,
@@ -177,6 +178,7 @@ pub const TAINT_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sinks: "sinks",
     sanitizers: "sanitizers",
     barriers: "barriers",
+    guard_barriers: "guard_barriers",
     entry_points: "entry_points",
     transforms: "transforms",
     external_models: "external_models",
@@ -188,6 +190,7 @@ pub const WITHOUT_FLOW_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sinks: "sinks",
     sanitizers: "without_flow/sanitizers",
     barriers: "without_flow/barriers",
+    guard_barriers: "without_flow/guard_barriers",
     entry_points: "without_flow/entry_points",
     transforms: "without_flow/transforms",
     external_models: "without_flow/external_models",
@@ -199,6 +202,7 @@ pub const FLOW_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sinks: "observations",
     sanitizers: "kills",
     barriers: "barriers",
+    guard_barriers: "guard_barriers",
     entry_points: "entry_points",
     transforms: "transforms",
     external_models: "external_models",
@@ -1584,6 +1588,7 @@ impl FindingSeverity {
 #[derive(Debug, Clone)]
 pub struct MatchPolicySpec {
     pub selector: PolicySelector,
+    pub guards: PolicyGuardConfiguration,
 }
 
 #[derive(Debug, Clone)]
@@ -1781,6 +1786,7 @@ pub struct TaintWithoutFlowSpec {
     pub sources: TaintEndpointSet<TaintSourceSpec>,
     pub sanitizers: TaintEndpointSet<TaintSanitizerSpec>,
     pub barriers: TaintEndpointSet<TaintBarrierSpec>,
+    pub guards: PolicyGuardConfiguration,
     pub transforms: TaintEndpointSet<TaintTransformSpec>,
     pub external_models: TaintEndpointSet<TaintExternalModelSpec>,
 }
@@ -1797,6 +1803,7 @@ impl TaintWithoutFlowSpec {
             sinks: TaintEndpointSet::default(),
             sanitizers: self.sanitizers.clone(),
             barriers: self.barriers.clone(),
+            guards: self.guards.clone(),
             entry_points: TaintEndpointSet::default(),
             transforms: self.transforms.clone(),
             external_models: self.external_models.clone(),
@@ -1818,6 +1825,7 @@ pub struct TaintPolicySpec {
     pub sinks: TaintEndpointSet<TaintSinkSpec>,
     pub sanitizers: TaintEndpointSet<TaintSanitizerSpec>,
     pub barriers: TaintEndpointSet<TaintBarrierSpec>,
+    pub guards: PolicyGuardConfiguration,
     pub entry_points: TaintEndpointSet<TaintEntryPointSpec>,
     pub transforms: TaintEndpointSet<TaintTransformSpec>,
     pub external_models: TaintEndpointSet<TaintExternalModelSpec>,
@@ -2128,6 +2136,101 @@ pub struct TaintSinkSpec {
 pub struct TaintBarrierSpec {
     pub id: TaintEntryId,
     pub value_type: ValueTypePredicate,
+}
+
+/// Common authored guard configuration for match and taint analyses.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyGuardConfiguration {
+    pub barriers: Vec<TaintGuardBarrierSpec>,
+}
+
+/// A policy-owned branch guard. The predicate selects evidence; the shared
+/// binding proof establishes which exact reaching definition the edge cleans.
+#[derive(Debug, Clone)]
+pub struct TaintGuardBarrierSpec {
+    pub id: TaintEntryId,
+    pub predicate: TaintGuardPredicate,
+    pub clean_when: bool,
+    pub removes: Vec<TaintLabel>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TaintGuardPredicate {
+    Call {
+        selector: PolicySelector,
+        operand: TaintSanitizerOperand,
+        requires: Vec<TaintSanitizerRequirement>,
+    },
+    Comparison(TaintComparisonGuardSpec),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaintComparisonGuardSpec {
+    pub relation: TaintGuardRelation,
+    pub operand: TaintGuardOperand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintGuardRelation {
+    Equality,
+    Inequality,
+    Ordering,
+}
+
+impl TaintGuardRelation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Equality => "equality",
+            Self::Inequality => "inequality",
+            Self::Ordering => "ordering",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintGuardOperand {
+    Either,
+    Lesser,
+    Greater,
+}
+
+impl TaintGuardOperand {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Either => "either",
+            Self::Lesser => "lesser",
+            Self::Greater => "greater",
+        }
+    }
+}
+
+pub(crate) fn guard_barrier_selector_path(segment: &str, id: &TaintEntryId) -> String {
+    format!(
+        "/analysis/{segment}/{}/predicate/selector",
+        json_pointer_segment(id.as_str())
+    )
+}
+
+impl TaintGuardBarrierSpec {
+    pub(crate) fn selectors(&self, segments: TaintSetSegments) -> Vec<(String, &PolicySelector)> {
+        let TaintGuardPredicate::Call {
+            selector, requires, ..
+        } = &self.predicate
+        else {
+            return Vec::new();
+        };
+        let base = guard_barrier_selector_path(segments.guard_barriers, &self.id);
+        let mut selectors = vec![(base.clone(), selector)];
+        selectors.extend(requires.iter().enumerate().filter_map(|(index, item)| {
+            match &item.condition {
+                TaintSanitizerCondition::ResultOf(selector) => {
+                    Some((sanitizer_requirement_selector_path(&base, index), selector))
+                }
+                _ => None,
+            }
+        }));
+        selectors
+    }
 }
 
 /// A sanitizer either cleans a transferred value or proves a carrier clean on a branch.
@@ -2442,7 +2545,15 @@ impl InconclusivePolicy {
 }
 
 #[derive(Debug, Clone)]
+pub struct TypestateTransferSpec {
+    pub id: TypestateEventId,
+    pub selector: PolicySelector,
+    pub from: TypestateCallBinding,
+}
+
+#[derive(Debug, Clone)]
 pub struct TypestateAutomatonSpec {
+    pub transfers: Vec<TypestateTransferSpec>,
     pub event_set: Option<TypestateEventSetSpec>,
     pub states: Vec<TypestateStateId>,
     pub initial: TypestateStateId,
@@ -3434,6 +3545,15 @@ pub struct PolicySelectorPath(Box<str>);
 pub(crate) fn typestate_event_selector_path(id: &TypestateEventId) -> String {
     format!(
         "/analysis/automaton/events/{}/selector",
+        json_pointer_segment(id.as_str())
+    )
+}
+
+/// The authored calls record owns the selector, including file references.
+/// Keep its lookup key identical in decoding, loading, and loaded models.
+pub(crate) fn typestate_transfer_selector_path(id: &TypestateEventId) -> String {
+    format!(
+        "/analysis/automaton/transfers/{}/calls/selector",
         json_pointer_segment(id.as_str())
     )
 }

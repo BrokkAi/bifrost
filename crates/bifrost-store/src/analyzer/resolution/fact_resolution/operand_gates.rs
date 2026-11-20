@@ -770,14 +770,16 @@ mod tests {
                 service.typed.supertypes_by_definition.insert(
                     source,
                     vec![
-                        LoweredSourceSupertypeProperty::new(
-                            source,
-                            reference,
-                            frontier,
-                            ResolutionSupertypeKind::Superclass,
-                            0,
-                        )
-                        .into(),
+                        crate::analyzer::resolution::LoweredSupertypeProperty::from_source(
+                            LoweredSourceSupertypeProperty::new(
+                                source,
+                                reference,
+                                frontier,
+                                ResolutionSupertypeKind::Superclass,
+                                0,
+                            ),
+                            Language::Java,
+                        ),
                     ],
                 );
                 states.insert(
@@ -829,14 +831,16 @@ mod tests {
         service.typed.supertypes_by_definition.insert(
             source,
             vec![
-                LoweredSourceSupertypeProperty::new(
-                    source,
-                    reference,
-                    frontier,
-                    ResolutionSupertypeKind::Superclass,
-                    0,
-                )
-                .into(),
+                crate::analyzer::resolution::LoweredSupertypeProperty::from_source(
+                    LoweredSourceSupertypeProperty::new(
+                        source,
+                        reference,
+                        frontier,
+                        ResolutionSupertypeKind::Superclass,
+                        0,
+                    ),
+                    Language::Java,
+                ),
             ],
         );
         let states = [(

@@ -44,6 +44,21 @@ impl DrainedStderr {
         String::from_utf8_lossy(&self.drained.lock().expect("stderr capture lock poisoned"))
             .into_owned()
     }
+
+    pub fn wait_for(&self, needle: &str, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let text = self.text_so_far();
+            if text.contains(needle) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "timed out waiting for stderr {needle:?}; full stderr:\n{}",
+            self.text_so_far()
+        );
+    }
 }
 
 impl Read for DrainedStderr {
@@ -89,6 +104,57 @@ pub fn round_trip_json_line(
     read_line(reader, stderr)
 }
 
+/// Functional tests retry initial preparation explicitly; contract tests use
+/// round_trip_json_line to observe the first response unchanged.
+pub fn round_trip_when_ready(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    payload: Value,
+) -> Value {
+    round_trip_when_ready_with_watchdog(
+        stdin,
+        reader,
+        stderr,
+        payload,
+        std::time::Duration::from_secs(120),
+    )
+}
+
+/// [`round_trip_when_ready`] with a caller-supplied watchdog for setup that
+/// deliberately builds a large fixture. The default stays a hang detector for
+/// ordinary fixtures.
+pub fn round_trip_when_ready_with_watchdog(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    payload: Value,
+    watchdog: std::time::Duration,
+) -> Value {
+    let deadline = std::time::Instant::now() + watchdog;
+    loop {
+        let response = round_trip_json_line(stdin, reader, stderr, payload.clone());
+        let incomplete = &response["result"]["_meta"]["io.bifrost/incomplete"];
+        let preparing = incomplete["stage"] == "workspace_readiness"
+            && incomplete["completion"]["reasons"]
+                .as_array()
+                .is_some_and(|reasons| {
+                    reasons.iter().any(|reason| reason == "workspace_not_ready")
+                });
+        let probing = payload["params"]["name"] == "get_active_workspace"
+            && response["result"]["structuredContent"]["analyzer_ready"] == false
+            && response["result"]["structuredContent"]["workspace_build"]["status"] != "failed";
+        if !preparing && !probing {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace never became ready within {watchdog:?}: {response}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub fn tool_call_request(id: i64, name: &str, arguments: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -132,7 +198,7 @@ pub fn call_mcp_tool(
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
 
-    round_trip_json_line(
+    round_trip_when_ready(
         &mut stdin,
         &mut reader,
         &mut stderr,

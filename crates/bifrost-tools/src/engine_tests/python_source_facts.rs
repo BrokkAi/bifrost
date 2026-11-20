@@ -155,6 +155,10 @@ mod python_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn python_return_rows_have_indexed_access_exact_accounting_and_immutable_links() {
         let fixture = InlineTestProject::with_language(Language::Python)
             .file("source.py", SOURCE)

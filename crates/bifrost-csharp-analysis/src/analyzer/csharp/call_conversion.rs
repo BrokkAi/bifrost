@@ -34,6 +34,27 @@ pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: CSharpCallArgumentConversionP
 pub(crate) struct CSharpCallArgumentConversionProver;
 
 impl CallArgumentConversionProver for CSharpCallArgumentConversionProver {
+    fn validate_owner(&self, owner: Node<'_>) -> Result<(), ConversionUnknown> {
+        if let Some(parameters) =
+            brokk_bifrost_csharp::declarations::csharp_parameter_list_node(owner)
+                .filter(|parameters| parameters.kind() == "parameter_list")
+        {
+            let formals = brokk_bifrost_csharp::declarations::csharp_parameter_syntax(
+                parameters,
+                &mut || true,
+            )
+            .ok_or(ConversionUnknown::UnresolvedSignature)?;
+            if formals.iter().any(|formal| {
+                formal.params && formal.type_node.is_none_or(|ty| ty.kind() != "array_type")
+            }) {
+                // Collection params still have Rest input ports, but array
+                // invocation/conversion proofs do not describe their construction.
+                return Err(ConversionUnknown::UnsupportedConversion);
+            }
+        }
+        Ok(())
+    }
+
     fn prove_argument(
         &self,
         _analyzer: &dyn IAnalyzer,
@@ -51,8 +72,7 @@ impl CallArgumentConversionProver for CSharpCallArgumentConversionProver {
             return Err(ConversionUnknown::UnsupportedLanguage);
         }
         let source_type = actual_type(actual, source)?;
-        let formal_type = formal
-            .child_by_field_name("type")
+        let formal_type = brokk_bifrost_csharp::declarations::csharp_parameter_type_node(formal)
             .ok_or(ConversionUnknown::UnresolvedSignature)
             .and_then(|node| written_type(node, formal_source))?;
         classify(source_type, formal_type)
@@ -134,6 +154,68 @@ impl CallArgumentConversionProver for CSharpCallArgumentConversionProver {
         match classify(source_type, formal_type) {
             Ok(proof) => ModelArgumentApplicability::Applicable(Box::new(proof)),
             Err(reason) => ModelArgumentApplicability::Unknown(reason),
+        }
+    }
+
+    fn select_model_invocation(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        actuals: &[Node<'_>],
+        source: &str,
+        signatures: &[brokk_bifrost_analysis::analyzer::semantic_model::Signature],
+    ) -> Option<
+        Result<
+            brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelInvocationSelection,
+            ConversionUnknown,
+        >,
+    > {
+        // C# chooses normal/expanded form per member, not by Java's whole-set
+        // phases. This bounded hook certifies only a complete singleton family;
+        // the shared selector retains ambiguous/expanded/unknown candidates.
+        let [signature] = signatures else {
+            return None;
+        };
+        let last = signature
+            .parameters
+            .last()
+            .filter(|formal| formal.variadic)?;
+        if !signature.type_parameters.is_empty()
+            || signature
+                .parameters
+                .iter()
+                .any(|formal| !formal.passing_mode.accepts_positional())
+            || signature.parameters[..signature.parameters.len() - 1]
+                .iter()
+                .any(|formal| formal.variadic)
+        {
+            return None;
+        }
+        if !matches!(last.r#type, TypeRef::Array { .. }) {
+            return None;
+        }
+        if signature.parameters.len() != actuals.len() {
+            return None;
+        }
+        let types = signature
+            .parameters
+            .iter()
+            .map(|formal| model_type(&formal.r#type))
+            .collect::<Result<Vec<_>, _>>();
+        let normal = types.and_then(|types| prove_normal_array(actuals, source, &types));
+        match normal {
+            Ok(()) => Some(Ok((
+                0,
+                signature
+                    .parameters
+                    .iter()
+                    .map(|formal| formal.r#type.clone())
+                    .collect(),
+                Some(
+                    brokk_bifrost_analysis::analyzer::semantic::call_binding::FixedArrayInvocation,
+                ),
+            ))),
+            Err(_) => None,
         }
     }
 
@@ -302,9 +384,15 @@ fn written_type(node: Node<'_>, source: &str) -> Result<CSharpConversionType, Co
 }
 
 fn actual_type(node: Node<'_>, source: &str) -> Result<CSharpConversionType, ConversionUnknown> {
+    if node.has_error() || node.is_missing() {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    }
     match node.kind() {
         "character_literal" => Ok(CSharpConversionType::Primitive(CSharpPrimitive::Char)),
-        "integer_literal" => Ok(CSharpConversionType::Primitive(CSharpPrimitive::Int32)),
+        "integer_literal" => integer_literal_type(
+            node.utf8_text(source.as_bytes())
+                .map_err(|_| ConversionUnknown::UnsupportedExpression)?,
+        ),
         "string_literal"
         | "verbatim_string_literal"
         | "raw_string_literal"
@@ -314,6 +402,32 @@ fn actual_type(node: Node<'_>, source: &str) -> Result<CSharpConversionType, Con
         "identifier" => parameter_type(node, source),
         _ => Err(ConversionUnknown::UnsupportedExpression),
     }
+}
+
+// The AST has already selected the literal. Classify its value and suffix,
+// without interpreting surrounding source syntax (C# 6.4.5.3).
+fn integer_literal_type(text: &str) -> Result<CSharpConversionType, ConversionUnknown> {
+    let lower = text.to_ascii_lowercase();
+    let digits_end = lower.trim_end_matches(['u', 'l']).len();
+    let (digits, suffix) = lower.split_at(digits_end);
+    let digits = digits.replace('_', "");
+    let (digits, radix) = if let Some(value) = digits.strip_prefix("0x") {
+        (value, 16)
+    } else if let Some(value) = digits.strip_prefix("0b") {
+        (value, 2)
+    } else {
+        (digits.as_str(), 10)
+    };
+    let value =
+        u64::from_str_radix(digits, radix).map_err(|_| ConversionUnknown::UnsupportedExpression)?;
+    let name = match suffix {
+        "" if value <= i32::MAX as u64 => "int",
+        "" | "u" if value <= u32::MAX as u64 => "uint",
+        "" | "l" if value <= i64::MAX as u64 => "long",
+        "" | "u" | "l" | "ul" | "lu" => "ulong",
+        _ => return Err(ConversionUnknown::UnsupportedExpression),
+    };
+    Ok(named_type(name))
 }
 
 fn parameter_type(node: Node<'_>, source: &str) -> Result<CSharpConversionType, ConversionUnknown> {
@@ -327,9 +441,9 @@ fn parameter_type(node: Node<'_>, source: &str) -> Result<CSharpConversionType, 
         {
             for (slot, declaration) in parameters {
                 if slot.names.iter().any(|parameter| parameter == name) {
-                    let declared_type = declaration
-                        .child_by_field_name("type")
-                        .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+                    let declared_type =
+                        brokk_bifrost_csharp::declarations::csharp_parameter_type_node(declaration)
+                            .ok_or(ConversionUnknown::UnresolvedSourceType)?;
                     return written_type(declared_type, source);
                 }
             }
@@ -337,4 +451,91 @@ fn parameter_type(node: Node<'_>, source: &str) -> Result<CSharpConversionType, 
         owner = candidate.parent();
     }
     Err(ConversionUnknown::UnresolvedSourceType)
+}
+
+/// Normal-form proof is intentionally narrower than C# applicability: every
+/// conversion must be supported, including identity of the final array value.
+fn prove_normal_array(
+    actuals: &[Node<'_>],
+    source: &str,
+    types: &[CSharpConversionType],
+) -> Result<(), ConversionUnknown> {
+    if actuals.len() != types.len() {
+        return Err(ConversionUnknown::SignatureApplicability);
+    }
+    let Some(CSharpConversionType::Array(_)) = types.last() else {
+        return Err(ConversionUnknown::UnsupportedConversion);
+    };
+    for (actual, target) in actuals.iter().zip(types) {
+        classify(actual_type(*actual, source)?, target.clone())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn source_normal_array_invocation(
+    call: Node<'_>,
+    source: &str,
+    declaration: Node<'_>,
+    formal_source: &str,
+) -> Option<brokk_bifrost_analysis::analyzer::semantic::call_binding::FixedArrayInvocation> {
+    let parameters = brokk_bifrost_csharp::declarations::csharp_parameter_list_node(declaration)?;
+    let formals =
+        brokk_bifrost_csharp::declarations::csharp_parameter_syntax(parameters, &mut || true)?;
+    if !formals.last()?.params {
+        return None;
+    }
+    // Generic substitution and ref/out/in passing are outside this proof.
+    let mut owner = Some(declaration);
+    while let Some(node) = owner {
+        if node.child_by_field_name("type_parameters").is_some() {
+            return None;
+        }
+        owner = node.parent();
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut actuals = Vec::new();
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if argument.kind() == "comment" {
+            continue;
+        }
+        if argument.kind() != "argument"
+            || argument.has_error()
+            || argument.is_missing()
+            || argument.child_by_field_name("name").is_some()
+            || argument
+                .children(&mut argument.walk())
+                .any(|child| matches!(child.kind(), "ref" | "out" | "in"))
+        {
+            return None;
+        }
+        let expressions = argument
+            .named_children(&mut argument.walk())
+            .filter(|node| node.kind() != "comment")
+            .collect::<Vec<_>>();
+        let [expression] = expressions.as_slice() else {
+            return None;
+        };
+        actuals.push(*expression);
+    }
+    let types = formals
+        .iter()
+        .map(|formal| {
+            if formal
+                .anchor
+                .children(&mut formal.anchor.walk())
+                .any(|node| matches!(node.kind(), "ref" | "out" | "in"))
+            {
+                return Err(ConversionUnknown::UnsupportedConversion);
+            }
+            written_type(
+                formal
+                    .type_node
+                    .ok_or(ConversionUnknown::UnresolvedSignature)?,
+                formal_source,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    prove_normal_array(&actuals, source, &types).ok()?;
+    Some(brokk_bifrost_analysis::analyzer::semantic::call_binding::FixedArrayInvocation)
 }

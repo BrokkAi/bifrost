@@ -25,7 +25,7 @@ fn authored_policy_source_changes_verification_input_without_changing_semantics(
             None,
         ),
         configuration: StableDigest::sha256("configuration"),
-        models: StableDigest::sha256(NO_ACTIVE_MODELS),
+        models: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(None),
         epoch: policy_substrate_epoch(StableDigest::sha256("test-lowering")),
     };
     assert_eq!(
@@ -103,7 +103,7 @@ fn distinct_binding_partitions_have_distinct_persisted_keys() {
             None,
         ),
         configuration: StableDigest::sha256("configuration"),
-        models: StableDigest::sha256(NO_ACTIVE_MODELS),
+        models: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(None),
         epoch: policy_substrate_epoch(StableDigest::sha256("test-lowering")),
     };
     let blob = Oid::from_str("0000000000000000000000000000000000000000").expect("blob id");

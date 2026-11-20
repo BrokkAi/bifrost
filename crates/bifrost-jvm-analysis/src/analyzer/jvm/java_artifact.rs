@@ -7,6 +7,9 @@ use crate::analyzer::jvm::take_artifact_record as take_record;
 use crate::analyzer::jvm::visibility_from_java_access_flags;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_semantic::analyzer::semantic_model::model::{
+    GenericTraitBound, ImplementedTraitFact,
+};
 #[cfg(test)]
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
 
@@ -103,6 +106,7 @@ pub(crate) struct JavaApiType {
     pub(crate) visibility: Visibility,
     is_abstract: bool,
     is_sealed: bool,
+    is_final: Option<bool>,
     callable_surface_complete: bool,
     jvm_inventory: Option<Box<brokk_bifrost_analysis::analyzer::semantic_model::JvmOwnerInventory>>,
     type_parameters: Vec<String>,
@@ -728,15 +732,22 @@ fn finish_production(
             callable_values: None,
         }]
     };
-    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
-        request,
-        artifact_sha256,
-        "bifrost-java-jar",
-        "java",
-        diagnostics,
-        suppressed_diagnostics,
-        shards,
-    )
+    let mut production =
+        brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
+            request,
+            artifact_sha256,
+            "bifrost-java-jar",
+            "java",
+            diagnostics,
+            suppressed_diagnostics,
+            shards,
+        );
+    if let Some(pack) = &mut production.pack {
+        pack.schema_version =
+            brokk_bifrost_semantic::analyzer::semantic_model::CLASS_FINALITY_MIN_SCHEMA_VERSION;
+        pack.producer.version = super::jvm_pack_producer_version().to_owned();
+    }
+    production
 }
 
 pub(crate) fn java_api_facts(
@@ -771,6 +782,7 @@ pub(crate) fn java_api_facts(
             .expect("parsed Java type receives an id")
             .clone();
         types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -786,6 +798,7 @@ pub(crate) fn java_api_facts(
             type_kind: declaration.type_kind,
             visibility: declaration.visibility,
             is_abstract: declaration.is_abstract,
+            is_final: declaration.is_final,
             is_sealed: declaration.is_sealed,
             callable_surface_complete: declaration.callable_surface_complete
                 && declaration.members.len()
@@ -864,6 +877,8 @@ pub(crate) fn java_api_facts(
                 signature.parameters[0].name = Some(formal_name.to_owned());
             }
             let fact = MemberFact {
+                target_independent: None,
+                inherent_impl_self_arguments: None,
                 implemented_trait: None,
                 self_form: None,
                 non_overridable: member.non_overridable,
@@ -1134,7 +1149,16 @@ pub(crate) fn source_api_types(
                 visibility,
                 is_abstract: modifiers.contains(&"abstract")
                     || matches!(type_kind, TypeKind::Interface | TypeKind::Annotation),
-                is_sealed: modifiers.contains(&"final") || modifiers.contains(&"sealed"),
+                is_final: if node.has_error() || node.is_error() || node.is_missing() {
+                    None
+                } else {
+                    match type_kind {
+                        TypeKind::Class => Some(modifiers.contains(&"final")),
+                        TypeKind::Record => Some(true),
+                        _ => None,
+                    }
+                },
+                is_sealed: modifiers.contains(&"sealed"),
                 callable_surface_complete,
                 jvm_inventory: None,
                 type_parameters,
@@ -1326,6 +1350,7 @@ fn source_members(
                         && !modifiers.contains(&"final"),
                     callable_family_complete: false,
                     signature: Some(Signature {
+                        bounds: None,
                         type_parameters,
                         parameters,
                         returns,
@@ -1392,6 +1417,7 @@ fn source_members(
                         is_virtual: false,
                         callable_family_complete: false,
                         signature: Some(Signature {
+                            bounds: None,
                             type_parameters: Vec::new(),
                             parameters: Vec::new(),
                             returns: Some(field_type.clone()),
@@ -1550,6 +1576,7 @@ fn source_members(
                 is_virtual: false,
                 callable_family_complete: false,
                 signature: Some(Signature {
+                    bounds: None,
                     type_parameters: Vec::new(),
                     parameters: Vec::new(),
                     returns: None,
@@ -1585,6 +1612,7 @@ fn generated_java_member(
         is_virtual: !is_static && member_kind == MemberKind::Method,
         callable_family_complete: false,
         signature: Some(Signature {
+            bounds: None,
             type_parameters: Vec::new(),
             parameters,
             returns,
@@ -2287,6 +2315,7 @@ pub(crate) struct JavaClassSurface {
     pub(crate) visibility: Visibility,
     pub(crate) is_abstract: bool,
     pub(crate) is_sealed: bool,
+    pub(crate) is_final: Option<bool>,
     pub(crate) type_parameters: Vec<String>,
     pub(crate) hierarchy: Vec<HierarchyFact>,
     pub(crate) jvm_inventory:
@@ -2414,6 +2443,7 @@ pub(crate) fn class_surface(
                 type_kind: declaration.type_kind,
                 visibility: declaration.visibility,
                 is_abstract: declaration.is_abstract,
+                is_final: declaration.is_final,
                 is_sealed: declaration.is_sealed,
                 type_parameters: declaration.type_parameters,
                 hierarchy: declaration.hierarchy,
@@ -2462,6 +2492,7 @@ pub(crate) fn class_surface_facts(
         type_kind: surface.type_kind,
         visibility: surface.visibility,
         is_abstract: surface.is_abstract,
+        is_final: surface.is_final,
         is_sealed: surface.is_sealed,
         callable_surface_complete: false,
         jvm_inventory: surface.jvm_inventory,
@@ -2733,7 +2764,7 @@ impl EnclosingScopeResolver {
                     let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
                     cursor.parse_method_signature().filter(|_| cursor.at_end())
                 })
-                .map(|(parameters, _, _)| parameters)
+                .map(|(parameters, _, _, _)| parameters)
                 .unwrap_or_default();
             if !is_static && parameters.is_empty() {
                 continue;
@@ -2775,6 +2806,16 @@ fn class_api_type(
         return ClassEntryResult::Invalid;
     };
     let flags = class_file.access_flags();
+    // #10572: impossible class-finality claims must not enter generated packs.
+    let has_permitted_subclasses = class_file
+        .attributes()
+        .iter()
+        .any(|attribute| matches!(attribute, Attribute::PermittedSubclasses { .. }));
+    if flags.contains(ClassFlags::ACC_FINAL)
+        && (has_permitted_subclasses || flags.contains(ClassFlags::ACC_INTERFACE))
+    {
+        return ClassEntryResult::Invalid;
+    }
     if flags.contains(ClassFlags::ACC_MODULE) {
         return ClassEntryResult::Excluded;
     }
@@ -3014,11 +3055,8 @@ fn class_api_type(
         type_kind,
         visibility,
         is_abstract: flags.contains(ClassFlags::ACC_ABSTRACT),
-        is_sealed: flags.contains(ClassFlags::ACC_FINAL)
-            || class_file
-                .attributes()
-                .iter()
-                .any(|attribute| matches!(attribute, Attribute::PermittedSubclasses { .. })),
+        is_final: Some(flags.contains(ClassFlags::ACC_FINAL)),
+        is_sealed: has_permitted_subclasses,
         callable_surface_complete: false,
         jvm_inventory,
         type_parameters,
@@ -3059,7 +3097,7 @@ fn erased_class_hierarchy(class_file: &ClassFile) -> Vec<HierarchyFact> {
     hierarchy
 }
 
-fn unresolved_type_variable<'a>(
+pub(super) fn unresolved_type_variable<'a>(
     types: impl IntoIterator<Item = &'a TypeRef>,
     scopes: &[&[String]],
 ) -> Option<&'a str> {
@@ -3207,6 +3245,7 @@ fn class_field_member(
         is_virtual: false,
         callable_family_complete: false,
         signature: Some(Signature {
+            bounds: None,
             type_parameters: Vec::new(),
             parameters: Vec::new(),
             returns: Some(field_type),
@@ -3232,6 +3271,34 @@ pub(crate) fn erased_class_method_parameters(
     let mut cursor = SignatureCursor::new(descriptor.as_bytes(), max_depth);
     let (parameters, _) = cursor.parse_method_descriptor()?;
     cursor.at_end().then_some(parameters)
+}
+
+/// One predicate per declared conjunct, in declared order: `T extends A & B`
+/// gives `T: A` and `T: B`. Object conjuncts were already omitted.
+fn method_bound_predicates(
+    type_parameters: &[String],
+    bounds: Vec<Vec<TypeRef>>,
+) -> Vec<GenericTraitBound> {
+    debug_assert_eq!(type_parameters.len(), bounds.len());
+    type_parameters
+        .iter()
+        .zip(bounds)
+        .flat_map(|(name, bounds)| {
+            bounds.into_iter().map(move |trait_type| GenericTraitBound {
+                subject: TypeRef::TypeParameter { name: name.clone() },
+                bound: ImplementedTraitFact {
+                    rust_stability: None,
+                    trait_type,
+                    is_negative: false,
+                    type_parameters: Vec::new(),
+                    self_pattern: None,
+                    bounds: Vec::new(),
+                    associated_types: Vec::new(),
+                },
+                maybe: false,
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3279,7 +3346,7 @@ fn class_method_member(
             let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
             cursor.parse_method_signature().filter(|_| cursor.at_end())
         })
-        .filter(|(type_parameters, parameters, returns)| {
+        .filter(|(type_parameters, _, parameters, returns)| {
             if let Some(parameter) = unresolved_type_variable(
                 parameters.iter().chain(returns),
                 &[owner_type_parameters, type_parameters],
@@ -3297,25 +3364,39 @@ fn class_method_member(
                 true
             }
         });
-    let (type_parameters, mut parameter_types, mut returns) = match generic {
-        Some(value) => value,
-        None => {
-            let mut cursor = SignatureCursor::new(descriptor.as_bytes(), max_depth);
-            let Some((parameters, returns)) =
-                cursor.parse_method_descriptor().filter(|_| cursor.at_end())
-            else {
-                callable_families.mark_name_incomplete(binary_name);
-                diagnostics.warning_for_declaration(
-                    super::producer_codes::JAVA_CLASS_UNSUPPORTED_METHOD_SIGNATURE.code,
-                    Some(class_entry.to_owned()),
-                    format!("{owner_name}.{binary_name}"),
-                    format!("could not decode method signature for {owner_name}.{binary_name}"),
-                );
-                return None;
-            };
-            (Vec::new(), parameters, returns)
-        }
-    };
+    let (type_parameters, mut type_parameter_bounds, mut parameter_types, mut returns) =
+        match generic {
+            Some(value) => value,
+            None => {
+                let mut cursor = SignatureCursor::new(descriptor.as_bytes(), max_depth);
+                let Some((parameters, returns)) =
+                    cursor.parse_method_descriptor().filter(|_| cursor.at_end())
+                else {
+                    callable_families.mark_name_incomplete(binary_name);
+                    diagnostics.warning_for_declaration(
+                        super::producer_codes::JAVA_CLASS_UNSUPPORTED_METHOD_SIGNATURE.code,
+                        Some(class_entry.to_owned()),
+                        format!("{owner_name}.{binary_name}"),
+                        format!("could not decode method signature for {owner_name}.{binary_name}"),
+                    );
+                    return None;
+                };
+                (Vec::new(), Vec::new(), parameters, returns)
+            }
+        };
+    // A bound can name a type variable that neither the owner nor the method
+    // declares, for example `<U extends T>` in a non-static inner class whose
+    // enclosing scope is not recorded. The pack validator rejects such a bound
+    // and with it the whole pack, so the bounds of this method become unknown
+    // (the fail-closed state) while its signature is kept.
+    let bounds_known = unresolved_type_variable(
+        type_parameter_bounds.iter().flatten(),
+        &[owner_type_parameters, type_parameters.as_slice()],
+    )
+    .is_none();
+    for bound in type_parameter_bounds.iter_mut().flatten() {
+        normalize_binary_type_ref(bound, class_file);
+    }
     for parameter in &mut parameter_types {
         normalize_binary_type_ref(parameter, class_file);
     }
@@ -3372,6 +3453,8 @@ fn class_method_member(
             && !flags.contains(MethodFlags::ACC_FINAL),
         callable_family_complete: false,
         signature: Some(Signature {
+            bounds: (!type_parameters.is_empty() && bounds_known)
+                .then(|| method_bound_predicates(&type_parameters, type_parameter_bounds)),
             type_parameters,
             parameters,
             returns,
@@ -3534,6 +3617,13 @@ fn method_visibility(flags: &MethodFlags) -> Visibility {
     )
 }
 
+type ParsedMethodSignature = (
+    Vec<String>,
+    Vec<Vec<TypeRef>>,
+    Vec<TypeRef>,
+    Option<TypeRef>,
+);
+
 struct SignatureCursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -3572,7 +3662,7 @@ impl<'a> SignatureCursor<'a> {
     }
 
     fn parse_class_signature(&mut self) -> Option<(Vec<String>, Vec<HierarchyFact>)> {
-        let type_parameters = self.parse_type_parameters(0)?;
+        let (type_parameters, _) = self.parse_type_parameters(0)?;
         let superclass = self.parse_type(0)?;
         let mut hierarchy = Vec::new();
         if !matches!(&superclass, TypeRef::Named { name, .. } if name == "java.lang.Object") {
@@ -3592,13 +3682,13 @@ impl<'a> SignatureCursor<'a> {
         Some((type_parameters, hierarchy))
     }
 
-    fn parse_method_signature(&mut self) -> Option<(Vec<String>, Vec<TypeRef>, Option<TypeRef>)> {
-        let type_parameters = self.parse_type_parameters(0)?;
+    fn parse_method_signature(&mut self) -> Option<ParsedMethodSignature> {
+        let (type_parameters, bounds) = self.parse_type_parameters(0)?;
         let (parameters, returns) = self.parse_method_descriptor()?;
         while self.consume(b'^') {
             self.parse_type(0)?;
         }
-        Some((type_parameters, parameters, returns))
+        Some((type_parameters, bounds, parameters, returns))
     }
 
     fn parse_method_descriptor(&mut self) -> Option<(Vec<TypeRef>, Option<TypeRef>)> {
@@ -3618,14 +3708,15 @@ impl<'a> SignatureCursor<'a> {
         Some((parameters, returns))
     }
 
-    fn parse_type_parameters(&mut self, depth: usize) -> Option<Vec<String>> {
+    fn parse_type_parameters(&mut self, depth: usize) -> Option<(Vec<String>, Vec<Vec<TypeRef>>)> {
         if !self.consume(b'<') {
-            return Some(Vec::new());
+            return Some((Vec::new(), Vec::new()));
         }
         if depth >= self.max_depth {
             return None;
         }
         let mut parameters = Vec::new();
+        let mut bounds = Vec::new();
         while self.peek()? != b'>' {
             let start = self.position;
             while self.peek()? != b':' {
@@ -3639,15 +3730,23 @@ impl<'a> SignatureCursor<'a> {
             }
             parameters.push(name);
             self.take();
+            let mut parameter_bounds = Vec::new();
             if self.peek()? != b':' {
-                self.parse_type(depth + 1)?;
+                let bound = self.parse_type(depth + 1)?;
+                if !matches!(&bound, TypeRef::Named { name, .. } if name == "java.lang.Object") {
+                    parameter_bounds.push(bound);
+                }
             }
             while self.consume(b':') {
-                self.parse_type(depth + 1)?;
+                let bound = self.parse_type(depth + 1)?;
+                if !matches!(&bound, TypeRef::Named { name, .. } if name == "java.lang.Object") {
+                    parameter_bounds.push(bound);
+                }
             }
+            bounds.push(parameter_bounds);
         }
         self.take();
-        Some(parameters)
+        Some((parameters, bounds))
     }
 
     fn parse_type(&mut self, depth: usize) -> Option<TypeRef> {
@@ -3775,6 +3874,213 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    #[hardwon("#10572: JVM class finality was conflated with restricted sealed inheritance")]
+    fn class_finality_tracks_class_flags_and_attributes_across_surface_and_pack() {
+        use crate::analyzer::jvm::external::{TestClassAccess, test_class_file_bytes_with_access};
+        use brokk_bifrost_semantic::analyzer::semantic_model::{
+            CompilerOptions, DecodeLimits, compile_pack, decode_shard_for_manifest,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("finality.jar");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+        let limits = ArtifactProducerLimits::default();
+        let mut expected = Vec::new();
+        for (name, flags, attribute, kind, sealed, finality) in [
+            ("Open", 0x0021, None, TypeKind::Class, false, false),
+            ("Final", 0x0031, None, TypeKind::Class, false, true),
+            (
+                "Sealed",
+                0x0021,
+                Some("PermittedSubclasses"),
+                TypeKind::Class,
+                true,
+                false,
+            ),
+            (
+                "Record",
+                0x0031,
+                Some("Record"),
+                TypeKind::Record,
+                false,
+                true,
+            ),
+            ("Enum", 0x4031, None, TypeKind::Enum, false, true),
+            (
+                "EnumBodies",
+                0x4021,
+                Some("PermittedSubclasses"),
+                TypeKind::Enum,
+                true,
+                false,
+            ),
+        ] {
+            let internal = format!("fixture/{name}");
+            let class = TestClassFile {
+                internal_name: &internal,
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            };
+            let mut bytes = test_class_file_bytes_with_access(
+                &class,
+                TestClassAccess {
+                    class: flags,
+                    methods: &[],
+                    interfaces: &[],
+                },
+            );
+            if let Some(attribute) = attribute {
+                // Extend the fixture's constant pool and class attribute table,
+                // as an independent class writer would. No javac is needed.
+                let pool_count = u16::from_be_bytes([bytes[8], bytes[9]]);
+                let mut constants = vec![1];
+                constants.extend_from_slice(&(attribute.len() as u16).to_be_bytes());
+                constants.extend_from_slice(attribute.as_bytes());
+                if sealed {
+                    constants.push(1);
+                    constants.extend_from_slice(&13u16.to_be_bytes());
+                    constants.extend_from_slice(b"fixture/Child");
+                    constants.push(7);
+                    constants.extend_from_slice(&(pool_count + 1).to_be_bytes());
+                }
+                let offset = bytes.len() - 14;
+                bytes.splice(offset..offset, constants);
+                bytes[8..10]
+                    .copy_from_slice(&(pool_count + if sealed { 3 } else { 1 }).to_be_bytes());
+                let end = bytes.len();
+                bytes[end - 2..].copy_from_slice(&1u16.to_be_bytes());
+                bytes.extend_from_slice(&pool_count.to_be_bytes());
+                bytes.extend_from_slice(&(if sealed { 4u32 } else { 2u32 }).to_be_bytes());
+                bytes.extend_from_slice(&(if sealed { 1u16 } else { 0u16 }).to_be_bytes());
+                if sealed {
+                    bytes.extend_from_slice(&(pool_count + 2).to_be_bytes());
+                }
+            }
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            let mut remaining = limits.max_records;
+            let mut exhausted = false;
+            let entry = format!("{internal}.class");
+            let JavaClassSurfaceOutcome::Declared(surface) = class_surface(
+                "finality.jar",
+                &entry,
+                &bytes,
+                &mut |_| None,
+                limits.max_signature_depth,
+                &mut remaining,
+                &mut exhausted,
+                &mut diagnostics,
+            ) else {
+                panic!("class must parse: {name}")
+            };
+            assert_eq!(
+                (surface.is_final, surface.is_sealed, surface.type_kind),
+                (Some(finality), sealed, kind),
+                "{name}"
+            );
+            let (types, _) = class_surface_facts(surface, limits.max_records, &mut diagnostics);
+            if sealed {
+                // A contradictory producer claim cannot certify finality.
+                // This fixture's class attribute adds ten bytes to its header.
+                let mut invalid = bytes.clone();
+                let flags_offset = invalid.len() - 24;
+                invalid[flags_offset..flags_offset + 2]
+                    .copy_from_slice(&(flags | 0x0010).to_be_bytes());
+                assert!(matches!(
+                    class_surface(
+                        "invalid.jar",
+                        &entry,
+                        &invalid,
+                        &mut |_| None,
+                        limits.max_signature_depth,
+                        &mut remaining,
+                        &mut exhausted,
+                        &mut diagnostics,
+                    ),
+                    JavaClassSurfaceOutcome::Invalid
+                ));
+            }
+            assert_eq!(
+                (types[0].is_final, types[0].is_sealed),
+                (Some(finality), sealed),
+                "{name}"
+            );
+            archive
+                .start_file(&entry, SimpleFileOptions::default())
+                .unwrap();
+            use std::io::Write;
+            archive.write_all(&bytes).unwrap();
+            expected.push((format!("fixture.{name}"), finality, sealed));
+        }
+        archive.finish().unwrap();
+        let production = JavaJarPackProducer
+            .produce_exact_artifact(&request(jar, ExternalArtifactKind::JavaClassJar), &limits);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:?}",
+            production.diagnostics
+        );
+        let pack = production.pack.unwrap();
+        assert_eq!(pack.schema_version, 43);
+        assert!(pack.producer.version.ends_with("+jvm-pack-2"));
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let (types, _, _) = decoded.payload().declaration_facts().unwrap();
+        for (name, finality, sealed) in expected {
+            let fact = types.iter().find(|fact| fact.name == name).unwrap();
+            assert_eq!(
+                (fact.is_final, fact.is_sealed),
+                (Some(finality), sealed),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#10572: Java source records and explicit final classes lacked independent finality")]
+    fn source_class_finality_withholds_recovered_and_enum_claims() {
+        let source = "package fixture; public final class Final {} public class Open {} public record Rec(int x) {} public enum Enum { ONLY } public enum Bodies { ONE { void run() {} }; } public sealed class Sealed permits Final {} public final class Broken {";
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut remaining = limits.max_records;
+        let mut exhausted = false;
+        let names = source_declared_type_names(source).into_iter().collect();
+        let types = source_api_types(
+            "fixture/Types.java",
+            source,
+            &names,
+            limits.max_signature_depth,
+            &mut remaining,
+            &mut exhausted,
+            &mut diagnostics,
+        );
+        for (name, finality, sealed) in [
+            ("Final", Some(true), false),
+            ("Open", Some(false), false),
+            ("Rec", Some(true), false),
+            ("Enum", None, false),
+            ("Bodies", None, false),
+            ("Sealed", Some(false), true),
+            ("Broken", None, false),
+        ] {
+            let fact = types
+                .iter()
+                .find(|fact| fact.name == format!("fixture.{name}"))
+                .unwrap();
+            assert_eq!(
+                (fact.is_final, fact.is_sealed),
+                (finality, sealed),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     #[hardwon(
@@ -3973,6 +4279,15 @@ mod tests {
         assert!(pack.schema_version >= 21, "{}", pack.schema_version);
         let mut relabeled = pack.clone();
         relabeled.schema_version = 20;
+        // Schema 20 also predates class finality (43); clear it so the check
+        // below isolates the enclosing-type-parameter gate.
+        for shard in &mut relabeled.shards {
+            if let AuthoredPayload::DeclarationFacts { types, .. } = &mut shard.payload {
+                for fact in types {
+                    fact.is_final = None;
+                }
+            }
+        }
         let errors = compile_pack(&relabeled, &CompilerOptions::default())
             .expect_err("enclosing type parameters must not validate under schema 20");
         assert!(

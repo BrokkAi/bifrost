@@ -39,6 +39,43 @@ pub use crate::analyzer::resolution::seam_profile::CloserWork;
 #[cfg(any(test, feature = "test-support"))]
 pub use crate::analyzer::resolution::seam_profile::{CLOSER_WORK_KINDS, CLOSER_WORK_LABELS};
 
+pub(super) fn context_publishable_qualifier_completion(
+    completion: &ResolutionCompletion,
+) -> ResolutionCompletion {
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return ResolutionCompletion::Complete;
+    };
+    let retained = reasons
+        .iter()
+        .filter(|reason| match reason {
+            ResolutionIncompleteReason::OpenBoundary { semantic, .. }
+            | ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+            | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)
+            | ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
+                !semantic.is_operation_local()
+            }
+            ResolutionIncompleteReason::CyclicExpansion(path) => {
+                path.operation_local_number().is_none() || path.is_context_local()
+            }
+            // These describe this request's cancellation, cycle, budget, or
+            // live mount selection, not the import context's inventory.
+            ResolutionIncompleteReason::Cancelled
+            | ResolutionIncompleteReason::CyclicPrefixDependency(_)
+            | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
+            | ResolutionIncompleteReason::TimeBudgetExceeded(_)
+            | ResolutionIncompleteReason::UnmountedFile { .. }
+            | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+            | ResolutionIncompleteReason::Unclassified(_) => false,
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        ResolutionCompletion::Complete
+    } else {
+        ResolutionCompletion::incomplete(retained)
+    }
+}
+
 pub(super) fn closer_step(
     session: &ResolutionSession,
     cancellation: &CancellationToken,
@@ -586,10 +623,10 @@ pub(super) struct LexicalRouteStarts<R = (u32, u32), P = ()> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_lexical_route_starts<R, P, I>(
     start: ResolutionScopeId,
-    mut parent: impl FnMut(ResolutionScopeId) -> Result<Option<ResolutionScopeId>>,
+    parent: impl FnMut(ResolutionScopeId) -> Result<Option<ResolutionScopeId>>,
     mut read: impl FnMut(ResolutionScopeId, u32) -> Result<Read<I>>,
-    mut outer_can_compete: impl FnMut(Option<&R>, u32) -> bool,
-    mut prunes_provider: impl FnMut(&R, &R) -> bool,
+    outer_can_compete: impl FnMut(Option<&R>, u32) -> bool,
+    prunes_provider: impl FnMut(&R, &R) -> bool,
     completion: &mut ResolutionCompletion,
     cancellation: &CancellationToken,
 ) -> Result<Read<LexicalRouteStarts<R, P>>>
@@ -597,103 +634,191 @@ where
     R: Clone + Ord,
     I: IntoIterator<Item = Result<RankedLexicalTier<R, P>>>,
 {
-    let mut result = LexicalRouteStarts {
-        starts: Vec::new(),
-        scopes: Vec::new(),
-        blocks_fallback: false,
-        providers: Vec::new(),
-    };
-    let mut scope = Some(start);
-    let mut depth = 0;
-    let mut seen = HashSet::default();
-    let mut best = None::<R>;
-    let mut binding = None::<R>;
-    while let Some(level) = scope {
-        if cancellation.is_cancelled() {
-            return Ok(Read::Cancelled(completion.combine(&cancelled_completion())));
+    let mut cursor = LexicalRouteCursor::new(start);
+    match cursor.poll(
+        parent,
+        |scope, depth| Ok(LexicalCursorRead::Tiers(read(scope, depth)?)),
+        outer_can_compete,
+        prunes_provider,
+        completion,
+        cancellation,
+    )? {
+        Read::Ready {
+            value: LexicalCursorProgress::Ready(value),
+            completion,
+        } => Ok(Read::Ready { value, completion }),
+        Read::Ready {
+            value: LexicalCursorProgress::Members(_),
+            ..
+        } => unreachable!("synchronous readers never suspend"),
+        Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+        Read::Unavailable { reason, completion } => Ok(Read::Unavailable { reason, completion }),
+    }
+}
+
+enum LexicalCursorRead<I> {
+    Tiers(Read<I>),
+    Members(DemandMemberSelectionRequest),
+}
+enum LexicalCursorProgress<R, P> {
+    Ready(LexicalRouteStarts<R, P>),
+    Members(DemandMemberSelectionRequest),
+}
+struct LexicalRouteCursor<R, P> {
+    result: LexicalRouteStarts<R, P>,
+    scope: Option<ResolutionScopeId>,
+    depth: u32,
+    seen: HashSet<ResolutionScopeId>,
+    best: Option<R>,
+    binding: Option<R>,
+    entered: bool,
+}
+impl<R: Clone + Ord, P> LexicalRouteCursor<R, P> {
+    fn new(start: ResolutionScopeId) -> Self {
+        Self {
+            result: LexicalRouteStarts {
+                starts: Vec::new(),
+                scopes: Vec::new(),
+                blocks_fallback: false,
+                providers: Vec::new(),
+            },
+            scope: Some(start),
+            depth: 0,
+            seen: HashSet::default(),
+            best: None,
+            binding: None,
+            entered: false,
         }
-        assert!(
-            seen.insert(level),
-            "cyclic lexical lookup parents: {:?}",
-            result.scopes
-        );
-        result.scopes.push(level.get());
-        let tiers = match read(level, depth)? {
-            Read::Ready {
-                value,
-                completion: read_completion,
-            } => {
-                *completion = completion.combine(&read_completion);
-                value
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn poll<I: IntoIterator<Item = Result<RankedLexicalTier<R, P>>>>(
+        &mut self,
+        mut parent: impl FnMut(ResolutionScopeId) -> Result<Option<ResolutionScopeId>>,
+        mut read: impl FnMut(ResolutionScopeId, u32) -> Result<LexicalCursorRead<I>>,
+        mut outer_can_compete: impl FnMut(Option<&R>, u32) -> bool,
+        mut prunes_provider: impl FnMut(&R, &R) -> bool,
+        completion: &mut ResolutionCompletion,
+        cancellation: &CancellationToken,
+    ) -> Result<Read<LexicalCursorProgress<R, P>>> {
+        while let Some(level) = self.scope {
+            if cancellation.is_cancelled() {
+                return Ok(Read::Cancelled(completion.combine(&cancelled_completion())));
             }
-            Read::Cancelled(read_completion) => {
-                return Ok(Read::Cancelled(completion.combine(&read_completion)));
-            }
-            Read::Unavailable {
-                reason,
-                completion: read_completion,
-            } => {
-                return Ok(Read::Unavailable {
-                    reason,
-                    completion: completion.combine(&read_completion),
-                });
-            }
-        };
-        for read in tiers {
-            let RankedLexicalTier {
-                rank,
-                tier,
-                providers,
-            } = read?;
-            *completion = completion.combine(&tier.coverage).combine(&tier.blockers);
-            let binds = !tier.edges.is_empty();
-            if binds && binding.as_ref().is_none_or(|previous| rank < *previous) {
-                binding = Some(rank.clone());
-            }
-            if binds || tier.blocks_fallback {
-                match best.as_ref().map(|previous| rank.cmp(previous)) {
-                    None | Some(std::cmp::Ordering::Less) => {
-                        result.starts.clear();
-                        best = Some(rank.clone());
-                    }
-                    _ => {}
-                }
-                result.blocks_fallback = true;
-            }
-            if best.as_ref().is_none_or(|best| rank <= *best) {
-                result
-                    .starts
-                    .extend(tier.edges.into_iter().map(|location| RankedStart {
-                        location,
-                        rank: Some(rank.clone()),
-                        scope: Some(level),
-                    }));
-            }
-            result
-                .providers
-                .extend(
-                    providers
-                        .into_iter()
-                        .map(|provider| LexicalProviderObservation {
-                            provider,
-                            pruned: false,
-                        }),
+            if !self.entered {
+                assert!(
+                    self.seen.insert(level),
+                    "cyclic lexical lookup parents: {:?}",
+                    self.result.scopes
                 );
+                self.result.scopes.push(level.get());
+                self.entered = true;
+            }
+            let tiers = match read(level, self.depth)? {
+                LexicalCursorRead::Members(request) => {
+                    return Ok(Read::ready(LexicalCursorProgress::Members(request)));
+                }
+                LexicalCursorRead::Tiers(read) => match read {
+                    Read::Ready {
+                        value,
+                        completion: read_completion,
+                    } => {
+                        *completion = completion.combine(&read_completion);
+                        value
+                    }
+                    Read::Cancelled(read_completion) => {
+                        return Ok(Read::Cancelled(completion.combine(&read_completion)));
+                    }
+                    Read::Unavailable {
+                        reason,
+                        completion: read_completion,
+                    } => {
+                        return Ok(Read::Unavailable {
+                            reason,
+                            completion: completion.combine(&read_completion),
+                        });
+                    }
+                },
+            };
+            for read in tiers {
+                let RankedLexicalTier {
+                    rank,
+                    tier,
+                    providers,
+                } = read?;
+                *completion = completion.combine(&tier.coverage).combine(&tier.blockers);
+                let binds = !tier.edges.is_empty();
+                if binds
+                    && !tier.independent
+                    && self
+                        .binding
+                        .as_ref()
+                        .is_none_or(|previous| rank < *previous)
+                {
+                    self.binding = Some(rank.clone());
+                }
+                if (binds && !tier.independent) || tier.blocks_fallback {
+                    match self.best.as_ref().map(|previous| rank.cmp(previous)) {
+                        None | Some(std::cmp::Ordering::Less) => {
+                            // Earlier independent alternatives remain possible
+                            // even when an outer tier supplies a proven binding.
+                            self.result.starts.retain(|start| {
+                                start.rank.as_ref().is_some_and(|prior| prior <= &rank)
+                            });
+                            self.best = Some(rank.clone());
+                        }
+                        _ => {}
+                    }
+                    self.result.blocks_fallback = true;
+                }
+                if tier.independent || self.best.as_ref().is_none_or(|best| rank <= *best) {
+                    self.result
+                        .starts
+                        .extend(tier.edges.into_iter().map(|location| RankedStart {
+                            location,
+                            rank: Some(rank.clone()),
+                            scope: Some(level),
+                        }));
+                }
+                self.result
+                    .providers
+                    .extend(
+                        providers
+                            .into_iter()
+                            .map(|provider| LexicalProviderObservation {
+                                provider,
+                                pruned: false,
+                            }),
+                    );
+            }
+            let next_depth = self.depth + 1;
+            if self.best.is_some() && !outer_can_compete(self.best.as_ref(), next_depth) {
+                break;
+            }
+            self.scope = parent(level)?;
+            self.depth = next_depth;
+            self.entered = false;
         }
-        let next_depth = depth + 1;
-        if best.is_some() && !outer_can_compete(best.as_ref(), next_depth) {
-            break;
+        let binding = self
+            .binding
+            .take()
+            .filter(|binding| self.best.as_ref().is_none_or(|best| binding <= best));
+        for observed in &mut self.result.providers {
+            if let (Some(binding), Some(provider)) = (&binding, &observed.provider.rank) {
+                observed.pruned = prunes_provider(binding, provider);
+            }
         }
-        scope = parent(level)?;
-        depth = next_depth;
+        Ok(Read::ready(LexicalCursorProgress::Ready(
+            std::mem::replace(
+                &mut self.result,
+                LexicalRouteStarts {
+                    starts: Vec::new(),
+                    scopes: Vec::new(),
+                    blocks_fallback: false,
+                    providers: Vec::new(),
+                },
+            ),
+        )))
     }
-    let binding = binding.filter(|binding| best.as_ref().is_none_or(|best| binding <= best));
-    for observed in &mut result.providers {
-        if let (Some(binding), Some(provider)) = (&binding, &observed.provider.rank) {
-            observed.pruned = prunes_provider(binding, provider);
-        }
-    }
-    Ok(Read::ready(result))
 }
 
 /// A declaration already proven by the language's selected-member reader.
@@ -1345,6 +1470,27 @@ pub trait HalfRules {
     ) -> Result<Read<Self::LexicalTiers>> {
         unreachable!("lexical starts require binding tiers")
     }
+    /// Request inherited members only after this lexical tier misses. The
+    /// shared cursor retains the tier until its exact scheduler reply arrives.
+    fn lexical_member_request(
+        &self,
+        _: &Self::Placement,
+        _: ResolutionScopeId,
+        _: &ResolutionLookupSemanticRecipe,
+    ) -> Result<Read<Option<DemandMemberSelectionRequest>>> {
+        Ok(Read::ready(None))
+    }
+    fn lexical_member_reply(
+        &self,
+        _: &Self::Placement,
+        _: ResolutionScopeId,
+        _: u32,
+        _: &ResolutionLookupSemanticRecipe,
+        _: SemanticId,
+        _: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
+    ) -> Result<Read<HalfLexicalMemberTiers<Self>>> {
+        unreachable!("only a language requesting lexical members resumes them")
+    }
     fn outer_can_compete(&self, _: &Self::Placement, _: Option<&Self::Rank>, _: u32) -> bool {
         false
     }
@@ -1881,6 +2027,9 @@ pub struct PublicationDelta {
     pub relation: DemandSelectedOverlayBlueprint,
     pub paths: Vec<(CandidatePathIdentity, PartialPath)>,
 }
+
+pub(super) type HalfLexicalMemberTiers<H> =
+    Vec<LexicalStartTier<<H as HalfRules>::Rank, <H as HalfRules>::Provider>>;
 
 type HalfPlacementStarts<H> = Vec<PlacementStart<<H as HalfRules>::Member, <H as HalfRules>::Rank>>;
 
@@ -3141,6 +3290,95 @@ pub(super) fn prefix_inputs<R: DemandRules>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lexical_cursor_wait_does_not_restart_inner_scopes_and_honors_cancellation() {
+        type Tiers = Vec<Result<RankedLexicalTier<u32, ()>>>;
+        let cancellation = CancellationToken::new();
+        let mut completion = ResolutionCompletion::Complete;
+        let mut cursor = LexicalRouteCursor::<u32, ()>::new(ResolutionScopeId::new(0));
+        let mut visited = Vec::new();
+        let first = cursor
+            .poll(
+                |scope| Ok((scope.get() == 0).then(|| ResolutionScopeId::new(1))),
+                |scope, _| {
+                    visited.push(scope.get());
+                    Ok(if scope.get() == 0 {
+                        LexicalCursorRead::Tiers(Read::ready(Vec::<
+                            Result<RankedLexicalTier<u32, ()>>,
+                        >::new()))
+                    } else {
+                        LexicalCursorRead::Members(DemandMemberSelectionRequest::for_go_type(
+                            crate::analyzer::resolution::ResolutionTypeRef::new(
+                                SemanticId::for_test("lexical-parent"),
+                                0,
+                            ),
+                            SemanticId::for_test("nested-type"),
+                            false,
+                        ))
+                    })
+                },
+                |_, _| false,
+                |_, _| false,
+                &mut completion,
+                &cancellation,
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            Read::Ready {
+                value: LexicalCursorProgress::Members(_),
+                ..
+            }
+        ));
+        assert_eq!(visited, [0, 1]);
+        let second = cursor
+            .poll(
+                |_| panic!("a resumed binding must stop before an outer namespace"),
+                |scope, _| {
+                    visited.push(scope.get());
+                    Ok(LexicalCursorRead::Tiers(Read::ready(vec![Ok(
+                        RankedLexicalTier {
+                            rank: 1,
+                            tier: RouteEdgeTier {
+                                blocks_fallback: true,
+                                ..Default::default()
+                            },
+                            providers: Vec::new(),
+                        },
+                    )])))
+                },
+                |_, _| false,
+                |_, _| false,
+                &mut completion,
+                &cancellation,
+            )
+            .unwrap();
+        let Read::Ready {
+            value: LexicalCursorProgress::Ready(answer),
+            ..
+        } = second
+        else {
+            panic!("resumed lexical tier must finish");
+        };
+        assert_eq!(visited, [0, 1, 1]);
+        assert_eq!(answer.scopes, [0, 1]);
+        assert!(answer.blocks_fallback);
+        cancellation.cancel();
+        let mut cursor = LexicalRouteCursor::<u32, ()>::new(ResolutionScopeId::new(0));
+        let stopped = cursor
+            .poll(
+                |_| panic!("cancelled cursor must not read parents"),
+                |_, _| -> Result<LexicalCursorRead<Tiers>> {
+                    panic!("cancelled cursor must not read tiers")
+                },
+                |_, _| false,
+                |_, _| false,
+                &mut completion,
+                &cancellation,
+            )
+            .unwrap();
+        assert!(matches!(stopped, Read::Cancelled(_)));
+    }
     use super::*;
 
     use crate::analyzer::resolution::PartialPathId;
@@ -4114,8 +4352,8 @@ fn bridge_from_material(
             cross_language_evidence,
             evidence.clone(),
         )
-    } else if let Some(prefix) = prefix {
-        SelectedRootBridgeDescriptor::from_selected_path_tokens_with_prefix(
+    } else {
+        SelectedRootBridgeDescriptor::from_selected_route_tokens(
             identity.fragment(),
             material.source_language,
             token,
@@ -4125,21 +4363,6 @@ fn bridge_from_material(
             material.target_language,
             target_token,
             prefix,
-            route.to_vec(),
-            demand.clone(),
-            target_demand.clone(),
-            evidence.clone(),
-        )
-    } else {
-        SelectedRootBridgeDescriptor::from_selected_path_tokens(
-            identity.fragment(),
-            material.source_language,
-            token,
-            anchor,
-            anchor_semantic,
-            target_fragment,
-            material.target_language,
-            target_token,
             route.to_vec(),
             demand.clone(),
             target_demand.clone(),
@@ -4575,26 +4798,104 @@ fn close_start_selection<H: HalfRules>(
     rules: &H,
     owner: &H::Placement,
     facts: &mut PlacementFacts<H::Target>,
-    mut selection: StartSelection<H::Rank, H::Provider>,
+    state: &mut Option<Box<StartSelectionState<H::Rank, H::Provider>>>,
     cancellation: &CancellationToken,
-) -> Result<Read<StartSelection<H::Rank, H::Provider>>> {
-    if let Some(request) = selection.lexical.take() {
+) -> Result<Read<StartSelectionProgress<H::Rank, H::Provider>>> {
+    let retained = state
+        .as_mut()
+        .expect("selected lexical starts retain their cursor");
+    if let Some(request) = &retained.request {
         let tag = facts.tag;
         let lookup = &request.lookup;
-        let selected = select_lexical_route_starts(
-            request.scope,
-            |scope| rules.lexical_parent(owner, scope),
-            |scope, depth| {
-                let (tiers, completion) = match rules.lexical_tier(owner, scope, depth, lookup)? {
-                    Read::Ready { value, completion } => (value, completion),
-                    Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
-                    Read::Unavailable { reason, completion } => {
-                        return Ok(Read::Unavailable { reason, completion });
+        let pending = &mut retained.pending;
+        let mut hook_completion = ResolutionCompletion::Complete;
+        let selected = retained
+            .cursor
+            .as_mut()
+            .expect("lexical request has a cursor")
+            .poll(
+                |scope| rules.lexical_parent(owner, scope),
+                |scope, depth| {
+                    if cancellation.is_cancelled() {
+                        return Ok(LexicalCursorRead::Tiers(Read::Cancelled(
+                            cancelled_completion(),
+                        )));
                     }
-                };
-                Ok(Read::Ready {
-                    completion,
-                    value: tiers.into_iter().map(move |mut read| {
+                    let (tiers, completion) = if let Some(mut pending) = pending.take() {
+                        assert_eq!((pending.scope, pending.depth), (scope, depth));
+                        pending.tiers.extend(
+                            pending
+                                .reply
+                                .take()
+                                .expect("resume supplies the exact lexical member reply"),
+                        );
+                        (pending.tiers, ResolutionCompletion::Complete)
+                    } else {
+                        let (tiers, completion) = match rules
+                            .lexical_tier(owner, scope, depth, lookup)?
+                        {
+                            Read::Ready { value, completion } => {
+                                (value.into_iter().collect::<Vec<_>>(), completion)
+                            }
+                            Read::Cancelled(completion) => {
+                                return Ok(LexicalCursorRead::Tiers(Read::Cancelled(completion)));
+                            }
+                            Read::Unavailable { reason, completion } => {
+                                return Ok(LexicalCursorRead::Tiers(Read::Unavailable {
+                                    reason,
+                                    completion,
+                                }));
+                            }
+                        };
+                        if tiers.iter().all(|tier| {
+                            tier.ranked.tier.edges.is_empty() && !tier.ranked.tier.blocks_fallback
+                        }) {
+                            match rules.lexical_member_request(owner, scope, lookup)? {
+                                Read::Ready {
+                                    value: Some(request),
+                                    completion: inherited,
+                                } => {
+                                    hook_completion =
+                                        hook_completion.combine(&completion).combine(&inherited);
+                                    let [owner] = request.values.as_slice() else {
+                                        panic!("a lexical member tier names one enclosing owner");
+                                    };
+                                    assert!(
+                                        !tiers.is_empty(),
+                                        "a lexical member request attaches to a concrete tier"
+                                    );
+                                    *pending = Some(PendingLexicalTier {
+                                        owner: owner.ty().identity(),
+                                        scope,
+                                        depth,
+                                        tiers,
+                                        reply: None,
+                                    });
+                                    return Ok(LexicalCursorRead::Members(request));
+                                }
+                                Read::Ready {
+                                    completion: inherited,
+                                    ..
+                                } => {
+                                    hook_completion = hook_completion.combine(&inherited);
+                                }
+                                Read::Cancelled(completion) => {
+                                    return Ok(LexicalCursorRead::Tiers(Read::Cancelled(
+                                        completion,
+                                    )));
+                                }
+                                Read::Unavailable { reason, completion } => {
+                                    return Ok(LexicalCursorRead::Tiers(Read::Unavailable {
+                                        reason,
+                                        completion,
+                                    }));
+                                }
+                            }
+                        }
+                        (tiers, completion)
+                    };
+                    let mut value = Vec::with_capacity(tiers.len());
+                    for mut read in tiers {
                         if let Some((location, head)) = read.head {
                             let route = [head];
                             let cursor = WalkCursor {
@@ -4623,19 +4924,32 @@ fn close_start_selection<H: HalfRules>(
                             read.ranked.tier.coverage =
                                 read.ranked.tier.coverage.combine(&coverage);
                         }
-                        Ok(read.ranked)
-                    }),
-                })
-            },
-            |best, depth| rules.outer_can_compete(owner, best, depth),
-            |binding, provider| rules.prunes_provider(binding, provider),
-            &mut facts.completion,
-            cancellation,
-        )?;
-        selection = match selected {
-            Read::Ready { value, completion } => {
+                        value.push(Ok(read.ranked));
+                    }
+                    Ok(LexicalCursorRead::Tiers(Read::Ready { value, completion }))
+                },
+                |best, depth| rules.outer_can_compete(owner, best, depth),
+                |binding, provider| rules.prunes_provider(binding, provider),
+                &mut facts.completion,
+                cancellation,
+            )?;
+        facts.completion = facts.completion.combine(&hook_completion);
+        retained.selection = match selected {
+            Read::Ready {
+                value: LexicalCursorProgress::Ready(value),
+                completion,
+            } => {
                 facts.completion = facts.completion.combine(&completion);
                 value.into()
+            }
+            Read::Ready {
+                value: LexicalCursorProgress::Members(request),
+                completion,
+            } => {
+                return Ok(Read::Ready {
+                    value: StartSelectionProgress::Members(request),
+                    completion,
+                });
             }
             Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
             Read::Unavailable { reason, completion } => {
@@ -4643,6 +4957,10 @@ fn close_start_selection<H: HalfRules>(
             }
         };
     }
+    let mut selection = state
+        .take()
+        .expect("completed selection is consumed once")
+        .selection;
     if let Some(head) = selection.head.take() {
         let route = [head];
         let mut locations = Vec::new();
@@ -4672,7 +4990,7 @@ fn close_start_selection<H: HalfRules>(
         }
         selection.locations = locations;
     }
-    Ok(Read::ready(selection))
+    Ok(Read::ready(StartSelectionProgress::Ready(selection)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4687,38 +5005,21 @@ pub(super) fn deadend_bridge(
     demand: &ResolutionLookupSemanticRecipe,
     completion: ResolutionCompletion,
 ) -> SelectedRootBridgeDescriptor {
-    if let Some(prefix) = prefix {
-        SelectedRootBridgeDescriptor::from_selected_path_tokens_with_prefix(
-            fragment,
-            language,
-            token,
-            anchor,
-            anchor_semantic,
-            fragment,
-            language,
-            token,
-            prefix,
-            route.to_vec(),
-            demand.clone(),
-            demand.clone(),
-            completion,
-        )
-    } else {
-        SelectedRootBridgeDescriptor::from_selected_path_tokens(
-            fragment,
-            language,
-            token,
-            anchor,
-            anchor_semantic,
-            fragment,
-            language,
-            token,
-            route.to_vec(),
-            demand.clone(),
-            demand.clone(),
-            completion,
-        )
-    }
+    SelectedRootBridgeDescriptor::from_selected_route_tokens(
+        fragment,
+        language,
+        token,
+        anchor,
+        anchor_semantic,
+        fragment,
+        language,
+        token,
+        prefix,
+        route.to_vec(),
+        demand.clone(),
+        demand.clone(),
+        completion,
+    )
 }
 
 struct SourceAccumulator {
@@ -4999,6 +5300,37 @@ struct ActiveSourceRoute<R> {
     rank: Option<R>,
     scope: Option<ResolutionScopeId>,
 }
+struct PendingLexicalTier<R, P> {
+    owner: SemanticId,
+    scope: ResolutionScopeId,
+    depth: u32,
+    tiers: Vec<LexicalStartTier<R, P>>,
+    reply: Option<Vec<LexicalStartTier<R, P>>>,
+}
+struct StartSelectionState<R, P> {
+    selection: StartSelection<R, P>,
+    request: Option<LexicalStartRequest>,
+    cursor: Option<LexicalRouteCursor<R, P>>,
+    pending: Option<PendingLexicalTier<R, P>>,
+}
+impl<R: Clone + Ord, P> StartSelectionState<R, P> {
+    fn new(mut selection: StartSelection<R, P>) -> Self {
+        let request = selection.lexical.take();
+        let cursor = request
+            .as_ref()
+            .map(|request| LexicalRouteCursor::new(request.scope));
+        Self {
+            selection,
+            request,
+            cursor,
+            pending: None,
+        }
+    }
+}
+enum StartSelectionProgress<R, P> {
+    Ready(StartSelection<R, P>),
+    Members(DemandMemberSelectionRequest),
+}
 struct SourcePlacementState<R: DemandRules> {
     owner: R::Placement,
     facts: PlacementFacts<R::Target>,
@@ -5009,6 +5341,7 @@ struct SourcePlacementState<R: DemandRules> {
     proven: Vec<(SelectedMemberTarget, ProofId, BridgeMaterial)>,
     // Only opted-in access allocates row state; default source frames stay small.
     access: Option<Box<MemberAccessState<R::MemberRow>>>,
+    lexical: Option<Box<StartSelectionState<R::Rank, R::Provider>>>,
 }
 pub(crate) struct SourceCloseState<R: DemandRules> {
     scopes: Option<crate::analyzer::store::resolution_lexical::NodeSourceScopes>,
@@ -6079,37 +6412,140 @@ fn poll_source_rows<R: DemandRules>(
                     canonical: None,
                     proven: Vec::new(),
                     access: None,
+                    lexical: None,
                 }
             };
             if let Some(reply) = selection.take() {
                 let view =
                     provenance.expect("member projection has its request-local evidence view");
-                match resume_source_members(
-                    shared,
-                    &rules,
-                    &mut active,
-                    reply,
-                    view,
-                    &current.source,
-                    &mut state.accum,
-                    &mut current.accum,
-                )? {
-                    Read::Ready {
-                        value: Some(request),
-                        completion,
-                    } => {
-                        current.active = Some(active);
-                        drop(rules);
-                        state.half = Some(current);
-                        return Ok(Read::Ready {
-                            value: SourceRowsProgress::Break(request),
-                            completion,
-                        });
+                if let Some(lexical) = &mut active.lexical {
+                    let pending = lexical
+                        .pending
+                        .as_mut()
+                        .expect("lexical reply has an outstanding tier");
+                    let SourceMemberReply::Members(reply) = reply else {
+                        panic!("lexical inheritance requests members");
+                    };
+                    let lookup = &lexical
+                        .request
+                        .as_ref()
+                        .expect("lexical member request retains its lookup")
+                        .lookup;
+                    let mut tiers = Vec::new();
+                    // Selection carries operation-owned hierarchy reasons. Keep
+                    // those in query evidence rather than published source rows.
+                    let mut completion = ResolutionCompletion::Complete;
+                    for &owner in &reply.owners {
+                        if shared.cancellation.is_cancelled() {
+                            return Ok(Read::Cancelled(
+                                completion.combine(&cancelled_completion()),
+                            ));
+                        }
+                        match rules.lexical_member_reply(
+                            &active.owner,
+                            pending.scope,
+                            pending.depth,
+                            lookup,
+                            owner,
+                            view,
+                        )? {
+                            Read::Ready {
+                                value,
+                                completion: read,
+                            } => {
+                                completion = completion.combine(&read);
+                                tiers.extend(value);
+                            }
+                            Read::Cancelled(read) => {
+                                return Ok(Read::Cancelled(completion.combine(&read)));
+                            }
+                            Read::Unavailable {
+                                reason,
+                                completion: read,
+                            } => {
+                                return Ok(Read::Unavailable {
+                                    reason,
+                                    completion: completion.combine(&read),
+                                });
+                            }
+                        }
                     }
-                    Read::Ready { value: None, .. } => {}
-                    Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
-                    Read::Unavailable { reason, completion } => {
-                        return Ok(Read::Unavailable { reason, completion });
+                    let selection_completion = reply.completion.combine(&completion);
+                    state.accum.hook_completion =
+                        state.accum.hook_completion.combine(&selection_completion);
+                    let published_completion =
+                        context_publishable_qualifier_completion(&reply.completion)
+                            .combine(&completion);
+                    active.facts.completion =
+                        active.facts.completion.combine(&published_completion);
+                    let attached = pending
+                        .tiers
+                        .first_mut()
+                        .expect("a lexical request has its own ranked tier");
+                    attached.ranked.tier.coverage =
+                        attached.ranked.tier.coverage.combine(&published_completion);
+                    // An open inherited simple-name tier cannot exclude outer
+                    // lexical candidates. Its full evidence remains above.
+                    if selection_completion != ResolutionCompletion::Complete {
+                        for tier in &mut tiers {
+                            tier.ranked.tier.independent = true;
+                        }
+                    }
+                    assert!(
+                        pending.reply.replace(tiers).is_none(),
+                        "one lexical reply is consumed once"
+                    );
+                    current.accum.member_reads.push(MemberReadObservation {
+                        access: None,
+                        placement: active.facts.tag.1,
+                        cursor: WalkCursor {
+                            tag: active.facts.tag,
+                            location: RouteLocation::Owner {
+                                definition: pending.owner,
+                                scope: None,
+                            },
+                            consumed_prefix_segments: 0,
+                            start_step: 0,
+                            namespace: lookup.namespace(),
+                        },
+                        position: if current.source.route.is_empty() {
+                            MemberRoutePosition::Terminal
+                        } else {
+                            MemberRoutePosition::Segment
+                        },
+                        owners: reply.owners.clone().into_boxed_slice(),
+                        completion: selection_completion,
+                        provenance: reply.provenance,
+                        order: reply.order,
+                    });
+                } else {
+                    match resume_source_members(
+                        shared,
+                        &rules,
+                        &mut active,
+                        reply,
+                        view,
+                        &current.source,
+                        &mut state.accum,
+                        &mut current.accum,
+                    )? {
+                        Read::Ready {
+                            value: Some(request),
+                            completion,
+                        } => {
+                            current.active = Some(active);
+                            drop(rules);
+                            state.half = Some(current);
+                            return Ok(Read::Ready {
+                                value: SourceRowsProgress::Break(request),
+                                completion,
+                            });
+                        }
+                        Read::Ready { value: None, .. } => {}
+                        Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                        Read::Unavailable { reason, completion } => {
+                            return Ok(Read::Unavailable { reason, completion });
+                        }
                     }
                 }
             }
@@ -6197,18 +6633,38 @@ fn poll_source_rows<R: DemandRules>(
                         active.phase = PlacementPhase::Prefix;
                     }
                     PlacementPhase::Prefix => {
-                        if let Some(selected) =
-                            rules.prefix_selection(&active.owner, &mut active.facts)?
-                        {
+                        if active.lexical.is_none() {
+                            active.lexical = rules
+                                .prefix_selection(&active.owner, &mut active.facts)?
+                                .map(|selection| Box::new(StartSelectionState::new(selection)));
+                        }
+                        if active.lexical.is_some() {
                             let selected = close_start_selection(
                                 &rules,
                                 &active.owner,
                                 &mut active.facts,
-                                selected,
+                                &mut active.lexical,
                                 shared.cancellation,
                             )?;
                             let selected = match selected {
-                                Read::Ready { value, completion } => {
+                                Read::Ready {
+                                    value: StartSelectionProgress::Members(request),
+                                    completion,
+                                } => {
+                                    current.active = Some(active);
+                                    drop(rules);
+                                    state.half = Some(current);
+                                    return Ok(Read::Ready {
+                                        value: SourceRowsProgress::Break(
+                                            AccessPrerequisiteRequest::Members(request),
+                                        ),
+                                        completion,
+                                    });
+                                }
+                                Read::Ready {
+                                    value: StartSelectionProgress::Ready(value),
+                                    completion,
+                                } => {
                                     state.accum.hook_completion =
                                         state.accum.hook_completion.combine(&completion);
                                     value
@@ -6253,18 +6709,38 @@ fn poll_source_rows<R: DemandRules>(
                         active.phase = PlacementPhase::Lexical;
                     }
                     PlacementPhase::Lexical => {
-                        if let Some(selected) =
-                            rules.lexical_selection(&active.owner, &mut active.facts)?
-                        {
+                        if active.lexical.is_none() {
+                            active.lexical = rules
+                                .lexical_selection(&active.owner, &mut active.facts)?
+                                .map(|selection| Box::new(StartSelectionState::new(selection)));
+                        }
+                        if active.lexical.is_some() {
                             let selected = close_start_selection(
                                 &rules,
                                 &active.owner,
                                 &mut active.facts,
-                                selected,
+                                &mut active.lexical,
                                 shared.cancellation,
                             )?;
                             let selected = match selected {
-                                Read::Ready { value, completion } => {
+                                Read::Ready {
+                                    value: StartSelectionProgress::Members(request),
+                                    completion,
+                                } => {
+                                    current.active = Some(active);
+                                    drop(rules);
+                                    state.half = Some(current);
+                                    return Ok(Read::Ready {
+                                        value: SourceRowsProgress::Break(
+                                            AccessPrerequisiteRequest::Members(request),
+                                        ),
+                                        completion,
+                                    });
+                                }
+                                Read::Ready {
+                                    value: StartSelectionProgress::Ready(value),
+                                    completion,
+                                } => {
                                     state.accum.hook_completion =
                                         state.accum.hook_completion.combine(&completion);
                                     value
@@ -7936,6 +8412,7 @@ mod continuation_contract_tests {
             canonical: None,
             proven: Vec::new(),
             access: None,
+            lexical: None,
         };
         let Read::Ready {
             value: Some(request),

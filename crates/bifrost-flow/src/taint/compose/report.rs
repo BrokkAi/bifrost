@@ -28,7 +28,7 @@ use super::graph::{ComposedSourceId, Endpoint, Hop, HopQuality};
 use super::labels::LabeledPath;
 use super::provider::{
     BoundSource, CallModel, Completeness, CompositionProvider, InteriorObservation, InteriorSeed,
-    InteriorTarget,
+    InteriorTarget, StoreWriteObservation,
 };
 use super::search::{BudgetLane, Incompleteness, SearchOutcome, provider_error};
 use super::{ComposeError, CompositionBudget};
@@ -388,23 +388,28 @@ fn termination(budget: CompositionBudget, incomplete: &[Incompleteness]) -> Solv
         // The semantic request owns this budget and reports its own refusal.
         // Do not invent a solver-budget dimension for it.
         Some(BudgetLane::Semantic) => SolverTermination::FixedPoint,
+        // The remaining lanes are configured caps the search compares
+        // against counts of its own content, with no refusal: Content.
         Some(BudgetLane::Procedures) => {
             SolverTermination::ExceededBudget(SolverBudgetExceeded::new(
                 SolverBudgetDimension::ProviderMaterializations,
                 budget.max_procedures,
                 budget.max_procedures.saturating_add(1),
+                crate::analyzer::reuse_verdict::ReuseVerdict::Content,
             ))
         }
         Some(BudgetLane::Hops) => SolverTermination::ExceededBudget(SolverBudgetExceeded::new(
             SolverBudgetDimension::PropagatedOutputs,
             budget.max_hops,
             budget.max_hops.saturating_add(1),
+            crate::analyzer::reuse_verdict::ReuseVerdict::Content,
         )),
         Some(BudgetLane::CallersPerProcedure) => {
             SolverTermination::ExceededBudget(SolverBudgetExceeded::new(
                 SolverBudgetDimension::IncomingCalls,
                 budget.max_callers_per_procedure,
                 budget.max_callers_per_procedure.saturating_add(1),
+                crate::analyzer::reuse_verdict::ReuseVerdict::Content,
             ))
         }
         None => SolverTermination::FixedPoint,
@@ -574,6 +579,7 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
                 false,
                 retained_bytes,
                 WitnessReconstructionWork::new(0, emitted),
+                crate::analyzer::reuse_verdict::ReuseVerdict::Content,
             ),
             store_boundaries,
         )))
@@ -687,35 +693,12 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
         let Some(seed) = projected.or_else(|| interior_seed(self.sources, from)) else {
             return Ok(None);
         };
-        let (observations, target) = match to {
-            Endpoint::StoreWrite(write) => {
-                let writes = self.provider.store_writes();
-                let observation = &writes[*write];
-                (
-                    vec![InteriorObservation::Sink {
-                        point: observation.point,
-                        phase: observation.phase,
-                        carrier: observation.carrier.clone(),
-                    }],
-                    InteriorTarget::Observation(0),
-                )
-            }
-            Endpoint::Sink(sink) => (
-                vec![interior_observation(self.plan.value_flow(), *sink)],
-                InteriorTarget::Observation(0),
-            ),
-            Endpoint::Location(location) => (
-                vec![InteriorObservation::Location(location.clone())],
-                InteriorTarget::Observation(0),
-            ),
-            Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
-            Endpoint::Source(_)
-            | Endpoint::Execution(_)
-            | Endpoint::Object(_)
-            | Endpoint::Writeback { .. }
-            | Endpoint::CallHandoff { .. } => {
-                return Ok(None);
-            }
+        let Some((observations, target)) =
+            interior_endpoint_observation(Some(self.plan.value_flow()), to, |write| {
+                self.provider.store_writes().swap_remove(write)
+            })
+        else {
+            return Ok(None);
         };
         let projections = self
             .provider
@@ -778,6 +761,49 @@ pub(super) fn interior_seed<Fact>(
         | Endpoint::Execution(_) => None,
         Endpoint::Object(_) => None,
     }
+}
+
+/// The one correspondence between the destination of an interior hop and the
+/// observations asked of the provider, with the target its flows carry.
+/// Construction and lookup both go through here, so a destination kind that
+/// is observed is also found. `None` for an endpoint that is not an interior
+/// output. `store_write` is asked only for a Store-write destination, so a
+/// caller without a retained inventory pays for one only on that path.
+pub(super) fn interior_endpoint_observation(
+    value_flow: Option<&crate::value_flow::ValueFlowPlan>,
+    to: &Endpoint,
+    store_write: impl FnOnce(usize) -> StoreWriteObservation,
+) -> Option<(Vec<InteriorObservation>, InteriorTarget)> {
+    Some(match to {
+        Endpoint::StoreWrite(write) => {
+            let write = store_write(*write);
+            (
+                vec![InteriorObservation::Sink {
+                    point: write.point,
+                    phase: write.phase,
+                    carrier: write.carrier,
+                }],
+                InteriorTarget::Observation(0),
+            )
+        }
+        Endpoint::Sink(sink) => (
+            vec![interior_observation(
+                value_flow.expect("a recorded sink has a value plan"),
+                *sink,
+            )],
+            InteriorTarget::Observation(0),
+        ),
+        Endpoint::Location(location) => (
+            vec![InteriorObservation::Location(location.clone())],
+            InteriorTarget::Observation(0),
+        ),
+        Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
+        Endpoint::Source(_)
+        | Endpoint::Execution(_)
+        | Endpoint::Object(_)
+        | Endpoint::Writeback { .. }
+        | Endpoint::CallHandoff { .. } => return None,
+    })
 }
 
 pub(super) fn interior_observation(

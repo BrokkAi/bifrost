@@ -20,6 +20,7 @@ pub(in crate::analyzer::store::resolution_operation) struct SuperCursor {
 }
 
 impl SuperContext {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn read(rules: &PythonRules<'_, '_, '_>, reference: SemanticId) -> Result<Option<Self>> {
         let Some(ordinal) = reference.ordinal() else {
             return Ok(None);

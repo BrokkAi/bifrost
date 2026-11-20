@@ -61,7 +61,9 @@ use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackProduction;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyProvenance;
+
 use brokk_bifrost_analysis::analyzer::semantic_model::dependency::ASSUMED_DEPENDENCY_PROVENANCE_KEY;
+use brokk_bifrost_analysis::analyzer::semantic_model::dependency::BoundedDependencyDiagnostics;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
 
@@ -157,7 +159,14 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer::for_name("bifrost-python-stub")
+        (Producer::for_name("bifrost-python-stub")).with_dependency_revision()
+    }
+
+    /// A workspace pin names a distribution and version and carries no
+    /// artifact, so it selects only a compatible installed or reviewed pack;
+    /// a pinned distribution without one is not a failure (#14581).
+    fn installed_packs_only(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.artifacts.is_empty() && dependency.evidence.package.is_some()
     }
 
     fn produce(
@@ -253,8 +262,8 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
         }
         DependencyPackProduction {
             pack: Some(AuthoredSemanticModelPack {
-                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_dependency_artifacts(
-                    ExternalArtifactKind::PythonSource, artifacts)),
+                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(
+                    ExternalArtifactKind::PythonSource, &brokk_bifrost_analysis::analyzer::semantic_model::dependency::verified_raw_slots(artifacts))),
                 schema_version:
                     brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id,
@@ -1868,6 +1877,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         }
         let guard = self.guard_of(guard).cloned();
         self.types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -1886,6 +1896,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             type_kind,
             visibility: python_visibility(&name),
             is_abstract: false,
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -1981,6 +1992,8 @@ fn member_fact(
             .and_then(|signature| signature.returns.as_ref()),
     });
     MemberFact {
+        target_independent: None,
+        inherent_impl_self_arguments: None,
         implemented_trait: None,
         self_form: None,
         non_overridable: None,
@@ -2495,6 +2508,7 @@ fn project_callable_object_values(
                 }
             };
             let projected = Signature {
+                bounds: None,
                 type_parameters: signature.type_parameters.clone(),
                 parameters: projected_parameters.to_vec(),
                 returns: signature.returns.clone(),
@@ -2867,6 +2881,7 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
         });
     }
     Some(Signature {
+        bounds: None,
         type_parameters: node
             .child_by_field_name("type_parameters")
             .map(|list| type_parameter_names(list, source))
@@ -3450,7 +3465,8 @@ fn python_stdlib_dependency(
             // treated as proof that a declaration is absent.
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
         provenance,
         artifacts: Vec::new(),
@@ -3532,7 +3548,35 @@ pub fn resolve_python_semantic_pack_dependencies(
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
     let Some(environment) = &config.environment else {
-        return resolve_declared_python_stdlib_outcome(project);
+        let mut outcome = resolve_declared_python_stdlib_outcome(project);
+        // A declared runtime environment supplies verified wheel evidence;
+        // a pin row beside it could activate another version's shard for a
+        // callable the wheel resolves.
+        if !config.runtime_environments.is_empty() {
+            return outcome;
+        }
+        // Without an environment, the workspace's exact pins are the only
+        // evidence of which distributions it uses (#14581).
+        let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+        let (mut pinned, cancelled) =
+            crate::analyzer::python::packaging::python_lock_activation_rows(
+                project,
+                limits,
+                cancellation,
+                &mut diagnostics,
+            );
+        if cancelled {
+            outcome.cancelled = true;
+            outcome.complete = false;
+        }
+        let (pin_diagnostics, suppressed) = diagnostics.finish();
+        outcome.complete &= pin_diagnostics.is_empty() && suppressed.total() == 0;
+        outcome.diagnostics.extend(pin_diagnostics);
+        outcome.suppressed_diagnostics += suppressed;
+        outcome.profile.metadata_inputs_considered += pinned.len();
+        outcome.profile.dependencies_resolved += pinned.len();
+        outcome.dependencies.append(&mut pinned);
+        return outcome;
     };
     // Installed distribution and artifact discovery walks external trees
     // recursively; the capture cannot certify their membership.
@@ -4217,7 +4261,8 @@ impl<'a> DiscoveryState<'a> {
                 }),
                 target: Some(self.environment.platform.clone()),
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: vec![
                 DependencyProvenance {
@@ -4652,6 +4697,7 @@ from ...escape import Bad
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: None,
                 module: None,
                 toolchain: None,
@@ -4858,6 +4904,7 @@ from ...escape import Bad
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
+                    production_input_digest: None,
                     package: None,
                     module: None,
                     toolchain: None,
@@ -5309,6 +5356,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
+                    production_input_digest: None,
                     package: None,
                     module: None,
                     toolchain: None,
@@ -5527,6 +5575,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
+                    production_input_digest: None,
                     package: None,
                     module: None,
                     toolchain: None,

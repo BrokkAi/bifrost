@@ -18,8 +18,10 @@ pub(super) use symbols::{
     capture_ancestor_configuration_paths, restore_paths_from_retained_inputs,
 };
 
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
 
+use super::cache::CSharpMemoCaches;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use brokk_bifrost_analysis::analyzer::common::local_xml_name;
@@ -337,9 +339,18 @@ fn configuration_authority(
 }
 
 /// Identity of one workspace listing's MSBuild configuration inputs, present
-/// only when every input below the cap was read.
-fn read_config_digest(project: &dyn Project) -> Option<CompilationConfigIdentities> {
-    let listing = project.all_files_with_omissions().ok()?;
+/// only when every input below the cap was read. With a request cell, the
+/// listing is the request's shared one rather than a second walk (#13799); a
+/// failed listing is not stored there, so the retry contract is unchanged.
+fn read_config_digest(
+    project: &dyn Project,
+    request_listing: Option<&brokk_bifrost_analysis::analyzer::WorkspaceFileListingCell>,
+) -> Option<CompilationConfigIdentities> {
+    let listing = match request_listing {
+        Some(cell) => cell.listing(project),
+        None => project.all_files_with_omissions(),
+    }
+    .ok()?;
     let omissions = Arc::clone(&listing.1);
     let snapshot = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot::from_listing(
         project, None, &[], listing,
@@ -2391,21 +2402,98 @@ impl CSharpAnalyzer {
         // Rows describe the selected disk configuration. A request whose
         // overlay changes a configuration input needs a membership they
         // cannot state.
-        let overlay = self.record_membership_read(store.native_configuration_overlay_mismatch(
-            self.inner.project(),
-            &snapshots,
-            csharp_compilation::STORAGE_LANGUAGE,
-            Language::CSharp,
-            &CancellationToken::new(),
-        ))?;
+        let overlay =
+            self.record_configuration_read(store.native_configuration_overlay_mismatch(
+                self.inner.project(),
+                &snapshots,
+                csharp_compilation::STORAGE_LANGUAGE,
+                Language::CSharp,
+                &CancellationToken::new(),
+            ))?;
         if overlay != NativeConfigurationOverlayAuthority::Current {
             return Some(None);
         }
         self.inner.store_query_or_record(
-            |sink| sink.push(self.inner.scope_read_key()),
+            |_| {},
             store.selected_csharp_compilations(snapshot),
             "reading selected C# compilation membership",
         )
+    }
+
+    // Configuration publication reads consume MSBuild inputs, not source inventory.
+    pub(super) fn record_configuration_read<T>(
+        &self,
+        result: Result<T, brokk_bifrost_analysis::analyzer::store::StoreError>,
+    ) -> Option<T> {
+        self.compilation_authority_inputs();
+        self.inner
+            .store_query_or_record(|_| {}, result, "reading C# compilation configuration")
+    }
+
+    fn record_membership_path(&self, file: &ProjectFile) {
+        // The resolver records PathAbsent on an actual negative probe.
+        if let Some(oid) = self.inner.resolve_live_oid_for_file(file) {
+            if let Some(variant) = self.inner.selected_parse_variant(file) {
+                self.inner.record_reads(|sink| {
+                    sink.push(brokk_bifrost_analysis::analyzer::ReadKey::file(
+                        Language::CSharp,
+                        rel_path_string(file),
+                        oid,
+                        variant,
+                    ))
+                });
+            } else {
+                self.refuse_read_reuse();
+            }
+        }
+    }
+
+    /// The head's digest of one compilation's global-using fact, computed by
+    /// the store function the recording reader uses. None leaves the recorded
+    /// key unverifiable, which invalidates it. The native C# readers exist only
+    /// under test support, so a production build records no such key and has
+    /// nothing to verify.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(super) fn compilation_global_using_answer(
+        &self,
+        _label: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        None
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn compilation_global_using_answer(
+        &self,
+        label: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        use brokk_bifrost_analysis::analyzer::native_points::{
+            open_native_point_operation_with_services, selected_analyzer_services,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            SelectedResolutionOperationOpenOutcome, csharp_units::compilation_global_using_digest,
+        };
+        let _scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(self);
+        let cancellation = self.inner.active_query_cancellation().unwrap_or_default();
+        let services = selected_analyzer_services(self);
+        let operation = match open_native_point_operation_with_services(
+            &self.inner,
+            &services,
+            &cancellation,
+        ) {
+            Ok(SelectedResolutionOperationOpenOutcome::Ready(operation)) => operation,
+            Ok(_) => return None,
+            Err(error) => {
+                self.inner.record_query_failure(error);
+                return None;
+            }
+        };
+        match compilation_global_using_digest(&operation, label) {
+            Ok(digest) => digest,
+            Err(error) => {
+                self.inner.record_query_failure(error);
+                None
+            }
+        }
     }
 
     pub(super) fn record_membership_read<T>(
@@ -2434,13 +2522,15 @@ impl CSharpAnalyzer {
         let Some(selection) = self.selected_compilations()? else {
             return Some(CSharpCompilationVisibility::Unresolved);
         };
+        self.record_membership_path(reference);
+        self.record_membership_path(candidate);
         let Some(from) =
-            self.record_membership_read(selection.compilations_of(&rel_path_string(reference)))?
+            self.record_configuration_read(selection.compilations_of(&rel_path_string(reference)))?
         else {
             return Some(CSharpCompilationVisibility::Unresolved);
         };
         let Some(to) =
-            self.record_membership_read(selection.compilations_of(&rel_path_string(candidate)))?
+            self.record_configuration_read(selection.compilations_of(&rel_path_string(candidate)))?
         else {
             return Some(CSharpCompilationVisibility::Unresolved);
         };
@@ -2465,12 +2555,12 @@ impl CSharpAnalyzer {
             // direct ones only through proven transitive flow. Not visible
             // needs the opposite proof: outside every edge's reach, with
             // every reached project's references known.
-            let visible = self.record_membership_read(selection.visible_closure(compilation))?;
+            let visible = self.record_configuration_read(selection.visible_closure(compilation))?;
             let instance = if meets(&visible) {
                 CSharpCompilationVisibility::Visible
             } else {
                 let (reached, complete) =
-                    self.record_membership_read(selection.referenced_closure(compilation))?;
+                    self.record_configuration_read(selection.referenced_closure(compilation))?;
                 // Closure completeness includes every reached inventory.
                 if complete && !meets(&reached) {
                     CSharpCompilationVisibility::NotVisible
@@ -2634,18 +2724,7 @@ impl CSharpAnalyzer {
     /// omission contribution to the content key, are memoized for the generation. An unknown identity (a failed listing, a
     /// capped or unreadable configuration file) publishes nothing, and the next lookup retries.
     pub(super) fn compilation_config_identities(&self) -> Option<CompilationConfigIdentities> {
-        self.memo_caches.compilation_config_digest.read(
-            &memo_attribution(self),
-            |cell| {
-                cell.get_or_try_build_on_dedicated_pool(|| {
-                    let project = self.inner.project();
-                    read_config_digest(project).ok_or(())
-                })
-                .ok()
-                .map(|digest| *digest)
-            },
-            |answer| configuration_authority(answer.as_ref()),
-        )
+        config_identities(&self.memo_caches, self, self.inner.project())
     }
 
     pub(crate) fn compilation_membership_completeness(
@@ -2701,6 +2780,54 @@ impl CSharpAnalyzer {
     }
 }
 
+/// The generation's configuration identities, read through `memo_caches` and
+/// attributed to `analyzer`. The outer analyzer and its inner tree-sitter
+/// analyzer both reach the one memo through here.
+fn config_identities(
+    memo_caches: &CSharpMemoCaches,
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+) -> Option<CompilationConfigIdentities> {
+    let request_listing = analyzer.workspace_file_index_cell();
+    memo_caches.compilation_config_digest.read(
+        &memo_attribution(analyzer),
+        |cell| {
+            cell.get_or_try_build_on_dedicated_pool(|| {
+                read_config_digest(project, request_listing.as_deref()).ok_or(())
+            })
+            .ok()
+            .map(|digest| *digest)
+        },
+        |answer| configuration_authority(answer.as_ref()),
+    )
+}
+
+/// C#'s workspace content identity folds the compilation configuration into
+/// the source identity (#13307). Installed in the inner analyzer by
+/// [`CSharpAnalyzer`] with the generation's own memo, so the inner analyzer's
+/// recorded scope reads and the verifier agree by construction.
+pub(super) struct CSharpIdentityExtension {
+    pub(super) memo_caches: Arc<CSharpMemoCaches>,
+}
+
+impl brokk_bifrost_analysis::analyzer::content_identity::WorkspaceIdentityExtension
+    for CSharpIdentityExtension
+{
+    fn fold(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        project: &dyn Project,
+        sources: StableDigest,
+    ) -> Option<StableDigest> {
+        let (_, _, compilation_digest, _, _) =
+            config_identities(&self.memo_caches, analyzer, project)?;
+        let mut hasher = CanonicalHasher::new(b"bifrost-csharp-content-with-compilation-config:v1");
+        hasher.field("sources", sources.as_bytes());
+        hasher.field("compilation_config", compilation_digest.as_bytes());
+        Some(StableDigest::from_array(hasher.finish()))
+    }
+}
+
 fn membership_answer_label(completeness: CSharpCompilationMembershipCompleteness) -> String {
     match completeness {
         CSharpCompilationMembershipCompleteness::Complete => "complete".to_owned(),
@@ -2734,6 +2861,7 @@ fn omission_reason_label(
         Reason::UnreadableSymlink => "unreadable_symlink",
         Reason::NonRegular => "non_regular",
         Reason::NonUtf8Name => "non_utf8_name",
+        Reason::BoundedTree => "bounded_tree",
     }
 }
 
@@ -4016,6 +4144,10 @@ mod tests {
     #[hardwon(
         "#8632: a parent-relative conditional Compile item opened the wrong path, leaving a false proven owner"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn parent_relative_open_membership_keeps_independent_proven_owner() {
         let case = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/golden/open-membership/parent-relative");
@@ -4175,6 +4307,10 @@ mod tests {
     #[hardwon(
         "#8845: a multi-targeting Razor project could not evaluate IntermediateOutputPath, so its row stayed Root"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn target_assignments_open_only_their_properties() {
         use std::fmt::Write;
         let (_root, _project, _files, analyzer) = analyzed(&[
@@ -4320,6 +4456,10 @@ mod tests {
     #[hardwon(
         "#9973: unknown_configuration_presence violated the csharp_compilations open_reason CHECK"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn oversized_near_props_open_reason_is_persisted() {
         let oversized = format!("<Project><!--{}--></Project>", "x".repeat(2 * 1024 * 1024));
         let (_root, _project, _, analyzer) = analyzed(&[
@@ -4341,6 +4481,10 @@ mod tests {
 
     #[test]
     #[hardwon("#9973: target_assignment violated the csharp_compilations open_reason CHECK")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn target_assignment_open_reason_is_persisted() {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/golden/compilation-symbols/Append/obj");
@@ -4367,6 +4511,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn framework_instances_keep_one_selected_file_product() {
         let base =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/per-framework-items");
@@ -4440,6 +4588,10 @@ mod tests {
     #[hardwon("419d2f57df9a: early props saw a seeded TargetFramework in a single-target project")]
     #[hardwon("541f8d3d8b24: framework enumeration ignored assignments at import positions")]
     #[hardwon("9b78a10914df: locally treated framework globals produced closed symbol sets")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_compilation_symbols_match_the_compiler_golden() {
         use std::fmt::Write;
         let fixture_root =
@@ -4912,9 +5064,9 @@ mod tests {
             assert!(
                 keys.iter().any(|key| matches!(
                     key,
-                    ReadKey::Scope { languages, .. } if languages.as_ref() == [Language::CSharp]
+                    ReadKey::File { rel_path, .. } if rel_path.as_ref() == "Declared.cs"
                 )),
-                "membership must retain the source inventory containing Declared.cs: {keys:?}"
+                "membership must retain the queried source: {keys:?}"
             );
         }
     }
@@ -4993,6 +5145,188 @@ mod tests {
             "updated membership must retain new configuration authority: {:?}",
             reads.keys()
         );
+    }
+
+    /// Open membership: a hidden project file the listing omitted.
+    fn open_membership() -> (
+        tempfile::TempDir,
+        Arc<RecordedOmissionProject>,
+        CSharpAnalyzer,
+    ) {
+        analyzed_recording(
+            &[
+                ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+                ("App/Caller.cs", "class Caller {}"),
+                ("App/Declared.cs", "class Declared { int Field; }"),
+                (
+                    "Hidden/Hidden.csproj",
+                    "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+                ),
+            ],
+            &["Hidden/Hidden.csproj"],
+            &[project_omission(
+                "Hidden/Hidden.csproj",
+                WorkspaceFileOmissionReason::Symlink,
+            )],
+        )
+    }
+
+    #[test]
+    fn obligation_log_slices_replays_and_gates_one_site() {
+        use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
+        use brokk_bifrost_csharp::graph::membership_scope::{
+            DoubtMemo, MembershipScopedSource, Obligation, SiteAdmission,
+        };
+        use brokk_bifrost_csharp::graph_support::CSharpSource as _;
+
+        let (root, _project, analyzer) = open_membership();
+        assert!(
+            analyzer
+                .compilation_membership_completeness()
+                .cause()
+                .is_some()
+        );
+        let reference = ProjectFile::new(root.path(), "App/Caller.cs");
+        let declaring = ProjectFile::new(root.path(), "App/Declared.cs");
+        let class = analyzer
+            .declarations(&declaring)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("declared class");
+        let field = analyzer
+            .declarations(&declaring)
+            .into_iter()
+            .find(|unit| !unit.is_class())
+            .expect("declared field");
+        let candidate = Obligation::CandidateMembership {
+            file: declaring.clone(),
+        };
+
+        let membership = MembershipScopedSource::with_open_cause(
+            &analyzer,
+            &reference,
+            Some(CSharpCompilationMembershipOpenCause::ListingUnavailable),
+        );
+        assert!(membership.open_cause().is_some());
+        let first = membership.site();
+        assert_eq!(membership.admit_site(first), SiteAdmission::Proven);
+
+        // A derivation that admits an unproven field logs one candidate
+        // obligation; a memo hit replays it at a later site.
+        let mut memo = DoubtMemo::<u8, usize>::default();
+        let derived = *memo.get_or_derive(1, &membership, || {
+            assert!(membership.admit(&field));
+            1
+        });
+        assert_eq!(derived, 1);
+        assert_eq!(membership.admit_site(first), SiteAdmission::Withdrawn);
+        assert_eq!(membership.doubt(), 1);
+
+        let second = membership.site();
+        assert_eq!(membership.admit_site(second), SiteAdmission::Proven);
+        assert_eq!(memo.get(&1, &membership), Some(&1));
+        assert_eq!(membership.admit_site(second), SiteAdmission::Withdrawn);
+        assert_eq!(membership.doubt(), 2);
+
+        // Enumerating a type's members is logged before its candidates.
+        let third = membership.site();
+        membership.get_members_in_class(&class);
+        assert_eq!(membership.admit_site(third), SiteAdmission::Withdrawn);
+        assert_eq!(
+            membership.obligations()[membership.obligations().len() - 2..],
+            [
+                Obligation::EnumeratedTypeMembers {
+                    type_fq: class.fq_name(),
+                    name: String::new(),
+                },
+                candidate,
+            ]
+        );
+
+        // An enumeration that returns no candidate is logged, but
+        // `Enumerated*` obligations do not gate.
+        let fourth = membership.site();
+        assert!(!membership.workspace_namespace_exists("Nowhere"));
+        assert_eq!(membership.admit_site(fourth), SiteAdmission::Proven);
+        assert_eq!(
+            membership.obligations().last(),
+            Some(&Obligation::EnumeratedNamespaceTier {
+                namespace: "Nowhere".to_owned(),
+                name: String::new(),
+            })
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13133: memo replays copied obligations, so nested reuse grew the request log multiplicatively"
+    )]
+    #[test]
+    fn nested_memo_reuse_grows_the_log_by_one_entry_per_hit() {
+        use brokk_bifrost_core::analyzer::CodeUnitIndex;
+        use brokk_bifrost_csharp::graph::membership_scope::{DoubtMemo, MembershipScopedSource};
+
+        let (root, _project, analyzer) = open_membership();
+        let reference = ProjectFile::new(root.path(), "App/Caller.cs");
+        let declaring = ProjectFile::new(root.path(), "App/Declared.cs");
+        let field = analyzer
+            .declarations(&declaring)
+            .into_iter()
+            .find(|unit| !unit.is_class())
+            .expect("declared field");
+        let membership = MembershipScopedSource::with_open_cause(
+            &analyzer,
+            &reference,
+            Some(CSharpCompilationMembershipOpenCause::ListingUnavailable),
+        );
+
+        let mut a = DoubtMemo::<u8, ()>::default();
+        a.get_or_derive(1, &membership, || {
+            assert!(membership.admit(&field));
+        });
+        let derived_b = membership.doubted(|| {
+            a.get(&1, &membership);
+            a.get(&1, &membership);
+        });
+        assert_eq!(derived_b.obligations().len(), 1);
+
+        let mut b = DoubtMemo::<u8, ()>::default();
+        b.insert(1, derived_b);
+        for hit in 1..=20 {
+            let before = membership.log_len();
+            b.get(&1, &membership);
+            assert_eq!(membership.log_len(), before + 1, "hit {hit}");
+        }
+    }
+
+    #[test]
+    fn complete_membership_logs_no_obligation() {
+        use brokk_bifrost_core::analyzer::CodeUnit;
+        use brokk_bifrost_core::analyzer::CodeUnitIndex;
+        use brokk_bifrost_csharp::graph::membership_scope::{
+            MembershipScopedSource, SiteAdmission,
+        };
+        use brokk_bifrost_csharp::graph_support::CSharpSource as _;
+
+        let (_root, project, _files, analyzer) = analyzed(&[
+            ("App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+            ("Caller.cs", "class Caller {}"),
+            ("Declared.cs", "class Declared { int Field; }"),
+        ]);
+        let reference = file(&project, "Caller.cs");
+        let declaring = file(&project, "Declared.cs");
+        let class = analyzer
+            .declarations(&declaring)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("declared class");
+        let membership = MembershipScopedSource::new(&analyzer, &reference);
+        assert_eq!(membership.open_cause(), None);
+        let mark = membership.site();
+        membership.get_members_in_class(&class);
+        assert!(!membership.workspace_namespace_exists("Nowhere"));
+        assert_eq!(membership.admit_site(mark), SiteAdmission::Proven);
+        assert_eq!(membership.obligations(), Vec::new());
+        assert_eq!(membership.doubt(), 0);
     }
 
     #[test]
@@ -5638,9 +5972,38 @@ mod tests {
         ignored: Vec<PathBuf>,
     }
 
+    /// The effective rules of a test project are the delegate's rules plus the
+    /// fixed paths this wrapper leaves out of every listing.
+    fn fixed_exclusion_rules_digest(
+        domain: &[u8],
+        delegate: &TestProject,
+        exclusions: &[PathBuf],
+    ) -> io::Result<[u8; 32]> {
+        let mut normalized = exclusions
+            .iter()
+            .map(|path| brokk_bifrost_core::path_utils::workspace_relative_slash_path(path))
+            .collect::<Vec<_>>();
+        normalized.sort();
+        let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(domain);
+        hash.field("delegate", &delegate.ignore_rules_digest()?);
+        hash.sequence("exclusions", &normalized, |hash, path| {
+            hash.value(path.as_bytes())
+        });
+        Ok(hash.finish())
+    }
+
     impl Project for IgnoringProject {
         fn root(&self) -> &Path {
             self.delegate.root()
+        }
+
+        // A hand-written project names its effective ignore rules.
+        fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+            fixed_exclusion_rules_digest(
+                b"bifrost-csharp-ignoring-project-rules:v1",
+                &self.delegate,
+                &self.ignored,
+            )
         }
 
         fn analyzer_languages(&self) -> BTreeSet<Language> {
@@ -5704,6 +6067,15 @@ mod tests {
             self.delegate.root()
         }
 
+        // A hand-written project names its effective ignore rules.
+        fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+            fixed_exclusion_rules_digest(
+                b"bifrost-csharp-recorded-omission-project-rules:v1",
+                &self.delegate,
+                &self.unlisted,
+            )
+        }
+
         fn analyzer_languages(&self) -> BTreeSet<Language> {
             self.delegate.analyzer_languages()
         }
@@ -5756,6 +6128,7 @@ mod tests {
         WorkspaceFileOmission {
             path: PathBuf::from(path),
             reason,
+            bounded: None,
         }
     }
 
@@ -5814,6 +6187,7 @@ mod tests {
             let omission = WorkspaceFileOmission {
                 path,
                 reason: WorkspaceFileOmissionReason::NonUtf8Name,
+                bounded: None,
             };
             assert_eq!(
                 super::compilation_membership_completeness(
@@ -5956,8 +6330,37 @@ mod tests {
     }
 
     impl Project for FlakyListingProject {
+        fn project_read_slot(
+            &self,
+        ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+            self.delegate.project_read_slot()
+        }
+        fn install_read_recorder(
+            &self,
+            capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
+        ) -> bool {
+            self.delegate.install_read_recorder(capability)
+        }
+        fn invalidate_cached_file_listing(&self) {
+            self.delegate.invalidate_cached_file_listing();
+        }
+        fn file_listing_stamp(
+            &self,
+        ) -> Option<Vec<brokk_bifrost_core::analyzer::project::ProjectViewStamp>> {
+            self.delegate.file_listing_stamp()
+        }
         fn root(&self) -> &Path {
             self.delegate.root()
+        }
+
+        // A hand-written project names its effective ignore rules.
+        fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+            let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                b"bifrost-csharp-flaky-listing-project-rules:v1",
+            );
+            hash.field("delegate", &self.delegate.ignore_rules_digest()?);
+            hash.field("omit_build_files", &[u8::from(self.omit_build_files)]);
+            Ok(hash.finish())
         }
 
         fn analyzer_languages(&self) -> BTreeSet<Language> {
@@ -6051,6 +6454,106 @@ mod tests {
             analyzer.workspace_content_identities().as_ref(),
             Some(&identity)
         );
+    }
+
+    /// The digest is a function of the listing's contents, not of where the
+    /// listing came from: a request cell that another consumer filled first
+    /// gives the bytes a fresh walk gives, without walking again (#13799).
+    #[test]
+    fn config_digest_is_identical_from_the_request_cell_and_from_a_fresh_walk() {
+        let (_root, project, _analyzer) = two_project_fixture();
+        let fresh = read_config_digest(project.as_ref(), None).expect("fresh digest");
+
+        let cell = brokk_bifrost_analysis::analyzer::WorkspaceFileListingCell::default();
+        cell.listing(project.as_ref())
+            .expect("another consumer walks first");
+        let walks = project.workspace_file_listing_count();
+        let shared =
+            read_config_digest(project.as_ref(), Some(&cell)).expect("digest from the cell");
+
+        assert_eq!(
+            (shared.0, shared.1, shared.2, shared.3),
+            (fresh.0, fresh.1, fresh.2, fresh.3)
+        );
+        assert_eq!(shared.4, fresh.4);
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            walks,
+            "the digest must reuse the cell's listing"
+        );
+    }
+
+    /// A failed walk is not a listing: the cell stores nothing for it, so the
+    /// next ask in the same request walks again (the #5682 retry contract at
+    /// the cell), and a listing that succeeded is then reused.
+    #[test]
+    fn failed_listing_is_not_stored_in_the_request_cell() {
+        let (_root, delegate, _analyzed) = fixture(&[
+            ("A/A.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+            ("A/App.cs", "namespace A; class App {}"),
+        ]);
+        let project = FlakyListingProject {
+            delegate,
+            fail_listing: AtomicBool::new(true),
+            omit_build_files: false,
+        };
+        let cell = brokk_bifrost_analysis::analyzer::WorkspaceFileListingCell::default();
+        let baseline = project.workspace_file_listing_count();
+
+        assert!(cell.listing(&project).is_err());
+        project.fail_listing.store(false, Ordering::SeqCst);
+        cell.listing(&project).expect("the next ask walks again");
+        let walks = project.workspace_file_listing_count();
+        assert_eq!(
+            walks,
+            baseline + 1,
+            "the next ask must walk, not serve the failure"
+        );
+        cell.listing(&project).expect("the success is reused");
+        assert_eq!(project.workspace_file_listing_count(), walks);
+    }
+
+    /// The cell keys a listing by the project view that produced it. Another
+    /// view of the same root can list different files, so it walks its own
+    /// listing rather than reusing the first view's.
+    #[test]
+    fn request_cell_listings_are_keyed_by_project_view() {
+        let files = [
+            ("A/A.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+            ("A/Directory.Build.props", "<Project />"),
+            ("A/App.cs", "namespace A; class App {}"),
+        ];
+        let (_root, delegate, _analyzed) = fixture(&files);
+        let (all, hiding) = (
+            FlakyListingProject {
+                delegate: TestProject::new(delegate.root(), Language::CSharp),
+                fail_listing: AtomicBool::new(false),
+                omit_build_files: false,
+            },
+            FlakyListingProject {
+                delegate,
+                fail_listing: AtomicBool::new(false),
+                omit_build_files: true,
+            },
+        );
+        let cell = brokk_bifrost_analysis::analyzer::WorkspaceFileListingCell::default();
+        let (all_baseline, hiding_baseline) = (
+            all.workspace_file_listing_count(),
+            hiding.workspace_file_listing_count(),
+        );
+
+        let all_listing = cell.listing(&all).expect("first view lists");
+        let hiding_listing = cell.listing(&hiding).expect("second view lists");
+        assert_ne!(
+            all_listing.0, hiding_listing.0,
+            "a view that hides files must not be served another view's listing"
+        );
+        assert_eq!(all.workspace_file_listing_count(), all_baseline + 1);
+        assert_eq!(hiding.workspace_file_listing_count(), hiding_baseline + 1);
+        assert_eq!(cell.listing(&all).expect("reuse").0, all_listing.0);
+        assert_eq!(cell.listing(&hiding).expect("reuse").0, hiding_listing.0);
+        assert_eq!(all.workspace_file_listing_count(), all_baseline + 1);
+        assert_eq!(hiding.workspace_file_listing_count(), hiding_baseline + 1);
     }
 
     #[test]

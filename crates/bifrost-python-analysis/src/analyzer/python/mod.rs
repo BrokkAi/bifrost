@@ -402,6 +402,15 @@ impl PythonAnalyzer {
         self.inner.install_python_runtime_snapshot(base, published)
     }
 
+    /// Runtime-environment disk checks the current outer request performed.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn python_runtime_disk_verifications_for_test() -> usize {
+        runtime_provider::request_runtime_verification()
+            .expect("an open outer request")
+            .disk_checks()
+    }
+
     pub(crate) fn python_runtime_store_snapshot(
         &self,
     ) -> Option<(
@@ -418,9 +427,18 @@ impl PythonAnalyzer {
     /// analyzer's complete tree-sitter implementation.
     pub(crate) fn active_query_request_memo<T>(&self) -> Option<Arc<T>>
     where
-        T: Default + Send + Sync + 'static,
+        T: brokk_bifrost_core::domain_memo::DomainMemo,
     {
         self.inner.active_query_request_memo::<T>()
+    }
+
+    /// A memo for one caller when no query is active, charged to this
+    /// analyzer's owner and released with its last handle.
+    pub(crate) fn standalone_request_memo<T>(&self) -> Arc<T>
+    where
+        T: brokk_bifrost_core::domain_memo::DomainMemo,
+    {
+        self.inner.standalone_request_memo::<T>()
     }
 
     pub(crate) fn module_candidates_by_fqn_limited(
@@ -1202,6 +1220,17 @@ impl CodeUnitIndex for PythonAnalyzer {
         self.inner.all_declarations()
     }
 
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    // Python path modules additionally hydrate the selected published module
+    // name and its package context, through the inner path-symbol reader.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
+    }
+
     delegate_inner_methods! {
         fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
@@ -1397,11 +1426,22 @@ impl IAnalyzer for PythonAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            Self::from_inner(
-                self.inner.update_with_listing(changed_files, listing),
-                self.memo_budget,
-            )
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
+            (Self::from_inner(inner, self.memo_budget), effects)
         })
     }
 
@@ -2241,18 +2281,31 @@ impl LanguageSupport for PythonSupport {
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer,
         _changed: Option<&BTreeSet<ProjectFile>>,
-    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    > {
         let Some(python) = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()) else {
-            return Ok(());
+            return Ok(
+                brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects::Paths(
+                    Default::default(),
+                ),
+            );
         };
         let snapshots = python.inner.selected_workspace_snapshots();
         let snapshot = snapshots.get("python").expect("selected Python snapshot");
         if python.reconcile_outcome_for(snapshot).is_some() {
-            return Ok(());
+            return Ok(
+                brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects::Paths(
+                    Default::default(),
+                ),
+            );
         }
         python.reconcile_native_environment(
             &brokk_bifrost_core::cancellation::CancellationToken::new(),
-        )
+        )?;
+        // This producer reconciles native unit summaries for the already
+        // published snapshot; it never replaces source versions or parse keys.
+        Ok(brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects::no_changes())
     }
 
     fn open_receiver_request<'a>(
@@ -2904,12 +2957,17 @@ mod dependency_packs {
             // Python discovery reads distribution metadata under the roots the
             // host configures, plus the workspace's own toolchain declaration
             // files, which key the standard-library pack selection (#1869).
+            // The lock and requirements files key the artifact-less package
+            // activation rows of a workspace without one (#14581).
             &[
                 "METADATA",
                 "RECORD",
                 "top_level.txt",
                 "pyproject.toml",
                 ".python-version",
+                "uv.lock",
+                "poetry.lock",
+                "requirements.txt",
             ]
         }
 
@@ -2937,6 +2995,7 @@ mod dependency_packs {
             config: &AnalyzerConfig,
             project: &dyn Project,
             _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -3055,7 +3114,8 @@ mod dependency_packs {
                         toolchain: None,
                         target: None,
                         configuration: None,
-                        artifact_sha256: Some(identity.archive_sha256().to_owned()),
+                        production_input_digest: None,
+verified_raw_artifacts: (Some(identity.archive_sha256().to_owned())).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::PythonSource, &sha256)).collect(),
                     });
                 }
                 artifacts.push(stored::PythonRuntimeArtifactInput {
@@ -3297,7 +3357,23 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
         &REGISTRATION
     }
 
-    fn publish_native_source_rows(
+    fn native_resolution_rows_current(
+        &self,
+        conn: &rusqlite::Connection,
+        blob: i64,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<bool> {
+        brokk_bifrost_analysis::analyzer::store::python_binding_rows::source_is_current(conn, blob)
+    }
+
+    fn retire_native_resolution_rows(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        blob: i64,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        brokk_bifrost_analysis::analyzer::store::python_binding_rows::retire(tx, blob)
+    }
+
+    fn publish_native_resolution_rows(
         &self,
         tx: &rusqlite::Transaction<'_>,
         blob: i64,
@@ -3319,13 +3395,15 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
         &self,
         selection: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
         slot: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        context: &brokk_bifrost_analysis::analyzer::resolution::ConditionalTypeSeedContext<'_>,
         cancellation: &brokk_bifrost_analysis::CancellationToken,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<
-        Option<brokk_bifrost_analysis::analyzer::resolution::ConditionalTypeSeed>,
+        brokk_bifrost_analysis::analyzer::resolution::ConditionalTypeSeedRead,
     > {
         brokk_bifrost_analysis::analyzer::store::python_member_rows::receiver_seed(
             selection,
             slot,
+            context,
             cancellation,
         )
     }
@@ -3415,6 +3493,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
             .is_some_and(|name| {
                 brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES.contains(&name)
             })
+            || packaging::is_python_lock_activation_input(path)
     }
 }
 

@@ -175,6 +175,10 @@ mod rust_departing_tests_tests {
         "#4510: STAT4 recompiled the cached identifier-candidate query for distinct names"
     )]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn limited_identifier_candidate_query_does_not_reprepare_for_distinct_names() {
         use rusqlite::StatementStatus;
 
@@ -369,6 +373,177 @@ fn main() {}
             &RustAdapter::for_tests(),
             state.as_ref(),
             &prior_epoch,
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13333: variant and pub(self) visibility rows changed without a Rust salt bump"
+    )]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
+    fn rust_enum_variant_visibility_epoch_rederives_prior_visibility_rows() {
+        use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind;
+        use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "lib.rs",
+            "pub mod host {\n    pub(self) fn helper() {}\n    pub(super) enum Mode {\n        Idle,\n    }\n}\n",
+        );
+        let adapter = RustAdapter::for_tests();
+        let state = parse_state(&adapter, &file);
+        let facts = state.source_facts.as_ref().expect("Rust source facts");
+        let declaration_of = |kind: RustDeclarationKind| {
+            let matches = facts
+                .rust_declaration_properties
+                .iter()
+                .filter(|property| property.kind == kind)
+                .map(|property| property.declaration)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{kind:?}: {:?}",
+                facts.rust_declaration_properties
+            );
+            matches[0]
+        };
+        let helper = declaration_of(RustDeclarationKind::Function);
+        let idle = declaration_of(RustDeclarationKind::EnumVariant);
+
+        let native_sites = |declaration| {
+            facts
+                .native_declaration_sources
+                .iter()
+                .filter(|(_, source)| *source == declaration)
+                .map(|(site, _)| *site)
+                .collect::<Vec<_>>()
+        };
+        let (helper_sites, idle_sites) = (native_sites(helper), native_sites(idle));
+        assert!(
+            !idle_sites.is_empty(),
+            "{:?}",
+            facts.native_declaration_sources
+        );
+
+        // The rows the producer stored for these bytes before #13333 (measured
+        // on 2e99c4613b): the variant read its own absent modifier as private,
+        // and `pub(self)` took the coarse crate_or_module label. Both kept the
+        // same visibility gaps. The store requires each resolution row to
+        // agree with its source row, so both families carry the old values.
+        let mut prior = state.clone();
+        for fact in &mut prior.resolution_facts.declaration_visibilities {
+            if helper_sites.contains(&fact.declaration) {
+                fact.visibility = DeclaredVisibility::CrateOrModule;
+            } else if idle_sites.contains(&fact.declaration) {
+                fact.visibility = DeclaredVisibility::Private;
+            }
+        }
+        let prior_facts = prior.source_facts.as_mut().unwrap();
+        for property in &mut prior_facts.rust_declaration_properties {
+            if property.declaration == idle {
+                property.visibility = RustVisibility::Private;
+            }
+        }
+        for fact in prior_facts
+            .declaration_visibilities
+            .as_mut()
+            .expect("published Rust visibility family")
+        {
+            if fact.declaration == helper {
+                fact.visibility = DeclaredVisibility::CrateOrModule;
+            } else if fact.declaration == idle {
+                fact.visibility = DeclaredVisibility::Private;
+            }
+        }
+
+        let oid = oid_for(state.source.as_bytes());
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust");
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let rows = |store: &AnalyzerStore| {
+            let conn = store.read_conn().unwrap();
+            let (blob, generation) = conn
+                .query_row(
+                    "SELECT id, generation FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
+                    [oid.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap();
+            let read = |table: &str, declaration: i64| {
+                conn.query_row(
+                    &format!(
+                        "SELECT visibility FROM {table} WHERE blob_id = ?1 AND declaration_id = ?2"
+                    ),
+                    params![blob, declaration],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            };
+            let helper = i64::from(helper.get());
+            let idle = i64::from(idle.get());
+            (
+                generation,
+                [
+                    read("source_declaration_visibilities", helper),
+                    read("source_rust_declaration_properties", helper),
+                    read("source_declaration_visibilities", idle),
+                    read("source_rust_declaration_properties", idle),
+                ],
+            )
+        };
+
+        let prior_generation = store
+            .ensure_language_epoch_value(
+                "rust",
+                &epoch::rust_epoch_before_enum_variant_visibility(),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
+                &key,
+                prior_generation,
+                &adapter,
+                &prior,
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&store),
+            (
+                prior_generation.0,
+                ["crate_or_module", "self", "private", "private"].map(String::from)
+            )
+        );
+
+        // Upgrading moves the Rust generation, so the stale rows are no
+        // longer served and the blob must be parsed again.
+        let current_generation = store.ensure_language_epoch(&adapter).unwrap();
+        assert_ne!(current_generation, prior_generation);
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(std::slice::from_ref(&key))
+                .unwrap(),
+            vec![key.clone()]
+        );
+        store
+            .write_parsed_blob_at_generation(
+                &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
+                &key,
+                current_generation,
+                &adapter,
+                &state,
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&store),
+            (
+                current_generation.0,
+                ["private", "self", "crate_or_module", "super"].map(String::from)
+            )
         );
     }
 
@@ -664,7 +839,7 @@ fn main() {}
         );
 
         let current_generation = store
-            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
+            .ensure_language_epoch(&RustAdapter::for_tests())
             .unwrap();
 
         assert_ne!(current_generation, prior_generation);
@@ -1464,6 +1639,10 @@ fn main() {}
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn primary_route_only_module_properties_survive_reopen_without_display_links() {
         use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustDeclarationKind};
         let source = r#"
@@ -1575,6 +1754,10 @@ pub(crate) mod inline { mod nested; }
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn shared_embedded_module_properties_reopen_with_fifo_routes_and_exact_links() {
         use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind;
         use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
@@ -1767,6 +1950,10 @@ mod primary;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_module_publication_requires_source_facts_and_repairs_missing_witness() {
         let source = "#[macro_use] mod inline { pub mod leaf; } outer! { mod gated; }";
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -1871,6 +2058,10 @@ mod primary;
         "9fba40a6cb46: stale Rust macro DTOs overrode canonical declaration identities and route ranges"
     )]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_rust_macro_properties_ignore_stale_dto_and_reopen_exact_links() {
         let source = "#[macro_export]\nmacro_rules! public_macro { () => {}; }\nmacro_rules! private_macro { () => {}; }\nmod nested { macro_rules! local_macro { () => {}; } }\n";
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -2041,11 +2232,6 @@ mod primary;
             )
             .unwrap();
         });
-        assert!(
-            store
-                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
-                .is_err()
-        );
         let generation = store.current_generation("rust").unwrap();
         assert!(
             store
@@ -2055,6 +2241,11 @@ mod primary;
                     &[oid],
                     &|| true
                 )
+                .is_err()
+        );
+        assert!(
+            store
+                .rust_usage_facts(&brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"))
                 .is_err()
         );
         store
@@ -2075,6 +2266,10 @@ mod primary;
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_rust_declaration_properties_reopen_preserve_alternatives_and_fail_closed() {
         use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustDeclarationBoundary};
         let source = r#"
@@ -2418,6 +2613,10 @@ replay! {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn embedded_rust_declaration_identities_survive_store_reopen() {
         let source = "macro_rules! replay { ($($item:item)*) => { $($item)* }; }\nreplay! { pub struct Item { pub field: usize } pub fn repeated() {} pub fn repeated() {} }\n";
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -2484,6 +2683,10 @@ replay! {
     /// primary context, so the primary-module requirement holds for an
     /// embedded declaration exactly as it does for a primary one.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn bridged_macro_items_take_the_module_that_holds_their_invocation() {
         let source = "macro_rules! replay { ($($item:item)*) => { $($item)* }; }\npub mod inner {\n    replay! { pub fn nested() {} }\n}\nreplay! { pub fn top() {} }\n";
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -2553,6 +2756,10 @@ replay! {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn raw_embedded_imports_survive_store_reopen_without_projection_membership() {
         use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
 
@@ -2932,6 +3139,10 @@ helper::wrap! {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_import_properties_ignore_stale_dtos_and_store_once() {
         let source = "pub use crate::model::Public as Exported;\nfn local() { use crate::LocalOnly; mod inner { use crate::Inside; } }\nextern crate serde as serialization;\nmod nested { use crate::model::{Thing as Local, *}; }\n";
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -3357,6 +3568,10 @@ helper::wrap! {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_generic_import_batches_seek_900_oids_before_and_after_statistics() {
         const SOURCE: &str = "mod nested { use crate::model::Thing as Local; mod leaf; }\npub struct Tuple(pub usize, usize);\n#[macro_export]\nmacro_rules! exported { () => {}; }\nouter! { mod gated; }\n";
         let fixture = crate::inline_project::InlineTestProject::new()
@@ -3890,6 +4105,10 @@ helper::wrap! {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn canonical_import_segment_batches_seek_before_and_after_statistics() {
         // Schema 117 stores an import's module path once, in the canonical
         // `source_import_segments` family that `rust_import_targets` points at,
@@ -4553,11 +4772,9 @@ helper::wrap! {
 
         let requested = [oid.to_string()];
         let conn = store.conn.lock().unwrap();
-        let session = ResolutionSession::bounded(
-            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
-                ..Default::default()
-            },
+        let session = ResolutionSession::bounded_with_total_work(
+            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+            1,
             None,
         );
         let stopped = read_rust_usage_facts_bulk_with_session(

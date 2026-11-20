@@ -82,8 +82,42 @@ struct ProjectReadFacade<'a> {
     >,
 }
 impl Project for ProjectReadFacade<'_> {
+    fn listing_receipt_structurally_unknown(&self) -> bool {
+        self.delegate.listing_receipt_structurally_unknown()
+    }
+
+    fn membership_point_observation(
+        &self,
+        listing: &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+    ) -> Option<brokk_bifrost_core::analyzer::project::WorkspaceMembershipPointObservation> {
+        self.delegate.membership_point_observation(listing)
+    }
+
+    fn listing_ignore_inputs_verified(
+        &self,
+        listing: &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+    ) -> bool {
+        self.delegate.listing_ignore_inputs_verified(listing)
+    }
+
+    fn build_authority(&self) -> brokk_bifrost_core::analyzer::project::ProjectBuildAuthority<'_> {
+        self.delegate.build_authority()
+    }
+
     fn view_stamp(&self) -> Option<ProjectViewStamp> {
+        if self.listing.is_some() {
+            return None;
+        }
         self.delegate.view_stamp()
+    }
+
+    fn file_listing_stamp(&self) -> Option<Vec<ProjectViewStamp>> {
+        // A captured pair has its own membership but no independent stable
+        // view identity. The delegate's revisions cannot identify that pair.
+        if self.listing.is_some() {
+            return None;
+        }
+        self.delegate.file_listing_stamp()
     }
 
     fn directory_entries(&self, parent: &Path) -> std::io::Result<BTreeSet<ProjectFile>> {
@@ -369,6 +403,42 @@ impl Project for ProjectReadFacade<'_> {
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileOmissionReason};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#11968: captured listings aliased their delegate stamp")]
+    fn facade_listing_refuses_stamp_and_recorder_forwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let delegate = FilesystemProject::new(dir.path()).unwrap();
+        let first = with_workspace_file_listing(
+            &delegate,
+            (Arc::new(BTreeSet::new()), Arc::new(Vec::new())),
+        );
+        let second = with_workspace_file_listing(
+            &delegate,
+            (
+                Arc::new(BTreeSet::from([ProjectFile::new(
+                    delegate.root().to_path_buf(),
+                    "selected.java",
+                )])),
+                Arc::new(Vec::new()),
+            ),
+        );
+        assert!(first.view_stamp().is_none());
+        assert!(second.view_stamp().is_none());
+        assert!(first.file_listing_stamp().is_none());
+        assert!(second.file_listing_stamp().is_none());
+        delegate.invalidate_cached_file_listing();
+        assert!(first.file_listing_stamp().is_none());
+        assert!(first.view_stamp().is_none());
+        let recorder = ProjectReadFacade {
+            delegate: ProjectDelegate::Borrowed(&delegate),
+            project_reads: ProjectReadSlot::default(),
+            listing: None,
+        };
+        assert!(delegate.view_stamp().is_some());
+        assert_eq!(recorder.view_stamp(), delegate.view_stamp());
+        assert_eq!(recorder.file_listing_stamp(), delegate.file_listing_stamp());
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon("#11902: C++ discovery bypassed the generation listing")]

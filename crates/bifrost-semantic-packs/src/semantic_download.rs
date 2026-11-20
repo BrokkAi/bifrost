@@ -769,6 +769,17 @@ fn hex_digest(bytes: &[u8]) -> String {
     brokk_bifrost_analysis::analyzer::semantic_model::csmi::sha256_hex(bytes)
 }
 
+pub(super) fn extract_verified_approval_archive(
+    bytes: &[u8],
+    expected_sha256: &str,
+    destination: &Path,
+) -> Result<PathBuf, String> {
+    verify_digest(bytes, expected_sha256).map_err(|error| {
+        format!("first-party archive SHA-256 does not match its host pin: {error}")
+    })?;
+    safe_extract_archive(bytes, destination).map_err(|error| error.to_string())
+}
+
 fn safe_extract_archive(
     archive_bytes: &[u8],
     destination: &Path,
@@ -1172,6 +1183,7 @@ mod tests {
         .sha256()
         .to_owned();
         let activation = ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: "sample".to_owned(),
                 version: Some("=1.0.0".to_owned()),
@@ -1246,6 +1258,8 @@ mod tests {
 
     fn python_pack_query() -> SemanticPackSelectorQuery {
         SemanticPackSelectorQuery {
+            verified_raw_artifacts: Vec::new(),
+            production_input_digest: None,
             language: "python".to_owned(),
             ecosystem: "pypi".to_owned(),
             package: Some(CatalogCoordinate {
@@ -1269,6 +1283,8 @@ mod tests {
     /// version names a coordinate the bundle does not carry.
     fn declared_pack_query(version: &str) -> SemanticPackSelectorQuery {
         SemanticPackSelectorQuery {
+            verified_raw_artifacts: Vec::new(),
+            production_input_digest: None,
             language: "java".to_owned(),
             ecosystem: "jdk".to_owned(),
             package: None,
@@ -1452,6 +1468,7 @@ mod tests {
             let outcome = resolve_active_semantic_models(
                 catalog,
                 &SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: query.bifrost_version.clone(),
                     evidence: vec![SemanticModelActivationEvidence {
@@ -1462,7 +1479,8 @@ mod tests {
                         toolchain: query.toolchain.clone(),
                         target: query.target.clone(),
                         configuration: query.configuration.clone(),
-                        artifact_sha256: query.artifact_sha256.clone(),
+                        production_input_digest: None,
+verified_raw_artifacts: (query.artifact_sha256.clone()).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
                     }],
                     controls: Vec::new(),
                     limits: Default::default(),
@@ -2062,6 +2080,7 @@ mod tests {
                 source_pack_id: "bifrost.jdk".to_owned(),
                 source_pack_version: "21.0.8".to_owned(),
                 artifact_sha256: "a".repeat(64),
+                input_slots: None,
                 input_digest: "b".repeat(64),
                 producer_name: "fixture-producer".to_owned(),
                 producer_version: "1.0.0".to_owned(),

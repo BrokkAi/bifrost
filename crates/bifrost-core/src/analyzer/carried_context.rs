@@ -219,6 +219,17 @@ struct ContextSlot {
 
 type Payload = Arc<dyn Any + Send + Sync>;
 
+/// Read the request owner's operational completion without copying its state.
+pub trait RequestCompletion: Any + Send + Sync {
+    fn store_failed(&self) -> bool;
+}
+
+#[derive(Clone)]
+struct RequestState {
+    payload: Payload,
+    completion: Option<Arc<dyn RequestCompletion>>,
+}
+
 /// The narrow operation core can perform on an opaque attribution frame.
 pub trait ExecutionAttribution: Any + Send + Sync {
     fn mark_execution_dependent(&self);
@@ -292,14 +303,14 @@ fn mark(
 
 thread_local! {
     static CONTEXT: RefCell<Vec<ContextSlot>> = const { RefCell::new(Vec::new()) };
-    static REQUEST_STATE: RefCell<Vec<Option<Payload>>> = const { RefCell::new(Vec::new()) };
+    static REQUEST_STATE: RefCell<Vec<Option<RequestState>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The context of the thread handing work to another thread.
 #[derive(Clone)]
 pub struct CarriedContext {
     slot: ContextSlot,
-    request_state: Option<Payload>,
+    request_state: Option<RequestState>,
     project_reads_suppressed: bool,
 }
 
@@ -327,7 +338,7 @@ impl CarriedContext {
 
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
         let _guard = push_slot(self.slot.clone());
-        let _request_state = push_request_state(self.request_state.clone());
+        let _request_state = push_request_slot(self.request_state.clone());
         super::project_reads::with_project_read_suppression(self.project_reads_suppressed, f)
     }
 }
@@ -444,6 +455,23 @@ impl Drop for CarriedContextGuard {
 /// Request-owned state travels independently of read-attribution routing.
 /// An empty slot masks any state already installed on the receiving thread.
 pub fn push_request_state(state: Option<Payload>) -> RequestStateGuard {
+    push_request_slot(state.map(|payload| RequestState {
+        payload,
+        completion: None,
+    }))
+}
+
+/// Install the same allocation as opaque state and its completion observer.
+pub fn push_request_state_with_completion<T: RequestCompletion>(
+    state: Option<Arc<T>>,
+) -> RequestStateGuard {
+    push_request_slot(state.map(|state| RequestState {
+        payload: state.clone(),
+        completion: Some(state),
+    }))
+}
+
+fn push_request_slot(state: Option<RequestState>) -> RequestStateGuard {
     let depth = REQUEST_STATE.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.push(state.clone());
@@ -462,14 +490,27 @@ pub fn request_state<T: Any + Send + Sync>() -> Option<Arc<T>> {
         .with(|stack| stack.borrow().last().cloned().flatten())
         .map(|state| {
             state
+                .payload
                 .downcast()
                 .unwrap_or_else(|_| panic!("unexpected carried request state type"))
         })
 }
 
+/// A store failure belongs to the current request, including transported work.
+pub fn request_store_failed() -> bool {
+    REQUEST_STATE.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .and_then(Option::as_ref)
+            .and_then(|state| state.completion.as_ref())
+            .is_some_and(|completion| completion.store_failed())
+    })
+}
+
 /// Restores the request state on the thread that installed it.
 pub struct RequestStateGuard {
-    state: Option<Payload>,
+    state: Option<RequestState>,
     depth: usize,
     _thread: PhantomData<std::sync::MutexGuard<'static, ()>>,
 }
@@ -486,7 +527,7 @@ impl Drop for RequestStateGuard {
             let popped = stack.pop().expect("carried request state stack underflow");
             assert!(
                 match (&popped, &self.state) {
-                    (Some(popped), Some(state)) => Arc::ptr_eq(popped, state),
+                    (Some(popped), Some(state)) => Arc::ptr_eq(&popped.payload, &state.payload),
                     (None, None) => true,
                     _ => false,
                 },
@@ -500,6 +541,39 @@ impl Drop for RequestStateGuard {
 mod tests {
     use super::*;
     use crate::analyzer::project_reads::{project_reads_suppressed, without_project_reads};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11775: a transported independent answer lost its request's operational store failure"
+    )]
+    fn request_completion_follows_transport_and_request_masking() {
+        struct Completion(std::sync::atomic::AtomicBool);
+        impl RequestCompletion for Completion {
+            fn store_failed(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
+        let completion = Arc::new(Completion(std::sync::atomic::AtomicBool::new(false)));
+        let _request = push_request_state_with_completion(Some(completion.clone()));
+        let carried = CarriedContext::current();
+        assert!(!request_store_failed());
+        completion
+            .0
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(request_store_failed());
+        {
+            let _empty = push_request_state(None);
+            assert!(!request_store_failed());
+        }
+        assert!(request_store_failed());
+        std::thread::spawn(move || carried.run(|| assert!(request_store_failed())))
+            .join()
+            .expect("transported completion worker");
+        let _fresh = push_request_state_with_completion(Some(Arc::new(Completion(
+            std::sync::atomic::AtomicBool::new(false),
+        ))));
+        assert!(!request_store_failed());
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(

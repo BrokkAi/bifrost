@@ -5,6 +5,10 @@
 
 #[doc(hidden)]
 pub use super::nominal_rules::ImportTargetMounts;
+use crate::analyzer::resolution::{
+    ClassifiedSupertypeKind, SupertypeClassification, SupertypeKindEvidence,
+    classify_supertype_kind,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -61,7 +65,7 @@ use crate::analyzer::resolution::{
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionConstructionRequirementKind, ResolutionGapKind, ResolutionImportRouteKind,
     ResolutionImportSelectorKind, ResolutionMemberAccess, ResolutionMemberKind,
-    ResolutionNamespace, ResolutionRootImportKind, ResolutionSiteId, ResolutionSupertypeKind,
+    ResolutionNamespace, ResolutionRootImportKind, ResolutionSiteId,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, PrecedenceTier};
 use brokk_bifrost_jvm::java::import_split::{
@@ -825,6 +829,12 @@ pub struct JvmImportContextSnapshotKey {
     native_rejection_trace: bool,
 }
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for JvmImportContextSnapshotKey {
+    fn retained_bytes(&self) -> usize {
+        JvmImportContextSnapshotKey::retained_bytes(self)
+    }
+}
+
 impl JvmImportContextSnapshotKey {
     #[doc(hidden)]
     pub fn retained_bytes(&self) -> usize {
@@ -1190,9 +1200,16 @@ pub(super) struct JvmDeclaredType {
     indexed: bool,
 }
 
-pub(super) type JvmDeclaredTypeMemo = ExactReadMemo<(Language, String), Option<JvmDeclaredType>>;
-pub(super) type JvmDeclaredOwnerMemo =
-    ExactReadMemo<String, Option<Option<crate::analyzer::resolution::ExternalOwnerIdentity>>>;
+pub(super) type JvmDeclaredTypeMemo = ExactReadMemo<
+    (Language, String),
+    super::super::jvm_external_publication::JvmInventoryMemoValue<Option<JvmDeclaredType>>,
+>;
+pub(super) type JvmDeclaredOwnerMemo = ExactReadMemo<
+    String,
+    super::super::jvm_external_publication::JvmInventoryMemoValue<
+        Option<Option<crate::analyzer::resolution::ExternalOwnerIdentity>>,
+    >,
+>;
 pub(super) type JvmDeclarationPackageMemo = ExactReadMemo<(SemanticId, (u64, u64)), Option<String>>;
 
 #[derive(Clone)]
@@ -1788,6 +1805,14 @@ pub enum JvmImportContext {
     Cancelled,
 }
 
+/// Kind of the scoped gap that keeps an ambiguous name open (JLS 6.5.2) while a
+/// static import of an unenumerated owner might supply a field of that name.
+/// Never discharge it. The uncertainty concerns classifying the qualifier NAME
+/// as a variable or a type, so an exact member proof on the type does not moot
+/// it, unlike the owner-uncertainty kinds (OwnerInventoryOpen,
+/// jvm-model-declared-type, ...) that such a proof does moot (#13632).
+pub const JVM_IMPORT_MEMBER_ROUTE_OPEN_OBSCURING: &str = "jvm-static-import-field-open";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct JvmImportContextGap {
@@ -2235,6 +2260,7 @@ struct JvmUnitAccessRules<'a, 'p, 'q> {
 }
 
 impl UnitAccessRules for JvmUnitAccessRules<'_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn exact_relation(
         &self,
         caller: &PlacementKey,
@@ -2822,6 +2848,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Build a file's base import context cold. When this operation started
     /// fresh and the build is Ready, also capture it for later operations.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn jvm_import_context_with_snapshot(
         &self,
         source_language: Language,
@@ -2892,6 +2919,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// why not. A refusal leaves the operation unchanged; the caller then
     /// builds cold.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn restore_jvm_import_context_snapshot(
         &self,
         snapshot: &JvmImportContextSnapshot,
@@ -3056,6 +3084,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Name-independent selected rows, binders and provider inputs. This is
     /// entered only on a per-file/scope/stage operation-memo miss.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_import_context_parts(
         &self,
         source_language: Language,
@@ -7096,6 +7125,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn jvm_alias_rows(
         &self,
         blob: i64,
@@ -7175,6 +7205,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_import_target_rows(
         &self,
         key: JvmImportTargetKey,
@@ -7209,6 +7240,7 @@ impl SelectedResolutionOperation<'_, '_> {
     // with selected package membership. Uncertainty is a separate indexed
     // inventory, shared across names of the same package and stage.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn jvm_named_import_targets(
         &self,
         mounts: ImportTargetMounts,
@@ -7294,6 +7326,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(rows))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_import_uncertainty_targets(
         &self,
         mounts: ImportTargetMounts,
@@ -7435,6 +7468,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     // Existence is independent of a particular member name, and retains the
     // old package inventory's distinction between absent and present-but-empty.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_package_exists(&self, family: &dyn NominalPackageRules, package: &str) -> Result<bool> {
         let key = JvmImportTargetKey {
             mounts: family.import_target_mounts(),
@@ -7461,6 +7495,7 @@ impl SelectedResolutionOperation<'_, '_> {
     // Direct selected package hosts and selected parent edges are separate
     // positive facts. A parent package can exist without a file directly in it.
     // Preserve every source fragment of a package as one namespace receipt.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_selected_package_segment_hosts(
         &self,
         family: &dyn NominalPackageRules,
@@ -7672,6 +7707,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_package_member_targets(
         &self,
         key: &JvmPackageTargetKey,
@@ -7825,6 +7861,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     /// One indexed statement for every package/name demand in a file plan.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_active_package_members_batch(
         &self,
         language: Language,
@@ -7847,18 +7884,25 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(Some(admitted));
         };
         let shards = active.shards();
-        let providers = shards
+        let mut providers = shards
             .iter()
-            .map(|shard| shard.manifest.semantic_sha256.as_str())
+            .map(|shard| shard.inventory_provider_id())
             .collect::<Vec<_>>();
+        if let Some(open) = active.gate_inventory_providers(&mut providers) {
+            self.ready
+                .analyzer
+                .expect("model inventory has analyzer services")
+                .record_model_family_open(open);
+        }
         if providers.is_empty() {
             return Ok(Some(admitted));
         }
-        let mut statement = self
-            .ready
-            .inventory
-            .connection()
-            .prepare_cached(JVM_ACTIVE_PACKAGE_MEMBERS_SQL)?;
+        let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+            JVM_ACTIVE_PACKAGE_MEMBERS_SQL,
+            3,
+        );
+        let generation = self.ready.jvm_inventory_generation()?;
+        let mut statement = self.ready.inventory.connection().prepare_cached(&guarded)?;
         let rows = statement
             .query_map(
                 rusqlite::params![
@@ -7870,9 +7914,16 @@ impl SelectedResolutionOperation<'_, '_> {
                             .collect::<Vec<_>>()
                     )
                     .expect("package demands serialize"),
+                    generation,
                 ],
                 |row| {
-                    Ok((
+                    if !row.get::<_, bool>(10)? {
+                        return Ok(Err(()));
+                    }
+                    if row.get::<_, Option<usize>>(0)?.is_none() {
+                        return Ok(Ok(None));
+                    }
+                    Ok(Ok(Some((
                         row.get::<_, usize>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, u32>(2)?,
@@ -7882,12 +7933,20 @@ impl SelectedResolutionOperation<'_, '_> {
                         row.get::<_, bool>(6)?,
                         row.get::<_, bool>(7)?,
                         row.get::<_, bool>(8)?,
-                    ))
+                    ))))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if cancellation.is_cancelled() {
             return Ok(None);
+        }
+        let mut present_rows = Vec::new();
+        for row in rows {
+            match row {
+                Err(()) => return Ok(None),
+                Ok(Some(row)) => present_rows.push(row),
+                Ok(None) => {}
+            }
         }
         for (
             demand_index,
@@ -7899,7 +7958,7 @@ impl SelectedResolutionOperation<'_, '_> {
             family_complete,
             callables_complete,
             values_complete,
-        ) in rows
+        ) in present_rows
         {
             let (package, name, namespace) = &demands[demand_index];
             if !rules.admits_external_package_member(&kind, *namespace)
@@ -7910,7 +7969,7 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             let shard = shards
                 .iter()
-                .find(|shard| shard.manifest.semantic_sha256 == provider)
+                .find(|shard| shard.inventory_provider_id() == provider)
                 .expect("the point read uses active shard digests");
             let complete = shard.manifest.completeness
                 == crate::analyzer::semantic_model::Completeness::Complete
@@ -8072,6 +8131,7 @@ impl SelectedResolutionOperation<'_, '_> {
         clippy::too_many_arguments,
         reason = "per-reference package evidence is explicit"
     )]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_file_package_plan(
         &self,
         language: Language,
@@ -8165,26 +8225,42 @@ impl SelectedResolutionOperation<'_, '_> {
                     .and_then(|authority| authority.active_models())
             {
                 let shards = active.shards();
-                let providers = shards
+                let mut providers = shards
                     .iter()
-                    .map(|shard| shard.manifest.semantic_sha256.as_str())
+                    .map(|shard| shard.inventory_provider_id())
                     .collect::<Vec<_>>();
+                if let Some(open) = active.gate_inventory_providers(&mut providers) {
+                    self.ready
+                        .analyzer
+                        .expect("model inventory has analyzer services")
+                        .record_model_family_open(open);
+                }
                 if !providers.is_empty() {
-                    let mut statement = self
-                        .ready
-                        .inventory
-                        .connection()
-                        .prepare_cached(JVM_ACTIVE_PACKAGE_OWNERS_SQL)?;
+                    let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+                        JVM_ACTIVE_PACKAGE_OWNERS_SQL,
+                        3,
+                    );
+                    let generation = self.ready.jvm_inventory_generation()?;
+                    let mut statement =
+                        self.ready.inventory.connection().prepare_cached(&guarded)?;
                     let published = statement
                         .query_map(
                             rusqlite::params![
                                 serde_json::to_string(&providers).expect("provider IDs serialize"),
                                 serde_json::to_string(&candidate_packages)
                                     .expect("candidate packages serialize"),
+                                generation,
                             ],
-                            |row| row.get::<_, String>(0),
+                            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(2)?)),
                         )?
-                        .collect::<rusqlite::Result<HashSet<_>>>()?;
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if published.iter().any(|(_, current)| !current) {
+                        return Ok(None);
+                    }
+                    let published = published
+                        .into_iter()
+                        .filter_map(|(owner, _)| owner)
+                        .collect::<HashSet<_>>();
                     if cancellation.is_cancelled() {
                         return Ok(None);
                     }
@@ -8769,6 +8845,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn scala_predef_import_bridges(
         &self,
         import_context: &JvmPackageImportContext<'_>,
@@ -9170,6 +9247,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((!cancellation.is_cancelled()).then_some((bridges, gaps)))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_alias_import_bridges(
         &self,
         import: &JavaMemberImportDemand<'_>,
@@ -9713,6 +9791,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((!cancellation.is_cancelled()).then_some(completion))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_open_owner_alias_imports(
         &self,
         source_language: Language,
@@ -9821,6 +9900,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((!cancellation.is_cancelled()).then_some(result))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_boundary_access(
         &self,
         boundary: &brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary<
@@ -10319,6 +10399,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_single_type_import(
         &self,
         prepared: &JvmContextPreparation,
@@ -10804,6 +10885,43 @@ impl SelectedResolutionOperation<'_, '_> {
                     coverage_gaps: &scoped_gaps[coverage_start..],
                     accumulated_alias_open,
                 })?;
+                // JLS 6.4.2 and 6.5.2: a field imported by this static import
+                // obscures a type of the same simple name where an ambiguous
+                // name is classified. Keep the name open unless the owner's
+                // static values are enumerated completely and lack the member.
+                if demand_recipe.namespace() == ResolutionNamespace::Value
+                    && !accumulated_alias_open
+                    && open_aliases.is_empty()
+                    && scoped_gaps[coverage_start..].is_empty()
+                {
+                    let typed = self.ready.typed_source();
+                    let enumerated_without_field =
+                        match typed.model_owner_has_no_static_value(&owner, &member) {
+                            Some(decided) => decided,
+                            None => match self.declared_jvm_owner(Language::Java, &owner)? {
+                                Some(identity) => {
+                                    typed.external_owner_has_no_static_value(&identity, &member)?
+                                }
+                                None => false,
+                            },
+                        };
+                    if !enumerated_without_field {
+                        scoped_gaps.push(self.jvm_import_context_gap(
+                            JvmImportContextGapSpec {
+                                source: source.fragment(),
+                                source_token: token,
+                                source_reference: None,
+                                kind: JVM_IMPORT_MEMBER_ROUTE_OPEN_OBSCURING,
+                                owner: Some(owner.clone()),
+                                lookup: demand_recipe.clone(),
+                                detail: format!(
+                                    "Java static import owner `{owner}` is not enumerated, so it may declare a field `{member}`"
+                                ),
+                            },
+                            cancellation,
+                        )?);
+                    }
+                }
                 external_static_imports.push(JavaExternalStaticImportBoundary { member, owner });
             }
         }
@@ -10996,10 +11114,13 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Whether an indexed artifact, reviewed model, or language-defined root
     /// declares this type. Fixed roots fill unavailable detail only when an
     /// indexed provider has not already supplied its own inventory.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_declared_type(&self, language: Language, fqn: &str) -> Result<Option<JvmDeclaredType>> {
         let key = (language, fqn.to_owned());
         if let Some(candidate) = self.jvm_declared_type_memo.borrow().get(&key) {
-            return Ok(candidate.clone());
+            return Ok(candidate
+                .read_cached(self.ready.inventory.connection())?
+                .clone());
         }
         let candidate = if self.declares_jvm_type(language, fqn)? {
             let owner = self.declared_jvm_owner(language, fqn)?;
@@ -11015,9 +11136,27 @@ impl SelectedResolutionOperation<'_, '_> {
         } else {
             None
         };
-        self.jvm_declared_type_memo
-            .borrow_mut()
-            .insert(key, candidate.clone());
+        let mut proof = self
+            .jvm_declared_owner_memo
+            .borrow()
+            .get(&key.1)
+            .map(|entry| entry.proof())
+            .unwrap_or(super::super::jvm_external_publication::JvmInventoryMemoProof::Immutable);
+        if let Some(owner) = candidate
+            .as_ref()
+            .and_then(|candidate| candidate.owner.as_ref())
+            && let Some(indexed) = self.jvm_indexed_type_memo.borrow().get(owner)
+        {
+            proof = proof.combine(indexed.proof());
+        }
+        proof.validate_capture(self.ready.jvm_inventory_generation()?)?;
+        self.jvm_declared_type_memo.borrow_mut().insert(
+            key,
+            super::super::jvm_external_publication::JvmInventoryMemoValue::new(
+                candidate.clone(),
+                proof,
+            ),
+        );
         Ok(candidate)
     }
 
@@ -11106,21 +11245,22 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(SelectedPackageRows::Ready(package))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn jvm_external_type_is_indexed(
         &self,
         owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
     ) -> Result<bool> {
         if let Some(indexed) = self.jvm_indexed_type_memo.borrow().get(owner) {
-            return Ok(*indexed);
+            return Ok(*indexed.read_cached(self.ready.inventory.connection())?);
         }
         let indexed = self
             .ready
             .typed_source()
-            .external_owner_type_is_indexed(owner)?;
+            .external_owner_type_is_indexed_with_memo_proof(owner)?;
         self.jvm_indexed_type_memo
             .borrow_mut()
-            .insert(owner.clone(), indexed);
-        Ok(indexed)
+            .insert(owner.clone(), indexed.clone());
+        Ok(indexed.into_value())
     }
 
     fn declares_jvm_type(&self, language: Language, fqn: &str) -> Result<bool> {
@@ -11165,6 +11305,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Preserve absence, ambiguous authority, and a unique selected owner as
     /// separate results. The selected provider set is immutable for an operation.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_declared_owner_selection(
         &self,
         language: Language,
@@ -11177,26 +11318,29 @@ impl SelectedResolutionOperation<'_, '_> {
         if !providers.is_empty()
             && let Some(owner) = self.jvm_declared_owner_memo.borrow().get(&key)
         {
-            return Ok(owner.clone());
+            return Ok(owner
+                .read_cached(self.ready.inventory.connection())?
+                .clone());
         }
         let authority = self.ready.model_authority();
         let relations = nominal_language_rules(language)
             .expect("caller belongs to a nominal family")
             .family()
             .external_owners();
-        let owner = super::selected_jvm_declaration_owner(
+        let owner = super::selected_jvm_declaration_owner_with_memo_proof(
             relations,
             self.ready.inventory.connection(),
             authority.as_deref(),
             providers,
             fqn,
+            self.ready.jvm_inventory_generation()?,
         )?;
         if !providers.is_empty() {
             self.jvm_declared_owner_memo
                 .borrow_mut()
                 .insert(key, owner.clone());
         }
-        Ok(owner)
+        Ok(owner.into_value())
     }
 
     /// Prove a conventional visibility-domain relation between two selected
@@ -11224,6 +11368,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .expect("implicit project proof is always derived"))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_implicit_project_context(&self, context: i64) -> Result<JvmImplicitProjectContext> {
         let key = (
             context,
@@ -11631,6 +11776,7 @@ fn jvm_import_lookup_routes(
     routes
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn selected_java_import_route_gap_reasons(
     inventory: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     blob_id: i64,
@@ -13182,6 +13328,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// range and selected reference halves. Prefixed references intentionally
     /// do not appear in the compact package-route table, so read the same
     /// source halves the demand provider uses, bounded to this one blob.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn scala_import_qualifiers(
         &self,
         half: &SelectedRootPathHalf,
@@ -13300,6 +13447,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(selected.into_iter().collect()))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn scala_reference_package_prefixes_with_coverage(
         &self,
         blob: i64,
@@ -13347,6 +13495,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .transpose()
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn scala_primary_package(&self, blob: i64) -> Result<Option<String>> {
         let segments = self
             .ready
@@ -13369,6 +13518,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Read the lexical package context captured by the import producer for
     /// the exact selected blob. Selector halves share their AST declaration's
     /// context, including distinct sibling package blocks.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn scala_import_package_prefixes(
         &self,
         blob: i64,
@@ -13586,23 +13736,31 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut inherits = false;
         for chunk in owners.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
             let mut implicit_root_frontiers = BTreeSet::new();
+            let mut parent_roles = Vec::new();
             let outcome = typed.visit_supertype_pages_for_definitions(
                 TypedFactRequest::new(chunk),
                 cancellation,
                 &mut FactPageVisitor::new(&mut |page| {
                     for row in page.iter().map(|row| row.row()) {
-                        let implicit_root =
-                            row.source_kind() == Some(ResolutionSupertypeKind::ImplicitSuperclass);
-                        inherits |= !implicit_root;
-                        if implicit_root {
-                            implicit_root_frontiers.insert((row.definition(), row.frontier()));
-                        }
+                        parent_roles.push((row.definition(), row.frontier(), row.source_kind()));
                     }
                     Ok(true)
                 }),
             )?;
             if outcome.is_cancelled() {
                 return Ok(None);
+            }
+            for (definition, frontier, raw) in parent_roles {
+                let implicit_root = matches!(
+                    classify_supertype_kind(raw, SupertypeKindEvidence::ProducerClassified),
+                    SupertypeClassification::Classified(Some(
+                        ClassifiedSupertypeKind::ImplicitSuperclass
+                    ))
+                );
+                inherits |= !implicit_root;
+                if implicit_root {
+                    implicit_root_frontiers.insert((definition, frontier));
+                }
             }
             inherits |=
                 !(outcome.is_exhausted() && outcome.evidence() == &ResolutionCompletion::Complete);
@@ -13634,6 +13792,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Query-owned direct member continuation. Package prefixes come from
     /// exact selected package rows; each remaining segment must name a member
     /// of the already-proven type. Inherited routes remain incomplete.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn jvm_scala_object_definition(&self, definition: SemanticId) -> Result<bool> {
         let (Some(ordinal), Some(local_key)) = (definition.ordinal(), definition.local_key())
         else {
@@ -13668,6 +13827,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Scala's singleton term and module class share a declaration identity.
     /// The explicit term-type namespace proof and owned type body distinguish
     /// that pair from an ordinary field or the former class namespace aliases.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_singleton_import_type_owner(
         &self,
         definition: SemanticId,
@@ -14335,14 +14495,17 @@ impl SelectedResolutionOperation<'_, '_> {
                         inherited_route_open |= !outcome.is_exhausted()
                             || outcome.evidence() != &ResolutionCompletion::Complete
                             || supertypes.iter().any(|row| {
-                                row.source_kind()
-                                    != Some(ResolutionSupertypeKind::ImplicitSuperclass)
-                                    || language_implicit_root_member_names(target_language)
-                                        .contains(
-                                            &import
-                                                .selected_name
-                                                .unwrap_or(import.demand.spelling()),
-                                        )
+                                !matches!(
+                                    classify_supertype_kind(
+                                        row.source_kind(),
+                                        SupertypeKindEvidence::ProducerClassified
+                                    ),
+                                    SupertypeClassification::Classified(Some(
+                                        ClassifiedSupertypeKind::ImplicitSuperclass
+                                    ))
+                                ) || language_implicit_root_member_names(target_language).contains(
+                                    &import.selected_name.unwrap_or(import.demand.spelling()),
+                                )
                             });
                     }
                     for (member, access, member_access, unit, bridge_allowed) in owners {
@@ -15066,6 +15229,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok((!cancellation.is_cancelled()).then_some(publication))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_qualified_publication_input<'a>(
         &self,
         half: &'a SelectedRootPathHalf,
@@ -15428,6 +15592,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn jvm_source_reader_context(
         &self,
         half: &SelectedRootPathHalf,
@@ -15624,6 +15789,7 @@ impl SelectedResolutionOperation<'_, '_> {
             && !self.jvm_scala_object_definition(row.definition())?))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn jvm_source_member_target(
         &self,
         source: &super::demand_closure::SourceHalf,

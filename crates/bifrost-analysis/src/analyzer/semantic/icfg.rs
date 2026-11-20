@@ -286,6 +286,15 @@ impl IcfgProviderBehaviorIdentity {
         // states for itself, and none of them moves because an unrelated file
         // was edited.
         let push_engine_inputs = |digest: &mut LengthDelimitedDigest| {
+            digest.push(b"host-activation-authority");
+            digest.push(
+                snapshot
+                    .map_or_else(
+                        || workspace.analyzer().host_activation_identity(),
+                        |snapshot| snapshot.active_models().host_activation().identity(),
+                    )
+                    .as_bytes(),
+            );
             digest.push(b"dependency-discovery-output");
             digest.push(dependency_output.as_bytes());
             match snapshot {
@@ -381,11 +390,14 @@ impl IcfgProviderBehaviorIdentity {
         Self {
             digest: digest.finish(),
             read: read.finish(),
-            models: snapshot.map_or_else(no_active_model_set_digest, |snapshot| {
-                crate::analyzer::i_analyzer::active_model_digest(
-                    snapshot.active_models().active_model_set_hash(),
-                )
-            }),
+            models: snapshot.map_or_else(
+                || workspace.analyzer().model_set_digest(None),
+                |snapshot| {
+                    crate::analyzer::i_analyzer::active_model_digest(
+                        snapshot.active_models().active_model_set_hash(),
+                    )
+                },
+            ),
         }
     }
 }
@@ -399,6 +411,317 @@ pub struct CallBoundary {
     pub model: CallToReturnModel,
 }
 
+/// Independent prerequisites, conditional on selecting one runtime member.
+/// These inputs grant neither runtime-target proof nor body/effect closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct CallTransferFamilyInputs {
+    call: CallSiteHandle,
+    members: Box<[CallTransferFamilyMemberInputs]>,
+    projection: Option<StableDigest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum CallTransferInputStatus {
+    Satisfied,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum CallTransferFamilyProjection {
+    Projected,
+    BodyUnavailable,
+    Deferred,
+    MissingTransfer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct CallTransferFamilyMemberInputs {
+    declaration: crate::analyzer::semantic::SemanticLocator,
+    callee: Option<ProcedureHandle>,
+    projection: CallTransferFamilyProjection,
+    arity: Option<CallBindingArity>,
+    conversion: CallTransferInputStatus,
+    capture_transport: CallTransferInputStatus,
+    caller_evaluation: CallTransferInputStatus,
+}
+
+impl CallTransferFamilyMemberInputs {
+    pub fn declaration(&self) -> &crate::analyzer::semantic::SemanticLocator {
+        &self.declaration
+    }
+
+    pub fn callee(&self) -> Option<&ProcedureHandle> {
+        self.callee.as_ref()
+    }
+
+    pub fn projection(&self) -> CallTransferFamilyProjection {
+        self.projection
+    }
+
+    pub fn arity(&self) -> Option<CallBindingArity> {
+        self.arity
+    }
+
+    pub fn conversion(&self) -> CallTransferInputStatus {
+        self.conversion
+    }
+
+    pub fn capture_transport(&self) -> CallTransferInputStatus {
+        self.capture_transport
+    }
+
+    pub fn caller_evaluation(&self) -> CallTransferInputStatus {
+        self.caller_evaluation
+    }
+}
+
+impl CallTransferFamilyInputs {
+    fn new(
+        family: &crate::analyzer::semantic::DispatchFamilyEvidence,
+        conversion: CallTransferInputStatus,
+        capture_transport: CallTransferInputStatus,
+        caller_evaluation: CallTransferInputStatus,
+    ) -> Self {
+        use crate::analyzer::semantic::DispatchFamilyMemberBody;
+        let membership = family
+            .membership()
+            .expect("sealed full membership was checked");
+        assert_eq!(family.call(), membership.call());
+        assert!(
+            membership
+                .members()
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert!(
+            family
+                .inputs()
+                .iter()
+                .filter(|input| !matches!(
+                    input.body(),
+                    DispatchFamilyMemberBody::AbstractDeclaration
+                ))
+                .map(|input| input.declaration())
+                .eq(membership.members().iter())
+        );
+        let mut members = Vec::with_capacity(membership.members().len());
+        for input in family.inputs() {
+            let (callee, projection) = match input.body() {
+                DispatchFamilyMemberBody::AbstractDeclaration => continue,
+                DispatchFamilyMemberBody::Unavailable => {
+                    (None, CallTransferFamilyProjection::BodyUnavailable)
+                }
+                DispatchFamilyMemberBody::Materialized(callee) => (
+                    Some(callee.clone()),
+                    CallTransferFamilyProjection::MissingTransfer,
+                ),
+            };
+            members.push(CallTransferFamilyMemberInputs {
+                declaration: input.declaration().clone(),
+                callee,
+                projection,
+                arity: None,
+                conversion,
+                capture_transport,
+                caller_evaluation,
+            });
+        }
+        Self {
+            call: family.call().clone(),
+            members: members.into_boxed_slice(),
+            projection: None,
+        }
+    }
+
+    pub fn call(&self) -> &CallSiteHandle {
+        &self.call
+    }
+
+    pub fn members(&self) -> &[CallTransferFamilyMemberInputs] {
+        &self.members
+    }
+
+    /// Match the full sealed family to its complete materialized transfer set.
+    /// Unavailable, deferred or missing projections make this false. A match
+    /// proves neither runtime selection nor binding/effect/protocol closure;
+    /// the independent arity and caller-side prerequisites still apply.
+    /// The original carrier cannot be reused after raw evidence is weakened,
+    /// even when call/member identities remain the same.
+    /// Consumers must also reject cancelled or budget-limited enclosing
+    /// outcomes; this value does not carry the request's completion status.
+    pub fn applies_to(&self, call: &CallSiteHandle, set: &CallTransferSet) -> bool {
+        use crate::analyzer::semantic::DispatchFamilyMemberBody;
+        let Some(family) = &set.family else {
+            return false;
+        };
+        let Some(membership) = family.membership() else {
+            return false;
+        };
+        let transfers = &set.transfers;
+        if &self.call != call
+            || family.call() != call
+            || membership.call() != call
+            || !self
+                .members
+                .iter()
+                .map(|member| &member.declaration)
+                .eq(membership.members())
+            || self.members.len() != transfers.len()
+            || self.projection != Some(set.raw_projection_fingerprint())
+        {
+            return false;
+        }
+        self.members.iter().all(|member| {
+            if member.projection != CallTransferFamilyProjection::Projected {
+                return false;
+            }
+            let Ok(index) = family
+                .inputs()
+                .binary_search_by(|input| input.declaration().cmp(&member.declaration))
+            else {
+                return false;
+            };
+            let body_matches = matches!(
+                (family.inputs()[index].body(), &member.callee),
+                (DispatchFamilyMemberBody::Materialized(body), Some(callee)) if body == callee
+            );
+            body_matches
+                && transfers
+                    .iter()
+                    .filter(|transfer| {
+                        &transfer.origin == call
+                            && Some(&transfer.callee) == member.callee.as_ref()
+                            && transfer.callee_entry.id()
+                                == transfer.callee.semantics().entry_point()
+                            && transfer.callee_entry.procedure() == &transfer.callee
+                    })
+                    .count()
+                    == 1
+        })
+    }
+
+    fn member_mut(&mut self, callee: &ProcedureHandle) -> &mut CallTransferFamilyMemberInputs {
+        // The declaration inventory and semantic procedure locators are
+        // different projections. Sealing already matched these exact body
+        // handles to all raw candidates; use that association directly.
+        self.members
+            .iter_mut()
+            .find(|member| member.callee.as_ref() == Some(callee))
+            .expect("sealed membership contains every raw candidate body")
+    }
+
+    fn allocation_bytes(family: &crate::analyzer::semantic::DispatchFamilyEvidence) -> usize {
+        let membership = family
+            .membership()
+            .expect("sealed full membership was checked");
+        std::mem::size_of::<Self>()
+            + membership.members().len() * std::mem::size_of::<CallTransferFamilyMemberInputs>()
+            + membership
+                .members()
+                .iter()
+                .map(super::oracle::dispatch::family_locator_heap_bytes)
+                .sum::<usize>()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(self.members.as_ref())
+            + self
+                .members
+                .iter()
+                .map(|member| {
+                    super::oracle::dispatch::family_locator_heap_bytes(&member.declaration)
+                })
+                .sum::<usize>()
+    }
+
+    pub fn retained_artifacts(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.allocation(self as *const Self as usize, self.retained_bytes());
+        census.procedure(self.call.procedure());
+        for member in &self.members {
+            if let Some(callee) = &member.callee {
+                census.procedure(callee);
+            }
+        }
+    }
+}
+
+/// A sealed dispatch family whose every arm is projected in one transfer set.
+/// See [`CallTransferSet::family_closure`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct CallTransferFamilyClosure<'a> {
+    set: &'a CallTransferSet,
+}
+
+impl CallTransferFamilyClosure<'_> {
+    /// Whether the sealed family accounts for this boundary: an abstract
+    /// family declaration has no executable body, and the open remainder of
+    /// the target set is the absence that membership proved.
+    pub fn discharges(&self, boundary: &CallBoundary) -> bool {
+        self.set
+            .family
+            .as_deref()
+            .expect("a family closure retains its family")
+            .discharges(&boundary.dispatch)
+    }
+
+    /// Every arm of the family with its own completeness and the raw
+    /// transfer's proof, and without the boundaries the family accounts for.
+    /// The result carries no family certificate, so it cannot certify again.
+    pub fn analyzed_arms(&self) -> CallTransferSet {
+        CallTransferSet {
+            caller_conversion_may_run_user_code: false,
+            transfers: self
+                .set
+                .transfers
+                .iter()
+                .map(|transfer| CallTransfer {
+                    completeness: self.arm_completeness(transfer).clone(),
+                    ..transfer.clone()
+                })
+                .collect(),
+            boundaries: self
+                .set
+                .boundaries
+                .iter()
+                .filter(|boundary| !self.discharges(boundary))
+                .cloned()
+                .collect(),
+            coverage: CandidateCoverage::Exhaustive,
+            family: None,
+            family_inputs: None,
+        }
+    }
+
+    /// The arm's own completeness, independent of runtime selection. Its proof
+    /// stays the raw transfer's: one arm is still only a possible target.
+    fn arm_completeness(&self, transfer: &CallTransfer) -> &EvidenceCompleteness {
+        use crate::analyzer::semantic::DispatchFamilyMemberBody;
+        let family = self
+            .set
+            .family
+            .as_deref()
+            .expect("a family closure retains its family");
+        family
+            .inputs()
+            .iter()
+            .find(|input| {
+                matches!(input.body(), DispatchFamilyMemberBody::Materialized(body)
+                    if body == &transfer.callee)
+            })
+            .expect("a family closure projects every transfer from one sealed member")
+            .completeness()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallTransferSet {
     /// Caller-side argument evaluation is independent of any callee model.
@@ -406,6 +729,77 @@ pub struct CallTransferSet {
     pub transfers: Box<[CallTransfer]>,
     pub boundaries: Box<[CallBoundary]>,
     pub coverage: CandidateCoverage,
+    /// Enumeration and independent member inputs; never upgrades raw edges.
+    pub family: Option<Box<crate::analyzer::semantic::DispatchFamilyEvidence>>,
+    /// Conditional transfer inputs only; ordinary raw paths do not consume them.
+    pub family_inputs: Option<Box<CallTransferFamilyInputs>>,
+}
+
+impl CallTransferSet {
+    fn raw_projection_fingerprint(&self) -> StableDigest {
+        // Request-local applicability only. Bind every raw transfer field,
+        // caller conversion, boundary/model and coverage without duplicating
+        // reason strings. This is separate from ProcedureDispatch's answer.
+        crate::analyzer::semantic::ids::semantic_value_fingerprint(
+            b"bifrost-call-transfer-family-projection-v1",
+            &(
+                self.caller_conversion_may_run_user_code,
+                self.transfers.as_ref(),
+                self.boundaries.as_ref(),
+                self.coverage,
+            ),
+        )
+    }
+
+    /// The selection-only weakness that this call's sealed dispatch family
+    /// accounts for, when every arm of that family is projected here with
+    /// satisfied independent inputs.
+    ///
+    /// Enumeration proves the complete set of possible runtime arms, never
+    /// which arm executes: each raw transfer stays an Unproven may-target. A
+    /// consumer may use the certificate only when it analyzes every arm for
+    /// the same subject (#11296); it must still combine each arm's own
+    /// outcome, and it must keep cancelled or budget-limited enclosing
+    /// outcomes open, because this value does not carry request completion.
+    #[doc(hidden)]
+    pub fn family_closure(&self, call: &CallSiteHandle) -> Option<CallTransferFamilyClosure<'_>> {
+        let inputs = self.family_inputs.as_deref()?;
+        let family = self.family.as_deref()?;
+        let membership = family.membership()?;
+        // A reviewed external remainder is a separate, exact-summary closure
+        // and is not certified here.
+        if self.caller_conversion_may_run_user_code
+            || membership.external_remainder().is_some()
+            || !inputs.applies_to(call, self)
+        {
+            return None;
+        }
+        // An arm whose formals do not accept this call's actuals has its own
+        // binding gap, which analyzed_arms() must not replace with the arm's
+        // complete body evidence.
+        let inputs_satisfied = inputs.members().iter().all(|member| {
+            member.arity.is_some_and(CallBindingArity::accepts_actuals)
+                && member.conversion == CallTransferInputStatus::Satisfied
+                && member.capture_transport == CallTransferInputStatus::Satisfied
+                && member.caller_evaluation == CallTransferInputStatus::Satisfied
+        });
+        let arms_complete = family.arms_complete();
+        let closure = CallTransferFamilyClosure { set: self };
+        (inputs_satisfied
+            && arms_complete
+            && self
+                .boundaries
+                .iter()
+                .all(|boundary| &boundary.origin == call && closure.discharges(boundary)))
+        .then_some(closure)
+    }
+
+    fn bind_family_inputs(&mut self) {
+        if let Some(mut inputs) = self.family_inputs.take() {
+            inputs.projection = Some(self.raw_projection_fingerprint());
+            self.family_inputs = Some(inputs);
+        }
+    }
 }
 
 pub trait IcfgProvider: DispatchOracle {
@@ -421,6 +815,20 @@ pub trait IcfgProvider: DispatchOracle {
     /// Stable identity of provider state that can change emitted topology.
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         IcfgProviderBehaviorIdentity::hash_bytes(DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN)
+    }
+
+    /// The local control edges of `procedure` that no execution takes, in
+    /// ascending order.
+    ///
+    /// Summary tabulation and snapshot construction propagate along none of
+    /// them. A caller should keep the answer for the query, by procedure. A
+    /// provider that reads no workspace declarations names none.
+    fn infeasible_control_edges(
+        &self,
+        _procedure: &ProcedureHandle,
+        _cancellation: &crate::cancellation::CancellationToken,
+    ) -> Vec<crate::analyzer::semantic::ControlEdgeId> {
+        Vec::new()
     }
 
     fn call_transfers(
@@ -708,6 +1116,12 @@ impl<'a> WorkspaceIcfgProvider<'a> {
                 transfers.procedure(&key.0);
                 transfers.context(&key.2);
                 if let Some(outcome) = cached.outcome.available_value() {
+                    if let Some(family) = &outcome.family {
+                        family.retained_artifacts(&mut transfers);
+                    }
+                    if let Some(inputs) = &outcome.family_inputs {
+                        inputs.retained_artifacts(&mut transfers);
+                    }
                     for transfer in &outcome.transfers {
                         transfers.procedure(transfer.origin.procedure());
                         transfers.procedure(&transfer.callee);
@@ -1232,6 +1646,18 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         self.behavior_identity
     }
 
+    fn infeasible_control_edges(
+        &self,
+        procedure: &ProcedureHandle,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Vec<crate::analyzer::semantic::ControlEdgeId> {
+        crate::analyzer::semantic::statement_entries::language_infeasible_control_edges(
+            self.workspace(),
+            procedure,
+            cancellation,
+        )
+    }
+
     /// The default profile projection, with the callee artifact it reads
     /// named.
     ///
@@ -1313,6 +1739,34 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
     }
 }
 
+/// An inherited stop has no new numeric refusal to attribute to this fill.
+/// Return no replayable value and retain the operational read dependency.
+fn observed_icfg_stop<T>(
+    request: &SemanticRequest<'_>,
+    work: SemanticWork,
+) -> Option<SemanticOutcome<T>> {
+    if request.cancellation.is_cancelled() {
+        return Some(SemanticOutcome::Cancelled {
+            partial: None,
+            work,
+        });
+    }
+    if !request.stop_observed() {
+        return None;
+    }
+    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+    crate::analyzer::i_analyzer::record_current_query_incomplete(
+        crate::analyzer::QueryReadIncomplete::ProofStopped {
+            reason: "icfg_request_stopped",
+            cause: Some(crate::analyzer::read_ledger::DerivationExecutionCause::Budget),
+        },
+    );
+    Some(SemanticOutcome::Unknown {
+        partial: None,
+        work,
+    })
+}
+
 impl WorkspaceIcfgProvider<'_> {
     fn exit_profile_with_memo(
         &self,
@@ -1325,11 +1779,8 @@ impl WorkspaceIcfgProvider<'_> {
             crate::analyzer::semantic::SemanticMemoAdmission,
         )>,
     ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
-        if request.cancellation.is_cancelled() {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work: SemanticWork::default(),
-            });
+        if let Some(outcome) = observed_icfg_stop(request, SemanticWork::default()) {
+            return Ok(outcome);
         }
         self.record_artifact_read(callee_entry.procedure());
         let cacheable_request =
@@ -1340,8 +1791,10 @@ impl WorkspaceIcfgProvider<'_> {
                 .exit_profile(self.workspace().analyzer(), request.budget, &key)
         });
         if let Some(outcome) = cached.flatten() {
+            crate::analyzer::usages::common::QueryMemoOwner::ExitProfile.count_hit();
             return Ok(outcome);
         }
+        crate::analyzer::usages::common::QueryMemoOwner::ExitProfile.count_miss();
         let before = request.budget.replay_snapshot();
         let refinements = self
             .oracle
@@ -1377,6 +1830,7 @@ impl WorkspaceIcfgProvider<'_> {
         let mut inert = None;
         let mut whole_set = None;
         let mut allocation_lifetimes = None;
+        let (proof, refusal) = request.judged_with_refusal(|request| {
         for logical in procedure.semantics().logical_gaps() {
             match logical.base.control_flow_discharge() {
                 SemanticGapDischarge::InertDropGlue => {
@@ -1417,21 +1871,26 @@ impl WorkspaceIcfgProvider<'_> {
                 }
                 _ => {}
             }
+            if request.stop_observed() { break; }
         }
+            Ok::<_, SemanticProviderError>(())
+        });
+        proof.value?;
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
                 work: refinements.work(),
             });
         }
-        if request.stop_observed()
-            && let Some(refusal) = request.budget.first_refusal()
-        {
+        if let Some(refusal) = refusal {
             return Ok(SemanticOutcome::ExceededBudget {
                 partial: None,
                 exceeded: refusal.exceeded,
                 work: refinements.work(),
             });
+        }
+        if let Some(outcome) = observed_icfg_stop(request, refinements.work()) {
+            return Ok(outcome);
         }
         let mut outcome = materialize_exit_profile_with_runtime_reads(
             callee_entry,
@@ -1517,11 +1976,8 @@ impl WorkspaceIcfgProvider<'_> {
             crate::analyzer::semantic::SemanticMemoAdmission,
         )>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
-        if request.cancellation.is_cancelled() {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work: SemanticWork::default(),
-            });
+        if let Some(outcome) = observed_icfg_stop(request, SemanticWork::default()) {
+            return Ok(outcome);
         }
         self.record_artifact_read(caller);
         let cacheable_request =
@@ -1538,9 +1994,19 @@ impl WorkspaceIcfgProvider<'_> {
             )
         });
         if let Some(cached) = cached.flatten() {
+            crate::analyzer::usages::common::QueryMemoOwner::CallTransfer.count_hit();
+            if let Some(membership) = cached
+                .outcome
+                .available_value()
+                .and_then(|set| set.family.as_ref())
+                .and_then(|family| family.membership())
+            {
+                membership.replay(&self.memo_attribution());
+            }
             record_dispatch_read_attribution(self.workspace(), &cached.dispatch_read);
             return Ok(cached.outcome);
         }
+        crate::analyzer::usages::common::QueryMemoOwner::CallTransfer.count_miss();
         let before = request.budget.replay_snapshot();
         let semantic_call = caller
             .semantics()
@@ -1552,6 +2018,7 @@ impl WorkspaceIcfgProvider<'_> {
         // captured with this fill, so a cache hit replays them.
         let mut allocation_lifetimes = None;
         let mut call_evaluation_gaps = Vec::new();
+        let (proof, refusal) = request.judged_with_refusal(|request| {
         for gap in scoped_call_evaluation_gaps(caller, &semantic_call) {
             if crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
                 gap,
@@ -1563,19 +2030,30 @@ impl WorkspaceIcfgProvider<'_> {
             {
                 call_evaluation_gaps.push(gap);
             }
+            if request.stop_observed() { break; }
         }
+            Ok::<_, SemanticProviderError>(())
+        });
+        proof.value?;
         // A lifetime proof the request budget refused leaves its gap open and
         // makes this fill's answer execution-dependent: report the stop, as
         // the exit-profile fill does, so the outcome is never stored as a
         // finished one.
-        if request.stop_observed()
-            && let Some(refusal) = request.budget.first_refusal()
-        {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        if let Some(refusal) = refusal {
             return Ok(SemanticOutcome::ExceededBudget {
                 partial: None,
                 exceeded: refusal.exceeded,
                 work: SemanticWork::default(),
             });
+        }
+        if let Some(outcome) = observed_icfg_stop(request, SemanticWork::default()) {
+            return Ok(outcome);
         }
         let mut staged_budget = request.budget.clone();
         // Context proof can acquire entering-caller source in another artifact.
@@ -1694,10 +2172,14 @@ impl WorkspaceIcfgProvider<'_> {
             }
             _ => None,
         };
+        let mut family_input_work = SemanticWork::default();
         let mapped = dispatch_outcome.try_map(|dispatch| {
             let mut transfers = Vec::new();
             let mut additional_work = SemanticWork::default();
             let argument_callable = dispatch.argument_callable().cloned().map(Arc::new);
+            let capture_incomplete = argument_callable
+                .as_ref()
+                .is_some_and(|proof| !proof.captures().is_empty());
             if let Some(provenance) = &argument_callable {
                 additional_work = additional_work.conservative_add(SemanticWork {
                     captures: provenance.capture_bindings().len().saturating_add(
@@ -1724,7 +2206,33 @@ impl WorkspaceIcfgProvider<'_> {
                     ..SemanticWork::default()
                 });
             }
-            let (candidates, dispatch_boundaries, coverage) = dispatch.into_parts();
+            let super::oracle::dispatch::DispatchResultParts {
+                candidates,
+                boundaries: dispatch_boundaries,
+                coverage,
+                family,
+            } = dispatch.into_parts();
+            let mut family_inputs = family.as_ref().and_then(|family| {
+                let membership = family.membership()?;
+                if membership.members().is_empty() {
+                    return None;
+                }
+                let work = SemanticWork {
+                    owned_text_bytes: CallTransferFamilyInputs::allocation_bytes(family),
+                    ..SemanticWork::default()
+                };
+                if !staged_budget.admission_fits(work) {
+                    return None;
+                }
+                staged_budget.admit(work).expect("optional metadata fit was checked");
+                family_input_work = work;
+                Some(Box::new(CallTransferFamilyInputs::new(
+                    family,
+                    if inspect_conversions { CallTransferInputStatus::Unavailable } else { CallTransferInputStatus::Satisfied },
+                    if capture_incomplete { CallTransferInputStatus::Unavailable } else { CallTransferInputStatus::Satisfied },
+                    if call_evaluation_gaps.is_empty() { CallTransferInputStatus::Satisfied } else { CallTransferInputStatus::Unavailable },
+                )))
+            });
             let mut boundaries = dispatch_boundaries
                 .into_vec()
                 .into_iter()
@@ -1760,6 +2268,9 @@ impl WorkspaceIcfgProvider<'_> {
             for candidate in candidates.into_vec() {
                 let properties = candidate.target.semantics().properties();
                 if semantic_call.invocation_mode == CallInvocationMode::Detached {
+                    if let Some(member) = family_inputs.as_mut().map(|inputs| inputs.member_mut(&candidate.target)) {
+                        member.projection = CallTransferFamilyProjection::Deferred;
+                    }
                     let previous_reason_bytes = completeness_reason_bytes(&candidate.completeness);
                     let completeness = EvidenceCompleteness::Partial(
                         "callee body executes in a different task".into(),
@@ -1803,6 +2314,9 @@ impl WorkspaceIcfgProvider<'_> {
                     continue;
                 }
                 if properties.invocation.is_deferred() {
+                    if let Some(member) = family_inputs.as_mut().map(|inputs| inputs.member_mut(&candidate.target)) {
+                        member.projection = CallTransferFamilyProjection::Deferred;
+                    }
                     let previous_reason_bytes = completeness_reason_bytes(&candidate.completeness);
                     let completeness = EvidenceCompleteness::Partial(
                         "callee body execution requires a later resume transfer".into(),
@@ -1856,9 +2370,13 @@ impl WorkspaceIcfgProvider<'_> {
                     continue;
                 };
                 let conversion_incomplete = inspect_conversions;
+                let arity = call_binding_arity(&semantic_call, candidate.target.semantics().values());
+                if let Some(member) = family_inputs.as_mut().map(|inputs| inputs.member_mut(&candidate.target)) {
+                    member.projection = CallTransferFamilyProjection::Projected;
+                    member.arity = Some(arity);
+                }
                 let (mut completeness, mut added_reason_bytes) = call_binding_completeness(
-                    &semantic_call,
-                    candidate.target.semantics().values(),
+                    arity,
                     candidate.completeness,
                 );
                 // A transfer already partial keeps its first reason.
@@ -1871,10 +2389,7 @@ impl WorkspaceIcfgProvider<'_> {
                         completeness_reason_bytes(&completeness).saturating_sub(previous),
                     );
                 }
-                if argument_callable
-                    .as_ref()
-                    .is_some_and(|proof| !proof.captures().is_empty())
-                {
+                if capture_incomplete {
                     // Exact control-flow dispatch is established, but the value-flow
                     // consumer does not yet project this caller's capture environment.
                     // Preserve the association without claiming complete value transport.
@@ -1923,6 +2438,8 @@ impl WorkspaceIcfgProvider<'_> {
                 transfers: transfers.into_boxed_slice(),
                 boundaries: boundaries.into_boxed_slice(),
                 coverage,
+                family,
+                family_inputs,
             };
             additional_work = additional_work.conservative_add(SemanticWork {
                 owned_text_bytes: apply_call_evaluation_gaps(
@@ -1931,6 +2448,16 @@ impl WorkspaceIcfgProvider<'_> {
                 ),
                 ..SemanticWork::default()
             });
+            // All raw caller-side weakening has finished. No public operation
+            // can rebind the carrier to a replacement projection.
+            transfer_set.bind_family_inputs();
+            // Optional authority never displaces the paid raw projection. The
+            // initial allocation was admitted before construction; relinquish
+            // it before the ordinary charge if the raw projection needs room.
+            if transfer_set.family_inputs.is_some() && !staged_budget.admission_fits(additional_work) {
+                drop(transfer_set.family_inputs.take());
+                staged_budget.release_admission(family_input_work);
+            }
             Ok((transfer_set, additional_work))
         });
         let mapped = match mapped {
@@ -1959,6 +2486,7 @@ impl WorkspaceIcfgProvider<'_> {
         let original_work = mapped.work();
         let total_work = original_work
             .conservative_add(conversion_work)
+            .conservative_add(family_input_work)
             .conservative_add(additional_work);
         if let Some(outcome) = charge_call_transfer_projection(
             &mapped,
@@ -2037,23 +2565,20 @@ impl WorkspaceIcfgProvider<'_> {
             });
         }
         let max_source_bytes = request.budget.limits().source_bytes;
-        let Some((_, root_source)) =
-            exact_source_for_procedure(self.workspace(), root, max_source_bytes)?
-        else {
-            let work = SemanticWork {
-                source_bytes: max_source_bytes.saturating_add(1),
-                ..SemanticWork::default()
+        let (_, root_source) =
+            match exact_source_for_procedure(self.workspace(), root, max_source_bytes)?
+                .on_budget(request.budget)?
+            {
+                Ok(source) => source,
+                Err(exceeded) => {
+                    let work = SemanticWork::default();
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: Some(IcfgSnapshot::empty()),
+                        exceeded,
+                        work,
+                    });
+                }
             };
-            let exceeded = request.budget.check_admission(work).map_or_else(
-                |exceeded| exceeded,
-                |_| unreachable!("bounded root-source omission must exceed the remaining budget"),
-            );
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(IcfgSnapshot::empty()),
-                exceeded,
-                work,
-            });
-        };
         let root_entry = root
             .point_handle(root.semantics().entry_point())
             .ok_or_else(|| SemanticProviderError::internal("root procedure has no entry point"))?;
@@ -2066,6 +2591,10 @@ impl WorkspaceIcfgProvider<'_> {
         let mut transfer_cache: HashMap<
             (CallSiteHandle, OracleCallContext),
             SemanticOutcome<CallTransferSet>,
+        > = HashMap::default();
+        let mut infeasible_edges: HashMap<
+            ProcedureHandle,
+            Vec<crate::analyzer::semantic::ControlEdgeId>,
         > = HashMap::default();
         builder.work = root_work;
         builder.intern(
@@ -2092,6 +2621,13 @@ impl WorkspaceIcfgProvider<'_> {
                 continue;
             }
             let call = invoked_call_at(&key.point)?;
+            if !infeasible_edges.contains_key(key.point.procedure()) {
+                infeasible_edges.insert(
+                    key.point.procedure().clone(),
+                    self.infeasible_control_edges(key.point.procedure(), request.cancellation),
+                );
+            }
+            let infeasible = &infeasible_edges[key.point.procedure()];
 
             if let Some(call) = call {
                 let semantic_call = key
@@ -2186,24 +2722,27 @@ impl WorkspaceIcfgProvider<'_> {
                 // Preserve any unusual non-scaffolding local edges, while the
                 // known normal/exceptional continuation rows are replaced by
                 // call and matched-return transfers.
-                for (_, edge) in key
+                for (edge_id, edge) in key
                     .point
                     .procedure()
                     .semantics()
                     .successor_edges(key.point.id())
                 {
-                    if is_call_scaffolding(edge, &semantic_call) {
+                    if is_call_scaffolding(edge, &semantic_call) || infeasible.contains(&edge_id) {
                         continue;
                     }
                     add_local_edge(&mut builder, node, &key, edge, request)?;
                 }
             } else {
-                for (_, edge) in key
+                for (edge_id, edge) in key
                     .point
                     .procedure()
                     .semantics()
                     .successor_edges(key.point.id())
                 {
+                    if infeasible.contains(&edge_id) {
+                        continue;
+                    }
                     add_local_edge(&mut builder, node, &key, edge, request)?;
                 }
             }
@@ -2260,12 +2799,15 @@ pub(crate) fn cancelled_call_transfer_outcome(
     SemanticOutcome::Cancelled { partial, work }
 }
 
-pub(crate) fn apply_call_evaluation_gaps(
-    gaps: &[&SemanticGap],
-    transfers: &mut CallTransferSet,
-) -> usize {
+#[doc(hidden)]
+pub fn apply_call_evaluation_gaps(gaps: &[&SemanticGap], transfers: &mut CallTransferSet) -> usize {
     if gaps.is_empty() {
         return 0;
+    }
+    if let Some(inputs) = &mut transfers.family_inputs {
+        for member in &mut inputs.members {
+            member.caller_evaluation = CallTransferInputStatus::Unavailable;
+        }
     }
     let detail = gaps
         .iter()
@@ -2788,6 +3330,15 @@ pub fn validate_call_transfer_set(
     let origin = caller
         .call_site_handle(semantic_call.id)
         .ok_or_else(|| SemanticProviderError::internal("failed to scope ICFG transfer call"))?;
+    if transfers
+        .family
+        .as_ref()
+        .is_some_and(|family| family.call() != &origin)
+    {
+        return Err(SemanticProviderError::invalid_identity(
+            "dispatch family belongs to a different call",
+        ));
+    }
     if semantic_call.invocation_mode == CallInvocationMode::Detached
         && !transfers.transfers.is_empty()
     {

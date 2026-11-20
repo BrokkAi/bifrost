@@ -199,6 +199,7 @@ mod python_extraction_tests {
             )
             .expect("register external summary fixture");
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("package version"),
@@ -210,7 +211,8 @@ mod python_extraction_tests {
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -1041,6 +1043,7 @@ pub(super) mod runtime_fixture {
             )
             .unwrap();
         let activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: vec![],
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![],

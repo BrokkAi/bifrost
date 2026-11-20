@@ -565,6 +565,7 @@ pub fn generate_jdk_summaries(
         vec![AuthoredShard {
             id: "codeql.jdk21.procedure-summaries".to_owned(),
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 toolchain: Some(NameSelector {
                     name: "jdk".to_owned(),
                     version: Some(requirement.to_owned()),

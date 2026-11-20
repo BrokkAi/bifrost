@@ -463,6 +463,7 @@ Select and configure exactly one policy analysis kind. Legal in: policy, every a
 | `:rql-schema-version` | optional | policy, every analysis type | a supported positive schema version | `:rql-schema-version N`. Pin the RQL schema version for selectors that omit their own; explicit selector pins must agree. This is independent of the RQLP document schema version. |
 | `:sources` | required | policy, `taint` | an endpoint-set record | `:sources (endpoint-set ...)`. Compose the complete taint source set. |
 | `:sinks` | required | policy, `taint` | an endpoint-set record | `:sinks (endpoint-set ...)`. Compose the complete taint sink set. |
+| `:guard-barriers` | optional | policy, `match` or `taint` | guard-barrier records | `:guard-barriers [(guard-barrier ...)]`. Declare branch guards whose removals require an affirmative binding and storage proof. |
 | `:sanitizers` | optional | policy, `taint` | an endpoint-set record | `:sanitizers (endpoint-set ...)`. Compose optional sanitizer models; omission is empty. |
 | `:stores` | optional | policy, `taint` | an endpoint-set record | `:stores (endpoint-set ...)`. Compose optional persistence-store models from local store-write and store-read entries; omission is empty. |
 | `:entry-points` | optional | policy, `taint` | an endpoint-set record | `:entry-points (endpoint-set ...)`. Compose optional framework entry-point models; omission is empty. |
@@ -475,6 +476,35 @@ Select and configure exactly one policy analysis kind. Legal in: policy, every a
 | `:subjects` | required | policy, `typestate` | a subject-set record | `:subjects (subject-set ...)`. Compose values newly tracked by typestate. |
 | `:uncertainty` | required | policy, `typestate` | an uncertainty record | `:uncertainty (uncertainty ...)`. Declare explicit handling for subjects that escape the analysis root. |
 | `:automaton` | required | policy, `typestate` | an automaton record | `:automaton (automaton ...)`. Declare the author-facing typestate automaton and terminal obligations. |
+
+#### Authored guard barriers
+
+A taint guard barrier removes its declared labels on the branch selected by
+`:clean-when`, after proving the exact operand version and its exclusive owned
+storage. For example:
+
+```lisp
+:guard-barriers [
+  (guard-barrier :id size-checked
+    :predicate (comparison-guard :relation ordering :operand lesser)
+    :clean-when true
+    :removes [attacker-controlled])]
+```
+
+A `comparison-guard` selects `equality` or `inequality` with `:operand either`,
+or `ordering` with `:operand lesser` or `greater`. A `call-guard` instead names
+`:selector (rql ...)` and an operand such as `(argument :index 0)` or `receiver`;
+its selected result must control the branch.
+
+Storage proof currently supports inline owned values with complete nonescape
+evidence. References, raw pointers, opaque heap payloads, interior-mutable
+payloads, and unavailable evidence keep findings with a typed decline
+diagnostic. Escaping borrows and captures also prevent removal. An operand
+read before a later argument reassigns it describes the earlier version;
+the new value remains unguarded.
+
+These records are accepted by both match and taint source forms. Match
+`without-flow` guard removals are not yet applied by the evaluator.
 
 #### `call-modeling`
 
@@ -2536,7 +2566,8 @@ it while the other policies went on. Such a run reached no verdict, so it
 makes the exit status 2 unless the policy's `on-unknown` verdict is
 `warn-unreliable` or `fail-closed`.
 
-`failed` reasons: `invalid_execution_plan`,
+`failed` reasons: `endpoint_role_unresolved` (an empty endpoint role whose own
+selectors could not finish discovery), `invalid_execution_plan`,
 `workspace_snapshot_unavailable`, `source_read_failed`, `workspace_io`,
 `ambiguous_endpoint_dominance`, `ambiguous_typestate_binding`,
 `conflicting_organizational_risk_overlay`, `internal_invariant`.
@@ -2671,7 +2702,8 @@ Run diagnostic `impact` values: `advisory`, `declared_non_exhaustive`,
 Run diagnostic `code.type` values: `code_query` (with a nested CodeQuery
 `code`), `unsupported_analysis`, `stable_anchor_unavailable`,
 `endpoint_dominance_undecidable`, `evaluation_failure`, `empty_selection`,
-`unknown_verdict_fail_closed`, `batch_finding_limit`,
+`guard_removal_vocabulary_note`, `unknown_verdict_fail_closed`,
+`batch_finding_limit`,
 `report_retention_budget`, `cvss_variant_budget`,
 `projection_scenario_membership_budget`,
 `organizational_risk_overlay_budget`, `duplicate_finding_id` (an advisory:

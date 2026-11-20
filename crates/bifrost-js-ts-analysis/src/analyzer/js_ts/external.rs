@@ -33,9 +33,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     DependencyEvidenceKind, DependencyFileEvidenceLimits,
 };
 
-use crate::analyzer::js_ts::dependency_evidence::{
-    is_js_ts_dependency_input, js_ts_selected_dependency_file_evidence,
-};
+use crate::analyzer::js_ts::dependency_evidence::js_ts_selected_dependency_file_evidence;
 
 use brokk_bifrost_analysis::analyzer::dependency_support::resolve_dependency_path as resolve;
 #[cfg(test)]
@@ -209,7 +207,8 @@ pub fn typescript_library_activation_evidence(
                 toolchain: None,
                 target: None,
                 configuration: Some(format!("typescript-lib:{library}")),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             })
             .collect()
     } else {
@@ -484,10 +483,10 @@ fn npm_lock_activation_rows(
         "npm",
         "npm",
         |path| {
-            is_js_ts_dependency_input(path)
-                && !path
-                    .components()
-                    .any(|component| component.as_os_str() == "node_modules")
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyResolver::is_discovery_candidate(
+                &super::dependency_packs::NpmDependencyResolver,
+                path,
+            )
         },
         limits,
         cancellation,
@@ -604,7 +603,8 @@ fn npm_lock_activation_rows(
                         toolchain: None,
                         target: None,
                         configuration: None,
-                        artifact_sha256: None,
+                        production_input_digest: None,
+                        verified_raw_artifacts: Vec::new(),
                     },
                     provenance: provenance.clone(),
                     artifacts: Vec::new(),
@@ -1241,6 +1241,7 @@ impl TypeScriptDeclarationPackProducer {
             let mut activation = request.activation.clone();
             if activation.is_empty() {
                 activation.push(ActivationSelector {
+                    production_input_digest: None,
                     package: None,
                     module: None,
                     toolchain: None,
@@ -1668,7 +1669,7 @@ impl DependencyPackAdapter for JsTsDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer::for_name("bifrost-typescript-declaration")
+        (Producer::for_name("bifrost-typescript-declaration")).with_dependency_revision()
     }
 
     /// An npm lock row names a package coordinate and no artifact, so it
@@ -2187,6 +2188,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
     fn collect_property(&mut self, node: Node<'_>, owner_id: &str) {
         let name = field_text(node, "name", self.source).unwrap_or_else(|| "[]".to_owned());
         let signature = node.child_by_field_name("type").map(|node| Signature {
+            bounds: None,
             type_parameters: Vec::new(),
             parameters: Vec::new(),
             returns: Some(type_ref(node, self.source, self.limits.max_signature_depth)),
@@ -2215,6 +2217,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                     continue;
                 }
                 let signature = candidate.child_by_field_name("type").map(|node| Signature {
+                    bounds: None,
                     type_parameters: Vec::new(),
                     parameters: Vec::new(),
                     returns: Some(type_ref(node, self.source, self.limits.max_signature_depth)),
@@ -2290,6 +2293,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.type_index_by_name
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -2305,6 +2309,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             type_kind,
             visibility: Visibility::Public,
             is_abstract: node.kind() == "abstract_class_declaration",
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -2357,6 +2362,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 .and_then(|signature| signature.returns.as_ref()),
         });
         self.members.push(MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -2628,6 +2635,7 @@ fn callable_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
         });
     }
     Some(Signature {
+        bounds: None,
         type_parameters: type_parameters(node, source),
         parameters: parsed_parameters,
         returns: node
@@ -2844,6 +2852,7 @@ fn js_ts_dependency_production_request(
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {
+            production_input_digest: None,
             package: dependency
                 .evidence
                 .package
@@ -2903,6 +2912,7 @@ fn typescript_library_production_request(
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: TYPESCRIPT_STDLIB_PACKAGE.to_owned(),
                 version: Some(format!("={TYPESCRIPT_STDLIB_VERSION}")),
@@ -3092,7 +3102,8 @@ fn resolve_locked_package(
                     toolchain: None,
                     target: None,
                     configuration: Some(format!("typescript-lib:{library}")),
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 };
                 ResolvedDependency {
                     id: format!(
@@ -3163,7 +3174,8 @@ fn resolve_locked_package(
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 },
                 provenance,
                 artifacts: vec![
@@ -3395,7 +3407,7 @@ fn approved_package_roots(config: &JsTsDependencyDiscoveryConfig, root: &Path) -
         .into_iter()
         .filter_map(|path| {
             let canonical = path.canonicalize().ok()?;
-            if canonical != path {
+            if !is_canonical_spelling(&path, &canonical) {
                 refuse_external_discovery_reads();
             }
             Some(canonical)
@@ -3538,6 +3550,45 @@ mod producer_tests {
     use compiler::compile_pack;
 
     use producer::read_exact_source_set;
+
+    #[test]
+    #[hardwon("#13580: a Windows canonical spelling difference refused npm external-read carry")]
+    fn npm_package_roots_accept_windows_canonical_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"node_modules/widget":{"version":"2.1.0"}}}"#,
+        )
+        .unwrap();
+        let package = root.join("node_modules/widget");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"widget","version":"2.1.0","types":"index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("index.d.ts"),
+            "export declare function create(value: string): string;\n",
+        )
+        .unwrap();
+        let project = brokk_bifrost_core::analyzer::project::FilesystemProject::new(root).unwrap();
+        let config = JsTsDependencyDiscoveryConfig::default();
+        let (outcome, reads) = capture_external_discovery_reads(|| {
+            resolve_js_ts_semantic_pack_dependencies(
+                &config,
+                &project,
+                &DependencyPackLimits::default(),
+                None,
+            )
+        });
+        assert!(outcome.complete, "{:?}", outcome.diagnostics);
+        assert!(
+            reads.complete,
+            "a benign node_modules spelling must not refuse external-read carry"
+        );
+    }
 
     #[test]
     fn npm_lock_change_or_optional_lock_appearance_invalidates_reads() {
@@ -3983,6 +4034,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
         let mut request = request(PathBuf::new());
         request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
         request.activation = vec![ActivationSelector {
+            production_input_digest: None,
             package: None,
             module: None,
             toolchain: None,
@@ -4511,6 +4563,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: Some(NameSelector {
                     name: "widget".to_owned(),
                     version: Some("=1.2.3".to_owned()),

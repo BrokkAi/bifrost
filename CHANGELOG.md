@@ -7,134 +7,242 @@ projection and its commit history does not contain every source commit.
 
 ## [Unreleased]
 
-### Added
+## [0.15.4] - 2026-11-20
 
-- Rust async bodies are analyzed. Locals survive `.await`, and shared or
-  escaped memory becomes unknown after an await unless Rust ownership facts
-  prove it exclusive. Python, C# and JavaScript/TypeScript treat an await as
-  a possible memory interference the same way (#12128).
-- Structural queries treat Java `this(...)` and `super(...)` (including
-  `outer.super(...)`) and C# `: this(...)` and `: base(...)` as constructor
-  calls with their written arguments, keeping C# `ref`, `out`, `in` and named
-  arguments. A `call` or argument query over a file that contains them no
-  longer leaves them out and reports the answer complete (#10319).
-- A match policy's report carries the work metric
-  `query.match.candidate_sites`: the number of distinct sites its pattern's
-  anchor selected before any filter ran. A run with no findings can now show
-  whether it examined candidates. It is identical for cold and warm runs and
-  is absent, not zero, when it was not measured (#12581).
+### Breaking
+
+- Policy reports use schema 25, up from 23 in 0.15.3. Readers that pin the
+  version must accept 25. Failed definition and flow store reads are
+  refused at their admission boundaries instead of being published as
+  results, and a flow endpoint role that binds nothing reports the failure
+  reason `endpoint_role_unresolved` (#11955, #13322).
+
+### Removed
+
+- The MCP and CLI `relation_brief` tool is removed. Use RQL through
+  `query_code` for relation queries (#14424).
 
 ### Changed
 
-- Policy reports share their retention budget across policies to keep large
-  result sets from crowding out smaller ones. The 10,000-finding batch cap is
-  removed, while byte limits still apply. Retention cuts preserve acceptance
-  and suppression-audit candidates before ordinary findings (#12498, #12560).
+- The CLI approves installed first-party semantic packs whose exact release
+  content is verified by its host approval inventory. Explicit disabling,
+  compatibility, license and entitlement checks still apply; third-party
+  packs retain their review requirements (#14237).
+- The Bifrost DSH launcher requires engine 0.15.4 or later, so it never
+  runs an engine that lacks first-party pack approval (#14237).
+- Installed third-party Python semantic packs (for example Flask, Werkzeug
+  and Django models) activate from exact pins in the workspace's `uv.lock`,
+  `poetry.lock` or `requirements.txt` when no runtime environment is
+  configured, so CLI and hosted runs that never install dependencies no
+  longer leave them dormant (#14581).
+- RQL control relations compute only the requested relation families and
+  expand results lazily, replacing the former fixed work-count cutoff with
+  typed incomplete outcomes when result or retained-memory limits are reached
+  (#13657).
+- `BIFROST_CACHE_DIR` now keeps the analyzer database and the semantic-pack
+  catalog in a Bifrost-created `bifrost-store/` child with a self-ignoring
+  `.gitignore`, so a cache directory inside a repository no longer appears in
+  `git status` or work-tree diffs. The first run after upgrading rebuilds the
+  cache from scratch. Bifrost warns on every run about a database or catalog
+  that an earlier version left directly in the directory, so it can be
+  deleted; Bifrost never deletes it (#13703).
+- Cold MCP analyzer calls return `workspace_not_ready` promptly while workspace
+  preparation continues. Clients can poll `get_active_workspace` for readiness
+  and build progress before retrying. Request deadline diagnostics identify
+  the phase interrupted by the timeout (#13618, #13617).
+- Live source-scoped CLI, MCP and Python sessions now select JVM dependencies
+  from their full project build while analyzing only the selected sources.
+  `--without-project-build` (or the matching scoped-session option) restores
+  subset-only dependency discovery. Revision scopes remain incomplete until
+  a full revision build authority is available; the option is a no-op there
+  (#11968, #12427).
 
-- The Rust analyzer enables all declared Cargo features and the test
-  configuration for workspace members, including code outside the default
-  feature set (#12335). When two enabled configurations select different
-  declarations, the answer is ambiguous instead of a guess (#12164).
-- Rust analysis tracks local value flow inside async bodies across an
-  `await`. It treats shared or escaped memory as uncertain across suspension
-  and distinguishes constructing a future from running its body (#12251).
-- A failed listing read in a workspace without analyzers reports an
-  incomplete answer instead of an empty one (#12040).
+### Added
+
+- RQL `field_writes_of` and `field_reads_of` expose field access sites,
+  values and proof evidence. Unproven candidates remain visible with explicit
+  incomplete coverage, including unsupported static-field inventories
+  (#14040, #14380).
+- RQL call-argument results carry structured site context, and query
+  diagnostics identify the producing step. Steps that consume input but
+  return no rows distinguish filtering, no match and incomplete analysis
+  (#13917).
+- Rust Taint and flow-backed Match policies support authored guard barriers.
+  Configured flow removals require a proven accepting comparison and stable,
+  exclusively owned operand; borrowed or uncertain storage retains findings
+  (#13554, #13672).
+- The CLI and MCP expose `flow_query` for value-flow, control-path and
+  callable-reachability questions using selected source locations. Call paths
+  describe callable reachability, not ordering between points. Endpoint
+  selection and language support remain explicit: unsupported or incomplete
+  questions return typed reasons rather than an empty answer (#13677).
+- Long-running flow-policy evaluations report their current phase through
+  CLI progress on stderr and MCP progress notifications, while fast CLI
+  calls remain quiet (#13390).
+- The Rust API exposes exact Cargo and rustdoc dependency evidence for
+  offline model producers without scanning a project or publishing models
+  into a workspace (#13320).
 
 ### Fixed
 
-- PHP secret scanning recognizes single-line literal credentials in
-  double-quoted strings and heredoc or nowdoc assignments (#12433).
-
-- Ruby dependency analysis marks a declared gem as indexed only when that
-  gem's declaration pack is active (#12459).
-
-- Taint analysis retains selector gaps when failed evidence hides source or
-  sink endpoints, keeping the result incomplete (#12590).
-- Rust Poem taint analysis recognizes certified Query and Path tuple fields
-  as sources and retains evidence from each source (#12300).
-- Rust call binding proves standard `Deref` coercions for supported call
-  arguments (#12431).
-- Rust data-flow analysis checks each selected-payload return arm, allowing
-  supported procedures with multiple returns to retain their payload proof
-  (#12457).
-- C# `uses()` queries report incomplete coverage when unsupported syntax
-  prevents reference enumeration (#12461).
-- Semantic-pack catalog upgrades preserve installed and custom packs for
-  offline use and report failures when an older catalog cannot be imported
-  (#12475).
-- Symbol search accepts qualified names using each language's separators,
-  including PHP namespaces and nested Java and C# types (#12443).
-- MCP progress notifications finish before the corresponding response or
-  terminal task result. Redundant file-watcher events no longer leave
-  `query_code` waiting after a workspace refresh (#12775, #12452).
-- Go standard-library packs can be selected from the `go.mod` version when
-  a Go toolchain is unavailable, using compatible packs as approximate
-  standard-library evidence (#12529).
-- Rust inference determines the type of a standard `vec!` result when its
-  elements agree on a primitive type (#12370).
-- Java native call analysis follows generic return types through calls such
-  as `Map<String, String>.get(...).trim()` (#12532).
-- Rust indexing handles conditional expressions used as binary operands
-  without panicking (#12780).
-- Rust dependency discovery preserves configured targets when activating
-  standard-library packs and handles absent Cargo configuration under
-  symlinked workspace roots. Legal Cargo development-dependency cycles no
-  longer make unrelated crate routes incomplete (#12364, #12692, #12762, #12463).
-- Python analysis recognizes the implicit `typing.Generic` base of PEP 695
-  classes and binds a modeled class and its matching same-named factory as
-  one name (#12716, #12721).
-
-- Call reachability evaluates sink predicates at reachable call sites, so
-  unrelated sink matches no longer exhaust the query before reachable paths
-  can be checked. Incomplete traversals retain their encountered diagnostics
-  and remain incomplete (#12351).
-- Java call analysis resolves explicit `super` receivers against the direct
-  superclass and can bind generic constructors with explicit class type
-  arguments. JDK call analysis also recognizes the String overloads of
-  `PrintWriter.print` and `println` and the locale-taking overloads of
-  `printf` and `format` (#12334, #12336, #12214).
-- Go data-flow analysis distinguishes a value copied into an interface
-  parameter from a pointer passed through that interface (#12192).
-- Python hierarchy queries keep proven descendants when other possible
-  descendants are unresolved and exclude the queried class from its own
-  descendants (#12198, #12379).
-- Usage search reads the indexed version of each source file. Rust usage
-  search under an editor overlay retains known references when it cannot
-  establish complete coverage (#12242, #12231).
-- Rust go-to-definition navigates to the selected declaration when several
-  macro definitions or conditionally compiled items share a name. An inactive
-  macro definition no longer shadows an active one, and resolution stays
-  ambiguous when no unique declaration remains (#12365, #12317, #12240).
-- Rust resolution follows chained associated types through their intermediate
-  declarations. Rust ownership analysis checks for destructors across the
-  crate and verifies that unqualified `Copy`, `Clone` and `Drop` refer to
-  the standard traits before relying on them. Inert-value proofs check a typed
-  Drop inventory instead of assuming no drop glue when no `impl Drop` is
-  nearby (#12279, #11940, #12359, #12249, #10879).
-- Scala source-JAR analysis recognizes when an object's generic method shadows
-  an inherited static forwarder, even if their type parameter names differ
-  (#12387).
-- Rust, Go and Java rename diagnostics now identify uncertain references by
-  readable target name and workspace-relative location (#12361).
-- Workspace graph queries retain partial results when source coverage is
-  incomplete, and dead-code reports withhold findings that depend on proving
-  a reference is absent (#12340).
-
-- JavaScript and TypeScript usage analysis proves the receiver of a factory
-  call only when every reachable exit of the factory returns it. A path that
-  reaches the end of the body now leaves the call site unproven, and a
-  `finally` block that always exits replaces the returns it guards (#7239).
-- The C# RQL `supertypes` step no longer drops a base class or interface that
-  has no indexed declaration, such as `System.ICloneable` read from an
-  assembly, while reporting a complete answer. The answer keeps every indexed
-  ancestor and is incomplete with an `ancestor_external_unindexed` diagnostic
-  that names the type and is located at the type declaration (or partial
-  part) whose base list names it, so a match policy that depends on it is
-  inconclusive rather than clean. Ambiguous and unreadable base clauses also
-  make the answer incomplete. An explicit `object` base and an enum's underlying
-  type are not ancestors and stay closed. C# member families that reach such
-  a base name it as an unread ancestor (#7363).
+- Taint analysis binds keyword arguments to their own operands, preventing
+  missed or misattributed findings when positional and keyword arguments
+  are mixed (#14236).
+- Taint barrier refinement retains paths through store writes unless a
+  proven barrier covers them, avoiding dropped findings (#14319).
+- Taint attribution avoids duplicate source events and redundant witnesses,
+  allowing supported Ruby multi-sink cases to complete within the existing
+  witness budget (#14330, #14442).
+- Taint diagnostics retain independent binding, call-resolution and semantic
+  incompleteness causes instead of showing only the first blocker (#13608).
+- Java typestate can complete calls through an interface or abstract method
+  when the dispatch family is proven closed and every executable arm is
+  analyzed. A possible leak remains when any arm fails to close the resource
+  (#14305).
+- Java try-with-resources declarations bind and initialize resource variables
+  in order, preserving their identity for typestate checks in later resource
+  initializers and the try body (#14441).
+- Revision-based analysis classifies symlinks using their Git-tree targets,
+  so unrelated file links no longer make source listings incomplete.
+  Source-file links, directory aliases and unresolved links retain their
+  coverage gaps (#13423).
+- Rust analysis retains intentionally unavailable Cargo targets as
+  package-owned incomplete evidence while keeping healthy targets usable,
+  avoiding dropped binaries and waits for nonexistent target publications
+  (#13631).
+- RQL state-event and flow-relation queries use the selected procedure body,
+  avoiding incorrect empty results and mismatched-body panics (#14262).
+- Value-flow analysis carries static-field reads and writes through calls
+  and normal or exceptional returns, including transitive calls. Incomplete
+  call evidence remains conservative (#13897).
+- MCP `list_function_sources` preserves indexed files' sources in mixed
+  requests containing deleted or not-yet-indexed paths, reporting path-specific
+  incompleteness instead of failing the whole request (#13984).
+- Offline launcher startup can reuse an intact pack cache after relocation.
+  A selected cache missing required artifacts reports `offline-cache-miss`
+  instead of silently omitting its models (#14169).
+- Rust type and navigation queries infer supported identifier and struct-pattern
+  bindings from their matched values, including supported reference binding
+  modes. Unsupported pattern forms remain incomplete (#13255).
+- Rust resource-lifecycle analysis no longer assumes a call leaves a tracked
+  object unchanged merely because its direct receiver is a different
+  allocation. Unproven indirect effects remain uncertain (#13518).
+- Rust package identity survives harmless Cargo environment, output,
+  documentation and terminal settings; compiler flags that can replace crate
+  artifacts preserve uncertainty (#12926).
+- A cache store kept inside a repository could be corrupted when two
+  Bifrost processes shared it: hashing or listing the live store file
+  released SQLite's locks, and the other process then removed the write-ahead
+  log in use. Bifrost now never opens its own live database files outside
+  SQLite (#13703).
+- Rust usage and dead-code analysis retains known references while withholding
+  absence proofs across relevant unenumerated macro regions or refused source
+  files (#13908).
+- Policy explanations and near-miss rankings distinguish absent models from
+  unavailable or pending model activation, retaining uncertainty and naming
+  the activation cause instead of treating missing evidence as a decision
+  (#13602).
+- Rust value-flow analysis tracks dynamic-index stores in proven supported
+  standard containers as possible writes to their elements. Unsupported
+  indexing and operations that may invoke user code retain their coverage
+  gaps (#13757).
+- RQL guard queries report uncovered decisions as incomplete, and state-event
+  queries identify declaration seeds whose events in other procedures were
+  not evaluated. Rust records opaque guards for `?`, `let-else` and loop
+  exhaustion without treating them as sanitizers (#13335, #13341).
+- Rust closures inside opaque macro operands remain queryable with explicit
+  unknown capture gaps instead of invalidating the whole file's semantic
+  analysis (#13551). Admitted macro operands recover exact captures when the
+  selected creation proves every binding and its lexical parent; uncertain
+  captures retain their gaps (#13961).
+- Native Java resolution honors inherited external member-type shadowing and
+  handles supported inherited, array-receiver and generic-return calls.
+  Proven-final external receivers can now close dispatch; uncertain hierarchy
+  and type evidence stays incomplete (#13624, #13630, #13737, #13741, #13690).
+- Java value-flow analysis connects bare instance-field accesses to their
+  receiver across calls, preserving supported flows between methods on the
+  same object (#13769).
+- Value-flow projections interrupted by cancellation or budget exhaustion
+  retain truncated coverage, so missing property and event rows cannot be
+  mistaken for a complete empty answer (#13880).
+- JVM dependency selection includes every dependency returned by discovery
+  instead of stopping at 128, avoiding model-selection failures in larger
+  projects. Discovery limits still report incomplete coverage (#14081).
+- Custom cache locations inside a workspace no longer lose SQLite locks
+  through source-file hashing or listing, preventing shared-cache corruption
+  on affected POSIX systems (#13722).
+- JavaScript and TypeScript test-quality checks recognize Chai `expect` and
+  `should` assertions and Node's bare `assert(...)`, avoiding false
+  `no-assertions` reports for those forms (#13256).
+- MCP reports host request deadlines as typed inconclusive tool results
+  instead of generic JSON-RPC errors. Readiness timeouts identify that
+  background workspace preparation continues (#13412).
+- Policy reports distinguish inconclusive runs from clean runs even when
+  the configured exit policy allows them. A flow endpoint role that binds
+  nothing because its selectors are incomplete now fails with
+  `endpoint_role_unresolved` and exit status 2 (#13322). Static selector/port
+  capability mismatches are reported as inconclusive even under partial
+  discovery, with exit status governed by `--on-inconclusive` (#13702).
+- JVM dependency discovery finds the JDK through `java` on `PATH` when
+  `JAVA_HOME` is unset. An explicitly empty `JAVA_HOME` still disables
+  environment-based JDK discovery (#13278).
+- Java functional-interface analysis uses consistent generic-signature and
+  inheritance checks for source navigation and semantic models, retaining
+  uncertainty where the signature cannot be proven (#12969).
+- Fixes a 0.15.3 regression in which Rust model-declared calls on
+  external-crate receivers and constructors became inconclusive when the
+  receiver's type arguments were unknown, as for `ZipArchive<File>` without
+  a standard-library pack or `Archive::new(upload)` without a turbofish
+  (#14209).
+- Java `++` and `--` on a field count as writes in the
+  `java/non-final-immutable-field` rule and in RQL `field_writes_of`, so a
+  field updated only that way is no longer reported as never reassigned
+  (#14563, #14274).
+- Java call binding no longer reports every call that names a type as
+  `callee_unresolved` inside a class whose supertype cannot be resolved
+  (#14293). Same-arity Java constructor overloads prove the callee identity
+  that dispatch and summaries key on (#14206). A method-call result stored
+  into a reference-typed declarator is no longer treated as an identity
+  conversion, since the compiler inserts a cast there (#14259).
+- Java control flow drops the uncaught exceptional edge of a `try` that
+  catches `Throwable` (#13770), and folds `String` `charAt`, `length` and
+  `equals` on constant receivers to prune unreachable `switch` arms
+  (#13763). The Java final-bound rule no longer treats sealed model types
+  as final (#10572).
+- Typestate treats a constructor result as a fresh subject, so a finding on
+  `new ObjectInputStream(in)` survives unmodeled calls before its use and a
+  second live stream in the same method (#14542).
+- Taint reports keep call-site evidence for every retained incompleteness
+  cause, not only the first (#14555). Under
+  `(on-unknown :verdict treat-may-as-finding)`, explicitly selected
+  undecided branch, reachability and assignment rows are reported as
+  possible findings (#14547).
+- Model-catalog lookups that fail in one reader keep the answer open in
+  every language instead of only for JVM languages, so a surviving
+  declaration is not taken as unique or as proof of absence (#14073).
+- Ignore files apply as Git applies them: outside a Git repository,
+  `.gitignore` files above the workspace root no longer exclude sources
+  (#13429). An incremental update that names an ignored file no longer
+  indexes it, and a failed workspace listing no longer selects the files of
+  a previous process (#13492). Incremental updates keep a successful source
+  selection when the ignore-rule digest is unavailable (#14054).
+- The store-file guard from #13703 holds its registry across a work-tree
+  hash and registers stores before opening them, closing a race that could
+  still release SQLite's locks (#14006).
+- JDK `release` files whose `JAVA_VERSION` has more than four dotted
+  elements are accepted; the extra vendor elements are ignored for version
+  comparison (#13459).
+- A semantic-pack warm-up that panics publishes its failure instead of
+  leaving MCP requests waiting on it forever (#13479).
+- RQL value-flow queries fail instead of silently dropping an endpoint
+  whose witness cannot be reconstructed (#13525).
+- Rust enum variants inherit their enum's restricted visibility (#13333),
+  no longer shadow same-named types inside the enum body (#13315), and a
+  block-local item keeps its own visibility under an enum variant or trait
+  (#13934).
+- A missing value for a host approval option no longer consumes the next
+  policy flag, so a malformed policy invocation exits with status 2 rather
+  than 1 (#14314).
 
 ## [0.15.3] - 2026-11-12
 
@@ -164,10 +272,10 @@ projection and its commit history does not contain every source commit.
   `bifrost.python-codeql-quality` `call-wrong-named-argument` (6),
   `call-wrong-named-class-argument` (5); `bifrost.security.csharp`
   `signedxml-embedded-key-trust` (5), `xmldocument-url-resolver` (5).
-- Policy reports use schema 20, up from 7 in 0.15.2. The version appears in
+- Policy reports use schema 23, up from 7 in 0.15.2. The version appears in
   the JSON report, the `report` returned by MCP `run_policy`, and SARIF
   `bifrost.policyReportSchemaVersion`. Readers that pin the version must
-  accept 20. New fields include finding `evaluation_location`, per-run
+  accept 23. New fields include finding `evaluation_location`, per-run
   `diagnostic_causes`, `worst_omitted_diagnostic_severity` and
   `budget_refusals`, `evaluation.budget`, and
   `omitted_related_locations_exactness`. New diagnostic codes include
@@ -239,6 +347,27 @@ projection and its commit history does not contain every source commit.
   longer treat the boxed copy as the caller's own storage (#10561, #10436).
 - C# treats `new T()` as a fresh object when `T` resolves to a class or
   record class in the same file (#9506).
+- MCP `run_policy` accepts source selections and an inline-suppression prefix,
+  using the CLI's containment checks and refusing stale resident source
+  selections (#13008).
+- Ruby receiver typing uses supported inline Sorbet signatures and workspace
+  `sig/**/*.rbs` declarations to resolve modeled parameter and collection
+  element calls, retaining uncertainty for ambiguous or unsupported types
+  (#12977, #13038).
+- Rust async bodies are analyzed. Locals survive `.await`, and shared or
+  escaped memory becomes unknown after an await unless Rust ownership facts
+  prove it exclusive. Python, C# and JavaScript/TypeScript treat an await as
+  a possible memory interference the same way (#12128).
+- Structural queries treat Java `this(...)` and `super(...)` (including
+  `outer.super(...)`) and C# `: this(...)` and `: base(...)` as constructor
+  calls with their written arguments, keeping C# `ref`, `out`, `in` and named
+  arguments. A `call` or argument query over a file that contains them no
+  longer leaves them out and reports the answer complete (#10319).
+- A match policy's report carries the work metric
+  `query.match.candidate_sites`: the number of distinct sites its pattern's
+  anchor selected before any filter ran. A run with no findings can now show
+  whether it examined candidates. It is identical for cold and warm runs and
+  is absent, not zero, when it was not measured (#12581).
 
 ### Changed
 
@@ -295,6 +424,19 @@ projection and its commit history does not contain every source commit.
   budget and still report a complete answer (#12272).
 - Incomplete rename evidence uses workspace-relative paths and readable
   target names instead of absolute paths and internal identifiers (#12260).
+- Policy reports share their retention budget across policies to keep large
+  result sets from crowding out smaller ones. The 10,000-finding batch cap is
+  removed, while byte limits still apply. Retention cuts preserve acceptance
+  and suppression-audit candidates before ordinary findings (#12498, #12560).
+- The Rust analyzer enables all declared Cargo features and the test
+  configuration for workspace members, including code outside the default
+  feature set (#12335). When two enabled configurations select different
+  declarations, the answer is ambiguous instead of a guess (#12164).
+- Rust analysis tracks local value flow inside async bodies across an
+  `await`. It treats shared or escaped memory as uncertain across suspension
+  and distinguishes constructing a future from running its body (#12251).
+- A failed listing read in a workspace without analyzers reports an
+  incomplete answer instead of an empty one (#12040).
 
 ### Fixed
 
@@ -493,6 +635,100 @@ projection and its commit history does not contain every source commit.
 - A policy run with `--sources` over a C# repository no longer exits with
   "selected source version unavailable" when a committed `.cs` file is
   not selected. The run completes and writes its report (#12508).
+- Native Rust type analysis infers supported binary-operator results using
+  proven operator-trait and reference identities; unsupported or unresolved
+  operator evidence remains incomplete (#12495).
+- PHP taint analysis can prove that supported cross-file object allocations
+  have no destructor effects, avoiding unnecessary inconclusive results
+  while retaining gaps for unresolved lifetime behavior (#13251).
+- Cache retention budgets account for allocator size rounding. On glibc
+  Linux, idle Bifrost processes return freed heap memory to the operating
+  system after foreground and background work finishes (#12891, #12827).
+- Java native call analysis recognizes supported array arguments passed
+  directly to varargs methods (#13067).
+- Call/control analysis admits Rust field reads and raw-pointer
+  dereferences, plus Java instance-field and array reads, when their memory
+  and exceptional behavior is represented (#12955). Named-field Rust struct
+  literals no longer cause an unsupported call/control refusal (#12841).
+- PHP secret scanning recognizes single-line literal credentials in
+  double-quoted strings and heredoc or nowdoc assignments (#12433).
+- Ruby dependency analysis marks a declared gem as indexed only when that
+  gem's declaration pack is active (#12459).
+- Taint analysis retains selector gaps when failed evidence hides source or
+  sink endpoints, keeping the result incomplete (#12590).
+- Rust Poem taint analysis recognizes certified Query and Path tuple fields
+  as sources and retains evidence from each source (#12300).
+- Rust call binding proves standard `Deref` coercions for supported call
+  arguments (#12431).
+- Rust data-flow analysis checks each selected-payload return arm, allowing
+  supported procedures with multiple returns to retain their payload proof
+  (#12457).
+- C# `uses()` queries report incomplete coverage when unsupported syntax
+  prevents reference enumeration (#12461).
+- Semantic-pack catalog upgrades preserve installed and custom packs for
+  offline use and report failures when an older catalog cannot be imported
+  (#12475).
+- Symbol search accepts qualified names using each language's separators,
+  including PHP namespaces and nested Java and C# types (#12443).
+- MCP progress notifications finish before the corresponding response or
+  terminal task result. Redundant file-watcher events no longer leave
+  `query_code` waiting after a workspace refresh (#12775, #12452).
+- Go standard-library packs can be selected from the `go.mod` version when
+  a Go toolchain is unavailable, using compatible packs as approximate
+  standard-library evidence (#12529).
+- Rust inference determines the type of a standard `vec!` result when its
+  elements agree on a primitive type (#12370).
+- Java native call analysis follows generic return types through calls such
+  as `Map<String, String>.get(...).trim()` (#12532).
+- Rust indexing handles conditional expressions used as binary operands
+  without panicking (#12780).
+- Rust dependency discovery preserves configured targets when activating
+  standard-library packs and handles absent Cargo configuration under
+  symlinked workspace roots. Legal Cargo development-dependency cycles no
+  longer make unrelated crate routes incomplete (#12364, #12692, #12762, #12463).
+- Python analysis recognizes the implicit `typing.Generic` base of PEP 695
+  classes and binds a modeled class and its matching same-named factory as
+  one name (#12716, #12721). Class hierarchy queries use alias, mutation and
+  metaclass evidence; `eval`, aliased `exec` and builtins-namespace writes
+  preserve uncertainty about names that may be rebound (#12114, #12818).
+- Call reachability evaluates sink predicates at reachable call sites, so
+  unrelated sink matches no longer exhaust the query before reachable paths
+  can be checked. Incomplete traversals retain their encountered diagnostics
+  and remain incomplete (#12351).
+- Java call analysis resolves explicit `super` receivers against the direct
+  superclass and can bind generic constructors with explicit class type
+  arguments. JDK call analysis also recognizes the String overloads of
+  `PrintWriter.print` and `println` and the locale-taking overloads of
+  `printf` and `format` (#12334, #12336, #12214).
+- Go data-flow analysis distinguishes a value copied into an interface
+  parameter from a pointer passed through that interface (#12192).
+- Python hierarchy queries keep proven descendants when other possible
+  descendants are unresolved and exclude the queried class from its own
+  descendants (#12198, #12379).
+- Usage search reads the indexed version of each source file. Rust usage
+  search under an editor overlay retains known references when it cannot
+  establish complete coverage (#12242, #12231).
+- Rust go-to-definition navigates to the selected declaration when several
+  macro definitions or conditionally compiled items share a name. An inactive
+  macro definition no longer shadows an active one, and resolution stays
+  ambiguous when no unique declaration remains (#12365, #12317, #12240).
+- Rust resolution follows chained associated types through their intermediate
+  declarations. Rust ownership analysis checks for destructors across the
+  crate and verifies that unqualified `Copy`, `Clone` and `Drop` refer to
+  the standard traits before relying on them. Inert-value proofs check a typed
+  Drop inventory instead of assuming no drop glue when no `impl Drop` is
+  nearby (#12279, #11940, #12359, #12249, #10879).
+- Scala source-JAR analysis recognizes when an object's generic method shadows
+  an inherited static forwarder, even if their type parameter names differ
+  (#12387).
+- Rust, Go and Java rename diagnostics now identify uncertain references by
+  readable target name and workspace-relative location (#12361).
+- Workspace graph queries retain partial results when source coverage is
+  incomplete, and dead-code reports withhold findings that depend on proving
+  a reference is absent (#12340).
+- PHP value flow keeps `foreach` over an object open instead of modeling it
+  as an array read, because iterators and `IteratorAggregate` run user code
+  that can read and write any heap (#13434).
 
 ## [0.15.2] - 2026-11-06
 

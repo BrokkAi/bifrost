@@ -230,6 +230,7 @@ pub(crate) const RESOLUTION_IDENTITY_RECIPES_SQL: &str = "SELECT id, semantic_la
 // Only durable resolution_identities rows are memoized. Staged recipes remain
 // in the lexical reader, which still observes the current staging generation.
 // This raw-row layer records no ledger keys; caller attribution stays outside it.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(crate) fn read_stored_lookup_recipes(
     selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
     names: &[i64],

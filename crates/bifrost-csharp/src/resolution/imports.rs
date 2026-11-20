@@ -34,8 +34,12 @@ impl Producer<'_, '_> {
         let names = parts
             .iter()
             .map(|&part| self.name(part))
-            .collect::<Vec<_>>();
-        let bound = alias.map(|n| self.name(n));
+            .collect::<Option<Vec<_>>>();
+        let bound = alias.map_or(Some(None), |n| self.name(n).map(Some));
+        let (Some(names), Some(bound)) = (names, bound) else {
+            self.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
         self.facts.import_routes.push(ResolutionImportRouteFact {
             site,
             root_scope: ctx.scope,

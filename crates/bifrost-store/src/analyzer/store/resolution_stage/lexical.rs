@@ -325,6 +325,7 @@ impl PreparedStageLexical {
 
     /// Candidate identity is exclusive across ordinary and stage sources, even
     /// when both bodies agree. Read scope does not narrow admission authority.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn validate_ordinary_paths(
         &self,
         selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
@@ -358,6 +359,7 @@ impl PreparedStageLexical {
 
     /// Compare overlapping defined ordinary nodes by complete structured payload.
     /// Catalog-only ordinary rows establish identity, not a node definition.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn validate_ordinary_nodes(
         &self,
         selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
@@ -549,6 +551,7 @@ WHERE catalog.blob_id=?3
 /// Resolve one query's reference semantics to their explicit stage nodes or
 /// producer-proven ordinary site nodes. The result dies with the typed query.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn reference_nodes(
     selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
     requests: &[(SelectedResolutionMountOrdinal, SemanticId)],

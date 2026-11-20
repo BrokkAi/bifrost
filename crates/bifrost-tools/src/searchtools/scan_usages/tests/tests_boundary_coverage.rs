@@ -325,8 +325,11 @@ fn raw_reference_sites_include_model_authored_accessor_call() {
             .all(|file| file.path != "Caller.java"),
         "{without_model:?}"
     );
-    // This session pack exists only in this test. The modeled accessor is a
-    // reference to a workspace method, with no target spelling at the callsite.
+    // This is a workspace-local model (EphemeralWorkspace): only activation-
+    // owned models describe workspace declarations. External pack records
+    // anchor only to sources they carry (#9559 3d).
+    // The modeled accessor is a reference to a workspace method, with no
+    // target spelling at the callsite.
     // The inactive target shard validates the relation while leaving the
     // workspace declaration as the only active target identity.
     let pack_id = "fixture.raw-accessor-reference";
@@ -387,10 +390,23 @@ fn raw_reference_sites_include_model_authored_accessor_call() {
             }
         }]
     });
-    let catalog = brokk_bifrost_analysis::test_support::embedded_session_semantic_pack_fixture(
-        pack_id,
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+    };
+    let compiled = brokk_bifrost_analysis::test_support::compile_semantic_pack_fixture(
         serde_json::to_vec(&pack).unwrap(),
     );
+    let catalog =
+        SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).expect("ephemeral catalog");
+    catalog
+        .register_session_pack(
+            &compiled,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::EphemeralWorkspace,
+                source_id: pack_id.to_owned(),
+            },
+        )
+        .expect("register workspace-local session pack fixture");
     let outcome = brokk_bifrost_analysis::test_support::activate_semantic_model_fixture(
         fixture.analyzer.analyzer(),
         &catalog,
@@ -406,7 +422,8 @@ fn raw_reference_sites_include_model_authored_accessor_call() {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
     );
     assert!(

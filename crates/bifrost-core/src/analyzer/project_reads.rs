@@ -107,6 +107,48 @@ pub fn observed_path_kind_digest(kind: WorkspacePathKind) -> [u8; 32] {
 thread_local! {
     static READ_RECEIPT: RefCell<ProjectReadReceipt> = RefCell::new(ProjectReadReceipt::default());
     static BUILDING_RECEIPT: Cell<bool> = const { Cell::new(false) };
+    static RECEIPT_TAPS: RefCell<Vec<ReceiptTap>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A completed inventory's source inputs, independent of the source's lifetime.
+/// Other receipt fields do not participate in Inventory attribution.
+#[derive(Clone, Debug)]
+pub struct InventoryReadReceipt {
+    pub source_root: std::path::PathBuf,
+    pub inventory: Option<[u8; 32]>,
+    pub incomplete: Option<super::project::IgnoreObservationError>,
+}
+
+impl InventoryReadReceipt {
+    fn of(project: &dyn Project, receipt: &ProjectReadReceipt) -> Self {
+        Self {
+            source_root: project.root().to_path_buf(),
+            inventory: receipt.inventory,
+            incomplete: receipt.incomplete.clone(),
+        }
+    }
+}
+
+/// One getter call's publication and original inventory owners. Request-local
+/// listing cells retain source slots rather than borrowed Project objects.
+#[derive(Clone, Debug, Default)]
+pub struct PublishedInventoryReads {
+    publication: ProjectReadReceipt,
+    reads: Vec<(ProjectReadSlot, InventoryReadReceipt)>,
+}
+
+struct ReceiptTap {
+    base_depth: usize,
+    publication: Option<ProjectReadReceipt>,
+    reads: Vec<(ProjectReadSlot, InventoryReadReceipt)>,
+}
+
+fn capture_inventory_read(slot: &ProjectReadSlot, receipt: &InventoryReadReceipt, depth: usize) {
+    RECEIPT_TAPS.with_borrow_mut(|taps| {
+        for tap in taps.iter_mut().filter(|tap| tap.base_depth == depth) {
+            tap.reads.push((slot.clone(), receipt.clone()));
+        }
+    });
 }
 
 /// The getter proved its answer without consulting listing membership.
@@ -173,6 +215,72 @@ pub fn publish_receipt(receipt: ProjectReadReceipt) {
     });
 }
 
+/// Capture every inventory that completes at the getter-relative outer
+/// boundary, even when maintenance suppression prevents ordinary recording.
+/// The enclosing receipt and capture stack survive both success and unwind.
+pub fn capture_published_inventory_reads<T>(
+    getter: impl FnOnce() -> T,
+) -> (T, PublishedInventoryReads) {
+    struct Restore {
+        enclosing: ProjectReadReceipt,
+        tap_count: usize,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_RECEIPT.with_borrow_mut(|receipt| *receipt = std::mem::take(&mut self.enclosing));
+            RECEIPT_TAPS.with_borrow_mut(|taps| taps.truncate(self.tap_count));
+        }
+    }
+    let base_depth = PROJECT_READ_DEPTH.with(Cell::get);
+    let restore = Restore {
+        enclosing: READ_RECEIPT.with_borrow_mut(std::mem::take),
+        tap_count: RECEIPT_TAPS.with_borrow_mut(|taps| {
+            let count = taps.len();
+            taps.push(ReceiptTap {
+                base_depth,
+                publication: None,
+                reads: Vec::new(),
+            });
+            count
+        }),
+    };
+    let result = getter();
+    let tap = RECEIPT_TAPS.with_borrow_mut(|taps| taps.pop().expect("the getter's capture"));
+    let captured = PublishedInventoryReads {
+        publication: tap
+            .publication
+            .unwrap_or_else(|| READ_RECEIPT.with_borrow(Clone::clone)),
+        reads: tap.reads,
+    };
+    drop(restore);
+    if project_getter_in_progress() {
+        publish_receipt(captured.publication.clone());
+    }
+    (result, captured)
+}
+
+/// Replay completed inventories through their original slots and current
+/// registrations. Nested getters contribute only their aggregate publication.
+pub fn replay_published_inventory_reads(captured: &PublishedInventoryReads) {
+    let depth = PROJECT_READ_DEPTH.with(Cell::get);
+    // A capture of a hit must retain the same latent effects as a fresh walk.
+    for (slot, receipt) in &captured.reads {
+        capture_inventory_read(slot, receipt, depth);
+    }
+    RECEIPT_TAPS.with_borrow_mut(|taps| {
+        for tap in taps.iter_mut().filter(|tap| tap.base_depth == depth) {
+            tap.publication = Some(captured.publication.clone());
+        }
+    });
+    if depth != 0 {
+        publish_receipt(captured.publication.clone());
+    } else if !project_reads_suppressed() {
+        for (slot, receipt) in &captured.reads {
+            slot.record_inventory(receipt);
+        }
+    }
+}
+
 /// Compose only from the completed call's files and already-built rule inputs.
 /// Delegates can contribute receipts, but recursive receipt construction cannot.
 pub fn publish_file_set(
@@ -218,6 +326,10 @@ pub fn file_set_receipt(
     let _reset = Reset(was_building);
 
     let observation = project.ignore_observation_for_files(files)?;
+    let rules_digest = match observation.rules_evidence {
+        super::project::IgnoreRulesEvidence::Known(digest) => digest,
+        super::project::IgnoreRulesEvidence::Unavailable(cause) => return Err(cause),
+    };
     assert_eq!(
         observation.ignored.len(),
         files.len(),
@@ -259,7 +371,7 @@ pub fn file_set_receipt(
         paths,
         selected,
         overlays,
-        observation.rules_digest,
+        rules_digest,
     ))
 }
 
@@ -370,10 +482,13 @@ pub fn measure_project_io<T>(read: impl FnOnce() -> T) -> (T, ProjectIoCounts) {
 }
 
 /// Implemented only by analysis; receipts contain no core-visible read keys.
-pub trait ErasedReadAttribution: Send + Sync {
+pub trait ErasedReadAttribution:
+    super::internal_memo_partitions::DeferredMemoAttribution + Send + Sync
+{
     fn is_live(&self) -> bool;
     fn is_capturing(&self) -> bool;
     fn record(&self, project: &dyn Project, read: ProjectRead<'_>, receipt: ProjectReadReceipt);
+    fn record_inventory(&self, receipt: &InventoryReadReceipt);
     fn capture_identity(&self) -> Option<super::memo_attribution::CaptureIdentity>;
     #[track_caller]
     fn record_unattributed(&self);
@@ -405,6 +520,9 @@ impl OpaqueReadReceipt {
     pub fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
+    pub(super) fn allocation_identity(&self) -> usize {
+        Arc::as_ptr(&self.value) as *const () as usize
+    }
 }
 
 pub struct ErasedCapturedReads {
@@ -416,7 +534,7 @@ pub struct ErasedCapturedReads {
 }
 
 #[derive(Clone)]
-pub struct ReadCapability(Arc<dyn ErasedReadAttribution>);
+pub struct ReadCapability(pub(super) Arc<dyn ErasedReadAttribution>);
 impl ReadCapability {
     pub fn new(recorder: impl ErasedReadAttribution + 'static) -> Self {
         Self(Arc::new(recorder))
@@ -467,9 +585,11 @@ pub fn with_project_read_suppression<T>(suppressed: bool, build: impl FnOnce() -
         depth: usize,
         suppression_depth: usize,
         receipt: ProjectReadReceipt,
+        taps: Vec<ReceiptTap>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
+            RECEIPT_TAPS.with_borrow_mut(|taps| *taps = std::mem::take(&mut self.taps));
             PROJECT_READ_DEPTH.with(|depth| depth.set(self.depth));
             PROJECT_READ_SUPPRESSION_DEPTH.with(|depth| depth.set(self.suppression_depth));
             READ_RECEIPT.with_borrow_mut(|receipt| {
@@ -478,6 +598,7 @@ pub fn with_project_read_suppression<T>(suppressed: bool, build: impl FnOnce() -
         }
     }
     let _restore = Restore {
+        taps: RECEIPT_TAPS.with_borrow_mut(std::mem::take),
         depth: PROJECT_READ_DEPTH.with(|depth| depth.replace(usize::from(suppressed))),
         suppression_depth: PROJECT_READ_SUPPRESSION_DEPTH
             .with(|depth| depth.replace(usize::from(suppressed))),
@@ -487,6 +608,11 @@ pub fn with_project_read_suppression<T>(suppressed: bool, build: impl FnOnce() -
 }
 
 impl ProjectReadSlot {
+    /// Whether both handles belong to the same original project read source.
+    pub fn is_same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn is_capturing(&self) -> bool {
         self.0
             .read()
@@ -614,25 +740,32 @@ impl ProjectReadSlot {
     ) -> io::Result<(Arc<std::collections::BTreeSet<ProjectFile>>, T)> {
         let mut guard = self.enter(None, ProjectRead::Unattributed);
         let files = read();
-        if guard.outermost {
+        let depth = PROJECT_READ_DEPTH.with(Cell::get);
+        let captured_boundary =
+            RECEIPT_TAPS.with_borrow(|taps| taps.iter().any(|tap| tap.base_depth + 1 == depth));
+        if guard.outermost || captured_boundary {
             match &files {
                 Ok((files, _)) => {
                     let source =
                         super::project::FilesystemProject::from_listing(root, Arc::clone(files));
-                    self.record(&source, || ProjectRead::Inventory);
-                }
-                Err(_) => {
-                    for recorder in self
-                        .0
-                        .read()
-                        .expect("project read recorders poisoned")
-                        .iter()
-                    {
-                        if recorder.0.is_capturing() {
-                            recorder.0.record_unattributed();
-                        }
+                    if captured_boundary {
+                        let receipt = READ_RECEIPT
+                            .with_borrow(|receipt| InventoryReadReceipt::of(&source, receipt));
+                        capture_inventory_read(self, &receipt, depth - 1);
+                        RECEIPT_TAPS.with_borrow_mut(|taps| {
+                            for tap in taps.iter_mut().filter(|tap| tap.base_depth + 1 == depth) {
+                                tap.publication = Some(READ_RECEIPT.with_borrow(Clone::clone));
+                            }
+                        });
+                    }
+                    if guard.outermost {
+                        self.record(&source, || ProjectRead::Inventory);
                     }
                 }
+                Err(_) if guard.outermost => {
+                    self.dispatch(|recorder| recorder.record_unattributed())
+                }
+                Err(_) => {}
             }
         }
         guard.outermost = false;
@@ -640,6 +773,22 @@ impl ProjectReadSlot {
     }
 
     fn record<'a>(&self, project: &dyn Project, read: impl Fn() -> ProjectRead<'a>) {
+        if matches!(read(), ProjectRead::Inventory) {
+            let receipt =
+                READ_RECEIPT.with_borrow(|receipt| InventoryReadReceipt::of(project, receipt));
+            self.record_inventory(&receipt);
+        } else {
+            self.dispatch(|recorder| {
+                recorder.record(project, read(), READ_RECEIPT.with_borrow(Clone::clone))
+            });
+        }
+    }
+
+    fn record_inventory(&self, receipt: &InventoryReadReceipt) {
+        self.dispatch(|recorder| recorder.record_inventory(receipt));
+    }
+
+    fn dispatch(&self, record: impl Fn(&dyn ErasedReadAttribution)) {
         #[cfg(any(test, feature = "test-support"))]
         let _recording = {
             struct Reset(bool);
@@ -658,9 +807,7 @@ impl ProjectReadSlot {
             .clone();
         for recorder in recorders {
             if recorder.0.is_capturing() {
-                recorder
-                    .0
-                    .record(project, read(), READ_RECEIPT.with_borrow(Clone::clone));
+                record(&*recorder.0);
             }
         }
     }
@@ -747,6 +894,29 @@ impl Drop for ProjectReadDepth {
 }
 impl Drop for ProjectListingRead<'_> {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let depth = PROJECT_READ_DEPTH.with(Cell::get);
+            let captured_boundary =
+                RECEIPT_TAPS.with_borrow(|taps| taps.iter().any(|tap| tap.base_depth + 1 == depth));
+            if captured_boundary && self.project.is_some() {
+                assert!(
+                    matches!(self.read, ProjectRead::Inventory),
+                    "listing captures require Inventory at the getter-relative outer boundary"
+                );
+                let receipt = READ_RECEIPT.with_borrow(|receipt| {
+                    InventoryReadReceipt::of(
+                        self.project.expect("inventory getter carries its source"),
+                        receipt,
+                    )
+                });
+                capture_inventory_read(self.slot, &receipt, depth - 1);
+                RECEIPT_TAPS.with_borrow_mut(|taps| {
+                    for tap in taps.iter_mut().filter(|tap| tap.base_depth + 1 == depth) {
+                        tap.publication = Some(READ_RECEIPT.with_borrow(Clone::clone));
+                    }
+                });
+            }
+        }
         // Keep nested suppression installed while recording the completed receipt. Never record a partially unwound build.
         if self.outermost && !std::thread::panicking() {
             self.slot.record(
@@ -864,6 +1034,7 @@ mod ignore_receipt_tests {
     use super::*;
     use crate::analyzer::Language;
     use crate::analyzer::project::{IgnoreObservationError, IgnoreObservationOperation};
+    use crate::path_normalization::NormalizePath;
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -960,6 +1131,97 @@ mod ignore_receipt_tests {
     }
 
     #[test]
+    #[hardwon("#14054: unavailable ignore proof discarded a successful source selection")]
+    #[hardwon("#14279: a raw symlinked TMPDIR root diverged from the canonical project root")]
+    fn ignore_receipt_unavailable_proof_preserves_selection_but_matcher_failure_does_not() {
+        if !crate::analyzer::project::rerun_test_with_symlinked_tempdir(
+            "analyzer::project_reads::ignore_receipt_tests::ignore_receipt_unavailable_proof_preserves_selection_but_matcher_failure_does_not",
+            "BIFROST_ISSUE_14279_PROJECT_READ_SELECTION_CHILD",
+        ) {
+            return;
+        }
+        struct Opaque(crate::analyzer::project::TestProject);
+        impl Project for Opaque {
+            fn root(&self) -> &Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.analyzable_files_from(&self.all_files()?, language)
+            }
+            fn analyzable_files_from(
+                &self,
+                files: &BTreeSet<ProjectFile>,
+                language: Language,
+            ) -> io::Result<BTreeSet<ProjectFile>> {
+                Ok(files
+                    .iter()
+                    .filter(|file| {
+                        file.language() == language && file.rel_path() == Path::new("selected.rs")
+                    })
+                    .cloned()
+                    .collect())
+            }
+            fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        for path in ["selected.rs", "unselected.rs"] {
+            std::fs::write(root.join(path), "pub struct Marker;\n").unwrap();
+        }
+        let opaque = Opaque(crate::analyzer::project::TestProject::new(
+            &root,
+            Language::Rust,
+        ));
+        let files = opaque.all_files().unwrap();
+        let selected = BTreeSet::from([ProjectFile::new(&root, "selected.rs")]);
+        let observation = opaque
+            .ignore_observation_for_files(&files)
+            .expect("successful custom selection does not require reusable ignore proof");
+        assert_eq!(observation.selected, selected);
+        let cause = file_set_receipt(&opaque, &files).unwrap_err();
+        assert_eq!(cause.operation, IgnoreObservationOperation::Matcher);
+        assert!(cause.to_string().contains("custom Project must name"));
+
+        let filesystem = crate::analyzer::project::FilesystemProject::new(&root).unwrap();
+        let healthy = filesystem.ignore_observation_for_files(&files).unwrap();
+        assert_eq!(healthy.selected, files);
+        std::fs::write(root.join(".bifrostignore"), "[z-a]\n").unwrap();
+        filesystem.invalidate_cached_file_listing();
+        let files = filesystem.all_files().unwrap();
+        let failure = filesystem.ignore_observation_for_files(&files).unwrap_err();
+        assert_eq!(failure.operation, IgnoreObservationOperation::Matcher);
+        assert!(!failure.cause.to_string().is_empty());
+        {
+            let _read = filesystem.project_read_slot().unwrap().listing(&filesystem);
+            publish_file_set(&filesystem, &files).unwrap();
+            READ_RECEIPT.with_borrow(|receipt| {
+                assert!(receipt.incomplete.is_some());
+                assert!(receipt.listing.is_none());
+                assert!(receipt.inventory.is_none());
+            });
+        }
+        std::fs::write(root.join(".bifrostignore"), "unselected.rs\n").unwrap();
+        filesystem.invalidate_cached_file_listing();
+        let files = filesystem.all_files().unwrap();
+        assert_eq!(
+            filesystem
+                .ignore_observation_for_files(&files)
+                .unwrap()
+                .selected,
+            selected
+        );
+        assert!(file_set_receipt(&filesystem, &files).is_ok());
+    }
+
+    #[test]
     #[hardwon("#12889: listing failure was published as a default certificate")]
     fn ignore_receipt_generic_listing_failure_is_typed_incomplete() {
         let temp = tempfile::tempdir().unwrap();
@@ -1006,5 +1268,88 @@ mod ignore_receipt_tests {
             assert!(!cause.cause.to_string().is_empty());
             assert!(receipt.listing.is_none());
         });
+    }
+
+    #[test]
+    #[hardwon(
+        "#13799: capture_published_inventory_reads left the enclosing receipt replaced when its getter unwound"
+    )]
+    fn capture_published_inventory_reads_restores_the_enclosing_receipt_when_the_getter_unwinds() {
+        let enclosing = ProjectReadReceipt {
+            inventory: Some([7; 32]),
+            ..ProjectReadReceipt::default()
+        };
+        publish_receipt(enclosing);
+        let source = crate::analyzer::project::FileSetProject::from_listing(
+            std::env::current_dir().unwrap(),
+            [],
+            vec![],
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture_published_inventory_reads(|| {
+                source.all_files().unwrap();
+                publish_receipt(ProjectReadReceipt {
+                    inventory: Some([9; 32]),
+                    ..ProjectReadReceipt::default()
+                });
+                panic!("getter failed")
+            })
+        }));
+        assert!(unwound.is_err());
+        READ_RECEIPT.with_borrow(|receipt| assert_eq!(receipt.inventory, Some([7; 32])));
+        RECEIPT_TAPS
+            .with_borrow(|taps| assert!(taps.is_empty(), "the capture's tap must be removed"));
+        READ_RECEIPT.with_borrow_mut(|receipt| *receipt = ProjectReadReceipt::default());
+    }
+
+    /// The outermost getter clears the thread's receipt as its depth guard
+    /// drops, so a capture that reads the thread afterwards gets a default
+    /// receipt. The capture takes the receipt before the guard clears it.
+    #[test]
+    #[hardwon(
+        "#13799: capturing a filesystem walk at read depth 0 returned the cleared default receipt"
+    )]
+    fn capture_published_inventory_reads_returns_the_receipt_a_depth_zero_getter_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}").unwrap();
+        let project = crate::analyzer::project::FilesystemProject::new(temp.path()).unwrap();
+        assert_eq!(PROJECT_READ_DEPTH.with(Cell::get), 0);
+
+        let (listing, captured) =
+            capture_published_inventory_reads(|| project.all_files_with_omissions());
+        listing.expect("walk");
+
+        assert!(captured.publication.listing.is_some(), "{captured:?}");
+        assert!(captured.publication.inventory.is_some(), "{captured:?}");
+        assert!(captured.publication.ignore_rules.is_some(), "{captured:?}");
+        READ_RECEIPT.with_borrow(|receipt| {
+            assert!(
+                receipt.inventory.is_none(),
+                "the getter's guard cleared the thread's receipt, which is why it is captured in the guard"
+            );
+        });
+        RECEIPT_TAPS.with_borrow(|taps| assert!(taps.is_empty()));
+    }
+    #[test]
+    #[hardwon(
+        "#13799: carried worker jobs could replace a suspended listing capture's receipt and owners"
+    )]
+    fn listing_capture_ignores_independently_carried_worker_reads() {
+        use crate::analyzer::project::FileSetProject;
+        let root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let source = FileSetProject::from_listing(root.path(), [], vec![]);
+        let other = FileSetProject::from_listing(other_root.path(), [], vec![]);
+        let (_, captured) = capture_published_inventory_reads(|| {
+            with_project_read_suppression(false, || other.all_files().unwrap());
+            source.all_files().unwrap();
+        });
+        assert_eq!(captured.reads.len(), 1);
+        assert_eq!(captured.reads[0].1.source_root, source.root());
+        assert_eq!(
+            captured.publication.inventory,
+            captured.reads[0].1.inventory
+        );
+        RECEIPT_TAPS.with_borrow(|taps| assert!(taps.is_empty()));
     }
 }

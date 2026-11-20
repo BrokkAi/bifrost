@@ -76,6 +76,42 @@ WITH selected AS MATERIALIZED (
     ON subject_kind.blob_id = target_member.blob_id
    AND subject_kind.declaration_id = target_authority.declaration
   WHERE subject.endpoint_role = 'subject'
+), macro_names AS MATERIALIZED (
+  -- Names a member crate defines with macro_rules!/macro; a certified standard
+  -- macro name must not be one of them (#13259).
+  SELECT DISTINCT CASE WHEN unit.identifier LIKE 'r#%' THEN substr(unit.identifier, 3) ELSE unit.identifier END AS name
+  FROM members AS m
+  JOIN source_rust_macro_definitions AS definition ON definition.blob_id = m.blob_id
+  JOIN source_declaration_units AS mapping
+    ON mapping.blob_id = definition.blob_id AND mapping.declaration_id = definition.declaration_id
+  JOIN code_units AS unit ON unit.blob_id = mapping.blob_id AND unit.unit_key = mapping.unit_key
+), macro_environment AS MATERIALIZED (
+  -- 1 when something other than the invocation's own path could rebind a
+  -- standard macro name in this crate: a prelude other than std, an inner
+  -- attribute that changes the prelude or the item set, an extern crate or
+  -- #[macro_use] route, a module named like a standard crate, or a macro definition with no named code unit.
+  SELECT (
+    NOT EXISTS (SELECT 1 FROM selected AS s
+                JOIN rust_resolution_unit_summary_contexts AS c ON c.summary_id = s.summary_id
+                WHERE c.prelude = 'std')
+    OR EXISTS (SELECT 1 FROM members AS m
+               JOIN source_rust_inner_attributes AS a ON a.blob_id = m.blob_id
+               WHERE a.name IN ('no_implicit_prelude', 'no_core', 'no_std', 'cfg_attr'))
+    OR EXISTS (SELECT 1 FROM members AS m
+               JOIN rust_import_targets AS t ON t.blob_id = m.blob_id
+               WHERE t.is_extern_crate <> 0 OR t.is_macro_use <> 0)
+    OR EXISTS (SELECT 1 FROM members AS m
+               JOIN source_rust_module_declarations AS d ON d.blob_id = m.blob_id
+               WHERE d.macro_use <> 0
+                  OR d.module_name IN ('std', 'core', 'alloc'))
+    OR EXISTS (SELECT 1 FROM members AS m
+               JOIN source_rust_macro_definitions AS definition ON definition.blob_id = m.blob_id
+               WHERE NOT EXISTS (SELECT 1 FROM source_declaration_units AS mapping
+                                 JOIN code_units AS unit
+                                   ON unit.blob_id = mapping.blob_id AND unit.unit_key = mapping.unit_key
+                                 WHERE mapping.blob_id = definition.blob_id
+                                   AND mapping.declaration_id = definition.declaration_id))
+  ) AS open
 )
 SELECT 0 AS row_kind,
        s.unit_key, s.summary_digest, s.topology_digest,
@@ -98,7 +134,20 @@ SELECT 1, m.rel_path, hex(m.blob_oid), m.source_state,
 FROM members AS m
 UNION ALL
 SELECT 2, m.rel_path, hex(m.blob_oid), b.ordinal, b.kind, b.start_byte,
-       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+       b.macro_absolute, b.macro_shadow_possible, json(b.macro_path),
+       CASE WHEN b.kind = 0 THEN
+         (SELECT open FROM macro_environment)
+         OR EXISTS (SELECT 1 FROM macro_names AS n
+                    WHERE n.name = json_extract(b.macro_path, '$[#-1]'))
+         -- A Cargo dependency can own a standard-looking extern-prelude root
+         -- without any source import, including a renamed path dependency.
+         OR EXISTS (SELECT 1 FROM selected AS s
+                    JOIN rust_crate_dependencies AS dependency
+                      ON dependency.topology_id = s.topology_id
+                     AND dependency.extern_name = json_extract(b.macro_path, '$[0]')
+                    WHERE json_array_length(b.macro_path) = 2
+                      AND dependency.boundary <> 'std') END,
+       NULL, NULL, NULL, NULL
 FROM members AS m
 JOIN source_rust_impl_census_boundaries AS b ON b.blob_id = m.blob_id
 UNION ALL

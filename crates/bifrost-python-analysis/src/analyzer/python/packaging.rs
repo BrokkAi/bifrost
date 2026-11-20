@@ -12,9 +12,13 @@ use pep440_rs::{Version, VersionSpecifiers};
 use pep508_rs::{PackageName, Requirement, VerbatimUrl, VersionOrUrl};
 use toml_edit::{ImDocument, Item, Value};
 
+mod activation;
 mod legacy;
 mod locks;
 
+pub use crate::analyzer::python::packaging::activation::{
+    PYTHON_LOCK_ACTIVATION_INPUTS, is_python_lock_activation_input, python_lock_activation_rows,
+};
 pub use crate::analyzer::python::packaging::locks::associate_python_poetry_lock;
 
 use brokk_bifrost_core::cancellation::CancellationToken;

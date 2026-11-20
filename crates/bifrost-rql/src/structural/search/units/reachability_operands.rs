@@ -232,7 +232,7 @@ pub fn execute_call_reachability_source(
         .clone();
     let mut row_keys = Vec::new();
     let mut rows = Vec::new();
-    let detailed = execute_detailed_unit(
+    let executed = execute_unit_with_finalizer(
         analyzer,
         flow_state,
         workspace,
@@ -242,8 +242,9 @@ pub fn execute_call_reachability_source(
         scope,
         &mut row_keys,
         Some(&mut rows),
+        ProjectSelectorRows,
     );
-    let result = project_unit_result(&detailed, row_keys);
+    let result = executed.unit;
     for row in &mut rows {
         for trace in &mut row.traces {
             trace.branch.insert(0, 0);
@@ -288,7 +289,7 @@ pub fn execute_call_reachability_sink(
     let scope = scope.without_candidate_census();
     let mut row_keys = Vec::new();
     let mut rows = Vec::new();
-    let detailed = execute_detailed_unit(
+    let executed = execute_unit_with_finalizer(
         analyzer,
         flow_state,
         workspace,
@@ -298,11 +299,12 @@ pub fn execute_call_reachability_sink(
         scope,
         &mut row_keys,
         Some(&mut rows),
+        ProjectSelectorRows,
     );
     let mut endpoints = sink_endpoints(&rows);
     endpoints.sort_by(|left, right| left.site.cmp(&right.site));
     CallReachabilitySinkProduct {
-        result: project_unit_result(&detailed, row_keys),
+        result: executed.unit,
         endpoints,
     }
 }

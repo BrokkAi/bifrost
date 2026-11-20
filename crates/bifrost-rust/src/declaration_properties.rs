@@ -493,7 +493,9 @@ pub(crate) fn declared_visibility(
     use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
     match visibility {
         RustVisibility::Public => DeclaredVisibility::Public,
-        RustVisibility::Private => DeclaredVisibility::Private,
+        // `pub(self)` restricts an item to its own module, exactly like no
+        // modifier.
+        RustVisibility::Private | RustVisibility::SelfModule => DeclaredVisibility::Private,
         _ => DeclaredVisibility::CrateOrModule,
     }
 }

@@ -257,6 +257,7 @@ pub fn semantic_from_cells(runtime: Option<i64>, shared: Option<i64>) -> Semanti
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn read<T>(
     selection: &SelectedResolutionMountInventory<'_>,
     cancellation: &CancellationToken,
@@ -1517,6 +1518,7 @@ pub(in crate::analyzer::store) fn candidate_branches_sql() -> &'static str {
 }
 
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn candidate_completion(
     selection: &SelectedResolutionMountInventory<'_>,
     direction: crate::analyzer::resolution::LoweredCandidateDirection,
@@ -1964,6 +1966,7 @@ pub(in crate::analyzer::store) fn hydrate_context_paths(
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn reference_completions(
     selection: &SelectedResolutionMountInventory<'_>,
     queries: &[crate::analyzer::resolution::ResolutionQuery],
@@ -2045,6 +2048,7 @@ pub(in crate::analyzer::store) fn reference_completions(
     Ok((completions, evidence.finish(), cancellation.is_cancelled()))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn reference_inventory_completion(
     selection: &SelectedResolutionMountInventory<'_>,
     fragments: Option<&crate::hash::HashSet<BindingFragmentId>>,
@@ -2094,6 +2098,7 @@ pub(in crate::analyzer::store) fn reference_inventory_completion_sql() -> String
     )
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn reference_inventory(
     selection: &SelectedResolutionMountInventory<'_>,
     fragments: Option<&crate::hash::HashSet<BindingFragmentId>>,
@@ -2255,6 +2260,7 @@ pub fn root_terminal_candidates(
 /// Read all-host proof rows while classifying effective answer eligibility in
 /// the same snapshot. Scope never removes a proof row.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn raw_reverse_candidate_rows(
     selection: &SelectedResolutionMountInventory<'_>,
     requests: &[crate::analyzer::resolution::BatchCandidateRequest],
@@ -2364,6 +2370,7 @@ pub fn raw_reverse_candidate_rows(
 
 /// The former stage service's fragment coverage is aggregate, unlike each
 /// reference seed's source-owned fragment coverage.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn fragment_completion(
     selection: &SelectedResolutionMountInventory<'_>,
     cancellation: &CancellationToken,

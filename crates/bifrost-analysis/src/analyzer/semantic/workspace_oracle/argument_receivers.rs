@@ -212,7 +212,17 @@ impl WorkspaceSemanticOracle<'_> {
             };
             let span = span.start_byte() as usize..span.end_byte() as usize;
             if caller_syntax.is_none() {
-                caller_syntax = Some(self.caller_syntax(actual.procedure(), request)?);
+                let syntax = match self.caller_syntax(actual.procedure(), request)? {
+                    Ok(syntax) => syntax,
+                    Err(exceeded) => {
+                        return Ok(SemanticOutcome::ExceededBudget {
+                            partial: None,
+                            exceeded,
+                            work,
+                        });
+                    }
+                };
+                caller_syntax = Some(syntax);
             }
             let Some(Some((file, source, tree))) = caller_syntax.as_ref() else {
                 continue;
@@ -264,22 +274,33 @@ impl WorkspaceSemanticOracle<'_> {
         &self,
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Option<(ProjectFile, std::sync::Arc<str>, tree_sitter::Tree)>, SemanticProviderError>
-    {
-        let Some((file, source)) = exact_source_for_procedure(
+    ) -> Result<
+        Result<
+            Option<(ProjectFile, std::sync::Arc<str>, tree_sitter::Tree)>,
+            crate::analyzer::semantic::SemanticBudgetExceeded,
+        >,
+        SemanticProviderError,
+    > {
+        let (file, source) = match exact_source_for_procedure(
             self.workspace,
             procedure,
             request.budget.limits().source_bytes,
         )?
-        else {
-            return Ok(None);
+        .on_budget(request.budget)?
+        {
+            Ok(source) => source,
+            Err(exceeded) => {
+                return Ok(Err(exceeded));
+            }
         };
         request.budget.charge_work(SemanticWork {
             source_bytes: source.len(),
             ..SemanticWork::default()
         });
         let language = crate::analyzer::common::language_for_file(&file);
-        Ok(parse_tree_for_language(&file, language, &source).map(|tree| (file, source, tree)))
+        Ok(Ok(
+            parse_tree_for_language(&file, language, &source).map(|tree| (file, source, tree))
+        ))
     }
 
     /// Resolve `call` as ordinary dispatch would if its receiver expression

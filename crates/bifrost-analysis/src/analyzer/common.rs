@@ -17,6 +17,9 @@ use crate::analyzer::{
     CodeUnit, FqName, IAnalyzer, Language, Project, ProjectFile, Range, SummaryFileProjection,
 };
 
+use brokk_bifrost_core::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -171,6 +174,12 @@ pub struct ReplayableQueryCacheValue<T> {
     receipt: Arc<QueryCacheBuildReceipt>,
 }
 
+impl<T> CarriesReuseVerdict for ReplayableQueryCacheValue<T> {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.receipt.reuse_verdict()
+    }
+}
+
 impl<T> ReplayableQueryCacheValue<T> {
     pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> ReplayableQueryCacheValue<U> {
         ReplayableQueryCacheValue {
@@ -183,6 +192,15 @@ impl<T> ReplayableQueryCacheValue<T> {
     /// refused operational fill. The receipt owns and accounts for the data.
     pub fn incomplete_reasons(&self) -> &[crate::analyzer::QueryReadIncomplete] {
         &self.receipt.reasons
+    }
+
+    /// Whether a refused fill belongs only to the request that pinned an input.
+    /// Unlike [`QueryCacheBuildReceipt::request_memo_admissible`], this also
+    /// applies the replay-receipt admission cap that the shared cache enforces.
+    pub fn request_pinned_memo_admissible(&self) -> bool {
+        self.receipt.channels.request_pinned_dependences > 0
+            && self.receipt.request_memo_admissible()
+            && replayable_receipt_admitted(&self.receipt)
     }
 
     pub fn retained_receipt_bytes(&self) -> usize {
@@ -226,7 +244,7 @@ impl QueryCacheBuildReceipt {
 
 impl QueryCacheBuildReceipt {
     /// Allocated: the region charge.
-    fn allocated_bytes(&self) -> usize {
+    pub fn allocated_bytes(&self) -> usize {
         let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::allocated();
         heap.slice(&self.keys);
         for key in self.keys.iter() {
@@ -273,7 +291,7 @@ impl<T> std::ops::Deref for ReplayableQueryCacheValue<T> {
 }
 
 /// Retain snapshot-deterministic incompleteness with its typed receipt. The
-/// failed-wave path still shares transient attempts only with their consumers.
+/// failed-wave path shares deterministic attempts; transient failures stay local.
 /// Named input keys remain in the caller's bounded authority memo; this cell
 /// retains completion evidence rather than a second workspace-sized read set.
 #[doc(hidden)]
@@ -335,9 +353,28 @@ pub struct QueryCacheBuildReceipt {
     runtime_cache_touched: bool,
 }
 
+impl CarriesReuseVerdict for QueryCacheBuildReceipt {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        let verdict = self
+            .channels
+            .explicit_verdict
+            .join(ReuseVerdict::from_counts(
+                self.channels.execution_dependences,
+                self.channels.budget_dependences,
+                self.channels.request_pinned_dependences,
+            ));
+        if verdict.is_content() && (self.has_execution_dependences() || self.channels.reuse_refused)
+        {
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+        } else {
+            verdict
+        }
+    }
+}
+
 impl QueryCacheBuildReceipt {
     pub fn stable_reasons(&self) -> &[crate::analyzer::QueryReadIncomplete] {
-        debug_assert!(!self.has_execution_dependences());
+        debug_assert!(!self.has_unpinned_execution_dependences());
         &self.reasons
     }
 
@@ -359,6 +396,32 @@ impl QueryCacheBuildReceipt {
                 .iter()
                 .any(|reason| reason.is_execution_dependent())
     }
+    /// Whether the build depended on execution beyond inputs its request
+    /// pinned. A request-pinned input holds for the request that pinned it
+    /// (#14322), so a request-owned product may keep a build that has only
+    /// those; a product any later request may reuse checks
+    /// [`Self::has_execution_dependences`] instead.
+    pub fn has_unpinned_execution_dependences(&self) -> bool {
+        self.channels.unpinned_execution_dependences() > 0
+            || self
+                .reasons
+                .iter()
+                .any(|reason| reason.is_execution_dependent())
+    }
+
+    /// Request memos may retain deterministic refusals and request-pinned
+    /// inputs, but never transient work failures.
+    pub fn request_memo_admissible(&self) -> bool {
+        !self.has_unpinned_execution_dependences()
+            && self.channels.budget_dependences == 0
+            && !self.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    crate::analyzer::QueryReadIncomplete::StoreFailure(_)
+                )
+            })
+    }
+
     pub fn is_complete(&self) -> bool {
         self.reasons.is_empty()
             && self.channels.execution_dependences == 0
@@ -398,15 +461,31 @@ pub fn replay_query_read_incompleteness(reasons: &[crate::analyzer::QueryReadInc
 
 /// Completion replay for a receipt that also restores its captured channels.
 /// Reason-only receipts keep using replay_query_read_incompleteness.
-pub(crate) fn replay_captured_query_read_incompleteness(
-    reasons: &[crate::analyzer::QueryReadIncomplete],
-) {
+#[doc(hidden)]
+pub fn replay_captured_query_read_incompleteness(reasons: &[crate::analyzer::QueryReadIncomplete]) {
     for reason in reasons {
         match reason {
             crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
                 crate::analyzer::i_analyzer::replay_captured_store_error(error.clone())
             }
             reason => crate::analyzer::i_analyzer::replay_captured_query_incomplete(reason.clone()),
+        }
+    }
+}
+
+/// Replay interned causes: identical effects to
+/// `replay_captured_query_read_incompleteness` over their reasons, without
+/// recomputing any cause key.
+#[doc(hidden)]
+pub fn replay_captured_causes(
+    causes: &[std::sync::Arc<crate::analyzer::i_analyzer::CapturedCause>],
+) {
+    for cause in causes {
+        match cause.reason() {
+            crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
+                crate::analyzer::i_analyzer::replay_captured_store_error(error.clone())
+            }
+            _ => crate::analyzer::i_analyzer::replay_captured_cause(cause),
         }
     }
 }
@@ -432,9 +511,45 @@ pub fn capture_query_cache_build<T>(
     )
 }
 
+#[doc(hidden)]
+pub fn capture_current_query_cache_build<T>(
+    build: impl FnOnce() -> T,
+) -> (T, QueryCacheBuildReceipt) {
+    let (value, reads, reasons) = crate::analyzer::i_analyzer::capture_current_query_reads(build);
+    let receipt = QueryCacheBuildReceipt {
+        keys: Arc::from(reads.keys()),
+        reasons,
+        channels: reads.channels(),
+        runtime_cache_touched: reads.runtime_cache_touched(),
+    };
+    receipt.replay();
+    (value, receipt)
+}
+
+impl crate::retention_budget::RetainedBytes for QueryCacheBuildReceipt {
+    fn retained_bytes(&self) -> usize {
+        QueryCacheBuildReceipt::retained_bytes(self)
+            + 2 * std::mem::size_of::<usize>() // Arc slice allocation header.
+            + (self.reasons.capacity() - self.reasons.len())
+                * std::mem::size_of::<crate::analyzer::QueryReadIncomplete>()
+    }
+}
+
+impl crate::analyzer::store::semantic_composition::SearchInputReceipt for QueryCacheBuildReceipt {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 struct FailedQueryCacheBuild<T> {
     value: Arc<T>,
     receipt: QueryCacheBuildReceipt,
+}
+
+impl<T> CarriesReuseVerdict for FailedQueryCacheBuild<T> {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.receipt.reuse_verdict()
+    }
 }
 
 fn shared_query_cache_fill<T>(
@@ -454,7 +569,7 @@ fn replay_failed_query_cache_build<T>(failure: Arc<FailedQueryCacheBuild<T>>) ->
     Arc::clone(&failure.value)
 }
 
-/// Completed values stay cached; waiters share only their current failed wave.
+/// Completed values stay cached; only deterministic failed waves are shared.
 #[doc(hidden)]
 pub fn complete_query_cache_pool<T: Send + Sync + 'static>(
     analyzer: &dyn IAnalyzer,
@@ -481,7 +596,7 @@ fn shared_optional_query_cache_fill<T>(
     }
 }
 
-/// Share failed attempts without keeping a cancelled waiter parked.
+/// Share deterministic failures without keeping a cancelled waiter parked.
 #[doc(hidden)]
 pub fn complete_query_cache_pool_while<T: Send + Sync + 'static>(
     analyzer: &dyn IAnalyzer,
@@ -563,13 +678,14 @@ pub fn replayable_query_cache_fill<T>(
         analyzer.record_query_incomplete(reason);
     }
     let snapshot_changed = analyzer.project().analysis_generation() != generation_before;
+    let cancelled = analyzer
+        .active_query_cancellation()
+        .is_some_and(|token| token.is_cancelled());
     if incomplete
         || snapshot_changed
         || reads.execution_dependences() > 0
         || reads.reuse_refused()
-        || analyzer
-            .active_query_cancellation()
-            .is_some_and(|token| token.is_cancelled())
+        || cancelled
     {
         crate::profiling::note_with(|| {
             format!(
@@ -578,7 +694,17 @@ pub fn replayable_query_cache_fill<T>(
                 line!()
             )
         });
-        crate::analyzer::i_analyzer::join_execution_dependence(analyzer);
+        // A fill refused only for request-pinned inputs already forwarded that
+        // cause to its consumers. Marking it as another cause too would make
+        // the request that read those inputs rebuild the fill (#14322).
+        let request_pinned_only = !incomplete
+            && !snapshot_changed
+            && !cancelled
+            && !reads.reuse_refused()
+            && reads.execution_dependences() == reads.request_pinned_dependences();
+        if !request_pinned_only {
+            crate::analyzer::i_analyzer::join_execution_dependence(analyzer);
+        }
         Err(value)
     } else {
         Ok(value)
@@ -885,6 +1011,13 @@ impl<'a> QueryCacheFill<'a> {
     }
 
     pub fn is_complete(&self) -> bool {
+        self.is_operationally_complete() && !self.reads.reuse_refused()
+    }
+
+    /// Complete apart from a reuse refusal: no cancellation, generation
+    /// change, execution dependence or content gap stopped the fill. A pure
+    /// refusal denies shared reuse but leaves the answer exact (#12820).
+    pub fn is_operationally_complete(&self) -> bool {
         let snapshot_changed =
             self.analyzer.project().analysis_generation() != self.generation_before;
         let cancelled = self
@@ -912,7 +1045,6 @@ impl<'a> QueryCacheFill<'a> {
             && !snapshot_changed
             && !cancelled
             && self.reads.execution_dependences() == 0
-            && !self.reads.reuse_refused()
     }
 }
 
@@ -926,8 +1058,9 @@ impl Drop for QueryCacheFill<'_> {
 }
 
 /// Share a fallible Moka build together with its typed read receipt.
-/// Every failed-wave consumer replays that receipt into its own request chain;
-/// Moka does not retain the Err for a later wave. The builder decides admission
+/// Content failures share their receipt. A caller whose initializer did not
+/// run never replays another request's execution failure: it builds once for
+/// itself. Moka does not retain errors. The builder decides admission
 /// (normally through complete_query_cache_fill), so success and failure may
 /// have different payload types, including weighted replay entries.
 #[doc(hidden)]
@@ -942,15 +1075,46 @@ where
     V: Clone + Send + Sync + 'static,
     E: Send + Sync + 'static,
 {
-    cache
-        .try_get_with_by_ref(key, || {
-            let (attempt, receipt) = capture_query_cache_build(analyzer, build);
-            attempt.map_err(|value| (Arc::new(value), receipt))
+    // Owning the still-unused FnOnce proves this caller was a waiter. There
+    // is no retry around Moka: a foreign execution error consumes it once.
+    let mut build = Some(build);
+    let result = cache.try_get_with_by_ref(key, || {
+        let (attempt, receipt) = capture_query_cache_build(
+            analyzer,
+            build
+                .take()
+                .expect("Moka runs this initializer at most once"),
+        );
+        attempt.map_err(|value| FailedQueryCacheBuild {
+            value: Arc::new(value),
+            receipt,
         })
-        .map_err(|failure| {
-            failure.1.replay();
-            Arc::clone(&failure.0)
-        })
+    });
+    match result {
+        Ok(value) => Ok(value),
+        Err(failure) => {
+            if build.is_some()
+                && crate::analyzer::pool_memo::shareable_wave_result::<(), _>(Err(Arc::clone(
+                    &failure,
+                )))
+                .is_err()
+            {
+                let (own, _) = capture_query_cache_build(
+                    analyzer,
+                    build.take().expect("a waiter still owns its initializer"),
+                );
+                return own
+                    .inspect(|value| {
+                        // The same builder admission that guards Moka's ordinary
+                        // success path also guards this caller's own value.
+                        cache.insert(key.clone(), value.clone());
+                    })
+                    .map_err(Arc::new);
+            }
+            failure.receipt.replay();
+            Err(Arc::clone(&failure.value))
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -1726,6 +1890,297 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#11997: Moka shared an initializer's execution failure with healthy waiters")]
+    fn moka_waiters_share_content_errors_but_compute_after_foreign_execution_errors() {
+        use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, MultiAnalyzer, QueryReadIncomplete};
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        struct Joined {
+            signal: mpsc::Sender<()>,
+            announced: AtomicBool,
+        }
+        #[derive(Clone)]
+        struct Key {
+            value: u8,
+            joined: Option<Arc<Joined>>,
+        }
+        impl Hash for Key {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.value.hash(state);
+            }
+        }
+        impl PartialEq for Key {
+            fn eq(&self, other: &Self) -> bool {
+                if self.value != other.value {
+                    return false;
+                }
+                // While the leader is blocked the value cache is empty. Moka
+                // 0.12's only equal stored key is in its initializer waiter map
+                // (try_init_or_read -> try_insert_waiter). This proves each
+                // caller found the live wave, without sleeps or scheduler luck.
+                for probe in [&self.joined, &other.joined].into_iter().flatten() {
+                    if !probe.announced.swap(true, Ordering::SeqCst) {
+                        probe.signal.send(()).expect("announce an actual waiter");
+                    }
+                }
+                true
+            }
+        }
+        impl Eq for Key {}
+
+        const FOLLOWERS: usize = 4;
+        for verdict in [
+            super::ReuseVerdict::Content,
+            super::ReuseVerdict::ExecutionDependent(super::ExecutionCause::Other),
+        ] {
+            let analyzer = Arc::new(MultiAnalyzer::default());
+            let cache = Arc::new(moka::sync::Cache::new(16));
+            let rebuilds = Arc::new(AtomicUsize::new(0));
+            let (started_tx, started_rx) = mpsc::sync_channel(0);
+            let (release_tx, release_rx) = mpsc::sync_channel(0);
+            let (joined_tx, joined_rx) = mpsc::channel();
+            let leader_analyzer = analyzer.clone();
+            let leader_cache = cache.clone();
+            let leader = std::thread::spawn(move || {
+                let scope = AnalyzerQueryScope::new(leader_analyzer.as_ref());
+                let result = super::query_cache_moka(
+                    leader_analyzer.as_ref(),
+                    &leader_cache,
+                    &Key {
+                        value: 1,
+                        joined: None,
+                    },
+                    || {
+                        match verdict {
+                            super::ReuseVerdict::Content => {
+                                leader_analyzer.record_query_incomplete(
+                                    QueryReadIncomplete::ArtifactUnavailable(
+                                        "missing input".into(),
+                                    ),
+                                );
+                            }
+                            super::ReuseVerdict::ExecutionDependent(_) => {
+                                crate::analyzer::i_analyzer::record_store_error_on_current_contexts(
+                                    crate::analyzer::store::StoreError::new(
+                                        "initializer's own failure",
+                                    ),
+                                );
+                                assert!(scope.store_error().is_some());
+                                assert!(brokk_bifrost_core::analyzer::carried_context::request_store_failed());
+                            }
+                        }
+                        started_tx.send(()).expect("leader is initializing");
+                        release_rx.recv().expect("all followers found the wave");
+                        Err::<usize, usize>(41)
+                    },
+                );
+                assert_eq!(result, Err(Arc::new(41)));
+            });
+            started_rx.recv().expect("wait for the real initializer");
+            let followers = (0..FOLLOWERS)
+                .map(|_| {
+                    let analyzer = analyzer.clone();
+                    let cache = cache.clone();
+                    let rebuilds = rebuilds.clone();
+                    let joined = Arc::new(Joined {
+                        signal: joined_tx.clone(),
+                        announced: AtomicBool::new(false),
+                    });
+                    std::thread::spawn(move || {
+                        let scope = AnalyzerQueryScope::new(analyzer.as_ref());
+                        let result = super::query_cache_moka(
+                            analyzer.as_ref(),
+                            &cache,
+                            &Key {
+                                value: 1,
+                                joined: Some(joined),
+                            },
+                            || {
+                                rebuilds.fetch_add(1, Ordering::SeqCst);
+                                Ok::<usize, usize>(42)
+                            },
+                        );
+                        (result, scope.store_error(), scope.read_completion())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..FOLLOWERS {
+                joined_rx
+                    .recv()
+                    .expect("each follower matched the live waiter key");
+            }
+            release_tx.send(()).expect("release the failed wave");
+            leader.join().expect("leader completed");
+            let results = followers
+                .into_iter()
+                .map(|thread| thread.join().expect("follower completed"))
+                .collect::<Vec<_>>();
+            match verdict {
+                super::ReuseVerdict::Content => {
+                    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+                    for (result, store_error, completion) in results {
+                        assert_eq!(result, Err(Arc::new(41)));
+                        assert!(store_error.is_none());
+                        assert!(matches!(
+                            completion,
+                            Err(QueryReadIncomplete::ArtifactUnavailable(_))
+                        ));
+                    }
+                }
+                super::ReuseVerdict::ExecutionDependent(_) => {
+                    assert_eq!(rebuilds.load(Ordering::SeqCst), FOLLOWERS);
+                    for (result, store_error, completion) in results {
+                        assert_eq!(result, Ok(42));
+                        assert!(store_error.is_none(), "{store_error:?}");
+                        assert!(completion.is_ok(), "{completion:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#11997: a leader's failed own read crossed into a healthy cache-wave follower")]
+    fn retained_fill_failure_does_not_cross_to_a_healthy_wave_follower() {
+        use crate::analyzer::workspace::EmptyAnalyzer;
+        use crate::analyzer::{AnalyzerQueryScope, TestProject};
+        use std::sync::{Arc, mpsc};
+
+        let root = tempfile::tempdir().unwrap();
+        let analyzer = Arc::new(EmptyAnalyzer::new(Arc::new(TestProject::new(
+            root.path(),
+            Language::CSharp,
+        ))));
+        let memo = Arc::new(crate::analyzer::pool_memo::PoolSafeMemo::new());
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (joined_tx, joined_rx) = mpsc::sync_channel(0);
+        let leader_analyzer = analyzer.clone();
+        let leader_memo = memo.clone();
+        let leader = std::thread::spawn(move || {
+            let scope = AnalyzerQueryScope::new(leader_analyzer.as_ref());
+            assert!(scope.store_error().is_none());
+            let _fill = AnalyzerQueryScope::for_retained_fill(leader_analyzer.as_ref());
+            let value = super::complete_query_cache_pool_while(
+                leader_analyzer.as_ref(),
+                &leader_memo,
+                &|| true,
+                || {
+                    // The fault belongs to the initializer's own reads. A clean
+                    // independent fill under a failed parent is valid (#11701).
+                    crate::analyzer::i_analyzer::record_store_error_on_current_contexts(
+                        crate::analyzer::store::StoreError::new("leader's own failed read"),
+                    );
+                    assert!(scope.store_error().is_some());
+                    assert!(brokk_bifrost_core::analyzer::carried_context::request_store_failed());
+                    started_tx.send(()).expect("signal active leader");
+                    release_rx.recv().expect("release after follower joins");
+                    Some(41)
+                },
+                || panic!("off-pool leader does not duplicate the build"),
+            );
+            (value, scope.store_error())
+        });
+        started_rx.recv().expect("leader is inside its shared fill");
+        let follower_analyzer = analyzer.clone();
+        let follower_memo = memo.clone();
+        let follower = std::thread::spawn(move || {
+            let scope = AnalyzerQueryScope::new(follower_analyzer.as_ref());
+            assert!(scope.store_error().is_none());
+            let joined = std::cell::Cell::new(false);
+            // get_or_try_build_wave_while holds the shared wave before the
+            // first predicate call. This signal proves a real wave follower;
+            // it cannot pass by arriving only after the failed leader exits.
+            let keep_going = || {
+                if !joined.replace(true) {
+                    joined_tx.send(()).expect("signal joined follower");
+                }
+                true
+            };
+            let value = super::complete_query_cache_pool_while(
+                follower_analyzer.as_ref(),
+                &follower_memo,
+                &keep_going,
+                || Some(42),
+                || Some(42),
+            );
+            (value, scope.store_error(), scope.read_completion())
+        });
+        joined_rx
+            .recv()
+            .expect("healthy caller joined the existing failure wave");
+        release_tx.send(()).expect("release failed leader");
+        let (leader_value, leader_error) = leader.join().expect("leader did not panic");
+        let (follower_value, follower_error, follower_completion) =
+            follower.join().expect("follower did not panic");
+        assert!(leader_value.is_none());
+        assert!(leader_error.is_some());
+        assert!(
+            follower_error.is_none(),
+            "healthy follower inherited a foreign failure: {follower_error:?}"
+        );
+        assert!(follower_completion.is_ok(), "{follower_completion:?}");
+        assert_eq!(follower_value.as_deref(), Some(&42));
+        assert_eq!(memo.get().as_deref(), Some(&42));
+    }
+
+    #[test]
+    // The former parent-prefailed refusal assertion was withdrawn: independent
+    // fills retain clean own answers. Keep the failure injection and the later
+    // healthy hit as a witness of that boundary (#11701, #11997).
+    fn clean_retained_fill_under_a_failed_parent_is_reused_by_a_fresh_request() {
+        use crate::analyzer::workspace::EmptyAnalyzer;
+        use crate::analyzer::{AnalyzerQueryScope, TestProject};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(root.path(), Language::CSharp)));
+        let cell = super::QueryCacheCell::new();
+        {
+            let outer = AnalyzerQueryScope::new(&analyzer);
+            assert!(outer.store_error().is_none());
+            crate::analyzer::i_analyzer::record_store_error_on_current_contexts(
+                crate::analyzer::store::StoreError::new("failed parent"),
+            );
+            assert!(
+                outer.store_error().is_some(),
+                "the injection must record a failure"
+            );
+            assert!(brokk_bifrost_core::analyzer::carried_context::request_store_failed());
+            let fill = AnalyzerQueryScope::for_retained_fill(&analyzer);
+            assert!(fill.store_error().is_none());
+            assert_eq!(super::complete_query_cache_fill(&analyzer, || 41), Ok(41));
+            let (result, receipt) = super::capture_query_cache_build(&analyzer, || {
+                super::replayable_query_cache_fill(&analyzer, || 42)
+            });
+            assert_eq!(result, Ok(42));
+            assert!(!receipt.store_failed());
+            assert!(receipt.is_complete());
+            assert_eq!(
+                super::replayable_query_cache_cell(&analyzer, &cell, || 42),
+                42
+            );
+            assert!(cell.get().is_some(), "the fill's own reads are clean");
+            drop(fill);
+            assert!(outer.store_error().is_some());
+        }
+        let fresh = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            super::replayable_query_cache_cell(&analyzer, &cell, || panic!("clean fill retained")),
+            42
+        );
+        assert_eq!(
+            super::replayable_query_cache_cell(&analyzer, &cell, || panic!("ready hit")),
+            42
+        );
+        assert!(fresh.read_completion().is_ok());
+        assert!(fresh.store_error().is_none());
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#12527: overflowing external diagnostics lost distinct recognized producer codes"
     )]
@@ -2020,6 +2475,27 @@ mod tests {
         );
         assert!(!replayable_receipt_admitted(&receipt));
         assert_eq!(receipt.reasons.as_slice(), std::slice::from_ref(&oversized));
+
+        let request_value = |channels, reasons| super::ReplayableQueryCacheValue {
+            value: (),
+            receipt: Arc::new(QueryCacheBuildReceipt {
+                keys: Arc::default(),
+                reasons,
+                channels,
+                runtime_cache_touched: false,
+            }),
+        };
+        assert!(!request_value(Default::default(), Vec::new()).request_pinned_memo_admissible());
+        let pinned = brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+            execution_dependences: 1,
+            request_pinned_dependences: 1,
+            ..Default::default()
+        };
+        assert!(request_value(pinned, Vec::new()).request_pinned_memo_admissible());
+        let oversized = vec![QueryReadIncomplete::SemanticEvidenceGap(
+            "x".repeat(super::MAX_REPLAYABLE_RECEIPT_BYTES + 1).into(),
+        )];
+        assert!(!request_value(pinned, oversized).request_pinned_memo_admissible());
     }
 
     #[test]

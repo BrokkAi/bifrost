@@ -59,6 +59,391 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateDeltaEvent {
+    FullListing(Language),
+    Admission {
+        language: Language,
+        requested: usize,
+        validated: usize,
+    },
+    Decision {
+        certified: bool,
+        reason: &'static str,
+    },
+    Consulted {
+        language: Language,
+        keys: usize,
+    },
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FORCE_FULL_UPDATE_DELTA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UPDATE_DELTA_EVENTS: std::cell::RefCell<Option<Vec<UpdateDeltaEvent>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn update_delta_event(event: UpdateDeltaEvent) {
+    UPDATE_DELTA_EVENTS.with_borrow_mut(|events| {
+        if let Some(events) = events {
+            events.push(event);
+        }
+    });
+}
+
+/// Observe only this thread's update operation, without retaining endpoints.
+#[cfg(any(test, feature = "test-support"))]
+pub fn capture_update_delta<T>(run: impl FnOnce() -> T) -> (T, Vec<UpdateDeltaEvent>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            UPDATE_DELTA_EVENTS.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+    UPDATE_DELTA_EVENTS.with_borrow_mut(|slot| {
+        assert!(slot.is_none(), "update delta observer cannot nest");
+        *slot = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let value = run();
+    let events = UPDATE_DELTA_EVENTS.with_borrow_mut(|slot| slot.take().unwrap());
+    (value, events)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn without_update_delta_observer<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<UpdateDeltaEvent>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UPDATE_DELTA_EVENTS.with_borrow_mut(|slot| *slot = self.0.take());
+        }
+    }
+    let _restore = Restore(UPDATE_DELTA_EVENTS.with_borrow_mut(Option::take));
+    run()
+}
+
+/// Run the reference leg through the unchanged full-comparison path.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_full_update_delta<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_FULL_UPDATE_DELTA.set(self.0);
+        }
+    }
+    let _restore = Restore(FORCE_FULL_UPDATE_DELTA.replace(true));
+    run()
+}
+
+/// One selected analyzed key replacement, including additions and removals.
+#[derive(Debug)]
+pub struct SelectedKeyTransition {
+    pub file: ProjectFile,
+    pub old: Option<crate::gitblob::BlobKey>,
+    pub new: Option<crate::gitblob::BlobKey>,
+}
+
+#[derive(Debug, Default)]
+pub struct UpdatePathEffects {
+    pub affected: std::collections::BTreeSet<ProjectFile>,
+    pub selected_keys: Vec<SelectedKeyTransition>,
+}
+
+/// Effects reported by a producer before the transaction's single decision.
+#[derive(Debug)]
+pub enum UpdateEffects {
+    Paths(UpdatePathEffects),
+    AllMayHaveChanged(&'static str),
+}
+
+impl UpdateEffects {
+    pub fn no_changes() -> Self {
+        Self::Paths(UpdatePathEffects::default())
+    }
+
+    // Hard-won: #13637: unverified ignore receipt visited unchanged language wrappers whose default report uncertified deltas
+    /// Report `no_changes()` for a wrapper whose own cross-file update effects
+    /// are not yet bounded (#13191) only when neither `changed_files` nor its
+    /// inner `TreeSitterAnalyzer` observed any change for that language.
+    pub fn no_changes_or_unreported(
+        self,
+        changed_files: &std::collections::BTreeSet<ProjectFile>,
+    ) -> Self {
+        match self {
+            Self::Paths(paths)
+                if changed_files.is_empty()
+                    && paths.affected.is_empty()
+                    && paths.selected_keys.is_empty() =>
+            {
+                Self::Paths(paths)
+            }
+            Self::Paths(_) => Self::AllMayHaveChanged("delegate did not report update effects"),
+            other @ Self::AllMayHaveChanged(_) => other,
+        }
+    }
+
+    pub fn combine(&mut self, other: Self) {
+        match (&mut *self, other) {
+            (Self::Paths(paths), Self::Paths(additional)) => {
+                paths.affected.extend(additional.affected);
+                paths.selected_keys.extend(additional.selected_keys);
+            }
+            (Self::Paths(_), other @ Self::AllMayHaveChanged(_)) => *self = other,
+            (Self::AllMayHaveChanged(_), _) => {}
+        }
+    }
+
+    pub fn selected_paths(
+        old: &dyn WorkspaceFactIndex,
+        new: &dyn WorkspaceFactIndex,
+        paths: std::collections::BTreeSet<ProjectFile>,
+    ) -> Self {
+        if paths.is_empty() {
+            return Self::no_changes();
+        }
+        if !old.supports_analyzed_blob_projection() || !new.supports_analyzed_blob_projection() {
+            return Self::AllMayHaveChanged("producer admission state is not frozen");
+        }
+        let files = paths.iter().cloned().collect::<Vec<_>>();
+        let (Some(old), Some(new)) = (
+            old.analyzed_blob_candidates(&files),
+            new.analyzed_blob_candidates(&files),
+        ) else {
+            return Self::AllMayHaveChanged("selected-key transition unavailable");
+        };
+        let mut old = old
+            .into_iter()
+            .map(|candidate| (candidate.file, candidate.key))
+            .collect::<HashMap<_, _>>();
+        let mut new = new
+            .into_iter()
+            .map(|candidate| (candidate.file, candidate.key))
+            .collect::<HashMap<_, _>>();
+        let selected_keys = files
+            .into_iter()
+            .map(|file| SelectedKeyTransition {
+                old: old.remove(&file),
+                new: new.remove(&file),
+                file,
+            })
+            .collect();
+        Self::Paths(UpdatePathEffects {
+            affected: paths,
+            selected_keys,
+        })
+    }
+}
+
+/// The transaction's single decision, borrowing its exact two endpoints.
+/// No producer or consumer can attach the paths to a different snapshot.
+pub(crate) enum UpdateDecision<'a> {
+    CertifiedDelta {
+        base: &'a WorkspaceAnalyzer,
+        head: &'a WorkspaceAnalyzer,
+        prepared: Box<ChangedFacts>,
+        analysis_epochs: HashMap<String, crate::analyzer::store::GenerationId>,
+    },
+    AllMayHaveChanged(&'static str),
+}
+
+impl<'a> UpdateDecision<'a> {
+    /// Decide whether the update's certified delta may stand in for the full
+    /// comparison. Every read here is an optimization: a failure only selects
+    /// `AllMayHaveChanged`, after which master's full path reads and records
+    /// failures exactly as it does without this path. The advisory scope stops
+    /// failures raised here at this boundary so they never reach, or fail, an
+    /// enclosing request or policy context.
+    pub(crate) fn decide(
+        base: &'a WorkspaceAnalyzer,
+        head: &'a WorkspaceAnalyzer,
+        effects: UpdateEffects,
+        old_ignore: brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation,
+        read: &crate::analyzer::store::UpdateProjectionRead<'_>,
+        consulted: &HashMap<Language, Vec<ProjectFile>>,
+    ) -> Self {
+        let _bounded = AnalyzerQueryScope::for_advisory_read(base.analyzer());
+        Self::decide_bounded(base, head, effects, old_ignore, read, consulted)
+    }
+
+    fn decide_bounded(
+        base: &'a WorkspaceAnalyzer,
+        head: &'a WorkspaceAnalyzer,
+        effects: UpdateEffects,
+        old_ignore: brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation,
+        read: &crate::analyzer::store::UpdateProjectionRead<'_>,
+        consulted: &HashMap<Language, Vec<ProjectFile>>,
+    ) -> Self {
+        use brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation;
+        #[cfg(any(test, feature = "test-support"))]
+        if FORCE_FULL_UPDATE_DELTA.get() {
+            return Self::AllMayHaveChanged("differential reference");
+        }
+        let UpdateEffects::Paths(mut paths) = effects else {
+            let UpdateEffects::AllMayHaveChanged(reason) = effects else {
+                unreachable!()
+            };
+            return Self::AllMayHaveChanged(reason);
+        };
+        let transition_paths = paths
+            .selected_keys
+            .iter()
+            .map(|transition| transition.file.clone())
+            .collect::<HashSet<_>>();
+        if paths
+            .affected
+            .iter()
+            .any(|path| !transition_paths.contains(path))
+        {
+            return Self::AllMayHaveChanged("producer omitted selected-key transitions");
+        }
+        paths.affected.extend(transition_paths);
+        if !matches!(old_ignore, RetainedIgnoreObservation::Ok)
+            || !matches!(
+                head.analyzer().project().retained_ignore_observation(),
+                RetainedIgnoreObservation::Ok
+            )
+        {
+            return Self::AllMayHaveChanged("retained ignore observation unavailable");
+        }
+        if base.config() != head.config()
+            || base.analyzer().project().overlay_content().is_some()
+            || head.analyzer().project().overlay_content().is_some()
+            || !identity_inputs_moved(base, head).is_empty()
+        {
+            return Self::AllMayHaveChanged("unreported identity or overlay effect");
+        }
+        let old_indexes = fact_indexes_by_language(base);
+        let new_indexes = fact_indexes_by_language(head);
+        if old_indexes
+            .values()
+            .chain(new_indexes.values())
+            .any(|index| !index.supports_analyzed_blob_projection())
+        {
+            return Self::AllMayHaveChanged("language admission requires broad validation");
+        }
+        let (Some(old_store), Some(new_store)) = (base.store(), head.store()) else {
+            return Self::AllMayHaveChanged("store authority unavailable");
+        };
+        if !std::sync::Arc::ptr_eq(old_store, new_store) {
+            return Self::AllMayHaveChanged("store authority changed");
+        }
+        let mut generations = HashMap::default();
+        for index in old_indexes.values().chain(new_indexes.values()) {
+            let Some(selected) = index.projection_generations() else {
+                return Self::AllMayHaveChanged("generation authority unavailable");
+            };
+            for (language, generation) in selected {
+                if let Some(previous) = generations.insert(language.clone(), *generation)
+                    && previous != *generation
+                {
+                    return Self::AllMayHaveChanged("generation selection changed");
+                }
+            }
+        }
+        for (language, generation) in &generations {
+            if let Err(error) = read.require_epoch(language, *generation) {
+                base.analyzer().record_query_failure(error);
+                return Self::AllMayHaveChanged("generation authority failed");
+            }
+        }
+        for (workspace, indexes) in [(base, &old_indexes), (head, &new_indexes)] {
+            let _scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+
+            for index in indexes.values() {
+                let Some(snapshots) = index.projection_snapshots() else {
+                    return Self::AllMayHaveChanged("selected snapshot authority unavailable");
+                };
+                for snapshot in snapshots.values() {
+                    match read.selected_set_complete(snapshot) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Self::AllMayHaveChanged("selected set completeness unknown");
+                        }
+                        Err(error) => {
+                            workspace.analyzer().record_query_failure(error);
+                            return Self::AllMayHaveChanged("selected set certificate unavailable");
+                        }
+                    }
+                }
+            }
+        }
+        let mut languages = old_indexes
+            .keys()
+            .chain(new_indexes.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        languages.sort();
+        languages.dedup();
+        let paths = languages
+            .into_iter()
+            .map(|language| (language, paths.affected.iter().cloned().collect()))
+            .collect();
+        let prepared = ChangedFacts::between_projection_in(base, head, &paths, consulted, read);
+        if read.had_failure() || !prepared.is_complete() {
+            return Self::AllMayHaveChanged("projection preparation failed");
+        }
+        Self::CertifiedDelta {
+            base,
+            head,
+            prepared: Box::new(prepared),
+            analysis_epochs: generations,
+        }
+    }
+
+    pub(crate) fn changed_facts(
+        self,
+        base: &WorkspaceAnalyzer,
+        head: &WorkspaceAnalyzer,
+    ) -> ChangedFacts {
+        match self {
+            Self::CertifiedDelta {
+                base: certified_base,
+                head: certified_head,
+                prepared,
+                analysis_epochs,
+            } => {
+                assert!(std::ptr::eq(base, certified_base) && std::ptr::eq(head, certified_head));
+                crate::profiling::note_with(|| {
+                    format!(
+                        "update_delta=CertifiedDelta epochs={}",
+                        analysis_epochs.len()
+                    )
+                });
+                #[cfg(any(test, feature = "test-support"))]
+                update_delta_event(UpdateDeltaEvent::Decision {
+                    certified: true,
+                    reason: "certified",
+                });
+                *prepared
+            }
+            Self::AllMayHaveChanged(reason) => {
+                #[cfg(any(test, feature = "test-support"))]
+                update_delta_event(UpdateDeltaEvent::Decision {
+                    certified: false,
+                    reason,
+                });
+                crate::profiling::note_with(|| {
+                    format!("update_delta=AllMayHaveChanged reason={reason}")
+                });
+                ChangedFacts::between(base, head)
+            }
+        }
+    }
+}
+
+/// One candidate for request-local batched admission. Constructed by the same
+/// owner that constructs the language's full analyzed listing.
+#[doc(hidden)]
+pub struct AnalyzedBlobCandidate {
+    pub file: ProjectFile,
+    pub key: crate::gitblob::BlobKey,
+    pub authoritative: bool,
+}
+
 /// The producer side of the read ledger's per-file keys, for one language.
 ///
 /// A `ReadKey::File` names a blob and a `ReadKey::Index` names a name-keyed
@@ -78,6 +463,13 @@ pub trait WorkspaceFactIndex: Send + Sync {
     /// listing omission that may hide source would withdraw. An update with no
     /// changed file needs to run only while there is a proof to withdraw.
     fn holds_workspace_listing_proof(&self) -> bool {
+        false
+    }
+
+    /// Whether the generation this analyzer was published from observed a
+    /// listing omission that can hide a source. When the omission is gone the
+    /// withdrawn proof can be rebuilt, so the update must run.
+    fn hiding_omission_hidden(&self) -> bool {
         false
     }
 
@@ -131,6 +523,53 @@ pub trait WorkspaceFactIndex: Send + Sync {
     /// None when the listing could not be read completely (a store failure):
     /// a partial list would read the missing files as absent.
     fn analyzed_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>>;
+
+    fn projection_generations(
+        &self,
+    ) -> Option<&HashMap<String, crate::analyzer::store::GenerationId>> {
+        None
+    }
+
+    fn projection_snapshots(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::store::WorkspaceSnapshots>> {
+        None
+    }
+
+    fn analyzed_blob_candidates_in(
+        &self,
+        _paths: &[ProjectFile],
+        _read: &crate::analyzer::store::UpdateProjectionRead<'_>,
+    ) -> Option<Vec<AnalyzedBlobCandidate>> {
+        None
+    }
+
+    fn blob_index_keys_in(
+        &self,
+        _file: &ProjectFile,
+        _oid: Oid,
+        _read: &crate::analyzer::store::UpdateProjectionRead<'_>,
+    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
+        None
+    }
+
+    fn supports_analyzed_blob_projection(&self) -> bool {
+        false
+    }
+
+    /// Prepare only the requested paths. None preserves a failed language,
+    /// rather than interpreting a failed admission as an empty listing.
+    fn analyzed_blob_candidates(
+        &self,
+        _paths: &[ProjectFile],
+    ) -> Option<Vec<AnalyzedBlobCandidate>> {
+        None
+    }
+
+    /// Resolve an admitted candidate under this endpoint's request selection.
+    fn admitted_blob_oid(&self, _file: &ProjectFile) -> Option<Oid> {
+        None
+    }
 
     /// Whether this index reads package-identity inputs at all.
     fn has_workspace_package_identity_inputs(&self) -> bool {
@@ -782,6 +1221,160 @@ fn identity_inputs_moved(base: &WorkspaceAnalyzer, head: &WorkspaceAnalyzer) -> 
 }
 
 impl ChangedFacts {
+    /// Project a transaction-certified path set and admit exactly the head
+    /// File keys that the caller collected from its replay ledgers.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn between_projection(
+        base: &WorkspaceAnalyzer,
+        head: &WorkspaceAnalyzer,
+        paths: &HashMap<Language, Vec<ProjectFile>>,
+        consulted: &HashMap<Language, Vec<ProjectFile>>,
+    ) -> Self {
+        let Some(store) = base.store() else {
+            return Self::between(base, head);
+        };
+        let read = match store.begin_update_projection_read() {
+            Ok(read) => read,
+            Err(error) => {
+                base.analyzer().record_query_failure(error);
+                return Self::between(base, head);
+            }
+        };
+        Self::between_projection_in(base, head, paths, consulted, &read)
+    }
+
+    fn between_projection_in(
+        base: &WorkspaceAnalyzer,
+        head: &WorkspaceAnalyzer,
+        paths: &HashMap<Language, Vec<ProjectFile>>,
+        consulted: &HashMap<Language, Vec<ProjectFile>>,
+        read: &crate::analyzer::store::UpdateProjectionRead<'_>,
+    ) -> Self {
+        // Keep each endpoint's legacy query cache alive across admission and
+        // index reads. In particular, selected variants seeded by the frozen
+        // reader must not be discarded and re-read on another connection.
+        let _base_scope = AnalyzerQueryScope::capturing_read_incompleteness(base.analyzer());
+        let _head_scope = AnalyzerQueryScope::capturing_read_incompleteness(head.analyzer());
+        let base_indexes = fact_indexes_by_language(base);
+        let head_indexes = fact_indexes_by_language(head);
+        let mut base_blobs = admitted_blob_projection(base, paths, read);
+        let mut head_blobs = admitted_blob_projection(head, paths, read);
+        let mut delta = ChangedDelta::empty();
+        let mut unavailable_listings = HashSet::default();
+        for (workspace, indexes) in [(base, &base_indexes), (head, &head_indexes)] {
+            for language in workspace.analyzer().languages() {
+                if !indexes.contains_key(&language) {
+                    delta.languages_without_index.push(language);
+                }
+            }
+        }
+        for (language, paths) in paths {
+            let old = if base_indexes.contains_key(language) {
+                base_blobs.remove(language).flatten()
+            } else {
+                Some(HashMap::default())
+            };
+            let new = if head_indexes.contains_key(language) {
+                head_blobs.remove(language).flatten()
+            } else {
+                Some(HashMap::default())
+            };
+            let (Some(old), Some(new)) = (old, new) else {
+                delta.languages_without_index.push(*language);
+                unavailable_listings.insert(*language);
+                continue;
+            };
+            let mut names = paths
+                .iter()
+                .map(crate::path_utils::rel_path_string)
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            for path in names {
+                let old_blob = old.get(path.as_str());
+                let new_blob = new.get(path.as_str());
+                // Preserve the full comparison's equal-OID skip, even when
+                // the selected variant changed.
+                if old_blob.map(|(_, oid)| oid) == new_blob.map(|(_, oid)| oid) {
+                    continue;
+                }
+                let entries =
+                    |blob: Option<&(ProjectFile, Oid)>, index: Option<&&dyn WorkspaceFactIndex>| {
+                        blob.map(|(file, oid)| {
+                            index.and_then(|index| index.blob_index_keys_in(file, *oid, read))
+                        })
+                    };
+                let old_entries = {
+                    let _scope = AnalyzerQueryScope::capturing_read_incompleteness(base.analyzer());
+                    entries(old_blob, base_indexes.get(language))
+                };
+                let new_entries = {
+                    let _scope = AnalyzerQueryScope::capturing_read_incompleteness(head.analyzer());
+                    entries(new_blob, head_indexes.get(language))
+                };
+                delta.record_index_difference(*language, path.as_str(), old_entries, new_entries);
+            }
+        }
+        let mut head_path_blobs = HashMap::default();
+        for (language, paths) in consulted {
+            crate::profiling::note_with(|| {
+                format!("update_delta.consulted[{language:?}] keys={}", paths.len())
+            });
+            #[cfg(any(test, feature = "test-support"))]
+            update_delta_event(UpdateDeltaEvent::Consulted {
+                language: *language,
+                keys: paths.len(),
+            });
+        }
+        for (language, blobs) in admitted_blob_projection(head, consulted, read) {
+            let Some(blobs) = blobs else {
+                delta.languages_without_index.push(language);
+                continue;
+            };
+            if !unavailable_listings.contains(&language) {
+                head_path_blobs.extend(
+                    blobs
+                        .into_iter()
+                        .map(|(path, (_, oid))| ((language, path), oid)),
+                );
+            }
+        }
+        delta.languages_without_index.sort();
+        delta.languages_without_index.dedup();
+        Self {
+            delta,
+            head_blobs: head_path_blobs,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn assert_projection_equivalent(
+        &self,
+        reference: &Self,
+        consulted: &HashMap<Language, Vec<ProjectFile>>,
+    ) {
+        let canonical = |delta: &ChangedDelta| {
+            let mut delta = delta.clone();
+            delta.unenumerated.sort();
+            delta.languages_without_index.sort();
+            delta.identity_inputs_moved.sort();
+            delta
+        };
+        assert_eq!(canonical(&self.delta), canonical(&reference.delta));
+        for (language, paths) in consulted {
+            for file in paths {
+                let path = crate::path_utils::rel_path_string(file);
+                assert_eq!(
+                    self.head_blob(*language, path.as_str()),
+                    reference.head_blob(*language, path.as_str()),
+                    "head File answer for {language:?} {path}"
+                );
+            }
+        }
+    }
+
     /// The difference between two workspaces for a diff_base run. Unlike
     /// [`ChangedDelta::between`] it applies no identity guard; see there.
     pub fn between(base: &WorkspaceAnalyzer, head: &WorkspaceAnalyzer) -> Self {
@@ -1111,6 +1704,8 @@ fn fact_indexes_by_language(
 /// None when the language's listing could not be read; see
 /// [`WorkspaceFactIndex::analyzed_blobs`].
 fn blob_map(index: &dyn WorkspaceFactIndex) -> Option<HashMap<Box<str>, (ProjectFile, Oid)>> {
+    #[cfg(any(test, feature = "test-support"))]
+    update_delta_event(UpdateDeltaEvent::FullListing(index.fact_index_language()));
     Some(
         index
             .analyzed_blobs()?
@@ -1123,6 +1718,120 @@ fn blob_map(index: &dyn WorkspaceFactIndex) -> Option<HashMap<Box<str>, (Project
             })
             .collect(),
     )
+}
+
+/// Request-local admission for exactly the supplied language/path pairs. Each
+/// endpoint owns preparation and OID resolution; the store admits all selected
+/// keys in one batch. No workspace listing or retained relation is constructed.
+type AdmittedBlobMap = HashMap<Box<str>, (ProjectFile, Oid)>;
+type BlobProjection = HashMap<Language, Option<AdmittedBlobMap>>;
+
+#[doc(hidden)]
+fn admitted_blob_projection(
+    workspace: &WorkspaceAnalyzer,
+    paths: &HashMap<Language, Vec<ProjectFile>>,
+    read: &crate::analyzer::store::UpdateProjectionRead<'_>,
+) -> BlobProjection {
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+    let indexes = fact_indexes_by_language(workspace);
+    let mut prepared = HashMap::default();
+    let mut generations = HashMap::default();
+    let mut keys = Vec::new();
+    for (language, paths) in paths {
+        let candidates = match indexes.get(language) {
+            Some(index) => index.analyzed_blob_candidates_in(paths, read),
+            None => Some(Vec::new()),
+        };
+        let validated = candidates.as_ref().map_or(0, |candidates| {
+            candidates
+                .iter()
+                .filter(|candidate| !candidate.authoritative)
+                .map(|candidate| &candidate.key)
+                .collect::<HashSet<_>>()
+                .len()
+        });
+        crate::profiling::note_with(|| {
+            format!(
+                "update_delta.admission[{language:?}] requested={} validated={validated}",
+                paths.len()
+            )
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        update_delta_event(UpdateDeltaEvent::Admission {
+            language: *language,
+            requested: paths.len(),
+            validated,
+        });
+        if let Some(selected) = indexes
+            .get(language)
+            .and_then(|index| index.projection_generations())
+        {
+            for (storage_language, generation) in selected {
+                if let Some(previous) = generations.insert(storage_language.clone(), *generation) {
+                    assert_eq!(
+                        previous, *generation,
+                        "one endpoint selects one generation per storage language"
+                    );
+                }
+            }
+        }
+        if let Some(candidates) = &candidates {
+            keys.extend(
+                candidates
+                    .iter()
+                    .filter(|candidate| !candidate.authoritative)
+                    .map(|candidate| candidate.key.clone()),
+            );
+        }
+        prepared.insert(*language, candidates);
+    }
+    let mut seen = HashSet::default();
+    keys.retain(|key| seen.insert(key.clone()));
+    let present = if keys.is_empty() {
+        Some(HashSet::default())
+    } else {
+        match read.parsed_blob_keys(&keys, &generations) {
+            Ok(present) => Some(present),
+            Err(error) => {
+                workspace.analyzer().record_query_failure(error);
+                None
+            }
+        }
+    };
+    prepared
+        .into_iter()
+        .map(|(language, candidates)| {
+            let blobs = candidates.and_then(|candidates| {
+                if !indexes.contains_key(&language) {
+                    return Some(HashMap::default());
+                }
+                let present = present.as_ref()?;
+                let index = indexes.get(&language)?;
+
+                let blobs = candidates
+                    .into_iter()
+                    .filter(|candidate| candidate.authoritative || present.contains(&candidate.key))
+                    .filter_map(|candidate| {
+                        let oid = index.admitted_blob_oid(&candidate.file)?;
+                        Some((
+                            Box::from(crate::path_utils::rel_path_string(&candidate.file).as_str()),
+                            (candidate.file, oid),
+                        ))
+                    })
+                    .collect();
+                (!scope.captured_read_incompleteness().iter().any(|reason| {
+                    matches!(
+                        reason,
+                        crate::analyzer::QueryReadIncomplete::StoreFailure(_)
+                            | crate::analyzer::QueryReadIncomplete::InternalInvariant(_)
+                            | crate::analyzer::QueryReadIncomplete::Cancelled
+                    )
+                }))
+                .then_some(blobs)
+            });
+            (language, blobs)
+        })
+        .collect()
 }
 
 /// The bounded limits a replayed lookup re-runs its funnel under.
@@ -1209,30 +1918,9 @@ impl SummaryAnswers for NoSummaryAnswers {
     }
 }
 
-/// Request-owned, language-neutral slots for bounded language lookup memos.
-#[derive(Default)]
-pub struct OwnedLookupMemo {
-    slots: std::sync::Mutex<
-        HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-    >,
-}
-impl std::fmt::Debug for OwnedLookupMemo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedLookupMemo").finish_non_exhaustive()
-    }
-}
-impl OwnedLookupMemo {
-    pub fn get<T: Default + Send + Sync + 'static>(&self) -> std::sync::Arc<T> {
-        let mut slots = self.slots.lock().expect("lookup memo poisoned");
-        std::sync::Arc::clone(
-            slots
-                .entry(std::any::TypeId::of::<T>())
-                .or_insert_with(|| std::sync::Arc::new(T::default())),
-        )
-        .downcast::<T>()
-        .expect("lookup slot has its registered type")
-    }
-}
+/// Request-owned, language-neutral typed memos for bounded language lookups:
+/// one registry per (domain, analyzer), charged to that analyzer's owner.
+pub type OwnedLookupMemo = brokk_bifrost_core::domain_memo::DomainMemoRegistry;
 
 /// Replayed lookup answers, keyed by the question and its replay limits.
 ///
@@ -1242,7 +1930,7 @@ impl OwnedLookupMemo {
 /// outlives the workspace it was computed against.
 #[derive(Debug, Default)]
 pub struct LookupMemo {
-    drop_inventory: OwnedLookupMemo,
+    drop_inventory: Option<OwnedLookupMemo>,
     answers:
         HashMap<(LookupKind, LookupQuestion, Option<LookupReplayLimits>), Option<StableDigest>>,
     replay_elapsed: Duration,
@@ -1268,6 +1956,7 @@ impl LookupMemo {
         if let Some(answer) = self.answers.get(&key) {
             return *answer;
         }
+        count_lookup_replay(LookupKind::ExternalSelection);
         let request = self.selection_request.get_or_insert_with(OuterRequest::new);
         let answer = if let LookupQuestion::ExternalSelection { question_digest } = question {
             authorities
@@ -1282,7 +1971,7 @@ impl LookupMemo {
                         })
                 })
                 .and_then(Result::ok)
-                .filter(|a| a.complete && a.certified)
+                .filter(|a| a.replayable())
                 .map(|a| StableDigest::from_array(a.answer_digest))
         } else {
             None
@@ -1352,6 +2041,7 @@ impl LookupMemo {
         if let Some(answer) = self.answers.get(&(kind, question.clone(), Some(limits))) {
             return *answer;
         }
+        count_lookup_replay(kind);
         let started = Instant::now();
         if kind == LookupKind::WorkspaceFact
             && let LookupQuestion::WorkspaceFact {
@@ -1400,12 +2090,19 @@ impl LookupMemo {
                 "replay_owned_lookup",
             )
             .and_then(|support| {
+                // The head's own owner pays for the inventories it keeps.
+                if self.drop_inventory.is_none() {
+                    self.drop_inventory = head
+                        .store()
+                        .map(|store| OwnedLookupMemo::new(store.retention_budget()));
+                }
+                let memo = self.drop_inventory.as_ref()?;
                 support.replay_owned_lookup(
                     head,
                     kind,
                     question,
                     limits.semantic.nested_entries,
-                    &self.drop_inventory,
+                    memo,
                 )
             })
         } else {
@@ -1511,6 +2208,17 @@ pub fn replay_lookup(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     match kind {
+        LookupKind::SelectedReceiverProof => {
+            let LookupQuestion::SelectedReceiverProof(question) = question else {
+                debug_assert!(false, "a selected receiver proof needs its typed question");
+                return None;
+            };
+            let file = analyzed_file(analyzer, &question.source().rel_path)?;
+            let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+            head.selected_receiver_proof_read(&file, question, &cancellation)
+                .ok()?
+                .map(|answer| answer.canonical_digest())
+        }
         LookupKind::StoredSemanticIrPublication => {
             let LookupQuestion::StoredSemanticIrPublication(q) = question else {
                 debug_assert!(
@@ -1587,7 +2295,7 @@ pub fn replay_lookup(
             kind,
             question,
             limits.semantic.nested_entries,
-            &OwnedLookupMemo::default(),
+            &OwnedLookupMemo::new(head.store()?.retention_budget()),
         ),
         LookupKind::StructuralNameInventory
         | LookupKind::StructuralRoleNameInventory
@@ -1878,6 +2586,22 @@ fn answer_workspace_fact(
 ) -> Option<StableDigest> {
     let analyzer = head.analyzer();
     match family {
+        WorkspaceFactFamily::SelectedDependencyEvidence => {
+            // Overlay evidence has a lease UUID, not a reusable content identity.
+            if !matches!(subject, FactSubject::Whole)
+                || analyzer.project().overlay_content().is_some()
+            {
+                return None;
+            }
+            let snapshots = analyzer.selected_workspace_snapshots_for_reads()?;
+            head.store()?
+                .selected_dependency_evidence_digest(
+                    &snapshots,
+                    language,
+                    &super::workspace_authority::QueryEvidenceReadRecorder,
+                )
+                .ok()?
+        }
         WorkspaceFactFamily::WorkspaceFileListing | WorkspaceFactFamily::WorkspaceFileInventory => {
             if language != Language::None || !matches!(subject, FactSubject::Whole) {
                 return None;
@@ -1971,6 +2695,31 @@ fn answer_workspace_fact(
         // workspace file: a jar that appears or disappears under a repository
         // root changes it with no workspace edit.
         WorkspaceFactFamily::JvmExternalGaps => {
+            if language != Language::None || !matches!(subject, FactSubject::Whole) {
+                return None;
+            }
+            crate::analyzer::languages::language_support(Language::Java)?
+                .workspace_fact_answer(analyzer, family, language, subject)
+        }
+        // The visible JVM dependency inputs: a function of the head's listing
+        // and the configured roots, answered by the same code that recorded it.
+        WorkspaceFactFamily::JvmDependencyInputs => {
+            if language != Language::None || !matches!(subject, FactSubject::Whole) {
+                return None;
+            }
+            crate::analyzer::languages::language_support(Language::Java)?
+                .workspace_fact_answer(analyzer, family, language, subject)
+        }
+        // The jars the JVM external index decodes and the scan that found them,
+        // answered by the discovery pass that recorded the fact.
+        WorkspaceFactFamily::CSharpDependencyInputs | WorkspaceFactFamily::CSharpArtifactInputs => {
+            if language != Language::CSharp || !matches!(subject, FactSubject::Whole) {
+                return None;
+            }
+            crate::analyzer::languages::language_support(Language::CSharp)?
+                .workspace_fact_answer(analyzer, family, language, subject)
+        }
+        WorkspaceFactFamily::JvmArtifactInputs => {
             if language != Language::None || !matches!(subject, FactSubject::Whole) {
                 return None;
             }
@@ -2332,11 +3081,12 @@ fn procedure_dispatch_call_at_relative_site(
 /// The engine's analysis epoch: every grammar and query epoch it could derive
 /// a fact under.
 ///
-/// The epoch of one language is the fingerprint of every engine input that
-/// invalidates previously derived facts for it: the store salt, the live
-/// grammar's ABI and node tables, and the bundled query files. It is one value
-/// per language -- a language's dialects share it, because
-/// [`crate::analyzer::store::epoch::epoch_for`] memoizes per language.
+/// The base epoch fingerprints the store salt, grammar ABI and node tables,
+/// bundled queries and admission policy for each language. Configured Source
+/// producer selectors additionally enter the adapter's canonical Source epoch
+/// and workspace content identity; this engine-wide fold does not publish
+/// Source facts or replace those configured identities. Policy lowering also
+/// folds the language adapter fingerprints.
 ///
 /// Folded over every language the grammar registry serves, not over the
 /// languages one workspace happens to hold: this is the third non-source input
@@ -2476,6 +3226,16 @@ pub fn verify_read_set(
         crate::analyzer::read_ledger::read_set_digest(keys).digest(),
     );
     verify_read_set_for_artifact(unit, head, changed, inputs, keys, limits, summaries, memo)
+}
+
+/// Profiling only (`lookups.replayed.<kind>`): one recorded lookup was
+/// executed again at head because no memo held its answer.
+fn count_lookup_replay(kind: LookupKind) {
+    brokk_bifrost_core::profiling::profile_count_labeled(
+        "lookups.replayed",
+        kind.stable_label(),
+        1,
+    );
 }
 
 /// [`verify_read_set`] for a derived product that already has its own exact
@@ -2857,6 +3617,7 @@ pub fn verify_read_key(
                 {
                     Some(*answer)
                 } else {
+                    count_lookup_replay(*kind);
                     let started = Instant::now();
                     let answer = match (kind, question) {
                         (LookupKind::Derivation(kind), LookupQuestion::Derivation(question)) => {
@@ -2888,7 +3649,8 @@ pub fn verify_read_key(
                     None => Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact }),
                 }
             }
-            LookupKind::StoredSemanticIrPublication
+            LookupKind::SelectedReceiverProof
+            | LookupKind::StoredSemanticIrPublication
             | LookupKind::RustCopyAbsence
             | LookupKind::RustMacroInvocations
             | LookupKind::RustBoundTraitImplInventory
@@ -3738,7 +4500,7 @@ mod tests {
     }
 
     #[test]
-    fn external_selection_replay_requires_certified_complete_current_answers() {
+    fn external_selection_replay_requires_replayable_current_answers() {
         use brokk_bifrost_core::analyzer::external_selection::{
             ExternalSelectionAuthority, ExternalSelectionQuestion, ExternalSelectionQuestionKind,
             SelectionRefused, SelectionRetry, VerifiedSelection,
@@ -3750,11 +4512,28 @@ mod tests {
         };
         struct Authority {
             complete: bool,
-            certified: bool,
+            verified: bool,
+            only_replayable_gaps: bool,
             stale: bool,
             calls: AtomicUsize,
         }
         impl ExternalSelectionAuthority for Authority {
+            fn basis(
+                &self,
+                _question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
+                _answer: [u8; 32],
+            ) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis>
+            {
+                None
+            }
+            fn answer_under_basis(
+                &self,
+                _question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
+                _basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+            ) -> Option<[u8; 32]> {
+                None
+            }
+
             fn questions(&self) -> Vec<ExternalSelectionQuestion> {
                 vec![ExternalSelectionQuestion {
                     kind: ExternalSelectionQuestionKind::Dependencies,
@@ -3778,7 +4557,9 @@ mod tests {
                     answer_digest: [4; 32],
                     view_stamp: None,
                     complete: self.complete,
-                    certified: self.certified,
+                    verified: self.verified,
+                    certified: self.complete && self.verified,
+                    only_replayable_gaps: self.only_replayable_gaps,
                     records: Arc::new(()),
                 }))
             }
@@ -3786,21 +4567,27 @@ mod tests {
         let question = LookupQuestion::ExternalSelection {
             question_digest: [3; 32],
         };
-        for (complete, certified, stale) in [
-            (true, true, false),
-            (false, true, false),
-            (true, false, false),
-            (true, true, true),
+        // (complete, verified, only replayable gaps, stale): a complete verified
+        // answer replays; an incomplete one replays only when verified and every
+        // gap is fixed for unchanged inputs, such as an unresolved coordinate.
+        for (complete, verified, only_replayable_gaps, stale) in [
+            (true, true, false, false),
+            (false, true, false, false),
+            (false, true, true, false),
+            (false, false, true, false),
+            (true, false, false, false),
+            (true, true, false, true),
         ] {
             let authority = Authority {
                 complete,
-                certified,
+                verified,
+                only_replayable_gaps,
                 stale,
                 calls: AtomicUsize::new(0),
             };
             let mut memo = LookupMemo::new();
-            let expected =
-                (complete && certified && !stale).then(|| StableDigest::from_array([4; 32]));
+            let expected = (verified && (complete || only_replayable_gaps) && !stale)
+                .then(|| StableDigest::from_array([4; 32]));
             for _ in 0..2 {
                 assert_eq!(
                     memo.external_selection_answer(

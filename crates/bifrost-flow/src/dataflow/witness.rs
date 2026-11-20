@@ -9,6 +9,8 @@ use crate::analyzer::semantic::{
 };
 
 use super::{FactId, PathQuality, PathQualityFrontier, SummaryEdge};
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
+use brokk_bifrost_core::analyzer::work_budget::{LimitRefused, LimitedCounter};
 
 const DEFAULT_RECONSTRUCTION_STEPS: usize = 4_096;
 const DEFAULT_RECONSTRUCTION_EXPANSIONS: usize = 16_384;
@@ -621,9 +623,13 @@ pub struct SummaryWitness {
     alternatives_truncated: bool,
     retained_bytes: usize,
     work: WitnessReconstructionWork,
+    // Execution dependence of the reconstruction or retention that shaped
+    // this witness, such as a refused step or expansion limit.
+    reuse: ReuseVerdict,
 }
 
 impl SummaryWitness {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         steps: Vec<SummaryWitnessStep>,
         quality: PathQuality,
@@ -632,6 +638,7 @@ impl SummaryWitness {
         alternatives_truncated: bool,
         retained_bytes: usize,
         work: WitnessReconstructionWork,
+        reuse: ReuseVerdict,
     ) -> Self {
         debug_assert_eq!(truncation_cause.is_some(), omitted_steps_lower_bound > 0);
         Self {
@@ -642,10 +649,13 @@ impl SummaryWitness {
             alternatives_truncated,
             retained_bytes,
             work,
+            reuse,
         }
     }
 
-    pub(crate) fn retention_truncated_marker(quality: PathQuality) -> Self {
+    /// The marker for a solve that abandoned its witnesses. `reuse` is the
+    /// verdict of the retention limit that made the solve abandon them.
+    pub(crate) fn retention_truncated_marker(quality: PathQuality, reuse: ReuseVerdict) -> Self {
         Self {
             steps: Box::new([]),
             quality,
@@ -654,6 +664,7 @@ impl SummaryWitness {
             alternatives_truncated: true,
             retained_bytes: size_of::<Self>(),
             work: WitnessReconstructionWork::default(),
+            reuse,
         }
     }
 
@@ -666,6 +677,7 @@ impl SummaryWitness {
             false,
             size_of::<Self>(),
             WitnessReconstructionWork::new(expansions, 0),
+            ReuseVerdict::Content,
         )
     }
 
@@ -787,7 +799,14 @@ impl SummaryWitness {
                     .saturating_add(suffix.work.evidence_expansions()),
                 emitted_steps,
             ),
+            self.reuse.join(suffix.reuse),
         ))
+    }
+}
+
+impl CarriesReuseVerdict for SummaryWitness {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
     }
 }
 
@@ -929,7 +948,8 @@ pub(crate) enum WitnessAdmission {
     Retained(WitnessEvidenceId),
     Duplicate,
     Truncated,
-    Exhausted,
+    /// A best-effort retention limit refused the candidate.
+    Exhausted(LimitRefused),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1552,38 +1572,39 @@ impl WitnessArena {
             alternatives.mark_truncated(quality);
             return Ok(WitnessAdmission::Truncated);
         }
-        if self.limits.is_best_effort()
-            && (candidate_budget
+        if self.limits.is_best_effort() {
+            // Checked in order and short-circuiting, so one refusal is
+            // observed per exhausted candidate.
+            let allowance = candidate_budget
                 .request_remaining_relations
-                .is_some_and(|remaining| {
-                    !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                        staging.nodes.len(),
-                        remaining,
-                    )
-                    .allows(1)
+                .map_or(Ok(()), |remaining| {
+                    LimitedCounter::from_usage(staging.nodes.len(), remaining).try_allow(1)
                 })
-                || self
-                    .limits
-                    .best_effort_max_relations()
-                    .is_some_and(|limit| {
-                        !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                            self.nodes.len().saturating_add(staging.nodes.len()),
-                            limit,
-                        )
-                        .allows(1)
-                    })
-                || self
-                    .limits
-                    .best_effort_max_retained_bytes()
-                    .is_some_and(|limit| {
-                        !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                            self.retained_bytes.saturating_add(*staging.retained_bytes),
-                            limit,
-                        )
-                        .allows(candidate_budget.retained_bytes)
-                    }))
-        {
-            return Ok(WitnessAdmission::Exhausted);
+                .and_then(|()| {
+                    self.limits
+                        .best_effort_max_relations()
+                        .map_or(Ok(()), |limit| {
+                            LimitedCounter::from_usage(
+                                self.nodes.len().saturating_add(staging.nodes.len()),
+                                limit,
+                            )
+                            .try_allow(1)
+                        })
+                })
+                .and_then(|()| {
+                    self.limits
+                        .best_effort_max_retained_bytes()
+                        .map_or(Ok(()), |limit| {
+                            LimitedCounter::from_usage(
+                                self.retained_bytes.saturating_add(*staging.retained_bytes),
+                                limit,
+                            )
+                            .try_allow(candidate_budget.retained_bytes)
+                        })
+                });
+            if let Err(refused) = allowance {
+                return Ok(WitnessAdmission::Exhausted(refused));
+            }
         }
         let candidate = candidate();
         debug_assert_eq!(candidate.retained_bytes(), candidate_budget.retained_bytes);
@@ -1811,6 +1832,7 @@ impl WitnessStore {
         let mut expansions = 0usize;
         let mut truncation_cause = None::<WitnessTruncationCause>;
         let mut omitted_steps_lower_bound = 0usize;
+        let mut reuse = ReuseVerdict::Content;
 
         while let Some(task) = stack.pop() {
             match task {
@@ -1818,12 +1840,10 @@ impl WitnessStore {
                     evidence: id,
                     suppress_relative_seed,
                 } => {
-                    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                        expansions,
-                        limits.max_expansions(),
-                    )
-                    .allows(1)
+                    if let Err(refused) =
+                        LimitedCounter::from_usage(expansions, limits.max_expansions()).try_allow(1)
                     {
+                        reuse.join_in(refused.reuse_verdict());
                         truncation_cause = truncation_cause
                             .or(Some(WitnessTruncationCause::ReconstructionExpansionLimit));
                         omitted_steps_lower_bound = usize::from(!suppress_relative_seed)
@@ -1895,12 +1915,10 @@ impl WitnessStore {
                 }
                 Task::Emit(step) => {
                     let step = *step;
-                    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                        steps.len(),
-                        limits.max_steps(),
-                    )
-                    .allows(1)
+                    if let Err(refused) =
+                        LimitedCounter::from_usage(steps.len(), limits.max_steps()).try_allow(1)
                     {
+                        reuse.join_in(refused.reuse_verdict());
                         truncation_cause = truncation_cause
                             .or(Some(WitnessTruncationCause::ReconstructionStepLimit));
                         omitted_steps_lower_bound = 1 + stack
@@ -1951,6 +1969,7 @@ impl WitnessStore {
             alternatives_truncated,
             retained_bytes,
             WitnessReconstructionWork::new(expansions, emitted_steps),
+            reuse,
         ))
     }
 
@@ -2390,7 +2409,7 @@ fn long_dispatch_locator_obeys_witness_byte_cap() {
                     )
                     .unwrap();
                 if !should_retain {
-                    assert_eq!(admission, WitnessAdmission::Exhausted);
+                    assert!(matches!(admission, WitnessAdmission::Exhausted(_)));
                     assert!(staged.is_empty());
                     assert_eq!(staged_bytes, 0);
                     continue;
@@ -2454,7 +2473,7 @@ fn best_effort_byte_admission_is_checked_before_candidate_allocation() {
         )
         .unwrap();
 
-    assert_eq!(admission, WitnessAdmission::Exhausted);
+    assert!(matches!(admission, WitnessAdmission::Exhausted(_)));
     assert!(staged.is_empty());
     assert_eq!(staged_bytes, 0);
 }
@@ -2477,7 +2496,7 @@ fn best_effort_request_admission_is_checked_before_candidate_allocation() {
         )
         .unwrap();
 
-    assert_eq!(admission, WitnessAdmission::Exhausted);
+    assert!(matches!(admission, WitnessAdmission::Exhausted(_)));
     assert!(staged.is_empty());
     assert_eq!(staged_bytes, 0);
 }

@@ -267,9 +267,14 @@ pub fn prove_against_active_model(
         });
     }
     if !model.is_published() {
-        return JvmNameProof::Incomplete(JvmProofGap::ExternalBoundary {
-            boundary: retained.miss_boundary(),
-        });
+        // Discovery and preparation gaps survive withdrawal of the model
+        // surface. Consult the same gap reporter used for a published miss.
+        let boundary = if model.discovery_truncated() {
+            BoundaryStatus::ExternalDeclaredUnindexed
+        } else {
+            retained.miss_boundary()
+        };
+        return JvmNameProof::Incomplete(JvmProofGap::ExternalBoundary { boundary });
     }
     match model_disposition() {
         Err(gap) => JvmNameProof::Incomplete(JvmProofGap::PackExtraction(gap)),

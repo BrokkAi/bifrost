@@ -376,6 +376,91 @@ pub struct ExternalMemberFamilyAnswer {
     pub visited: usize,
 }
 
+/// Exact, request-scoped declaration identity, including declarations (such
+/// as Rust impl blocks) which have no display CodeUnit.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MemberOwnerIdentity {
+    pub file: crate::analyzer::ProjectFile,
+    pub declaration: brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId,
+}
+
+/// A resolved Self and its exact type-parameter replacements. Empty means a
+/// non-generic Self, not an unknown substitution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMemberSelf {
+    pub declaration: CodeUnit,
+    pub substitution: Vec<(
+        CodeUnit,
+        brokk_bifrost_core::analyzer::model::StructuredTypeIdentity,
+    )>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberOwnerUnknownReason {
+    Unsupported,
+    ContractUnavailable,
+    BodyUnavailable,
+    DeclarationLinks,
+    GeneratedSurface,
+    ConditionalSurface,
+    UnresolvedSelf,
+    GenericOwner,
+    NoDefaultBody,
+    FactsUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberOwnerSelectionReason {
+    OwnItem,
+    Default,
+    Unknown(MemberOwnerUnknownReason),
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberOwnerSelection {
+    pub owner: MemberOwnerIdentity,
+    pub resolved_self: Option<ResolvedMemberSelf>,
+    pub selected_method: Option<CodeUnit>,
+    pub reason: MemberOwnerSelectionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MemberOwnerInventoryReason {
+    Unsupported,
+    ContractUnavailable,
+    FactsUnavailable,
+    /// No per-trait readiness certificate exists yet (#13304).
+    ImplementorReadinessUnavailable {
+        trait_declaration: CodeUnit,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MemberOwnerInventoryStatus {
+    Closed,
+    Open(Vec<MemberOwnerInventoryReason>),
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberOwnerSelections {
+    /// The existing family answer's descendant completion, without promotion.
+    pub family_completeness: MemberFamilyCompleteness,
+    pub inventory: MemberOwnerInventoryStatus,
+    pub owners: Vec<MemberOwnerSelection>,
+}
+
+impl MemberOwnerSelections {
+    pub fn unsupported() -> Self {
+        Self {
+            family_completeness: MemberFamilyAnswer::unsupported_answer().descendants,
+            inventory: MemberOwnerInventoryStatus::Open(vec![
+                MemberOwnerInventoryReason::Unsupported,
+            ]),
+            owners: Vec::new(),
+        }
+    }
+}
+
 impl ExternalMemberFamilyAnswer {
     pub fn unsupported() -> Self {
         Self::stopped(ExternalMemberFamilyStatus::Unsupported, 0)
@@ -439,6 +524,22 @@ pub trait MemberFamilyProvider: CapabilityProvider + Send + Sync {
         _cancellation: Option<&CancellationToken>,
     ) -> ExternalMemberFamilyAnswer {
         ExternalMemberFamilyAnswer::unsupported()
+    }
+
+    /// Select each workspace impl owner's own item or proven inherited body.
+    /// A concrete Self is an exact identity filter, never an applicability or
+    /// blanket-impl matcher. Owners whose Self is unresolved are retained as
+    /// Unknown; only known, different Self identities are excluded.
+    /// Unknown owner selection and open inventory are independent evidence;
+    /// neither permits guessing a default.
+    fn member_owner_selections(
+        &self,
+        _member: &CodeUnit,
+        _receiver: brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape,
+        _concrete_self: Option<&ResolvedMemberSelf>,
+        _call_site: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+    ) -> MemberOwnerSelections {
+        MemberOwnerSelections::unsupported()
     }
 }
 

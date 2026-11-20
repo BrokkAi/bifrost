@@ -1453,29 +1453,31 @@ where
         }),
         cancellation,
     );
+    let input_truncated = relation_limit < relations.len() || snapshot.coverage().is_truncated();
+    let projection_cancelled = projection
+        .incomplete_reasons
+        .iter()
+        .any(|reason| matches!(reason, PropertyReachingIncompleteReason::Cancelled));
+    // Missing projected data proves absence only after a complete scan.
+    // The immutable IR's own read inventory remains independently complete.
+    let read_projection_complete = !input_truncated && !projection_cancelled;
     let read_events = property_read_event_indices(&procedure, point);
     let mut incomplete_reasons = Vec::new();
-    let selected_read = match read_events.as_slice() {
-        [] => {
-            incomplete_reasons
-                .push(PropertyReachingIncompleteReason::SelectedReadMissing { point });
-            None
-        }
-        [event_index] => projection
+    let selected_read = match select_property_read_event(point, &read_events) {
+        Ok(event_index) => projection
             .reads
             .iter()
-            .find(|read| read.point.id() == point && read.event_index == *event_index)
+            .find(|read| read.point.id() == point && read.event_index == event_index)
             .cloned()
             .or_else(|| {
-                incomplete_reasons
-                    .push(PropertyReachingIncompleteReason::SelectedReadMissing { point });
+                if read_projection_complete {
+                    incomplete_reasons
+                        .push(PropertyReachingIncompleteReason::SelectedReadMissing { point });
+                }
                 None
             }),
-        _ => {
-            incomplete_reasons.push(PropertyReachingIncompleteReason::SelectedReadAmbiguous {
-                point,
-                event_indices: read_events.clone().into_boxed_slice(),
-            });
+        Err(reason) => {
+            incomplete_reasons.push(*reason);
             None
         }
     };
@@ -1498,34 +1500,43 @@ where
             },
         );
     }
-    if cancellation.is_cancelled()
-        || projection
-            .incomplete_reasons
-            .iter()
-            .any(|reason| matches!(reason, PropertyReachingIncompleteReason::Cancelled))
-    {
+    let cancelled = projection_cancelled || cancellation.is_cancelled();
+    if cancelled {
         incomplete_reasons.push(PropertyReachingIncompleteReason::Cancelled);
     }
 
-    if relation_limit < relations.len()
-        || snapshot.coverage().is_truncated()
-        || cancellation.is_cancelled()
-    {
+    if input_truncated || cancelled {
         let reads = selected_read.into_iter().collect::<Vec<_>>();
         let stores = projection
             .stores
             .into_iter()
             .filter(|store| reads.iter().any(|read| store.location == read.location))
-            .collect();
-        incomplete_reasons.extend(projection.incomplete_reasons);
-        let coverage = if relation_limit < relations.len() || snapshot.coverage().is_truncated() {
-            CandidateCoverage::Truncated
-        } else {
-            CandidateCoverage::Open
-        };
-        incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
-            coverage,
-        ));
+            .collect::<Vec<_>>();
+        // An interrupted scan cannot establish relevance for unrelated gaps.
+        // IR identifies the selected read events even if projection stopped
+        // before visiting them; projected stores need the same location.
+        let scoped_event_keys = read_events
+            .iter()
+            .map(|index| (point, *index))
+            .chain(
+                stores
+                    .iter()
+                    .map(|store| (store.point.id(), store.event_index)),
+            )
+            .collect::<HashSet<_>>();
+        incomplete_reasons.extend(projection.incomplete_reasons.into_iter().filter(|reason| {
+            matches!(reason, PropertyReachingIncompleteReason::Cancelled)
+                || incomplete_reason_event_key(reason)
+                    .is_some_and(|key| scoped_event_keys.contains(&key))
+        }));
+        // Cancellation truncates the projection but does not certify an
+        // independent open receiver set or a separate budget refusal.
+        let coverage = CandidateCoverage::Truncated;
+        if input_truncated {
+            incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
+                coverage,
+            ));
+        }
         return derive_property_reaching_from_records(
             procedure,
             graph,
@@ -1557,15 +1568,22 @@ where
             cancellation,
         );
         incomplete_reasons.extend(scope_reasons);
-        let coverage = property_candidate_coverage(
-            snapshot,
-            relations,
-            relation_limit,
-            stores.iter().map(|store| &store.location),
-            std::iter::once(&read.location),
-            cancellation,
-        );
-        if !coverage.is_exhaustive() {
+        let mut coverage = if cancellation.is_cancelled() {
+            CandidateCoverage::Truncated
+        } else {
+            property_candidate_coverage(
+                snapshot,
+                relations,
+                relation_limit,
+                stores.iter().map(|store| &store.location),
+                std::iter::once(&read.location),
+                cancellation,
+            )
+        };
+        if cancellation.is_cancelled() {
+            incomplete_reasons.push(PropertyReachingIncompleteReason::Cancelled);
+            coverage = CandidateCoverage::Truncated;
+        } else if !coverage.is_exhaustive() {
             incomplete_reasons.push(PropertyReachingIncompleteReason::CandidateCoverage(
                 coverage,
             ));
@@ -1606,13 +1624,60 @@ where
     )
 }
 
+/// Select the property read using immutable IR, without acquiring a snapshot.
+#[doc(hidden)]
+pub fn selected_property_read_event_index(
+    procedure: &ProcedureHandle,
+    point: ProgramPointId,
+) -> Result<u32, Box<PropertyReachingIncompleteReason>> {
+    select_property_read_event(point, &property_read_event_indices(procedure, point))
+}
+
+fn select_property_read_event(
+    point: ProgramPointId,
+    read_events: &[u32],
+) -> Result<u32, Box<PropertyReachingIncompleteReason>> {
+    match read_events {
+        [] => Err(Box::new(
+            PropertyReachingIncompleteReason::SelectedReadMissing { point },
+        )),
+        [index] => Ok(*index),
+        _ => Err(Box::new(
+            PropertyReachingIncompleteReason::SelectedReadAmbiguous {
+                point,
+                event_indices: read_events.into(),
+            },
+        )),
+    }
+}
+
 fn property_read_event_indices(procedure: &ProcedureHandle, point: ProgramPointId) -> Vec<u32> {
-    let receiver_preparations = procedure
-        .semantics()
-        .implicit_receiver_preparation_memory_events();
-    procedure
-        .semantics()
-        .point(point)
+    let point_row = procedure.semantics().point(point);
+    // Receiver preparations require an aggregate copy at this point. Avoid
+    // scanning the whole procedure for ordinary reads or an empty entry.
+    let receiver_preparations = if point_row.is_some_and(|row| {
+        row.events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::ValueFlow {
+                    kind: crate::analyzer::semantic::ir::ValueFlowKind::Transfer(
+                        crate::analyzer::semantic::ir::ValueTransfer {
+                            kind: crate::analyzer::semantic::ir::TransferKind::AggregateCopy,
+                            ..
+                        }
+                    ),
+                    ..
+                }
+            )
+        })
+    }) {
+        procedure
+            .semantics()
+            .implicit_receiver_preparation_memory_events()
+    } else {
+        Default::default()
+    };
+    point_row
         .into_iter()
         .flat_map(|point| point.events.iter().enumerate())
         .filter_map(|(index, event)| {
@@ -1825,6 +1890,10 @@ fn selected_property_scope_reasons(
         relation.point.id() == selected_read.point.id()
             && relation.event_index == selected_read.event_index
     }) {
+        if cancellation.is_cancelled() {
+            reasons.push(PropertyReachingIncompleteReason::Cancelled);
+            break;
+        }
         if let Some(original) = &relation.original_cell
             && let Some(location) = project_location(
                 snapshot.procedure(),
@@ -1926,6 +1995,10 @@ fn selected_property_coordinate_reasons(
         &selected_read.location.receiver,
         cancellation,
     );
+    if cancellation.is_cancelled() {
+        reasons.push(PropertyReachingIncompleteReason::Cancelled);
+        return (reasons, scoped_event_keys);
+    }
     if selected_aliases.is_none() {
         reasons.push(
             PropertyReachingIncompleteReason::SelectedAliasClosureUnavailable {
@@ -1938,7 +2011,7 @@ fn selected_property_coordinate_reasons(
     for relation in relations.iter().take(relation_limit) {
         if cancellation.is_cancelled() {
             reasons.push(PropertyReachingIncompleteReason::Cancelled);
-            break;
+            return (reasons, scoped_event_keys);
         }
         let event = relation_event(procedure, relation);
         let role = memory_relation_role(relation, &event.effect);
@@ -2031,6 +2104,10 @@ fn selected_property_coordinate_reasons(
         if receiver != selected_read.location.receiver {
             let receiver_aliases =
                 closed_local_allocation_aliases(snapshot, relations, &receiver, cancellation);
+            if cancellation.is_cancelled() {
+                reasons.push(PropertyReachingIncompleteReason::Cancelled);
+                return (reasons, scoped_event_keys);
+            }
             match (selected_aliases.as_ref(), receiver_aliases) {
                 (Some(selected_aliases), Some(receiver_aliases))
                     if receiver_aliases.is_disjoint(selected_aliases) =>
@@ -2104,13 +2181,13 @@ fn selected_property_coordinate_reasons(
     for point in procedure.semantics().points() {
         if cancellation.is_cancelled() {
             reasons.push(PropertyReachingIncompleteReason::Cancelled);
-            break;
+            return (reasons, scoped_event_keys);
         }
         let mut point_handle_slot = None;
         for (index, event) in point.events.iter().enumerate() {
             if cancellation.is_cancelled() {
                 reasons.push(PropertyReachingIncompleteReason::Cancelled);
-                break;
+                return (reasons, scoped_event_keys);
             }
             let (relation, endpoint, location) = match event.effect {
                 SemanticEffect::MemoryStore {

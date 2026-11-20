@@ -752,6 +752,15 @@ impl CodeUnitIndex for RubyAnalyzer {
         self.inner.all_declarations()
     }
 
+    // Declaration identity uses the selected file's facts and the inner
+    // package/name authority check. No sibling declaration inventory is read.
+    fn declarations_for_files_answer(
+        &self,
+        files: &[ProjectFile],
+    ) -> brokk_bifrost_core::analyzer::query_read_incomplete::LookupOutcome<Vec<CodeUnit>> {
+        self.inner.declarations_for_files_answer(files)
+    }
+
     brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
         fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit>;
     }
@@ -959,10 +968,26 @@ impl IAnalyzer for RubyAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self {
+        IAnalyzer::update_with_listing_report(self, changed_files, listing).0
+    }
+
+    fn update_with_listing_report(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> (
+        Self,
+        brokk_bifrost_analysis::analyzer::read_verification::UpdateEffects,
+    ) {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            Self::from_inner(
-                self.inner.update_with_listing(changed_files, listing),
-                self.memo_budget,
+            let (inner, effects) = self
+                .inner
+                .update_with_listing_report(changed_files, listing);
+            // Workspace RBS signature inputs are read and reported by the inner
+            // generation; the wrapper holds only per-generation memo handles.
+            (
+                Self::from_inner(inner, self.memo_budget),
+                effects.no_changes_or_unreported(changed_files),
             )
         })
     }
@@ -1527,6 +1552,19 @@ impl LanguageEdgePass for RubyEdgePass {
         EdgePassId::Ruby
     }
 
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RubyAnalyzer>(analyzer)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |ruby| ruby.inner.selected_graph_source_exclusions(),
+            )
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         build_rooted_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeSites::Fqn)
@@ -1710,6 +1748,10 @@ mod dependency_packs {
             super::dependency_evidence::is_ruby_dependency_input(rel_path)
         }
 
+        fn diagnostic_follows_recorded_reads(&self, code: &str) -> bool {
+            super::dependency_discovery::diagnostic_follows_recorded_reads(code)
+        }
+
         fn adapter(&self) -> &'static dyn DependencyPackAdapter {
             &RubyDependencyPackAdapter
         }
@@ -1727,6 +1769,7 @@ mod dependency_packs {
             config: &AnalyzerConfig,
             project: &dyn Project,
             _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {

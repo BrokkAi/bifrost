@@ -199,8 +199,8 @@ fn documentation_diagnostics_deduplicate_per_file_and_namespace() {
     let messages = result
         .diagnostics
         .iter()
-        .filter(|d| d.message.contains("syntax"))
-        .map(|d| d.message.as_str())
+        .filter(|d| d.message().contains("syntax"))
+        .map(|d| d.message())
         .collect::<Vec<_>>();
     assert_eq!(
         messages,

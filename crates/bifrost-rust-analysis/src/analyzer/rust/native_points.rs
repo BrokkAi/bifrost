@@ -254,9 +254,7 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
         operation: &mut SelectedResolutionOperation<'_, '_>,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        let result = resolve_rust_definition_in_operation(query, operation);
-        operation.observe_macro_retention_result(macro_retention_complete(&result));
-        result
+        resolve_rust_definition_in_operation(query, operation)
     }
 
     pub(crate) fn resolve_with_evidence(
@@ -267,7 +265,7 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
         let mut evidence = CallEvidence::default();
         let outcome =
             resolve_rust_definition_in_operation_with_evidence(query, operation, &mut evidence);
-        operation.observe_macro_retention_result(macro_retention_complete(&outcome));
+        operation.observe_macro_retention_result(macro_retention_allowed(&outcome));
         (outcome, evidence)
     }
 
@@ -292,7 +290,7 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
         operation.observe_macro_retention_result(results.iter().all(|result| {
             result
                 .as_ref()
-                .is_some_and(|(outcome, _)| macro_retention_complete(outcome))
+                .is_some_and(|(outcome, _)| macro_retention_allowed(outcome))
         }));
         results
     }
@@ -368,11 +366,14 @@ pub(crate) fn resolve_rust_definition_in_operation(
     query: BoundedReceiverQuery<'_>,
     operation: &mut SelectedResolutionOperation<'_, '_>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    resolve_rust_definition_in_operation_with_evidence(
+    let result = resolve_rust_definition_in_operation_with_evidence(
         query,
         operation,
         &mut CallEvidence::default(),
-    )
+    );
+    // Nominal proofs also enter here directly, without a factory observer.
+    operation.observe_macro_retention_result(macro_retention_allowed(&result));
+    result
 }
 
 fn resolve_rust_definition_in_operation_with_evidence(
@@ -546,13 +547,13 @@ fn resolve_rust_definition_bounded_with_after_open_and_evidence(
         &cancellation,
         evidence,
     );
-    operation.observe_macro_retention_result(macro_retention_complete(&result));
+    operation.observe_macro_retention_result(macro_retention_allowed(&result));
     result
 }
 
-fn macro_retention_complete(outcome: &BoundedResolution<DefinitionLookupOutcome>) -> bool {
+fn macro_retention_allowed(outcome: &BoundedResolution<DefinitionLookupOutcome>) -> bool {
     matches!(outcome, BoundedResolution::Complete { value, .. }
-    if !matches!(value.status, DefinitionLookupStatus::Unavailable | DefinitionLookupStatus::Incomplete)
+    if !matches!(value.status, DefinitionLookupStatus::Unavailable)
         && !value.diagnostics.iter().any(|diagnostic| {
             matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error" | "native_unavailable")
         }))
@@ -1536,6 +1537,101 @@ fn focused_qualified_type_route(query: &BoundedReceiverQuery<'_>) -> bool {
                         .is_some_and(|name| name.id() == token.id())
             })
     })
+}
+
+/// Whether the name that heads the focused route is decided by one explicit,
+/// non-glob `use` at the item level of the reference's own module.
+///
+/// The caller uses this to ignore attribute-macro frontiers, so the answer
+/// must hold whatever an attribute expansion adds. An item added to the module
+/// under the imported name would define that name twice (rustc E0255). An item
+/// added to a block that encloses the reference would shadow the import, so a
+/// block that holds any attribute refuses.
+fn rust_module_import_decides_route_head(query: &BoundedReceiverQuery<'_>) -> bool {
+    let Some(tree) = query.tree else {
+        return false;
+    };
+    let root = tree.root_node();
+    let Some(token) =
+        root.descendant_for_byte_range(query.site.focus_start_byte, query.site.focus_end_byte)
+    else {
+        return false;
+    };
+    let mut head = token;
+    if let Some(route) = token.parent()
+        && matches!(route.kind(), "scoped_identifier" | "scoped_type_identifier")
+        && route.child_by_field_name("name").map(|name| name.id()) == Some(token.id())
+    {
+        head = route;
+        while matches!(head.kind(), "scoped_identifier" | "scoped_type_identifier") {
+            let Some(path) = head.child_by_field_name("path") else {
+                return false;
+            };
+            head = path;
+        }
+    }
+    if !matches!(head.kind(), "identifier" | "type_identifier") {
+        return false;
+    }
+    let mut ancestor = head.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "mod_item" {
+            break;
+        }
+        let mut cursor = node.walk();
+        if node.kind() == "block"
+            && node.named_children(&mut cursor).any(|child| {
+                matches!(
+                    child.kind(),
+                    "attribute_item"
+                        | "inner_attribute_item"
+                        | "declaration_with_attribute"
+                        | "expression_with_attribute"
+                        | "block_expression_with_attribute"
+                )
+            })
+        {
+            return false;
+        }
+        ancestor = node.parent();
+    }
+    let rust = resolve_analyzer::<RustAnalyzer>(query.analyzer)
+        .expect("Rust point projection requires Rust");
+    let imports = brokk_bifrost_rust::lexical_scope::visible_import_declarations_in_tree_with(
+        rust.inner.adapter().lexical_caches(),
+        root,
+        query.source,
+        head.start_byte(),
+        &query.source[head.byte_range()],
+    );
+    let [import] = imports.as_slice() else {
+        return false;
+    };
+    let Some(path) = import.path.as_ref() else {
+        return false;
+    };
+    if import.is_wildcard
+        || !path.lexical_scopes.is_empty()
+        || path.kind
+            == Some(brokk_bifrost_core::analyzer::model::StructuredImportPathKind::ExternCrate)
+    {
+        return false;
+    }
+    // An attribute on the `use` itself can remove or rewrite the import.
+    let mut declaration =
+        root.descendant_for_byte_range(path.declaration_start_byte, path.declaration_start_byte);
+    while let Some(node) = declaration {
+        match node.kind() {
+            "use_declaration" => {
+                return node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() != "declaration_with_attribute");
+            }
+            "declaration_with_attribute" => return false,
+            _ => declaration = node.parent(),
+        }
+    }
+    false
 }
 
 fn adapt_declaration_value(
@@ -2649,6 +2745,7 @@ fn adapt_definition_value(
                     answer,
                     completion,
                     focused_qualified_type_route(query),
+                    rust_module_import_decides_route_head(query),
                 );
                 match modeled {
                     Ok(definitions) if !definitions.is_empty() => {
@@ -2997,13 +3094,18 @@ enum AttributeFrontierClosure {
     ExternalMacro(
         Vec<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustGapFrontier>,
     ),
+    /// The reference binds through an explicit, non-glob `use` of an item of
+    /// an unindexed external crate.
+    ExplicitExternalImport(
+        Vec<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustGapFrontier>,
+    ),
 }
 
 /// Decide whether the attribute-macro frontiers a lookup retained can be
 /// ignored for the binding of one callable reference.
 ///
 /// An attribute macro can add items, so a frontier is a gap in what the
-/// module may declare. It cannot change the binding in these two shapes:
+/// module may declare. It cannot change the binding in these three shapes:
 ///
 /// - A written inherent method. A duplicate inherent method would be a
 ///   compile error, and inherent methods take precedence over trait methods.
@@ -3014,6 +3116,11 @@ enum AttributeFrontierClosure {
 ///   attribute expansion does that, which matches what an expanding analyzer
 ///   sees for this binding. Owner decision, 2026-10-09, for the Rust
 ///   cleartext-logging parity work.
+/// - A route whose head an explicit, non-glob `use` of the reference's own
+///   module binds to an item of an unindexed external crate (#14209).
+///   `rust_module_import_decides_route_head` proves the import from the
+///   syntax tree and says why no expansion can rebind the name. The lookup
+///   stays an external boundary, as it is in a module without the attribute.
 ///
 /// The native lookup has no prelude model for the macro namespace, so the
 /// prelude macro has no canonical target or definition. Its name is decided
@@ -3025,6 +3132,7 @@ fn rust_attribute_frontier_cannot_change_binding(
     definitions: &[CodeUnit],
     lexical: &[LexicalDefinition],
     callee_name: &str,
+    module_import_decides_route_head: bool,
 ) -> Option<AttributeFrontierClosure> {
     rust_written_inherent_method_frontiers(
         answers,
@@ -3045,6 +3153,102 @@ fn rust_attribute_frontier_cannot_change_binding(
         )
         .map(AttributeFrontierClosure::ExternalMacro)
     })
+    .or_else(|| {
+        if !module_import_decides_route_head {
+            return None;
+        }
+        rust_explicit_external_import_frontiers(
+            answers,
+            completion,
+            canonical_targets,
+            definitions,
+            lexical,
+        )
+        .map(AttributeFrontierClosure::ExplicitExternalImport)
+    })
+}
+
+/// The explicit external import shape. The caller has proved the import from
+/// the syntax tree. The lookup must have no workspace answer and must have
+/// reached the unindexed external boundary through that import. Every other incomplete reason
+/// must be an unsupported semantic that names a retained attribute-macro
+/// frontier, or the operation-minted reason of a route prefix that the import
+/// binds.
+fn rust_explicit_external_import_frontiers(
+    answers: &[SelectedRustReferenceAnswer],
+    completion: &ResolutionCompletion,
+    canonical_targets: &std::collections::BTreeSet<SemanticId>,
+    definitions: &[CodeUnit],
+    lexical: &[LexicalDefinition],
+) -> Option<
+    Vec<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustGapFrontier>,
+> {
+    use crate::analyzer::resolution::ResolutionIncompleteReason;
+    // `boundary_import_names` is the store's proof that the open boundary is a
+    // non-glob import of an external dependency. Without it the import may
+    // name a workspace item that an attribute withholds.
+    if !canonical_targets.is_empty()
+        || !definitions.is_empty()
+        || !lexical.is_empty()
+        || answers
+            .iter()
+            .all(|answer| answer.boundary_import_names.is_empty())
+    {
+        return None;
+    }
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return None;
+    };
+    // A member reference under the imported name (`Archive::new`) cannot place
+    // its prefix while the frontier is open. That is the only operation-minted
+    // reason this shape admits.
+    let only_external_prefix_reasons = answers
+        .iter()
+        .flat_map(|answer| answer.named_reasons.iter())
+        .filter(|(kind, _)| *kind != "GeneratedItemSurface")
+        .all(|(kind, evidence)| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(evidence).expect("a named reason carries JSON evidence");
+            *kind == "UnplacedRoutePrefix"
+                && parsed["evidence"].as_array().is_some_and(|evidence| {
+                    evidence
+                        .iter()
+                        .all(|item| item["prefix_class"] == "external_crate")
+                })
+        });
+    let retained_gap_frontiers = answers
+        .iter()
+        .flat_map(|answer| answer.retained_gap_frontiers.iter().copied())
+        .collect::<Vec<_>>();
+    let mut external_boundary = false;
+    let mut frontiers = Vec::new();
+    for reason in reasons.iter() {
+        match reason {
+            ResolutionIncompleteReason::OpenBoundary {
+                status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                ..
+            } => external_boundary = true,
+            ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                let frontier = retained_gap_frontiers
+                    .iter()
+                    .find(|frontier| frontier.semantic == *semantic)?;
+                if frontier.kind.is_attribute_macro_frontier() {
+                    frontiers.push(*frontier);
+                } else if semantic.operation_local_number().is_none()
+                    || !only_external_prefix_reasons
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !external_boundary || frontiers.is_empty() {
+        return None;
+    }
+    frontiers.sort_unstable_by_key(|frontier| (frontier.semantic, frontier.kind.evidence_name()));
+    frontiers.dedup();
+    Some(frontiers)
 }
 
 /// The written inherent method shape. Its gate is the one on master: every
@@ -3204,6 +3408,7 @@ fn adapt_definition_answer(
     answers: Vec<SelectedRustReferenceAnswer>,
     completion: ResolutionCompletion,
     qualified_route_head: bool,
+    module_import_decides_route_head: bool,
 ) -> DefinitionLookupOutcome {
     let canonical_targets = answers
         .iter()
@@ -3451,6 +3656,7 @@ fn adapt_definition_answer(
         &definitions,
         &lexical,
         &site.text,
+        module_import_decides_route_head,
     );
     // A reference that reached a block-local item names it, although the item
     // has no parser unit; see `rust_block_local_binding_is_decided`.
@@ -3478,13 +3684,16 @@ fn adapt_definition_answer(
     let external_boundary = !prelude_value_member_reference
         && canonical_target_count == 0
         && lexical_definition.is_none()
-        && matches!(&completion, ResolutionCompletion::Incomplete(reasons)
+        && (matches!(
+            attribute_frontier_closure,
+            Some(AttributeFrontierClosure::ExplicitExternalImport(_))
+        ) || matches!(&completion, ResolutionCompletion::Incomplete(reasons)
         if reasons.iter().all(|reason| matches!(reason,
             crate::analyzer::resolution::ResolutionIncompleteReason::OpenBoundary {
                 status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
                 ..
             }
-        )));
+        ))));
     // A selected source or lexical candidate can be only the authored side of
     // an unexpanded generated surface. When the completion contains no other
     // kind of gap and no displayable definition, preserve the partial local
@@ -3703,6 +3912,11 @@ fn adapt_definition_answer(
             AttributeFrontierClosure::ExternalMacro(frontiers) => (
                 "attribute_macro_frontier_cannot_change_external_macro_binding",
                 "attribute macro frontier cannot change external macro binding",
+                frontiers,
+            ),
+            AttributeFrontierClosure::ExplicitExternalImport(frontiers) => (
+                "attribute_macro_frontier_cannot_change_explicit_import_binding",
+                "attribute macro frontier cannot change explicit import binding",
                 frontiers,
             ),
         };

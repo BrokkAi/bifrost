@@ -14,7 +14,18 @@ use super::config::{JvmAnalyzerConfig, JvmDependencyDiscoveryMode};
 /// v2 (#11607): a dependency selection recorded for an aggregate evaluation is
 /// verified by recomputing it from the coordinates its manifests declared, so
 /// the recorded answers of v1 name no such tree part.
-pub const JVM_SELECTION_CODE_DOMAIN: &[u8] = b"bifrost-jvm-external-selection-code:v2";
+///
+/// v3 (#13266): JDK discovery also resolves `java` on `PATH` while `JAVA_HOME`
+/// is unset, so the same configuration selects a JDK it did not before.
+///
+/// v4 (#13459): a JDK `release` file whose `JAVA_VERSION` has vendor elements
+/// beyond the fourth is accepted instead of rejected, so an unchanged release
+/// file selects a JDK it did not before.
+///
+/// v5 (#13851): the dependency selection reads up to the dependency-pack
+/// preparation bound instead of the first 128 artifacts, so a workspace with
+/// more than 128 dependency jars selects jars it left unread before.
+pub const JVM_SELECTION_CODE_DOMAIN: &[u8] = b"bifrost-jvm-external-selection-code:v5";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalSelectionQuestionKind {
@@ -100,9 +111,29 @@ pub struct VerifiedSelection {
     pub question_digest: [u8; 32],
     pub answer_digest: [u8; 32],
     pub view_stamp: Option<ProjectViewStamp>,
+    /// Provenance: a later run can ask the authority again and compare. It says
+    /// nothing about what the selection covers or whether it is complete.
+    pub verified: bool,
+    /// `complete && verified`: the selection can prove absence and a later run
+    /// can compare it.
     pub certified: bool,
+    /// The only basis for proving absence.
     pub complete: bool,
+    /// Every reason the selection is incomplete is a gap that is fixed for
+    /// unchanged inputs (a pack's fixed partial coverage, or a declared
+    /// coordinate with no local artifact). False when any reason may clear
+    /// on the next attempt, or when no reason is named.
+    pub only_replayable_gaps: bool,
     pub records: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl VerifiedSelection {
+    /// The only reuse predicate. Whether a later run can verify this selection
+    /// and nothing about it can change for unchanged inputs. This is a reuse
+    /// question, not an absence one: `complete` alone proves absence.
+    pub fn replayable(&self) -> bool {
+        self.verified && (self.complete || self.only_replayable_gaps)
+    }
 }
 
 impl std::fmt::Debug for VerifiedSelection {
@@ -111,8 +142,10 @@ impl std::fmt::Debug for VerifiedSelection {
             .field("question_digest", &self.question_digest)
             .field("answer_digest", &self.answer_digest)
             .field("view_stamp", &self.view_stamp)
+            .field("verified", &self.verified)
             .field("certified", &self.certified)
             .field("complete", &self.complete)
+            .field("only_replayable_gaps", &self.only_replayable_gaps)
             .finish_non_exhaustive()
     }
 }
@@ -137,9 +170,7 @@ pub trait ExternalSelectionAuthority: Send + Sync {
         &self,
         _question: &ExternalSelectionQuestion,
         _answer: [u8; 32],
-    ) -> Option<JvmDependencyBasis> {
-        None
-    }
+    ) -> Option<JvmDependencyBasis>;
 
     /// The answer of a `Split` question when its tree part is `basis` and the
     /// environment is this authority's, read from no workspace manifest. `None`
@@ -148,9 +179,7 @@ pub trait ExternalSelectionAuthority: Send + Sync {
         &self,
         _question: &ExternalSelectionQuestion,
         _basis: &JvmDependencyBasis,
-    ) -> Option<[u8; 32]> {
-        None
-    }
+    ) -> Option<[u8; 32]>;
 }
 
 /// Collect one current question per digest across language delegates.
@@ -180,6 +209,8 @@ impl ExternalSelectionQuestion {
         let mut dependencies =
             CanonicalHasher::new(b"bifrost-external-selection-question:dependencies:v1");
         dependencies.value(JVM_SELECTION_CODE_DOMAIN);
+        // #11968: scope is part of the receipt, including for existing defaults.
+        boolean(&mut dependencies, config.without_project_build);
         let external = &config.external_dependencies;
         dependencies.sequence(
             "artifact_paths",
@@ -253,7 +284,7 @@ impl ExternalSelectionQuestion {
         );
         boolean(&mut jdk, standard.discover_java_home);
         if standard.discover_java_home {
-            jdk.value(b"JAVA_HOME");
+            jdk.value(b"JAVA_HOME|PATH");
         }
         vec![
             Self {
@@ -278,6 +309,21 @@ mod tests {
 
     struct Java(JvmAnalyzerConfig);
     impl ExternalSelectionAuthority for Java {
+        fn basis(
+            &self,
+            _question: &crate::analyzer::external_selection::ExternalSelectionQuestion,
+            _answer: [u8; 32],
+        ) -> Option<crate::analyzer::external_selection::JvmDependencyBasis> {
+            None
+        }
+        fn answer_under_basis(
+            &self,
+            _question: &crate::analyzer::external_selection::ExternalSelectionQuestion,
+            _basis: &crate::analyzer::external_selection::JvmDependencyBasis,
+        ) -> Option<[u8; 32]> {
+            None
+        }
+
         fn answer(
             &self,
             _request: &super::super::outer_request::OuterRequest,
@@ -347,5 +393,144 @@ mod tests {
                 "{config:?}"
             );
         }
+    }
+}
+
+/// Workspace-owned, bounded external-toolchain verification records. Payloads
+/// retain typed selections and their metadata observations outside the evictable
+/// content digest region. Callers must validate their observation before reuse.
+#[derive(Default)]
+pub struct ToolchainVerifications {
+    state: std::sync::Mutex<ToolchainVerificationState>,
+    /// Serializes library verification; callers recheck the record after locking.
+    verification: std::sync::Mutex<()>,
+}
+
+type ToolchainRecord = ([u8; 32], Arc<dyn std::any::Any + Send + Sync>);
+
+#[derive(Default)]
+struct ToolchainVerificationState {
+    records: std::collections::VecDeque<ToolchainRecord>,
+    refresh: Option<Arc<dyn Fn() + Send + Sync>>,
+    pending: bool,
+}
+
+impl ToolchainVerifications {
+    /// Configuration-sized retention, including historical JAVA_HOME choices.
+    const ENTRY_LIMIT: usize = 8;
+
+    pub fn get<T: std::any::Any + Send + Sync>(&self, key: &[u8; 32]) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .expect("toolchain verification state poisoned")
+            .records
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .and_then(|(_, value)| Arc::clone(value).downcast().ok())
+    }
+
+    /// Publish only after full verification. A fresh publication permits a new
+    /// stale observation to schedule work, even if the previous worker is ending.
+    pub fn replace<T: std::any::Any + Send + Sync>(&self, key: [u8; 32], value: Arc<T>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("toolchain verification state poisoned");
+        state.records.retain(|(candidate, _)| *candidate != key);
+        state.records.push_back((key, value));
+        while state.records.len() > Self::ENTRY_LIMIT {
+            state.records.pop_front();
+        }
+        state.pending = false;
+    }
+
+    /// The callback must only wake background work; it must not acquire service
+    /// workspace locks or perform verification on the calling request thread.
+    pub fn set_refresh_callback(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        self.state
+            .lock()
+            .expect("toolchain verification state poisoned")
+            .refresh = Some(callback);
+    }
+
+    /// Returns false for library callers without an executor. Repeated stale
+    /// observations coalesce until publication or explicit worker completion.
+    pub fn signal_stale(&self) -> bool {
+        let callback = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("toolchain verification state poisoned");
+            let Some(callback) = state.refresh.clone() else {
+                return false;
+            };
+            if state.pending {
+                return true;
+            }
+            state.pending = true;
+            callback
+        };
+        callback();
+        true
+    }
+
+    /// Call on every scheduled-work exit, including errors, to allow retry.
+    pub fn refresh_finished(&self) {
+        self.state
+            .lock()
+            .expect("toolchain verification state poisoned")
+            .pending = false;
+    }
+
+    pub fn lock_verification(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.verification
+            .lock()
+            .expect("toolchain verification poisoned")
+    }
+}
+
+#[cfg(test)]
+mod toolchain_verification_tests {
+    use super::ToolchainVerifications;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn stale_signals_coalesce_and_failed_work_can_retry() {
+        let records = ToolchainVerifications::default();
+        assert!(!records.signal_stale());
+        let scheduled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&scheduled);
+        records.set_refresh_callback(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| assert!(records.signal_stale())))
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert_eq!(scheduled.load(Ordering::SeqCst), 1);
+        records.refresh_finished();
+        assert!(records.signal_stale());
+        assert_eq!(scheduled.load(Ordering::SeqCst), 2);
+        records.replace([1; 32], Arc::new(42usize));
+        assert!(records.signal_stale());
+        assert_eq!(scheduled.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn replacing_an_entry_preserves_bounded_oldest_eviction() {
+        let records = ToolchainVerifications::default();
+        for key in 0..8 {
+            records.replace([key; 32], Arc::new(key));
+        }
+        records.replace([0; 32], Arc::new(99u8));
+        records.replace([8; 32], Arc::new(8u8));
+        assert_eq!(*records.get::<u8>(&[0; 32]).unwrap(), 99);
+        assert!(records.get::<u8>(&[1; 32]).is_none());
+        assert!(records.get::<usize>(&[0; 32]).is_none());
     }
 }

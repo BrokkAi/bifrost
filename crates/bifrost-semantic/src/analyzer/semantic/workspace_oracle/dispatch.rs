@@ -870,6 +870,25 @@ impl<'a> ProcedureLookupProgress<'a> {
         self.max_examined.saturating_sub(self.examined)
     }
 
+    fn partition_point<T>(
+        &mut self,
+        values: &[T],
+        predicate: impl Fn(&T) -> bool,
+    ) -> Result<usize, ProcedureRangeLookupStatus> {
+        let mut left = 0;
+        let mut right = values.len();
+        while left < right {
+            self.examine()?;
+            let middle = left + (right - left) / 2;
+            if predicate(&values[middle]) {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        Ok(left)
+    }
+
     #[doc(hidden)]
     pub fn failed(&self, status: ProcedureRangeLookupStatus) -> ProcedureRangeLookup {
         ProcedureRangeLookup {
@@ -904,9 +923,19 @@ pub fn content_identity_with_progress(
 
 #[doc(hidden)]
 pub fn sort_procedures_by_locator<'a>(
-    mut source: Vec<&'a ProcedureSemantics>,
+    source: Vec<&'a ProcedureSemantics>,
     progress: &mut ProcedureLookupProgress<'_>,
 ) -> Result<Vec<&'a ProcedureSemantics>, ProcedureRangeLookupStatus> {
+    sort_with_lookup_progress(source, progress, |left, right| {
+        left.locator().cmp(right.locator())
+    })
+}
+
+fn sort_with_lookup_progress<T: Copy>(
+    mut source: Vec<T>,
+    progress: &mut ProcedureLookupProgress<'_>,
+    compare: impl Fn(&T, &T) -> Ordering,
+) -> Result<Vec<T>, ProcedureRangeLookupStatus> {
     let len = source.len();
     let mut width = 1usize;
     let mut target = Vec::with_capacity(len);
@@ -920,7 +949,7 @@ pub fn sort_procedures_by_locator<'a>(
             let mut right = middle;
             while left < middle && right < end {
                 progress.examine()?;
-                if source[left].locator() <= source[right].locator() {
+                if compare(&source[left], &source[right]) != Ordering::Greater {
                     target.push(source[left]);
                     left += 1;
                 } else {
@@ -945,6 +974,194 @@ pub fn sort_procedures_by_locator<'a>(
     Ok(source)
 }
 
+fn procedure_source_extent(procedure: &ProcedureSemantics) -> (usize, usize) {
+    let span = procedure
+        .source_mappings()
+        .iter()
+        .find(|mapping| {
+            mapping.kind == SourceMappingKind::Exact
+                && mapping.locator.role() == SemanticRole::SourceMapping
+        })
+        .map(|mapping| mapping.locator.anchor().span())
+        .unwrap_or_else(|| procedure.locator().anchor().span());
+    (span.start_byte() as usize, span.end_byte() as usize)
+}
+
+fn procedure_owns_source_range(
+    procedure: &ProcedureSemantics,
+    extent: (usize, usize),
+    range: &Range,
+    progress: &mut ProcedureLookupProgress<'_>,
+) -> Result<bool, ProcedureRangeLookupStatus> {
+    if range.start_byte < extent.0 || extent.1 < range.end_byte {
+        return Ok(false);
+    }
+    for hole in procedure.source_range_holes() {
+        progress.examine()?;
+        // An enclosing expression may contain a nested body's span. Only
+        // inputs inside the unlowered body are excluded from this owner.
+        if hole.start_byte() as usize <= range.start_byte
+            && range.end_byte <= hole.end_byte() as usize
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn procedure_range_handles(
+    artifact: &Arc<SemanticArtifact>,
+    exact: Vec<&ProcedureSemantics>,
+    enclosing: Vec<&ProcedureSemantics>,
+    progress: &mut ProcedureLookupProgress<'_>,
+) -> Result<Vec<ProcedureHandle>, ProcedureRangeLookupStatus> {
+    let matches = if exact.is_empty() { enclosing } else { exact };
+    let mut matches = sort_procedures_by_locator(matches, progress)?;
+    matches.dedup_by_key(|procedure| procedure.id());
+    let mut handles = Vec::with_capacity(matches.len());
+    for procedure in matches {
+        progress.examine()?;
+        handles.push(
+            artifact
+                .procedure_handle(procedure.id())
+                .expect("validated artifact procedure has a scoped handle"),
+        );
+    }
+    Ok(handles)
+}
+
+/// A transient index of procedure source extents for one artifact window.
+/// A range-maximum tree skips disjoint owners even when a file-wide
+/// initializer overlaps many sibling procedures.
+pub struct ProcedureSourceRangeIndex<'a> {
+    artifact: &'a Arc<SemanticArtifact>,
+    extents: Vec<(usize, usize, &'a ProcedureSemantics)>,
+    max_ends: Vec<usize>,
+}
+
+impl<'a> ProcedureSourceRangeIndex<'a> {
+    /// Conservative live storage through construction, lookup and ranking.
+    /// Lookup holds candidate/sort buffers beside the completed index, then
+    /// ranking can clone the returned handles to remove enclosing ancestors.
+    pub fn reservation_bytes(
+        procedures: usize,
+    ) -> Result<usize, crate::analyzer::semantic::SemanticArtifactLeaseError> {
+        use std::mem::size_of;
+        let extent = size_of::<(usize, usize, &ProcedureSemantics)>();
+        let construction = 2 * extent;
+        let lookup = extent
+            + 2 * size_of::<usize>()
+            + 3 * size_of::<&ProcedureSemantics>()
+            + 2 * size_of::<ProcedureHandle>();
+        procedures
+            .checked_mul(construction.max(lookup))
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+            // Six vector headers plus the bounded traversal stack.
+            .and_then(|bytes| {
+                bytes.checked_add((18 + 2 * usize::BITS as usize) * size_of::<usize>())
+            })
+            .ok_or(crate::analyzer::semantic::SemanticArtifactLeaseError::RetainedBytesOverflow)
+    }
+
+    /// Live index metadata, excluding artifact storage owned by its lease.
+    pub fn retained_bytes(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Self>()
+            + 4 * size_of::<usize>()
+            + self.extents.capacity() * size_of::<(usize, usize, &ProcedureSemantics)>()
+            + self.max_ends.capacity() * size_of::<usize>()
+    }
+
+    pub fn new(
+        artifact: &'a Arc<SemanticArtifact>,
+        progress: &mut ProcedureLookupProgress<'_>,
+    ) -> Result<Self, ProcedureRangeLookupStatus> {
+        let mut extents = Vec::with_capacity(artifact.procedures().len());
+        for procedure in artifact.procedures() {
+            progress.examine()?;
+            let (start, end) = procedure_source_extent(procedure);
+            extents.push((start, end, procedure));
+        }
+        let extents = sort_with_lookup_progress(extents, progress, |left, right| {
+            (left.0, left.1, left.2.locator()).cmp(&(right.0, right.1, right.2.locator()))
+        })?;
+        let mut max_ends = vec![0; 2 * extents.len()];
+        for (index, &(_, end, _)) in extents.iter().enumerate() {
+            progress.examine()?;
+            max_ends[extents.len() + index] = end;
+        }
+        for index in (1..extents.len()).rev() {
+            progress.examine()?;
+            max_ends[index] = max_ends[2 * index].max(max_ends[2 * index + 1]);
+        }
+        Ok(Self {
+            artifact,
+            extents,
+            max_ends,
+        })
+    }
+
+    /// Look up one range at a time so scratch storage is bounded by the
+    /// procedure census, independent of the number of field usages.
+    pub fn lookup(
+        &self,
+        range: &Range,
+        progress: &mut ProcedureLookupProgress<'_>,
+    ) -> Result<Vec<ProcedureHandle>, ProcedureRangeLookupStatus> {
+        let mut exact = Vec::new();
+        let mut enclosing = Vec::new();
+        progress.examine()?;
+        let candidates =
+            progress.partition_point(&self.extents, |&(start, _, _)| start <= range.start_byte)?;
+        // A prefix has at most one node per tree level. Descending one
+        // subtree adds at most one pending sibling per level, so two machine
+        // word depths cover the stack without capacity growth.
+        let mut pending = Vec::with_capacity(2 * usize::BITS as usize);
+        let mut left = self.extents.len();
+        let mut right = left + candidates;
+        while left < right {
+            progress.examine()?;
+            if left % 2 == 1 {
+                pending.push(left);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                pending.push(right);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        while let Some(node) = pending.pop() {
+            progress.examine()?;
+            if self.max_ends[node] < range.end_byte {
+                continue;
+            }
+            if node < self.extents.len() {
+                assert!(pending.len() + 2 <= pending.capacity());
+                pending.extend([2 * node, 2 * node + 1]);
+                continue;
+            }
+            let (start, end, procedure) = self.extents[node - self.extents.len()];
+            if !procedure_owns_source_range(procedure, (start, end), range, progress)? {
+                continue;
+            }
+            let matches = if start == range.start_byte && end == range.end_byte {
+                &mut exact
+            } else {
+                &mut enclosing
+            };
+            if matches.capacity() == 0 {
+                // Reserve only the list that is used, with a census bound
+                // rather than relying on Vec's unspecified growth policy.
+                matches.reserve_exact(self.extents.len());
+            }
+            matches.push(procedure);
+        }
+        procedure_range_handles(self.artifact, exact, enclosing, progress)
+    }
+}
+
 pub fn procedures_for_source_ranges(
     artifact: &Arc<SemanticArtifact>,
     ranges: &[Range],
@@ -952,79 +1169,40 @@ pub fn procedures_for_source_ranges(
     cancellation: &CancellationToken,
 ) -> ProcedureRangeLookup {
     let mut progress = ProcedureLookupProgress::new(max_examined, cancellation);
-    let mut exact = Vec::new();
-    let mut enclosing = Vec::new();
-    for procedure in artifact.procedures() {
-        if let Err(status) = progress.examine() {
-            return progress.failed(status);
-        }
-        let span = procedure
-            .source_mappings()
-            .iter()
-            .find(|mapping| {
-                mapping.kind == SourceMappingKind::Exact
-                    && mapping.locator.role() == SemanticRole::SourceMapping
-            })
-            .map(|mapping| mapping.locator.anchor().span())
-            .unwrap_or_else(|| procedure.locator().anchor().span());
-        let mut exact_match = false;
-        let mut enclosing_match = false;
-        for range in ranges {
-            if let Err(status) = progress.examine() {
-                return progress.failed(status);
-            }
-            if range.start_byte < span.start_byte() as usize
-                || (span.end_byte() as usize) < range.end_byte
-            {
-                continue;
-            }
-            let mut excluded = false;
-            for hole in procedure.source_range_holes() {
-                if let Err(status) = progress.examine() {
-                    return progress.failed(status);
+    // A one-off lookup scans once; sorting an index here would add repeated
+    // O(procedures log procedures) work for independent source-site callers.
+    // Consumers with many ranges can build ProcedureSourceRangeIndex once.
+    let lookup = (|| {
+        let mut exact = Vec::new();
+        let mut enclosing = Vec::new();
+        for procedure in artifact.procedures() {
+            progress.examine()?;
+            let extent = procedure_source_extent(procedure);
+            let mut exact_match = false;
+            let mut enclosing_match = false;
+            for range in ranges {
+                progress.examine()?;
+                if !procedure_owns_source_range(procedure, extent, range, &mut progress)? {
+                    continue;
                 }
-                // A surrounding call or declaration can contain a nested
-                // body's span and still be owned here. Exclude only inputs
-                // inside that unlowered body, not their enclosing syntax.
-                if hole.start_byte() as usize <= range.start_byte
-                    && range.end_byte <= hole.end_byte() as usize
-                {
-                    excluded = true;
+                if extent == (range.start_byte, range.end_byte) {
+                    exact_match = true;
                     break;
                 }
+                enclosing_match = true;
             }
-            if excluded {
-                continue;
+            if exact_match {
+                exact.push(procedure);
+            } else if enclosing_match {
+                enclosing.push(procedure);
             }
-            if range.start_byte == span.start_byte() as usize
-                && range.end_byte == span.end_byte() as usize
-            {
-                exact_match = true;
-                break;
-            }
-            enclosing_match |= span.start_byte() as usize <= range.start_byte
-                && span.end_byte() as usize >= range.end_byte;
         }
-        if exact_match {
-            exact.push(procedure);
-        } else if enclosing_match {
-            enclosing.push(procedure);
-        }
-    }
-    let matches = if exact.is_empty() { enclosing } else { exact };
-    let matches = match sort_procedures_by_locator(matches, &mut progress) {
-        Ok(matches) => matches,
+        procedure_range_handles(artifact, exact, enclosing, &mut progress)
+    })();
+    let handles = match lookup {
+        Ok(handles) => handles,
         Err(status) => return progress.failed(status),
     };
-    let mut handles = Vec::with_capacity(matches.len());
-    for procedure in matches {
-        if let Err(status) = progress.examine() {
-            return progress.failed(status);
-        }
-        if let Some(handle) = artifact.procedure_handle(procedure.id()) {
-            handles.push(handle);
-        }
-    }
     ProcedureRangeLookup {
         handles,
         examined: progress.examined,
@@ -1191,4 +1369,66 @@ pub fn compare_locator_fields(left: &SemanticLocator, right: &SemanticLocator) -
         // Source anchors ordinarily distinguish dispatch targets. Retain the
         // locator's complete stable identity as a deterministic tie-breaker.
         .then_with(|| left.cmp(right))
+}
+
+#[cfg(test)]
+mod range_sort_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::cell::Cell;
+
+    #[test]
+    #[hardwon("#14365: procedure prefix comparisons escaped work allowance and cancellation")]
+    fn procedure_prefix_search_stops_at_budget_and_cancellation() {
+        let cancellation = CancellationToken::new();
+        let comparisons = Cell::new(0);
+        let mut bounded = ProcedureLookupProgress::new(1, &cancellation);
+        assert_eq!(
+            bounded.partition_point(&[1, 2, 3, 4], |_| {
+                comparisons.set(comparisons.get() + 1);
+                true
+            }),
+            Err(ProcedureRangeLookupStatus::BudgetExhausted)
+        );
+        assert_eq!(bounded.examined, 1);
+        assert_eq!(comparisons.get(), 1);
+
+        comparisons.set(0);
+        let mut interrupted = ProcedureLookupProgress::new(usize::MAX, &cancellation);
+        assert_eq!(
+            interrupted.partition_point(&[1, 2, 3, 4], |_| {
+                comparisons.set(comparisons.get() + 1);
+                cancellation.cancel();
+                true
+            }),
+            Err(ProcedureRangeLookupStatus::Cancelled)
+        );
+        assert_eq!(interrupted.examined, 1);
+        assert_eq!(comparisons.get(), 1);
+    }
+
+    #[test]
+    #[hardwon("#14365: procedure extent sorting ignored work allowance and cancellation")]
+    fn procedure_range_sort_stops_at_budget_and_cancellation() {
+        let cancellation = CancellationToken::new();
+        let mut bounded = ProcedureLookupProgress::new(2, &cancellation);
+        assert_eq!(
+            sort_with_lookup_progress(vec![4, 3, 2, 1], &mut bounded, i32::cmp),
+            Err(ProcedureRangeLookupStatus::BudgetExhausted),
+        );
+        assert_eq!(bounded.examined, 2);
+
+        let mut interrupted = ProcedureLookupProgress::new(usize::MAX, &cancellation);
+        let comparisons = Cell::new(0);
+        assert_eq!(
+            sort_with_lookup_progress(vec![4, 3, 2, 1], &mut interrupted, |left, right| {
+                comparisons.set(comparisons.get() + 1);
+                cancellation.cancel();
+                left.cmp(right)
+            }),
+            Err(ProcedureRangeLookupStatus::Cancelled),
+        );
+        assert_eq!(comparisons.get(), 1);
+        assert_eq!(interrupted.examined, 1);
+    }
 }

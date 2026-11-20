@@ -16,22 +16,33 @@ pub const MEMBERS_BY_IDS: &str = r#"WITH ids AS MATERIALIZED (
 )
 SELECT m.* FROM ids CROSS JOIN active_catalog_declaration_members m ON m.record_id=ids.id;"#;
 
-/// Raw IDs are pack-local. Count every active owner before taking the scalar
-/// qualification shortcut; guarded or shared owners use the existing ranked
-/// and guarded qualification reader instead. Materialize only scalar metadata
-/// after the indexed seeks: aggregating directly over the compound active view
-/// would materialize whole records before applying the requested IDs.
+/// Raw IDs are pack-local. Materialize the two scalar inputs separately so
+/// joining the compound active views cannot move an ID scan inside the name
+/// loop. Seek names through their record index for these selected owners only;
+/// their database and shard predicates preserve active membership. The names
+/// view would let SQLite choose a whole-shard scan even for one requested key.
 pub const SEARCH_OWNER_QUALIFICATIONS: &str = r#"WITH ids AS MATERIALIZED (
  SELECT DISTINCT CAST(value AS TEXT) AS id FROM json_each(:ids)
-), selected AS MATERIALIZED (
- SELECT t.source_db,t.shard_key,t.record_key,t.record_id,n.language,
+), selected_types AS MATERIALIZED (
+ SELECT t.source_db,t.shard_key,t.record_key,t.record_id,
         COALESCE(json_type(t.record_json,'$.guard') <> 'null',0) AS guarded,
         json_extract(t.record_json,'$.name') AS owner_name
  FROM ids CROSS JOIN active_catalog_declaration_types t ON t.record_id=ids.id
- JOIN active_catalog_declaration_names n USING(source_db,shard_key,record_key)
- WHERE n.identity_name=1
+), names AS MATERIALIZED (
+ SELECT 'durable' AS source_db,n.shard_key,n.record_key,n.language
+ FROM selected_types st CROSS JOIN main.catalog_declaration_names n
+ INDEXED BY catalog_declaration_names_record
+ ON n.record_key=st.record_key AND n.shard_key=st.shard_key
+ WHERE st.source_db='durable' AND n.identity_name=1
+ UNION ALL
+ SELECT 'session' AS source_db,n.shard_key,n.record_key,n.language
+ FROM selected_types st CROSS JOIN session.catalog_declaration_names n
+ INDEXED BY catalog_declaration_names_record
+ ON n.record_key=st.record_key AND n.shard_key=st.shard_key
+ WHERE st.source_db='session' AND n.identity_name=1
 )
-SELECT * FROM selected;"#;
+SELECT t.source_db,t.shard_key,t.record_key,t.record_id,n.language,t.guarded,t.owner_name
+FROM selected_types t JOIN names n USING(source_db,shard_key,record_key);"#;
 
 pub const TYPES_BY_IDENTITY_NAME: &str = r#"SELECT t.* FROM active_catalog_declaration_names AS n
 JOIN active_catalog_declaration_types AS t
@@ -90,11 +101,25 @@ WHERE r.from_id=:id AND r.origin='relation_fact';"#;
 pub const RELATIONS_TO: &str = r#"SELECT r.* FROM active_catalog_declaration_relations AS r
 WHERE r.to_id=:id AND r.origin='relation_fact';"#;
 
-pub const OVERLAY_RELATIONS_FROM: &str = r#"SELECT r.* FROM active_catalog_declaration_relations AS r
-WHERE r.from_id IN (SELECT value FROM json_each(:owner_ids));"#;
+/// Seek the relation index once per requested ID. With `from_id IN (SELECT ...
+/// json_each)` through the compound active view the planner drove the view's
+/// branches from the active-shard list and filtered every relation row of every
+/// active shard (about 10 ms a statement, whatever the ID count). Materializing
+/// the IDs and joining them in as the outer loop makes `from_id=?` the seek, as
+/// MEMBER_IDS_BY_OWNERS does. `DISTINCT` keeps one row per relation when an ID is
+/// repeated, as `IN` did.
+pub const OVERLAY_RELATIONS_FROM: &str = r#"WITH owners AS MATERIALIZED (
+  SELECT DISTINCT value FROM json_each(:owner_ids)
+)
+SELECT r.* FROM owners CROSS JOIN active_catalog_declaration_relations r
+WHERE r.from_id=owners.value;"#;
 
-pub const OVERLAY_RELATIONS_TO: &str = r#"SELECT r.* FROM active_catalog_declaration_relations AS r
-WHERE r.to_id IN (SELECT value FROM json_each(:raw_targets));"#;
+/// The target-side twin of OVERLAY_RELATIONS_FROM, seeking `to_id`.
+pub const OVERLAY_RELATIONS_TO: &str = r#"WITH targets AS MATERIALIZED (
+  SELECT DISTINCT value FROM json_each(:raw_targets)
+)
+SELECT r.* FROM targets CROSS JOIN active_catalog_declaration_relations r
+WHERE r.to_id=targets.value;"#;
 
 pub const ANCESTOR_RELATIONS: &str = r#"SELECT r.* FROM active_catalog_declaration_relations AS r
 WHERE r.from_id IN (SELECT value FROM json_each(:owner_ids))
@@ -262,6 +287,48 @@ pub const TYPES_BY_PATH: &str =
 
 pub const MEMBERS_BY_PATH: &str =
     r#"SELECT m.* FROM active_catalog_declaration_members AS m WHERE m.authored_path=:path;"#;
+
+// Resolve path-index candidates before active-shard joins. Letting the
+// planner start at active_shards walks every declaration of each active shard.
+pub const SOURCE_TYPES_TOUCHING_PATH: &str = r#"WITH requested AS MATERIALIZED (SELECT value FROM json_each(:ancestors)),
+candidates AS MATERIALIZED (
+SELECT 'durable' AS source_db,r.shard_key,r.record_key
+FROM main.catalog_declaration_types r INDEXED BY catalog_declaration_types_path
+WHERE r.authored_path IN (SELECT value FROM requested)
+UNION ALL
+SELECT 'durable' AS source_db,r.shard_key,r.record_key
+FROM main.catalog_declaration_types r INDEXED BY catalog_declaration_types_path
+WHERE r.authored_path>=:descendant_start AND r.authored_path<:descendant_end
+UNION ALL
+SELECT 'session' AS source_db,r.shard_key,r.record_key
+FROM session.catalog_declaration_types r INDEXED BY catalog_declaration_types_path
+WHERE r.authored_path IN (SELECT value FROM requested)
+UNION ALL
+SELECT 'session' AS source_db,r.shard_key,r.record_key
+FROM session.catalog_declaration_types r INDEXED BY catalog_declaration_types_path
+WHERE r.authored_path>=:descendant_start AND r.authored_path<:descendant_end)
+SELECT r.* FROM candidates c CROSS JOIN active_catalog_declaration_types r
+ON r.source_db=c.source_db AND r.shard_key=c.shard_key AND r.record_key=c.record_key;"#;
+
+pub const SOURCE_MEMBERS_TOUCHING_PATH: &str = r#"WITH requested AS MATERIALIZED (SELECT value FROM json_each(:ancestors)),
+candidates AS MATERIALIZED (
+SELECT 'durable' AS source_db,r.shard_key,r.record_key
+FROM main.catalog_declaration_members r INDEXED BY catalog_declaration_members_path
+WHERE r.authored_path IN (SELECT value FROM requested)
+UNION ALL
+SELECT 'durable' AS source_db,r.shard_key,r.record_key
+FROM main.catalog_declaration_members r INDEXED BY catalog_declaration_members_path
+WHERE r.authored_path>=:descendant_start AND r.authored_path<:descendant_end
+UNION ALL
+SELECT 'session' AS source_db,r.shard_key,r.record_key
+FROM session.catalog_declaration_members r INDEXED BY catalog_declaration_members_path
+WHERE r.authored_path IN (SELECT value FROM requested)
+UNION ALL
+SELECT 'session' AS source_db,r.shard_key,r.record_key
+FROM session.catalog_declaration_members r INDEXED BY catalog_declaration_members_path
+WHERE r.authored_path>=:descendant_start AND r.authored_path<:descendant_end)
+SELECT r.* FROM candidates c CROSS JOIN active_catalog_declaration_members r
+ON r.source_db=c.source_db AND r.shard_key=c.shard_key AND r.record_key=c.record_key;"#;
 
 pub const SEARCH_TYPES: &str = r#"SELECT n.source_db,n.shard_key,n.record_key,n.manifest_digest,n.shard_id,
        n.name AS spelling,n.language,n.namespace,n.identity_name,t.record_id,t.record_json
@@ -460,6 +527,8 @@ pub const RAW_STATEMENTS: &[(&str, &str)] = &[
     ("MEMBER_ALIASES", MEMBER_ALIASES),
     ("MEMBERS_QUALIFIED", MEMBERS_QUALIFIED),
     ("MEMBERS_ALIAS_QUALIFIED", MEMBERS_ALIAS_QUALIFIED),
+    ("SOURCE_TYPES_TOUCHING_PATH", SOURCE_TYPES_TOUCHING_PATH),
+    ("SOURCE_MEMBERS_TOUCHING_PATH", SOURCE_MEMBERS_TOUCHING_PATH),
     ("TYPES_BY_PATH", TYPES_BY_PATH),
     ("MEMBERS_BY_PATH", MEMBERS_BY_PATH),
     ("SEARCH_TYPES", SEARCH_TYPES),

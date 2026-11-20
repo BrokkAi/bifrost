@@ -32,6 +32,7 @@ pub fn prepare_with_adapter<A: LanguageAdapter>(
         state,
         required_projections,
         &CancellationToken::default(),
+        &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
     )
     .expect("prepare combined parsed and resolution bundle")
     {

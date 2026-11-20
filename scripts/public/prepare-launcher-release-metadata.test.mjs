@@ -110,3 +110,24 @@ function prepare(dist, pluginRelease, version) {
     pluginRelease,
   ]);
 }
+
+test("raises the minimum to the release when the metadata asks and clears the marker", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-metadata-test-"));
+  const { dist, pluginRelease } = await stagedRelease(temp, "0.9.4", "a");
+  await fs.writeFile(
+    pluginRelease,
+    `${JSON.stringify({
+      binaryVersion: "0.9.3",
+      minimumBinaryVersion: "0.9.0",
+      raiseMinimumBinaryVersion: true,
+      allowPrerelease: false,
+      archiveSha256: {},
+    }, null, 2)}\n`,
+  );
+
+  await prepare(dist, pluginRelease, "0.9.4");
+
+  const projected = JSON.parse(await fs.readFile(pluginRelease, "utf8"));
+  assert.equal(projected.minimumBinaryVersion, "0.9.4");
+  assert.equal("raiseMinimumBinaryVersion" in projected, false);
+});

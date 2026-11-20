@@ -561,6 +561,21 @@ impl ProcedureCfgBuilder {
         Ok(id)
     }
 
+    pub(crate) fn record_actual_borrow(
+        &mut self,
+        id: ValueId,
+        borrow: crate::analyzer::semantic::ActualBorrowKind,
+    ) -> bool {
+        let Some(value) = self.parts.values.get_mut(id.index()) else {
+            return false;
+        };
+        if value.kind != crate::analyzer::semantic::SemanticValueKind::Address {
+            return false;
+        }
+        value.actual_borrow = borrow;
+        true
+    }
+
     pub(crate) fn add_allocation(
         &mut self,
         allocation: AllocationSite,
@@ -2741,6 +2756,7 @@ mod tests {
             let before = builder.prospective_work();
             let error = builder
                 .add_value(SemanticValue {
+                    actual_borrow: Default::default(),
                     static_type_origin: None,
                     static_type_class: Default::default(),
                     id: ValueId::new(0),

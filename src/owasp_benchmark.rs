@@ -66,9 +66,8 @@ use brokk_bifrost_flow::dataflow::{
     SemanticInputStatus, SummaryBoundaryKind, UnmodeledCallBehavior,
 };
 use brokk_bifrost_policy::{
-    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicySemanticModelContext, PolicySourceIdentity, evaluate_policy_inputs_with_analyzer,
-    evaluate_policy_inputs_with_analyzer_and_semantic_models,
+    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicySourceIdentity,
+    evaluate_policy_inputs_with_analyzer,
 };
 use brokk_bifrost_python_analysis::analyzer::python_runtime_artifact::{
     SUPPORTED_PYTHON_DECLARED_ENVIRONMENT_PRODUCER_VERSION,
@@ -579,6 +578,8 @@ pub struct BenchmarkSuite {
     pub(crate) languages: &'static [&'static str],
     /// The attacker-controlled sources, shared by every category.
     pub(crate) sources: &'static [Source],
+    /// What the source table leaves out. These gaps apply to every category.
+    pub(crate) source_gaps: &'static [CoverageGap],
     /// The scored categories, in a fixed order so the artifact is byte-stable
     /// across runs.
     pub(crate) categories: &'static [CategorySpec],
@@ -600,6 +601,17 @@ impl BenchmarkSuite {
     fn sinks(&self, category: InjectionCategory) -> &'static [Sink] {
         self.spec(category).sinks
     }
+
+    /// Every coverage gap a category's policy carries: the source table's,
+    /// then the category's own.
+    fn coverage_gaps(
+        &self,
+        category: InjectionCategory,
+    ) -> impl Iterator<Item = &'static CoverageGap> + use<> {
+        self.source_gaps
+            .iter()
+            .chain(self.spec(category).coverage_gaps)
+    }
 }
 
 /// The names a suite's rendered policies carry.
@@ -620,10 +632,21 @@ const OWASP_POLICY_NAMING: PolicyNaming = PolicyNaming {
 pub(crate) struct CategorySpec {
     pub(crate) category: InjectionCategory,
     pub(crate) sinks: &'static [Sink],
-    /// Why the sinks cover only part of the category's operations, when they
-    /// do. The policy then declares `:coverage (proven-subset ...)`, so a case
-    /// whose sink the table misses is not reported as proven clean.
-    pub(crate) partial_coverage: Option<&'static str>,
+    /// What the sink table leaves out of the category.
+    pub(crate) coverage_gaps: &'static [CoverageGap],
+}
+
+/// Operations an endpoint table leaves out on purpose. A category whose
+/// policy carries any gap declares `:coverage (proven-subset ...)` with the
+/// gaps' reasons, and a case of that category without a finding counts as
+/// cleared only when every gap selects its operations structurally and
+/// none of them occurs in the case's file. A gap without a selector proves
+/// nothing about any file, so no case of its categories can be cleared.
+pub(crate) struct CoverageGap {
+    pub(crate) reason: &'static str,
+    /// A CodeQuery `match` object, as JSON, that selects the left-out
+    /// operations.
+    pub(crate) uncovered: Option<&'static str>,
 }
 
 /// One attacker-controlled source.
@@ -761,6 +784,7 @@ pub static BENCHMARK_JAVA: BenchmarkSuite = BenchmarkSuite {
     // The Benchmark's other categories (crypto, hash, weakrand, securecookie,
     // trustbound) are not source-to-sink taint problems and are deliberately
     // out of scope.
+    source_gaps: &[],
     categories: &[
         // The JDBC lane (`prepareStatement` .. `addBatch`) plus the Spring
         // `JdbcTemplate` lane. The Benchmark routes 156 of its `sqli` cases
@@ -772,7 +796,7 @@ pub static BENCHMARK_JAVA: BenchmarkSuite = BenchmarkSuite {
         // is already covered by the JDBC `execute` entry above.
         CategorySpec {
             category: InjectionCategory::Sqli,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[
                 Sink::name("prepareStatement", 0),
                 Sink::name("prepareCall", 0),
@@ -794,7 +818,7 @@ pub static BENCHMARK_JAVA: BenchmarkSuite = BenchmarkSuite {
         // flows into it as command injection.
         CategorySpec {
             category: InjectionCategory::Cmdi,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[
                 Sink::name("exec", 0),
                 Sink::name("exec", 1),
@@ -806,14 +830,14 @@ pub static BENCHMARK_JAVA: BenchmarkSuite = BenchmarkSuite {
         // the search filter are injectable, so both operands are sinks.
         CategorySpec {
             category: InjectionCategory::Ldapi,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("search", 0), Sink::name("search", 1)],
         },
         // `new File(parent, child)` resolves `child` against `parent`, so an
         // attacker-controlled child path traverses as well as a whole path.
         CategorySpec {
             category: InjectionCategory::Pathtraver,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[
                 Sink::name("File", 0),
                 Sink::name("File", 1),
@@ -829,12 +853,12 @@ pub static BENCHMARK_JAVA: BenchmarkSuite = BenchmarkSuite {
         },
         CategorySpec {
             category: InjectionCategory::Xpathi,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("evaluate", 0), Sink::name("compile", 0)],
         },
         CategorySpec {
             category: InjectionCategory::Xss,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[
                 Sink::qualified(
                     "println",
@@ -875,12 +899,11 @@ pub static BENCHMARK_JAVA: BenchmarkSuite = BenchmarkSuite {
 
 /// OWASP BenchmarkPython 0.1.
 ///
-/// The sources are the Flask request reads the premium Werkzeug model covers:
-/// `MultiDict.get` on the `ImmutableMultiDict` behind `request.args` and
-/// `request.form`. The suite's other request reads (`getlist`, `keys`,
-/// `request.cookies`, `request.headers`, `request.query_string`,
-/// `request.path`) have no model, so they bind nothing and their cases abstain
-/// or go unflagged until the Werkzeug model covers them.
+/// The sources are the Flask request reads the premium Werkzeug model covers
+/// exactly: `ImmutableMultiDict.get` and `getlist` on `request.form`,
+/// `request.args` and `request.cookies`, which the model types as exact
+/// `ImmutableMultiDict` results. The suite's other request reads are coverage
+/// gaps (see `source_gaps`).
 ///
 /// The sinks are name selectors, as in BenchmarkJava, taken from the calls the
 /// suite makes (see the vetting record on #11040). `xss` is not scored: its
@@ -894,30 +917,69 @@ pub static BENCHMARK_PYTHON: BenchmarkSuite = BenchmarkSuite {
     expected_results_file: "expectedresults-0.1.csv",
     policy_naming: OWASP_POLICY_NAMING,
     languages: &["python"],
-    sources: &[Source::ResolvedMethod {
-        callee: "get",
-        callable: "werkzeug.datastructures.structures.MultiDict.get",
-        receiver_type: "werkzeug.datastructures.structures.ImmutableMultiDict",
-    }],
+    sources: &[
+        Source::ResolvedMethod {
+            callee: "get",
+            callable: "werkzeug.datastructures.structures.ImmutableMultiDict.get",
+            receiver_type: "werkzeug.datastructures.structures.ImmutableMultiDict",
+        },
+        Source::ResolvedMethod {
+            callee: "getlist",
+            callable: "werkzeug.datastructures.structures.ImmutableMultiDict.getlist",
+            receiver_type: "werkzeug.datastructures.structures.ImmutableMultiDict",
+        },
+    ],
+    // Every request read the source table leaves out, so a case that
+    // contains one cannot be cleared. One gap per attribute keeps each
+    // selector's answer under the CodeQuery row limit. `request.headers`
+    // covers its `get`, `getlist`, `get_all` and `keys` reads.
+    source_gaps: &[
+        CoverageGap {
+            reason: "request.headers is not a source",
+            uncovered: Some(
+                r#"{"kind": "field_access", "name": "headers", "object": {"name": "request"}}"#,
+            ),
+        },
+        CoverageGap {
+            reason: "request.path is not a source",
+            uncovered: Some(
+                r#"{"kind": "field_access", "name": "path", "object": {"name": "request"}}"#,
+            ),
+        },
+        CoverageGap {
+            reason: "request.query_string and request.stream are not sources",
+            uncovered: Some(
+                r#"{"kind": "field_access", "name": {"regex": "^(query_string|stream)$"}, "object": {"name": "request"}}"#,
+            ),
+        },
+        CoverageGap {
+            reason: "keys() reads of request.form and request.args are not sources",
+            uncovered: Some(r#"{"kind": "call", "callee": {"name": "keys"}}"#),
+        },
+        CoverageGap {
+            reason: "helpers.separate_request.request_wrapper reads are not sources",
+            uncovered: Some(r#"{"kind": "call", "callee": {"name": "request_wrapper"}}"#),
+        },
+    ],
     categories: &[
         // `sqlite3.Cursor.execute(sql)`.
         CategorySpec {
             category: InjectionCategory::Sqli,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("execute", 0)],
         },
         // `subprocess.run(args, ...)`: the command list or the `shell=True`
         // string.
         CategorySpec {
             category: InjectionCategory::Cmdi,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("run", 0)],
         },
         // ldap3 `Connection.search(search_base, search_filter, ...)`: both the
         // base and the filter are injectable.
         CategorySpec {
             category: InjectionCategory::Ldapi,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("search", 0), Sink::name("search", 1)],
         },
         // `open` and `codecs.open`, `pathlib.Path(path)` and
@@ -927,9 +989,12 @@ pub static BENCHMARK_PYTHON: BenchmarkSuite = BenchmarkSuite {
         // receiver, which these argument sinks do not select.
         CategorySpec {
             category: InjectionCategory::Pathtraver,
-            partial_coverage: Some(
-                "pathlib receiver operations such as p.exists() and p.read_text() are not selected",
-            ),
+            coverage_gaps: &[CoverageGap {
+                reason: "pathlib receiver calls p.exists() and p.read_text() are not sinks",
+                uncovered: Some(
+                    r#"{"kind": "call", "callee": {"name": {"regex": "^(exists|read_text)$"}}, "arity": 0}"#,
+                ),
+            }],
             sinks: &[
                 Sink::name("open", 0),
                 Sink::name("Path", 0),
@@ -940,7 +1005,7 @@ pub static BENCHMARK_PYTHON: BenchmarkSuite = BenchmarkSuite {
         // `elementpath.select(root, query)`.
         CategorySpec {
             category: InjectionCategory::Xpathi,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[
                 Sink::name("xpath", 0),
                 Sink::name("XPath", 0),
@@ -949,7 +1014,7 @@ pub static BENCHMARK_PYTHON: BenchmarkSuite = BenchmarkSuite {
         },
         CategorySpec {
             category: InjectionCategory::Codeinj,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("eval", 0), Sink::name("exec", 0)],
         },
         // `pickle.loads(data)` and `yaml.load(data, Loader=...)`. The suite's
@@ -957,13 +1022,13 @@ pub static BENCHMARK_PYTHON: BenchmarkSuite = BenchmarkSuite {
         // different name and is not a sink.
         CategorySpec {
             category: InjectionCategory::Deserialization,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("loads", 0), Sink::name("load", 0)],
         },
         // `flask.redirect(location)`.
         CategorySpec {
             category: InjectionCategory::Redirect,
-            partial_coverage: None,
+            coverage_gaps: &[],
             sinks: &[Sink::name("redirect", 0)],
         },
     ],
@@ -1103,11 +1168,18 @@ pub fn build_policy(
             }
         }
     }
-    let coverage = suite
-        .spec(category)
-        .partial_coverage
-        .map(|reason| format!("\x20 :coverage (proven-subset :reason {reason:?})\n"))
-        .unwrap_or_default();
+    let reasons = suite
+        .coverage_gaps(category)
+        .map(|gap| gap.reason)
+        .collect::<Vec<_>>();
+    let coverage = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\x20 :coverage (proven-subset :reason {:?})\n",
+            reasons.join("; ")
+        )
+    };
     let id = policy_id(suite, category, call_modeling);
     let PolicyNaming {
         title, taxonomy, ..
@@ -1253,6 +1325,11 @@ fn jdk_toolchain() -> CatalogCoordinate {
 /// here.
 const JDK_PACK_VERSION: &str = "21.0.8";
 
+/// The dependency id JVM discovery gives the JDK of `version`.
+fn jdk_dependency_id(version: &str) -> String {
+    format!("jdk:{version}")
+}
+
 /// Write an evidence-only JDK home: a `release` file naming the exact
 /// version and no `lib/src.zip`. JVM dependency discovery
 /// (`discover_jdk_semantic_pack_dependencies` in
@@ -1289,38 +1366,26 @@ fn write_evidence_only_jdk_home(root: &Path, version: &str) -> Result<PathBuf, S
 /// artificial workspace-relative catalog path with no behavioral difference.
 ///
 /// `catalog` must already have the real `bifrost.jdk` release bundle
-/// installed (`bifrost-semantic-pack install <bundle> <catalog>`); this
-/// function never installs or mutates it. On success, returns `request` with
-/// the JDK's own dependency evidence folded in (so the caller's later
-/// per-category resolution sees it) and the preparation outcome (for
-/// completeness/gap reporting). On any refusal -- discovery incomplete, or
-/// the completeness gate declining the installed pack -- returns `Err`
+/// installed (`bifrost-semantic-pack install <bundle> <catalog>`) for
+/// `jdk_version`, the version of the JDK home in `analyzer_config`, and be
+/// open read-write: preparation produces packs for the workspace's dependency
+/// jars into it, as the product path does. `analyzer_config` must be the
+/// config `workspace` was built with (see `java_analyzer_config`). The
+/// activation publishes the active models on `workspace`, where the category
+/// runs read them; on success this returns the preparation outcome, for gap
+/// reporting. On any refusal -- discovery incomplete, or the completeness gate declining the installed pack -- returns `Err`
 /// naming the reason; this function never silently drops the JDK from the
 /// active set.
 pub fn activate_jdk_dependency_pack(
     workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    jdk_version: &str,
     catalog: &SemanticPackCatalog,
     request: SemanticModelActivationRequest,
-    jdk_version: &str,
     cancellation: &CancellationToken,
-) -> Result<
-    (
-        SemanticModelActivationRequest,
-        DependencyPackPreparationOutcome,
-    ),
-    String,
-> {
-    let scratch = tempfile::tempdir()
-        .map_err(|error| format!("create scratch dir for JDK evidence home: {error}"))?;
-    let jdk_home = write_evidence_only_jdk_home(scratch.path(), jdk_version)?;
-
-    let mut jdk_config = AnalyzerConfig::default();
-    jdk_config.jvm.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
-    jdk_config.jvm.standard_library_discovery.discover_java_home = false;
-    jdk_config.jvm.standard_library_discovery.jdk_homes = vec![jdk_home];
-
+) -> Result<DependencyPackPreparationOutcome, String> {
     let outcome = workspace.activate_dependency_packs(
-        &jdk_config,
+        analyzer_config,
         &[DependencyPackEcosystem::Jvm],
         DependencyPackWorkspaceContext {
             catalog,
@@ -1343,19 +1408,62 @@ pub fn activate_jdk_dependency_pack(
     let preparation = ecosystem
         .preparation
         .ok_or_else(|| "JDK dependency-pack preparation did not run".to_owned())?;
-    if !preparation.complete {
+    if preparation.cancelled {
+        return Err(format!(
+            "JDK dependency-pack preparation was cancelled: {:?}",
+            preparation.diagnostics
+        ));
+    }
+    // The category runs read the snapshot this activation published; a
+    // runtime that is not ready published none, or a partial one.
+    if !matches!(
+        outcome.runtime,
+        Some(SemanticModelRuntimeOutcome::Ready { .. })
+    ) {
+        return Err(format!(
+            "JVM dependency-pack activation is not ready: {:#?}",
+            outcome.runtime
+        ));
+    }
+    // The JDK pack is mandatory. A dependency jar whose pack could not be
+    // produced is not: preparation records it as a failure, and the reader
+    // treats that jar as unknown instead of refusing every JVM lookup, as it
+    // does on the product path.
+    let jdk_dependency_id = jdk_dependency_id(jdk_version);
+    if !preparation
+        .installed_packs
+        .iter()
+        .any(|pack| pack.dependency_id == jdk_dependency_id)
+    {
+        return Err(format!(
+            "the JDK pack for {jdk_dependency_id} was not installed: installed={:?} \
+             diagnostics={:?}",
+            preparation
+                .installed_packs
+                .iter()
+                .map(|pack| &pack.dependency_id)
+                .collect::<Vec<_>>(),
+            preparation.diagnostics
+        ));
+    }
+    if preparation
+        .installed_packs
+        .iter()
+        .any(|pack| !pack.activation_ready)
+    {
         return Err(format!(
             "JDK dependency-pack preparation was refused by the declaration-scoped \
              completeness gate: {:?}",
             preparation.diagnostics
         ));
     }
-    let merged = preparation
-        .compose_activation_request(request)
-        .ok_or_else(|| {
-            "JDK dependency-pack preparation produced no activation evidence".to_owned()
-        })?;
-    Ok((merged, preparation))
+    if !preparation.failures.is_empty() {
+        eprintln!(
+            "dependency packs not prepared, left as gaps: {:?}",
+            preparation.failures
+        );
+    }
+    Ok(preparation)
 }
 
 // ===========================================================================
@@ -1556,6 +1664,8 @@ fn prepare_python(
     .map_err(|error| format!("build staged Python workspace: {error}"))?;
 
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: bifrost_version()?,
         evidence: vec![SemanticModelActivationEvidence {
@@ -1569,7 +1679,8 @@ fn prepare_python(
             }),
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }],
         controls,
         limits: SemanticModelRuntimeLimits::default(),
@@ -1656,12 +1767,12 @@ fn prepare_python(
     Ok(PreparedSuite {
         analysis_root: work.clone(),
         workspace,
-        semantic_models: SuiteSemanticModels::Published,
         activated_pack_ids,
         skipped_packs: Vec::new(),
         activation: SuiteActivation::Python {
             python_artifacts: artifacts,
         },
+        _jdk_home: None,
     })
 }
 
@@ -2050,7 +2161,8 @@ pub struct JavaInputs {
     /// (`bifrost-semantic-pack install <bundle> <this dir>`). The JDK
     /// declaration pack activates from here through the product dependency
     /// path (`activate_jdk_dependency_pack`), not as a curated session pack.
-    /// Opened read-only: a run never installs into or otherwise mutates it.
+    /// Opened read-write: a run produces packs for the dependency jars into
+    /// it, as the product path does, and later runs reuse them.
     pub jdk_catalog_root: PathBuf,
 }
 
@@ -2124,7 +2236,15 @@ pub enum SuiteActivation {
     /// a false absence proof; this count is the honesty budget the product
     /// activation path enforces, restated here so it is visible in the
     /// artifact rather than only in a log line.
-    Java { jdk_pack_gaps: usize },
+    ///
+    /// `unprepared_dependencies` names each dependency jar whose pack
+    /// preparation failed, with its cause. The run treats those jars as
+    /// unknown, so a score is comparable only with runs that left the same
+    /// jars unprepared.
+    Java {
+        jdk_pack_gaps: usize,
+        unprepared_dependencies: Vec<String>,
+    },
     /// The wheels installed as archive-verified runtime evidence, which the
     /// premium models were pinned to.
     Python {
@@ -2228,7 +2348,8 @@ fn load_pack(spec: &PackSpec) -> Result<LoadedPack, String> {
         toolchain: Some(jdk_toolchain()),
         target: Some("jvm".to_owned()),
         configuration: None,
-        artifact_sha256: spec.artifact_sha256.clone(),
+        production_input_digest: None,
+verified_raw_artifacts: (spec.artifact_sha256.clone()).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
     };
     Ok(LoadedPack {
         pack_id: spec.pack_id.clone(),
@@ -2240,8 +2361,17 @@ fn load_pack(spec: &PackSpec) -> Result<LoadedPack, String> {
 /// Build the analyzer config: feed the resolved dependency jars as explicit
 /// external artifacts so Benchmark types resolve, and keep dependency discovery
 /// on metadata mode (read the pom coordinates, never run a build tool).
-fn run_analyzer_config(dependency_jars: &[PathBuf]) -> AnalyzerConfig {
+///
+/// The workspace and its dependency-pack activation must share this config.
+/// The request-owned JVM reader expects a catalog entry for every dependency
+/// and JDK the workspace selects, so an activation that saw fewer jars, or
+/// another JDK home, leaves the rest unaccounted and every JVM lookup open
+/// (#13851). The JDK is the evidence-only home at `jdk_home`, never the
+/// host's `JAVA_HOME`.
+fn java_analyzer_config(dependency_jars: &[PathBuf], jdk_home: PathBuf) -> AnalyzerConfig {
     let mut config = AnalyzerConfig::default();
+    config.jvm.standard_library_discovery.discover_java_home = false;
+    config.jvm.standard_library_discovery.jdk_homes = vec![jdk_home];
     config.jvm.dependency_discovery.mode = JvmDependencyDiscoveryMode::Metadata;
     config.jvm.external_dependencies.artifact_paths = dependency_jars
         .iter()
@@ -2259,30 +2389,12 @@ struct PreparedSuite {
     /// against: the checkout itself for Java, the staged copy for Python.
     analysis_root: PathBuf,
     workspace: WorkspaceAnalyzer,
-    semantic_models: SuiteSemanticModels,
     activated_pack_ids: Vec<String>,
     skipped_packs: Vec<(String, String)>,
     activation: SuiteActivation,
-}
-
-/// Where each category's policy evaluation gets its active semantic models.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a run holds exactly one value, so the variant size costs nothing"
-)]
-pub(crate) enum SuiteSemanticModels {
-    /// Acquire them again from this request. Java's composed request carries
-    /// the JDK dependency evidence itself, so the acquisition selects the same
-    /// set its activation did.
-    Request {
-        catalog: SemanticPackCatalog,
-        request: SemanticModelActivationRequest,
-    },
-    /// Use the snapshot the suite's dependency-pack activation published on
-    /// the workspace. Python's premium models are selected by runtime-artifact
-    /// evidence that only that publication carries; acquiring again from the
-    /// request alone publishes a set without them.
-    Published,
+    /// Java's evidence-only JDK home, kept until the category runs finish
+    /// because the workspace's JDK discovery reads it.
+    _jdk_home: Option<tempfile::TempDir>,
 }
 
 /// Build the BenchmarkJava workspace over the checkout and activate its
@@ -2297,20 +2409,29 @@ fn prepare_java(
     let project = FilesystemProject::new(benchmark_root)
         .map_err(|error| format!("open benchmark project: {error}"))?;
     let project: Arc<dyn Project> = Arc::new(project);
-    let analyzer_config = run_analyzer_config(&inputs.dependency_jars);
-    let workspace =
-        WorkspaceAnalyzer::build_ephemeral_footgun_with_budget(project, analyzer_config, budget)
-            .map_err(|error| format!("build benchmark workspace: {error}"))?;
+    let jdk_home_root = tempfile::tempdir()
+        .map_err(|error| format!("create scratch dir for JDK evidence home: {error}"))?;
+    let jdk_home = write_evidence_only_jdk_home(jdk_home_root.path(), JDK_PACK_VERSION)?;
+    let analyzer_config = java_analyzer_config(&inputs.dependency_jars, jdk_home);
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun_with_budget(
+        project,
+        analyzer_config.clone(),
+        budget,
+    )
+    .map_err(|error| format!("build benchmark workspace: {error}"))?;
 
-    // #2558: the catalog is opened read-only at the operator catalog
-    // directory carrying the real, pre-installed `bifrost.jdk` release
-    // bundle, not an ephemeral in-memory catalog. Session packs (authored
+    // #2558: the catalog is opened at the operator catalog directory
+    // carrying the real, pre-installed `bifrost.jdk` release bundle, not an
+    // ephemeral in-memory catalog. Session packs (authored
     // sanitizer/summary content) register into this same handle below, so
     // one catalog and one activation request serve both the curated content
-    // and the product-path JDK dependency pack.
+    // and the product-path JDK dependency pack. It is read-write because
+    // dependency preparation produces packs for the workspace's jars into it;
+    // a read-only catalog refuses that production and leaves those jars
+    // unaccounted (#13851).
     let catalog = SemanticPackCatalog::open(
         &inputs.jdk_catalog_root,
-        CatalogOpenMode::ReadOnly,
+        CatalogOpenMode::ReadWrite,
         CatalogOptions::default(),
     )
     .map_err(|error| {
@@ -2355,6 +2476,8 @@ fn prepare_java(
         activated_pack_ids.push(pack.pack_id);
     }
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: bifrost_version()?,
         evidence,
@@ -2362,37 +2485,43 @@ fn prepare_java(
         limits: SemanticModelRuntimeLimits::default(),
     };
 
-    // #2558: fold the JDK dependency pack's own evidence into `request`
-    // through the product activation path. Mandatory, like the curated
+    // #2558: activate `request` together with the dependency packs through
+    // the product activation path. The JDK pack is mandatory, like the curated
     // packs above: a refusal here (discovery incomplete, or the
     // declaration-scoped completeness gate declining the installed pack)
     // aborts the run rather than silently scoring without the JDK pack.
     let jdk_activation_cancellation = CancellationToken::new().with_timeout(timeout);
-    let (request, jdk_preparation) = activate_jdk_dependency_pack(
+    let jdk_preparation = activate_jdk_dependency_pack(
         &workspace,
+        &analyzer_config,
+        JDK_PACK_VERSION,
         &catalog,
         request,
-        JDK_PACK_VERSION,
         &jdk_activation_cancellation,
     )?;
-    activated_pack_ids.extend(
-        jdk_preparation
-            .installed_packs
-            .iter()
-            .map(|_| "bifrost.jdk".to_owned()),
-    );
-    let jdk_pack_gaps: usize = jdk_preparation
+    let jdk_dependency_id = jdk_dependency_id(JDK_PACK_VERSION);
+    let jdk_pack = jdk_preparation
         .installed_packs
         .iter()
-        .map(|pack| pack.gaps)
-        .sum();
+        .find(|pack| pack.dependency_id == jdk_dependency_id)
+        .expect("activate_jdk_dependency_pack refuses a run without the JDK pack");
+    activated_pack_ids.push("bifrost.jdk".to_owned());
+    let jdk_pack_gaps = jdk_pack.gaps;
+    let unprepared_dependencies = jdk_preparation
+        .failures
+        .iter()
+        .map(|failure| format!("{}: {:?}", failure.dependency_id, failure.cause))
+        .collect();
     Ok(PreparedSuite {
         analysis_root: benchmark_root.to_path_buf(),
         workspace,
-        semantic_models: SuiteSemanticModels::Request { catalog, request },
         activated_pack_ids,
         skipped_packs,
-        activation: SuiteActivation::Java { jdk_pack_gaps },
+        activation: SuiteActivation::Java {
+            jdk_pack_gaps,
+            unprepared_dependencies,
+        },
+        _jdk_home: Some(jdk_home_root),
     })
 }
 
@@ -2437,10 +2566,10 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let PreparedSuite {
         analysis_root,
         workspace,
-        semantic_models,
         activated_pack_ids,
         skipped_packs,
         activation,
+        _jdk_home,
     } = match &config.inputs {
         SuiteInputs::Java(inputs) => {
             prepare_java(&config.benchmark_root, inputs, &budget, config.timeout)?
@@ -2492,10 +2621,22 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let mut taint_roots = 0usize;
     let mut category_runs = Vec::new();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let mut uncovered_cases = BTreeMap::new();
+    for category in suite.categories() {
+        for selector in suite
+            .coverage_gaps(category)
+            .filter_map(|gap| gap.uncovered)
+        {
+            if !uncovered_cases.contains_key(selector) {
+                let located = locate_uncovered_cases(&workspace, &flow_state, selector);
+                eprintln!("[owasp-progress] coverage gap {selector}: {located:?}");
+                uncovered_cases.insert(selector, located);
+            }
+        }
+    }
     let workspace_run = WorkspaceRun {
         analysis_root: &analysis_root,
         workspace: &workspace,
-        semantic_models: &semantic_models,
         flow_state: &flow_state,
         options: &options,
         budget: &budget,
@@ -2583,15 +2724,46 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let observations: Vec<CaseObservation> = label_set
         .cases
         .iter()
-        .map(|case| CaseObservation {
-            name: case.name.clone(),
-            category: case.category,
-            is_real: case.is_real,
-            flagged: flagged.contains_key(&case.name),
-            completion: case_completion
+        .map(|case| {
+            let flagged = flagged.contains_key(&case.name);
+            let mut completion = case_completion
                 .get(&case.name)
                 .copied()
-                .unwrap_or(CaseCompletion::NotAnalyzed),
+                .unwrap_or(CaseCompletion::NotAnalyzed);
+            // A verdict of clean must also rule out the operations the
+            // tables leave out; a gap that might hold the case's flow turns
+            // the clearance into an abstention.
+            if !flagged
+                && completion.is_reliable()
+                && let Some(gap) = suite.coverage_gaps(case.category).find(|gap| {
+                    !gap.uncovered.is_some_and(|selector| {
+                        matches!(
+                            &uncovered_cases[selector],
+                            UncoveredCases::Located(cases) if !cases.contains(&case.name)
+                        )
+                    })
+                })
+            {
+                completion = CaseCompletion::Inconclusive;
+                let reason = match gap.uncovered.map(|selector| &uncovered_cases[selector]) {
+                    Some(UncoveredCases::Unknown(detail)) => format!(
+                        "coverage_gap: {} (selector incomplete: {detail})",
+                        gap.reason
+                    ),
+                    _ => format!("coverage_gap: {}", gap.reason),
+                };
+                case_reasons
+                    .entry(case.name.clone())
+                    .or_default()
+                    .insert(reason);
+            }
+            CaseObservation {
+                name: case.name.clone(),
+                category: case.category,
+                is_real: case.is_real,
+                flagged,
+                completion,
+            }
         })
         .collect();
 
@@ -2645,7 +2817,6 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
 pub(crate) struct WorkspaceRun<'a> {
     pub(crate) analysis_root: &'a Path,
     pub(crate) workspace: &'a WorkspaceAnalyzer,
-    pub(crate) semantic_models: &'a SuiteSemanticModels,
     pub(crate) flow_state: &'a brokk_bifrost_flow::FlowWorkspaceState,
     pub(crate) options: &'a PolicyEvaluationOptions,
     pub(crate) budget: &'a RetentionBudget,
@@ -2695,33 +2866,20 @@ pub(crate) fn evaluate_policy(
         PolicySourceIdentity::new(policy_id),
         policy,
     )];
-    let outcome = match run.semantic_models {
-        SuiteSemanticModels::Request { catalog, request } => {
-            evaluate_policy_inputs_with_analyzer_and_semantic_models(
-                run.analysis_root,
-                &inputs,
-                run.workspace,
-                run.flow_state,
-                run.options,
-                PolicySemanticModelContext {
-                    catalog,
-                    request,
-                    persistence: None,
-                },
-                Some(&cancellation),
-                run.budget,
-            )
-        }
-        SuiteSemanticModels::Published => evaluate_policy_inputs_with_analyzer(
-            run.analysis_root,
-            &inputs,
-            run.workspace,
-            run.flow_state,
-            run.options,
-            Some(&cancellation),
-            run.budget,
-        ),
-    }
+    // The models are the snapshot the suite's dependency-pack activation
+    // published on the workspace. Acquiring them again from the activation
+    // request alone loses what only that publication carries: the dependency
+    // packs whose preparation failed, which the JVM reader must see recorded
+    // to treat those jars as unknown, and Python's runtime-artifact evidence.
+    let outcome = evaluate_policy_inputs_with_analyzer(
+        run.analysis_root,
+        &inputs,
+        run.workspace,
+        run.flow_state,
+        run.options,
+        Some(&cancellation),
+        run.budget,
+    )
     .map_err(|error| format!("evaluate {label} policy: {error}"))?;
     if std::env::var_os("BIFROST_OWASP_DEBUG").is_some() {
         eprintln!(
@@ -2929,6 +3087,47 @@ fn declaration_name(locator: &SemanticLocator) -> String {
         .filter_map(|segment| segment.name())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// The cases whose files contain an operation a coverage gap selects.
+#[derive(Debug)]
+enum UncoveredCases {
+    Located(BTreeSet<String>),
+    /// The selector's query did not complete, so no file is known to be free
+    /// of the operations.
+    Unknown(String),
+}
+
+fn locate_uncovered_cases(
+    workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    selector: &str,
+) -> UncoveredCases {
+    let matcher: serde_json::Value =
+        serde_json::from_str(selector).expect("a coverage-gap selector is JSON");
+    // Only the files matter, but the answer is rows; a selector whose rows
+    // exceed the largest limit comes back incomplete and fails closed.
+    let query = crate::rql::CodeQuery::from_json(&serde_json::json!({
+        "match": matcher,
+        "limit": crate::rql::query::MAX_LIMIT,
+    }))
+    .expect("a coverage-gap selector is a valid CodeQuery match");
+    let result = crate::rql::execute_workspace(workspace, flow_state, &query);
+    match result.completion() {
+        crate::rql::CodeQueryCompletion::Complete => UncoveredCases::Located(
+            result
+                .results
+                .iter()
+                .filter_map(|item| match &item.value {
+                    crate::rql::CodeQueryResultValue::StructuralMatch { value } => {
+                        case_name_from_path(&value.path)
+                    }
+                    other => panic!("a match query returned a non-match row: {other:?}"),
+                })
+                .collect(),
+        ),
+        completion => UncoveredCases::Unknown(format!("{completion:?}: {:?}", result.diagnostics)),
+    }
 }
 
 /// Take the worst (least reliable) completion seen for a case across roots, so a
@@ -3199,11 +3398,16 @@ mod tests {
             .expect("write fixture source");
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(scratch.path()).expect("open fixture project"));
+        let jdk_home_root = tempfile::tempdir().expect("scratch dir for the JDK home");
+        let jdk_home = write_evidence_only_jdk_home(jdk_home_root.path(), "21.0.2")
+            .expect("write the evidence-only JDK home");
+        let analyzer_config = java_analyzer_config(&[], jdk_home);
         let workspace =
-            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, analyzer_config.clone())
                 .expect("build ephemeral workspace");
         let cancellation = CancellationToken::new();
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: Vec::new(),
@@ -3213,9 +3417,10 @@ mod tests {
 
         let error = activate_jdk_dependency_pack(
             &workspace,
+            &analyzer_config,
+            "21.0.2",
             &installed_catalog,
             request,
-            "21.0.2",
             &cancellation,
         )
         .expect_err(

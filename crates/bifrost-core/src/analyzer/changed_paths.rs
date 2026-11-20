@@ -72,6 +72,18 @@ impl ChangedPaths {
         }
     }
 
+    /// Changed spellings for indexed dependency candidates. ProjectFile has
+    /// already normalized lexical dot components; spelling and case remain.
+    pub fn exact_paths(&self) -> &[PathBuf] {
+        &self.exact
+    }
+
+    /// Whether carry must also protect existing anchors against aliases.
+    /// The distinction is the same one `touches` uses for its folded pass.
+    pub fn has_uncertified_paths(&self) -> bool {
+        self.unprovable || !self.folded.is_empty()
+    }
+
     /// Whether `protected` equals, contains or lies inside a changed path, or
     /// an uncertified spelling could name it.
     pub fn touches(&self, protected: &Path) -> bool {

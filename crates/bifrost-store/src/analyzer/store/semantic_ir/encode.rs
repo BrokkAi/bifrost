@@ -684,6 +684,7 @@ impl<'a> Encoder<'a> {
                              ..
                          }| integer(*ordinal),
                     ),
+                    some(value.actual_borrow as i64),
                 ],
             );
         }
@@ -1542,6 +1543,24 @@ impl<'a> Encoder<'a> {
                     operand_b = integer(member);
                 }
                 GuardPredicate::Truthy { value } => operand_a = integer(value),
+                GuardPredicate::ValueEquality {
+                    left,
+                    right,
+                    negated,
+                } => {
+                    operand_a = integer(left);
+                    operand_b = integer(right);
+                    guard_flag = flag(negated);
+                }
+                GuardPredicate::ValueOrdering {
+                    left,
+                    right,
+                    relation: ordering,
+                } => {
+                    operand_a = integer(left);
+                    operand_b = integer(right);
+                    relation = code(ordering);
+                }
                 GuardPredicate::Opaque { digest: condition } => {
                     digest = some(i64::from_ne_bytes(condition.get().to_ne_bytes()));
                 }

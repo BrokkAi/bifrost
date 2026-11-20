@@ -2,6 +2,7 @@
 //! indexes (#1442, #1582).
 
 use std::sync::{Arc, Condvar, Mutex, Weak};
+#[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
 use crate::analyzer::without_project_reads;
@@ -288,13 +289,27 @@ impl IndexWarmer {
         kinds
     }
 
-    /// Block until no warm is running or queued. Panics if the warmer does not
-    /// go idle within 30 seconds.
+    /// Drain every running or queued warm. Production teardown must retain
+    /// its analyzer ownership until the worker releases it, however long that
+    /// takes; a timeout assertion in Drop can abort an unwinding process.
     pub fn wait_until_idle(&self) {
+        let state = self.state.lock().expect("index warmer lock poisoned");
+        let state = self
+            .idle
+            .wait_while(state, |state| {
+                matches!(state.worker, Worker::Running { .. })
+            })
+            .expect("index warmer lock poisoned while waiting for idle");
+        assert!(matches!(state.worker, Worker::Idle));
+    }
+
+    /// Bound a test's drain wait so a stuck worker fails its watchdog.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_until_idle_within(&self, duration: Duration) {
         let state = self.state.lock().expect("index warmer lock poisoned");
         let (state, timeout) = self
             .idle
-            .wait_timeout_while(state, Duration::from_secs(30), |state| {
+            .wait_timeout_while(state, duration, |state| {
                 matches!(state.worker, Worker::Running { .. })
             })
             .expect("index warmer lock poisoned while waiting for idle");
@@ -331,9 +346,9 @@ mod tests {
         let warmer = IndexWarmer::new();
         warmer.forced_outstanding.store(QUERY, Ordering::Relaxed);
         warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 1);
         warmer
             .forced_outstanding
@@ -342,14 +357,14 @@ mod tests {
             .clear_forced_after_warm
             .store(STRUCTURAL, Ordering::Relaxed);
         warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 2);
         assert_eq!(warmer.forced_outstanding.load(Ordering::Relaxed), QUERY);
         warmer
             .forced_outstanding
             .store(QUERY | STRUCTURAL, Ordering::Relaxed);
         warmer.schedule(snapshot);
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 3);
     }
 
@@ -366,12 +381,12 @@ mod tests {
             .store(QUERY, Ordering::Relaxed);
         warmer.panic_before_next_warm.store(true, Ordering::Relaxed);
         warmer.schedule(Arc::clone(&snapshot));
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 1);
         assert_eq!(warmer.forced_outstanding.load(Ordering::Relaxed), QUERY);
 
         warmer.schedule(snapshot);
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 2);
         assert_eq!(warmer.forced_outstanding.load(Ordering::Relaxed), 0);
     }
@@ -395,11 +410,11 @@ mod tests {
         entered.wait();
         warmer.schedule(Arc::clone(&next_snapshot));
         release.wait();
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 1);
 
         warmer.schedule(next_snapshot);
-        warmer.wait_until_idle();
+        warmer.wait_until_idle_within(Duration::from_secs(30));
         assert_eq!(warmer.warm_attempts.load(Ordering::Relaxed), 2);
     }
 
@@ -442,7 +457,7 @@ mod capture_tests {
         let analyzer = MultiAnalyzer::default();
         let warmer = IndexWarmer::new();
         let (_, reads) = capture_query_reads(&analyzer, || {
-            warmer.wait_until_idle();
+            warmer.wait_until_idle_within(Duration::from_secs(30));
             assert!(matches!(warmer.state.lock().unwrap().worker, Worker::Idle));
         });
         assert!(reads.keys().is_empty());

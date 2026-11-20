@@ -13,6 +13,9 @@ pub struct SelectedRustTargetReferences {
     pub search: SelectedReferenceSearchAnswer,
     #[doc(hidden)]
     pub bindings: Box<[FactReverseReferenceBinding]>,
+    /// The persisted gap sites that keep the search's inventory open.
+    #[doc(hidden)]
+    pub open_sites: Box<[crate::analyzer::resolution::reference_vocabulary::OpenInventorySite]>,
     #[doc(hidden)]
     pub metrics: FactReverseResolutionMetrics,
 }

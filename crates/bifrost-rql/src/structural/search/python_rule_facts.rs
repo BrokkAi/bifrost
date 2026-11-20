@@ -1649,6 +1649,10 @@ fn report_rule_fact_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 
@@ -4281,6 +4285,10 @@ fn report_uninitialized_variable_incomplete(
         message,
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     }));
 }
 
@@ -4415,7 +4423,7 @@ pub(super) fn uninitialized_variable_expansions<'a>(
         return Vec::new();
     }
 
-    let Some(outcome) = semantic.materialized_outcome(&row.file) else {
+    let Ok(outcome) = semantic.materialized_outcome(&row.file) else {
         report_uninitialized_variable_incomplete(
             diagnostics,
             Incompleteness::Operational(DerivationExecutionCause::Provider),
@@ -4590,7 +4598,8 @@ pub(super) fn uninitialized_variable_expansions<'a>(
                         Reason::Cancelled => {
                             Incompleteness::Operational(DerivationExecutionCause::Cancelled)
                         }
-                        Reason::BudgetExhausted { .. } => {
+                        Reason::BudgetExhausted { .. }
+                        | Reason::PropertySnapshotBudgetExhausted { .. } => {
                             Incompleteness::Operational(DerivationExecutionCause::Budget)
                         }
                         Reason::SourceGenerationChanged => {

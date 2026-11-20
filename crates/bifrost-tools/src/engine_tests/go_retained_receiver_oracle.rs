@@ -3,6 +3,9 @@
 //! answers exactly as a plain retained run. A complete prepared structural file
 //! amortizes setup, so a retained point may answer when a fresh default-budget
 //! point stops; that difference alone is not an answer regression.
+//! Syntax and row visits are telemetry that never refuses (#13216), so only
+//! points whose reference work includes a refusing budget axis exercise an
+//! exceeded prefix.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -242,7 +245,6 @@ fn large_budget() -> ReceiverAnalysisBudget {
         max_targets: default.max_targets * 100,
         max_summary_expansions: default.max_summary_expansions * 100,
         max_resolution_rounds: default.max_resolution_rounds * 100,
-        max_scope_nodes: default.max_scope_nodes * 100,
         max_hierarchy_order_work: default.max_hierarchy_order_work * 100,
         max_hierarchy_order_steps: default.max_hierarchy_order_steps * 100,
         ..default
@@ -274,6 +276,7 @@ fn go_retained_receiver_oracle() {
     let mut total_points = 0;
     let mut per_case_counts = Vec::new();
     let mut all_dropped = Vec::new();
+    let mut budgeted_cases = 0;
     for case in &cases {
         let temporary = tempfile::tempdir().expect("temporary Go project");
         let root = temporary.path().canonicalize().expect("canonical root");
@@ -442,19 +445,33 @@ fn go_retained_receiver_oracle() {
             .count();
         per_case_counts.push((case.display().to_string(), compared));
         eprintln!("ORACLE_CASE {} compared={compared}", case.display());
+        // #13216 made syntax and row visits telemetry that never refuses; only
+        // the aggregate work axes below can end a request with ExceededBudget.
+        // A case whose reference points all answer from setup or scope alone
+        // has nothing to stop, so it still compares answers but contributes no
+        // budgeted prefix.
         let eligible: Vec<_> = reference
             .iter()
             .enumerate()
             .filter_map(|(index, value)| {
                 let work = value.as_ref()?.work;
-                (work.setup_nodes.saturating_add(work.scope_nodes) > 1).then_some(index)
+                (work.summary_expansions > 0
+                    || work.resolution_rounds > 0
+                    || work.hierarchy_order_steps > 0)
+                    .then_some(index)
             })
             .collect();
-        assert!(
-            !eligible.is_empty(),
-            "no point can stop after doing scope work: {}",
-            case.display()
-        );
+        if eligible.is_empty() {
+            let work: Vec<_> = reference
+                .iter()
+                .map(|value| value.as_ref().map(|value| value.work))
+                .collect();
+            eprintln!(
+                "ORACLE_SKIP {} has no point with budgetable work: {work:#?}",
+                case.display(),
+            );
+            continue;
+        }
         for desired in [
             eligible[0],
             eligible[eligible.len() / 2],
@@ -485,12 +502,11 @@ fn go_retained_receiver_oracle() {
                         },
                     ));
                 }
-                let needed_scope = work.setup_nodes.saturating_add(work.scope_nodes);
-                if needed_scope > 1 {
+                if work.hierarchy_order_steps > 0 {
                     budgets.push((
-                        "scope_nodes",
+                        "hierarchy_order_steps",
                         ReceiverAnalysisBudget {
-                            max_scope_nodes: needed_scope - 1,
+                            max_hierarchy_order_work: work.hierarchy_order_steps - 1,
                             ..large_budget()
                         },
                     ));
@@ -505,6 +521,7 @@ fn go_retained_receiver_oracle() {
                             || work.scope_nodes > 0
                             || work.resolution_rounds > 0
                             || work.summary_expansions > 0
+                            || work.hierarchy_order_steps > 0
                     });
                     if result == Observation::Stop(format!("ExceededBudget({limit})")) && did_work {
                         stopped_run =
@@ -569,7 +586,12 @@ fn go_retained_receiver_oracle() {
                 &mut mismatches,
             );
         }
+        budgeted_cases += 1;
     }
+    assert!(
+        budgeted_cases > 0,
+        "no case exercised a budgeted prefix: {per_case_counts:#?}"
+    );
     assert!(
         all_dropped.is_empty(),
         "large-budget reference dropped points:\n{all_dropped:#?}"

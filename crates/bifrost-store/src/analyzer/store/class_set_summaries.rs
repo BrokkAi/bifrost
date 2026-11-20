@@ -888,12 +888,13 @@ pub(crate) const DEPENDENCY_SOURCES_SQL: &str =
      WHERE summary_id=?1 ORDER BY dependency_ordinal,source_ordinal";
 pub(crate) const READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
-        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),NULL AS copy_owning_unit,NULL AS copy_target_unit,NULL AS copy_module_path,NULL AS copy_target_identity_digest,NULL AS copy_census_version,NULL AS copy_config_digest,NULL AS copy_producer_digest,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,read_ordinal, drop_owning_unit, drop_module_path, drop_identity_digest, drop_config_digest, drop_proof_version
+        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),NULL AS copy_owning_unit,NULL AS copy_target_unit,NULL AS copy_module_path,NULL AS copy_target_identity_digest,NULL AS copy_census_version,NULL AS copy_config_digest,NULL AS copy_producer_digest,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,selected_receiver_question, selected_resolution_epoch, selected_application_digest, selected_receiver_digest, selected_transfer_rule_digest,selected_reference_digest,read_ordinal,drop_owning_unit,drop_module_path,drop_identity_digest,drop_config_digest,drop_proof_version
      FROM class_set_summary_reads WHERE summary_id=?1 ORDER BY read_ordinal";
 pub(crate) const CHARGES_SQL: &str = "SELECT charge_kind,amount
      FROM class_set_summary_charges WHERE summary_id=?1 ORDER BY charge_kind";
 
 impl AnalyzerStore {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn contains_class_set_summary_procedure(
         &self,
         identity: ClassSetSummaryDigest,
@@ -1009,6 +1010,7 @@ impl AnalyzerStore {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_summary_for_digest(
         &self,
         lookup_digest: ClassSetSummaryDigest,
@@ -1022,6 +1024,7 @@ impl AnalyzerStore {
 
     /// Return a complete bounded compatible family. `None` reports that the
     /// family exceeded `max_rows`; a truncated prefix is never exposed.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_summary_family_lookups(
         &self,
         key: &ClassSetSummaryFamilyKey,
@@ -1064,6 +1067,7 @@ impl AnalyzerStore {
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_summary_dependents_of_lookup(
         &self,
         lookup_digest: ClassSetSummaryDigest,
@@ -1076,6 +1080,7 @@ impl AnalyzerStore {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_summary_dependents_of_lineage_entry(
         &self,
         procedure_lineage: ClassSetSummaryDigest,
@@ -1092,6 +1097,7 @@ impl AnalyzerStore {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn class_set_summary_dependents_of_read(
         &self,
         read: &ReadKey,
@@ -1487,8 +1493,8 @@ fn insert_summary(
         conn.execute(
             "INSERT INTO class_set_summary_reads(
                 summary_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
-                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,drop_owning_unit,drop_module_path,drop_identity_digest,drop_config_digest,drop_proof_version
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,jsonb(?20),?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,selected_receiver_question, selected_resolution_epoch, selected_application_digest, selected_receiver_digest, selected_transfer_rule_digest, selected_reference_digest,drop_owning_unit,drop_module_path,drop_identity_digest,drop_config_digest,drop_proof_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, jsonb(?20), ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
             params![
                 id,
                 row.ordinal,
@@ -1514,6 +1520,12 @@ fn insert_summary(
             columns.parse_variant_digest,
             columns.structural_role,
             columns.structural_keyword,
+            columns.selected_receiver_question,
+            columns.selected_resolution_epoch,
+            columns.selected_application_digest,
+            columns.selected_receiver_digest,
+            columns.selected_transfer_rule_digest,
+            columns.selected_reference_digest,
             columns.drop_owning_unit,
             columns.drop_module_path,
             columns.drop_identity_digest,
@@ -1876,7 +1888,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<ReadKeyBatch> {
     let mut rows = s.query(params![id])?;
     let mut reads = ReadKeyBatch::default();
     while let Some(row) = rows.next()? {
-        let ordinal: u32 = row.get(29)?;
+        let ordinal: u32 = row.get(35)?;
         if ordinal as usize != reads.len() {
             return Err(StoreError::corrupt(
                 "class-set summary read ordinals are not dense",
@@ -2765,6 +2777,12 @@ mod tests {
         use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, WorkspaceFactFamily};
         use crate::analyzer::semantic::ids::StableDigest;
         let mut expected = row(1);
+        for key in super::super::read_keys::selected_receiver_proof_keys() {
+            expected.reads.push(ClassSetSummaryReadRow {
+                ordinal: expected.reads.len().try_into().unwrap(),
+                key,
+            });
+        }
         for key in super::super::read_keys::rust_drop_receipt_keys() {
             expected.reads.push(ClassSetSummaryReadRow {
                 ordinal: u32::try_from(expected.reads.len()).unwrap(),
@@ -2809,6 +2827,59 @@ mod tests {
             store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn selected_receiver_proof_future_family_misses_without_hiding_corruption() {
+        let store = store_with_blob();
+        let mut expected = row(1);
+        for key in super::super::read_keys::selected_receiver_proof_keys() {
+            expected.reads.push(ClassSetSummaryReadRow {
+                ordinal: expected.reads.len().try_into().unwrap(),
+                key,
+            });
+        }
+        expected.content_digest = expected.canonical_content_digest();
+        store
+            .publish_class_set_summary(expected, &CancellationToken::new())
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE class_set_summary_reads SET family='selected_receiver_proof:v2' WHERE selected_receiver_question IS NOT NULL; PRAGMA ignore_check_constraints=OFF;").unwrap();
+        }
+        assert_eq!(
+            store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
+            None
+        );
+        for column in [
+            "selected_application_digest",
+            "selected_receiver_digest",
+            "selected_transfer_rule_digest",
+            "selected_reference_digest",
+        ] {
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA ignore_check_constraints=ON; UPDATE class_set_summary_reads SET {column}=zeroblob(31) WHERE selected_receiver_question IS NOT NULL; PRAGMA ignore_check_constraints=OFF;"
+                )).unwrap();
+            }
+            let error = store
+                .class_set_summary_for_digest(digest_byte(1))
+                .unwrap_err();
+            assert!(!error.is_unsupported_read_key(), "{column}: {error}");
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch(&format!(
+                    "PRAGMA ignore_check_constraints=ON; UPDATE class_set_summary_reads SET {column}=zeroblob(32) WHERE selected_receiver_question IS NOT NULL; PRAGMA ignore_check_constraints=OFF;"
+                )).unwrap();
+            }
+        }
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("UPDATE class_set_summaries SET read_count=read_count+1")
+                .unwrap();
+        }
+        assert!(store.class_set_summary_for_digest(digest_byte(1)).is_err());
     }
 
     #[test]
@@ -3006,10 +3077,7 @@ mod tests {
             .unwrap();
         let conn = store.conn.lock().unwrap();
         let shape_error = conn
-            .execute(
-                "UPDATE class_set_summary_reads SET languages = 'python'",
-                [],
-            )
+            .execute("UPDATE class_set_summary_reads SET digest = X'00'", [])
             .unwrap_err();
         assert!(shape_error.to_string().contains("CHECK constraint failed"));
         conn.execute(

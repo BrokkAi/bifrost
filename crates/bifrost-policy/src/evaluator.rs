@@ -59,7 +59,7 @@ use brokk_bifrost_rql::structural::search::{
     UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance,
     UnitRowProvenanceRef, execute_code_query_detailed_eager_index_in_scope,
     execute_code_query_detailed_eager_index_with_row_family_session_in_scope,
-    execute_code_query_detailed_eager_index_workspace_in_scope, execute_code_query_unit,
+    execute_code_query_semantic_unit_in_scope, execute_code_query_unit,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_rql::structural::{
@@ -577,7 +577,7 @@ pub(crate) fn apply_approximate_family_backstop(
         .shards
         .iter()
         .filter(|shard| {
-            shard.approximate && shard.manifest.provenance.is_close_match_approximation()
+            shard.approximate() && shard.manifest.provenance.is_close_match_approximation()
         })
         .map(|shard| shard.matching_evidence.len().max(1))
         .sum::<usize>();
@@ -607,7 +607,7 @@ pub(crate) fn approximate_pack_contributors(
 ) -> Vec<ModelAttributionContributor> {
     let mut contributors = Vec::new();
     for shard in &snapshot.active_models().shards {
-        if !shard.approximate {
+        if !shard.approximate() {
             continue;
         }
         let Some(claim) = shard
@@ -1253,17 +1253,21 @@ fn evaluate_match_policy(
     // the same rendered rows.
     let evaluated = match execution_scope {
         Some(execution_scope) => match match_policy_query(policy) {
-            Ok(query) => evaluate_match_query_candidates_in_scope(
-                &policy.definition().metadata.id,
-                policy.definition().completion_on_depth_bound_reached,
-                context.flow_resources(),
-                context.analyzer,
-                context.workspace,
-                query,
-                budget,
-                context.cancellation,
-                execution_scope,
-            ),
+            Ok(query) => {
+                let mut evaluated = evaluate_match_query_candidates_in_scope(
+                    &policy.definition().metadata.id,
+                    policy.definition().completion_on_depth_bound_reached,
+                    policy_flow_resources(policy, context.flow_resources(), budget),
+                    context.analyzer,
+                    context.workspace,
+                    query,
+                    budget,
+                    context.cancellation,
+                    execution_scope,
+                );
+                append_match_guard_load_notes(policy, &mut evaluated);
+                evaluated
+            }
             Err(refusal) => refusal.into_run(budget),
         },
         None => match context.incremental {
@@ -3369,7 +3373,10 @@ fn evaluate_match_policy_by_unit(
         subject_batch,
         &mut attempt,
     ) {
-        Ok(evaluated) => (evaluated, None),
+        Ok(mut evaluated) => {
+            append_match_guard_load_notes(policy, &mut evaluated);
+            (evaluated, None)
+        }
         Err(reason) => (
             widened_match_candidates(policy, context, budget, subject_batch),
             Some(reason),
@@ -3431,8 +3438,11 @@ fn sliced_match_candidates(
     // enumeration to the scanners that still need it, which is what keeps
     // unit-wise execution linear in the file count.
     let workspace_files = context.analyzer.analyzed_files();
+    // The guard-binding source must be attached on this route as on the whole
+    // and shared routes, or sliced and from-scratch runs disagree.
+    let flow_resources = policy_flow_resources(policy, context.flow_resources(), budget);
     let execution = UnitQueryExecution {
-        flow_state: context.flow_resources(),
+        flow_state: flow_resources.clone(),
         analyzer: context.analyzer,
         workspace: context.workspace,
         cancellation: context.cancellation,
@@ -3440,8 +3450,9 @@ fn sliced_match_candidates(
         workspace_files: &workspace_files,
         depth_opt_in: policy.definition().completion_on_depth_bound_reached,
         subject_batch,
+        guard_identity: crate::evaluator::assertion::match_guard_batch_identity(policy),
     };
-    let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
+    let mut reuse = UnitReuse::new(policy, incremental, budget, &flow_resources);
     let sliced = sliced_query_units(
         policy,
         &executable,
@@ -3479,6 +3490,72 @@ fn sliced_match_candidates(
     ))
 }
 
+struct LoadedMatchGuardBindingSource {
+    match_guards: Vec<crate::resolved::ResolvedMatchGuardBarrier>,
+    resolved_selectors: Vec<crate::resolved::ResolvedPolicySelector>,
+    flow_state: brokk_bifrost_rql::SemanticFlowResources,
+    query_limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
+    max_selector_results: usize,
+}
+
+impl brokk_bifrost_rql::MatchGuardBindingSource for LoadedMatchGuardBindingSource {
+    fn bindings_for_procedure(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        cancellation: &CancellationToken,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+    ) -> Result<brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::CompiledGuardBindings, String>{
+        crate::taint_policy::guard_barriers::bind_match_guard_barriers_in(
+            workspace,
+            &self.flow_state,
+            self.query_limits,
+            self.max_selector_results,
+            cancellation,
+            &self.match_guards,
+            &self.resolved_selectors,
+            procedure,
+        )
+    }
+}
+
+fn policy_flow_resources(
+    policy: &LoadedPolicy,
+    base: brokk_bifrost_rql::SemanticFlowResources,
+    budget: &PolicyBudget,
+) -> brokk_bifrost_rql::SemanticFlowResources {
+    if policy
+        .match_guards()
+        .iter()
+        .all(|guard| guard.tokens.is_empty())
+    {
+        return base;
+    }
+    let source = Arc::new(LoadedMatchGuardBindingSource {
+        match_guards: policy.match_guards().to_vec(),
+        resolved_selectors: policy.resolved_selectors().to_vec(),
+        flow_state: base.clone(),
+        query_limits: budget.query_limits(),
+        max_selector_results: budget.max_selector_results(),
+    });
+    base.with_guard_bindings(Some(source))
+}
+
+fn append_match_guard_load_notes(policy: &LoadedPolicy, evaluated: &mut EvaluatedMatchPolicy) {
+    for note in policy.match_guard_load_notes() {
+        if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::GuardRemovalVocabularyNote,
+            PolicyDiagnosticSeverity::Note,
+            PolicyDiagnosticImpact::Advisory,
+            note.message.clone(),
+            None,
+            Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
+        ) {
+            evaluated.diagnostics.push(diagnostic);
+        }
+    }
+}
+
 /// Evaluate one match policy in full without recording a unit.
 ///
 /// The execution is the whole-workspace one -- the same entry point the
@@ -3501,10 +3578,11 @@ fn widened_match_candidates(
         Ok(executable) => executable,
         Err(refusal) => return refusal.into_run(budget),
     };
+    let flow_resources = policy_flow_resources(policy, context.flow_resources(), budget);
     let execute = || {
         execute_code_query_unit(
             context.analyzer,
-            context.flow_resources(),
+            flow_resources.clone(),
             context.workspace,
             &executable,
             budget.query_limits(),
@@ -3517,12 +3595,13 @@ fn widened_match_candidates(
     // Another widened consumer of the same selector runs this same execution,
     // so the batch keeps its whole-workspace unit under no seed file.
     let shared = subject_batch.and_then(|batch| {
-        batch.query_units(
+        batch.query_units_with_guards(
             &executable,
             context.analyzer,
             context.workspace,
             budget.query_limits(),
             policy.definition().completion_on_depth_bound_reached,
+            crate::evaluator::assertion::match_guard_batch_identity(policy),
         )
     });
     let product = match shared {
@@ -3540,7 +3619,7 @@ fn widened_match_candidates(
         policy.definition().completion_on_depth_bound_reached,
         product.depth_bound_status,
     );
-    adapt_match_execution(
+    let mut evaluated = adapt_match_execution(
         &policy.definition().metadata.id,
         binding_output_class(&executable.plan),
         policy.definition().completion_on_depth_bound_reached,
@@ -3552,7 +3631,9 @@ fn widened_match_candidates(
         product.work,
         product.budgeted_work.candidate_sites,
         budget,
-    )
+    );
+    append_match_guard_load_notes(policy, &mut evaluated);
+    evaluated
 }
 
 /// The authored query of a match policy, or the failure that stops it.
@@ -3593,12 +3674,12 @@ pub(crate) fn evaluate_match_policy_candidates(
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
-    let flow_state = flow_state.into();
+    let flow_state = policy_flow_resources(policy, flow_state.into(), budget);
     let query = match match_policy_query(policy) {
         Ok(query) => query,
         Err(refusal) => return refusal.into_run(budget),
     };
-    evaluate_match_query_candidates(
+    let mut evaluated = evaluate_match_query_candidates(
         &policy.definition().metadata.id,
         policy.definition().completion_on_depth_bound_reached,
         &flow_state,
@@ -3607,7 +3688,9 @@ pub(crate) fn evaluate_match_policy_candidates(
         query,
         budget,
         cancellation,
-    )
+    );
+    append_match_guard_load_notes(policy, &mut evaluated);
+    evaluated
 }
 
 /// Evaluate a match policy without units from the batch's one whole execution
@@ -3630,18 +3713,21 @@ fn shared_match_candidates(
         Ok(executable) => executable,
         Err(refusal) => return refusal.into_run(budget),
     };
-    let rows = batch.execute(
+    let flow_resources = policy_flow_resources(policy, context.flow_resources(), budget);
+    let rows = batch.execute_with_guards(
         &executable,
         context,
+        flow_resources,
         budget,
         policy.definition().completion_on_depth_bound_reached,
+        crate::evaluator::assertion::match_guard_batch_identity(policy),
     );
     assert_depth_status_key_invariant(
         query,
         policy.definition().completion_on_depth_bound_reached,
         rows.depth_bound_status,
     );
-    adapt_match_execution(
+    let mut evaluated = adapt_match_execution(
         &policy.definition().metadata.id,
         binding_output_class(&executable.plan),
         policy.definition().completion_on_depth_bound_reached,
@@ -3653,7 +3739,9 @@ fn shared_match_candidates(
         rows.work,
         rows.candidate_sites,
         budget,
-    )
+    );
+    append_match_guard_load_notes(policy, &mut evaluated);
+    evaluated
 }
 
 /// Why a match policy stopped before it executed anything.
@@ -3730,6 +3818,8 @@ fn executable_match_query(
             | QueryValueKind::MemberFamilyEdge
             | QueryValueKind::StateEvent
             | QueryValueKind::BindingInitializerCall
+            | QueryValueKind::FieldWrite
+            | QueryValueKind::FieldRead
             | QueryValueKind::FlowRelation
             | QueryValueKind::ControlRelation
             | QueryValueKind::BranchRelation
@@ -3876,53 +3966,42 @@ fn evaluate_match_query_candidates_in_scope(
     // index reuse is guaranteed: build the snapshot index on first use
     // instead of letting Auto's first-request deferral scan the workspace
     // once per policy.
-    let detailed = match workspace {
-        Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
-            workspace,
-            &flow_state,
-            &executable,
-            budget.query_limits(),
-            cancellation,
-            execution_scope,
-        ),
-        None => execute_code_query_detailed_eager_index_in_scope(
-            analyzer,
-            &flow_state,
-            &executable,
-            budget.query_limits(),
-            cancellation,
-            execution_scope,
-        ),
-    };
+    let mut unit = execute_code_query_semantic_unit_in_scope(
+        analyzer,
+        &flow_state,
+        workspace,
+        &executable,
+        budget.query_limits(),
+        cancellation,
+        execution_scope,
+    )
+    .unit;
+    CodeQueryDiagnostic::strip_step_attribution(&mut unit.diagnostics);
     assert_depth_status_key_invariant(
         query,
         completion_on_depth_bound_reached,
-        detailed.result.depth_bound_status,
+        unit.depth_bound_status,
     );
+    let (items, evidence) = unit
+        .rows
+        .into_iter()
+        .map(|row| (row.item, row.evidence))
+        .unzip();
     adapt_match_execution(
         policy_id,
         binding_output_class(&executable.plan),
         completion_on_depth_bound_reached,
-        detailed.result.depth_bound_status,
+        unit.depth_bound_status,
         // One adapter serves the whole run and the unit path: the whole run's
         // rendered rows are projected into exactly the product a unit
         // publishes before adaptation, so no finding can differ by which path
         // produced it.
-        detailed
-            .result
-            .results
-            .iter()
-            .map(UnitRowItem::project)
-            .collect(),
-        detailed
-            .evidence
-            .iter()
-            .map(UnitRowEvidence::project)
-            .collect(),
-        &detailed.result.diagnostics,
-        detailed.result.completion(),
-        detailed.work,
-        detailed.budgeted_work.candidate_sites,
+        items,
+        evidence,
+        &unit.diagnostics,
+        unit.completion,
+        unit.work,
+        unit.budgeted_work.candidate_sites,
         budget,
     )
 }
@@ -4161,8 +4240,15 @@ fn adapt_query_diagnostics(
         // policy that audits the whole workspace by design cannot take; and
         // because only a whole execution can raise it, forwarding it would
         // make a sliced run differ from a full one both in the report's bytes
-        // and at the retention boundary it feeds.
-        if diagnostic.code == CodeQueryDiagnosticCode::BroadQuery {
+        // and at the retention boundary it feeds. The step-produced-no-rows
+        // advisory is excluded for the same reason: only a whole execution
+        // raises it (a seed-file unit's empty step is normal), it explains an
+        // interactive query rather than the meaning of a policy's rows, and
+        // forwarding it would make a sliced run differ from a full one.
+        if matches!(
+            diagnostic.code,
+            CodeQueryDiagnosticCode::BroadQuery | CodeQueryDiagnosticCode::StepProducedNoRows
+        ) {
             continue;
         }
         truncated |= diagnostic.related.len() > max_related;
@@ -4354,6 +4440,10 @@ pub(crate) fn refusal_identity(diagnostic: &CodeQueryDiagnostic) -> CodeQueryDia
     identity.related.clear();
     identity.has_non_utf8_refusal = false;
     identity.refusal_sites.clear();
+    identity.step_index = None;
+    identity.step_op = None;
+    identity.no_rows_reason = None;
+    identity.cause_codes.clear();
     if let Some((base, _)) = identity.message.split_once("\ncall-binding refusal:") {
         identity.message = base.to_owned();
     }
@@ -7103,7 +7193,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::DispatchTarget
         | DetailedCodeQueryDomain::MemberFamily
         | DetailedCodeQueryDomain::MemberFamilyEdge
-        | DetailedCodeQueryDomain::BindingInitializerCall => None,
+        | DetailedCodeQueryDomain::BindingInitializerCall
+        | DetailedCodeQueryDomain::FieldWrite
+        | DetailedCodeQueryDomain::FieldRead => None,
         DetailedCodeQueryDomain::PythonHierarchyFact => Some(MatchResultDomain::StructuralMatch),
     }
 }
@@ -7573,6 +7665,20 @@ fn weak_finding_digest(
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, finding_id.as_bytes());
         }
+        DetailedCodeQueryKey::FieldWrite {
+            id,
+            procedure_id,
+            program_point_id,
+        }
+        | DetailedCodeQueryKey::FieldRead {
+            id,
+            procedure_id,
+            program_point_id,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
+            update_hash(&mut hasher, program_point_id.as_bytes());
+        }
         DetailedCodeQueryKey::BindingInitializerCall {
             id,
             establishment_event_id,
@@ -7821,7 +7927,9 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::EffectBudgetExhausted => {
             PolicyIncompleteReason::PipelineRowBudget
         }
-        CodeQueryDiagnosticCode::RenderedCapturesTruncated => {
+        CodeQueryDiagnosticCode::RenderedCapturesTruncated
+        | CodeQueryDiagnosticCode::PresentationRowsRefused
+        | CodeQueryDiagnosticCode::PresentationOwnerUnavailable => {
             PolicyIncompleteReason::ReportRetentionBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {
@@ -7902,11 +8010,15 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
             PolicyIncompleteReason::PartialDiscovery
         }
         CodeQueryDiagnosticCode::InvalidPlan
+        // Advisory recovery never enters the incomplete-reason set, but the
+        // diagnostic vocabulary still has one exhaustive reason projection.
+        | CodeQueryDiagnosticCode::DerivedCacheRebuilt
         | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
         | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
         | CodeQueryDiagnosticCode::WorkspaceSemanticModelsNotLoaded
-        | CodeQueryDiagnosticCode::BroadQuery => PolicyIncompleteReason::PartialDiscovery,
+        | CodeQueryDiagnosticCode::BroadQuery
+        | CodeQueryDiagnosticCode::StepProducedNoRows => PolicyIncompleteReason::PartialDiscovery,
         CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
             PolicyIncompleteReason::PartialDiscovery
         }

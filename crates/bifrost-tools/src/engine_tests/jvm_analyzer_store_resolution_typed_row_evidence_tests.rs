@@ -54,6 +54,10 @@ mod jvm_extraction_tests {
 
     #[hardwon("#7509: the selected-stage encoder omitted type_components rows")]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_stage_type_components_match_prepared_java_rows() {
         use brokk_bifrost_analysis::analyzer::resolution::lower_resolution_facts_for_selection;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
@@ -142,6 +146,10 @@ mod jvm_extraction_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_hierarchy_terminals_preserve_mounts_and_cancellation() {
         use brokk_bifrost_analysis::analyzer::resolution::fact_lowering::LoweringGapOrigin;
 
@@ -201,6 +209,10 @@ mod jvm_extraction_tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn frontier_completion_validates_requested_authority_without_unrelated_mounts() {
         for damage in ["unrelated", "missing", "stale", "withdrawn_blob"] {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
@@ -407,6 +419,10 @@ mod jvm_extraction_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn actual_mixed_intrinsic_reader_retains_stage_evidence_on_stop_and_cancel() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
 

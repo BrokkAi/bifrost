@@ -7,6 +7,13 @@
 
 mod normal_returns;
 #[doc(hidden)]
+#[path = "work_queue.rs"]
+mod work_queue;
+pub use work_queue::{
+    ContextualWork, ProvenanceCharge, WorkQueue, WorkSink, contextual_vec_bytes,
+    push_contextual_work, push_with_capacity_observer,
+};
+
 pub use normal_returns::{NormalReturnDomainCertificate, certify_normal_return_domain};
 
 use crate::analyzer::semantic::lexical_definitions::FormalVariadicKind;
@@ -925,6 +932,30 @@ where
     Ok(())
 }
 
+/// Drive borrowed contextual work using the same cancellation/budget algorithm
+/// as ordinary work. The guard outlives the driver's allocation, including on
+/// cancellation or unwinding; the scoped queue never exposes its backing Vec.
+#[doc(hidden)]
+pub fn drive_contextual_procedure_work<T, C: Copy>(
+    builder: &mut ProcedureCfgBuilder,
+    initial: ContextualWork<T, C>,
+    owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    cancellation: &CancellationToken,
+    mut step: impl FnMut(
+        &mut ProcedureCfgBuilder,
+        T,
+        &mut WorkQueue<'_, T, C>,
+    ) -> Result<(), ProcedureLoweringError>,
+) -> Result<(), ProcedureLoweringError> {
+    let mut charge = ProvenanceCharge::new(owner);
+    charge.set_bytes(contextual_vec_bytes::<T, C>(1));
+    let mut observe = |bytes| charge.set_bytes(bytes);
+    drive_procedure_work(builder, [initial], cancellation, |builder, work, stack| {
+        let mut queue = WorkQueue::new(stack, work.context, &mut observe);
+        step(builder, work.item, &mut queue)
+    })
+}
+
 /// Observe cancellation and record adapter traversal before retaining work
 /// outside the executable CFG. Traversal is non-refusing work telemetry;
 /// retained CFG rows remain subject to the builder's resident admissions.
@@ -1149,7 +1180,7 @@ pub(crate) type ScheduledControlNode<T> = (T, ProgramPointId);
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn schedule_conditional_choice<T, W>(
-    stack: &mut Vec<W>,
+    stack: &mut (impl WorkSink<W> + ?Sized),
     condition: ScheduledControlNode<T>,
     consequence: ScheduledControlNode<T>,
     alternative: ScheduledControlNode<T>,
@@ -1499,7 +1530,7 @@ pub fn emit_cleanup_completion_route(
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn schedule_short_circuit_condition<T, W>(
-    stack: &mut Vec<W>,
+    stack: &mut (impl WorkSink<W> + ?Sized),
     kind: ShortCircuitKind,
     left: ScheduledControlNode<T>,
     right: ScheduledControlNode<T>,
@@ -1574,7 +1605,9 @@ pub struct ConditionTargets {
 }
 
 #[doc(hidden)]
-pub trait ProcedureWorkHandler<'tree> {
+pub trait ProcedureWorkHandler<'tree, C: Copy = ()> {
+    fn enter_work_context(&mut self, _context: C) {}
+
     fn cancellation_token(&self) -> &CancellationToken;
     fn lower_statement(
         &mut self,
@@ -1583,7 +1616,7 @@ pub trait ProcedureWorkHandler<'tree> {
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut dyn WorkSink<ProcedureWork<'tree>, Context = C>,
     ) -> Result<(), ProcedureLoweringError>;
     fn lower_expression(
         &mut self,
@@ -1592,7 +1625,7 @@ pub trait ProcedureWorkHandler<'tree> {
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut dyn WorkSink<ProcedureWork<'tree>, Context = C>,
     ) -> Result<(), ProcedureLoweringError>;
     fn lower_condition(
         &mut self,
@@ -1601,20 +1634,21 @@ pub trait ProcedureWorkHandler<'tree> {
         entry: ProgramPointId,
         targets: ConditionTargets,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut dyn WorkSink<ProcedureWork<'tree>, Context = C>,
     ) -> Result<(), ProcedureLoweringError>;
 }
 
 #[doc(hidden)]
-pub fn dispatch_procedure_work<'tree, H: ProcedureWorkHandler<'tree>>(
+pub fn dispatch_procedure_work<'tree, C: Copy, H: ProcedureWorkHandler<'tree, C>>(
     handler: &mut H,
     builder: &mut ProcedureCfgBuilder,
     work: ProcedureWork<'tree>,
-    stack: &mut Vec<ProcedureWork<'tree>>,
+    stack: &mut dyn WorkSink<ProcedureWork<'tree>, Context = C>,
 ) -> Result<(), ProcedureLoweringError> {
     if handler.cancellation_token().is_cancelled() {
         return Err(ProcedureLoweringError::Cancelled(Box::default()));
     }
+    handler.enter_work_context(stack.context());
     match work {
         ProcedureWork::Statement {
             node,
@@ -1670,7 +1704,7 @@ pub fn conditional_false_target(
 /// next entry while preserving the caller's work-item type.
 #[doc(hidden)]
 pub fn schedule_sequential_work<T, W>(
-    stack: &mut Vec<W>,
+    stack: &mut (impl WorkSink<W> + ?Sized),
     children: &[T],
     entries: &[ProgramPointId],
     next: ControlTarget,
@@ -1696,11 +1730,48 @@ pub fn schedule_sequential_work<T, W>(
     }
 }
 
+/// The same sequential scheduler for children admitted in different contexts.
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_contextual_sequential_work<T: Copy, W, C: Copy>(
+    stack: &mut dyn WorkSink<W, Context = C>,
+    children: &[ContextualWork<T, C>],
+    entries: &[ProgramPointId],
+    next: ControlTarget,
+    scope: ScopeFrameId,
+    mut work: impl FnMut(usize, T, ProgramPointId, ControlTarget, ScopeFrameId) -> W,
+) {
+    struct ContextSink<'a, W, C: Copy>(&'a mut dyn WorkSink<W, Context = C>);
+    impl<W, C: Copy> WorkSink<ContextualWork<W, C>> for ContextSink<'_, W, C> {
+        type Context = ();
+        fn context(&self) {}
+        fn push(&mut self, value: ContextualWork<W, C>) {
+            self.0.push_with_context(value.item, value.context);
+        }
+        fn push_with_context(&mut self, value: ContextualWork<W, C>, (): ()) {
+            self.push(value);
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+    schedule_sequential_work(
+        &mut ContextSink(stack),
+        children,
+        entries,
+        next,
+        scope,
+        |index, child, entry, next, scope| ContextualWork {
+            item: work(index, child.item, entry, next, scope),
+            context: child.context,
+        },
+    );
+}
+
 /// Schedule a linear sequence whose active cleanup scope changes after
 /// individual children, as for bindings initialized by sequential statements.
 #[doc(hidden)]
 pub fn schedule_sequential_work_with_scopes<T, W>(
-    stack: &mut Vec<W>,
+    stack: &mut (impl WorkSink<W> + ?Sized),
     children: &[T],
     entries: &[ProgramPointId],
     next: ControlTarget,
@@ -1748,7 +1819,7 @@ pub fn schedule_loop_flow<T, W, Initializer, Expression, Statement, Condition>(
     initial_condition_target: ControlTarget,
     body: ScheduledControlNode<T>,
     updates: &[ScheduledControlNode<T>],
-    stack: &mut Vec<W>,
+    stack: &mut (impl WorkSink<W> + ?Sized),
     initializer_work: Initializer,
     expression_work: Expression,
     statement_work: Statement,
@@ -3188,6 +3259,7 @@ impl<'a> ProcedureLoweringSession<'a> {
         let id = ValueId::try_from_index(self.next_value)
             .map_err(|_| ProcedureLoweringError::Invalid("too many semantic values".into()))?;
         builder.add_value(SemanticValue {
+            actual_borrow: Default::default(),
             static_type_origin: None,
             static_type_class: Default::default(),
             id,
@@ -3197,6 +3269,24 @@ impl<'a> ProcedureLoweringSession<'a> {
         })?;
         self.next_value += 1;
         Ok(id)
+    }
+
+    /// Record expression-level borrow evidence for an already allocated
+    /// address. This does not derive borrowing from a declaration signature.
+    #[doc(hidden)]
+    pub fn record_actual_borrow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        value: ValueId,
+        borrow: crate::analyzer::semantic::ActualBorrowKind,
+    ) -> Result<(), ProcedureLoweringError> {
+        if builder.record_actual_borrow(value, borrow) {
+            Ok(())
+        } else {
+            Err(ProcedureLoweringError::Invalid(
+                "actual borrow requires an address value in this procedure".into(),
+            ))
+        }
     }
 
     /// Retain a semantic value after the adapter has established that its
@@ -3917,7 +4007,28 @@ impl<'a> ProcedureLoweringSession<'a> {
         location: MemoryLocationId,
         detail: impl Into<Box<str>>,
     ) -> Result<(), ProcedureLoweringError> {
-        self.add_gap_with_impacts(
+        self.add_unprojected_index_gap_with_discharge(
+            builder,
+            point,
+            location,
+            SemanticGapDischarge::None,
+            detail,
+        )
+    }
+
+    /// The index-memory gap of an index location that flow state does not
+    /// project, carrying the producer's discharge for consumers (value flow)
+    /// that need only the location's identity.
+    #[doc(hidden)]
+    pub fn add_unprojected_index_gap_with_discharge(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+        discharge: SemanticGapDischarge,
+        detail: impl Into<Box<str>>,
+    ) -> Result<(), ProcedureLoweringError> {
+        self.add_gap_with_impacts_and_discharge(
             builder,
             point,
             SemanticGapSubject::MemoryLocation(location),
@@ -3926,6 +4037,7 @@ impl<'a> ProcedureLoweringSession<'a> {
                 .with(SemanticGapImpact::HeapWrite)
                 .with(SemanticGapImpact::Aliasing),
             SemanticGapKind::Unsupported,
+            discharge,
             detail,
         )?;
         Ok(())

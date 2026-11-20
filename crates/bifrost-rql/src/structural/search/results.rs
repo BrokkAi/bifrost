@@ -59,9 +59,11 @@ pub(crate) enum UnionExecutionStrategy {
     Parallel,
 }
 
-#[derive(Debug, Default, Serialize, JsonSchema)]
-pub struct CodeQueryResult {
-    pub results: Vec<CodeQueryResultItem>,
+// Shared execution envelope; the default public alias contains presented rows.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(rename = "CodeQueryResult")]
+pub struct QueryResult<I> {
+    pub results: Vec<I>,
     pub truncated: bool,
     /// Whether a bounded callers/callees closure has a new declaration one
     /// step beyond its bound. This is an observation about the query, not a
@@ -78,9 +80,29 @@ pub struct CodeQueryResult {
     /// states the frame of reference the row set was drawn from (#2770).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_subset: Option<SubsetCoverage>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "QueryDiagnostics::is_empty")]
     #[schemars(default)]
-    pub diagnostics: Vec<CodeQueryDiagnostic>,
+    pub diagnostics: QueryDiagnostics,
+}
+
+pub type CodeQueryResult = QueryResult<CodeQueryResultItem>;
+
+impl<I> Default for QueryResult<I> {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+            truncated: false,
+            depth_bound_status: None,
+            session_subset: None,
+            diagnostics: QueryDiagnostics::default(),
+        }
+    }
+}
+
+impl<I> QueryResult<I> {
+    pub fn completion(&self) -> CodeQueryCompletion {
+        code_query_completion_refs(self.truncated, self.diagnostics.iter())
+    }
 }
 
 /// Outcome of checking whether a bounded call closure can grow by one step.
@@ -292,16 +314,7 @@ impl CodeQueryCompletion {
     }
 }
 
-impl CodeQueryResult {
-    /// Derive whether this result can support a complete negative conclusion.
-    ///
-    /// Completion is intentionally based only on typed diagnostic impact and
-    /// the existing bounded-output flag. Diagnostic prose remains presentation
-    /// and can change without changing this decision.
-    pub fn completion(&self) -> CodeQueryCompletion {
-        code_query_completion(self.truncated, &self.diagnostics)
-    }
-
+impl<C, E, A, B> QueryResult<QueryResultItem<QueryResultValue<C, E, A, B>>> {
     /// Cap a clean per-row flow status by the run's own completion (#1952).
     ///
     /// An interrupted or budget-limited query may be missing rows, so no
@@ -314,25 +327,34 @@ impl CodeQueryResult {
     /// MCP host's pending semantic-pack acquisition marker, #3401) re-runs it
     /// here, so the cap still has exactly one derivation.
     pub fn cap_flow_status_by_run(&mut self) {
-        let (status, reason) = match self.completion() {
-            CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. } => return,
-            CodeQueryCompletion::Cancelled => (
-                CodeQueryFlowStatus::QueryCancelled,
-                "query execution was cancelled",
-            ),
-            CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::Invalid { .. } => (
-                CodeQueryFlowStatus::Partial,
-                "query execution was incomplete",
-            ),
-        };
+        let completion = self.completion();
         for item in &mut self.results {
-            if let CodeQueryResultValue::FlowEndpoint { value } = &mut item.value
-                && value.status == CodeQueryFlowStatus::Complete
-            {
-                value.status = status;
-                value.reason = Some(reason.to_owned());
+            if let QueryResultValue::FlowEndpoint { value } = &mut item.value {
+                cap_flow_status_for_completion(value, &completion);
             }
         }
+    }
+}
+
+/// Shared execution envelope cap, applied before either scalar or wire publication.
+pub(super) fn cap_flow_status_for_completion(
+    value: &mut CodeQueryFlowEndpoint,
+    completion: &CodeQueryCompletion,
+) {
+    let (status, reason) = match completion {
+        CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. } => return,
+        CodeQueryCompletion::Cancelled => (
+            CodeQueryFlowStatus::QueryCancelled,
+            "query execution was cancelled",
+        ),
+        CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::Invalid { .. } => (
+            CodeQueryFlowStatus::Partial,
+            "query execution was incomplete",
+        ),
+    };
+    if value.status == CodeQueryFlowStatus::Complete {
+        value.status = status;
+        value.reason = Some(reason.to_owned());
     }
 }
 
@@ -352,11 +374,18 @@ pub fn code_query_completion(
     truncated: bool,
     diagnostics: &[CodeQueryDiagnostic],
 ) -> CodeQueryCompletion {
+    code_query_completion_refs(truncated, diagnostics.iter().map(DiagnosticRef::Semantic))
+}
+
+fn code_query_completion_refs<'a>(
+    truncated: bool,
+    diagnostics: impl Iterator<Item = DiagnosticRef<'a>> + Clone,
+) -> CodeQueryCompletion {
     let codes_with_impact = |impact: CodeQueryDiagnosticImpact| {
         let mut codes = Vec::new();
-        for diagnostic in diagnostics {
-            if diagnostic.impact == impact {
-                codes.push(diagnostic.code);
+        for diagnostic in diagnostics.clone() {
+            if diagnostic.impact() == impact {
+                codes.push(diagnostic.code());
             }
         }
         codes.sort_unstable();
@@ -368,15 +397,15 @@ pub fn code_query_completion(
         return CodeQueryCompletion::Invalid { codes: invalid };
     }
     if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled)
+        .clone()
+        .any(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::Cancelled)
     {
         return CodeQueryCompletion::Cancelled;
     }
     let incomplete = codes_with_impact(CodeQueryDiagnosticImpact::Incomplete);
     assert!(
         !truncated || !incomplete.is_empty(),
-        "a truncated CodeQuery result must name its cause in an Incomplete diagnostic: {diagnostics:?}"
+        "a truncated CodeQuery result must name its cause in an Incomplete diagnostic"
     );
     if !incomplete.is_empty() {
         return CodeQueryCompletion::Incomplete { codes: incomplete };
@@ -402,9 +431,10 @@ pub fn code_query_result_json_schema() -> serde_json::Value {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct CodeQueryResultItem {
+#[schemars(rename = "CodeQueryResultItem")]
+pub struct QueryResultItem<V> {
     #[serde(flatten)]
-    pub value: CodeQueryResultValue,
+    pub value: V,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]
     pub provenance: Vec<CodeQueryProvenance>,
@@ -418,7 +448,9 @@ pub struct CodeQueryResultItem {
     pub row_projection: Vec<crate::query::QueryRowProjectionColumn>,
 }
 
-impl CodeQueryResultItem {
+pub type CodeQueryResultItem = QueryResultItem<CodeQueryResultValue>;
+
+impl<V> QueryResultItem<V> {
     /// Build the shared, unstyled provenance summary used by text transports.
     #[doc(hidden)]
     pub fn provenance_summary(&self) -> Option<String> {
@@ -451,358 +483,147 @@ impl CodeQueryResultItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(tag = "result_type", rename_all = "snake_case")]
-pub enum CodeQueryResultValue {
-    StructuralMatch {
-        #[serde(flatten)]
-        value: CodeQueryMatch,
-    },
-    Declaration {
-        #[serde(flatten)]
-        value: CodeQueryDeclaration,
-    },
-    Procedure {
-        #[serde(flatten)]
-        value: CodeQueryProcedure,
-    },
-    ProgramPoint {
-        #[serde(flatten)]
-        value: CodeQueryProgramPoint,
-    },
-    ControlEdge {
-        #[serde(flatten)]
-        value: Box<CodeQueryControlEdge>,
-    },
-    TypestateFinding {
-        #[serde(flatten)]
-        value: Box<CodeQueryTypestateFinding>,
-    },
-    TypestateWitness {
-        #[serde(flatten)]
-        value: Box<CodeQueryTypestateWitness>,
-    },
-    FlowEndpoint {
-        #[serde(flatten)]
-        value: Box<CodeQueryFlowEndpoint>,
-    },
-    FlowWitness {
-        #[serde(flatten)]
-        value: Box<CodeQueryFlowWitness>,
-    },
-    ClassSetRow {
-        #[serde(flatten)]
-        value: Box<CodeQueryClassSetRow>,
-    },
-    AbsentMemberFinding {
-        #[serde(flatten)]
-        value: Box<CodeQueryAbsentMemberFinding>,
-    },
-    AbsentMemberWitness {
-        #[serde(flatten)]
-        value: Box<CodeQueryAbsentMemberWitness>,
-    },
-    TaintFinding {
-        #[serde(flatten)]
-        value: Box<CodeQueryTaintFinding>,
-    },
-    File {
-        #[serde(flatten)]
-        value: CodeQueryFile,
-    },
-    DependencyEvidence {
-        #[serde(flatten)]
-        value: Box<CodeQueryDependencyEvidence>,
-    },
-    ConfigurationFact {
-        #[serde(flatten)]
-        value: Box<CodeQueryConfigurationFact>,
-    },
-    ReferenceSite {
-        #[serde(flatten)]
-        value: Box<CodeQueryReferenceSite>,
-    },
-    CallSite {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallSite>,
-    },
-    ExpressionSite {
-        #[serde(flatten)]
-        value: Box<CodeQueryExpressionSite>,
-    },
-    JsxAttributeValue {
-        #[serde(flatten)]
-        value: Box<CodeQueryJsxAttributeValue>,
-    },
-    ReceiverAnalysis {
-        #[serde(flatten)]
-        value: Box<CodeQueryReceiverAnalysis>,
-    },
-    MemberTargetAnalysis {
-        #[serde(flatten)]
-        value: Box<CodeQueryMemberTargetAnalysis>,
-    },
-    ReceiverOutcome {
-        #[serde(flatten)]
-        value: Box<CodeQueryReceiverOutcome>,
-    },
-    ReceiverEvidence {
-        #[serde(flatten)]
-        value: Box<CodeQueryReceiverEvidence>,
-    },
-    PointsToCandidate {
-        #[serde(flatten)]
-        value: Box<CodeQueryPointsToCandidate>,
-    },
-    FieldWriteValue {
-        #[serde(flatten)]
-        value: Box<CodeQueryFieldWriteValue>,
-    },
+// The wire and live-selector products share one variant catalog. Only the
+// four site-bearing payloads differ; semantic facts cannot contain fake sites.
+macro_rules! query_result_value {
+    ($call:ident, $expression:ident, $argument:ident, $binding:ident; $( $(#[$attr:meta])* $variant:ident: $payload:ty, )*) => {
+        #[derive(Debug, Clone, Serialize, JsonSchema)]
+        #[serde(tag = "result_type", rename_all = "snake_case")]
+        #[schemars(rename = "CodeQueryResultValue")]
+        pub enum QueryResultValue<$call, $expression, $argument, $binding> {
+            $( $(#[$attr])* $variant { #[serde(flatten)] value: $payload }, )*
+        }
+
+        impl CodeQueryResultValue {
+            pub(super) fn into_selector_value(self) -> super::scalar_projection::SelectorResultValue {
+                match self {
+                    $( Self::$variant { value } => selector_variant!($variant, value), )*
+                }
+            }
+        }
+    };
+}
+macro_rules! selector_variant {
+    (CallSite, $value:ident) => {{
+        drop($value);
+        unreachable!("call sites project directly from native facts")
+    }};
+    (ExpressionSite, $value:ident) => {{
+        drop($value);
+        unreachable!("expression sites project directly from native facts")
+    }};
+    (CallArgument, $value:ident) => {{
+        drop($value);
+        unreachable!("arguments project directly from native facts")
+    }};
+    (CallBinding, $value:ident) => {{
+        drop($value);
+        unreachable!("bindings project directly from native facts")
+    }};
+    ($variant:ident, $value:ident) => {
+        super::scalar_projection::SelectorResultValue::$variant { value: $value }
+    };
+}
+
+pub type CodeQueryResultValue = QueryResultValue<
+    Box<CodeQueryCallSite>,
+    Box<CodeQueryExpressionSite>,
+    Box<CodeQueryCallShapeArgument>,
+    Box<CodeQueryCallBinding>,
+>;
+
+query_result_value! {
+    CallSitePayload, ExpressionSitePayload, CallArgumentPayload, CallBindingPayload;
+    StructuralMatch: CodeQueryMatch,
+    Declaration: CodeQueryDeclaration,
+    Procedure: CodeQueryProcedure,
+    ProgramPoint: CodeQueryProgramPoint,
+    ControlEdge: Box<CodeQueryControlEdge>,
+    TypestateFinding: Box<CodeQueryTypestateFinding>,
+    TypestateWitness: Box<CodeQueryTypestateWitness>,
+    FlowEndpoint: Box<CodeQueryFlowEndpoint>,
+    FlowWitness: Box<CodeQueryFlowWitness>,
+    ClassSetRow: Box<CodeQueryClassSetRow>,
+    AbsentMemberFinding: Box<CodeQueryAbsentMemberFinding>,
+    AbsentMemberWitness: Box<CodeQueryAbsentMemberWitness>,
+    TaintFinding: Box<CodeQueryTaintFinding>,
+    File: CodeQueryFile,
+    DependencyEvidence: Box<CodeQueryDependencyEvidence>,
+    ConfigurationFact: Box<CodeQueryConfigurationFact>,
+    ReferenceSite: Box<CodeQueryReferenceSite>,
+    CallSite: CallSitePayload,
+    ExpressionSite: ExpressionSitePayload,
+    JsxAttributeValue: Box<CodeQueryJsxAttributeValue>,
+    ReceiverAnalysis: Box<CodeQueryReceiverAnalysis>,
+    MemberTargetAnalysis: Box<CodeQueryMemberTargetAnalysis>,
+    ReceiverOutcome: Box<CodeQueryReceiverOutcome>,
+    ReceiverEvidence: Box<CodeQueryReceiverEvidence>,
+    PointsToCandidate: Box<CodeQueryPointsToCandidate>,
+    FieldWriteValue: Box<CodeQueryFieldWriteValue>,
+    FieldWrite: Box<CodeQueryFieldWrite>,
+    FieldRead: Box<CodeQueryFieldRead>,
     #[serde(rename = "keyed_read_value")]
-    RuntimeKeyedReadValue {
-        #[serde(flatten)]
-        value: Box<CodeQueryRuntimeKeyedReadValue>,
-    },
-    CallShape {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallShape>,
-    },
-    CallResult {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallResult>,
-    },
-    CallArgumentGroup {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallArgumentGroup>,
-    },
-    CallArgument {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallShapeArgument>,
-    },
-    CallBinding {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallBinding>,
-    },
-    CallEffect {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallEffect>,
-    },
-    CallResultContract {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallResultContract>,
-    },
-    CallResultObligation {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallResultObligation>,
-    },
-    ResultSubjectUse {
-        #[serde(flatten)]
-        value: Box<CodeQueryResultSubjectUse>,
-    },
-    ResultContractUse {
-        #[serde(flatten)]
-        value: Box<CodeQueryResultContractUse>,
-    },
-    ResultContractFailureUse {
-        #[serde(flatten)]
-        value: Box<CodeQueryResultContractFailureUse>,
-    },
-    NilnessOperation {
-        #[serde(flatten)]
-        value: Box<CodeQueryNilnessOperation>,
-    },
-    SwitchCoverage {
-        #[serde(flatten)]
-        value: Box<CodeQuerySwitchCoverage>,
-    },
-    AssignmentRelation {
-        #[serde(flatten)]
-        value: Box<CodeQueryAssignmentRelation>,
-    },
-    DetachedTaskTransfer {
-        #[serde(flatten)]
-        value: Box<CodeQueryDetachedTaskTransfer>,
-    },
-    ProcedureEffect {
-        #[serde(flatten)]
-        value: Box<CodeQueryProcedureEffect>,
-    },
-    CallableSignature {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallableSignature>,
-    },
-    LiteralOccurrence {
-        #[serde(flatten)]
-        value: Box<CodeQueryLiteralOccurrence>,
-    },
-    CallableMetrics {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallableMetrics>,
-    },
-    SignatureParameter {
-        #[serde(flatten)]
-        value: Box<CodeQuerySignatureParameter>,
-    },
-    DecoratedParameter {
-        #[serde(flatten)]
-        value: Box<CodeQueryDecoratedParameter>,
-    },
-    CallableApplicability {
-        #[serde(flatten)]
-        value: Box<CodeQueryCallableApplicability>,
-    },
-    OverloadSelection {
-        #[serde(flatten)]
-        value: Box<CodeQueryOverloadSelection>,
-    },
-    MemberSelection {
-        #[serde(flatten)]
-        value: Box<CodeQueryMemberSelection>,
-    },
-    DispatchOutcome {
-        #[serde(flatten)]
-        value: Box<CodeQueryDispatchOutcome>,
-    },
-    DispatchTarget {
-        #[serde(flatten)]
-        value: Box<CodeQueryDispatchTarget>,
-    },
-    MemberFamily {
-        #[serde(flatten)]
-        value: Box<CodeQueryMemberFamily>,
-    },
-    MemberFamilyEdge {
-        #[serde(flatten)]
-        value: Box<CodeQueryMemberFamilyEdge>,
-    },
-    PythonHierarchyFact {
-        #[serde(flatten)]
-        value: Box<CodeQueryPythonHierarchyFact>,
-    },
-    Occurrence {
-        #[serde(flatten)]
-        value: Box<CodeQueryOccurrence>,
-    },
-    LexicalScope {
-        #[serde(flatten)]
-        value: Box<CodeQueryLexicalScope>,
-    },
-    Binding {
-        #[serde(flatten)]
-        value: Box<CodeQueryBinding>,
-    },
-    ResolutionCandidate {
-        #[serde(flatten)]
-        value: Box<CodeQueryResolutionCandidate>,
-    },
-    CandidateHop {
-        #[serde(flatten)]
-        value: Box<CodeQueryCandidateHop>,
-    },
-    GenerationSite {
-        #[serde(flatten)]
-        value: Box<CodeQueryGenerationSite>,
-    },
-    Export {
-        #[serde(flatten)]
-        value: Box<CodeQueryExport>,
-    },
-    DeclarationState {
-        #[serde(flatten)]
-        value: Box<CodeQueryDeclarationState>,
-    },
-    ReferenceEdge {
-        #[serde(flatten)]
-        value: Box<CodeQueryReferenceEdge>,
-    },
-    StateEvent {
-        #[serde(flatten)]
-        value: Box<CodeQueryStateEvent>,
-    },
-    BindingInitializerCall {
-        #[serde(flatten)]
-        value: Box<CodeQueryBindingInitializerCall>,
-    },
-    FlowRelation {
-        #[serde(flatten)]
-        value: Box<CodeQueryFlowRelation>,
-    },
-    ControlRelation {
-        #[serde(flatten)]
-        value: Box<CodeQueryControlRelation>,
-    },
-    BranchRelation {
-        #[serde(flatten)]
-        value: Box<CodeQueryBranchRelation>,
-    },
-    LoopRelation {
-        #[serde(flatten)]
-        value: Box<CodeQueryLoopRelation>,
-    },
-    CppExpression {
-        #[serde(flatten)]
-        value: Box<CodeQueryCppExpression>,
-    },
-    FailureHandlerState {
-        #[serde(flatten)]
-        value: Box<CodeQueryFailureHandlerState>,
-    },
-    StatementReachability {
-        #[serde(flatten)]
-        value: Box<CodeQueryStatementReachability>,
-    },
-    PendingCleanupFlow {
-        #[serde(flatten)]
-        value: Box<CodeQueryPendingCleanupFlow>,
-    },
-    PythonRuleFact {
-        #[serde(flatten)]
-        value: Box<CodeQueryPythonRuleFact>,
-    },
-    RustMarkerImpl {
-        #[serde(flatten)]
-        value: Box<CodeQueryRustMarkerImpl>,
-    },
-    RustPointerFinding {
-        #[serde(flatten)]
-        value: Box<CodeQueryRustPointerFinding>,
-    },
-    Guard {
-        #[serde(flatten)]
-        value: Box<CodeQueryGuard>,
-    },
-    RewritePath {
-        #[serde(flatten)]
-        value: Box<CodeQueryRewritePath>,
-    },
-    QualifiedPath {
-        #[serde(flatten)]
-        value: Box<CodeQueryQualifiedPath>,
-    },
-    PathSegment {
-        #[serde(flatten)]
-        value: Box<CodeQueryPathSegment>,
-    },
-    SourceSet {
-        #[serde(flatten)]
-        value: Box<CodeQuerySourceSet>,
-    },
-    BuildTarget {
-        #[serde(flatten)]
-        value: Box<CodeQueryBuildTarget>,
-    },
-    TopologyEdge {
-        #[serde(flatten)]
-        value: Box<CodeQueryTopologyEdge>,
-    },
-    BuildConfiguration {
-        #[serde(flatten)]
-        value: Box<CodeQueryBuildConfiguration>,
-    },
-    CrossDomain {
-        #[serde(flatten)]
-        value: Box<CodeQueryCrossDomain>,
-    },
+    RuntimeKeyedReadValue: Box<CodeQueryRuntimeKeyedReadValue>,
+    CallShape: Box<CodeQueryCallShape>,
+    CallResult: Box<CodeQueryCallResult>,
+    CallArgumentGroup: Box<CodeQueryCallArgumentGroup>,
+    CallArgument: CallArgumentPayload,
+    CallBinding: CallBindingPayload,
+    CallEffect: Box<CodeQueryCallEffect>,
+    CallResultContract: Box<CodeQueryCallResultContract>,
+    CallResultObligation: Box<CodeQueryCallResultObligation>,
+    ResultSubjectUse: Box<CodeQueryResultSubjectUse>,
+    ResultContractUse: Box<CodeQueryResultContractUse>,
+    ResultContractFailureUse: Box<CodeQueryResultContractFailureUse>,
+    NilnessOperation: Box<CodeQueryNilnessOperation>,
+    SwitchCoverage: Box<CodeQuerySwitchCoverage>,
+    AssignmentRelation: Box<CodeQueryAssignmentRelation>,
+    DetachedTaskTransfer: Box<CodeQueryDetachedTaskTransfer>,
+    ProcedureEffect: Box<CodeQueryProcedureEffect>,
+    CallableSignature: Box<CodeQueryCallableSignature>,
+    LiteralOccurrence: Box<CodeQueryLiteralOccurrence>,
+    CallableMetrics: Box<CodeQueryCallableMetrics>,
+    SignatureParameter: Box<CodeQuerySignatureParameter>,
+    DecoratedParameter: Box<CodeQueryDecoratedParameter>,
+    CallableApplicability: Box<CodeQueryCallableApplicability>,
+    OverloadSelection: Box<CodeQueryOverloadSelection>,
+    MemberSelection: Box<CodeQueryMemberSelection>,
+    DispatchOutcome: Box<CodeQueryDispatchOutcome>,
+    DispatchTarget: Box<CodeQueryDispatchTarget>,
+    MemberFamily: Box<CodeQueryMemberFamily>,
+    MemberFamilyEdge: Box<CodeQueryMemberFamilyEdge>,
+    PythonHierarchyFact: Box<CodeQueryPythonHierarchyFact>,
+    Occurrence: Box<CodeQueryOccurrence>,
+    LexicalScope: Box<CodeQueryLexicalScope>,
+    Binding: Box<CodeQueryBinding>,
+    ResolutionCandidate: Box<CodeQueryResolutionCandidate>,
+    CandidateHop: Box<CodeQueryCandidateHop>,
+    GenerationSite: Box<CodeQueryGenerationSite>,
+    Export: Box<CodeQueryExport>,
+    DeclarationState: Box<CodeQueryDeclarationState>,
+    ReferenceEdge: Box<CodeQueryReferenceEdge>,
+    StateEvent: Box<CodeQueryStateEvent>,
+    BindingInitializerCall: Box<CodeQueryBindingInitializerCall>,
+    FlowRelation: Box<CodeQueryFlowRelation>,
+    ControlRelation: Box<CodeQueryControlRelation>,
+    BranchRelation: Box<CodeQueryBranchRelation>,
+    LoopRelation: Box<CodeQueryLoopRelation>,
+    CppExpression: Box<CodeQueryCppExpression>,
+    FailureHandlerState: Box<CodeQueryFailureHandlerState>,
+    StatementReachability: Box<CodeQueryStatementReachability>,
+    PendingCleanupFlow: Box<CodeQueryPendingCleanupFlow>,
+    PythonRuleFact: Box<CodeQueryPythonRuleFact>,
+    RustMarkerImpl: Box<CodeQueryRustMarkerImpl>,
+    RustPointerFinding: Box<CodeQueryRustPointerFinding>,
+    Guard: Box<CodeQueryGuard>,
+    RewritePath: Box<CodeQueryRewritePath>,
+    QualifiedPath: Box<CodeQueryQualifiedPath>,
+    PathSegment: Box<CodeQueryPathSegment>,
+    SourceSet: Box<CodeQuerySourceSet>,
+    BuildTarget: Box<CodeQueryBuildTarget>,
+    TopologyEdge: Box<CodeQueryTopologyEdge>,
+    BuildConfiguration: Box<CodeQueryBuildConfiguration>,
+    CrossDomain: Box<CodeQueryCrossDomain>,
 }
 
 /// Generic structural relationships carried by a full-detail match row.

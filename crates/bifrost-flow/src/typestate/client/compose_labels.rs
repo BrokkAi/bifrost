@@ -43,6 +43,50 @@ mod provenance_tests {
     use brokk_bifrost_core::analyzer::model::Language;
 
     #[test]
+    fn transfer_copies_only_current_states_and_preserves_the_source() {
+        let protocol = ProtocolSpec::from_json(
+            br#"{
+            "schema_version":1,"states":["insecure","secure"],"initial_state":"insecure",
+            "accepting_states":["insecure","secure"],"error_states":[],"events":[{"id":"set_secure","observation":{"occurrence":{"type":"allocation"}}}],
+            "transitions":[{"from":"insecure","on":"set_secure","to":"secure"}],"terminal_expectations":[],
+            "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state",
+                "uncertainty":{"ambiguous_dispatch":"abstain","unknown_call":"abstain",
+                "external_call":"abstain","escape":"abstain","incomplete_analysis":"abstain"}}
+        }"#,
+        )
+        .unwrap()
+        .compile()
+        .unwrap();
+        let bindings =
+            TypestateBindingPlan::try_new(&protocol, vec![], vec![], vec![], vec![]).unwrap();
+        let labels = TypestateComposeLabels::new(&protocol, &bindings);
+        let from = TypestateSubjectId::new(0);
+        let to = TypestateSubjectId::new(1);
+        let source = TypestateComposeFact::formal_entry(
+            &bindings,
+            from,
+            protocol
+                .state_id(&crate::typestate::ProtocolStateKey::new("secure").unwrap())
+                .unwrap(),
+        );
+        let copy = labels.apply(&TypestateComposeFunction::copy_state(from, to), &source);
+        assert_eq!(copy.alternatives().len(), 1);
+        assert_eq!(copy.alternatives()[0].subject(), Some(to));
+        assert_eq!(source.alternatives()[0].subject(), Some(from));
+        assert_eq!(
+            copy.alternatives()[0].protocol_state(),
+            source.alternatives()[0].protocol_state()
+        );
+        let zero = TypestateComposeFact::new([TypestateFact::zero()]);
+        assert!(
+            labels
+                .apply(&TypestateComposeFunction::copy_state(from, to), &zero)
+                .alternatives()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn distinct_first_relations_survive_then_choice_and_projection() {
         let artifact = SemanticArtifactKey::new(
             WorkspaceMountId::hash_bytes(b"relation-test"),
@@ -499,6 +543,12 @@ pub enum TypestateComposeStep {
         from: TypestateSubjectId,
         to: TypestateSubjectId,
     },
+    // Only live states cross a copy edge; past observations do not acquire a
+    // new subject or a new primary site. Future events are bound to the result.
+    CopyState {
+        from: TypestateSubjectId,
+        to: TypestateSubjectId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -628,6 +678,10 @@ impl TypestateComposeFunction {
 
     pub fn map_subject(from: TypestateSubjectId, to: TypestateSubjectId) -> Self {
         Self(vec![Segment::Step(TypestateComposeStep::MapSubject { from, to })].into())
+    }
+
+    pub fn copy_state(from: TypestateSubjectId, to: TypestateSubjectId) -> Self {
+        Self(vec![Segment::Step(TypestateComposeStep::CopyState { from, to })].into())
     }
 
     pub fn event(binding: TypestateEventBindingId) -> Self {
@@ -886,7 +940,8 @@ impl<'a> TypestateComposeLabels<'a> {
                         }
                         let before = collect_events.then(|| current.clone());
                         current = self.apply_step(*step, &current);
-                        if let TypestateComposeStep::MapSubject { from, to } = step
+                        if let TypestateComposeStep::MapSubject { from, to }
+                        | TypestateComposeStep::CopyState { from, to } = step
                             && let FirstUnprovenEvent::Relation(first) = relation
                         {
                             relation = FirstUnprovenEvent::Relation(first.remap(*from, *to));
@@ -966,9 +1021,7 @@ impl<'a> TypestateComposeLabels<'a> {
                         .bindings
                         .event_binding(id)
                         .expect("composed event names a bound event");
-                    if fact.subject() != Some(binding.subject())
-                        || fact.state_observation().is_none()
-                    {
+                    if !fact.accepts_bound_event(binding.subject()) {
                         next.push(*fact);
                     } else if binding.quality().is_definitive() {
                         next.extend(apply_bound_event(
@@ -992,6 +1045,12 @@ impl<'a> TypestateComposeLabels<'a> {
                     }
                 }
                 TypestateComposeStep::Incomplete(cause) => next.push(mark_incomplete(*fact, cause)),
+                TypestateComposeStep::CopyState { from, to } => {
+                    if matches!(fact.0, TypestateFactKind::State { subject, .. } if subject == from)
+                    {
+                        next.push(map_subject(*fact, to));
+                    }
+                }
                 TypestateComposeStep::MapSubject { from, to } => {
                     next.push(if fact.subject() == Some(from) {
                         map_subject(*fact, to)

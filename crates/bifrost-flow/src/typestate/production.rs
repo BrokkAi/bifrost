@@ -1000,6 +1000,7 @@ impl CachedTypestateSummaryResult {
                     .saturating_mul(std::mem::size_of::<ProtocolAdmissionDecision>()),
             )
             .saturating_add(self.result.retained_bytes())
+            .saturating_add(self.root_call_closure.heap_bytes())
             .saturating_add(self.semantic_admission.retained_bytes())
             .saturating_add(
                 self.execution_charge
@@ -1531,6 +1532,7 @@ where
                     incomplete_reasons: vec![
                         RootCallClosureIncompleteReason::UnavailableProjection,
                     ],
+                    class_initializations: Vec::new(),
                 },
                 protocol_cache_status: None,
                 published_protocol_summaries: 0,
@@ -1753,6 +1755,68 @@ pub struct RootCallClosure {
     complete: bool,
     reached: Vec<crate::analyzer::semantic::SemanticLocator>,
     incomplete_reasons: Vec<RootCallClosureIncompleteReason>,
+    class_initializations: Vec<ClassInitialization>,
+}
+
+/// A call that a precise callee summary resolves, whose callee may first
+/// initialize its declaring type (#13668). Class initialization (`<clinit>`:
+/// static blocks and static field initializers, possibly in another file) is
+/// not part of any callee body, so the summary does not cover it. The fact is
+/// derived from the callee's shape and declaring type, and retained with the
+/// bounded in-memory result cache, never persisted. A consumer closes it only
+/// with a fact that proves class
+/// initialization cannot affect its protocol state, such as a tracked resource
+/// proven non-escaping; until one exists it stays open and the answer is
+/// inconclusive.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClassInitialization {
+    pub caller: crate::analyzer::semantic::SemanticLocator,
+    pub call: CallSiteId,
+    pub class: crate::analyzer::semantic::DeclarationLocator,
+}
+
+/// The type whose initialization `callee` may trigger when `caller` calls it,
+/// when the language initializes types on first use. Only a static method or a
+/// constructor can be the first use. A type that is the caller's own innermost
+/// enclosing type is already initialized while the caller runs.
+fn class_initialized_by_call(
+    caller: &ProcedureHandle,
+    callee: &ProcedureHandle,
+) -> Option<crate::analyzer::semantic::DeclarationLocator> {
+    let callee = callee.semantics();
+    if !callee.locator().language().initializes_type_on_first_use()
+        || !(callee.properties().is_static
+            || callee.kind() == crate::analyzer::semantic::ProcedureKind::Constructor)
+    {
+        return None;
+    }
+    class_initialized_by_locator(caller.semantics().locator(), callee.locator())
+}
+
+fn class_initialized_by_locator(
+    caller: &crate::analyzer::semantic::SemanticLocator,
+    callee: &crate::analyzer::semantic::SemanticLocator,
+) -> Option<crate::analyzer::semantic::DeclarationLocator> {
+    use crate::analyzer::semantic::DeclarationSegmentKind;
+    let declaring_type = |segments: &[crate::analyzer::semantic::DeclarationSegment]| {
+        let end = segments
+            .iter()
+            .rposition(|segment| segment.kind() == DeclarationSegmentKind::Type)?;
+        Some(segments[..=end].to_vec())
+    };
+    let class = declaring_type(callee.declaration().segments())?;
+    let own = declaring_type(caller.declaration().segments());
+    if caller.mount() == callee.mount()
+        && caller.path() == callee.path()
+        && caller.language() == callee.language()
+        && own.as_ref() == Some(&class)
+    {
+        return None;
+    }
+    Some(
+        crate::analyzer::semantic::DeclarationLocator::new(class)
+            .expect("a declaring type path is nonempty"),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1768,6 +1832,41 @@ pub enum RootCallClosureIncompleteReason {
 }
 
 impl RootCallClosure {
+    fn heap_bytes(&self) -> usize {
+        self.reached
+            .capacity()
+            .saturating_mul(std::mem::size_of::<
+                crate::analyzer::semantic::SemanticLocator,
+            >())
+            .saturating_add(
+                self.reached
+                    .iter()
+                    .map(crate::value_flow::semantic_locator_heap_bytes)
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.incomplete_reasons
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RootCallClosureIncompleteReason>()),
+            )
+            .saturating_add(
+                self.class_initializations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ClassInitialization>()),
+            )
+            .saturating_add(
+                self.class_initializations
+                    .iter()
+                    .map(|initialization| {
+                        crate::value_flow::semantic_locator_heap_bytes(&initialization.caller)
+                            .saturating_add(crate::dataflow::declaration_locator_heap_bytes(
+                                &initialization.class,
+                            ))
+                    })
+                    .fold(0_usize, usize::saturating_add),
+            )
+    }
+
     pub fn excludes(&self, locator: &crate::analyzer::semantic::SemanticLocator) -> bool {
         self.complete && !self.reached.contains(locator)
     }
@@ -1778,6 +1877,11 @@ impl RootCallClosure {
 
     pub fn incomplete_reasons(&self) -> &[RootCallClosureIncompleteReason] {
         &self.incomplete_reasons
+    }
+
+    /// Calls whose callee may run a class initializer that no summary covers.
+    pub fn class_initializations(&self) -> &[ClassInitialization] {
+        &self.class_initializations
     }
 
     /// Scoped call/control coverage justifies the summary dependencies this
@@ -2412,6 +2516,7 @@ mod root_closure_tests {
         let external_only = RootCallClosure {
             complete: false,
             reached: Vec::new(),
+            class_initializations: Vec::new(),
             incomplete_reasons: vec![RootCallClosureIncompleteReason::ExternalCall],
         };
         assert!(external_only.summary_completeness_justified());
@@ -2459,6 +2564,7 @@ where
             complete: false,
             reached: Vec::new(),
             incomplete_reasons: vec![RootCallClosureIncompleteReason::BudgetStop],
+            class_initializations: Vec::new(),
         }),
         error => Err(error),
     })
@@ -2494,6 +2600,7 @@ where
     let mut coverage = Vec::new();
     let mut admission_refused = false;
     let mut protocol_admissions = Vec::new();
+    let mut class_initializations = Vec::new();
 
     while cursor < procedures.len() {
         let procedure = procedures[cursor].clone();
@@ -2653,6 +2760,29 @@ where
                 continue;
             }
             let outcome = provider.call_transfers(&procedure, call.id, request)?;
+            // A sealed family whose every arm is projected closes the call
+            // once each arm's summary closes too (#11296). Its arms stay
+            // Unproven may-targets; only selection weakness is discharged.
+            let analyzed_family = match &outcome {
+                SemanticOutcome::Complete { value, .. }
+                | SemanticOutcome::Unproven { partial: value, .. } => {
+                    let call_handle = procedure
+                        .call_site_handle(call.id)
+                        .expect("validated call belongs to its procedure");
+                    value
+                        .family_closure(&call_handle)
+                        .map(|closure| closure.analyzed_arms())
+                }
+                _ => None,
+            };
+            let family_closed = analyzed_family.is_some();
+            let outcome = match analyzed_family {
+                Some(value) => SemanticOutcome::Complete {
+                    value,
+                    work: outcome.work(),
+                },
+                None => outcome,
+            };
             let (value, outcome_evidence) = match outcome {
                 SemanticOutcome::Complete { value, .. } => {
                     (value, SummaryEvidence::proven_complete())
@@ -2710,7 +2840,7 @@ where
             let local_transfer = value.boundaries.is_empty()
                 && !value.transfers.is_empty()
                 && value.transfers.iter().all(|transfer| {
-                    matches!(transfer.proof, ProofStatus::Proven)
+                    (family_closed || matches!(transfer.proof, ProofStatus::Proven))
                         && matches!(transfer.completeness, EvidenceCompleteness::Complete)
                 });
             if local_transfer {
@@ -2724,6 +2854,32 @@ where
                 });
             }
             for (boundary_index, boundary) in value.boundaries.iter().enumerate() {
+                // Modeled external summaries remain call boundaries, rather
+                // than materialized callee procedures. Their declaring type
+                // can initialize before the modeled call body runs as well.
+                if let Some(target) = boundary.dispatch.unmaterialized_external_target()
+                    && target.language().initializes_type_on_first_use()
+                    && (!target.has_receiver()
+                        || target
+                            .locator()
+                            .declaration()
+                            .segments()
+                            .last()
+                            .is_some_and(|segment| {
+                                segment.kind()
+                                == crate::analyzer::semantic::DeclarationSegmentKind::Constructor
+                            }))
+                    && let Some(class) = class_initialized_by_locator(
+                        procedure.semantics().locator(),
+                        target.locator(),
+                    )
+                {
+                    class_initializations.push(ClassInitialization {
+                        caller: procedure.semantics().locator().clone(),
+                        call: call.id,
+                        class,
+                    });
+                }
                 closure_complete = false;
                 closure_reasons.push(RootCallClosureIncompleteReason::OpenCall);
                 direct_effects[cursor].push(project_boundary_effect(
@@ -2735,7 +2891,14 @@ where
                 )?);
             }
             for transfer in value.transfers {
-                if !matches!(transfer.proof, ProofStatus::Proven)
+                if let Some(class) = class_initialized_by_call(&procedure, &transfer.callee) {
+                    class_initializations.push(ClassInitialization {
+                        caller: procedure.semantics().locator().clone(),
+                        call: call.id,
+                        class,
+                    });
+                }
+                if !(family_closed || matches!(transfer.proof, ProofStatus::Proven))
                     || !matches!(transfer.completeness, EvidenceCompleteness::Complete)
                 {
                     closure_complete = false;
@@ -2852,6 +3015,7 @@ where
             .map(|procedure| procedure.semantics().locator().clone())
             .collect(),
         incomplete_reasons: closure_reasons,
+        class_initializations,
     };
     Ok(set)
 }
@@ -3025,42 +3189,81 @@ pub fn direct_scalar_source(
         if let SemanticValueKind::ConstantString(text) = semantics.value(value)?.kind.clone() {
             return Some(DirectScalarSource::ConstantString(text));
         }
-        let mut predecessors = semantics
-            .points()
-            .iter()
-            .flat_map(|point| &point.events)
-            .filter_map(|event| match &event.effect {
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver,
-                    source,
-                    target,
-                } if *target == value => Some((*source, None)),
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(transfer),
-                    source,
-                    target,
-                } if *target == value
-                    && transfer.kind == crate::analyzer::semantic::TransferKind::Copy =>
-                {
-                    Some((*source, None))
-                }
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::IntegerOffset { offset },
-                    source,
-                    target,
-                } if *target == value => Some((*source, Some(*offset))),
-                _ => None,
-            });
-        let (predecessor, offset) = predecessors.next()?;
-        if predecessors.next().is_some() {
-            return None;
-        }
+        let (predecessor, offset) = direct_snapshot_predecessor(semantics, value)?;
         if let Some(offset) = offset {
             return Some(DirectScalarSource::IntegerOffset {
                 source: predecessor,
                 offset,
             });
         }
+        value = predecessor;
+    }
+}
+
+/// The one value an immutable snapshot copies, with the offset an integer
+/// copy adds. A value with no copy, or with competing copies, has none.
+fn direct_snapshot_predecessor(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    value: ValueId,
+) -> Option<(
+    ValueId,
+    Option<crate::analyzer::semantic::SignedIntegerMagnitude>,
+)> {
+    let mut predecessors = semantics
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter_map(|event| match &event.effect {
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver,
+                source,
+                target,
+            } if *target == value => Some((*source, None)),
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(transfer),
+                source,
+                target,
+            } if *target == value
+                && transfer.kind == crate::analyzer::semantic::TransferKind::Copy =>
+            {
+                Some((*source, None))
+            }
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset { offset },
+                source,
+                target,
+            } if *target == value => Some((*source, Some(*offset))),
+            _ => None,
+        });
+    let predecessor = predecessors.next()?;
+    predecessors.next().is_none().then_some(predecessor)
+}
+
+/// Whether `value` is an immutable snapshot of `origin`: `origin` itself, or
+/// a chain of single-assignment copies of it. Such a value denotes whatever
+/// `origin` denotes at every point where it can be read, whatever that object
+/// is. A reassigned binding, a write through a capture or an address, a
+/// computed value, or competing sources is not a snapshot.
+pub fn direct_snapshot_of(
+    procedure: &ProcedureHandle,
+    mut value: ValueId,
+    origin: ValueId,
+) -> bool {
+    let semantics = procedure.semantics();
+    let mut visited = crate::hash::HashSet::default();
+    let binding_origins = BindingOriginIndex::from_semantics(semantics);
+    let indirect_writes = indirect_binding_write_targets(semantics, &binding_origins);
+    loop {
+        if !visited.insert(value) || direct_value_is_reassigned(procedure, value, &indirect_writes)
+        {
+            return false;
+        }
+        if value == origin {
+            return true;
+        }
+        let Some((predecessor, None)) = direct_snapshot_predecessor(semantics, value) else {
+            return false;
+        };
         value = predecessor;
     }
 }
@@ -3326,6 +3529,7 @@ fn build_summary_set(
             complete: false,
             reached: Vec::new(),
             incomplete_reasons: vec![RootCallClosureIncompleteReason::UnavailableProjection],
+            class_initializations: Vec::new(),
         },
     })
 }

@@ -571,6 +571,7 @@ fn native_definition_retains_canonical_ambiguity_when_display_units_coincide() {
         vec![repeated_left(), repeated_left()],
         ResolutionCompletion::Complete,
         false,
+        false,
     );
     assert_eq!(single.status, DefinitionLookupStatus::Resolved);
     assert_eq!(single.definitions.len(), 1);
@@ -578,6 +579,7 @@ fn native_definition_retains_canonical_ambiguity_when_display_units_coincide() {
         &left_site,
         vec![left, right],
         ResolutionCompletion::Complete,
+        false,
         false,
     );
     assert_eq!(outcome.definitions.len(), 1, "{outcome:#?}");
@@ -754,23 +756,22 @@ fn native_import_alternatives_share_one_terminal_budget_and_cancellation() {
     );
     assert_eq!(value.definitions.len(), 2);
     let exact = ReceiverAnalysisBudget {
-        max_scope_nodes: work.scope_nodes,
         max_summary_expansions: work.summary_expansions,
         max_resolution_rounds: work.resolution_rounds,
         ..ReceiverAnalysisBudget::default()
     };
     assert_eq!(complete_definition(run(exact, None)).definitions.len(), 2);
-    assert!(work.scope_nodes > 0);
+    assert!(work.resolution_rounds > 0);
     assert!(matches!(
         run(
             ReceiverAnalysisBudget {
-                max_scope_nodes: work.scope_nodes - 1,
+                max_resolution_rounds: work.resolution_rounds - 1,
                 ..exact
             },
             None
         ),
         BoundedResolution::Exceeded {
-            limit: ReceiverBudgetLimit::ScopeNodes,
+            limit: ReceiverBudgetLimit::ResolutionRounds,
             ..
         }
     ));
@@ -4756,6 +4757,326 @@ fn rust_definition_batch_reuses_one_selected_operation_per_file() {
     }
 }
 
+fn check_incomplete_macro_frontier_reuse(repetitions: usize) {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, capture_query_reads};
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_macro_frontier_cache_counts_for_test;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::take_selection_open_counts_for_test;
+
+    // The same external Option receiver questions that recur in the depth
+    // cutoff fixture, with multiple cleanup members in one procedure.
+    let source = r#"pub trait Base { fn base() -> Self; }
+pub trait Sub: Base + external::Unknown {}
+pub fn leak<T: Sub>(password: &str, outer: Option<Option<Option<Option<Option<Option<Option<Option<Option<Option<Option<Option<i32>>>>>>>>>>>>) -> i32 {
+    T::base();
+    let step0 = outer.expect("step");
+    let step1 = step0.expect("step");
+    let step2 = step1.expect("step");
+    let step3 = step2.expect("step");
+    let step4 = step3.expect("step");
+    let step5 = step4.expect("step");
+    let step6 = step5.expect("step");
+    let step7 = step6.expect("step");
+    let step8 = step7.expect("step");
+    let step9 = step8.expect("step");
+    let step10 = step9.expect("step");
+    step10.expect(password)
+}
+"#;
+    let (project, rust) = rust_source_project(source);
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let file = project.file("src/lib.rs");
+    let tree = rust_tree(source);
+    let site = reference_site(source, "base");
+    let cancellation = CancellationToken::new();
+    let factory = RustDefinitionOperationFactory::new(analyzer, &cancellation).unwrap();
+    let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+        analyzer,
+        Arc::new(brokk_bifrost_analysis::analyzer::ReadLedger::new()),
+        "policy=test.incomplete-frontier".to_owned(),
+    );
+    let run = || {
+        let (answer, reads) = capture_query_reads(analyzer, || {
+            let SelectedResolutionOperationOpenOutcome::Ready(operation) =
+                factory.open(&cancellation).unwrap()
+            else {
+                panic!("ready operation")
+            };
+            let mut operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+            factory.resolve(
+                &mut operation,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: ReceiverAnalysisBudget::default(),
+                    cancellation: Some(&cancellation),
+                },
+            )
+        });
+        let BoundedResolution::Complete { value, .. } = &answer else {
+            panic!("complete lookup: {answer:?}")
+        };
+        assert_eq!(
+            value.status,
+            DefinitionLookupStatus::Incomplete,
+            "{answer:?}"
+        );
+        assert!(
+            value.incomplete_evidence.as_ref().is_some_and(|evidence| {
+                matches!(&evidence.completion,
+                    brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(reasons)
+                    if reasons.iter().any(|reason| matches!(reason,
+                        brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::OpenBoundary {
+                            status: brokk_bifrost_analysis::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                            ..
+                        }
+                    ))
+                )
+            }),
+            "{answer:?}"
+        );
+        (
+            format!("{answer:?}"),
+            format!("{:?}", reads.keys()),
+            reads.unattributed_reads(),
+            reads.execution_dependences(),
+        )
+    };
+    take_macro_frontier_cache_counts_for_test();
+    take_selection_open_counts_for_test();
+    let first = run();
+    for _ in 1..repetitions {
+        assert_eq!(first, run(), "retained answers and read channels");
+    }
+    let (hits, preparations) = take_macro_frontier_cache_counts_for_test();
+    let (fresh, reused) = take_selection_open_counts_for_test();
+    eprintln!(
+        "#12167 operations={repetitions} exact_set={hits} preparations={preparations} fresh={fresh} retained={reused}"
+    );
+    assert_eq!(
+        hits,
+        repetitions - 1,
+        "second and later operations hit exact_set"
+    );
+    assert_eq!(preparations, 1);
+    assert!(reused > 0 && fresh <= 1, "fresh={fresh}, retained={reused}");
+    set_macro_frontier_cache_disabled_for_test(true);
+    // Open without the receipt bridge for the cold control.
+    let cold = {
+        let (answer, reads) = capture_query_reads(analyzer, || {
+            resolve_rust_definition_bounded(BoundedReceiverQuery {
+                analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: Some(&cancellation),
+            })
+        });
+        (
+            format!("{answer:?}"),
+            format!("{:?}", reads.keys()),
+            reads.unattributed_reads(),
+            reads.execution_dependences(),
+        )
+    };
+    set_macro_frontier_cache_disabled_for_test(false);
+    assert_eq!(
+        first, cold,
+        "retained selection equals cold answers and receipts"
+    );
+}
+
+#[test]
+#[hardwon("#12167: an incomplete binding answer discarded the reader's macro frontier")]
+fn incomplete_binding_macro_frontier_receipt_parity() {
+    check_incomplete_macro_frontier_reuse(2);
+}
+
+#[test]
+#[hardwon("#12167: repeated type-proof questions opened a fresh selection every time")]
+fn incomplete_binding_macro_frontier_selection_counts() {
+    check_incomplete_macro_frontier_reuse(8);
+}
+
+mod macro_retention_model_authority {
+    use brokk_bifrost_analysis::analyzer::resolution::ExternalOwnerIdentity;
+    use brokk_bifrost_analysis::analyzer::resolution::registry_vocabulary::ModeledExternalPackageIdentity;
+    use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+    use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+        ModelOwnerAnswer, ModelProviderSelection, ModelSymbolRef, ModelTypeOwnerAnswer,
+        SemanticModelOverlayBuildError, SemanticModelSymbol,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels;
+    use brokk_bifrost_core::analyzer::model::Language;
+    use std::sync::Arc;
+    pub(super) struct Authority(pub &'static str);
+    impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority
+        for Authority
+    {
+        fn model_declared_types_named(
+            &self,
+            _language: &str,
+            _names: &[&str],
+        ) -> Result<
+            std::sync::Arc<std::collections::HashSet<(String, String)>>,
+            SemanticModelOverlayBuildError,
+        > {
+            unimplemented!("this fixture only reads the model identity")
+        }
+        fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>> {
+            None
+        }
+        fn model_selected_groups(
+            &self,
+            _language: &str,
+            _reference: &TypeRef,
+            _selection: &ModelProviderSelection,
+            _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+        ) -> Result<Vec<Vec<SemanticModelSymbol>>, SemanticModelOverlayBuildError> {
+            unimplemented!("this fixture only reads the model identity")
+        }
+        fn model_type_owner(
+            &self,
+            _language: &str,
+            _nominal: &TypeRef,
+            _selection: &ModelProviderSelection,
+            _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+        ) -> Result<ModelTypeOwnerAnswer<SemanticModelSymbol>, SemanticModelOverlayBuildError>
+        {
+            unimplemented!("this fixture only reads the model identity")
+        }
+        fn model_member_declarations(
+            &self,
+            _owner: &ModelSymbolRef,
+            _selection: &ModelProviderSelection,
+            _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+        ) -> Result<Option<ModelOwnerAnswer>, SemanticModelOverlayBuildError> {
+            unimplemented!("this fixture only reads the model identity")
+        }
+        fn model_callable_results(
+            &self,
+            _callable: &ModelSymbolRef,
+            _selection: &ModelProviderSelection,
+            _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+        ) -> Result<Option<Vec<Option<TypeRef>>>, SemanticModelOverlayBuildError> {
+            unimplemented!("this fixture only reads the model identity")
+        }
+        fn modeled_external_package_identity(
+            &self,
+            _language: Language,
+            _import_path: &str,
+        ) -> Option<ModeledExternalPackageIdentity> {
+            None
+        }
+        fn declares_jvm_type(&self, _fqn: &str) -> bool {
+            false
+        }
+        fn declared_jvm_owner(&self, _fqn: &str) -> Option<ExternalOwnerIdentity> {
+            None
+        }
+        fn active_model_set_hash(&self) -> &str {
+            self.0
+        }
+    }
+}
+
+#[test]
+#[hardwon("#12167: retained macro frontiers replayed an unchecked model-set receipt")]
+fn retained_macro_frontier_rejects_changed_models() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, capture_query_reads};
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionStageOutcome, take_macro_frontier_cache_counts_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    let source = "macro_rules! identity { ($value:expr) => { $value }; } pub struct Item; pub fn run() { let _ = identity!(Item); }";
+    let (project, rust) = rust_source_project(source);
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let file = project.file("src/lib.rs");
+    let tree = rust_tree(source);
+    let site = reference_site(source, "Item");
+    let cancellation = CancellationToken::new();
+    let snapshots = rust.inner.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+    let services =
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(analyzer);
+    let factory = RustDefinitionOperationFactory::new(analyzer, &cancellation).unwrap();
+    let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+        analyzer,
+        Arc::new(brokk_bifrost_analysis::analyzer::ReadLedger::new()),
+        "policy=test.model-frontier".to_owned(),
+    );
+    let run = |hash, cache| {
+        let (answer, reads) = capture_query_reads(analyzer, || {
+            let input = rust
+                .selected_resolution_operation_input(&snapshots, &languages, &[])
+                .with_analyzer(&services)
+                .with_model_authority(Some(Arc::new(macro_retention_model_authority::Authority(
+                    hash,
+                ))));
+            let SelectedResolutionOperationOpenOutcome::Ready(operation) = rust
+                .inner
+                .analyzer_store()
+                .open_selected_resolution_operation(input, &cancellation)
+                .unwrap()
+            else {
+                panic!("ready operation")
+            };
+            let mut operation = *operation;
+            if cache {
+                operation = operation.with_macro_frontier_reads(Box::new(analyzer));
+            }
+            assert!(matches!(
+                operation
+                    .prepare_selected_macro_frontiers_for_files(&[file.rel_path()], &cancellation)
+                    .unwrap(),
+                SelectedResolutionStageOutcome::Ready
+            ));
+            factory.resolve(
+                &mut operation,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: ReceiverAnalysisBudget::default(),
+                    cancellation: Some(&cancellation),
+                },
+            )
+        });
+        (
+            format!("{answer:?}"),
+            format!("{:?}", reads.keys()),
+            reads.unattributed_reads(),
+            reads.execution_dependences(),
+        )
+    };
+    // Publish lazy macro capsules before checking a pristine retained front.
+    run("first", false);
+    take_macro_frontier_cache_counts_for_test();
+    run("first", true);
+    take_macro_frontier_cache_counts_for_test();
+    run("first", true);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test(),
+        (1, 0),
+        "the unchanged model authority reuses its certified front"
+    );
+    let changed = run("second", true);
+    let (hits, preparations) = take_macro_frontier_cache_counts_for_test();
+    assert_eq!(hits, 0);
+    assert_eq!(preparations, 1);
+    assert_eq!(
+        changed,
+        run("second", false),
+        "changed authority equals cold answers and receipts"
+    );
+}
+
 #[test]
 #[hardwon("#11281+#8410: projected macro inputs lost import bindings and repeated frontier work")]
 fn repeated_macro_point_reads_match_unshared_preparation() {
@@ -5689,7 +6010,7 @@ fn pristine_macro_fronts_keep_file_sets_and_isolate_reader_histories() {
     let cancelled_consumer = BoundedResolution::Cancelled {
         work: Default::default(),
     };
-    second.observe_macro_retention_result(macro_retention_complete(&cancelled_consumer));
+    second.observe_macro_retention_result(macro_retention_allowed(&cancelled_consumer));
     drop(second);
     let after_cancelled = open();
     assert_eq!(prepare(&after_cancelled, "src/b.rs"), cold_b);
@@ -5851,10 +6172,11 @@ struct MacroBoundaryReads<'a> {
 impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads
     for MacroBoundaryReads<'_>
 {
-    fn capture(&self, prepare: &mut dyn FnMut() -> brokk_bifrost_analysis::analyzer::store::Result<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionStageOutcome>) -> (brokk_bifrost_analysis::analyzer::store::Result<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionStageOutcome>, Box<dyn std::any::Any + Send + Sync>){
+    fn capture(&self, active_model_set_hash: Option<&str>, prepare: &mut dyn FnMut() -> brokk_bifrost_analysis::analyzer::store::Result<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionStageOutcome>) -> (brokk_bifrost_analysis::analyzer::store::Result<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionStageOutcome>, Box<dyn std::any::Any + Send + Sync>){
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads;
         (self.before)();
-        let result = SelectedMacroFrontierReads::capture(&self.analyzer, prepare);
+        let result =
+            SelectedMacroFrontierReads::capture(&self.analyzer, active_model_set_hash, prepare);
         (self.after)();
         result
     }
@@ -5864,8 +6186,12 @@ impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacr
     fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize {
         brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads::receipt_bytes(&self.analyzer,receipt)
     }
-    fn receipt_is_reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool {
-        self.reusable && brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads::receipt_is_reusable(&self.analyzer,receipt)
+    fn receipt_is_reusable(
+        &self,
+        receipt: &(dyn std::any::Any + Send + Sync),
+        active_model_set_hash: Option<&str>,
+    ) -> bool {
+        self.reusable && brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads::receipt_is_reusable(&self.analyzer,receipt, active_model_set_hash)
     }
     fn policy_unit_label(&self) -> Option<String> {
         None
@@ -6029,4 +6355,106 @@ fn macro_front_owned_publication_is_ready_then_retains_the_second_build() {
         1,
         "the second build was retained"
     );
+}
+
+#[test]
+#[hardwon(
+    "#13540: contextual generic results accepted a trait-object coercion destination as the source type"
+)]
+fn expected_result_witness_guard_cannot_be_bypassed_by_callable_or_impl_results() {
+    for definition in [
+        "pub fn make<W: Shape>() -> W { loop {} }",
+        "pub struct Wrapper<W>(W); impl<W: Shape> Wrapper<W> { pub fn make() -> W { loop {} } }",
+    ] {
+        let callee = if definition.contains("Wrapper") {
+            "Wrapper::make()"
+        } else {
+            "make()"
+        };
+        for (annotation, expected) in [
+            ("&dyn Shape", None),
+            ("Box<dyn Shape>", None),
+            ("Square", Some("Square")),
+            ("SquareAlias", Some("Square")),
+            ("U", Some("U")),
+            ("Erased", None),
+        ] {
+            let source = format!(
+                "pub trait Shape {{}} pub struct Square; impl Shape for Square {{}} pub type SquareAlias = Square; pub type Erased = &'static dyn Shape; pub union U {{ pub value: u32 }} impl Shape for U {{}} {definition} pub fn caller() {{ let value: {annotation} = {callee}; }}"
+            );
+            let outcome = complete_type(run_type(
+                &source,
+                "make",
+                ReceiverAnalysisBudget::default(),
+                None,
+            ));
+            if let Some(expected) = expected {
+                assert_eq!(
+                    outcome.status,
+                    TypeLookupStatus::Resolved,
+                    "{source}: {outcome:#?}"
+                );
+                assert!(
+                    outcome
+                        .types
+                        .iter()
+                        .any(|ty| ty.fqn.rsplit('.').next() == Some(expected)),
+                    "{outcome:#?}"
+                );
+            } else {
+                assert_eq!(
+                    outcome.status,
+                    TypeLookupStatus::Incomplete,
+                    "bypassed expected-result guard: {source}: {outcome:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "#14209: an attribute macro in the module made a call under an explicitly imported external type an incomplete lookup, which kept a model-bound call inconclusive"
+)]
+fn explicit_external_import_decides_route_head_under_attribute_frontier() {
+    let manifest = "[package]\nname = \"plugin_host\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ntokio = \"1\"\ntokio-tar = \"0.3\"\n";
+    let call = "pub fn install(upload: u8) { let _ = Archive::new(upload); }";
+    // An item an expansion adds to the importing module cannot take the
+    // imported name. One added to an enclosing block, or to a module that
+    // sees the name through a glob, can.
+    let cases = [
+        (
+            "module attribute",
+            format!("use tokio_tar::Archive;\n{call}\n#[tokio::main]\nasync fn main() {{}}\n"),
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+        ),
+        (
+            "block attribute",
+            "use tokio_tar::Archive;\npub fn install(upload: u8) { #[tokio::main]\nasync fn helper() {}\n let _ = Archive::new(upload); }\n".to_owned(),
+            DefinitionLookupStatus::Incomplete,
+        ),
+        (
+            "attributed import",
+            format!("#[cfg_attr(unix, path_attr)]\nuse tokio_tar::Archive;\n{call}\n#[tokio::main]\nasync fn main() {{}}\n"),
+            DefinitionLookupStatus::Incomplete,
+        ),
+        (
+            "glob import",
+            format!("use tokio_tar::*;\n{call}\n#[tokio::main]\nasync fn main() {{}}\n"),
+            DefinitionLookupStatus::Incomplete,
+        ),
+        (
+            "glob of the importing module",
+            format!("use tokio_tar::Archive;\nmod inner {{ use super::*; #[tokio::main]\nasync fn helper() {{}}\n {call} }}\n"),
+            DefinitionLookupStatus::Incomplete,
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let files = [("Cargo.toml", manifest), ("src/main.rs", source.as_str())];
+        for name in ["Archive", "new"] {
+            let outcome =
+                definition_in_workspace(&files, "src/main.rs", "Archive::new(upload)", name);
+            assert_eq!(outcome.status, expected, "{label}, {name}: {outcome:#?}");
+        }
+    }
 }

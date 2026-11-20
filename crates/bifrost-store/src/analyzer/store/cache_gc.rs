@@ -25,8 +25,11 @@ pub fn maybe_gc_for_analyzer(
     };
     let reclaimed = if _build_lock.is_some() {
         store
-            .reclaim_stale_generations(i64::MAX as usize)
-            .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?
+            .reclaim_jvm_external_publications()
+            .map_err(|error| format!("JVM provider retention failed: {error}"))?
+            + store
+                .reclaim_stale_generations(i64::MAX as usize)
+                .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?
     } else {
         0
     };
@@ -58,8 +61,11 @@ pub fn force_gc_for_analyzer(
     let _build_lock =
         AnalyzerCacheBuildLock::acquire(db_path, "reclaiming stale analyzer generations")?;
     let reclaimed = store
-        .reclaim_stale_generations(i64::MAX as usize)
-        .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?;
+        .reclaim_jvm_external_publications()
+        .map_err(|error| format!("JVM provider retention failed: {error}"))?
+        + store
+            .reclaim_stale_generations(i64::MAX as usize)
+            .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?;
     if brokk_bifrost_core::cache_gc::planner_statistics_enabled() {
         if reclaimed > 0 {
             store
@@ -72,4 +78,25 @@ pub fn force_gc_for_analyzer(
         }
     }
     Ok(outcome)
+}
+
+impl AnalyzerStore {
+    /// Bound projection identities independently of which binary runs collection.
+    pub fn reclaim_jvm_external_publications(&self) -> super::Result<usize> {
+        self.conn.execute(|conn| {
+            // Keep the current identity and one previous identity during an upgrade
+            // handoff. With three or more binaries sharing a cache, a reader may
+            // republish an evicted identity: this costs time but is never unsound.
+            Ok(conn.execute(
+                "DELETE FROM jvm_external_provider_publications WHERE publication_sequence IN (
+                    SELECT publication_sequence FROM (
+                        SELECT publication_sequence, row_number() OVER (
+                            PARTITION BY semantic_sha256 ORDER BY publication_sequence DESC
+                        ) AS publication_rank FROM jvm_external_provider_publications
+                    ) WHERE publication_rank > 2
+                )",
+                [],
+            )?)
+        })
+    }
 }

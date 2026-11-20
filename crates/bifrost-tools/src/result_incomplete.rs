@@ -50,6 +50,10 @@ impl From<QueryReadIncomplete> for ToolResultIncomplete {
                 Some("semantic models selected but not published".into()),
             ),
             QueryReadIncomplete::Cancelled => (R::Cancelled, None),
+            QueryReadIncomplete::InternalInvariant(detail) => (
+                R::AnalysisFailure,
+                Some(format!("internal invariant: {detail}")),
+            ),
             QueryReadIncomplete::StructureUnavailable(file) => (
                 R::StructureUnavailable,
                 Some(format!("indexed syntax was unavailable for {file:?}")),
@@ -93,6 +97,21 @@ mod tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#13024: missing producer causes must retain an internal-bug diagnostic")]
+    fn internal_invariant_uses_existing_analysis_failure_wire_shape() {
+        let result = ToolResultIncomplete::from(QueryReadIncomplete::InternalInvariant(
+            "route_read: failed producer recorded no typed cause",
+        ));
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({
+                "reason": "analysis_failure",
+                "detail": "internal invariant: route_read: failed producer recorded no typed cause"
+            })
+        );
+    }
 
     #[test]
     #[hardwon("#11145: cancelled proof stops surfaced as analysis failures")]

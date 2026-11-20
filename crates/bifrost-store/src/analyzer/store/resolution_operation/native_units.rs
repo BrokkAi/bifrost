@@ -9,6 +9,47 @@ use crate::analyzer::resolution::{LoweredDeclarationTypeProperty, NamedArgumentL
 use brokk_bifrost_core::analyzer::model::DeclarationKind;
 use brokk_bifrost_core::analyzer::resolution_facts::DeclarationTypeRole;
 
+#[derive(Debug)]
+pub(in crate::analyzer::store) struct JvmExternalMemberMetadata {
+    pub member_name: String,
+    is_static: bool,
+    callable_parameter_count: Option<u32>,
+    declaration_is_abstract: Option<bool>,
+}
+
+pub(in crate::analyzer::store) fn selected_jvm_external_member_metadata(
+    connection: &rusqlite::Connection,
+    owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
+    ordinal: u32,
+    generation: i64,
+) -> Result<JvmExternalMemberMetadata> {
+    let guarded = super::super::jvm_external_publication::jvm_inventory_guarded_sql(
+        "SELECT member_name,is_static,CASE WHEN signature_present=1 AND member_kind IN ('method','function','constructor') THEN json_array_length(parameters_jsonb) END,is_abstract FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3",
+        4,
+    );
+    let mut statement = connection.prepare_cached(&guarded)?;
+    let mut rows = statement.query(rusqlite::params![
+        owner.provider_id.as_ref(),
+        owner.owner_fqn.as_ref(),
+        ordinal,
+        generation
+    ])?;
+    let row = rows
+        .next()?
+        .expect("the generation guard always returns a row");
+    if !row.get::<_, bool>(5)? {
+        return Err(StoreError::stale_resolution(
+            "JVM provider inventory changed during the request",
+        ));
+    }
+    Ok(JvmExternalMemberMetadata {
+        member_name: row.get(0)?,
+        is_static: row.get(1)?,
+        callable_parameter_count: row.get(2)?,
+        declaration_is_abstract: row.get(3)?,
+    })
+}
+
 pub(in crate::analyzer::store) const NATIVE_ARGUMENT_REASON_IDENTITY_DIGEST_SQL: &str =
     "SELECT CAST(input.key AS INTEGER), catalog.identity_digest
      FROM json_each(?1) AS input
@@ -204,6 +245,7 @@ static GO_TARGET_KEY_ACQUISITION_SQL: std::sync::LazyLock<String> =
         )
     });
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn go_target_keys(
     ready: &ReadySelectedResolution<'_, '_>,
     ordinal: SelectedResolutionMountOrdinal,
@@ -354,6 +396,7 @@ fn go_unresolved_route_exempt(
         || (!direct && bridge && !has_links && nameless && anonymous_type)
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn go_unresolved_route_check(
     ready: &ReadySelectedResolution<'_, '_>,
     ordinal: SelectedResolutionMountOrdinal,
@@ -482,6 +525,7 @@ pub fn go_target_nominated_semantics_sql_for_test() -> &'static str {
 /// end in stored unit keys, none of which has the target's identifier.
 /// Incomplete route data anywhere in the file keeps the match
 /// `Unavailable`; a reverse query returning no row is not that proof.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn go_selected_target_match(
     ready: &ReadySelectedResolution<'_, '_>,
     ordinal: SelectedResolutionMountOrdinal,
@@ -741,6 +785,10 @@ pub struct ProjectedNativeExternalMember {
     pub member_name: String,
     #[doc(hidden)]
     pub is_static: bool,
+    /// Whether this row comes from the built-in intrinsic member surface
+    /// rather than an artifact inventory. An intrinsic row names a member but
+    /// is not evidence enough to mint an inherited-call receipt.
+    pub is_intrinsic: bool,
     /// Abstract flag of this exact inventory row; NULL remains unknown.
     pub declaration_is_abstract: Option<bool>,
     /// The parameter count of a method or constructor whose signature the
@@ -899,9 +947,22 @@ pub fn project_native_model_member_selection(
     }))
 }
 
+/// One selected inherited external instance member reached from a source type.
+/// This request-local receipt permits invocation proving, not publication.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct SelectedInheritedExternalMember {
+    pub identity: crate::analyzer::resolution::ExternalMemberIdentity,
+    pub member_name: String,
+    pub declaration_is_abstract: Option<bool>,
+}
+
 #[doc(hidden)]
 #[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub struct SelectedNativeReferenceUnits {
+    /// Receiver admission and post-overload concrete-method proof for this answer.
+    pub java_qualified_super_proven: bool,
+    pub java_inherited_external_member: Option<SelectedInheritedExternalMember>,
     pub query_obligations: crate::analyzer::resolution::QueryObligations,
     #[doc(hidden)]
     pub answer: FactResolutionAnswer,
@@ -920,6 +981,10 @@ pub struct SelectedNativeReferenceUnits {
     #[doc(hidden)]
     pub static_type_qualifier_reason_digests:
         Vec<(crate::analyzer::resolution::ExternalOwnerIdentity, [u8; 32])>,
+    /// Reasons that keep an ambiguous qualifier name open; see
+    /// `JVM_IMPORT_MEMBER_ROUTE_OPEN_OBSCURING`.
+    #[doc(hidden)]
+    pub obscuring_name_reason_digests: Vec<[u8; 32]>,
     #[doc(hidden)]
     pub definitions: SelectedNativeDefinitions,
     #[doc(hidden)]
@@ -1616,6 +1681,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn selected_declaration_value_site(
         &self,
         locator: &SelectedSemanticLocator,
@@ -1897,7 +1963,9 @@ impl SelectedResolutionOperation<'_, '_> {
         &mut self,
         prepared: super::GoPreparedImportContext,
         query_result_slot: Option<SemanticId>,
-        go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+        selected_receiver_override: Option<
+            crate::analyzer::resolution::SelectedReceiverSlotOverride,
+        >,
         locator: &SelectedSemanticLocator,
         definition: Option<SemanticId>,
         budget: ReceiverAnalysisBudget,
@@ -1928,7 +1996,7 @@ impl SelectedResolutionOperation<'_, '_> {
             artifacts: Some(artifacts),
             language_demand: super::NativeLanguageDemand::Go {
                 demand: Box::new(prepared.demand),
-                receiver_overlay: go_receiver_overlay,
+                receiver_overlay: selected_receiver_override,
             },
             selected_import_gap: None,
             query_result_slot,
@@ -2144,7 +2212,9 @@ impl SelectedResolutionOperation<'_, '_> {
     pub fn resolve_native_reference_units_bounded_for_go_request(
         &mut self,
         prepared: super::GoPreparedImportContext,
-        go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+        selected_receiver_override: Option<
+            crate::analyzer::resolution::SelectedReceiverSlotOverride,
+        >,
         locator: &SelectedSemanticLocator,
         budget: ReceiverAnalysisBudget,
         cancellation: &CancellationToken,
@@ -2154,7 +2224,7 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> Result<BoundedResolution<NativeReferenceUnitsOutcome>> {
         self.resolve_native_reference_units_bounded_for_go_request_with_reader(
             prepared,
-            go_receiver_overlay,
+            selected_receiver_override,
             locator,
             budget,
             cancellation,
@@ -2170,7 +2240,9 @@ impl SelectedResolutionOperation<'_, '_> {
     pub fn resolve_native_reference_units_bounded_for_go_request_with_reader(
         &mut self,
         prepared: super::GoPreparedImportContext,
-        go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+        selected_receiver_override: Option<
+            crate::analyzer::resolution::SelectedReceiverSlotOverride,
+        >,
         locator: &SelectedSemanticLocator,
         budget: ReceiverAnalysisBudget,
         cancellation: &CancellationToken,
@@ -2190,7 +2262,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 artifacts: Some(artifacts),
                 language_demand: super::NativeLanguageDemand::Go {
                     demand: Box::new(prepared.demand),
-                    receiver_overlay: go_receiver_overlay,
+                    receiver_overlay: selected_receiver_override,
                 },
                 selected_import_gap: None,
                 query_result_slot: None,
@@ -2201,6 +2273,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(session.finish(outcome))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn resolve_native_reference_units_in_session(
         &mut self,
         query: super::NativeReferenceQuery<'_>,
@@ -2236,6 +2309,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 let call_binding_reason_digests = operation.external_call_binding_reason_digests(&answer)?;
                 let constructor_hierarchy_reason_digests = operation.constructor_hierarchy_reason_digests(&answer)?;
                 let static_type_qualifier_reason_digests = operation.static_type_qualifier_reason_digests(&answer)?;
+                let obscuring_name_reason_digests = operation.obscuring_name_reason_digests(&answer)?;
                 let mut argument_reason_ids = Vec::new();
                 if let Some(binding) = &argument_binding
                     && let crate::analyzer::resolution::ResolutionCompletion::Incomplete(reasons) = binding.completion()
@@ -2268,22 +2342,23 @@ impl SelectedResolutionOperation<'_, '_> {
                         if !external_source.is_jvm_external_provider(&owner.provider_id) {
                             continue;
                         }
-                        let (member_name, is_static, callable_parameter_count, declaration_is_abstract) = if let Some(members) = super::super::resolution_typed::external_owners::intrinsic_member_inventory_for_owner(ready.inventory.connection(), &owner)? {
-                            (members[ordinal as usize].name.to_owned(), false, None, None)
-                        } else { ready.inventory.connection().prepare_cached("SELECT member_name,is_static,CASE WHEN signature_present=1 AND member_kind IN ('method','function','constructor') THEN json_array_length(parameters_jsonb) END,is_abstract FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3")?.query_row(
-                            rusqlite::params![owner.provider_id.as_ref(),owner.owner_fqn.as_ref(),ordinal],
-                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))? };
+                        let (member_name, is_static, callable_parameter_count, declaration_is_abstract, is_intrinsic) = if let Some(members) = super::super::resolution_typed::external_owners::intrinsic_member_inventory_for_owner(ready.inventory.connection(), &owner, ready.jvm_inventory_generation()?)? {
+                            (members[ordinal as usize].name.to_owned(), false, None, None, true)
+                        } else {
+                            let metadata = selected_jvm_external_member_metadata(ready.inventory.connection(), &owner, ordinal, ready.jvm_inventory_generation()?)?;
+                            (metadata.member_name, metadata.is_static, metadata.callable_parameter_count, metadata.declaration_is_abstract, false)
+                        };
                         external_members.push(ProjectedNativeExternalMember {
                             coordinate: crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(ordinal),
                             identity: crate::analyzer::resolution::ExternalMemberIdentity { owner: owner.clone(), ordinal },
-                            member_name, is_static, callable_parameter_count, declaration_is_abstract,
+                            member_name, is_static, callable_parameter_count, declaration_is_abstract, is_intrinsic,
                             declaring_language: ready.model_authority().and_then(|authority| authority.active_models()).and_then(|models| {
-                                models.shards().iter().find(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref())
+                                models.shards().iter().find(|shard| shard.inventory_provider_id() == owner.provider_id.as_ref())
                                     .and_then(|shard| Language::from_config_label(&shard.manifest.language))
                             }),
                             pack: ready.context_identities.is_jvm_package_member_target(target).then(|| {
                                 let shards = ready.model_authority().and_then(|authority| authority.active_models()).expect("selected package member has an active pack").shards();
-                                let shard = shards.iter().find(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref()).expect("member provider is active");
+                                let shard = shards.iter().find(|shard| shard.inventory_provider_id() == owner.provider_id.as_ref()).expect("member provider is active");
                                 (shard.manifest.pack_id.clone(), shard.manifest.version.clone())
                             }),
                         });
@@ -2389,7 +2464,21 @@ impl SelectedResolutionOperation<'_, '_> {
                     .is_empty()
                     .then(|| ready.context_identities.java_explicit_import_boundary(reference))
                     .flatten();
+                // The resolver already proved access, including JLS 6.6.2.1's
+                // qualifier rule for a protected member, before it selected a
+                // complete binding, so any accessible instance member qualifies.
+                let java_inherited_external_member = operation.java_inherited_external_member(&answer)
+                    .and_then(|(identity, implicit_interface)| {
+                        let member = external_members.iter().find(|member| member.identity == identity && !member.is_static && !member.is_intrinsic)?;
+                        Some(SelectedInheritedExternalMember {
+                            identity,
+                            member_name: member.member_name.clone(),
+                            declaration_is_abstract: if implicit_interface { Some(true) } else { member.declaration_is_abstract },
+                        })
+                    });
                 let selected = SelectedNativeReferenceUnits {
+                    java_inherited_external_member,
+                    java_qualified_super_proven: operation.proves_java_qualified_super(reference, &answer),
                     query_obligations: answer.query_obligations.clone(),
                     answer,
                     argument_binding,
@@ -2397,6 +2486,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     call_binding_reason_digests,
                     constructor_hierarchy_reason_digests,
                     static_type_qualifier_reason_digests,
+                    obscuring_name_reason_digests,
                     definitions,
                     external_members,
                     model_member_selection,
@@ -2980,6 +3070,7 @@ impl ReadySelectedResolution<'_, '_> {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn selected_argument_reason_digests_batch(
     inventory: &SelectedResolutionMountInventory<'_>,
     reasons: &[SemanticId],
@@ -3186,6 +3277,7 @@ mod argument_reason_digest_tests {
 }
 
 /// Canonical Python declaration placement from the selected file publication.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn python_definition_module_anchor(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     ordinal: SelectedResolutionMountOrdinal,
@@ -3218,6 +3310,7 @@ pub fn python_definition_module_anchor(
 
 /// Go package placement authority for a selected definition's OwnModule anchor.
 #[doc(hidden)]
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub fn go_definition_module_anchor(
     selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     ordinal: SelectedResolutionMountOrdinal,
@@ -3536,6 +3629,7 @@ fn selected_public_completion_details(
 }
 
 /// Locate the source evidence of a semantic through the native row relations.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn selected_public_diagnostic_site(
     ready: &ReadySelectedResolution<'_, '_>,
     semantic: SemanticId,
@@ -3574,6 +3668,7 @@ pub(super) fn selected_public_diagnostic_site(
 }
 
 /// Resolve evidence for one query only. No identity lookup survives its answer.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn selected_public_diagnostic_identity(
     ready: &ReadySelectedResolution<'_, '_>,
     semantic: SemanticId,
@@ -3845,6 +3940,7 @@ fn project_native_definition_units_with_language(
 /// The reverse candidate reader constructed these IDs from complete selected
 /// rows, so their mount/local-key coordinates already have source authority.
 /// Do not rediscover that provenance once per candidate.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn project_hydrated_source_definition_units(
     ready: &ReadySelectedResolution<'_, '_>,
     definitions: &[SemanticId],
@@ -4653,6 +4749,7 @@ fn project_native_trace_provenance(
 
 /// The exact source token establishes a binder. Recipes provide its structured
 /// target segments; neither its target declaration nor a facts-arena node is guessed.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn project_native_import_binder(
     ready: &ReadySelectedResolution<'_, '_>,
     token: SemanticId,
@@ -4847,8 +4944,486 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
+impl super::super::resolution_typed::SelectedNominalKindProvider
+    for ReadySelectedResolution<'_, '_>
+{
+    fn refuse_reuse(&self) {
+        if let Some(analyzer) = self.analyzer {
+            analyzer.refuse_read_reuse();
+        }
+    }
+
+    fn records_class_like_staticness(&self, language: Language) -> bool {
+        language == Language::CSharp
+    }
+
+    fn class_like_metadata(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<Vec<crate::analyzer::resolution::fact_source::SelectedDeclarationClassLikeMetadata>>,
+    > {
+        use crate::analyzer::resolution::fact_source::{
+            SelectedClassLikeMetadataPart as Part, SelectedDeclarationClassLikeMetadata as Row,
+        };
+        let lexical = self.lexical_source();
+        let mut sources = Vec::new();
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let Some(SelectedSemanticProvenance::FragmentLocal(local)) =
+                lexical.semantic_provenance(definition, cancellation)?
+            else {
+                if let Some(analyzer) = self.analyzer {
+                    analyzer.refuse_read_reuse();
+                }
+                continue;
+            };
+            let ordinal = local.mount().ordinal();
+            let record = self.inventory.mount_record_by_ordinal(ordinal)?;
+            let language = record.semantic_language();
+            if !self.records_class_like_staticness(language) {
+                continue;
+            }
+            sources.push((definition, (ordinal, local.local_key())));
+        }
+        let Some(metadata) = self.selected_source_declaration_metadata(sources, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut result = Vec::with_capacity(metadata.len());
+        for (definition, selected) in metadata {
+            let (metadata_complete, parts) = match selected {
+                SelectedSourceMetadata::Recorded { metadata, .. } => (
+                    true,
+                    metadata
+                        .iter()
+                        .map(|value| {
+                            let kind = value.class_like_kind();
+                            Part {
+                                kind,
+                                is_static: kind.map(|_| value.class_like_is_static()),
+                            }
+                        })
+                        .collect(),
+                ),
+                SelectedSourceMetadata::Missing | SelectedSourceMetadata::Unavailable => {
+                    (false, Vec::new())
+                }
+            };
+            result.push(Row {
+                definition,
+                metadata_complete,
+                staticness_recorded: true,
+                parts,
+            });
+        }
+        Ok((!cancellation.is_cancelled()).then_some(result))
+    }
+
+    fn target_kinds(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<
+            Vec<(
+                SemanticId,
+                crate::analyzer::resolution::NominalParentTargetKind,
+            )>,
+        >,
+    > {
+        use crate::analyzer::resolution::NominalParentTargetKind as Kind;
+        use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+        use brokk_bifrost_core::analyzer::model::ClassLikeKind;
+
+        let lexical = self.lexical_source();
+        let mut result = Vec::with_capacity(definitions.len());
+        let mut sources = Vec::new();
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if let Some(symbol) = self.context_identities.model_member_identity(definition) {
+                // The accessor records Models even when this declaration is
+                // missing; reading the captured field directly would bypass it.
+                let Some(authority) = self.model_authority() else {
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.refuse_read_reuse();
+                    }
+                    result.push((definition, Kind::Incomplete));
+                    continue;
+                };
+                let Some(active) = authority.active_models() else {
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.refuse_read_reuse();
+                    }
+                    result.push((definition, Kind::Incomplete));
+                    continue;
+                };
+                let kind = if let Some(declaration) =
+                    python_models::declaration(&*authority, &active, &symbol, cancellation)?
+                {
+                    if declaration.declaration.provenance.ambiguous {
+                        Kind::Ambiguous
+                    } else if declaration.declaration.provenance.completeness
+                        != crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+                    {
+                        Kind::Incomplete
+                    } else {
+                        match declaration.declaration.kind {
+                            SemanticModelSymbolKind::Class | SemanticModelSymbolKind::Record => {
+                                Kind::Class
+                            }
+                            SemanticModelSymbolKind::Interface => Kind::Interface,
+                            SemanticModelSymbolKind::Struct => Kind::Struct,
+                            SemanticModelSymbolKind::Enum => Kind::Enum,
+                            SemanticModelSymbolKind::TypeAlias => Kind::Incomplete,
+                            SemanticModelSymbolKind::Annotation
+                            | SemanticModelSymbolKind::Delegate
+                            | SemanticModelSymbolKind::Trait
+                            | SemanticModelSymbolKind::Union
+                            | SemanticModelSymbolKind::Module
+                            | SemanticModelSymbolKind::Constructor
+                            | SemanticModelSymbolKind::Method
+                            | SemanticModelSymbolKind::Function
+                            | SemanticModelSymbolKind::Field
+                            | SemanticModelSymbolKind::Property
+                            | SemanticModelSymbolKind::Constant
+                            | SemanticModelSymbolKind::Static
+                            | SemanticModelSymbolKind::Macro
+                            | SemanticModelSymbolKind::Event => Kind::NonBase,
+                        }
+                    }
+                } else {
+                    Kind::Missing
+                };
+                result.push((definition, kind));
+                continue;
+            }
+            let Some(provenance) = lexical.semantic_provenance(definition, cancellation)? else {
+                return Ok(None);
+            };
+            match provenance {
+                SelectedSemanticProvenance::FragmentLocal(local) => {
+                    sources.push((definition, (local.mount().ordinal(), local.local_key())));
+                }
+                SelectedSemanticProvenance::Shared(_) | SelectedSemanticProvenance::Stage(_) => {
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.refuse_read_reuse();
+                    }
+                    result.push((definition, Kind::Missing));
+                }
+            }
+        }
+        let Some(metadata) = self.selected_source_declaration_metadata(sources, cancellation)?
+        else {
+            return Ok(None);
+        };
+        for (definition, metadata) in metadata {
+            let kind = match metadata {
+                SelectedSourceMetadata::Missing => Kind::Missing,
+                SelectedSourceMetadata::Unavailable => Kind::Incomplete,
+                SelectedSourceMetadata::Recorded { metadata, .. } => {
+                    let mut kinds = metadata.iter().filter_map(|value| value.class_like_kind());
+                    match kinds.next() {
+                        None => Kind::Missing,
+                        Some(first) if kinds.any(|kind| kind != first) => Kind::Ambiguous,
+                        Some(ClassLikeKind::Class) => Kind::Class,
+                        Some(ClassLikeKind::Interface) => Kind::Interface,
+                        Some(ClassLikeKind::Struct) => Kind::Struct,
+                        Some(ClassLikeKind::Enum) => Kind::Enum,
+                    }
+                }
+            };
+            result.push((definition, kind));
+        }
+        Ok((!cancellation.is_cancelled()).then_some(result))
+    }
+    fn method_attributes(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<
+            Vec<(
+                SemanticId,
+                crate::analyzer::resolution::SelectedDeclarationMethodAttributes,
+            )>,
+        >,
+    > {
+        use crate::analyzer::resolution::SelectedDeclarationMethodAttributes as Attributes;
+        use crate::analyzer::semantic_model::{
+            SemanticModelCompleteness, SemanticModelSymbolKind, Visibility,
+        };
+        let lexical = self.lexical_source();
+        let mut result = Vec::with_capacity(definitions.len());
+        let mut sources = Vec::new();
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if let Some(symbol) = self.context_identities.model_member_identity(definition) {
+                // The accessor records Models on hits and misses. Never use
+                // captured model fields as a replacement for that receipt.
+                let attributes = if let (Some(_), Some(authority)) =
+                    (self.analyzer, self.model_authority())
+                    && let Some(active) = authority.active_models()
+                    && let Some(selected) =
+                        python_models::declaration(&*authority, &active, &symbol, cancellation)?
+                    && !selected.declaration.provenance.ambiguous
+                    && selected.declaration.provenance.completeness
+                        == SemanticModelCompleteness::Complete
+                {
+                    Attributes {
+                        is_method: Some(
+                            selected.declaration.kind == SemanticModelSymbolKind::Method,
+                        ),
+                        is_static: Some(selected.declaration.is_static),
+                        is_public: Some(selected.declaration.visibility == Visibility::Public),
+                    }
+                } else {
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.refuse_read_reuse();
+                    }
+                    Attributes::default()
+                };
+                result.push((definition, attributes));
+                continue;
+            }
+            let Some(provenance) = lexical.semantic_provenance(definition, cancellation)? else {
+                return Ok(None);
+            };
+            match provenance {
+                SelectedSemanticProvenance::FragmentLocal(local) => {
+                    sources.push((definition, (local.mount().ordinal(), local.local_key())))
+                }
+                SelectedSemanticProvenance::Shared(_) | SelectedSemanticProvenance::Stage(_) => {
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.refuse_read_reuse();
+                    }
+                    result.push((definition, Attributes::default()));
+                }
+            }
+        }
+        let Some(metadata) = self.selected_source_declaration_metadata(sources, cancellation)?
+        else {
+            return Ok(None);
+        };
+        for (definition, selected) in metadata {
+            let attributes = match selected {
+                SelectedSourceMetadata::Missing | SelectedSourceMetadata::Unavailable => {
+                    Attributes::default()
+                }
+                SelectedSourceMetadata::Recorded { unit, metadata } => {
+                    source_method_attributes(&unit, &metadata)
+                }
+            };
+            result.push((definition, attributes));
+        }
+        Ok((!cancellation.is_cancelled()).then_some(result))
+    }
+}
+
+/// Query-local canonical source answer shared by kind and member admission.
+enum SelectedSourceMetadata {
+    Missing,
+    Unavailable,
+    Recorded {
+        unit: CodeUnit,
+        metadata: Vec<brokk_bifrost_core::analyzer::model::SignatureMetadata>,
+    },
+}
+
+/// A function-valued CodeUnit is not necessarily a type member. Structured
+/// owner kinds are included in declaration_id, and therefore in the FULL
+/// signature metadata receipt that authorizes this selected question.
+fn source_method_attributes(
+    unit: &CodeUnit,
+    metadata: &[brokk_bifrost_core::analyzer::model::SignatureMetadata],
+) -> crate::analyzer::resolution::SelectedDeclarationMethodAttributes {
+    use crate::analyzer::resolution::SelectedDeclarationMethodAttributes as Attributes;
+    use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+    Attributes {
+        is_method: if unit.is_function() && unit.owner_is_type_scope() {
+            consistent_recorded_attribute(metadata.iter().map(|value| {
+                value
+                    .callable_modifiers_recorded()
+                    .then_some(!value.callable_is_constructor())
+            }))
+        } else {
+            Some(false)
+        },
+        is_static: consistent_recorded_attribute(metadata.iter().map(|value| {
+            value
+                .callable_modifiers_recorded()
+                .then_some(value.callable_is_static())
+        })),
+        is_public: consistent_recorded_attribute(metadata.iter().map(|value| {
+            value
+                .callable_modifiers_recorded()
+                .then(|| value.callable_declared_visibility())
+                .flatten()
+                .filter(|visibility| *visibility != DeclaredVisibility::Unknown)
+                .map(|visibility| visibility == DeclaredVisibility::Public)
+        })),
+    }
+}
+
+fn consistent_recorded_attribute<T: Copy + Eq>(
+    mut values: impl Iterator<Item = Option<T>>,
+) -> Option<T> {
+    let first = values.next()??;
+    values.all(|value| value == Some(first)).then_some(first)
+}
+
+impl ReadySelectedResolution<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
+    fn selected_source_declaration_metadata(
+        &self,
+        sources: Vec<(
+            SemanticId,
+            (SelectedResolutionMountOrdinal, ResolutionLocalKey),
+        )>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<(SemanticId, SelectedSourceMetadata)>>> {
+        let mut result = Vec::with_capacity(sources.len());
+        let coordinates = sources
+            .iter()
+            .map(|(_, coordinate)| *coordinate)
+            .collect::<Vec<_>>();
+        let Some(mut rows) = read_fragment_definition_rows(self, &coordinates, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut selected = Vec::new();
+        for (definition, coordinate) in sources {
+            let keys = rows
+                .units
+                .get(&coordinate)
+                .into_iter()
+                .flatten()
+                .map(|row| row.unit_key)
+                .collect::<HashSet<_>>();
+            let projected = project_fragment_definition(self, coordinate, &mut rows)?;
+            let (Some(SelectedNativeDefinition::Unit(unit)), Some(&unit_key)) =
+                (projected, keys.iter().next().filter(|_| keys.len() == 1))
+            else {
+                // No canonical declaration question can honestly be recorded
+                // for an unavailable or ambiguous unit. Refuse outer reuse.
+                if let Some(analyzer) = self.analyzer {
+                    analyzer.refuse_read_reuse();
+                }
+                result.push((definition, SelectedSourceMetadata::Missing));
+                continue;
+            };
+            let mount = self.inventory.mount_record_by_ordinal(coordinate.0)?;
+            selected.push((definition, unit, mount.blob_id(), unit_key));
+        }
+        for selected in selected.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let requests = super::super::resolution::json_pair_array(
+                selected.iter().map(|(_, _, blob, key)| (*blob, *key)),
+            );
+            let columns = super::super::signature_metadata_projection_columns_sql("metadata");
+            let sql = format!(
+                "SELECT CAST(request.key AS INTEGER), {columns}
+                 FROM json_each(?1) AS request
+                 CROSS JOIN main.unit_signature_metadata_values AS metadata
+                   ON metadata.blob_id=json_extract(request.value,'$[0]')
+                  AND metadata.unit_key=json_extract(request.value,'$[1]')
+                 ORDER BY CAST(request.key AS INTEGER), metadata.ordinal"
+            );
+            let mut metadata: Vec<
+                Option<Vec<brokk_bifrost_core::analyzer::model::SignatureMetadata>>,
+            > = vec![Some(Vec::new()); selected.len()];
+            {
+                let mut statement = self.inventory.connection().prepare_cached(&sql)?;
+                let available_column = statement.column_count() - 1;
+                let mut query = statement.query([&requests])?;
+                while let Some(row) = query.next()? {
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let index = row.get::<_, usize>(0)?;
+                    if row.get::<_, Option<bool>>(available_column)? != Some(true) {
+                        metadata[index] = None;
+                    } else if let Some(values) = &mut metadata[index] {
+                        values.push(super::super::signature_metadata_projection_from_row(
+                            row, 1,
+                        )?);
+                    }
+                }
+            }
+            // Statements and query guards are gone before borrowed recording.
+            // The recorder hashes the FULL ordered canonical vector, never a
+            // synthetic vector containing only the class-like kind.
+            for ((definition, unit, _, _), metadata) in selected.iter().zip(metadata) {
+                let (Some(analyzer), Some(metadata)) = (self.analyzer, metadata) else {
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.refuse_read_reuse();
+                    }
+                    result.push((*definition, SelectedSourceMetadata::Unavailable));
+                    continue;
+                };
+                analyzer.record_selected_signature_metadata(unit, Some(&metadata));
+                result.push((
+                    *definition,
+                    SelectedSourceMetadata::Recorded {
+                        unit: unit.clone(),
+                        metadata,
+                    },
+                ));
+            }
+        }
+        Ok((!cancellation.is_cancelled()).then_some(result))
+    }
+}
+
+#[cfg(test)]
+mod method_attribute_authority_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7314: exported package functions were certified as public instance methods")]
+    fn selected_method_authority_requires_a_structural_type_owner() {
+        let source = "package api\ntype T struct{}\nfunc Exported(){}\nfunc (T) Method(){}\n";
+        let tree = brokk_bifrost_go::parse::parse_go(source).unwrap();
+        let root = std::env::temp_dir().join("selected-method-authority");
+        let file = ProjectFile::new(root, "api.go");
+        let parsed = brokk_bifrost_go::declarations::parse_go_file(&file, source, &tree);
+        for (name, is_method) in [("Exported", false), ("Method", true)] {
+            let (unit, metadata) = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.identifier() == name)
+                .expect("actual Go callable metadata");
+            assert!(
+                metadata
+                    .iter()
+                    .all(|value| value.callable_modifiers_recorded()
+                        && !value.callable_is_static()
+                        && !value.callable_is_constructor())
+            );
+            let attributes = source_method_attributes(unit, metadata);
+            assert_eq!(
+                attributes,
+                crate::analyzer::resolution::SelectedDeclarationMethodAttributes {
+                    is_method: Some(is_method),
+                    is_static: Some(false),
+                    is_public: Some(true),
+                },
+                "{unit:?}: {metadata:?}"
+            );
+        }
+    }
+}
+
 // These accessors use selected rows and registry identities, never source ASTs.
 impl ReadySelectedResolution<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn recorded_operator_inventory(
         &self,
         kind: crate::analyzer::read_ledger::LookupKind,
@@ -4890,6 +5465,7 @@ impl ReadySelectedResolution<'_, '_> {
         Ok(Some(answer.rows))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn selected_operator_files_for_blob(&self, oid: git2::Oid) -> Result<Vec<ProjectFile>> {
         self.inventory
             .connection()
@@ -4988,6 +5564,11 @@ impl super::super::language_support::SelectedTypeHeadSource for ReadySelectedRes
                 Some(unit) => Read::Available(
                     super::super::language_support::SelectedNominalHeadDeclaration {
                         identity: unit.declaration_id(),
+                        rust_declaration_kind: super::rust_crate_rows::selected_declaration_kind(
+                            self,
+                            identity,
+                            &CancellationToken::default(),
+                        )?,
                         declaration: unit,
                     },
                 ),
@@ -5094,6 +5675,7 @@ impl super::super::language_support::SelectedTypeHeadSource for ReadySelectedRes
             },
         ))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn standard_type_root(
         &self,
         file: &ProjectFile,
@@ -5235,6 +5817,7 @@ impl super::super::language_support::SelectedTypeHeadSource for ReadySelectedRes
         }
         Ok(Some(SelectedTypeOwner::Source(unit)))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn intern_owner(
         &self,
         owner: &super::super::language_support::SelectedTypeOwner,
@@ -5292,5 +5875,19 @@ impl super::super::language_support::SelectedTypeHeadSource for ReadySelectedRes
             }
             SelectedTypeOwner::ExternalPath(_) => Ok(None),
         }
+    }
+}
+
+impl ReadySelectedResolution<'_, '_> {
+    pub(super) fn rust_model_selected_read(
+        &self,
+    ) -> Option<super::super::selected_read::SelectedRead<'_>> {
+        let services = self
+            .rust_macro_invocation_services
+            .as_deref()
+            .or(self.analyzer)?;
+        Some(super::super::selected_read::SelectedRead::new(
+            self, services,
+        ))
     }
 }

@@ -28,8 +28,6 @@ mod bounded_tests {
 
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
     use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
 
     use tree_sitter::Tree;
@@ -619,28 +617,6 @@ void advance(ring_t *ring) { get(ring, ring->count - 2)->next = 0; }
             builds, 1,
             "initializer inference must reuse the source-ordered binding engine"
         );
-    }
-
-    #[test]
-    fn bounded_cpp_wide_deep_walk_stops_without_partial_result() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let outcome = resolve_cpp_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::tiny(),
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
-        ));
     }
 
     #[test]

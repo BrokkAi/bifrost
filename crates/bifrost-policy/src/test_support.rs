@@ -296,7 +296,8 @@ fn rust_dependency_snapshot(
             toolchain: None,
             target: Some("x86_64-unknown-linux-gnu".to_owned()),
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         })
         .collect();
     test_snapshot_from_compiled_pack_with_evidences(

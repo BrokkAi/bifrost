@@ -81,7 +81,7 @@ fn context_kind(value: i64) -> Result<RustSourceContextKind> {
         5 => Ok(RustSourceContextKind::Block),
         6 => Ok(RustSourceContextKind::DeclarationBody),
         7 => Ok(RustSourceContextKind::Type),
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust source context kind {value}"
         ))),
     }
@@ -129,7 +129,7 @@ fn wrapper_kind(value: i64) -> Result<RustTypeWrapperSourceKind> {
         1 => Ok(RustTypeWrapperSourceKind::Pointer),
         2 => Ok(RustTypeWrapperSourceKind::Array),
         3 => Ok(RustTypeWrapperSourceKind::Slice),
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust type wrapper kind {value}"
         ))),
     }
@@ -150,7 +150,7 @@ fn macro_fragment_kind(value: i64) -> Result<MacroFragmentKind> {
         10 => Ok(MacroFragmentKind::Vis),
         11 => Ok(MacroFragmentKind::Lifetime),
         12 => Ok(MacroFragmentKind::Literal),
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust macro fragment kind {value}"
         ))),
     }
@@ -165,7 +165,7 @@ fn macro_ident_role(value: i64) -> Result<MacroIdentRole> {
         4 => Ok(MacroIdentRole::Mixed),
         5 => Ok(MacroIdentRole::Unused),
         6 => Ok(MacroIdentRole::Undetermined),
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust macro ident role {value}"
         ))),
     }
@@ -176,7 +176,7 @@ fn macro_delimiter(value: i64) -> Result<RustMacroDelimiter> {
         0 => Ok(RustMacroDelimiter::Parenthesis),
         1 => Ok(RustMacroDelimiter::Bracket),
         2 => Ok(RustMacroDelimiter::Brace),
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust macro delimiter {value}"
         ))),
     }
@@ -187,7 +187,7 @@ fn macro_repetition_operator(value: i64) -> Result<RustMacroRepetitionOperator> 
         0 => Ok(RustMacroRepetitionOperator::Star),
         1 => Ok(RustMacroRepetitionOperator::Plus),
         2 => Ok(RustMacroRepetitionOperator::Optional),
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust macro repetition operator {value}"
         ))),
     }
@@ -196,11 +196,11 @@ fn macro_repetition_operator(value: i64) -> Result<RustMacroRepetitionOperator> 
 fn macro_expansion(kind: i64, root: Option<SourceOccurrenceId>) -> Result<RustItemMacroExpansion> {
     match kind {
         0 => root.map(RustItemMacroExpansion::Parsed).ok_or_else(|| {
-            StoreError::new("parsed Rust item macro expansion has no root occurrence")
+            StoreError::corrupt("parsed Rust item macro expansion has no root occurrence")
         }),
         1 => {
             if root.is_some() {
-                return Err(StoreError::new(
+                return Err(StoreError::corrupt(
                     "empty Rust item macro expansion has a root occurrence",
                 ));
             }
@@ -208,7 +208,7 @@ fn macro_expansion(kind: i64, root: Option<SourceOccurrenceId>) -> Result<RustIt
         }
         2 => {
             if root.is_some() {
-                return Err(StoreError::new(
+                return Err(StoreError::corrupt(
                     "missing-interior Rust item macro expansion has a root occurrence",
                 ));
             }
@@ -218,7 +218,7 @@ fn macro_expansion(kind: i64, root: Option<SourceOccurrenceId>) -> Result<RustIt
         }
         3 => {
             if root.is_some() {
-                return Err(StoreError::new(
+                return Err(StoreError::corrupt(
                     "unavailable Rust item macro expansion has a root occurrence",
                 ));
             }
@@ -228,13 +228,13 @@ fn macro_expansion(kind: i64, root: Option<SourceOccurrenceId>) -> Result<RustIt
         }
         4 => {
             if root.is_some() {
-                return Err(StoreError::new(
+                return Err(StoreError::corrupt(
                     "unrequested Rust item macro expansion has a root occurrence",
                 ));
             }
             Ok(RustItemMacroExpansion::NotRequested)
         }
-        _ => Err(StoreError::new(format!(
+        _ => Err(StoreError::corrupt(format!(
             "invalid Rust item macro expansion kind {kind}"
         ))),
     }
@@ -249,7 +249,7 @@ fn require_source_fact_index<T: std::fmt::Debug>(
     collection: &str,
 ) -> Result<usize> {
     indices.get(&occurrence).copied().ok_or_else(|| {
-        StoreError::new(format!(
+        StoreError::corrupt(format!(
             "Rust item {label} references missing {kind} {occurrence:?}; {collection}={facts:?}"
         ))
     })
@@ -273,13 +273,13 @@ fn require_owned_context(
         "contexts",
     )?;
     let Some(own_index) = owner_context_indices.get(&owner).copied() else {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "Rust item {label} has no owned context for declaration {owner:?}; contexts={contexts:?}"
         )));
     };
     let own_context = &contexts[own_index];
     if own_context.kind != expected || own_context.parent != Some(containing_context) {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "Rust item {label} owned context is inconsistent: declaration={owner:?}, containing={containing_context:?}, expected_kind={expected:?}, own_context={own_context:?}, contexts={contexts:?}"
         )));
     }
@@ -289,7 +289,7 @@ fn require_owned_context(
 fn require_dense_ordinal(ordinal: i64, expected: usize, label: &str) -> Result<usize> {
     let ordinal = nonnegative_usize(ordinal, label)?;
     if ordinal != expected {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "Rust item {label} ordinal {ordinal} is not dense at {expected}"
         )));
     }
@@ -326,18 +326,19 @@ impl RustSourceStorage for AnalyzerStore {
             return Ok(None);
         }
 
-        self.read_source_transaction("rust", generation, |tx| {
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust");
+        self.read_blob_source_transaction(&key, generation, |tx| {
             if !keep_going() {
                 return Ok(None);
             }
 
             let oid_text = oid.to_string();
-            type RustPublicationHeader = (i64, i64, i64, Option<i64>, i64, Option<i64>, Option<i64>);
+            type RustPublicationHeader = (i64, i64, i64, Option<i64>, i64, Option<i64>, Option<i64>, Option<i64>);
             let witness: Option<RustPublicationHeader> = tx
                 .query_row(
                     "SELECT keys.blob_id, item.logical_rows, item.payload_bytes,
                             item.macro_facts_version, module.root_occurrence_id, item.type_forms_version,
-                            item.macro_contexts_version
+                            item.macro_contexts_version, census.arguments_version
                        FROM rust_published_fact_blobs AS keys
                        JOIN source_fact_manifests AS manifest
                          ON manifest.blob_id = keys.blob_id
@@ -345,6 +346,8 @@ impl RustSourceStorage for AnalyzerStore {
                          ON item.blob_id = keys.blob_id
                        JOIN source_rust_module_manifests AS module
                          ON module.blob_id = keys.blob_id
+                       JOIN source_rust_impl_census_files AS census
+                         ON census.blob_id = keys.blob_id
                       WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.parse_variant = x''
                         AND keys.generation = ?2
                         AND manifest.publication_state = 'complete'
@@ -365,6 +368,7 @@ impl RustSourceStorage for AnalyzerStore {
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
+                            row.get(7)?,
                         ))
                     },
                 )
@@ -377,25 +381,31 @@ impl RustSourceStorage for AnalyzerStore {
                 root_value,
                 type_forms_version,
                 macro_contexts_version,
+                arguments_version,
             )) = witness
             else {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "published Rust blob {oid} has no complete Rust item/type marker"
                 )));
             };
             if macro_facts_version != Some(RUST_MACRO_FACTS_VERSION) {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "published Rust blob {oid} has unavailable macro source facts marker {macro_facts_version:?}"
                 )));
             }
             if type_forms_version != Some(RUST_TYPE_FORMS_VERSION) {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "published Rust blob {oid} has unavailable compound type facts marker {type_forms_version:?}"
                 )));
             }
             if macro_contexts_version != Some(RUST_MACRO_CONTEXTS_VERSION) {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "published Rust blob {oid} has unavailable macro context facts marker {macro_contexts_version:?}"
+                )));
+            }
+            if arguments_version != Some(1) {
+                return Err(StoreError::new(format!(
+                    "published Rust blob {oid} has unavailable macro argument facts marker {arguments_version:?}"
                 )));
             }
             let expected_rows = nonnegative_usize(expected_rows, "item logical_rows")?;
@@ -420,7 +430,7 @@ impl RustSourceStorage for AnalyzerStore {
                 }
                 let occurrence = source_occurrence(row.get(0)?, "item syntax")?;
                 if syntax_indices.insert(occurrence, syntax.len()).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust item syntax occurrence {occurrence:?}; syntax={syntax:?}"
                     )));
                 }
@@ -466,7 +476,7 @@ impl RustSourceStorage for AnalyzerStore {
                         | RustSourceContextKind::Type,
                         None,
                     ) => {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust source context {context:?} of kind {kind:?} has no owner"
                         )));
                     }
@@ -476,7 +486,7 @@ impl RustSourceStorage for AnalyzerStore {
                         | RustSourceContextKind::DeclarationBody,
                         Some(owner),
                     ) => {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust source context {context:?} of kind {kind:?} has unexpected owner {owner:?}"
                         )));
                     }
@@ -485,7 +495,7 @@ impl RustSourceStorage for AnalyzerStore {
                 let expanding_attribute_starts = row
                     .get::<_, Option<String>>(5)?
                     .ok_or_else(|| {
-                        StoreError::new(format!(
+                        StoreError::corrupt(format!(
                             "published Rust blob has unavailable expanding-attribute context facts: context={context:?}"
                         ))
                     })?;
@@ -509,7 +519,7 @@ impl RustSourceStorage for AnalyzerStore {
                     expanding_attribute_starts,
                 };
                 if context_indices.insert(context, ordinal).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust item context {context:?}; contexts={contexts:?}"
                     )));
                 }
@@ -519,7 +529,7 @@ impl RustSourceStorage for AnalyzerStore {
             drop(statement);
 
             if contexts.is_empty() {
-                return Err(StoreError::new(
+                return Err(StoreError::corrupt(
                     "schema54 Rust item marker has no context root",
                 ));
             }
@@ -530,13 +540,13 @@ impl RustSourceStorage for AnalyzerStore {
                 || contexts[0].owner.is_some()
                 || contexts[0].kind != RustSourceContextKind::FileRoot
             {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "invalid Rust item context root expected={expected_root:?}; contexts={contexts:?}"
                 )));
             }
             for (index, context) in contexts.iter().enumerate() {
                 if !syntax_indices.contains_key(&context.context) {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust source context has no shared syntax row: context={context:?}, syntax={syntax:?}"
                     )));
                 }
@@ -552,7 +562,7 @@ impl RustSourceStorage for AnalyzerStore {
                     "contexts",
                 )?;
                 if parent_index >= index {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust item context parent is not earlier: child={context:?}, parent={parent:?}, contexts={contexts:?}"
                     )));
                 }
@@ -563,7 +573,7 @@ impl RustSourceStorage for AnalyzerStore {
                     continue;
                 };
                 if owner_context_indices.insert(owner, index).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "multiple Rust source contexts own declaration {owner:?}; contexts={contexts:?}"
                     )));
                 }
@@ -594,7 +604,7 @@ impl RustSourceStorage for AnalyzerStore {
                     "impl",
                 )?;
                 if impl_indices.insert(declaration, impls.len()).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust impl declaration {declaration:?}; impls={impls:?}"
                     )));
                 }
@@ -647,7 +657,7 @@ impl RustSourceStorage for AnalyzerStore {
                     "trait",
                 )?;
                 if trait_indices.insert(declaration, traits.len()).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust trait declaration {declaration:?}; traits={traits:?}"
                     )));
                 }
@@ -687,7 +697,7 @@ impl RustSourceStorage for AnalyzerStore {
                     "contexts",
                 )?;
                 if alias_indices.insert(declaration, aliases.len()).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust alias declaration {declaration:?}; aliases={aliases:?}"
                     )));
                 }
@@ -731,7 +741,7 @@ impl RustSourceStorage for AnalyzerStore {
                     .insert(declaration, callables.len())
                     .is_some()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust callable declaration {declaration:?}; callables={callables:?}"
                     )));
                 }
@@ -811,7 +821,7 @@ impl RustSourceStorage for AnalyzerStore {
                             name,
                         }),
                         pair => {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "incomplete Rust generic parameter name {pair:?}"
                             )));
                         }
@@ -819,7 +829,7 @@ impl RustSourceStorage for AnalyzerStore {
                 };
                 if generics.last().map(|group| group.declaration) != Some(declaration) {
                     let owner_context = owner_context_indices.get(&declaration).copied()
-                        .ok_or_else(|| StoreError::new(format!(
+                        .ok_or_else(|| StoreError::corrupt(format!(
                             "Rust generic parameter has no owner context: declaration={declaration:?}; contexts={contexts:?}"
                         )))?;
                     if !matches!(
@@ -829,7 +839,7 @@ impl RustSourceStorage for AnalyzerStore {
                             | RustSourceContextKind::Function
                             | RustSourceContextKind::Type
                     ) {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust generic parameter has invalid owner context: declaration={declaration:?}; context={:?}",
                             contexts[owner_context]
                         )));
@@ -873,7 +883,7 @@ impl RustSourceStorage for AnalyzerStore {
                     syntax_kind: row.get(4)?,
                 };
                 if !syntax_indices.contains_key(&child.occurrence) {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust body child has no shared syntax row {child:?}; syntax={syntax:?}"
                     )));
                 }
@@ -892,7 +902,7 @@ impl RustSourceStorage for AnalyzerStore {
                     )?;
                     traits[index].body_children.push(child);
                 } else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust body child has missing item owner {owner:?}; impls={impls:?}, traits={traits:?}"
                     )));
                 }
@@ -925,14 +935,14 @@ impl RustSourceStorage for AnalyzerStore {
                             name,
                         }),
                         pair => {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "incomplete Rust callable parameter label {pair:?}"
                             )));
                         }
                     },
                 };
                 let Some(index) = callable_indices.get(&owner).copied() else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust callable parameter has missing item owner {owner:?}; callables={callables:?}"
                     )));
                 };
@@ -981,7 +991,7 @@ impl RustSourceStorage for AnalyzerStore {
                         Some(1) => RustItemMacroSourcePosition::ItemStatement,
                         Some(2) => RustItemMacroSourcePosition::Other,
                         value => {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "invalid or missing Rust macro source position {value:?}"
                             )));
                         }
@@ -991,7 +1001,7 @@ impl RustSourceStorage for AnalyzerStore {
                 if fact.position == RustItemMacroSourcePosition::DirectItem
                     && fact.expansion == RustItemMacroExpansion::NotRequested
                 {
-                    return Err(StoreError::new(
+                    return Err(StoreError::corrupt(
                         "direct-item Rust macro has no replay evidence",
                     ));
                 }
@@ -1007,13 +1017,13 @@ impl RustSourceStorage for AnalyzerStore {
                     if contexts[root_index].kind != RustSourceContextKind::FileRoot
                         || contexts[root_index].parent != Some(context)
                     {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "parsed Rust item macro root is not the child of its invocation context: macro={fact:?}, contexts={contexts:?}"
                         )));
                     }
                 }
                 if macro_indices.insert(invocation, macros.len()).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust item macro invocation {invocation:?}; macros={macros:?}"
                     )));
                 }
@@ -1061,7 +1071,7 @@ impl RustSourceStorage for AnalyzerStore {
                     .insert(declaration, import_contexts.len())
                     .is_some()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust item import declaration {declaration:?}; imports={import_contexts:?}"
                     )));
                 }
@@ -1094,13 +1104,13 @@ impl RustSourceStorage for AnalyzerStore {
                     0 => {
                         let leading = row
                             .get::<_, Option<i64>>(2)?
-                            .ok_or_else(|| StoreError::new("Rust path type has no leading_absolute"))?;
+                            .ok_or_else(|| StoreError::corrupt("Rust path type has no leading_absolute"))?;
                         if row.get::<_, Option<i64>>(3)?.is_some()
                             || row.get::<_, Option<String>>(4)?.is_some()
                             || compound.is_some()
                             || parameters.is_some()
                         {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "Rust path type has unsupported fields: occurrence={occurrence:?}"
                             )));
                         }
@@ -1114,18 +1124,18 @@ impl RustSourceStorage for AnalyzerStore {
                             || compound.is_some()
                             || parameters.is_some()
                         {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "unsupported Rust type has leading_absolute: occurrence={occurrence:?}"
                             )));
                         }
                         let terminal = row.get::<_, Option<i64>>(3)?.ok_or_else(|| {
-                            StoreError::new("unsupported Rust type has no terminal occurrence")
+                            StoreError::corrupt("unsupported Rust type has no terminal occurrence")
                         })?;
                         let syntax_kind = row.get::<_, Option<String>>(4)?.ok_or_else(|| {
-                            StoreError::new("unsupported Rust type has no syntax kind")
+                            StoreError::corrupt("unsupported Rust type has no syntax kind")
                         })?;
                         if syntax_kind.is_empty() {
-                            return Err(StoreError::new(
+                            return Err(StoreError::corrupt(
                                 "unsupported Rust type has empty syntax kind",
                             ));
                         }
@@ -1140,12 +1150,12 @@ impl RustSourceStorage for AnalyzerStore {
                             || row.get::<_, Option<String>>(4)?.is_some()
                             || (!matches!(kind, 2 | 5) && parameters.is_some())
                         {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "compound Rust type has incompatible fields: occurrence={occurrence:?}, kind={kind}"
                             )));
                         }
                         let compound = compound.ok_or_else(|| {
-                            StoreError::new("compound Rust type has no form occurrence")
+                            StoreError::corrupt("compound Rust type has no form occurrence")
                         })?;
                         RustTypeSourceShape::Compound {
                             occurrence: source_occurrence(compound, "compound type")?,
@@ -1163,13 +1173,13 @@ impl RustSourceStorage for AnalyzerStore {
                         }
                     }
                     kind => {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "invalid Rust type path kind {kind}"
                         )));
                     }
                 };
                 if type_indices.insert(occurrence, types.len()).is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust type occurrence {occurrence:?}; types={types:?}"
                     )));
                 }
@@ -1211,7 +1221,7 @@ impl RustSourceStorage for AnalyzerStore {
                     "types",
                 )?;
                 let RustTypeSourceShape::Compound { children, .. } = &mut types[index].shape else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "compound child belongs to a non-compound type: owner={owner:?}, child={child:?}"
                     )));
                 };
@@ -1274,7 +1284,7 @@ impl RustSourceStorage for AnalyzerStore {
                     generic_arguments: None,
                 };
                 let RustTypeSourceShape::Path { segments, .. } = &mut types[index].shape else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "unsupported Rust type has a path segment {type_occurrence:?}; types={types:?}"
                     )));
                 };
@@ -1305,17 +1315,17 @@ impl RustSourceStorage for AnalyzerStore {
                 )?;
                 let segment_ordinal = nonnegative_usize(row.get(1)?, "generic list segment ordinal")?;
                 let RustTypeSourceShape::Path { segments, .. } = &mut types[index].shape else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "unsupported Rust type has a generic list {type_occurrence:?}; types={types:?}"
                     )));
                 };
                 let Some(segment) = segments.get_mut(segment_ordinal) else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust generic list has missing segment parent type={type_occurrence:?}, segment={segment_ordinal}; types={types:?}"
                     )));
                 };
                 if segment.generic_arguments.is_some() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "duplicate Rust generic list type={type_occurrence:?}, segment={segment_ordinal}"
                     )));
                 }
@@ -1350,17 +1360,17 @@ impl RustSourceStorage for AnalyzerStore {
                 let segment_ordinal =
                     nonnegative_usize(row.get(1)?, "generic argument segment ordinal")?;
                 let RustTypeSourceShape::Path { segments, .. } = &mut types[index].shape else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "unsupported Rust type has a generic argument {type_occurrence:?}; types={types:?}"
                     )));
                 };
                 let Some(segment) = segments.get_mut(segment_ordinal) else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust generic argument has missing segment parent type={type_occurrence:?}, segment={segment_ordinal}"
                     )));
                 };
                 let Some(arguments) = segment.generic_arguments.as_mut() else {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust generic argument has no list fact type={type_occurrence:?}, segment={segment_ordinal}"
                     )));
                 };
@@ -1433,7 +1443,7 @@ impl RustSourceStorage for AnalyzerStore {
 
             for ty in &types {
                 if !ty.wrappers.is_empty() && ty.wrappers[0].occurrence != ty.occurrence {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust type wrapper chain does not begin at its type root: type={ty:?}"
                     )));
                 }
@@ -1454,18 +1464,18 @@ impl RustSourceStorage for AnalyzerStore {
                             )?;
                         }
                         if segments.is_empty() {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "Rust path type has no segments: type={ty:?}"
                             )));
                         }
                         if segments.iter().any(|segment| segment.name.is_empty()) {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "Rust path type has an empty segment name: type={ty:?}"
                             )));
                         }
                     }
                     RustTypeSourceShape::Unsupported { syntax_kind, .. } if syntax_kind.is_empty() => {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust unsupported type has an empty syntax kind: type={ty:?}"
                         )));
                     }
@@ -1484,7 +1494,7 @@ impl RustSourceStorage for AnalyzerStore {
                                     | RustTypeCompoundSourceKind::HigherRanked
                             ) && type_parameters.is_some())
                         {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "Rust compound type has incompatible children or parameters: type={ty:?}"
                             )));
                         }
@@ -1507,7 +1517,9 @@ impl RustSourceStorage for AnalyzerStore {
 
             let mut impl_census_boundaries = Vec::new();
             let mut statement = tx.prepare_cached(
-                "SELECT ordinal, kind, start_byte FROM source_rust_impl_census_boundaries
+                "SELECT ordinal, kind, start_byte, macro_absolute, macro_shadow_possible,
+                        json(macro_path)
+                   FROM source_rust_impl_census_boundaries
                   WHERE blob_id = ?1 ORDER BY ordinal",
             )?;
             let mut rows = statement.query([blob_id])?;
@@ -1522,16 +1534,67 @@ impl RustSourceStorage for AnalyzerStore {
                     2 => RustImplCensusBoundaryKind::ExpandingAttribute,
                     3 => RustImplCensusBoundaryKind::InternalAttribute,
                     4 => RustImplCensusBoundaryKind::SyntaxError,
-                    value => return Err(StoreError::new(format!("invalid Rust impl census boundary kind {value}"))),
+                    value => return Err(StoreError::corrupt(format!("invalid Rust impl census boundary kind {value}"))),
                 };
-                impl_census_boundaries.push(RustImplCensusBoundary {
-                    kind,
-                    start_byte: nonnegative_usize(row.get(2)?, "impl census boundary start")?,
+                let start_byte = nonnegative_usize(row.get(2)?, "impl census boundary start")?;
+                let absolute = row.get::<_, Option<i64>>(3)?;
+                let shadow = row.get::<_, Option<i64>>(4)?;
+                let path = row
+                    .get::<_, Option<String>>(5)?
+                    .map(|json| serde_json::from_str::<Vec<String>>(&json))
+                    .transpose()
+                    .map_err(|error| StoreError::corrupt(format!("invalid Rust census macro path: {error}")))?;
+                impl_census_boundaries.push(match (kind, absolute, shadow, path) {
+                    (RustImplCensusBoundaryKind::Macro, Some(absolute), Some(shadow), Some(path)) => RustImplCensusBoundary {
+                        kind,
+                        start_byte,
+                        macro_path: path,
+                        macro_absolute: absolute != 0,
+                        macro_shadow_possible: shadow != 0,
+                    },
+                    // A boundary written before the macro path was recorded
+                    // cannot be certified; keep it open.
+                    (RustImplCensusBoundaryKind::Macro, None, None, None) => RustImplCensusBoundary {
+                        macro_shadow_possible: true,
+                        ..RustImplCensusBoundary::without_macro_path(kind, start_byte)
+                    },
+                    (kind, None, None, None) if kind != RustImplCensusBoundaryKind::Macro => {
+                        RustImplCensusBoundary::without_macro_path(kind, start_byte)
+                    }
+                    other => {
+                        return Err(StoreError::corrupt(format!(
+                            "Rust impl census boundary has inconsistent macro columns: {other:?}"
+                        )));
+                    }
                 });
             }
             drop(rows);
             drop(statement);
+            let Some(macro_arguments) = brokk_bifrost_analysis::analyzer::store::source_facts::rust_items::read_rust_macro_argument_attributes(
+                tx, blob_id, 0..=i64::MAX, keep_going,
+            )? else { return Ok(None); };
+            let mut statement = tx.prepare_cached(
+                "SELECT declaration, enclosing_scope FROM resolution_rust_impl_declarations
+                 WHERE blob_id=?1 AND enclosing_scope IS NOT NULL ORDER BY declaration",
+            )?;
+            let mut rows = statement.query([blob_id])?;
+            let mut native_impl_scopes = Vec::new();
+            while let Some(row) = rows.next()? {
+                if !keep_going() {
+                    return Ok(None);
+                }
+                native_impl_scopes.push((
+                    SourceDeclarationId::new(row.get(0)?),
+                    brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId::new(
+                        row.get(1)?,
+                    ),
+                ));
+            }
+            drop(rows);
+            drop(statement);
             let item_facts = RustItemSourceFacts {
+                macro_arguments,
+                native_impl_scopes,
                 impl_census_boundaries,
                 contexts,
                 syntax,
@@ -1548,7 +1611,7 @@ impl RustSourceStorage for AnalyzerStore {
             };
             let actual_cost = rust_item_source_cost(&item_facts, &types);
             if actual_cost != (expected_rows, expected_payload) {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "Rust item source cost mismatch expected=({expected_rows}, {expected_payload}), actual={actual_cost:?}; items={item_facts:?}, types={types:?}"
                 )));
             }
@@ -1580,7 +1643,7 @@ impl RustSourceStorage for AnalyzerStore {
                 }
                 let declaration = source_declaration(row.get(0)?, "hierarchy declaration")?;
                 if declaration.index() != declarations.len() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "non-dense hierarchy declaration {declaration:?}: declarations={declarations:?}"
                     )));
                 }
@@ -1599,13 +1662,13 @@ impl RustSourceStorage for AnalyzerStore {
             drop(rows);
             drop(statement);
             if declarations.len() != expected_declarations {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "incomplete hierarchy declarations for {oid}: expected {expected_declarations}, declarations={declarations:?}"
                 )));
             }
             for definition in &item_facts.macro_definitions {
                 if declarations.get(definition.declaration.index()).is_none() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust macro definition has missing source declaration {:?}; declarations={declarations:?}",
                         definition.declaration
                     )));
@@ -1624,7 +1687,7 @@ impl RustSourceStorage for AnalyzerStore {
                 }
                 let declaration = source_declaration(row.get(0)?, "hierarchy module")?;
                 if declarations.get(declaration.index()).is_none() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "hierarchy module has no declaration {declaration:?}: declarations={declarations:?}"
                     )));
                 }
@@ -1648,12 +1711,12 @@ impl RustSourceStorage for AnalyzerStore {
                 let declaration = source_declaration(row.get(0)?, "hierarchy unit bridge")?;
                 let key: i64 = row.get(1)?;
                 if declarations.get(declaration.index()).is_none() {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "hierarchy unit bridge has no declaration {declaration:?}: declarations={declarations:?}"
                     )));
                 }
                 let unit = units.get(&key).ok_or_else(|| {
-                    StoreError::new(format!(
+                    StoreError::corrupt(format!(
                         "hierarchy declaration {declaration:?} has no mounted unit {key} for {oid}"
                     ))
                 })?;
@@ -1662,7 +1725,7 @@ impl RustSourceStorage for AnalyzerStore {
             drop(rows);
             drop(statement);
             if declaration_units.len() != expected_links {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "incomplete hierarchy declaration bridges for {oid}: expected {expected_links}, links={declaration_units:?}"
                 )));
             }
@@ -1673,6 +1736,26 @@ impl RustSourceStorage for AnalyzerStore {
             if !keep_going() {
                 return Ok(None);
             }
+            let mut impl_spans = HashMap::default();
+            let mut statement = tx.prepare_cached(
+                "SELECT d.declaration_id, o.start_byte, o.end_byte
+                 FROM source_declarations d
+                 JOIN source_occurrences o ON o.blob_id = d.blob_id
+                  AND o.occurrence_id = d.occurrence_id
+                 JOIN source_rust_impl_items i ON i.blob_id = d.blob_id
+                  AND i.declaration_id = d.declaration_id
+                 WHERE d.blob_id = ?1",
+            )?;
+            let mut rows = statement.query([blob_id])?;
+            while let Some(row) = rows.next()? {
+                if !keep_going() {
+                    return Ok(None);
+                }
+                impl_spans.insert(source_declaration(row.get(0)?, "impl span")?,
+                    (row.get(1)?, row.get(2)?));
+            }
+            drop(rows);
+            drop(statement);
             Ok(Some(RustHierarchySourceFacts {
                 items: item_facts,
                 types,
@@ -1682,6 +1765,7 @@ impl RustSourceStorage for AnalyzerStore {
                 declaration_units,
                 module_names,
                 imports,
+                impl_spans,
             }))
         })
     }
@@ -1716,7 +1800,7 @@ pub(crate) fn read_rust_macro_definition_rows(
             .insert(declaration, macro_definitions.len())
             .is_some()
         {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "duplicate Rust macro definition {declaration:?}; definitions={macro_definitions:?}"
             )));
         }
@@ -1751,7 +1835,7 @@ pub(crate) fn read_rust_macro_definition_rows(
         }
         let declaration = source_declaration(row.get(0)?, "macro arm owner")?;
         let Some(definition_index) = macro_definition_indices.get(&declaration).copied() else {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "Rust macro arm has missing definition {declaration:?}; definitions={macro_definitions:?}"
             )));
         };
@@ -1762,7 +1846,7 @@ pub(crate) fn read_rust_macro_definition_rows(
             .insert(occurrence, (declaration, arm_ordinal))
             .is_some()
         {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "duplicate Rust macro arm occurrence {occurrence:?}"
             )));
         }
@@ -1770,7 +1854,7 @@ pub(crate) fn read_rust_macro_definition_rows(
             .insert((declaration, arm_ordinal), definition.arms.len())
             .is_some()
         {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "duplicate Rust macro arm declaration={declaration:?}, ordinal={arm_ordinal}"
             )));
         }
@@ -1813,12 +1897,12 @@ pub(crate) fn read_rust_macro_definition_rows(
         let declaration = source_declaration(row.get(0)?, "macro pattern owner")?;
         let arm_ordinal = nonnegative_usize(row.get(1)?, "macro pattern arm ordinal")?;
         let Some(definition_index) = macro_definition_indices.get(&declaration).copied() else {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "Rust macro pattern has missing definition {declaration:?}; definitions={macro_definitions:?}"
             )));
         };
         let Some(&arm_index) = arm_indices.get(&(declaration, arm_ordinal)) else {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "Rust macro pattern has missing arm declaration={declaration:?}, ordinal={arm_ordinal}"
             )));
         };
@@ -1830,7 +1914,7 @@ pub(crate) fn read_rust_macro_definition_rows(
             .map(|value| source_occurrence(value, "macro pattern parent"))
             .transpose()?;
         if pattern_indices.contains_key(&occurrence) {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "duplicate Rust macro pattern occurrence {occurrence:?}"
             )));
         }
@@ -1841,7 +1925,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                         && *parent_arm == arm_ordinal
                         && *parent_ordinal < ordinal => {}
                 _ => {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust macro pattern parent is not earlier in its arm: occurrence={occurrence:?}, parent={parent:?}"
                     )));
                 }
@@ -1868,7 +1952,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                     || separator.is_some()
                     || operator.is_some()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "invalid Rust literal macro pattern shape occurrence={occurrence:?}"
                     )));
                 }
@@ -1887,7 +1971,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                     || separator.is_some()
                     || operator.is_some()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "invalid Rust binding macro pattern shape occurrence={occurrence:?}"
                     )));
                 }
@@ -1910,7 +1994,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                     || separator.is_some()
                     || operator.is_some()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "invalid Rust group macro pattern shape occurrence={occurrence:?}"
                     )));
                 }
@@ -1927,7 +2011,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                     || separator.as_deref().is_some_and(str::is_empty)
                     || operator.is_none()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "invalid Rust repetition macro pattern shape occurrence={occurrence:?}"
                     )));
                 }
@@ -1947,14 +2031,14 @@ pub(crate) fn read_rust_macro_definition_rows(
                     || separator.is_some()
                     || operator.is_some()
                 {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "invalid Rust invalid-pattern shape occurrence={occurrence:?}"
                     )));
                 }
                 RustMacroPatternSourceKind::Invalid
             }
             _ => {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "invalid Rust macro pattern node kind {node_kind}"
                 )));
             }
@@ -1976,25 +2060,25 @@ pub(crate) fn read_rust_macro_definition_rows(
             match arm.pattern {
                 Some(root) => {
                     let Some(root_pattern) = arm.patterns.first() else {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust macro arm root pattern is missing: declaration={:?}, arm={arm_ordinal}, root={root:?}, arm={arm:?}",
                             definition.declaration,
                         )));
                     };
                     if root_pattern.occurrence != root {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust macro arm root pattern is not first: declaration={:?}, arm={arm_ordinal}, root={root:?}, arm={arm:?}",
                             definition.declaration,
                         )));
                     }
                     if root_pattern.parent.is_some() {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust macro arm root pattern has a parent: declaration={:?}, arm={arm_ordinal}, root={root:?}, arm={arm:?}",
                             definition.declaration,
                         )));
                     }
                     if !matches!(&root_pattern.kind, RustMacroPatternSourceKind::Group { .. }) {
-                        return Err(StoreError::new(format!(
+                        return Err(StoreError::corrupt(format!(
                             "Rust macro arm root pattern is not a group: declaration={:?}, arm={arm_ordinal}, root={root:?}, arm={arm:?}",
                             definition.declaration,
                         )));
@@ -2004,7 +2088,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                             return Ok(None);
                         }
                         let Some(parent) = pattern.parent else {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "Rust macro arm has multiple roots: declaration={:?}, arm={arm_ordinal}, arm={arm:?}",
                                 definition.declaration,
                             )));
@@ -2018,7 +2102,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                             RustMacroPatternSourceKind::Group { .. }
                                 | RustMacroPatternSourceKind::Repetition { .. }
                         ) {
-                            return Err(StoreError::new(format!(
+                            return Err(StoreError::corrupt(format!(
                                 "Rust macro pattern parent cannot contain children: declaration={:?}, arm={arm_ordinal}, arm={arm:?}",
                                 definition.declaration,
                             )));
@@ -2026,7 +2110,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                     }
                 }
                 None if !arm.patterns.is_empty() => {
-                    return Err(StoreError::new(format!(
+                    return Err(StoreError::corrupt(format!(
                         "Rust macro arm without a root has pattern nodes: declaration={:?}, arm={arm_ordinal}, arm={arm:?}",
                         definition.declaration,
                     )));
@@ -2050,12 +2134,12 @@ pub(crate) fn read_rust_macro_definition_rows(
         let declaration = source_declaration(row.get(0)?, "macro ident role owner")?;
         let arm_ordinal = nonnegative_usize(row.get(1)?, "macro ident role arm ordinal")?;
         let Some(definition_index) = macro_definition_indices.get(&declaration).copied() else {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "Rust macro ident role has missing definition {declaration:?}"
             )));
         };
         let Some(&arm_index) = arm_indices.get(&(declaration, arm_ordinal)) else {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "Rust macro ident role has missing arm declaration={declaration:?}, ordinal={arm_ordinal}"
             )));
         };
@@ -2063,13 +2147,15 @@ pub(crate) fn read_rust_macro_definition_rows(
         require_dense_ordinal(row.get(2)?, arm.ident_roles.len(), "macro ident role")?;
         let name: String = row.get(3)?;
         if name.is_empty() {
-            return Err(StoreError::new("Rust macro ident role has an empty name"));
+            return Err(StoreError::corrupt(
+                "Rust macro ident role has an empty name",
+            ));
         }
         if !pattern_binding_names
             .get(&(declaration, arm_ordinal))
             .is_some_and(|names| names.contains(&name))
         {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "Rust macro ident role has no matching pattern binding: declaration={declaration:?}, arm={arm_ordinal}, name={name:?}"
             )));
         }
@@ -2082,7 +2168,7 @@ pub(crate) fn read_rust_macro_definition_rows(
             .or_default()
             .insert(name)
         {
-            return Err(StoreError::new(format!(
+            return Err(StoreError::corrupt(format!(
                 "duplicate Rust macro ident role name: declaration={declaration:?}, arm={arm_ordinal}"
             )));
         }
@@ -2102,7 +2188,7 @@ pub(crate) fn read_rust_macro_definition_rows(
                 .get(&(*declaration, *arm_ordinal))
                 .is_some_and(|names| names.contains(binding_name))
             {
-                return Err(StoreError::new(format!(
+                return Err(StoreError::corrupt(format!(
                     "Rust macro pattern binding has no identifier role: declaration={declaration:?}, arm={arm_ordinal}, name={binding_name:?}"
                 )));
             }

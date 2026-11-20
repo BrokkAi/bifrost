@@ -105,6 +105,7 @@ pub(super) fn publish_ruby_signature_file(
 /// The garbage-collection epoch at which every one of `blobs` had a head
 /// for this producer, or `None` when one has none (never published, or
 /// collected), so its facts are unknown.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn ruby_signature_heads_present(
     store: &AnalyzerStore,
     blobs: &[Oid],
@@ -129,6 +130,7 @@ pub(super) fn ruby_signature_heads_present(
 /// The stored declarations of `member` of `owner` in each of `blobs`, one
 /// entry per blob in order, or `None` when garbage collection has deleted
 /// a head since `epoch`, when the heads were all present.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn ruby_signature_methods_named(
     store: &AnalyzerStore,
     owner: &str,
@@ -211,6 +213,7 @@ pub(super) fn ruby_signature_methods_named(
 
 /// Which of `names` (`::`-joined constant paths) some of `blobs` declares,
 /// or `None` when garbage collection has deleted a head since `epoch`.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn ruby_signature_types_declared(
     store: &AnalyzerStore,
     names: &[String],

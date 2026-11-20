@@ -55,6 +55,14 @@ impl ResolvedActiveSemanticModels {
     ) -> FamilyRows<Vec<ActivatedSemanticModelRecord<T>>> {
         let mut fetched = Vec::new();
         let mut jvm_open = owners.jvm_open;
+        #[cfg(any(test, feature = "test-support"))]
+        let owners = {
+            let mut owners = owners;
+            if let Some(reader) = &self.test_question_reader {
+                owners.readers.push(Arc::clone(&reader.0));
+            }
+            owners
+        };
         for reader in &owners.readers {
             match semantic_catalog_question(
                 statement_name,

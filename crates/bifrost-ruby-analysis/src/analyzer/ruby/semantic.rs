@@ -1057,6 +1057,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (specs, mut initial_work, mut inventory_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
@@ -1593,6 +1594,8 @@ type RubyLoweringError = ProcedureLoweringError;
 type EdgeTarget = ControlTarget;
 
 type Work<'tree> = ProcedureWork<'tree>;
+type WorkStack<'stack, 'tree> = dyn brokk_bifrost_analysis::analyzer::semantic::lowering::WorkSink<Work<'tree>, Context = ()>
+    + 'stack;
 
 #[derive(Debug, Clone, Copy)]
 struct CleanupRegion<'tree> {
@@ -1654,7 +1657,7 @@ impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'ta
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         self.statement(builder, node, entry, next, scope, stack)
     }
@@ -1666,7 +1669,7 @@ impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'ta
         entry: ProgramPointId,
         next: ControlTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         self.expression(builder, node, entry, next, scope, stack)
     }
@@ -1678,7 +1681,7 @@ impl<'tree, 'targets> ProcedureWorkHandler<'tree> for LoweringContext<'tree, 'ta
         entry: ProgramPointId,
         targets: ConditionTargets,
         scope: ScopeFrameId,
-        stack: &mut Vec<ProcedureWork<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         self.condition(
             builder,
@@ -2593,7 +2596,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         if ruby_statement_kind(node).is_some() {
             self.session.record_statement_entry(builder, node, entry)?;
@@ -2713,7 +2716,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         match node.kind() {
             "program"
@@ -2847,7 +2850,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         when_true: EdgeTarget,
         when_false: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         if let Some(value) = ruby_folded_boolean_constant(self.source, node) {
             let taken = if value { when_true } else { when_false };
@@ -3200,7 +3203,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let condition = required_field(node, "condition")?;
         let consequence = node
@@ -3257,7 +3260,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
@@ -3332,7 +3335,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let body = ruby_unconditional_loop_body(node, self.source)
             .expect("unconditional loop call has a structured block body");
@@ -3418,7 +3421,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let value_wrapper = required_field(node, "value")?;
         let iterable = first_runtime_named_child(value_wrapper).ok_or_else(|| {
@@ -3501,7 +3504,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let clauses = named_children(node)
             .into_iter()
@@ -3720,7 +3723,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let parts = body_components(node);
         if parts.rescues.is_empty() && parts.ensure.is_none() {
@@ -3931,7 +3934,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let body = required_field(node, "body")?;
         let handler = required_field(node, "handler")?;
@@ -3994,7 +3997,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         entry: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let terminal = if node.named_child_count() == 0 {
             entry
@@ -4121,7 +4124,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         entry: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let terminal = if node.named_child_count() == 0 {
             entry
@@ -4221,7 +4224,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         if self.precise_raise_binders.contains_key(&node.id()) {
             return self.precise_raise(builder, node, entry, scope, stack);
@@ -4397,7 +4400,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         call: RubyMethodCall,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<CallSiteId, RubyLoweringError> {
         let RubyMethodCall {
             invoke,
@@ -4481,7 +4484,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         result: Option<ValueId>,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<ProgramPointId, RubyLoweringError> {
         let invoke = self.point(builder, anchor, Vec::new())?;
         let normal = self.point(builder, anchor, Vec::new())?;
@@ -4532,7 +4535,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         entry: ProgramPointId,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let RubyPreciseRaise { source, binder } = self
             .precise_raise_binders
@@ -4585,7 +4588,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let (receiver, member) = self
             .property_parts(node)
@@ -4616,7 +4619,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let arguments = node
             .named_child(0)
@@ -4795,7 +4798,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         exceptional: ProgramPointId,
         normal_next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let departure = if normal_next.kind == ControlEdgeKind::Exceptional {
             let relay = self.point_from(builder, exceptional, Vec::new())?;
@@ -4857,7 +4860,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         self.session.record_gap(
             builder,
@@ -4933,7 +4936,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         stack.push(Work::Condition {
             node,
@@ -4958,7 +4961,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let operator = node
             .child_by_field_name("operator")
@@ -5070,7 +5073,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
@@ -5490,7 +5493,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
         targets: Vec<Node<'tree>>,
         values: Vec<Node<'tree>>,
     ) -> Result<(), RubyLoweringError> {
@@ -5610,7 +5613,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let object = required_field(node, "object")?;
         let indices = ruby_element_arguments(node);
@@ -5706,7 +5709,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let name = node_text(self.source, node).unwrap_or_default();
         if self.local_bindings.is_active_at(name, node.start_byte()) {
@@ -5733,7 +5736,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         invoke: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
@@ -5808,7 +5811,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let boundary = self.point(builder, node, Vec::new())?;
         for (capability, detail) in [
@@ -5850,7 +5853,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         if children.is_empty() {
             return self.session.add_target_edge(builder, entry, next);
@@ -5883,7 +5886,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<Option<ProgramPointId>, RubyLoweringError> {
         if children.is_empty() {
             return Ok(None);
@@ -5915,7 +5918,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let Some((_, rest)) = children.split_first() else {
             return self.session.add_target_edge(builder, entry, next);
@@ -5968,7 +5971,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         children: &[Node<'tree>],
         next: EdgeTarget,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         self.schedule_expressions_with_first_edge(
             builder,
@@ -5990,7 +5993,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         next: EdgeTarget,
         first_edge_kind: ControlEdgeKind,
         scope: ScopeFrameId,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         if children.is_empty() {
             return self.session.add_target_edge(
@@ -6037,7 +6040,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         kind: CompletionKind,
         label: Option<&str>,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let Some(route) = builder.resolve_completion(scope, &CompletionRequest::new(kind, label))
         else {
@@ -6064,7 +6067,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         from: ProgramPointId,
         route: &CompletionRoute,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<(), RubyLoweringError> {
         let target = self.route_target(builder, route, stack)?;
         self.session.add_target_edge(builder, from, target)
@@ -6074,7 +6077,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         route: &CompletionRoute,
-        stack: &mut Vec<Work<'tree>>,
+        stack: &mut WorkStack<'_, 'tree>,
     ) -> Result<EdgeTarget, RubyLoweringError> {
         let mut plan = CleanupRoutePlanner::new(route);
         while let Some(step) = plan.next(

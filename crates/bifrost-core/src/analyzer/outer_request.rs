@@ -1,7 +1,7 @@
 //! State shared by one outer analyzer request and its nested work.
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::external_selection::{SelectionRefused, VerifiedSelection};
 use super::project::{Project, ProjectViewStamp};
@@ -15,12 +15,26 @@ pub enum RequestEntryKey {
     ValueFlowRetention,
     /// One budget-bound selected-source factory for this outer request.
     SelectedSourceEntries,
+    /// This request's disk checks of the published Python runtime
+    /// environments (#13725).
+    PythonRuntimeVerification,
+    /// This request's Python definition answers, one per selected site
+    /// (#13847).
+    PythonDefinitionAnswers,
     /// The source allocation is retained by the entry's value, so its address
     /// cannot be reused while this request owns its selection.
     WorkspaceSelection {
         owner: usize,
     },
     JvmCatalogReader(JvmCatalogReaderKey),
+    JvmReaderDerivation {
+        activation: String,
+        view: [u8; 32],
+        excluded: [u8; 32],
+        questions: [u8; 32],
+        view_stamp: Option<ProjectViewStamp>,
+        generation: u64,
+    },
     /// An activation by its model-set hash and the digest of its request-owned
     /// active shards: the hash ignores which physical shards were selected.
     JvmCatalogActivation {
@@ -33,13 +47,33 @@ pub enum RequestEntryKey {
     },
 }
 
+/// A selection as a request admitted it. The flags mean different things and
+/// must not stand in for each other.
+///
+/// `certified` is `complete && verified`: the authority's answer is a
+/// deterministic snapshot that a later run can ask for again and compare, and it
+/// proves absence.
+///
+/// `complete` is the only basis for proving absence.
+///
+/// `replayable` is the only reuse predicate (`VerifiedSelection::replayable`).
+/// A selection that is not complete is replayable when it is verified and its
+/// only incompleteness is a gap that is fixed for unchanged inputs: a pack's
+/// partial coverage, or a declared coordinate with no local artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdmittedSelection {
     pub certified: bool,
     pub complete: bool,
+    pub replayable: bool,
     pub question_digest: [u8; 32],
     pub view_stamp: Option<ProjectViewStamp>,
+    /// What this request is bound to: the authority's answer together with any
+    /// gaps folded in at bind.
     pub answer_digest: [u8; 32],
+    /// What the authority itself answers for the question. A later run asks
+    /// the authority again, so a persisted read key names this digest, never
+    /// `answer_digest` when gaps were folded in.
+    pub authority_answer_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,6 +116,111 @@ pub struct OuterRequest {
     resources: Mutex<Resources>,
 }
 
+/// A borrow of one initialized entry in its original request.
+///
+/// This carries data provenance, not SQL permission. Consumers can project a
+/// field without supplying another request identity or source key. Only Core
+/// constructs the handle; it has no Default, Clone or Copy implementation.
+///
+/// Fields cannot be constructed outside Core:
+///
+/// ```compile_fail
+/// use brokk_bifrost_core::analyzer::outer_request::{OuterRequest, WorkspaceEntry};
+/// let request = OuterRequest::new();
+/// let entry = WorkspaceEntry { request: &request, source: 1, value: &42_u8 };
+/// ```
+///
+/// An entry, including a projection, cannot escape its callback:
+///
+/// ```compile_fail
+/// use brokk_bifrost_core::analyzer::outer_request::{OuterRequest, WorkspaceEntryBinding};
+/// struct Selection(u8);
+/// impl WorkspaceEntryBinding for Selection {
+///     type Binding = u8;
+///     fn binding(&self) -> &u8 { &self.0 }
+/// }
+/// let request = OuterRequest::new();
+/// request.bind_workspace_selection(1, || Selection(42));
+/// let escaped = request.with_workspace_selection::<Selection, _>(1, |entry| entry.project());
+/// ```
+///
+/// A caller cannot substitute another binding with a projection closure:
+///
+/// ```compile_fail
+/// use brokk_bifrost_core::analyzer::outer_request::{OuterRequest, WorkspaceEntryBinding};
+/// struct Selection(u8);
+/// impl WorkspaceEntryBinding for Selection {
+///     type Binding = u8;
+///     fn binding(&self) -> &u8 { &self.0 }
+/// }
+/// #[brokk_bifrost_test_macros::hardwon(
+///     "#10979: a projection closure could relabel another source's binding"
+/// )]
+/// fn cannot_substitute_a_foreign_binding() {
+///     static OTHER_SOURCE: u8 = 99;
+///     let request = OuterRequest::new();
+///     request.bind_workspace_selection(1, || Selection(41));
+///     request.with_workspace_selection::<Selection, _>(1, |entry| {
+///         entry.project(|_| &OTHER_SOURCE);
+///     });
+/// }
+/// ```
+///
+/// Borrowing does not create a clonable handle:
+///
+/// ```compile_fail
+/// use brokk_bifrost_core::analyzer::outer_request::WorkspaceEntry;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<WorkspaceEntry<'_, u8>>();
+/// ```
+#[doc(hidden)]
+pub struct WorkspaceEntry<'a, T: ?Sized> {
+    request: &'a Arc<OuterRequest>,
+    source: usize,
+    value: &'a T,
+}
+
+impl<'a, T: ?Sized> WorkspaceEntry<'a, T> {
+    pub fn request(&self) -> &Arc<OuterRequest> {
+        self.request
+    }
+
+    pub fn source(&self) -> usize {
+        self.source
+    }
+
+    pub fn value(&self) -> &T {
+        self.value
+    }
+
+    /// Borrow the original owner's binding without a caller-selected value.
+    pub fn project(self) -> WorkspaceEntry<'a, T::Binding>
+    where
+        T: WorkspaceEntryBinding,
+    {
+        WorkspaceEntry {
+            request: self.request,
+            source: self.source,
+            value: self.value.binding(),
+        }
+    }
+}
+
+/// The trusted request entry owner defines its one immutable binding.
+///
+/// Analysis's private request workspace selection supplies the production
+/// implementation. Readers consume that entry; they must not implement this
+/// trait to substitute data. The associated type keeps Core independent of
+/// Store and Analysis. A private Core supertrait cannot seal an implementation
+/// in the downstream Analysis crate, and Core cannot name its private type.
+/// The owner's implementation is the single reviewed binding extraction point.
+#[doc(hidden)]
+pub trait WorkspaceEntryBinding {
+    type Binding: ?Sized;
+
+    fn binding(&self) -> &Self::Binding;
+}
+
 impl std::fmt::Debug for OuterRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OuterRequest")
@@ -94,8 +233,13 @@ impl OuterRequest {
     #[doc(hidden)]
     pub fn new() -> Arc<Self> {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_ne!(id, 0, "outer request identity exhausted");
+        let id = NEXT_ID
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("outer request identity exhausted");
         Arc::new(Self {
             id,
             entries: Mutex::new(HashMap::new()),
@@ -114,23 +258,45 @@ impl OuterRequest {
         owner: usize,
         capture: impl FnOnce() -> T,
     ) {
-        self.entries
-            .lock()
-            .expect("outer request map poisoned")
-            .entry(RequestEntryKey::WorkspaceSelection { owner })
-            .or_insert_with(|| Arc::new(capture()));
+        let slot = {
+            let mut entries = self.entries.lock().expect("outer request map poisoned");
+            Arc::clone(
+                entries
+                    .entry(RequestEntryKey::WorkspaceSelection { owner })
+                    .or_insert_with(|| Arc::new(OnceLock::<Arc<T>>::new())),
+            )
+        };
+        let slot = Arc::downcast::<OnceLock<Arc<T>>>(slot)
+            .expect("workspace selection owner has one answer type");
+        // A source capture may consume another source or SQL. Never hold the
+        // request map while it runs. Competing first captures share this slot.
+        slot.get_or_init(|| Arc::new(capture()));
     }
 
-    /// Read an already bound selection. A reader cannot capture one here.
+    /// Read already captured data without opening or waiting for a selector.
     pub fn workspace_selection<T: Any + Send + Sync>(&self, owner: usize) -> Option<Arc<T>> {
-        self.entries
-            .lock()
-            .expect("outer request map poisoned")
-            .get(&RequestEntryKey::WorkspaceSelection { owner })
-            .map(|selection| {
-                Arc::downcast(Arc::clone(selection))
-                    .expect("workspace selection owner has one answer type")
-            })
+        let slot = {
+            let entries = self.entries.lock().expect("outer request map poisoned");
+            Arc::clone(entries.get(&RequestEntryKey::WorkspaceSelection { owner })?)
+        };
+        let slot = Arc::downcast::<OnceLock<Arc<T>>>(slot)
+            .expect("workspace selection owner has one answer type");
+        slot.get().cloned()
+    }
+
+    /// Borrow the actual initialized entry, retaining its original identity.
+    /// The callback cannot return the borrowed entry or a projected handle.
+    pub fn with_workspace_selection<T: Any + Send + Sync, R>(
+        self: &Arc<Self>,
+        owner: usize,
+        consume: impl FnOnce(WorkspaceEntry<'_, T>) -> R,
+    ) -> Option<R> {
+        let selection = self.workspace_selection::<T>(owner)?;
+        Some(consume(WorkspaceEntry {
+            request: self,
+            source: owner,
+            value: selection.as_ref(),
+        }))
     }
 
     /// Borrow an already opened resource without allocating a slot or invoking
@@ -281,10 +447,7 @@ impl OuterRequest {
         let Some(stamp) = project.view_stamp() else {
             let answer = Arc::new(fill()?);
             assert_eq!(answer.question_digest, question_digest);
-            assert!(
-                !answer.certified,
-                "unstamped views cannot certify selections"
-            );
+            assert!(!answer.verified, "unstamped views cannot verify selections");
             assert!(answer.view_stamp.is_none());
             return Ok(answer);
         };
@@ -315,6 +478,7 @@ impl OuterRequest {
             }
         };
         assert_eq!(answer.question_digest, question_digest);
+        debug_assert_eq!(answer.certified, answer.complete && answer.verified);
         let Some(answer_stamp) = answer.view_stamp.clone() else {
             panic!("a stamped view's fill returns a stamped answer");
         };
@@ -365,8 +529,10 @@ mod tests {
             question_digest: digest,
             answer_digest: digest,
             view_stamp: project.view_stamp(),
+            verified: project.view_stamp().is_some(),
             certified: project.view_stamp().is_some(),
             complete: true,
+            only_replayable_gaps: false,
             records: Arc::new(()),
         }
     }
@@ -384,22 +550,121 @@ mod tests {
             dependencies: AdmittedSelection {
                 certified: true,
                 complete: true,
+                replayable: true,
                 question_digest: [n; 32],
                 view_stamp: None,
                 answer_digest: [n; 32],
+                authority_answer_digest: [n; 32],
             },
             jdk: AdmittedSelection {
                 certified: true,
                 complete: true,
+                replayable: true,
                 question_digest: [n; 32],
                 view_stamp: None,
                 answer_digest: [n; 32],
+                authority_answer_digest: [n; 32],
             },
             curated: [n; 32],
             view: [n; 32],
             rules: [n; 32],
             generation: n as u64,
         })
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13536: capturing one source while reading another bound entry deadlocks the request map"
+    )]
+    fn workspace_capture_can_read_another_bound_entry() {
+        let request = OuterRequest::new();
+        request.bind_workspace_selection(1, || 41_u8);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            request
+                .bind_workspace_selection(2, || *request.workspace_selection::<u8>(1).unwrap() + 1);
+            send.send(*request.workspace_selection::<u8>(2).unwrap())
+                .unwrap();
+        });
+        assert_eq!(
+            receive.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(42),
+            "entry capture must not hold the request map while reading another source"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn workspace_projection_preserves_the_original_request_and_source() {
+        struct Selection {
+            value: u8,
+        }
+        impl WorkspaceEntryBinding for Selection {
+            type Binding = u8;
+
+            fn binding(&self) -> &u8 {
+                &self.value
+            }
+        }
+        let first = OuterRequest::new();
+        let second = OuterRequest::new();
+        first.bind_workspace_selection(11, || Selection { value: 41 });
+        first.bind_workspace_selection(22, || Selection { value: 99 });
+        second.bind_workspace_selection(11, || Selection { value: 17 });
+        let observed = |request: &Arc<OuterRequest>, source| {
+            request.with_workspace_selection::<Selection, _>(source, |entry| {
+                let field = entry.project();
+                (field.request().id(), field.source(), *field.value())
+            })
+        };
+        assert_eq!(observed(&first, 11), Some((first.id(), 11, 41)));
+        assert_eq!(observed(&first, 22), Some((first.id(), 22, 99)));
+        assert_eq!(observed(&second, 11), Some((second.id(), 11, 17)));
+        assert_eq!(observed(&first, 33), None, "lookup cannot capture a source");
+        first.bind_workspace_selection::<Selection>(11, || {
+            panic!("an original entry cannot be rebound")
+        });
+        assert_eq!(observed(&first, 11), Some((first.id(), 11, 41)));
+    }
+
+    #[test]
+    fn workspace_first_capture_initializes_once_without_blocking_readers() {
+        use std::sync::{Barrier, mpsc};
+        let request = OuterRequest::new();
+        let fills = AtomicUsize::new(0);
+        let release = Barrier::new(2);
+        let (entered, wait_for_entry) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let first = threads.spawn(|| {
+                request.bind_workspace_selection(1, || {
+                    fills.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    release.wait();
+                    42_u8
+                });
+            });
+            wait_for_entry.recv().unwrap();
+            assert!(request.workspace_selection::<u8>(1).is_none());
+            assert!(
+                request
+                    .with_workspace_selection::<u8, _>(1, |_| panic!("not yet initialized"))
+                    .is_none()
+            );
+            let second = threads.spawn(|| {
+                request.bind_workspace_selection(1, || {
+                    fills.fetch_add(1, Ordering::SeqCst);
+                    99_u8
+                });
+            });
+            release.wait();
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        assert_eq!(fills.load(Ordering::SeqCst), 1);
+        let first = request.workspace_selection::<u8>(1).unwrap();
+        let second = request.workspace_selection::<u8>(1).unwrap();
+        assert_eq!(*first, 42);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

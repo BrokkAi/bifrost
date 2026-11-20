@@ -13,4 +13,5 @@
 11570-slice2a-token-files
 9909-go-open-callee-selector-claim
 10561-go-interface-arg-boxing
+10143-go-method-value-typestate
 8590-go-nil-zero-declarations

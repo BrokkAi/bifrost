@@ -21,6 +21,7 @@ use crate::analyzer::read_ledger::{
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{CodeUnitType, Language};
 use brokk_bifrost_semantic::analyzer::semantic::read_ledger::{
+    LocalResolutionIdentityDigest, SelectedProofSource, SelectedReceiverProofQuestion,
     StoredSemanticIrParseVariant, StoredSemanticIrPublicationQuestion,
 };
 
@@ -114,6 +115,12 @@ pub(super) struct ReadKeyColumns {
     pub(super) copy_census_version: Option<i64>,
     pub(super) copy_config_digest: Option<Vec<u8>>,
     pub(super) copy_producer_digest: Option<Vec<u8>>,
+    pub(super) selected_receiver_question: Option<&'static str>,
+    pub(super) selected_resolution_epoch: Option<String>,
+    pub(super) selected_application_digest: Option<Vec<u8>>,
+    pub(super) selected_receiver_digest: Option<Vec<u8>>,
+    pub(super) selected_transfer_rule_digest: Option<Vec<u8>>,
+    pub(super) selected_reference_digest: Option<Vec<u8>>,
     pub(super) drop_owning_unit: Option<Vec<u8>>,
     pub(super) drop_module_path: Option<String>,
     pub(super) drop_identity_digest: Option<Vec<u8>>,
@@ -162,6 +169,12 @@ impl ReadKeyColumns {
             copy_census_version: None,
             copy_config_digest: None,
             copy_producer_digest: None,
+            selected_receiver_question: None,
+            selected_resolution_epoch: None,
+            selected_application_digest: None,
+            selected_receiver_digest: None,
+            selected_transfer_rule_digest: None,
+            selected_reference_digest: None,
             drop_owning_unit: None,
             drop_module_path: None,
             drop_identity_digest: None,
@@ -207,6 +220,62 @@ impl ReadKeyColumns {
                         unreachable!(
                             "a certified definition key is not persisted until #10325 adds its schema with a migration"
                         )
+                    }
+                    LookupQuestion::SelectedReceiverProof(question) => {
+                        let source = question.source();
+                        assert!(
+                            !source.rel_path.is_empty()
+                                && !source.storage_language.is_empty()
+                                && !source.storage_language.contains(',')
+                                && !source.producer_epoch.is_empty(),
+                            "selected proof has a complete source binding"
+                        );
+                        columns.languages = Some(source.storage_language.to_string());
+                        columns.rel_path = Some(source.rel_path.to_string());
+                        columns.blob_oid = Some(
+                            Oid::from_bytes(&source.blob_oid)
+                                .expect("fixed-width OID")
+                                .to_string(),
+                        );
+                        columns.selected_receiver_question = Some(question.stable_label());
+                        columns.selected_resolution_epoch = Some(source.producer_epoch.to_string());
+                        match source.parse_variant {
+                            StoredSemanticIrParseVariant::Empty => {
+                                columns.parse_variant_kind = Some("empty")
+                            }
+                            StoredSemanticIrParseVariant::Digest(digest) => {
+                                columns.parse_variant_kind = Some("digest");
+                                columns.parse_variant_digest = Some(digest.to_vec());
+                            }
+                        }
+                        match question {
+                            SelectedReceiverProofQuestion::BaseReceiverContext {
+                                reference,
+                                ..
+                            } => {
+                                columns.selected_reference_digest =
+                                    Some(reference.as_bytes().to_vec());
+                            }
+                            SelectedReceiverProofQuestion::OwnerApplication {
+                                application, ..
+                            } => {
+                                columns.selected_application_digest =
+                                    Some(application.as_bytes().to_vec());
+                            }
+                            SelectedReceiverProofQuestion::CurrentInstanceTransfer {
+                                application,
+                                receiver,
+                                transfer_rule,
+                                ..
+                            } => {
+                                columns.selected_application_digest =
+                                    Some(application.as_bytes().to_vec());
+                                columns.selected_receiver_digest =
+                                    Some(receiver.as_bytes().to_vec());
+                                columns.selected_transfer_rule_digest =
+                                    Some(transfer_rule.as_bytes().to_vec());
+                            }
+                        }
                     }
                     LookupQuestion::StoredSemanticIrPublication(question) => {
                         columns.languages = Some(question.storage_language.to_string());
@@ -593,6 +662,37 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         .then(|| row.get::<_, Option<Vec<u8>>>(26))
         .transpose()?
         .flatten();
+    let has_receiver_projection =
+        row.as_ref().column_names().get(29) == Some(&"selected_receiver_question");
+    if has_receiver_projection && row.as_ref().column_count() < 35 {
+        return Err(StoreError::corrupt(
+            "partial selected receiver proof projection",
+        ));
+    }
+    let selected_receiver_question = has_receiver_projection
+        .then(|| row.get::<_, Option<String>>(29))
+        .transpose()?
+        .flatten();
+    let selected_resolution_epoch = has_receiver_projection
+        .then(|| row.get::<_, Option<String>>(30))
+        .transpose()?
+        .flatten();
+    let selected_application_digest = has_receiver_projection
+        .then(|| row.get::<_, Option<Vec<u8>>>(31))
+        .transpose()?
+        .flatten();
+    let selected_receiver_digest = has_receiver_projection
+        .then(|| row.get::<_, Option<Vec<u8>>>(32))
+        .transpose()?
+        .flatten();
+    let selected_transfer_rule_digest = has_receiver_projection
+        .then(|| row.get::<_, Option<Vec<u8>>>(33))
+        .transpose()?
+        .flatten();
+    let selected_reference_digest = has_receiver_projection
+        .then(|| row.get::<_, Option<Vec<u8>>>(34))
+        .transpose()?
+        .flatten();
     // Even an unsupported future vocabulary must have well-typed SQL columns
     // and fixed-width digests. Do not mistake damaged rows for a cache miss.
     decode_digest(&key_digest, "read key")?;
@@ -608,6 +708,16 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         (copy_config_digest.as_deref(), "Copy configuration"),
         (copy_producer_digest.as_deref(), "Copy producer"),
         (parse_variant_digest.as_deref(), "parse variant"),
+        (
+            selected_application_digest.as_deref(),
+            "selected application",
+        ),
+        (selected_receiver_digest.as_deref(), "selected receiver"),
+        (selected_reference_digest.as_deref(), "selected reference"),
+        (
+            selected_transfer_rule_digest.as_deref(),
+            "selected transfer rule",
+        ),
     ] {
         if let Some(bytes) = bytes {
             decode_digest(bytes, field)?;
@@ -692,7 +802,24 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     }
     let is_publication =
         kind == "lookup" && family.as_deref() == Some("stored_semantic_ir_publication");
-    if !is_publication && (parse_variant_kind.is_some() || parse_variant_digest.is_some()) {
+    let is_receiver_proof =
+        kind == "lookup" && family.as_deref() == Some("selected_receiver_proof");
+    if !is_receiver_proof
+        && (selected_receiver_question.is_some()
+            || selected_resolution_epoch.is_some()
+            || selected_application_digest.is_some()
+            || selected_receiver_digest.is_some()
+            || selected_transfer_rule_digest.is_some()
+            || selected_reference_digest.is_some())
+    {
+        return Err(StoreError::corrupt(
+            "selected receiver columns on another read kind",
+        ));
+    }
+    if !is_publication
+        && !is_receiver_proof
+        && (parse_variant_kind.is_some() || parse_variant_digest.is_some())
+    {
         return Err(StoreError::corrupt(
             "publication variant columns on another read kind",
         ));
@@ -753,7 +880,107 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         },
         "lookup" => {
             let lookup_kind = lookup_kind.expect("lookup vocabulary was checked");
-            let question = if lookup_kind == LookupKind::StoredSemanticIrPublication {
+            let question = if lookup_kind == LookupKind::SelectedReceiverProof {
+                if !matches!(rel_path.as_deref(), Some(path) if !path.is_empty())
+                    || !matches!(languages.as_deref(), Some(lang) if !lang.is_empty() && !lang.contains(','))
+                    || !matches!(selected_resolution_epoch.as_deref(), Some(epoch) if !epoch.is_empty())
+                    || name.is_some()
+                    || index_key.is_some()
+                    || subject.is_some()
+                    || start_byte.is_some()
+                    || end_byte.is_some()
+                    || site_ordinal.is_some()
+                    || decl_kind.is_some()
+                    || decl_signature.is_some()
+                    || workspace_fact_family.is_some()
+                    || fact_member.is_some()
+                    || fact_names.is_some()
+                {
+                    return Err(StoreError::corrupt(
+                        "invalid selected receiver proof source or unrelated columns",
+                    ));
+                }
+                let oid = decode_oid(blob_oid.as_deref().ok_or_else(|| missing("source OID"))?)?;
+                let source = SelectedProofSource {
+                    rel_path: rel_path.ok_or_else(|| missing("path"))?.into_boxed_str(),
+                    storage_language: languages
+                        .ok_or_else(|| missing("storage language"))?
+                        .into_boxed_str(),
+                    blob_oid: oid.as_bytes().try_into().expect("fixed-width OID"),
+                    producer_epoch: selected_resolution_epoch
+                        .ok_or_else(|| missing("producer epoch"))?
+                        .into_boxed_str(),
+                    parse_variant: match (parse_variant_kind.as_deref(), parse_variant_digest) {
+                        (Some("empty"), None) => StoredSemanticIrParseVariant::Empty,
+                        (Some("digest"), Some(digest)) => {
+                            StoredSemanticIrParseVariant::Digest(digest.try_into().map_err(
+                                |_| StoreError::corrupt("invalid selected proof parse digest"),
+                            )?)
+                        }
+                        _ => {
+                            return Err(StoreError::corrupt(
+                                "invalid selected proof parse variant",
+                            ));
+                        }
+                    },
+                };
+                let local = |bytes: Option<Vec<u8>>,
+                             field: &str|
+                 -> Result<LocalResolutionIdentityDigest> {
+                    Ok(LocalResolutionIdentityDigest::new(
+                        *decode_digest(&bytes.ok_or_else(|| missing(field))?, field)?.as_bytes(),
+                    ))
+                };
+                LookupQuestion::SelectedReceiverProof(match selected_receiver_question.as_deref() {
+                    Some("base_receiver_context")
+                        if selected_application_digest.is_none()
+                            && selected_receiver_digest.is_none()
+                            && selected_transfer_rule_digest.is_none() =>
+                    {
+                        SelectedReceiverProofQuestion::BaseReceiverContext {
+                            source,
+                            reference: local(selected_reference_digest, "reference digest")?,
+                        }
+                    }
+                    Some("owner_application")
+                        if selected_reference_digest.is_none()
+                            && selected_receiver_digest.is_none()
+                            && selected_transfer_rule_digest.is_none() =>
+                    {
+                        SelectedReceiverProofQuestion::OwnerApplication {
+                            source,
+                            application: local(selected_application_digest, "application digest")?,
+                        }
+                    }
+                    Some("current_instance_transfer") if selected_reference_digest.is_none() => {
+                        SelectedReceiverProofQuestion::CurrentInstanceTransfer {
+                            source,
+                            application: local(selected_application_digest, "application digest")?,
+                            receiver: LocalResolutionIdentityDigest::new(
+                                *decode_digest(
+                                    &selected_receiver_digest
+                                        .ok_or_else(|| missing("receiver digest"))?,
+                                    "receiver digest",
+                                )?
+                                .as_bytes(),
+                            ),
+                            transfer_rule: LocalResolutionIdentityDigest::new(
+                                *decode_digest(
+                                    &selected_transfer_rule_digest
+                                        .ok_or_else(|| missing("transfer rule digest"))?,
+                                    "transfer rule digest",
+                                )?
+                                .as_bytes(),
+                            ),
+                        }
+                    }
+                    _ => {
+                        return Err(StoreError::corrupt(
+                            "invalid selected receiver question tag or locators",
+                        ));
+                    }
+                })
+            } else if lookup_kind == LookupKind::StoredSemanticIrPublication {
                 if !matches!(rel_path.as_deref(), Some(path) if !path.is_empty())
                     || !matches!(languages.as_deref(), Some(language) if !language.is_empty() && !language.contains(','))
                 {
@@ -1413,6 +1640,17 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
             )
         );
     }
+    if kind == LookupKind::SelectedReceiverProof
+        || matches!(question, LookupQuestion::SelectedReceiverProof(..))
+    {
+        return matches!(
+            (kind, question),
+            (
+                LookupKind::SelectedReceiverProof,
+                LookupQuestion::SelectedReceiverProof(..)
+            )
+        );
+    }
     if kind == LookupKind::StoredSemanticIrPublication
         || matches!(question, LookupQuestion::StoredSemanticIrPublication(..))
     {
@@ -1645,9 +1883,10 @@ const ALL_INDEX_FAMILIES: [IndexFamily; 9] = [
 ];
 
 /// Every derived-value lookup kind.
-const ALL_LOOKUP_KINDS: [LookupKind; 36] = [
+const ALL_LOOKUP_KINDS: [LookupKind; 37] = [
     LookupKind::CertifiedDefinitionAnswer,
     LookupKind::StoredSemanticIrPublication,
+    LookupKind::SelectedReceiverProof,
     LookupKind::ResolvedName,
     LookupKind::Definitions,
     LookupKind::IdentifierCandidates,
@@ -1793,12 +2032,162 @@ pub(super) fn workspace_fact_subjects() -> Vec<FactSubject> {
     ]
 }
 
+/// Test-only typed questions used by both real persisted receipt carriers.
+#[cfg(test)]
+pub(super) fn selected_receiver_proof_keys() -> Vec<ReadKey> {
+    let mut keys = Vec::new();
+    for parse_variant in [
+        StoredSemanticIrParseVariant::Empty,
+        StoredSemanticIrParseVariant::Digest([7; 32]),
+    ] {
+        let source = SelectedProofSource {
+            storage_language: "csharp".into(),
+            rel_path: "C.cs".into(),
+            blob_oid: [3; 20],
+            parse_variant,
+            producer_epoch: "csharp-test-proof".into(),
+        };
+        let application = LocalResolutionIdentityDigest::new([4; 32]);
+        for question in [
+            SelectedReceiverProofQuestion::BaseReceiverContext {
+                source: source.clone(),
+                reference: LocalResolutionIdentityDigest::new([8; 32]),
+            },
+            SelectedReceiverProofQuestion::OwnerApplication {
+                source: source.clone(),
+                application,
+            },
+            SelectedReceiverProofQuestion::CurrentInstanceTransfer {
+                source: source.clone(),
+                application,
+                receiver: LocalResolutionIdentityDigest::new([5; 32]),
+                transfer_rule: LocalResolutionIdentityDigest::new([6; 32]),
+            },
+        ] {
+            keys.push(ReadKey::lookup(
+                LookupKind::SelectedReceiverProof,
+                LookupQuestion::SelectedReceiverProof(question),
+                StableDigest::sha256("observed answer"),
+            ));
+        }
+    }
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
 
     use super::*;
     use brokk_bifrost_semantic::analyzer::semantic::read_ledger::CertifiedDefinitionKind;
+
+    #[test]
+    fn original_selected_receiver_question_canonical_digests_are_unchanged() {
+        let expected = [
+            (
+                "owner_application",
+                false,
+                "4d618c41771394270fc548f7c1dce0a122d117c75ac48f2d7d10c60cf6a264a2",
+            ),
+            (
+                "current_instance_transfer",
+                false,
+                "70c2a5cff48fb51dbf147c54ba12ffac53e14c58f5af7ffaf186d68c7ad27380",
+            ),
+            (
+                "owner_application",
+                true,
+                "7db4a8e3f09d10fc2cca3037ac6d0ab76a211c8e7dc51c10e8efaf12c792cbc5",
+            ),
+            (
+                "current_instance_transfer",
+                true,
+                "dd09d397ee1e80f742fba034ec2905d8dfdf43fa0990e780712407472b5acf99",
+            ),
+        ];
+        for key in selected_receiver_proof_keys() {
+            let ReadKey::Lookup {
+                question: LookupQuestion::SelectedReceiverProof(question),
+                ..
+            } = key
+            else {
+                unreachable!()
+            };
+            if let Some((_, _, digest)) = expected.iter().find(|(tag, variant, _)| {
+                *tag == question.stable_label()
+                    && *variant
+                        == matches!(
+                            question.source().parse_variant,
+                            StoredSemanticIrParseVariant::Digest(_)
+                        )
+            }) {
+                assert_eq!(question.canonical_digest().to_string(), *digest);
+            }
+        }
+    }
+    #[test]
+    fn selected_receiver_proof_columns_round_trip_and_reject_malformed_shapes() {
+        for key in selected_receiver_proof_keys() {
+            let columns = ReadKeyColumns::of(&key).unwrap();
+            assert_eq!(decode_columns(&columns).unwrap(), key);
+            assert!(
+                columns.name.is_none() && columns.subject.is_none() && columns.index_key.is_none()
+            );
+            for field in [
+                "epoch",
+                "application",
+                "parse",
+                "path",
+                "oid",
+                "tag",
+                "receiver",
+                "foreign",
+            ] {
+                let mut bad = ReadKeyColumns::of(&key).unwrap();
+                match field {
+                    "epoch" => bad.selected_resolution_epoch = Some(String::new()),
+                    "application" => bad.selected_application_digest = Some(vec![0; 31]),
+                    "parse" => bad.parse_variant_kind = None,
+                    "path" => bad.rel_path = Some(String::new()),
+                    "oid" => bad.blob_oid = None,
+                    "tag" => bad.selected_receiver_question = None,
+                    "receiver" => {
+                        if bad.selected_receiver_question == Some("base_receiver_context") {
+                            bad.selected_reference_digest = None;
+                        } else if bad.selected_receiver_question == Some("owner_application") {
+                            bad.selected_receiver_digest = Some(vec![0; 32]);
+                        } else {
+                            bad.selected_transfer_rule_digest = None;
+                        }
+                    }
+                    "foreign" => bad.subject = Some(vec![0; 32]),
+                    _ => unreachable!(),
+                }
+                assert!(decode_columns(&bad).is_err(), "{field}: {key:?}");
+            }
+            let mut future = ReadKeyColumns::of(&key).unwrap();
+            future.family = Some("selected_receiver_proof:v2");
+            assert!(
+                decode_columns(&future)
+                    .unwrap_err()
+                    .is_unsupported_read_key()
+            );
+            for field in ["application", "receiver", "transfer rule", "reference"] {
+                let mut malformed = ReadKeyColumns::of(&key).unwrap();
+                malformed.family = future.family;
+                let bytes = Some(vec![0; 31]);
+                match field {
+                    "application" => malformed.selected_application_digest = bytes,
+                    "receiver" => malformed.selected_receiver_digest = bytes,
+                    "transfer rule" => malformed.selected_transfer_rule_digest = bytes,
+                    "reference" => malformed.selected_reference_digest = bytes,
+                    _ => unreachable!(),
+                }
+                let error = decode_columns(&malformed).unwrap_err();
+                assert!(!error.is_unsupported_read_key(), "{field}: {error}");
+            }
+        }
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -1834,7 +2223,8 @@ mod tests {
         for kind in ALL_LOOKUP_KINDS.into_iter().filter(|kind| {
             !matches!(
                 kind,
-                LookupKind::RustBoundTraitImplInventory
+                LookupKind::SelectedReceiverProof
+                    | LookupKind::RustBoundTraitImplInventory
                     | LookupKind::RustTraitsImplementedByInventory
                     | LookupKind::CertifiedDefinitionAnswer
                     | LookupKind::RustUnresolvedTraitImplInventory
@@ -2121,6 +2511,18 @@ mod tests {
             ("derivation:rust_selection_content:v2", None, None, None),
             ("derivation:rust_unit_set:v1", None, None, None),
             (
+                "derivation:rust_unit_inputs:v1",
+                Some(vec![7u8; 32]),
+                None,
+                None,
+            ),
+            (
+                "derivation:rust_unit_inputs:v2",
+                Some(vec![7u8; 32]),
+                None,
+                None,
+            ),
+            (
                 "derivation:rust_forward_scope_witness:v1",
                 Some(vec![7u8; 32]),
                 Some("src/lib.rs"),
@@ -2213,6 +2615,7 @@ mod tests {
             ),
             ("derivation:rust_unit_inputs:v1", rust, subject, None, None),
             ("derivation:rust_unit_inputs:v2", rust, subject, None, None),
+            ("derivation:rust_unit_inputs:v3", rust, subject, None, None),
             (
                 "derivation:rust_unit_dependents:v1",
                 rust,
@@ -2738,7 +3141,7 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         connection
             .query_row(
-                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19 AS copy_owning_unit, ?20, ?21, ?22, ?23, ?24, ?25, ?26 AS parse_variant_kind, ?27, ?28 AS structural_role, ?29, ?30 AS drop_owning_unit, ?31 AS drop_module_path, ?32 AS drop_identity_digest, ?33 AS drop_config_digest, ?34 AS drop_proof_version",
+                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19 AS copy_owning_unit, ?20, ?21, ?22, ?23, ?24, ?25, ?26 AS parse_variant_kind, ?27, ?28 AS structural_role, ?29, ?30 AS selected_receiver_question, ?31, ?32, ?33, ?34, ?35, ?36 AS drop_owning_unit, ?37 AS drop_module_path, ?38 AS drop_identity_digest, ?39 AS drop_config_digest, ?40 AS drop_proof_version",
                 params![
                     columns.key_digest.as_slice(),
                     columns.kind,
@@ -2769,6 +3172,12 @@ mod tests {
                     columns.parse_variant_digest,
                     columns.structural_role,
                     columns.structural_keyword,
+                    columns.selected_receiver_question,
+                    columns.selected_resolution_epoch,
+                    columns.selected_application_digest,
+                    columns.selected_receiver_digest,
+                    columns.selected_transfer_rule_digest,
+                    columns.selected_reference_digest,
                     columns.drop_owning_unit,
                     columns.drop_module_path,
                     columns.drop_identity_digest,
@@ -2871,6 +3280,10 @@ mod tests {
     #[test]
     fn workspace_fact_columns_reject_inconsistent_subjects() {
         for (family, subject) in [
+            (
+                WorkspaceFactFamily::SelectedDependencyEvidence,
+                FactSubject::Whole,
+            ),
             (
                 WorkspaceFactFamily::WorkspaceFileListing,
                 FactSubject::Whole,

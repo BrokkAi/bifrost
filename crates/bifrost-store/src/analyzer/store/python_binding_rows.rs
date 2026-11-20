@@ -181,6 +181,25 @@ fn insert(tx: &Transaction<'_>, sql: &str, values: impl rusqlite::Params) -> Res
 }
 
 #[doc(hidden)]
+pub fn retire(tx: &Transaction<'_>, blob: i64) -> Result<()> {
+    // Native member/guard rows refer to resolution coordinates without
+    // cascades. Retire their owner before clearing the referenced graph.
+    // Observations/directives link to scopes/slots without cascades. Retire
+    // those edges before scopes cascade slots and events in this blob.
+    for sql in [
+        "DELETE FROM python_binding_source WHERE blob_id=?1",
+        "DELETE FROM python_import_module_operands WHERE blob_id=?1",
+        "DELETE FROM python_package_path_extensions WHERE blob_id=?1",
+        "DELETE FROM resolution_binding_observations WHERE blob_id=?1",
+        "DELETE FROM resolution_binding_directives WHERE blob_id=?1",
+        "DELETE FROM resolution_binding_scopes WHERE blob_id=?1",
+    ] {
+        tx.prepare_cached(sql)?.execute([blob])?;
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
 pub fn publish(
     tx: &Transaction<'_>,
     blob: i64,
@@ -1150,17 +1169,20 @@ impl PythonBindingRows {
     }
 }
 
+/// Whether this blob's retained native resolution inputs have the current format.
+pub fn source_is_current(conn: &Connection, blob: i64) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT format FROM python_binding_source WHERE blob_id=?1")?
+        .query_row([blob], |row| row.get::<_, i64>(0))
+        .optional()?
+        == Some(NATIVE_SOURCE_FORMAT))
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl AnalyzerStore {
     #[doc(hidden)]
     pub fn python_binding_source_is_current(&self, blob: i64) -> Result<bool> {
-        self.conn.execute(move |conn| {
-            Ok(conn
-                .prepare_cached("SELECT format FROM python_binding_source WHERE blob_id=?1")?
-                .query_row([blob], |row| row.get::<_, i64>(0))
-                .optional()?
-                == Some(NATIVE_SOURCE_FORMAT))
-        })
+        self.conn.execute(move |conn| source_is_current(conn, blob))
     }
 }
 

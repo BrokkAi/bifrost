@@ -1644,9 +1644,69 @@ pub fn control_dependence<G>(
 where
     G: DenseBidirectionalGraph,
 {
+    let mut rows = Vec::new();
+    let summary = visit_control_dependence(
+        graph,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        request,
+        |row| rows.push(row),
+    )?;
+    rows.sort_unstable();
+    rows.dedup();
+    Ok(ControlDependenceResult {
+        rows: rows.into_boxed_slice(),
+        non_exiting_regions: summary.non_exiting_regions,
+        unreachable_points: summary.unreachable_points,
+        work: summary.work,
+    })
+}
+
+/// Summary of pairs emitted without retaining a dependence closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlDependenceSummary<Node> {
+    pub non_exiting_regions: Box<[NonExitingRegion<Node>]>,
+    pub unreachable_points: usize,
+    pub work: CfgAlgorithmWork,
+}
+
+/// Emit each dependence pair using the shared postdominator-chain algorithm.
+/// Visitors may count before resident admission, then revisit to materialize.
+/// Work is checkpointed in both passes through the same request token.
+pub fn visit_control_dependence<G>(
+    graph: &G,
+    entry: G::Node,
+    normal_exit: G::Node,
+    exceptional_exit: G::Node,
+    request: &mut CfgAlgorithmRequest<'_>,
+    visit: impl FnMut(ControlDependenceRow<G::Edge, G::Node>),
+) -> AlgorithmResult<ControlDependenceSummary<G::Node>, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
     let started = request.budget.used();
     let postdom = postdominators(graph, entry, normal_exit, exceptional_exit, request)?;
-    let mut rows = Vec::new();
+    visit_control_dependence_pairs(graph, &postdom, request, visit)?;
+    Ok(ControlDependenceSummary {
+        non_exiting_regions: postdom.non_exiting_regions,
+        unreachable_points: postdom.unreachable_points,
+        work: request.budget.used().saturating_sub(started),
+    })
+}
+
+/// Emit each dependence pair from postdominators the caller already computed,
+/// so a caller that counts and then materializes (or also needs the
+/// postdominator tree) derives them once.
+pub fn visit_control_dependence_pairs<G>(
+    graph: &G,
+    postdom: &Postdominators<G::Node>,
+    request: &mut CfgAlgorithmRequest<'_>,
+    mut visit: impl FnMut(ControlDependenceRow<G::Edge, G::Node>),
+) -> AlgorithmResult<(), G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
     for index in 0..graph.node_count() {
         request.checkpoint()?;
         let source = required_node(graph, index);
@@ -1665,7 +1725,7 @@ where
                 if runner == postdom.synthetic_exit {
                     return Err(CfgAlgorithmError::InvalidNode(source));
                 }
-                rows.push(ControlDependenceRow {
+                visit(ControlDependenceRow {
                     controlling_edge: edge,
                     governed: required_node(graph, runner),
                 });
@@ -1674,14 +1734,7 @@ where
             }
         }
     }
-    rows.sort_unstable();
-    rows.dedup();
-    Ok(ControlDependenceResult {
-        rows: rows.into_boxed_slice(),
-        non_exiting_regions: postdom.non_exiting_regions,
-        unreachable_points: postdom.unreachable_points,
-        work: request.budget.used().saturating_sub(started),
-    })
+    request.checkpoint()
 }
 
 fn intersect_dominators<Node>(
@@ -2187,6 +2240,8 @@ pub fn value_liveness_facts(
             GuardPredicate::InstanceOf { value, classes }
             | GuardPredicate::ExactClass { value, classes, .. } => uses.extend([value, classes]),
             GuardPredicate::HasMember { value, member } => uses.extend([value, member]),
+            GuardPredicate::ValueEquality { left, right, .. }
+            | GuardPredicate::ValueOrdering { left, right, .. } => uses.extend([left, right]),
             GuardPredicate::Truthy { value } => uses.push(value),
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::NullComparison { .. }

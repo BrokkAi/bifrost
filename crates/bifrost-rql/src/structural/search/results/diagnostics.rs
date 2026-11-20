@@ -1,6 +1,578 @@
 use super::*;
 use crate::analyzer::semantic::{SemanticBudgetDimension, SemanticWork};
 use schemars::JsonSchema;
+use serde::ser::{SerializeSeq, SerializeStruct};
+
+/// One fixed presentation refusal, with no owned strings or root allocations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PresentationDiagnostic {
+    RowsRefused,
+    SourceTextRefused,
+    OwnerUnavailable,
+}
+
+impl std::fmt::Debug for PresentationDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct FixedRoot;
+        impl std::fmt::Debug for FixedRoot {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("CodeQueryExhaustedRoot")
+                    .field("path", &".")
+                    .field("procedure", &Option::<&str>::None)
+                    .field("lane", &"render/site_output/retained_bytes")
+                    .field("stage", &Some("result_presentation"))
+                    .field("budget", &Option::<CodeQueryExhaustedBudget>::None)
+                    .field("charge", &Option::<CodeQueryExhaustedCharge>::None)
+                    .field("feedback_iteration", &Option::<usize>::None)
+                    .finish()
+            }
+        }
+        let mut diagnostic = formatter.debug_struct("CodeQueryDiagnostic");
+        diagnostic
+            .field("code", &self.code())
+            .field("impact", &CodeQueryDiagnosticImpact::Incomplete)
+            .field("incompleteness", &self.incompleteness())
+            .field("branch", &(&[] as &[usize]))
+            .field("language", &"workspace")
+            .field("message", &self.message());
+        if *self == Self::OwnerUnavailable {
+            diagnostic.field("exhausted_roots", &(&[] as &[FixedRoot]));
+        } else {
+            diagnostic.field("exhausted_roots", &[FixedRoot]);
+        }
+        diagnostic.finish()
+    }
+}
+
+impl PresentationDiagnostic {
+    pub const fn code(self) -> CodeQueryDiagnosticCode {
+        match self {
+            Self::RowsRefused | Self::SourceTextRefused => {
+                CodeQueryDiagnosticCode::PresentationRowsRefused
+            }
+            Self::OwnerUnavailable => CodeQueryDiagnosticCode::PresentationOwnerUnavailable,
+        }
+    }
+
+    pub const fn incompleteness(self) -> Incompleteness {
+        let cause = match self {
+            Self::RowsRefused | Self::SourceTextRefused => DiagnosticExecutionCause::Budget,
+            Self::OwnerUnavailable => DiagnosticExecutionCause::Provider,
+        };
+        Incompleteness::Operational(cause)
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RowsRefused => "site presentation could not retain the requested payload",
+            Self::SourceTextRefused => {
+                "site source text could not be admitted for presentation; structural roles and values are retained"
+            }
+            Self::OwnerUnavailable => "site presentation has no analyzer retention owner",
+        }
+    }
+
+    fn presentation_label(self) -> &'static str {
+        match self {
+            Self::RowsRefused | Self::SourceTextRefused => "incomplete [presentation_rows_refused]",
+            Self::OwnerUnavailable => "incomplete [presentation_owner_unavailable]",
+        }
+    }
+}
+
+impl Serialize for PresentationDiagnostic {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let has_root = *self != Self::OwnerUnavailable;
+        let mut diagnostic =
+            serializer.serialize_struct("CodeQueryDiagnostic", 5 + usize::from(has_root))?;
+        diagnostic.serialize_field("incompleteness", &self.incompleteness())?;
+        diagnostic.serialize_field("code", &self.code())?;
+        diagnostic.serialize_field("impact", &CodeQueryDiagnosticImpact::Incomplete)?;
+        diagnostic.serialize_field("language", "workspace")?;
+        diagnostic.serialize_field("message", self.message())?;
+        if has_root {
+            #[derive(Serialize)]
+            struct FixedRoot {
+                path: &'static str,
+                lane: &'static str,
+                stage: &'static str,
+            }
+            diagnostic.serialize_field(
+                "exhausted_roots",
+                &[FixedRoot {
+                    path: ".",
+                    lane: "render/site_output/retained_bytes",
+                    stage: "result_presentation",
+                }],
+            )?;
+        }
+        diagnostic.end()
+    }
+}
+
+/// Legacy semantic diagnostics plus at most one allocation-free presentation
+/// refusal. Semantic mutation cannot silently erase a presentation failure.
+#[derive(Clone, Default)]
+pub struct QueryDiagnostics {
+    semantic: Vec<CodeQueryDiagnostic>,
+    presentation: Option<PresentationDiagnostic>,
+}
+
+impl std::fmt::Debug for QueryDiagnostics {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl From<Vec<CodeQueryDiagnostic>> for QueryDiagnostics {
+    fn from(semantic: Vec<CodeQueryDiagnostic>) -> Self {
+        Self {
+            semantic,
+            presentation: None,
+        }
+    }
+}
+
+impl QueryDiagnostics {
+    pub fn len(&self) -> usize {
+        self.semantic.len() + usize::from(self.presentation.is_some())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.semantic.is_empty() && self.presentation.is_none()
+    }
+
+    /// Append a legacy semantic or host-session diagnostic unchanged.
+    pub fn push(&mut self, diagnostic: CodeQueryDiagnostic) {
+        self.semantic.push(diagnostic);
+    }
+
+    pub fn extend(&mut self, diagnostics: impl IntoIterator<Item = CodeQueryDiagnostic>) {
+        self.semantic.extend(diagnostics);
+    }
+
+    /// Move another complete carrier after these semantic diagnostics. The
+    /// presentation refusal stays a static flag, never a raw owned diagnostic.
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.semantic.append(&mut other.semantic);
+        if let Some(diagnostic) = other.presentation {
+            self.set_presentation(diagnostic);
+        }
+    }
+
+    /// Keep the first whole-row refusal, upgrading a source-only refusal if
+    /// later presentation cannot preserve a complete row.
+    pub fn set_presentation(&mut self, diagnostic: PresentationDiagnostic) {
+        match self.presentation {
+            None | Some(PresentationDiagnostic::SourceTextRefused) => {
+                self.presentation = Some(diagnostic);
+            }
+            Some(
+                PresentationDiagnostic::RowsRefused | PresentationDiagnostic::OwnerUnavailable,
+            ) => {}
+        }
+    }
+
+    pub fn iter(&self) -> DiagnosticIter<'_> {
+        DiagnosticIter {
+            semantic: self.semantic.iter(),
+            presentation: self.presentation,
+        }
+    }
+
+    /// Borrow a semantic-only product; presentation is never a policy input.
+    pub fn semantic(&self) -> &[CodeQueryDiagnostic] {
+        assert!(
+            self.presentation.is_none(),
+            "presentation diagnostics cannot enter semantic execution"
+        );
+        &self.semantic
+    }
+
+    pub fn semantic_mut(&mut self) -> &mut Vec<CodeQueryDiagnostic> {
+        assert!(
+            self.presentation.is_none(),
+            "presentation diagnostics cannot enter semantic execution"
+        );
+        &mut self.semantic
+    }
+
+    pub fn into_semantic(self) -> Vec<CodeQueryDiagnostic> {
+        assert!(
+            self.presentation.is_none(),
+            "presentation diagnostics cannot enter semantic execution"
+        );
+        self.semantic
+    }
+}
+
+/// Borrowed diagnostics expose values without constructing a raw owned
+/// presentation diagnostic. Explicit extraction keeps its static carrier.
+#[derive(Clone, Copy)]
+pub enum DiagnosticRef<'a> {
+    Semantic(&'a CodeQueryDiagnostic),
+    Presentation(PresentationDiagnostic),
+}
+
+impl std::fmt::Debug for DiagnosticRef<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Semantic(diagnostic) => std::fmt::Debug::fmt(diagnostic, formatter),
+            Self::Presentation(diagnostic) => std::fmt::Debug::fmt(diagnostic, formatter),
+        }
+    }
+}
+
+impl<'a> DiagnosticRef<'a> {
+    pub fn code(self) -> CodeQueryDiagnosticCode {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.code,
+            Self::Presentation(diagnostic) => diagnostic.code(),
+        }
+    }
+    pub fn impact(self) -> CodeQueryDiagnosticImpact {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.impact,
+            Self::Presentation(_) => CodeQueryDiagnosticImpact::Incomplete,
+        }
+    }
+    pub fn incompleteness(self) -> Incompleteness {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.incompleteness,
+            Self::Presentation(diagnostic) => diagnostic.incompleteness(),
+        }
+    }
+    pub fn language(self) -> &'static str {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.language,
+            Self::Presentation(_) => "workspace",
+        }
+    }
+    pub fn message(self) -> &'a str {
+        match self {
+            Self::Semantic(diagnostic) => &diagnostic.message,
+            Self::Presentation(diagnostic) => diagnostic.message(),
+        }
+    }
+    pub fn branch(self) -> &'a [usize] {
+        match self {
+            Self::Semantic(diagnostic) => &diagnostic.branch,
+            Self::Presentation(_) => &[],
+        }
+    }
+    pub fn withheld_rows_path(self) -> Option<&'a str> {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.withheld_rows_path.as_deref(),
+            Self::Presentation(_) => None,
+        }
+    }
+    pub fn step_index(self) -> Option<usize> {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.step_index,
+            Self::Presentation(_) => None,
+        }
+    }
+    pub fn step_op(self) -> Option<&'a str> {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.step_op.as_deref(),
+            Self::Presentation(_) => None,
+        }
+    }
+    pub fn no_rows_reason(self) -> Option<CodeQueryStepNoRowsReason> {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.no_rows_reason,
+            Self::Presentation(_) => None,
+        }
+    }
+    pub fn cause_codes(self) -> &'a [CodeQueryDiagnosticCode] {
+        match self {
+            Self::Semantic(diagnostic) => &diagnostic.cause_codes,
+            Self::Presentation(_) => &[],
+        }
+    }
+    pub fn source(self) -> Option<&'a CodeQuerySourceSpan> {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.source.as_ref(),
+            Self::Presentation(_) => None,
+        }
+    }
+    pub fn related(self) -> &'a [CodeQueryRelatedSource] {
+        match self {
+            Self::Semantic(diagnostic) => &diagnostic.related,
+            Self::Presentation(_) => &[],
+        }
+    }
+    pub fn presentation_label(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Semantic(diagnostic) => std::borrow::Cow::Owned(diagnostic.presentation_label()),
+            Self::Presentation(diagnostic) => {
+                std::borrow::Cow::Borrowed(diagnostic.presentation_label())
+            }
+        }
+    }
+}
+
+impl brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict for DiagnosticRef<'_> {
+    fn reuse_verdict(&self) -> brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict {
+        if self.incompleteness().execution_cause().is_some() {
+            super::super::EXECUTION_DEPENDENT
+        } else {
+            brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content
+        }
+    }
+}
+
+impl Serialize for DiagnosticRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Semantic(diagnostic) => diagnostic.serialize(serializer),
+            Self::Presentation(diagnostic) => diagnostic.serialize(serializer),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "semantic extraction moves its existing diagnostic without a new box allocation"
+)]
+pub enum DiagnosticHandle {
+    Semantic(CodeQueryDiagnostic),
+    Presentation(PresentationDiagnostic),
+}
+
+impl std::fmt::Debug for DiagnosticHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.as_diagnostic_ref(), formatter)
+    }
+}
+
+impl DiagnosticHandle {
+    pub fn as_diagnostic_ref(&self) -> DiagnosticRef<'_> {
+        match self {
+            Self::Semantic(diagnostic) => DiagnosticRef::Semantic(diagnostic),
+            Self::Presentation(diagnostic) => DiagnosticRef::Presentation(*diagnostic),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DiagnosticIter<'a> {
+    semantic: std::slice::Iter<'a, CodeQueryDiagnostic>,
+    presentation: Option<PresentationDiagnostic>,
+}
+
+impl<'a> Iterator for DiagnosticIter<'a> {
+    type Item = DiagnosticRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.semantic
+            .next()
+            .map(DiagnosticRef::Semantic)
+            .or_else(|| self.presentation.take().map(DiagnosticRef::Presentation))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let length = self.semantic.len() + usize::from(self.presentation.is_some());
+        (length, Some(length))
+    }
+}
+
+impl ExactSizeIterator for DiagnosticIter<'_> {}
+
+impl<'a> IntoIterator for &'a QueryDiagnostics {
+    type Item = DiagnosticRef<'a>;
+    type IntoIter = DiagnosticIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct DiagnosticIntoIter {
+    semantic: std::vec::IntoIter<CodeQueryDiagnostic>,
+    presentation: Option<PresentationDiagnostic>,
+}
+
+impl Iterator for DiagnosticIntoIter {
+    type Item = DiagnosticHandle;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.semantic
+            .next()
+            .map(DiagnosticHandle::Semantic)
+            .or_else(|| self.presentation.take().map(DiagnosticHandle::Presentation))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let length = self.semantic.len() + usize::from(self.presentation.is_some());
+        (length, Some(length))
+    }
+}
+
+impl ExactSizeIterator for DiagnosticIntoIter {}
+
+impl IntoIterator for QueryDiagnostics {
+    type Item = DiagnosticHandle;
+    type IntoIter = DiagnosticIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        DiagnosticIntoIter {
+            semantic: self.semantic.into_iter(),
+            presentation: self.presentation,
+        }
+    }
+}
+
+impl Serialize for QueryDiagnostics {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for diagnostic in self {
+            sequence.serialize_element(&diagnostic)?;
+        }
+        sequence.end()
+    }
+}
+
+impl JsonSchema for QueryDiagnostics {
+    fn inline_schema() -> bool {
+        <Vec<CodeQueryDiagnostic>>::inline_schema()
+    }
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <Vec<CodeQueryDiagnostic>>::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        <Vec<CodeQueryDiagnostic>>::schema_id()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <Vec<CodeQueryDiagnostic>>::json_schema(generator)
+    }
+}
+
+#[cfg(test)]
+mod presentation_diagnostic_carrier_tests {
+    use super::*;
+
+    #[test]
+    fn static_presentation_diagnostics_keep_the_legacy_array_schema_and_wire_fields() {
+        assert!(!std::mem::needs_drop::<PresentationDiagnostic>());
+        for (kind, code, cause, message) in [
+            (
+                PresentationDiagnostic::RowsRefused,
+                "presentation_rows_refused",
+                DiagnosticExecutionCause::Budget,
+                "site presentation could not retain the requested payload",
+            ),
+            (
+                PresentationDiagnostic::SourceTextRefused,
+                "presentation_rows_refused",
+                DiagnosticExecutionCause::Budget,
+                "site source text could not be admitted for presentation; structural roles and values are retained",
+            ),
+            (
+                PresentationDiagnostic::OwnerUnavailable,
+                "presentation_owner_unavailable",
+                DiagnosticExecutionCause::Provider,
+                "site presentation has no analyzer retention owner",
+            ),
+        ] {
+            let mut diagnostics = QueryDiagnostics::default();
+            diagnostics.set_presentation(kind);
+            assert!(diagnostics.semantic.is_empty());
+            assert_eq!(diagnostics.semantic.capacity(), 0);
+            let mut expected = serde_json::json!({
+                "incompleteness": Incompleteness::Operational(cause),
+                "code": code,
+                "impact": "incomplete",
+                "language": "workspace",
+                "message": message,
+            });
+            if kind != PresentationDiagnostic::OwnerUnavailable {
+                expected["exhausted_roots"] = serde_json::json!([{
+                    "path": ".",
+                    "lane": "render/site_output/retained_bytes",
+                    "stage": "result_presentation",
+                }]);
+            }
+            assert_eq!(
+                serde_json::to_value(&diagnostics).unwrap(),
+                serde_json::json!([expected])
+            );
+            let borrowed = diagnostics.iter().next().unwrap();
+            assert_eq!(borrowed.message(), message);
+            assert_eq!(
+                borrowed.incompleteness(),
+                Incompleteness::Operational(cause)
+            );
+            assert!(borrowed.source().is_none());
+            assert!(borrowed.withheld_rows_path().is_none());
+            assert!(borrowed.step_index().is_none() && borrowed.step_op().is_none());
+            assert!(borrowed.cause_codes().is_empty());
+            assert!(matches!(
+                borrowed.presentation_label(),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            let detached = diagnostics.clone().into_iter().next().unwrap();
+            drop(diagnostics);
+            assert_eq!(detached.as_diagnostic_ref().message(), message);
+            assert!(matches!(detached, DiagnosticHandle::Presentation(_)));
+        }
+        assert_eq!(
+            schemars::schema_for!(QueryDiagnostics),
+            schemars::schema_for!(Vec<CodeQueryDiagnostic>),
+        );
+    }
+
+    #[test]
+    fn semantic_conversion_preserves_legacy_values_and_refuses_presentation_leakage() {
+        let semantic = incomplete_diagnostic(
+            CodeQueryDiagnosticCode::HierarchyIncomplete,
+            Incompleteness::Content,
+            "java",
+            "the original semantic gap".to_owned(),
+            Vec::new(),
+        );
+        let raw = vec![semantic];
+        let expected_debug = format!("{raw:?}");
+        let expected = serde_json::to_value(&raw).unwrap();
+        let mut diagnostics = QueryDiagnostics::from(raw);
+        assert_eq!(format!("{diagnostics:?}"), expected_debug);
+        assert_eq!(serde_json::to_value(&diagnostics).unwrap(), expected);
+        assert_eq!(diagnostics.semantic().len(), 1);
+        diagnostics.semantic_mut()[0].step_index = Some(2);
+        assert_eq!(diagnostics.clone().into_semantic()[0].step_index, Some(2));
+        diagnostics.set_presentation(PresentationDiagnostic::SourceTextRefused);
+        diagnostics.set_presentation(PresentationDiagnostic::RowsRefused);
+        diagnostics.set_presentation(PresentationDiagnostic::SourceTextRefused);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.iter().count(), 2);
+        assert_eq!(
+            diagnostics.iter().nth(1).unwrap().message(),
+            PresentationDiagnostic::RowsRefused.message()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                diagnostics.clone().into_semantic()
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { diagnostics.semantic() }))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                diagnostics.semantic_mut().clear();
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            diagnostics.iter().next().unwrap().code(),
+            CodeQueryDiagnosticCode::HierarchyIncomplete
+        );
+    }
+}
 
 macro_rules! saturating_add_work {
     ($left:ident, $right:ident; [$($field:ident),* $(,)?]; [$($flag:ident),* $(,)?] $(; [$($peak:ident),* $(,)?])?) => {
@@ -104,6 +676,7 @@ code_query_labeled_enum! {
         ValueFlowWitnessTruncated => "value_flow_witness_truncated",
         TypeFlowWitnessTruncated => "type_flow_witness_truncated",
         TypeFlowWitnessUnavailable => "type_flow_witness_unavailable",
+        DerivedCacheRebuilt => "derived_cache_rebuilt",
         UnresolvedTaintResultReference => "unresolved_taint_result_reference",
         TaintRegistrationStale => "taint_registration_stale",
         TaintHandleStale => "taint_handle_stale",
@@ -119,6 +692,8 @@ code_query_labeled_enum! {
         CallRelationTargetsAmbiguous => "call_relation_targets_ambiguous",
         CallRelationCandidateLimit => "call_relation_candidate_limit",
         CallRelationAnalysisFailed => "call_relation_analysis_failed",
+        PresentationRowsRefused => "presentation_rows_refused",
+        PresentationOwnerUnavailable => "presentation_owner_unavailable",
         RenderedCapturesTruncated => "rendered_captures_truncated",
         ReferenceSourceBytesTruncated => "reference_source_bytes_truncated",
         ReferenceCandidateFilesTruncated => "reference_candidate_files_truncated",
@@ -127,6 +702,7 @@ code_query_labeled_enum! {
         ReferenceCallsiteLimit => "reference_callsite_limit",
         ReferenceAnalysisFailed => "reference_analysis_failed",
         ReferenceKindUndecided => "reference_kind_undecided",
+        StepProducedNoRows => "step_produced_no_rows",
         EnclosingPatternUndecided => "enclosing_pattern_undecided",
         IdenticalCapturesOpen => "identical_captures_open",
         RowPredicateUndecided => "row_predicate_undecided",
@@ -199,8 +775,7 @@ impl CodeQueryDiagnosticCode {
     pub const fn inherent_execution_cause(self) -> Option<DiagnosticExecutionCause> {
         match self {
             Self::Cancelled => Some(DiagnosticExecutionCause::Cancelled),
-            Self::SemanticResultsOmitted
-            | Self::SemanticBudgetExhausted
+            Self::SemanticBudgetExhausted
             | Self::TypestateSolverBudgetExhausted
             | Self::TypestateFindingBudgetExhausted
             | Self::TypestateWitnessTruncated
@@ -210,6 +785,7 @@ impl CodeQueryDiagnosticCode {
             | Self::TaintFindingTruncated
             | Self::CallRelationBudgetExhausted
             | Self::CallRelationCandidateLimit
+            | Self::PresentationRowsRefused
             | Self::RenderedCapturesTruncated
             | Self::ReferenceSourceBytesTruncated
             | Self::ReferenceCandidateFilesTruncated
@@ -222,7 +798,8 @@ impl CodeQueryDiagnosticCode {
             | Self::MaterializationRowBudgetExhausted
             | Self::EnvironmentRowBudgetExhausted
             | Self::EffectBudgetExhausted => Some(DiagnosticExecutionCause::Budget),
-            Self::SemanticProviderFailed
+            Self::PresentationOwnerUnavailable
+            | Self::SemanticProviderFailed
             | Self::SemanticPackAcquisitionPending
             | Self::SemanticPackActivationFailed
             | Self::UnresolvedProtocolReference
@@ -398,17 +975,62 @@ pub struct CodeQueryDiagnostic {
     /// withheld rows may lie anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld_rows_path: Option<String>,
+    /// Zero-based index of the authored step this diagnostic belongs to,
+    /// within the `steps` array of the plan or branch that owns the step.
+    /// Absent on request-level diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    /// Canonical op label of the authored step at `step_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_op: Option<String>,
+    /// Why the step produced no rows. Set only on `step_produced_no_rows`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_rows_reason: Option<CodeQueryStepNoRowsReason>,
+    /// Codes of the step's own incomplete diagnostics that left it without
+    /// rows, in first-seen order. Set only for the `incomplete` reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub cause_codes: Vec<CodeQueryDiagnosticCode>,
+}
+
+/// Why an authored step turned a non-empty input into no rows.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryStepNoRowsReason {
+    /// The step itself reported incomplete work.
+    Incomplete,
+    /// The step's relation or lookup produced no rows, including after the
+    /// step's own inline conditions.
+    #[cfg_attr(feature = "query-result-fixtures", default)]
+    NoMatchingRows,
+    /// A standalone row-selecting step (`filter`, `identical_captures`,
+    /// `resolved_call`, `resolved_value`, `call_argument`) rejected all of its
+    /// input rows.
+    AllInputsFiltered,
 }
 
 impl CodeQueryDiagnostic {
-    /// Construct admission metadata together with the diagnostic code.
-    pub fn new(mut diagnostic: Self) -> Self {
-        if diagnostic.incompleteness == Incompleteness::Content
-            && let Some(cause) = diagnostic.code.inherent_execution_cause()
-        {
-            diagnostic.incompleteness = Incompleteness::Operational(cause);
-        }
+    /// Preserve the producer's typed admission metadata. A presentation code
+    /// cannot decide whether a mixed outcome is content or execution-dependent.
+    pub const fn new(diagnostic: Self) -> Self {
         diagnostic
+    }
+
+    /// Drop `step_produced_no_rows` advisories and clear step attribution on
+    /// the remaining diagnostics so policy consumers keep whole and unit-sliced
+    /// runs identical.
+    pub fn strip_step_attribution(diagnostics: &mut Vec<Self>) {
+        diagnostics.retain_mut(|diagnostic| {
+            if diagnostic.code == CodeQueryDiagnosticCode::StepProducedNoRows {
+                return false;
+            }
+            diagnostic.step_index = None;
+            diagnostic.step_op = None;
+            diagnostic.no_rows_reason = None;
+            diagnostic.cause_codes.clear();
+            true
+        });
     }
 }
 
@@ -424,6 +1046,10 @@ impl brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict for CodeQu
     }
 }
 
+/// `step_index` and `step_op` say where a diagnostic was seen, not what it
+/// says, so they stay out of identity: a diagnostic one capability raises in
+/// several steps is still one diagnostic when results are deduplicated, and
+/// the first one seen keeps its attribution.
 impl PartialEq for CodeQueryDiagnostic {
     fn eq(&self, other: &Self) -> bool {
         let Self {
@@ -441,6 +1067,10 @@ impl PartialEq for CodeQueryDiagnostic {
             related,
             exhausted_roots,
             withheld_rows_path,
+            step_index: _,
+            step_op: _,
+            no_rows_reason,
+            cause_codes,
         } = self;
         has_non_utf8_refusal == &other.has_non_utf8_refusal
             && code == &other.code
@@ -452,6 +1082,8 @@ impl PartialEq for CodeQueryDiagnostic {
             && related == &other.related
             && exhausted_roots == &other.exhausted_roots
             && withheld_rows_path == &other.withheld_rows_path
+            && no_rows_reason == &other.no_rows_reason
+            && cause_codes == &other.cause_codes
     }
 }
 impl Eq for CodeQueryDiagnostic {}
@@ -472,6 +1104,10 @@ impl std::hash::Hash for CodeQueryDiagnostic {
             related,
             exhausted_roots,
             withheld_rows_path,
+            step_index: _,
+            step_op: _,
+            no_rows_reason,
+            cause_codes,
         } = self;
         std::hash::Hash::hash(has_non_utf8_refusal, state);
         std::hash::Hash::hash(code, state);
@@ -483,6 +1119,8 @@ impl std::hash::Hash for CodeQueryDiagnostic {
         std::hash::Hash::hash(related, state);
         std::hash::Hash::hash(exhausted_roots, state);
         std::hash::Hash::hash(withheld_rows_path, state);
+        std::hash::Hash::hash(no_rows_reason, state);
+        std::hash::Hash::hash(cause_codes, state);
     }
 }
 
@@ -509,6 +1147,18 @@ impl std::fmt::Debug for CodeQueryDiagnostic {
         diagnostic.field("exhausted_roots", &self.exhausted_roots);
         if self.withheld_rows_path.is_some() {
             diagnostic.field("withheld_rows_path", &self.withheld_rows_path);
+        }
+        if self.step_index.is_some() {
+            diagnostic.field("step_index", &self.step_index);
+        }
+        if self.step_op.is_some() {
+            diagnostic.field("step_op", &self.step_op);
+        }
+        if self.no_rows_reason.is_some() {
+            diagnostic.field("no_rows_reason", &self.no_rows_reason);
+        }
+        if !self.cause_codes.is_empty() {
+            diagnostic.field("cause_codes", &self.cause_codes);
         }
         diagnostic.finish()
     }
@@ -677,6 +1327,14 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             exhausted_roots: Vec<CodeQueryExhaustedRoot>,
             #[serde(default)]
             withheld_rows_path: Option<String>,
+            #[serde(default)]
+            step_index: Option<usize>,
+            #[serde(default)]
+            step_op: Option<String>,
+            #[serde(default)]
+            no_rows_reason: Option<CodeQueryStepNoRowsReason>,
+            #[serde(default)]
+            cause_codes: Vec<CodeQueryDiagnosticCode>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -701,6 +1359,10 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             related: wire.related,
             exhausted_roots: wire.exhausted_roots,
             withheld_rows_path: wire.withheld_rows_path,
+            step_index: wire.step_index,
+            step_op: wire.step_op,
+            no_rows_reason: wire.no_rows_reason,
+            cause_codes: wire.cause_codes,
         })
     }
 }

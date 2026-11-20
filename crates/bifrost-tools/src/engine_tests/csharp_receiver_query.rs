@@ -13,8 +13,6 @@ mod csharp_extraction_tests {
 
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
     use brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverMemberTarget;
 
     use brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverQueryAnalysis;
@@ -136,61 +134,6 @@ void Call(Service service) {
         assert!(
             second.work.setup_nodes > 0,
             "cached site selection must remain charged"
-        );
-
-        let warm_scope = second
-            .work
-            .setup_nodes
-            .saturating_add(second.work.scope_nodes);
-        assert!(warm_scope > 0);
-        let bounded = service
-            .analyze_with_structural_facts(
-                ReceiverQueryOperation::MemberTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                &facts,
-                ReceiverAnalysisBudget {
-                    max_scope_nodes: warm_scope - 1,
-                    ..ReceiverAnalysisBudget::default()
-                },
-                None,
-            )
-            .expect("bounded cached C# receiver query");
-        assert!(matches!(
-            bounded.analysis,
-            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            })
-        ));
-        assert!(
-            bounded
-                .work
-                .setup_nodes
-                .saturating_add(bounded.work.scope_nodes)
-                < warm_scope
-        );
-
-        let cold = ReceiverQueryService::from_workspace(&workspace)
-            .analyze_with_structural_facts(
-                ReceiverQueryOperation::MemberTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                &facts,
-                ReceiverAnalysisBudget::tiny(),
-                None,
-            )
-            .expect("tiny-budget C# receiver query");
-        assert!(matches!(
-            cold.analysis,
-            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            })
-        ));
-        assert!(
-            cold.work.setup_nodes.saturating_add(cold.work.scope_nodes)
-                <= ReceiverAnalysisBudget::tiny().max_scope_nodes
         );
 
         let cancellation = CancellationToken::default();
@@ -377,28 +320,6 @@ public void Run() {}
             CompatibilityOutcome::Complete(ranges) if ranges.len() == 1
         ));
 
-        let tiny_budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 1,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let mut tiny_dispatch_ledger = ReceiverWorkLedger::new(tiny_budget);
-        assert!(matches!(
-            structural_member_dispatch_supports_precise(
-                workspace.analyzer(),
-                Language::CSharp,
-                &analysis,
-                None,
-                &mut tiny_dispatch_ledger,
-            )
-            .expect("tiny dispatch metadata budget"),
-            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
-        ));
-        let mut tiny_range_ledger = ReceiverWorkLedger::new(tiny_budget);
-        assert!(matches!(
-            code_unit_ranges_bounded(workspace.analyzer(), &target, None, &mut tiny_range_ledger,)
-                .expect("tiny declaration range budget"),
-            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
-        ));
         assert_eq!(
             csharp.full_hydration_count_for_test(),
             0,

@@ -272,7 +272,9 @@ use crate::analyzer::semantic::IndexSelector;
 
 use crate::analyzer::semantic::MemoryLocationId;
 
+use crate::analyzer::semantic::IndexedLocationIdentity;
 use crate::analyzer::semantic::MemoryLocationKind;
+use crate::analyzer::semantic::gap_certifies_canonical_index_identity;
 
 use crate::analyzer::semantic::MemoryRelationOrigin;
 
@@ -4564,6 +4566,7 @@ fn location_has_unproven_exact_index(location: &AbstractLocation) -> bool {
 /// selector-free location.
 fn access_root_endpoint(
     location: &AbstractLocation,
+    base_tail: AccessPathTail,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<ValueFlowEndpoint, SemanticProviderError> {
     let root = location.path().root();
@@ -4599,7 +4602,7 @@ fn access_root_endpoint(
     if let Some(value) = value {
         return Ok(ValueFlowEndpoint::Value(value));
     }
-    let path = AccessPath::bounded(root.clone(), Vec::new(), location.path().tail(), limits)
+    let path = AccessPath::bounded(root.clone(), Vec::new(), base_tail, limits)
         .map_err(|error| internal_contract("invalid container access path", error))?;
     let container = AbstractLocation::new(location.object().clone(), path)
         .map_err(|error| internal_contract("invalid container location", error))?;
@@ -4656,6 +4659,7 @@ fn possible_dereference_store_targets(
 /// sensitivity exactly as it was: this is about subscripts, not members.
 fn indexed_container_endpoint(
     location: &AbstractLocation,
+    base_tail: AccessPathTail,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<Option<ValueFlowEndpoint>, SemanticProviderError> {
     let selectors = location.path().selectors();
@@ -4665,7 +4669,7 @@ fn indexed_container_endpoint(
     else {
         return Ok(None);
     };
-    container_endpoint_at(location, first_index, limits).map(Some)
+    container_endpoint_at(location, first_index, base_tail, limits).map(Some)
 }
 
 /// The container prefix consumed by an element read, including keyed elements
@@ -4674,10 +4678,11 @@ fn element_read_container_endpoint(
     procedure: &ProcedureHandle,
     memory: MemoryLocationId,
     location: &AbstractLocation,
+    base_tail: AccessPathTail,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<Option<ValueFlowEndpoint>, SemanticProviderError> {
     if !keyed_property_reads_container_element(procedure, memory) {
-        return indexed_container_endpoint(location, limits);
+        return indexed_container_endpoint(location, base_tail, limits);
     }
     let Some(first_element) = location.path().selectors().iter().position(|selector| {
         matches!(
@@ -4687,22 +4692,30 @@ fn element_read_container_endpoint(
     }) else {
         return Ok(None);
     };
-    container_endpoint_at(location, first_element, limits).map(Some)
+    container_endpoint_at(location, first_element, base_tail, limits).map(Some)
 }
 
+/// `base_tail` is the tail the resolver gave the access path before the path
+/// type forced `Summary` for an `Any` element selector. It is `Summary` only
+/// for reasons that concern the container itself (a joined origin, an
+/// unresolved dereference root, an unknown backing offset, selector
+/// truncation), so a store through a summarized index and a read through an
+/// exact one name the same container carrier while a summarized container
+/// stays distinct from an exact one.
 fn container_endpoint_at(
     location: &AbstractLocation,
     first_element: usize,
+    base_tail: AccessPathTail,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<ValueFlowEndpoint, SemanticProviderError> {
     let selectors = location.path().selectors();
     if first_element == 0 {
-        return access_root_endpoint(location, limits);
+        return access_root_endpoint(location, base_tail, limits);
     }
     let path = AccessPath::bounded(
         location.path().root().clone(),
         selectors[..first_element].to_vec(),
-        location.path().tail(),
+        base_tail,
         limits,
     )
     .map_err(|error| internal_contract("invalid container access path", error))?;
@@ -5215,7 +5228,11 @@ fn publish_flow_outcome(
     gap_quality: Option<GapOutcomeQuality>,
     work: SemanticWork,
 ) -> SemanticOutcome<ValueFlowSnapshot> {
-    if interrupted.is_some() || snapshot.coverage() == CandidateCoverage::Truncated {
+    assert!(
+        interrupted.is_none() || snapshot.coverage() == CandidateCoverage::Truncated,
+        "an interrupted value-flow snapshot must publish Truncated coverage"
+    );
+    if snapshot.coverage() == CandidateCoverage::Truncated {
         snapshot.mark_execution_dependent();
     }
     let quality = merge_relation_quality(gap_quality, has_unproven_relation);
@@ -5510,12 +5527,14 @@ pub fn interrupted_call_bindings(
     work: SemanticWork,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError> {
+    // The build stopped before it bound every argument, so bindings may be
+    // missing (#13837).
     let bindings = materialize_call_bindings(
         call,
         candidate,
         context,
         build,
-        CandidateCoverage::Open,
+        CandidateCoverage::Truncated,
         limits,
     )?;
     Ok(match interruption {
@@ -5596,6 +5615,7 @@ pub enum GapDischargeVerdict {
     Discharged,
     Undischarged,
     RefusedByRequestLimit,
+    RefusedByRequestBudget(crate::analyzer::semantic::SemanticBudgetExceeded),
 }
 
 impl From<bool> for GapDischargeVerdict {
@@ -5922,11 +5942,15 @@ pub fn logical_gap_is_discharged(
     } else {
         host.inert_drop_glue_discharged(logical.base, procedure, request, inert)?
     };
-    Ok(if request.stop_observed() {
-        GapDischargeVerdict::RefusedByRequestLimit
-    } else {
-        verdict
-    })
+    Ok(
+        if request.stop_observed()
+            && !matches!(verdict, GapDischargeVerdict::RefusedByRequestBudget(_))
+        {
+            GapDischargeVerdict::RefusedByRequestLimit
+        } else {
+            verdict
+        },
+    )
 }
 
 /// The gap sweep of the relation projection. Every gap that
@@ -6034,15 +6058,13 @@ pub fn sweep_procedure_gaps(
                             interrupted = Some(Interruption::Cancelled);
                             break;
                         }
-                        if verdict == GapDischargeVerdict::RefusedByRequestLimit
-                            && let Some(refusal) = staged.budget.first_refusal()
-                        {
-                            interrupted = Some(Interruption::Budget(refusal.exceeded));
-                            relevant_gaps.push(logical.key());
-                            open = true;
-                            break;
-                        }
                         match verdict {
+                            GapDischargeVerdict::RefusedByRequestBudget(exceeded) => {
+                                interrupted = Some(Interruption::Budget(exceeded));
+                                relevant_gaps.push(logical.key());
+                                open = true;
+                                break;
+                            }
                             GapDischargeVerdict::Discharged => discharged_gaps.push(logical.key()),
                             GapDischargeVerdict::Undischarged
                             | GapDischargeVerdict::RefusedByRequestLimit => {
@@ -6061,21 +6083,29 @@ pub fn sweep_procedure_gaps(
                 let canonical_index_identity_discharged = if gap.control_flow_discharge()
                     == SemanticGapDischarge::CanonicalIndexIdentity
                 {
-                    let bases = store_bases
-                        .get_or_insert_with(|| LocalStoreBases::derive(procedure.semantics()));
-                    match host.canonical_index_identity_discharged(
-                        procedure,
-                        context,
-                        gap,
-                        bases,
-                        staged,
-                        request.cancellation,
-                    ) {
-                        Ok(discharged) => discharged,
-                        Err(StrongUpdateStop::Provider(error)) => return Err(error),
-                        Err(StrongUpdateStop::Interruption(stop)) => {
-                            interrupted = Some(stop);
-                            break;
+                    if gap_names_aggregate_index_cell(procedure, gap) {
+                        // The aggregate cell is never strongly updated and
+                        // may-equals every index of its base, so its identity
+                        // needs no base-singleton proof; decided here once
+                        // for every host.
+                        true
+                    } else {
+                        let bases = store_bases
+                            .get_or_insert_with(|| LocalStoreBases::derive(procedure.semantics()));
+                        match host.canonical_index_identity_discharged(
+                            procedure,
+                            context,
+                            gap,
+                            bases,
+                            staged,
+                            request.cancellation,
+                        ) {
+                            Ok(discharged) => discharged,
+                            Err(StrongUpdateStop::Provider(error)) => return Err(error),
+                            Err(StrongUpdateStop::Interruption(stop)) => {
+                                interrupted = Some(stop);
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -6139,6 +6169,10 @@ pub fn sweep_procedure_gaps(
                                         break;
                                     }
                                     GapDischargeVerdict::Undischarged => {}
+                                    GapDischargeVerdict::RefusedByRequestBudget(exceeded) => {
+                                        interrupted = Some(Interruption::Budget(exceeded));
+                                        break;
+                                    }
                                     GapDischargeVerdict::RefusedByRequestLimit => {
                                         execution_dependent = true
                                     }
@@ -6309,7 +6343,12 @@ pub fn project_procedure_relations(
     // Catch bindings the language proves a call cannot reach are neither
     // origins nor relations (#2192).
     let refuted_bindings = if interrupted.is_none() {
-        host.refuted_catch_bindings(procedure, request)?
+        let (bindings, refusal) =
+            request.judged_with_refusal(|request| host.refuted_catch_bindings(procedure, request));
+        if let Some(refusal) = refusal {
+            interrupted = Some(Interruption::Budget(refusal.exceeded));
+        }
+        bindings.value?
     } else {
         HashSet::new()
     };
@@ -6930,15 +6969,23 @@ pub fn project_procedure_relations(
                     result,
                     ..
                 } => {
-                    let (location, summary) = materialize_abstract_location(
+                    // The primary path and every exhaustive alternative get the
+                    // same per-path facts, so a branch-selected container is
+                    // smashed on each arm and not only on the first.
+                    let primary = DraftFacts::derive(
                         procedure,
                         access_path
                             .take()
                             .expect("memory loads resolve an access path"),
                         limits,
                     )?;
-                    let unproven_index = summary || location_has_unproven_exact_index(&location);
-                    exact_index |= unproven_index;
+                    let alternatives = alternative_access_paths
+                        .drain(..)
+                        .map(|draft| DraftFacts::derive(procedure, draft, limits))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // Summarized on any candidate path means summarized, as the
+                    // exact-index flag below is folded over every path.
+                    let mut summary = false;
                     let loaded = ValueFlowEndpoint::Value(value_handle(procedure, *result)?);
                     // #2453: an element read of a tainted array carries the
                     // array's label. The subscripted expression carries a
@@ -6955,44 +7002,51 @@ pub fn project_procedure_relations(
                             quality: None,
                         });
                     }
-                    if let Some(container) =
-                        element_read_container_endpoint(procedure, *memory, &location, limits)?
-                    {
-                        smashed.push(DerivedRelation {
-                            kind: ValueFlowRelationKind::MemoryLoad,
-                            memory_role: Some(MemoryRelationRole::Supplemental),
-                            source: container,
-                            target: loaded.clone(),
-                            quality: None,
-                        });
+                    for facts in std::iter::once(&primary).chain(alternatives.iter()) {
+                        summary |= facts.summary;
+                        exact_index |= facts.unproven_index;
+                        if let Some(container) = element_read_container_endpoint(
+                            procedure,
+                            *memory,
+                            &facts.location,
+                            facts.base_tail,
+                            limits,
+                        )? {
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryLoad,
+                                memory_role: Some(MemoryRelationRole::Supplemental),
+                                source: container,
+                                target: loaded.clone(),
+                                quality: None,
+                            });
+                        }
+                        // A subscript the analysis cannot prove reads whatever
+                        // any store put in the array, so it reads the wildcard
+                        // cell every store also writes. A proven-constant
+                        // subscript does not, which is what keeps #2191's
+                        // constant-index separation intact.
+                        if facts.unproven_index
+                            && let Some(cell) = wildcard_index_endpoint(&facts.location, limits)?
+                        {
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryLoad,
+                                memory_role: Some(MemoryRelationRole::Supplemental),
+                                source: cell,
+                                target: loaded.clone(),
+                                quality: None,
+                            });
+                        }
                     }
-                    // A subscript the analysis cannot prove reads whatever
-                    // any store put in the array, so it reads the wildcard
-                    // cell every store also writes. A proven-constant
-                    // subscript does not, which is what keeps #2191's
-                    // constant-index separation intact.
-                    if unproven_index
-                        && let Some(cell) = wildcard_index_endpoint(&location, limits)?
-                    {
-                        smashed.push(DerivedRelation {
-                            kind: ValueFlowRelationKind::MemoryLoad,
-                            memory_role: Some(MemoryRelationRole::Supplemental),
-                            source: cell,
-                            target: loaded.clone(),
-                            quality: None,
-                        });
-                    }
-                    for alternative in alternative_access_paths.drain(..) {
-                        let (alternative, _) =
-                            materialize_abstract_location(procedure, alternative, limits)?;
+                    for alternative in alternatives {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryLoad,
                             memory_role: Some(MemoryRelationRole::Alternative),
-                            source: ValueFlowEndpoint::Location(Box::new(alternative)),
+                            source: ValueFlowEndpoint::Location(Box::new(alternative.location)),
                             target: loaded.clone(),
                             quality: None,
                         });
                     }
+                    let location = primary.location;
                     let source = direct_capture_port_endpoint(procedure, *memory)?
                         .unwrap_or_else(|| ValueFlowEndpoint::Location(Box::new(location)));
                     (ValueFlowRelationKind::MemoryLoad, source, loaded, summary)
@@ -7002,15 +7056,20 @@ pub fn project_procedure_relations(
                     value,
                     ..
                 } => {
-                    let (location, summary) = materialize_abstract_location(
+                    let primary = DraftFacts::derive(
                         procedure,
                         access_path
                             .take()
                             .expect("memory stores resolve an access path"),
                         limits,
                     )?;
-                    let unproven_index = summary || location_has_unproven_exact_index(&location);
-                    exact_index |= unproven_index;
+                    let alternatives = alternative_access_paths
+                        .drain(..)
+                        .map(|draft| DraftFacts::derive(procedure, draft, limits))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // Summarized on any candidate path means summarized, as the
+                    // exact-index flag below is folded over every path.
+                    let mut summary = false;
                     let stored = ValueFlowEndpoint::for_value(value_handle(procedure, *value)?);
                     let dereference_targets = possible_dereference_store_targets(
                         procedure,
@@ -7052,45 +7111,55 @@ pub fn project_procedure_relations(
                             )),
                         });
                     }
-                    // #2453, the write direction. Every element store also
-                    // writes the wildcard cell, which is what an unprovable
-                    // subscript later reads.
-                    if let Some(cell) = wildcard_index_endpoint(&location, limits)? {
-                        smashed.push(DerivedRelation {
-                            kind: ValueFlowRelationKind::MemoryStore,
-                            memory_role: Some(MemoryRelationRole::Supplemental),
-                            source: stored.clone(),
-                            target: cell,
-                            quality: None,
-                        });
+                    for facts in std::iter::once(&primary).chain(alternatives.iter()) {
+                        summary |= facts.summary;
+                        exact_index |= facts.unproven_index;
+                        // #2453, the write direction. Every element store also
+                        // writes the wildcard cell, which is what an
+                        // unprovable subscript later reads.
+                        if let Some(cell) = wildcard_index_endpoint(&facts.location, limits)? {
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryStore,
+                                memory_role: Some(MemoryRelationRole::Supplemental),
+                                source: stored.clone(),
+                                target: cell,
+                                quality: None,
+                            });
+                        }
+                        // A store *through* an unprovable subscript could have
+                        // landed anywhere in the array, so it marks the array
+                        // itself, which every element read observes. A store
+                        // at a proven constant does not: #2191 separates two
+                        // literal subscripts and this must not revoke that.
+                        //
+                        // The aggregate cell is a deliberate complete domain,
+                        // so it is not `unproven_index`, but it likewise
+                        // stands for whichever element was written: a later
+                        // literal read must observe it, so a store whose path
+                        // holds one at any depth marks the container too.
+                        if (facts.unproven_index || facts.through_aggregate_index)
+                            && let Some(container) =
+                                indexed_container_endpoint(&facts.location, facts.base_tail, limits)?
+                        {
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryStore,
+                                memory_role: Some(MemoryRelationRole::Supplemental),
+                                source: stored.clone(),
+                                target: container,
+                                quality: None,
+                            });
+                        }
                     }
-                    // A store *through* an unprovable subscript could have
-                    // landed anywhere in the array, so it marks the array
-                    // itself, which every element read observes. A store at
-                    // a proven constant does not: #2191 separates two
-                    // literal subscripts and this must not revoke that.
-                    if unproven_index
-                        && let Some(container) = indexed_container_endpoint(&location, limits)?
-                    {
-                        smashed.push(DerivedRelation {
-                            kind: ValueFlowRelationKind::MemoryStore,
-                            memory_role: Some(MemoryRelationRole::Supplemental),
-                            source: stored.clone(),
-                            target: container,
-                            quality: None,
-                        });
-                    }
-                    for alternative in alternative_access_paths.drain(..) {
-                        let (alternative, _) =
-                            materialize_abstract_location(procedure, alternative, limits)?;
+                    for alternative in alternatives {
                         smashed.push(DerivedRelation {
                             kind: ValueFlowRelationKind::MemoryStore,
                             memory_role: Some(MemoryRelationRole::Alternative),
                             source: stored.clone(),
-                            target: ValueFlowEndpoint::Location(Box::new(alternative)),
+                            target: ValueFlowEndpoint::Location(Box::new(alternative.location)),
                             quality: None,
                         });
                     }
+                    let location = primary.location;
                     let target = direct_capture_port_endpoint(procedure, *memory)?
                         .unwrap_or_else(|| ValueFlowEndpoint::Location(Box::new(location)));
                     (ValueFlowRelationKind::MemoryStore, stored, target, summary)
@@ -7983,9 +8052,15 @@ pub fn project_procedure_relations(
         !matches!(draft.payload.proof, ProofStatus::Proven)
             || !matches!(draft.payload.completeness, EvidenceCompleteness::Complete)
     });
-    let coverage = if truncated {
+    if interrupted.is_none() && request.cancellation.is_cancelled() {
+        interrupted = Some(Interruption::Cancelled);
+    }
+    // An interrupted projection stopped before it visited every event, so its
+    // relation list may lack relations. Open would say every relation it found
+    // is listed and only admit more candidates (#13837).
+    let coverage = if truncated || interrupted.is_some() {
         CandidateCoverage::Truncated
-    } else if interrupted.is_some() || open {
+    } else if open {
         CandidateCoverage::Open
     } else {
         CandidateCoverage::Exhaustive
@@ -8004,9 +8079,6 @@ pub fn project_procedure_relations(
         payload_projection,
     )?
     .with_untransported_return_member(untransported_return_member);
-    if interrupted.is_none() && request.cancellation.is_cancelled() {
-        interrupted = Some(Interruption::Cancelled);
-    }
     *request.budget = staged.budget;
     Ok(publish_flow_outcome(
         snapshot,
@@ -8015,4 +8087,88 @@ pub fn project_procedure_relations(
         gap_quality,
         staged.work,
     ))
+}
+
+/// What the projection reads off one candidate access path of a memory access:
+/// the materialized location plus the draft-only facts the supplemental
+/// container and wildcard relations need. The primary path and every
+/// exhaustive alternative derive the same facts, so one code path decides
+/// them.
+struct DraftFacts {
+    location: AbstractLocation,
+    summary: bool,
+    /// The resolver's tail before `AccessPath::bounded` forces Summary for an
+    /// `Any` selector.
+    base_tail: AccessPathTail,
+    /// The path holds an aggregate cell of unknown element anywhere, not only
+    /// at the leaf (`rows[i].name`, `v[i][0]`). `AccessSelector` no longer
+    /// tells it from an unknown element, so the draft is read. A keyed
+    /// aggregate (a Go map's `m["k"]`) names its element and is not this.
+    through_aggregate_index: bool,
+    unproven_index: bool,
+}
+
+impl DraftFacts {
+    fn derive(
+        procedure: &ProcedureHandle,
+        draft: AccessPathDraft,
+        limits: crate::analyzer::semantic::OracleLimits,
+    ) -> Result<Self, SemanticProviderError> {
+        let base_tail = draft.tail;
+        let through_aggregate_index = draft.selectors.iter().any(|selector| {
+            matches!(
+                selector,
+                AccessSelectorDraft::Index {
+                    value: None,
+                    constant: None,
+                    identity: IndexedLocationIdentity::Aggregate,
+                }
+            )
+        });
+        let (location, summary) = materialize_abstract_location(procedure, draft, limits)?;
+        let unproven_index = summary || location_has_unproven_exact_index(&location);
+        Ok(Self {
+            location,
+            summary,
+            base_tail,
+            through_aggregate_index,
+            unproven_index,
+        })
+    }
+}
+
+/// Whether `location` is the one aggregate cell standing for every element of
+/// its base.
+fn is_aggregate_index_location(procedure: &ProcedureHandle, location: MemoryLocationId) -> bool {
+    matches!(
+        procedure
+            .semantics()
+            .memory_location(location)
+            .map(|location| &location.kind),
+        Some(MemoryLocationKind::Index {
+            index: None,
+            constant_index: None,
+            identity: IndexedLocationIdentity::Aggregate,
+            ..
+        })
+    )
+}
+
+/// Whether a certified canonical-index gap names the aggregate cell of its
+/// base rather than a literal element.
+fn gap_names_aggregate_index_cell(
+    procedure: &ProcedureHandle,
+    gap: &crate::analyzer::semantic::SemanticGap,
+) -> bool {
+    let semantics = procedure.semantics();
+    gap_certifies_canonical_index_identity(
+        gap,
+        semantics.points(),
+        semantics.memory_locations(),
+        semantics.values(),
+    ) && matches!(
+        gap.subject,
+        SemanticGapSubject::MemoryLocation(location)
+            if is_aggregate_index_location(procedure, location)
+    )
 }

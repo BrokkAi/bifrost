@@ -366,6 +366,10 @@ impl HierarchyEdgeProvider for PythonHierarchy {
             return Ok(Some(ImplicitBaseRead {
                 guard,
                 base: ((complete && !suppressed) || factory_open).then_some(ImplicitBaseFact {
+                    context_completion: ResolutionCompletion::Complete,
+                    binding: None,
+                    rules: None,
+                    kind: crate::analyzer::resolution::ClassifiedSupertypeKind::ImplicitSuperclass,
                     target: if definite && !factory_open {
                         appended.target
                     } else {
@@ -403,6 +407,10 @@ impl HierarchyEdgeProvider for PythonHierarchy {
                         0,
                     );
                     ImplicitBaseFact {
+                        context_completion: ResolutionCompletion::Complete,
+                        binding: None,
+                        rules: None,
+                        kind: crate::analyzer::resolution::ClassifiedSupertypeKind::ImplicitSuperclass,
                         target: Some(root.identity),
                         definite: true,
                         external: true,
@@ -537,6 +545,7 @@ pub(super) struct PythonDeclaredMemberRow {
     pub(super) completion: ResolutionCompletion,
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn authored_name(
     ready: &ReadySelectedResolution<'_, '_>,
     definition: SemanticId,
@@ -654,6 +663,7 @@ pub(super) fn class_attribute_candidates<P: DemandRootProvider + ?Sized>(
     Ok(Some(candidates))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn is_class(
     ready: &ReadySelectedResolution<'_, '_>,
     definition: SemanticId,
@@ -697,6 +707,7 @@ fn dynamic_attribute_hook(
     property.member_name() == "__getattribute__" && Some(property.owner_definition()) != object
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn member_rows(
     half: &PythonMemberContext<'_, '_, '_>,
     route: &PythonMemberRoute<'_>,
@@ -1209,6 +1220,7 @@ enum PythonDecoratorInput {
     PropertyAccessor(Option<u32>),
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn member_role_inputs(
     rules: &PythonRules<'_, '_, '_>,
     definition: SemanticId,

@@ -421,6 +421,20 @@ pub(in crate::analyzer::java::semantic) fn java_local_binding(
             let name = node.child_by_field_name("name")?;
             (name, body.start_byte(), body.start_byte(), body.end_byte())
         }
+        // A declared try-with-resources resource is in scope in the resources
+        // that follow it and in the try block, but not in the statement's
+        // catch or finally clauses (JLS 14.20.3, 6.3).
+        "resource" => {
+            let name = node.child_by_field_name("name")?;
+            let resources = node
+                .parent()
+                .filter(|parent| parent.kind() == "resource_specification")?;
+            let statement = resources
+                .parent()
+                .filter(|parent| parent.kind() == "try_with_resources_statement")?;
+            let body = statement.child_by_field_name("body")?;
+            (name, node.end_byte(), node.start_byte(), body.end_byte())
+        }
         _ => {
             let name = brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)?;
             let (start, end) = java_local_scope(node)?;

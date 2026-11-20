@@ -629,6 +629,14 @@ impl<'plan> ValueFlowProblem<'plan> {
             if !emitting {
                 return;
             }
+            if self.plan.call_replaces_global_location(
+                call,
+                edge.boundary(),
+                edge.kind(),
+                flow.carrier,
+            ) {
+                continue;
+            }
             let preserved = if application.abstained {
                 ActiveFlow {
                     uncertainty: flow.uncertainty.with_semantic(),

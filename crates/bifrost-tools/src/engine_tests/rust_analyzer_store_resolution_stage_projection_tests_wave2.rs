@@ -12,6 +12,10 @@ mod rust_departing_wave2_root_tests {
 
     use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedResolutionMountOrdinal;
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn authenticated_capsule_admission_replays_variables_and_rolls_back_cancelled_assignment() {
         use crate::engine_tests::rust_analyzer_store_resolution_operation_tests::rust_departing_root_tests::DenseSelectedMacroFixture;
         use brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots;

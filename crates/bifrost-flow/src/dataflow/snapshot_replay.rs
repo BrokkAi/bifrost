@@ -76,6 +76,15 @@ where
             .call_transfers_in_context(caller, call, context, request)
     }
 
+    fn infeasible_control_edges(
+        &self,
+        procedure: &ProcedureHandle,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Vec<crate::analyzer::semantic::ControlEdgeId> {
+        self.provider
+            .infeasible_control_edges(procedure, cancellation)
+    }
+
     fn snapshot(
         &self,
         _root: &ProcedureHandle,

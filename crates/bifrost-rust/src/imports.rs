@@ -1105,11 +1105,32 @@ where
     F: FnMut(usize) -> Result<(), E>,
 {
     charge(2)?;
-    if node
-        .parent()
-        .and_then(|body| body.parent())
-        .is_some_and(|owner| matches!(owner.kind(), "trait_item" | "enum_variant"))
-    {
+    // Variants have no visibility modifier of their own. Interpret the enum's
+    // modifier so exact declaration authority retains its restricted scope;
+    // error-recovered variants without an enclosing enum fall back to private.
+    let node = if node.kind() == "enum_variant" {
+        let Some(owner) = node
+            .parent()
+            .and_then(|variants| variants.parent())
+            .filter(|owner| owner.kind() == "enum_item")
+        else {
+            return Ok(RustVisibility::Private);
+        };
+        charge(2)?;
+        owner
+    } else {
+        node
+    };
+    // Trait members and fields of struct-like variants are public through their
+    // owner. An item in a block expression (an enum discriminant or const
+    // initializer) is not such a member: its parent is the block, and it keeps
+    // its own modifier.
+    if node.parent().is_some_and(|body| {
+        body.kind() != "block"
+            && body
+                .parent()
+                .is_some_and(|owner| matches!(owner.kind(), "trait_item" | "enum_variant"))
+    }) {
         return Ok(RustVisibility::Public);
     }
     let mut cursor = node.walk();
@@ -1715,6 +1736,27 @@ mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
+
+    #[test]
+    #[hardwon("#13934: a pub(crate) item in an enum discriminant block was reported Public")]
+    fn enum_discriminant_block_item_keeps_declared_visibility() {
+        let source = "enum E { A = { pub(crate) mod m {} 0 } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("set Rust grammar");
+        let tree = parser.parse(source, None).expect("parse enum");
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "mod_item" && source[node.byte_range()].contains("mod m") {
+                assert_eq!(rust_item_visibility(node, source), RustVisibility::Crate);
+                return;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        panic!("module item not found in enum discriminant");
+    }
 
     #[test]
     fn leading_absolute_is_recorded_per_grouped_leaf() {
@@ -2345,5 +2387,101 @@ mod qs3_anchor_contract {
                 expected
             );
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13333: variants of a pub(super)/pub(crate) enum were treated as private"
+    )]
+    fn enum_variant_visibility_inherits_owner_and_survives_malformed_syntax() {
+        use crate::test_helpers::parse_rust;
+
+        fn collect_variants(root: Node<'_>) -> Vec<Node<'_>> {
+            let mut variants = Vec::new();
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "enum_variant" {
+                    variants.push(node);
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            variants
+        }
+
+        use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+        for (source, expected, declared) in [
+            (
+                "enum Mode { Idle }",
+                RustVisibility::Private,
+                DeclaredVisibility::Private,
+            ),
+            (
+                "pub(self) enum Mode { Idle }",
+                RustVisibility::SelfModule,
+                DeclaredVisibility::Private,
+            ),
+            (
+                "pub enum Mode { Idle }",
+                RustVisibility::Public,
+                DeclaredVisibility::Public,
+            ),
+            (
+                "pub(crate) enum Mode { Idle }",
+                RustVisibility::Crate,
+                DeclaredVisibility::CrateOrModule,
+            ),
+            (
+                "pub(super) enum Mode { Idle }",
+                RustVisibility::SuperModule,
+                DeclaredVisibility::CrateOrModule,
+            ),
+            (
+                "pub(in super::host) enum Mode { Idle }",
+                RustVisibility::InPath(vec!["super".to_string(), "host".to_string()]),
+                DeclaredVisibility::CrateOrModule,
+            ),
+        ] {
+            let tree = parse_rust(source);
+            let variants = collect_variants(tree.root_node());
+            assert_eq!(variants.len(), 1, "{source}");
+            let visibility = rust_item_visibility(variants[0], source);
+            assert_eq!(visibility, expected, "{source}");
+            assert_eq!(
+                crate::declaration_properties::declared_visibility(&visibility),
+                declared,
+                "{source}"
+            );
+        }
+
+        let mut saw_detached_variant = false;
+        for malformed in [
+            "pub enum { Variant(u32), }",
+            "pub(super) enum Broken Variant(u32), Other { x: i32 } }",
+            "enum Partial { Variant(u32), fn stray() {",
+            "pub enum MissingBrace { Variant = 1",
+            "impl Thing { Variant(u32), }",
+        ] {
+            let tree = parse_rust(malformed);
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                let visibility = rust_item_visibility(node, malformed);
+                if node.kind() == "enum_variant"
+                    && node
+                        .parent()
+                        .and_then(|parent| parent.parent())
+                        .is_none_or(|owner| owner.kind() != "enum_item")
+                {
+                    saw_detached_variant = true;
+                    assert_eq!(visibility, RustVisibility::Private, "{malformed}");
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        assert!(
+            saw_detached_variant,
+            "at least one malformed input recovers a detached enum_variant"
+        );
     }
 }

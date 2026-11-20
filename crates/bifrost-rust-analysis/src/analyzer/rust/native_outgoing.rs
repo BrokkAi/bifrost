@@ -425,6 +425,11 @@ fn outgoing_inner(
                         | SelectedResolutionOperationOutcome::Stale(_)
                         | SelectedResolutionOperationOutcome::Cancelled(_) => break,
                     };
+                    // A stop during this resolution may have cut its answer
+                    // short; only sites finished before the stop are kept.
+                    if session.is_stopped() {
+                        break;
+                    }
                     match answer.resolution.reference_owner() {
                         Some(Some(owner)) if owner == caller_semantic => {}
                         Some(_) => continue,
@@ -571,6 +576,7 @@ fn outgoing_inner(
                             ),
                         );
                     }
+                    let site_start = result.sites.len();
                     for callee in definitions.into_iter().take(limits.max_candidates) {
                         if !session.scope_step() || cancellation.is_cancelled() {
                             break;
@@ -602,6 +608,7 @@ fn outgoing_inner(
                                     .name
                                     .is_none()
                                     .then_some(argument.argument_index),
+                                written_position: argument.position,
                                 formal_index: None,
                                 formal_name: None,
                                 variadic: false,
@@ -620,6 +627,11 @@ fn outgoing_inner(
                             arguments,
                         });
                     }
+                    // A stop inside this call's candidates leaves it partly
+                    // recorded; only finished sites are kept.
+                    if session.is_stopped() {
+                        result.sites.truncate(site_start);
+                    }
                 }
                 result.sites.sort_by(|a, b| {
                     (a.range.start_byte, &a.callee).cmp(&(b.range.start_byte, &b.callee))
@@ -631,21 +643,21 @@ fn outgoing_inner(
             },
         )
     })();
-    let mut result = match session.finish(selected) {
+    let (status, selected) = session.finish_keeping(selected);
+    let mut result = match status {
         BoundedResolution::Cancelled { .. } => CallRelationResult {
             cancelled: true,
             ..CallRelationResult::default()
         },
-        BoundedResolution::Exceeded { limit, work: _ } => {
-            let mut result = failed(
+        BoundedResolution::Exceeded { limit, work } => {
+            let mut failure = failed(
                 "native_call_budget",
-                CallRelationDiagnosticPayload::RustBudget { limit },
+                CallRelationDiagnosticPayload::RustBudget { limit, work },
                 caller,
             );
-            result.truncated = true;
-            result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
-            result.diagnostics[0].reason_kind = None;
-            result
+            failure.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+            failure.diagnostics[0].reason_kind = None;
+            CallRelationResult::budget_stopped(selected, failure)
         }
         BoundedResolution::Unavailable { .. } => {
             let mut result = failed(
@@ -658,34 +670,30 @@ fn outgoing_inner(
             result.truncated = true;
             result
         }
-        BoundedResolution::Complete {
-            value: Err(_error), ..
-        } => failed(
-            "native_store_error",
-            CallRelationDiagnosticPayload::Failure {
-                reason: CallRelationFailure::StoreError,
-            },
-            caller,
-        ),
-        BoundedResolution::Complete {
-            value: Ok(outcome), ..
-        } => match outcome {
-            SelectedResolutionOperationOutcome::Native(value) => value,
-            SelectedResolutionOperationOutcome::Unavailable(reason) => failed(
+        BoundedResolution::Complete { .. } => match selected {
+            Err(_error) => failed(
+                "native_store_error",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::StoreError,
+                },
+                caller,
+            ),
+            Ok(SelectedResolutionOperationOutcome::Native(value)) => value,
+            Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => failed(
                 "native_unavailable",
                 CallRelationDiagnosticPayload::NativeUnavailable {
                     reason: (&reason).into(),
                 },
                 caller,
             ),
-            SelectedResolutionOperationOutcome::Stale(reason) => failed(
+            Ok(SelectedResolutionOperationOutcome::Stale(reason)) => failed(
                 "native_stale",
                 CallRelationDiagnosticPayload::NativeStale {
                     reason: (&reason).into(),
                 },
                 caller,
             ),
-            SelectedResolutionOperationOutcome::Cancelled(_) => CallRelationResult {
+            Ok(SelectedResolutionOperationOutcome::Cancelled(_)) => CallRelationResult {
                 cancelled: true,
                 ..CallRelationResult::default()
             },
@@ -1039,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn native_outgoing_does_not_publish_budget_or_cancelled_prefixes() {
+    fn native_outgoing_with_no_finished_site_or_after_cancellation_publishes_nothing() {
         let (fixture, rust) = fixture();
         let caller = rust
             .declarations(&fixture.file("src/lib.rs"))
@@ -1051,7 +1059,7 @@ mod tests {
             &caller,
             limits(),
             ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
+                max_resolution_rounds: 0,
                 ..ReceiverAnalysisBudget::default()
             },
             &CancellationToken::new(),
@@ -1077,5 +1085,55 @@ mod tests {
             result.sites.is_empty() && result.cancelled && !result.truncated,
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn a_budget_stop_keeps_the_sites_finished_before_it_and_types_the_stop() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome;
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+            ReceiverAnalysisWork, ReceiverBudgetLimit,
+        };
+        let (fixture, rust) = fixture();
+        let caller = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "caller")
+            .expect("caller declaration");
+        let full = outgoing(
+            &rust,
+            &caller,
+            limits(),
+            ReceiverAnalysisBudget::default(),
+            &CancellationToken::new(),
+        );
+        assert!(!full.truncated && full.sites.len() > 1, "{full:?}");
+        let mut failure = failed(
+            "native_call_budget",
+            CallRelationDiagnosticPayload::RustBudget {
+                limit: ReceiverBudgetLimit::ResolutionRounds,
+                work: ReceiverAnalysisWork::default(),
+            },
+            &caller,
+        );
+        failure.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        let mut prefix = full.clone();
+        prefix.sites.truncate(1);
+        let kept = CallRelationResult::budget_stopped(
+            Ok::<_, ()>(SelectedResolutionOperationOutcome::Native(prefix.clone())),
+            failure.clone(),
+        );
+        assert_eq!(kept.sites, prefix.sites);
+        assert!(kept.truncated);
+        assert!(
+            kept.diagnostics
+                .iter()
+                .any(|d| d.code == CallRelationDiagnosticCode::BudgetExhausted),
+            "{kept:?}"
+        );
+        let nothing = CallRelationResult::budget_stopped(
+            Err::<SelectedResolutionOperationOutcome<CallRelationResult>, ()>(()),
+            failure,
+        );
+        assert!(nothing.sites.is_empty() && nothing.truncated);
     }
 }

@@ -35,6 +35,7 @@ use super::UsageProof;
 use super::UsageProofAuthority;
 use super::UsageQueryCompletion;
 use super::proof_rank;
+use brokk_bifrost_core::analyzer::usages::model::CallRelationKind;
 
 use crate::analyzer::common::language_for_file;
 
@@ -128,6 +129,11 @@ pub struct CallArgument {
     pub range: Range,
     pub name: Option<String>,
     pub position: Option<usize>,
+    /// Zero-based written position in the call's argument list, counting
+    /// positional and keyword arguments in source order. `None` for an
+    /// argument with no written argument list, such as a macro-admitted
+    /// candidate.
+    pub written_position: Option<usize>,
     pub formal_index: Option<usize>,
     pub formal_name: Option<String>,
     pub variadic: bool,
@@ -226,6 +232,29 @@ pub enum CallDispatchBoundaryKind {
     UnprovenTargetIdentity,
     /// A candidate set was retained only up to the supplied target bound.
     Truncated,
+}
+
+/// A possible runtime target of a call, added by dispatch expansion. Candidates
+/// live in [`CallRelationResult::dispatch_candidates`], never in `sites`, so a
+/// consumer that reads only `sites` keeps reading static bindings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchCandidateSite {
+    pub site: CallSite,
+    pub relation_kind: CallRelationKind,
+}
+
+impl DispatchCandidateSite {
+    pub fn new(site: CallSite) -> Self {
+        assert_eq!(
+            site.proof,
+            UsageProof::Unproven,
+            "a dispatch candidate is never proven: {site:?}"
+        );
+        Self {
+            site,
+            relation_kind: CallRelationKind::DispatchCandidate,
+        }
+    }
 }
 
 /// Typed result of resolving one exact call expression.
@@ -399,6 +428,14 @@ impl CallDispatchLookup {
 /// supplies the parsed source call; the registered language adapter decides
 /// whether it has a structured special case before generic reference lookup.
 #[doc(hidden)]
+/// Per-file memo map shared by every `dispatch_special_call_site` call of one
+/// dispatch batch or file session, keyed by the tree root node id. A language
+/// hook that derives a whole-file fact for one call stores it here so the
+/// remaining calls of the batch reuse it instead of recomputing per call.
+/// Owned by the batch or session, so it cannot grow with the workspace or
+/// cross queries.
+pub type SpecialDispatchMemos = HashMap<usize, Arc<dyn std::any::Any + Send + Sync>>;
+
 pub struct CallDispatchLanguageRequest<'a> {
     #[doc(hidden)]
     pub analyzer: &'a dyn IAnalyzer,
@@ -420,6 +457,8 @@ pub struct CallDispatchLanguageRequest<'a> {
     pub cancellation: Option<&'a CancellationToken>,
     #[doc(hidden)]
     pub work: CallRelationWork,
+    #[doc(hidden)]
+    pub special_dispatch_memos: &'a mut SpecialDispatchMemos,
 }
 
 use brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest;
@@ -427,44 +466,76 @@ use brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxStop;
 
 /// File-local syntax authority shared by serial and batched exact dispatch.
 struct CallDispatchSyntax {
-    primary: tree_sitter::Tree,
-    forest: EmbeddedSyntaxForest,
-    macro_inventories: HashMap<usize, brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory>,
+    primary: Arc<tree_sitter::Tree>,
+    forest: Arc<EmbeddedSyntaxForest>,
+    source_owner: Option<
+        brokk_bifrost_core::retention_budget::BudgetedValue<
+            super::prepared_macro_source::PreparedMacroSource,
+        >,
+    >,
 }
 
 impl CallDispatchSyntax {
     fn parse(
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         language: Language,
         source: &str,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Option<Self>, EmbeddedSyntaxStop> {
+        let support = crate::analyzer::languages::language_support(language);
+        if let Some(support) = support
+            && let Some(backing) = support.prepared_macro_source(analyzer, file, cancellation)?
+        {
+            if backing.prepared.source() != source {
+                analyzer.record_query_incomplete(
+                    crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                        "prepared source differs from exact dispatch source".into(),
+                    ),
+                );
+                return Ok(None);
+            }
+            return Self::from_prepared_macro_source(backing).map(Some);
+        }
         let Some(primary) = parse_tree_for_language(file, language, source) else {
             return Ok(None);
         };
+        if let Some(support) = support
+            && let Some(backing) =
+                support.exact_macro_source(&Arc::from(source), &primary, cancellation)?
+        {
+            return Self::from_prepared_macro_source(backing).map(Some);
+        }
         let spec = crate::analyzer::structural_spec_for(language)
             .expect("a parsed language has a structural specification");
         let forest =
             EmbeddedSyntaxForest::parse(spec, primary.root_node(), source, 200_000, cancellation)?;
-        let mut macro_inventories = HashMap::default();
-        if language == Language::Rust {
-            for tree in std::iter::once(&primary)
-                .chain(forest.trees().iter().map(|fragment| &fragment.tree))
-            {
-                let inventory = brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory::build(
-                    tree,
-                    source,
-                    &|| !cancellation.is_some_and(CancellationToken::is_cancelled),
-                )
-                .map_err(|_| EmbeddedSyntaxStop::Cancelled)?;
-                macro_inventories.insert(tree.root_node().id(), inventory);
-            }
-        }
         Ok(Some(Self {
-            primary,
-            forest,
-            macro_inventories,
+            primary: Arc::new(primary),
+            forest: Arc::new(forest),
+            source_owner: None,
         }))
+    }
+
+    fn from_prepared_macro_source(
+        backing: brokk_bifrost_core::retention_budget::BudgetedValue<
+            super::prepared_macro_source::PreparedMacroSource,
+        >,
+    ) -> Result<Self, EmbeddedSyntaxStop> {
+        Ok(Self {
+            primary: backing.prepared.shared_tree(),
+            forest: backing.embedded.clone()?,
+            source_owner: Some(backing),
+        })
+    }
+
+    fn macro_inventory(
+        &self,
+        tree: &tree_sitter::Tree,
+    ) -> Option<&brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory> {
+        self.source_owner
+            .as_ref()
+            .map(|source| source.macro_inventory(tree).as_ref())
     }
 
     fn tree(&self, range: &Range) -> &tree_sitter::Tree {
@@ -534,6 +605,11 @@ pub struct CallDispatchSession {
     prefetched_callees: HashSet<(usize, usize)>,
     /// Only completed source-checked worker expansions; absence is explicit.
     prefetched_expansions: HashMap<(usize, usize), CompletedExpansion>,
+    /// Whole-file facts a language's special dispatch derives for one call and
+    /// reuses for the rest of this session. Owned by the file session rather
+    /// than the analyzer, so it cannot grow with the workspace or cross
+    /// queries, like `callee_outcomes` above.
+    special_dispatch_memos: SpecialDispatchMemos,
 }
 
 const MAX_CPP_DISPATCH_PREFETCH_SITES: usize = 1024;
@@ -852,6 +928,7 @@ pub enum CallRelationInventoryReason {
     },
     Cancelled,
     TimeBudgetExceeded,
+    ReceiverBudgetExhausted,
     OccurrenceRowsIncomplete {
         uncovered_roles: Vec<brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole>,
     },
@@ -861,6 +938,12 @@ pub enum CallRelationInventoryReason {
     ForwardMetadataIncomplete,
     InverseIndexReferenceEnumerationIncomplete,
     InverseIndexResolutionIncomplete,
+    InverseIndexOpenSite {
+        reason_kind: String,
+        file: String,
+        line: u32,
+        macro_name: Option<String>,
+    },
     InverseIndexQueryObligationsOutstanding,
     InverseIndexAdmissionIncomplete,
     InverseIndexMetadataIncomplete,
@@ -883,6 +966,7 @@ impl From<&crate::analyzer::structural::reference_edges::EdgeIncompleteReason>
             },
             Reason::Cancelled => Self::Cancelled,
             Reason::TimeBudgetExceeded => Self::TimeBudgetExceeded,
+            Reason::ReceiverBudgetExhausted => Self::ReceiverBudgetExhausted,
             Reason::OccurrenceRowsIncomplete { uncovered_roles } => {
                 let mut roles = uncovered_roles.clone();
                 roles.sort();
@@ -899,6 +983,12 @@ impl From<&crate::analyzer::structural::reference_edges::EdgeIncompleteReason>
                 Self::InverseIndexReferenceEnumerationIncomplete
             }
             Reason::InverseIndexResolutionIncomplete => Self::InverseIndexResolutionIncomplete,
+            Reason::InverseIndexOpenSite(site) => Self::InverseIndexOpenSite {
+                reason_kind: site.reason_kind.clone(),
+                file: site.file.clone(),
+                line: site.line,
+                macro_name: site.macro_name.clone(),
+            },
             Reason::InverseIndexQueryObligationsOutstanding => {
                 Self::InverseIndexQueryObligationsOutstanding
             }
@@ -1294,9 +1384,11 @@ pub enum CallRelationDiagnosticPayload {
     },
     RustBudget {
         limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+        work: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork,
     },
     GoBudget {
         limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+        work: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork,
     },
     RustIncomingBudget {
         limits: CallRelationLimits,
@@ -1788,8 +1880,12 @@ impl CallRelationDiagnostic {
             RustCandidateBound { .. } => {
                 format!("call at {:?} exceeds its candidate bound", range())
             }
-            RustBudget { limit } => format!("native outgoing resolution exceeded {limit:?}"),
-            GoBudget { limit } => format!("native Go outgoing resolution exceeded {limit:?}"),
+            RustBudget { limit, work } => {
+                format!("native outgoing resolution exceeded {limit:?} after {work:?}")
+            }
+            GoBudget { limit, work } => {
+                format!("native Go outgoing resolution exceeded {limit:?} after {work:?}")
+            }
             RustIncomingBudget { limits } => {
                 format!("selected Rust incoming call projection exceeded limits {limits:?}")
             }
@@ -1963,6 +2059,7 @@ pub struct CallRelationResult {
     /// `TestX` function has no named caller and can still be Complete.
     pub caller_inventory: CallerInventoryCoverage,
     pub sites: Vec<CallSite>,
+    pub dispatch_candidates: Vec<DispatchCandidateSite>,
     /// Exact source sites whose target is a named external terminal leaf.
     pub external_terminal_sites: Vec<(ProjectFile, Range)>,
     pub truncated: bool,
@@ -1980,6 +2077,20 @@ pub struct CallRelationResult {
 }
 
 impl CallRelationResult {
+    /// Adds a dispatch candidate unless `sites` already holds a static binding
+    /// for the same call and target: the static binding wins.
+    pub fn push_dispatch_candidate(&mut self, candidate: DispatchCandidateSite) {
+        let candidate_site = &candidate.site;
+        if self.sites.iter().any(|site| {
+            site.file == candidate_site.file
+                && site.range == candidate_site.range
+                && site.callee == candidate_site.callee
+        }) {
+            return;
+        }
+        self.dispatch_candidates.push(candidate);
+    }
+
     /// A scan provider, rather than a downstream consumer, refused the grant.
     pub fn scan_grant_refused(&self) -> bool {
         self.diagnostics.iter().any(|diagnostic| {
@@ -1988,6 +2099,33 @@ impl CallRelationResult {
                 CallRelationDiagnosticCode::ScanGrantRefused(_)
             )
         })
+    }
+}
+
+impl CallRelationResult {
+    /// A bounded outgoing session stopped on a budget. Keep the sites finished
+    /// before the stop (`selected` carries them when the walk reached its end),
+    /// mark the result truncated and add the typed `failure` diagnostic. A stop
+    /// that left no native value keeps only the failure.
+    pub fn budget_stopped<E>(
+        selected: Result<
+            crate::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome<
+                CallRelationResult,
+            >,
+            E,
+        >,
+        mut failure: CallRelationResult,
+    ) -> CallRelationResult {
+        use crate::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome::Native;
+        let mut kept = match selected {
+            Ok(Native(partial)) => partial,
+            _ => CallRelationResult::default(),
+        };
+        kept.truncated = true;
+        kept.diagnostics.append(&mut failure.diagnostics);
+        kept.diagnostics.sort();
+        kept.diagnostics.dedup();
+        kept
     }
 }
 
@@ -2094,6 +2232,9 @@ fn record_call_relation_read(
     }
     for site in &result.sites {
         crate::analyzer::record_position_read(analyzer, &site.file);
+    }
+    for candidate in &result.dispatch_candidates {
+        crate::analyzer::record_position_read(analyzer, &candidate.site.file);
     }
     for (file, _) in &result.external_terminal_sites {
         crate::analyzer::record_position_read(analyzer, file);
@@ -2227,6 +2368,31 @@ pub fn call_relation_answer_digest(
         hasher.field("external_start", &(start as u64).to_be_bytes());
         hasher.field("external_end", &(end as u64).to_be_bytes());
     }
+    // Candidates join the digest only when present, so an answer without
+    // candidates keeps the digest it had before candidates existed.
+    let mut dispatch_candidates = result
+        .dispatch_candidates
+        .iter()
+        .map(|candidate| {
+            (
+                crate::path_utils::rel_path_string(&candidate.site.file),
+                candidate.site.range.start_byte,
+                candidate.site.range.end_byte,
+                candidate.site.caller.fq_name(),
+                candidate.site.callee.fq_name(),
+            )
+        })
+        .collect::<Vec<_>>();
+    dispatch_candidates.sort();
+    dispatch_candidates.dedup();
+    // Like static sites, offsets only order the candidates; coordinates never
+    // take part in semantic read identity (#8407).
+    for (rank, (path, _, _, caller, callee)) in dispatch_candidates.into_iter().enumerate() {
+        hasher.field("candidate_path", path.as_bytes());
+        hasher.field("candidate_rank", &(rank as u64).to_be_bytes());
+        hasher.field("candidate_caller", caller.as_bytes());
+        hasher.field("candidate_callee", callee.as_bytes());
+    }
     crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
 }
 
@@ -2349,7 +2515,7 @@ pub struct SourceCallableLayout {
 
 #[derive(Default)]
 pub struct CallBindingCache {
-    reads: Option<super::common::QueryMemoReads>,
+    reads: Option<super::common::RequestReadState>,
     conversions: super::call_conversion::CallConversionCache,
     formals: HashMap<(CodeUnit, usize), Option<FormalParameterLayout>>,
     source_layouts: HashMap<
@@ -3731,6 +3897,7 @@ impl CallDispatchSession {
                 Ok(None)
             } else {
                 CallDispatchSyntax::parse(
+                    analyzer,
                     &self.file,
                     self.language,
                     &self.exact_source,
@@ -3772,17 +3939,19 @@ impl CallDispatchSession {
             unreachable!("a parsed C/C++ dispatch session retains its syntax tree");
         };
         let tree = syntax.tree(call_span);
+        let special_dispatch_memos = &mut self.special_dispatch_memos;
         let language_request = CallDispatchLanguageRequest {
             analyzer,
             token,
             file: &self.file,
             source: &self.exact_source,
             tree,
-            macro_inventory: syntax.macro_inventories.get(&tree.root_node().id()),
+            macro_inventory: syntax.macro_inventory(tree),
             call_span,
             member_selection,
             cancellation,
             work,
+            special_dispatch_memos,
         };
         if let Some(lookup) = language_support_for_hook(self.language, "call_relation_provider")
             .and_then(|support| support.dispatch_special_call_site(language_request))
@@ -4000,6 +4169,7 @@ impl CallRelationService {
             callee_outcomes: HashMap::default(),
             prefetched_callees: HashSet::default(),
             prefetched_expansions: HashMap::default(),
+            special_dispatch_memos: SpecialDispatchMemos::default(),
         }
     }
 
@@ -4083,7 +4253,13 @@ impl CallRelationService {
                 work,
             ));
         }
-        let syntax = match CallDispatchSyntax::parse(file, language, &exact_source, cancellation) {
+        let syntax = match CallDispatchSyntax::parse(
+            analyzer,
+            file,
+            language,
+            &exact_source,
+            cancellation,
+        ) {
             Ok(syntax) => syntax,
             Err(stop) => return repeated(stopped_dispatch_syntax(&stop, work)),
         };
@@ -4096,6 +4272,7 @@ impl CallRelationService {
         };
         let mut lookups = vec![None; call_spans.len()];
         let mut resolvable = Vec::with_capacity(call_spans.len());
+        let mut special_dispatch_memos = SpecialDispatchMemos::default();
         for (index, call_span) in call_spans.iter().enumerate() {
             let tree = syntax.tree(call_span);
             if let Some(lookup) = language_support_for_hook(language, "call_relation_provider")
@@ -4106,11 +4283,12 @@ impl CallRelationService {
                         file,
                         source: &exact_source,
                         tree,
-                        macro_inventory: syntax.macro_inventories.get(&tree.root_node().id()),
+                        macro_inventory: syntax.macro_inventory(tree),
                         call_span,
                         member_selection: None,
                         cancellation,
                         work,
+                        special_dispatch_memos: &mut special_dispatch_memos,
                     })
                 })
             {
@@ -4766,6 +4944,7 @@ impl CallRelationService {
         diagnostics.dedup();
         CallRelationResult {
             sites,
+            dispatch_candidates: Vec::new(),
             external_terminal_sites: Vec::new(),
             truncated,
             cancelled,
@@ -5048,6 +5227,7 @@ impl CallRelationService {
         sort_and_dedup_sites(&mut sites);
         CallRelationResult {
             sites,
+            dispatch_candidates: Vec::new(),
             external_terminal_sites: Vec::new(),
             truncated,
             cancelled,
@@ -6204,10 +6384,13 @@ pub fn raw_call_site(
     let arguments = syntax
         .arguments
         .into_iter()
-        .map(|argument| CallArgument {
+        .enumerate()
+        .map(|(written_position, argument)| CallArgument {
             range: argument.range,
             name: argument.name,
             position: argument.position,
+            // Syntax arguments are the call's Arg and Kwarg roles in source order.
+            written_position: Some(written_position),
             formal_index: None,
             formal_name: None,
             variadic: false,
@@ -6818,6 +7001,7 @@ pub mod registry_fixture_support {
                 .expect("build ephemeral Kotlin workspace");
 
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("crate version parses"),
@@ -6832,7 +7016,8 @@ pub mod registry_fixture_support {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: vec![SemanticModelActivationControl {
                     scope: SemanticModelControlScope::Workspace,

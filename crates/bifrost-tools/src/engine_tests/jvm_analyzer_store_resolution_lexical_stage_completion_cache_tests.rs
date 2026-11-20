@@ -35,6 +35,10 @@ mod jvm_extraction_tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#6291: visited mount completion decoded every selected mount's gaps"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn jvm_scoped_unconditional_gaps_keep_only_the_visited_mounts() {
         use brokk_bifrost_analysis::analyzer::store::resolution_lexical::UnconditionalCandidateCache;
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_sql_trace::{
@@ -108,6 +112,10 @@ mod jvm_extraction_tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#6291: by_path mount reads repeated SQL within one selection"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn jvm_mount_path_memo_retains_hits_and_absence_in_its_selection() {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_sql_trace::{
             begin_production_selected_sql_trace_on_connection,
@@ -146,6 +154,10 @@ mod jvm_extraction_tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#6291: fresh JVM lexical readers repeated identical operation-wide gap reads"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn jvm_operation_gap_memo_survives_publication_but_follows_scope_writes() {
         use brokk_bifrost_analysis::analyzer::store::resolution_lexical::UnconditionalCandidateCache;

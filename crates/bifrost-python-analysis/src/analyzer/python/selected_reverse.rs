@@ -478,11 +478,9 @@ mod tests {
         };
         let files = python.analyzed_files().into_iter().collect();
         let scope = UsageScanScope::with_cancellation(&files, &cancellation);
-        let bounded = ResolutionSession::bounded(
-            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..Default::default()
-            },
+        let bounded = ResolutionSession::bounded_with_total_work(
+            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+            0,
             Some(&cancellation),
         );
         let stopped = request
@@ -497,9 +495,10 @@ mod tests {
             .unwrap();
         assert!(!stopped.targets[0].complete);
         assert!(
-            stopped.targets[0].obligations.iter().any(|reason| {
-                reason == "python_reverse_resolution_budget_exceeded:scope_nodes"
-            })
+            stopped.targets[0]
+                .obligations
+                .iter()
+                .any(|reason| { reason == "python_reverse_resolution_budget_exceeded:total_work" })
         );
         let session = ResolutionSession::unbounded();
         let result = request

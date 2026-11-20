@@ -289,6 +289,13 @@ pub struct HierarchySelectionProvenance {
     identity: HierarchyRequestIdentity,
 }
 
+/// Proof that the selected order is complete (see `complete_selection`). The
+/// field is private, so only the mint can construct it.
+#[derive(Clone, Copy)]
+pub(crate) struct CompleteSelection {
+    provenance: HierarchySelectionProvenance,
+}
+
 #[derive(Default)]
 pub(crate) struct ProviderObservationStore {
     observations: HashMap<HierarchyProviderKey, HierarchyProviderObservation>,
@@ -433,7 +440,45 @@ impl<'a> HierarchyProvenanceView<'a> {
             "hierarchy handle escaped its request or selection"
         );
     }
+    /// Mints the witness that the selection's order is complete: no unsearched
+    /// base, no required base and completion `Complete`. A rejected base guard
+    /// unions incomplete evidence into the order's completion, so a selection
+    /// whose provenance graph holds a guard's rewritten observation next to
+    /// another provider's complete one never gets a witness.
+    pub(crate) fn complete_selection(
+        &self,
+        selection: &DemandMemberSelection,
+    ) -> Option<CompleteSelection> {
+        let status = self.order_status(selection.order?);
+        (status.complete
+            && status.required_base.is_none()
+            && *status.completion == ResolutionCompletion::Complete)
+            .then_some(CompleteSelection {
+                provenance: selection.provenance,
+            })
+    }
+    /// Visits the provider observations of a complete selection. Only a
+    /// `CompleteSelection` is accepted, so the store's snapshot asserts hold by
+    /// construction.
     pub(crate) fn visit(
+        &self,
+        selection: CompleteSelection,
+        cancelled: &mut dyn FnMut() -> bool,
+        visitor: &mut dyn FnMut(&HierarchyProviderObservation) -> StoreResult<()>,
+    ) -> StoreResult<bool> {
+        self.visit_provenance(selection.provenance, cancelled, visitor)
+    }
+    /// Test harnesses that deliberately visit selections of incomplete orders.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn visit_provenance_for_test(
+        &self,
+        selection: HierarchySelectionProvenance,
+        cancelled: &mut dyn FnMut() -> bool,
+        visitor: &mut dyn FnMut(&HierarchyProviderObservation) -> StoreResult<()>,
+    ) -> StoreResult<bool> {
+        self.visit_provenance(selection, cancelled, visitor)
+    }
+    fn visit_provenance(
         &self,
         selection: HierarchySelectionProvenance,
         cancelled: &mut dyn FnMut() -> bool,
@@ -603,7 +648,7 @@ mod tests {
         let view = HierarchyProvenanceView::new(&arena);
         let mut seen = Vec::new();
         assert!(
-            view.visit(
+            view.visit_provenance(
                 view.selection(cached.provenance),
                 &mut || false,
                 &mut |observation| {
@@ -654,7 +699,7 @@ mod tests {
             .observe(key, HierarchyProviderVisit::Observed, evidence);
         let joined = arena.provenance.join(closed, open);
         let view = HierarchyProvenanceView::new(&arena);
-        view.visit(view.selection(joined), &mut || false, &mut |_| Ok(()))
+        view.visit_provenance(view.selection(joined), &mut || false, &mut |_| Ok(()))
             .unwrap();
     }
 
@@ -666,7 +711,37 @@ mod tests {
             HierarchyProvenanceView::new(&first).selection(HierarchyProvenanceId::default());
         let second = HierarchyOperationArena::default();
         HierarchyProvenanceView::new(&second)
-            .visit(handle, &mut || false, &mut |_| Ok(()))
+            .visit_provenance(handle, &mut || false, &mut |_| Ok(()))
             .unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13131: a rejected guard rewrote a provider's complete observation, so visiting an incomplete order's provenance could panic"
+    )]
+    fn incomplete_order_with_conflicting_snapshots_gets_no_complete_selection() {
+        let gap =
+            ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test("guard-gap"));
+        let observation = |completion: ResolutionCompletion| HierarchyProviderObservation {
+            provider: key(),
+            visit: HierarchyProviderVisit::Observed,
+            completion,
+            inventory_complete: Some(true),
+        };
+        let witnessed = crate::analyzer::resolution::fact_resolution::with_test_member_order(
+            vec![
+                observation(ResolutionCompletion::Complete),
+                observation(ResolutionCompletion::incomplete([gap])),
+            ],
+            |_| HierarchyOrderOutcome {
+                owners: Vec::new(),
+                complete: false,
+                required_base: None,
+                completion: ResolutionCompletion::incomplete([gap]),
+                cursor_scope: None,
+            },
+            |view, selection| view.complete_selection(&selection).is_some(),
+        );
+        assert!(!witnessed);
     }
 }

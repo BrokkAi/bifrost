@@ -182,6 +182,118 @@ impl TypeHierarchyProvider for RustAnalyzer {
 /// relation -- so no member family can see it. "Exhaustive over the indexed
 /// workspace" is exactly that scope, the same scope Go's family states.
 impl MemberFamilyProvider for RustAnalyzer {
+    fn member_owner_selections(
+        &self,
+        member: &CodeUnit,
+        _receiver: brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape,
+        concrete_self: Option<
+            &brokk_bifrost_analysis::analyzer::usages::member_family::ResolvedMemberSelf,
+        >,
+        _call_site: &brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest,
+    ) -> brokk_bifrost_analysis::analyzer::usages::member_family::MemberOwnerSelections {
+        use brokk_bifrost_analysis::analyzer::usages::member_family::{
+            MemberOwnerIdentity, MemberOwnerInventoryReason, MemberOwnerInventoryStatus,
+            MemberOwnerSelection, MemberOwnerSelectionReason, MemberOwnerSelections,
+            MemberOwnerUnknownReason, ResolvedMemberSelf,
+        };
+        use brokk_bifrost_rust::hierarchy::{
+            RustOwnerSelectionReason, rust_member_owner_selections,
+        };
+
+        if rust_member_family_capability(member) == MemberFamilyCapability::Unsupported {
+            return MemberOwnerSelections::unsupported();
+        }
+        let family_completeness = self.member_family(member, None).descendants;
+        let scope = AnalyzerQueryScope::new(self);
+        let selected = match rust_member_owner_selections(self, scope.token(), member) {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.record_hierarchy_error(error);
+                return MemberOwnerSelections {
+                    family_completeness,
+                    inventory: MemberOwnerInventoryStatus::Open(vec![
+                        MemberOwnerInventoryReason::FactsUnavailable,
+                    ]),
+                    owners: Vec::new(),
+                };
+            }
+        };
+        let Some((trait_declaration, owners)) = selected else {
+            return MemberOwnerSelections {
+                family_completeness,
+                inventory: MemberOwnerInventoryStatus::Open(vec![
+                    MemberOwnerInventoryReason::ContractUnavailable,
+                ]),
+                owners: Vec::new(),
+            };
+        };
+        let owners = owners
+            .into_iter()
+            .filter_map(|owner| {
+                let resolved_self = owner.resolved_self.map(|declaration| ResolvedMemberSelf {
+                    declaration,
+                    substitution: Vec::new(),
+                });
+                // An unresolved Self is not proof that this owner is irrelevant.
+                // Reject only a resolved nominal Self known to be different.
+                if let (Some(exact), Some(resolved)) = (concrete_self, resolved_self.as_ref())
+                    && resolved != exact
+                {
+                    return None;
+                }
+                let reason = match owner.reason {
+                    RustOwnerSelectionReason::OwnItem => MemberOwnerSelectionReason::OwnItem,
+                    RustOwnerSelectionReason::Default => MemberOwnerSelectionReason::Default,
+                    reason => MemberOwnerSelectionReason::Unknown(match reason {
+                        RustOwnerSelectionReason::ContractUnavailable => {
+                            MemberOwnerUnknownReason::ContractUnavailable
+                        }
+                        RustOwnerSelectionReason::BodyUnavailable => {
+                            MemberOwnerUnknownReason::BodyUnavailable
+                        }
+                        RustOwnerSelectionReason::DeclarationLinks => {
+                            MemberOwnerUnknownReason::DeclarationLinks
+                        }
+                        RustOwnerSelectionReason::GeneratedSurface => {
+                            MemberOwnerUnknownReason::GeneratedSurface
+                        }
+                        RustOwnerSelectionReason::ConditionalSurface => {
+                            MemberOwnerUnknownReason::ConditionalSurface
+                        }
+                        RustOwnerSelectionReason::UnresolvedSelf => {
+                            MemberOwnerUnknownReason::UnresolvedSelf
+                        }
+                        RustOwnerSelectionReason::GenericOwner => {
+                            MemberOwnerUnknownReason::GenericOwner
+                        }
+                        RustOwnerSelectionReason::NoDefaultBody => {
+                            MemberOwnerUnknownReason::NoDefaultBody
+                        }
+                        RustOwnerSelectionReason::OwnItem | RustOwnerSelectionReason::Default => {
+                            unreachable!()
+                        }
+                    }),
+                };
+                Some(MemberOwnerSelection {
+                    owner: MemberOwnerIdentity {
+                        file: owner.file,
+                        declaration: owner.declaration,
+                    },
+                    resolved_self,
+                    selected_method: owner.selected_method,
+                    reason,
+                })
+            })
+            .collect();
+        MemberOwnerSelections {
+            family_completeness,
+            inventory: MemberOwnerInventoryStatus::Open(vec![
+                MemberOwnerInventoryReason::ImplementorReadinessUnavailable { trait_declaration },
+            ]),
+            owners,
+        }
+    }
+
     fn member_family_capability(&self, member: &CodeUnit) -> MemberFamilyCapability {
         rust_member_family_capability(member)
     }
@@ -366,6 +478,305 @@ mod tests {
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
+
+    #[test]
+    fn member_owner_selections_read_exact_impl_tables() {
+        use brokk_bifrost_analysis::analyzer::usages::member_family::{
+            MemberOwnerInventoryReason, MemberOwnerInventoryStatus, MemberOwnerSelectionReason,
+            MemberOwnerUnknownReason, ResolvedMemberSelf,
+        };
+        use brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape;
+        use brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest;
+
+        let (_fixture, analyzer) = analyzer_with_files(&[
+            (
+                "Cargo.toml",
+                include_str!("../../../tests/fixtures/member-owner-selections/Cargo.toml"),
+            ),
+            (
+                "src/lib.rs",
+                include_str!("../../../tests/fixtures/member-owner-selections/src/lib.rs"),
+            ),
+            (
+                "src/overrides.rs",
+                include_str!("../../../tests/fixtures/member-owner-selections/src/overrides.rs"),
+            ),
+        ]);
+        let draw = definition(&analyzer, "member_owner_selections.Draw.draw");
+        let site = SourceLocationRequest {
+            file: draw.source().clone(),
+            line: None,
+            column: None,
+            start_byte: None,
+            end_byte: None,
+        };
+        let (answer, cold_reads) =
+            brokk_bifrost_analysis::analyzer::capture_query_reads(&analyzer, || {
+                analyzer.member_owner_selections(&draw, CalleeTypeShape::DynTrait, None, &site)
+            });
+        let (_, warm_reads) =
+            brokk_bifrost_analysis::analyzer::capture_query_reads(&analyzer, || {
+                analyzer.member_owner_selections(&draw, CalleeTypeShape::DynTrait, None, &site)
+            });
+        let file_reads = |ledger: &brokk_bifrost_analysis::analyzer::ReadLedger| {
+            ledger
+                .keys()
+                .into_iter()
+                .filter(|key| matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::File { .. }))
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert!(!file_reads(&cold_reads).is_empty());
+        assert_eq!(file_reads(&cold_reads), file_reads(&warm_reads));
+        assert!(
+            matches!(&answer.inventory, MemberOwnerInventoryStatus::Open(reasons)
+            if matches!(reasons.as_slice(), [MemberOwnerInventoryReason::ImplementorReadinessUnavailable { .. }]))
+        );
+        assert_eq!(
+            answer.family_completeness.outcome,
+            analyzer.member_family(&draw, None).descendants.outcome
+        );
+        assert_eq!(answer.owners.len(), 10, "{answer:?}");
+        for name in [
+            "A",
+            "B",
+            "Inherits",
+            "Empty",
+            "Macro",
+            "Conditional",
+            "Transformed",
+            "MyUnion",
+        ] {
+            let identity = definition(&analyzer, &format!("member_owner_selections.{name}"));
+            let owner = answer
+                .owners
+                .iter()
+                .find(|owner| {
+                    owner
+                        .resolved_self
+                        .as_ref()
+                        .is_some_and(|resolved| resolved.declaration == identity)
+                })
+                .unwrap_or_else(|| panic!("missing {name}: {answer:?}"));
+            match name {
+                "A" | "B" => {
+                    assert_eq!(
+                        owner.reason,
+                        MemberOwnerSelectionReason::OwnItem,
+                        "{owner:?}"
+                    );
+                    assert_ne!(owner.selected_method.as_ref(), Some(&draw));
+                }
+                "Inherits" | "Empty" | "MyUnion" => {
+                    assert_eq!(
+                        owner.reason,
+                        MemberOwnerSelectionReason::Default,
+                        "{owner:?}"
+                    );
+                    assert_eq!(owner.selected_method.as_ref(), Some(&draw));
+                }
+                "Macro" | "Conditional" | "Transformed" => {
+                    let expected = if name != "Conditional" {
+                        MemberOwnerUnknownReason::GeneratedSurface
+                    } else {
+                        MemberOwnerUnknownReason::ConditionalSurface
+                    };
+                    assert_eq!(
+                        owner.reason,
+                        MemberOwnerSelectionReason::Unknown(expected),
+                        "{owner:?}"
+                    );
+                    assert!(owner.selected_method.is_none());
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(answer.owners.iter().any(|owner| owner.reason
+            == MemberOwnerSelectionReason::Unknown(MemberOwnerUnknownReason::GenericOwner)));
+        assert!(answer.owners.iter().any(|owner| owner.reason
+            == MemberOwnerSelectionReason::Unknown(MemberOwnerUnknownReason::UnresolvedSelf)));
+        let tick = definition(&analyzer, "member_owner_selections.Draw.tick");
+        let tick_answer = analyzer.member_owner_selections(
+            &tick,
+            CalleeTypeShape::TraitBoundGeneric,
+            None,
+            &site,
+        );
+        let empty = definition(&analyzer, "member_owner_selections.Empty");
+        let empty_owner = tick_answer
+            .owners
+            .iter()
+            .find(|owner| {
+                owner
+                    .resolved_self
+                    .as_ref()
+                    .is_some_and(|resolved| resolved.declaration == empty)
+            })
+            .unwrap();
+        assert_eq!(empty_owner.reason, MemberOwnerSelectionReason::Default);
+        assert_eq!(empty_owner.selected_method.as_ref(), Some(&tick));
+        let exact = ResolvedMemberSelf {
+            declaration: definition(&analyzer, "member_owner_selections.A"),
+            substitution: Vec::new(),
+        };
+        let filtered =
+            analyzer.member_owner_selections(&draw, CalleeTypeShape::Nominal, Some(&exact), &site);
+        assert_eq!(filtered.owners.len(), 3, "{filtered:?}");
+        let exact_owner = filtered
+            .owners
+            .iter()
+            .find(|owner| owner.resolved_self.as_ref() == Some(&exact))
+            .expect("the exact A owner is retained");
+        assert_eq!(exact_owner.reason, MemberOwnerSelectionReason::OwnItem);
+        let different = definition(&analyzer, "member_owner_selections.B");
+        assert!(
+            !filtered.owners.iter().any(|owner| owner
+                .resolved_self
+                .as_ref()
+                .is_some_and(|resolved| resolved.declaration == different)),
+            "{filtered:?}"
+        );
+        for reason in [
+            MemberOwnerUnknownReason::GenericOwner,
+            MemberOwnerUnknownReason::UnresolvedSelf,
+        ] {
+            let unknown = filtered
+                .owners
+                .iter()
+                .find(|owner| owner.reason == MemberOwnerSelectionReason::Unknown(reason))
+                .unwrap_or_else(|| panic!("missing {reason:?}: {filtered:?}"));
+            let original = answer
+                .owners
+                .iter()
+                .find(|owner| owner.reason == unknown.reason)
+                .expect("the concrete query retains an existing unknown owner");
+            assert_eq!(unknown.owner, original.owner);
+            assert!(unknown.resolved_self.is_none());
+            assert!(unknown.selected_method.is_none());
+        }
+        let union_self = ResolvedMemberSelf {
+            declaration: definition(&analyzer, "member_owner_selections.MyUnion"),
+            substitution: Vec::new(),
+        };
+        let union_answer = analyzer.member_owner_selections(
+            &draw,
+            CalleeTypeShape::Nominal,
+            Some(&union_self),
+            &site,
+        );
+        assert_eq!(union_answer.owners.len(), 3, "{union_answer:?}");
+        let union_owner = union_answer
+            .owners
+            .iter()
+            .find(|owner| owner.resolved_self.as_ref() == Some(&union_self))
+            .expect("the exact union owner is retained");
+        assert_eq!(union_owner.reason, MemberOwnerSelectionReason::Default);
+        assert_eq!(union_owner.selected_method.as_ref(), Some(&draw));
+        let impl_method = exact_owner
+            .selected_method
+            .as_ref()
+            .expect("A owns its override");
+        assert_ne!(impl_method.source(), draw.source());
+        let through_impl =
+            analyzer.member_owner_selections(impl_method, CalleeTypeShape::DynTrait, None, &site);
+        assert_eq!(through_impl.inventory, answer.inventory);
+        assert_eq!(
+            through_impl.owners.len(),
+            answer.owners.len(),
+            "{through_impl:?}"
+        );
+        for (actual, expected) in through_impl.owners.iter().zip(&answer.owners) {
+            assert_eq!(
+                (
+                    &actual.owner,
+                    &actual.resolved_self,
+                    &actual.selected_method,
+                    actual.reason
+                ),
+                (
+                    &expected.owner,
+                    &expected.resolved_self,
+                    &expected.selected_method,
+                    expected.reason
+                )
+            );
+        }
+        let alias_target = ResolvedMemberSelf {
+            declaration: definition(&analyzer, "member_owner_selections.Foo"),
+            substitution: Vec::new(),
+        };
+        let alias_filtered = analyzer.member_owner_selections(
+            &draw,
+            CalleeTypeShape::Nominal,
+            Some(&alias_target),
+            &site,
+        );
+        assert_eq!(alias_filtered.owners.len(), 2, "{alias_filtered:?}");
+        assert!(
+            alias_filtered
+                .owners
+                .iter()
+                .all(|owner| owner.resolved_self.is_none()
+                    && owner.selected_method.is_none()
+                    && matches!(owner.reason, MemberOwnerSelectionReason::Unknown(_))),
+            "{alias_filtered:?}"
+        );
+        let wrapped = definition(
+            &analyzer,
+            "member_owner_selections.transformed_contract.Wrapped.run",
+        );
+        let wrapped_answer =
+            analyzer.member_owner_selections(&wrapped, CalleeTypeShape::DynTrait, None, &site);
+        assert_eq!(wrapped_answer.owners.len(), 1, "{wrapped_answer:?}");
+        assert_eq!(
+            wrapped_answer.owners[0].reason,
+            MemberOwnerSelectionReason::Unknown(MemberOwnerUnknownReason::GeneratedSurface)
+        );
+        let required = definition(&analyzer, "member_owner_selections.Required.required");
+        let required_answer =
+            analyzer.member_owner_selections(&required, CalleeTypeShape::DynTrait, None, &site);
+        assert_eq!(required_answer.owners.len(), 2, "{required_answer:?}");
+        assert!(
+            required_answer
+                .owners
+                .iter()
+                .any(|owner| owner.reason == MemberOwnerSelectionReason::OwnItem)
+        );
+        assert!(required_answer.owners.iter().any(|owner| owner.reason
+            == MemberOwnerSelectionReason::Unknown(MemberOwnerUnknownReason::NoDefaultBody)));
+
+        let namespaced_method = analyzer
+            .get_definitions("member_owner_selections.Namespaced.Item")
+            .into_iter()
+            .find(|unit| unit.is_function())
+            .expect("the value-namespace Item method is distinct from its associated type");
+        let namespaced_answer = analyzer.member_owner_selections(
+            &namespaced_method,
+            CalleeTypeShape::DynTrait,
+            None,
+            &site,
+        );
+        assert_eq!(namespaced_answer.owners.len(), 1, "{namespaced_answer:?}");
+        assert_eq!(
+            namespaced_answer.owners[0].reason,
+            MemberOwnerSelectionReason::Default
+        );
+        assert_eq!(
+            namespaced_answer.owners[0].selected_method.as_ref(),
+            Some(&namespaced_method)
+        );
+
+        // The workspace provider must reach the same real Rust source reader.
+        let workspace = brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer::new(
+            std::collections::BTreeMap::from([(
+                Language::Rust,
+                brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate::new(analyzer),
+            )]),
+        );
+        let delegated =
+            workspace.member_owner_selections(&draw, CalleeTypeShape::ImplTrait, None, &site);
+        assert_eq!(delegated.owners.len(), answer.owners.len());
+        assert_eq!(delegated.inventory, answer.inventory);
+    }
 
     pub(in crate::analyzer::rust::hierarchy) fn analyzer_with_files(
         files: &[(&str, &str)],

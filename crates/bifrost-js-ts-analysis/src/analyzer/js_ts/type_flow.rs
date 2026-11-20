@@ -14,8 +14,7 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
 use brokk_bifrost_js_ts::graph::receiver_analysis::{
-    JsTsReceiverFactProvider, JsTsReceiverSyntaxIndexBuild,
-    build_js_ts_receiver_syntax_index_bounded,
+    JsTsReceiverFactProvider, build_js_ts_receiver_syntax_index,
 };
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, slice,
@@ -99,8 +98,6 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
-
-use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
 
 use brokk_bifrost_core::analyzer::model::Language;
 
@@ -1475,11 +1472,19 @@ struct JsTsMemberSurfaceMemoKey {
     max_nodes: usize,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct JsTsMemberSurfaceRequestMemo {
-    summaries: KeyedPoolSafeMemo<JsTsMemberSurfaceMemoKey, JsTsMemberSurfaceMemoEntry>,
-    #[cfg(test)]
-    survey_count: AtomicUsize,
+// The key carries the language, content identity, project generation and
+// overlay: the authority the member-surface funnel records for every hit.
+impl brokk_bifrost_core::domain_memo::CertifyingKey for JsTsMemberSurfaceMemoKey {}
+
+brokk_bifrost_core::domain_memo_set! {
+    #[derive(Debug, Default)]
+    pub(crate) struct JsTsMemberSurfaceRequestMemo {
+        summaries: brokk_bifrost_core::domain_memo::CertifiedKeyed<
+            JsTsMemberSurfaceMemoKey,
+            JsTsMemberSurfaceMemoEntry,
+        >,
+        ; test_only { survey_count: AtomicUsize }
+    }
 }
 
 impl JsTsMemberSurfaceRequestMemo {
@@ -2272,22 +2277,18 @@ fn member_surface_survey(
             summary.coverage.include(JsTsSurfaceCoverage::Truncated);
             continue;
         }
-        let syntax_index = match build_js_ts_receiver_syntax_index_bounded(
+        let (syntax_index, visited) = build_js_ts_receiver_syntax_index(
             prepared.tree().root_node(),
             prepared.source(),
             cancellation,
-            remaining,
-        ) {
-            JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => {
-                remaining = remaining.saturating_sub(visited);
-                index
-            }
-            JsTsReceiverSyntaxIndexBuild::ExceededScope { .. } => {
-                summary.coverage.include(JsTsSurfaceCoverage::Truncated);
-                break;
-            }
-            JsTsReceiverSyntaxIndexBuild::Cancelled => return None,
-        };
+        )?;
+        // The survey's own node cap, which is not a scope allowance, decides
+        // whether this file still fits.
+        if visited > remaining {
+            summary.coverage.include(JsTsSurfaceCoverage::Truncated);
+            break;
+        }
+        remaining -= visited;
         let imports = compute_import_binder(prepared.source(), prepared.tree());
         let lexical =
             JsTsLexicalBindingIndex::build(prepared.tree().root_node(), prepared.source());

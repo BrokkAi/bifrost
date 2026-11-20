@@ -54,7 +54,7 @@ use brokk_bifrost_jvm::java::graph_support::{
 };
 
 impl JavaAnalyzer {
-    fn legacy_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
+    pub(crate) fn legacy_direct_ancestors(&self, code_unit: &CodeUnit) -> HierarchyAnswer {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         HierarchyAnswer::complete(crate::analyzer::jvm::hierarchy::memoized_ancestors(
@@ -187,6 +187,95 @@ impl TypeHierarchyProvider for JavaAnalyzer {
                 ));
             },
         )
+    }
+}
+
+/// The workspace descendants of each external root, per active model set,
+/// root and visit budget, with the certificate that names the answer. Every
+/// virtual call on an external owner asks this; the walk visits every
+/// workspace type.
+pub(crate) type ExternalRootDescendantsMemo = crate::analyzer::jvm::hierarchy::DerivedMemo<
+    (
+        Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest>,
+        Box<str>,
+        usize,
+    ),
+    ExternalRootDescendants,
+>;
+
+pub(crate) fn fresh_external_root_descendants(
+    memo_budget: u64,
+) -> Arc<ExternalRootDescendantsMemo> {
+    Arc::new(crate::analyzer::jvm::hierarchy::derived_memo(
+        memo_budget / 16,
+    ))
+}
+
+/// One external root's workspace descendants with the reason a workspace
+/// supertype nothing resolves keeps its families open, retained per snapshot,
+/// model set, root and visit budget.
+pub(crate) struct ExternalRootDescendants {
+    /// The walk's answer without its unmatched supertypes, which only the
+    /// unresolved-supertype report reads.
+    pub(crate) hierarchy: JavaExternalRootHierarchyAnswer,
+    unresolved_supertype: Option<Box<str>>,
+}
+
+impl ExternalRootDescendants {
+    /// The answer a `JavaExternalRootDescendants` certificate names: every
+    /// field a member family reads, and the reported gap.
+    pub(super) fn digest(&self) -> brokk_bifrost_analysis::analyzer::semantic::StableDigest {
+        let mut digest = brokk_bifrost_analysis::analyzer::semantic::LengthDelimitedDigest::new(
+            b"java-external-root-descendants/v1",
+        );
+        match &self.hierarchy.status {
+            JavaExternalRootHierarchyStatus::Complete => digest.push(b"complete"),
+            JavaExternalRootHierarchyStatus::Incomplete(
+                JavaExternalRootHierarchyIncompleteReason::HierarchyFactsUnavailable,
+            ) => digest.push(b"hierarchy_facts_unavailable"),
+            JavaExternalRootHierarchyStatus::Incomplete(
+                JavaExternalRootHierarchyIncompleteReason::AmbiguousSupertype,
+            ) => digest.push(b"ambiguous_supertype"),
+            JavaExternalRootHierarchyStatus::Incomplete(
+                JavaExternalRootHierarchyIncompleteReason::UnresolvedSupertype(name),
+            ) => {
+                digest.push(b"unresolved_supertype");
+                digest.push(name.as_bytes());
+            }
+            JavaExternalRootHierarchyStatus::Cancelled => digest.push(b"cancelled"),
+            JavaExternalRootHierarchyStatus::BudgetExhausted => digest.push(b"budget_exhausted"),
+        }
+        digest.push(
+            &u64::try_from(self.hierarchy.visited)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        let mut descendants = self
+            .hierarchy
+            .descendants
+            .iter()
+            .map(|unit| {
+                (
+                    brokk_bifrost_analysis::path_utils::workspace_relative_slash_path(
+                        unit.source().rel_path(),
+                    ),
+                    unit.fq_name(),
+                )
+            })
+            .collect::<Vec<_>>();
+        descendants.sort();
+        for (path, name) in descendants {
+            digest.push(path.as_bytes());
+            digest.push(name.as_bytes());
+        }
+        match &self.unresolved_supertype {
+            Some(gap) => {
+                digest.push(b"gap");
+                digest.push(gap.as_bytes());
+            }
+            None => digest.push(b"no_gap"),
+        }
+        digest.finish()
     }
 }
 
@@ -373,21 +462,14 @@ impl JavaAnalyzer {
         let external =
             self.external_declarations(analyzer.semantic_model_overlay_read().published());
         external.record_all_gaps(&crate::analyzer::jvm::external::QueryGapRecorder::new(self));
-        let hierarchy = self.external_root_hierarchy_with_external(
+        let descendants = self.external_root_descendants(
             analyzer,
             identity.owner_fqn(),
             max_visits,
             cancellation,
         );
-        // The scan runs whether or not a JDK pack is active. Skipping it without
-        // a pack would let a family over a library owner look complete while a
-        // workspace type extends a supertype nothing can resolve, and the
-        // analyzer path has no query obligation that would say otherwise. With
-        // no pack a JDK supertype is reported as unresolved, which fails closed.
-        if !hierarchy.unmatched_supertypes.is_empty() {
-            self.report_unresolved_supertype(analyzer, identity.owner_fqn(), &hierarchy);
-        }
-        let status = match hierarchy.status {
+        let hierarchy = &descendants.hierarchy;
+        let status = match &hierarchy.status {
             JavaExternalRootHierarchyStatus::Complete => None,
             JavaExternalRootHierarchyStatus::Incomplete(
                 JavaExternalRootHierarchyIncompleteReason::HierarchyFactsUnavailable,
@@ -421,7 +503,7 @@ impl JavaAnalyzer {
         );
         let mut family = MemberFacts::external_descendant_family(
             analyzer,
-            hierarchy.descendants,
+            hierarchy.descendants.clone(),
             hierarchy.visited,
             identity.member(),
             identity.arity(),
@@ -438,40 +520,151 @@ impl JavaAnalyzer {
         family
     }
 
-    /// Records the independent incompleteness reason when a workspace type has a
+    /// The workspace descendants of one external root, shared by every member
+    /// and every call that asks about that root. The walk visits every
+    /// workspace type and resolves each supertype that names neither a
+    /// workspace type nor the root, and the unresolved-supertype report
+    /// resolves them again; per call that cost grew as calls x workspace
+    /// types. The answer depends on the snapshot, the active model set, the
+    /// root and the visit budget, never on the member.
+    ///
+    /// The walk reads every workspace type, so its named reads are a
+    /// workspace-sized set; retaining and replaying that set per root is what
+    /// made each dispatch receipt large. The build instead records one
+    /// [`WorkspaceFactFamily::JavaExternalRootDescendants`] certificate whose
+    /// answer digest verification recomputes on the head, so a hit replays
+    /// one key and the incompleteness reasons of the walk. A walk stopped by
+    /// cancellation names no certificate, answers its own caller and is not
+    /// retained.
+    pub(super) fn external_root_descendants(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        external_root_fqn: &str,
+        max_visits: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<ExternalRootDescendants> {
+        use brokk_bifrost_analysis::analyzer::cache_weight::estimate_code_unit;
+        use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
+        use brokk_bifrost_analysis::analyzer::workspace_authority::{
+            AuthorityInputs, memo_attribution,
+        };
+        use brokk_bifrost_analysis::analyzer::{
+            FactSubject, WorkspaceAuthorityMemo, WorkspaceFactFamily,
+        };
+        let key = (
+            analyzer
+                .semantic_model_overlay()
+                .as_ref()
+                .map(|overlay| StableDigest::sha256(overlay.active_model_set_hash())),
+            Box::<str>::from(external_root_fqn),
+            max_visits,
+        );
+        crate::analyzer::jvm::hierarchy::derived_read_retaining(
+            &self.external_root_descendants,
+            self,
+            &key,
+            || {
+                let answer = WorkspaceAuthorityMemo::new(
+                    WorkspaceFactFamily::JavaExternalRootDescendants,
+                    (),
+                )
+                .read(
+                    &memo_attribution(self),
+                    |_| {
+                        let mut hierarchy = self.external_root_hierarchy_with_external(
+                            analyzer,
+                            external_root_fqn,
+                            max_visits,
+                            cancellation,
+                        );
+                        // The scan runs whether or not a JDK pack is active.
+                        // Skipping it without a pack would let a family over a
+                        // library owner look complete while a workspace type
+                        // extends a supertype nothing can resolve, and the
+                        // analyzer path has no query obligation that would say
+                        // otherwise. With no pack a JDK supertype is reported
+                        // as unresolved, which fails closed.
+                        let unresolved_supertype = self.unresolved_supertype_gap(
+                            analyzer,
+                            external_root_fqn,
+                            &hierarchy,
+                        );
+                        if let Some(gap) = &unresolved_supertype {
+                            analyzer.record_query_incomplete(
+                                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(
+                                    gap.clone(),
+                                ),
+                            );
+                        }
+                        // Only the report reads the unmatched supertypes.
+                        hierarchy.unmatched_supertypes = Vec::new();
+                        ExternalRootDescendants {
+                            hierarchy,
+                            unresolved_supertype,
+                        }
+                    },
+                    |answer| {
+                        if answer.hierarchy.status == JavaExternalRootHierarchyStatus::Cancelled {
+                            AuthorityInputs::Unnamed
+                        } else {
+                            AuthorityInputs::Fact {
+                                language: Language::Java,
+                                subject: FactSubject::Named {
+                                    name: external_root_fqn.into(),
+                                },
+                                answer: answer.digest(),
+                            }
+                        }
+                    },
+                );
+                let retain = answer.hierarchy.status != JavaExternalRootHierarchyStatus::Cancelled;
+                let bytes = std::mem::size_of_val(&key)
+                    + external_root_fqn.len()
+                    + std::mem::size_of::<ExternalRootDescendants>()
+                    + answer
+                        .unresolved_supertype
+                        .as_ref()
+                        .map_or(0, |gap| gap.len())
+                    + answer
+                        .hierarchy
+                        .descendants
+                        .iter()
+                        .map(|unit| usize::try_from(estimate_code_unit(unit)).unwrap_or(usize::MAX))
+                        .sum::<usize>();
+                (Arc::new(answer), bytes, retain)
+            },
+        )
+    }
+
+    /// The independent incompleteness reason when a workspace type has a
     /// supertype that is neither a workspace type, nor the root, nor a type the
     /// external surface resolves: that type might be an overrider of a member of
     /// the root, and the walk cannot see through it.
-    fn report_unresolved_supertype(
+    fn unresolved_supertype_gap(
         &self,
         analyzer: &dyn IAnalyzer,
         external_root_fqn: &str,
         hierarchy: &JavaExternalRootHierarchyAnswer,
-    ) {
+    ) -> Option<Box<str>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let packs = analyzer.semantic_model_overlay_read().published();
         let mut seen = brokk_bifrost_core::hash::HashSet::default();
-        for (descendant, raw) in &hierarchy.unmatched_supertypes {
-            if !seen.insert((descendant.source().clone(), raw.as_str())) {
-                continue;
-            }
-            if self
-                .supertype_identity(token, &packs, descendant, raw)
-                .is_none()
-            {
-                analyzer.record_query_incomplete(
-                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(
-                        format!(
-                            "jvm.dispatch.unresolved_supertype: {raw} of {} may override a member of {external_root_fqn}",
-                            descendant.fq_name()
-                        )
-                        .into_boxed_str(),
-                    ),
-                );
-                return;
-            }
-        }
+        hierarchy
+            .unmatched_supertypes
+            .iter()
+            .filter(|(descendant, raw)| seen.insert((descendant.source().clone(), raw.as_str())))
+            .find(|(descendant, raw)| {
+                self.supertype_identity(token, &packs, descendant, raw)
+                    .is_none()
+            })
+            .map(|(descendant, raw)| {
+                format!(
+                    "jvm.dispatch.unresolved_supertype: {raw} of {} may override a member of {external_root_fqn}",
+                    descendant.fq_name()
+                )
+                .into_boxed_str()
+            })
     }
 
     /// The type a workspace declaration's written supertype names: a lexically
@@ -769,7 +962,10 @@ impl JavaAnalyzer {
         };
         if let Some(name) = root {
             let inventory = if interface {
-                implicit_interface_members(Language::Java).map(|root| root.methods)
+                implicit_interface_members(Language::Java).map(|root| {
+                    root.methods
+                        .expect("Java has a fixed implicit Object method inventory")
+                })
             } else {
                 overridable_method_inventory(name)
             };
@@ -794,7 +990,7 @@ impl JavaAnalyzer {
         root: Option<&CodeUnit>,
         run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
     ) {
-        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind;
+        use brokk_bifrost_analysis::analyzer::resolution::ClassifiedSupertypeKind;
         let _scope = AnalyzerQueryScope::new(self);
         crate::analyzer::jvm::native_hierarchy::with_native_query(
             self.inner(),
@@ -823,12 +1019,12 @@ impl JavaAnalyzer {
                 // kind that leads to it continues the chain (JLS 8.1.4, 9.2). A
                 // resolved superclass or superinterface reaches the root through
                 // its own hierarchy, where a nearer redeclaration closes the route.
-                let continuing: &[ResolutionSupertypeKind] = if interface {
-                    &[ResolutionSupertypeKind::Interface]
+                let continuing: &[ClassifiedSupertypeKind] = if interface {
+                    &[ClassifiedSupertypeKind::Interface]
                 } else {
                     &[
-                        ResolutionSupertypeKind::Superclass,
-                        ResolutionSupertypeKind::ImplicitSuperclass,
+                        ClassifiedSupertypeKind::Superclass,
+                        ClassifiedSupertypeKind::ImplicitSuperclass,
                     ]
                 };
                 if parents.iter().any(|parent| {
@@ -848,7 +1044,10 @@ impl JavaAnalyzer {
                     ),
                     _ if interface => (
                         "java.lang.Object",
-                        implicit_interface_members(Language::Java).map(|root| root.methods),
+                        implicit_interface_members(Language::Java).map(|root| {
+                            root.methods
+                                .expect("Java has a fixed implicit Object method inventory")
+                        }),
                     ),
                     _ => (
                         "java.lang.Object",
@@ -860,7 +1059,7 @@ impl JavaAnalyzer {
                     .any(|parent| parent.unread.iter().any(|unread| unread.name == root))
                 {
                     parents.push(crate::analyzer::jvm::native_hierarchy::MappedParent {
-                        kind: Some(ResolutionSupertypeKind::ImplicitSuperclass),
+                        kind: Some(ClassifiedSupertypeKind::ImplicitSuperclass),
                         ordinal: u32::MAX,
                         targets: Vec::new(),
                         unread: vec![UnreadMemberFamilyAncestor {
@@ -1363,6 +1562,7 @@ mod tests {
                     )
                     .expect("register declarations");
                 let request = SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                         .expect("crate version"),
@@ -1377,7 +1577,8 @@ mod tests {
                         }),
                         target: Some("jvm".into()),
                         configuration: None,
-                        artifact_sha256: None,
+                        production_input_digest: None,
+                        verified_raw_artifacts: Vec::new(),
                     }],
                     controls: Vec::new(),
                     limits: SemanticModelRuntimeLimits::default(),
@@ -1848,13 +2049,30 @@ mod tests {
                 ..Default::default()
             },
         );
-        let statements = Arc::new(AtomicUsize::new(0));
+        const HEADS_SQL: &str = "SELECT heads.lang, heads.generation, heads.revision\n             FROM workspace_heads AS heads\n             LEFT JOIN analysis_epochs AS epochs ON epochs.lang = heads.lang\n             WHERE heads.workspace_id = ?1\n               AND heads.generation = COALESCE(epochs.generation, 0)";
+        // #10828 inventory freshness check on checkout.
+        const INVENTORY_SQL: &str =
+            "SELECT generation FROM jvm_external_inventory_generation WHERE id=0";
+        // Test-mode checkout validation. This workspace has no Rust snapshot,
+        // and #13857 issues no Rust selection stamp for one: no scoped epoch
+        // SELECT and no main/temp schema PRAGMAs. They remain allowed here as
+        // checkout validation in case the selection shape changes, but only
+        // the Java-owned reads below prove that the checkout happened.
+        const VALIDATION_SQL: [&str; 5] = [
+            HEADS_SQL,
+            "PRAGMA main.schema_version",
+            "PRAGMA temp.schema_version",
+            INVENTORY_SQL,
+            // #13416 selection freshness check when the selection has Rust.
+            "SELECT epoch FROM main.workspace_selection_epochs\n      WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3",
+        ];
+        let statements = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let probe = rusqlite::Connection::open_in_memory().unwrap();
         let counter = Arc::clone(&statements);
         let _subscription = brokk_bifrost_core::cache_db::sql_profile::subscribe_test_statements(
             &probe,
-            Arc::new(move |_| {
-                counter.fetch_add(1, Ordering::Relaxed);
+            Arc::new(move |sql| {
+                counter.lock().unwrap().push(sql.to_owned());
             }),
         );
         let family = |root: &str| {
@@ -1883,12 +2101,187 @@ mod tests {
 
         // The supertype `Base` of each servlet names the same external type
         // whatever root a query asks about, so another root resolves nothing.
-        statements.store(0, Ordering::Relaxed);
+        let assert_validation_only = || {
+            let mut statements = statements.lock().unwrap();
+            // After the first resolution in a snapshot, class, member and
+            // supertype resolution statements must remain zero. The issue for
+            // carrying generation on the request-pinned snapshot will remove
+            // these validation reads. Whether the external index is already
+            // warm makes the checkout count one or two; neither count changes
+            // the contract that no resolution statement reruns.
+            let unexpected: Vec<_> = statements
+                .iter()
+                .filter(|sql| !VALIDATION_SQL.contains(&sql.as_str()))
+                .collect();
+            assert!(unexpected.is_empty(), "unexpected SQL: {unexpected:?}");
+            for sql in [HEADS_SQL, INVENTORY_SQL] {
+                let count = statements
+                    .iter()
+                    .filter(|actual| actual.as_str() == sql)
+                    .count();
+                assert!(
+                    (1..=2).contains(&count),
+                    "checkout validation must occur once or twice: {sql}: {count}"
+                );
+            }
+            statements.clear();
+        };
+        statements.lock().unwrap().clear();
         assert_eq!(family("dep.Unrelated"), 0);
-        assert_eq!(statements.load(Ordering::Relaxed), 0);
+        assert_validation_only();
 
         let (warm, warm_reads) = capture_query_reads(&java, || family("dep.Middle"));
         assert_eq!(warm, cold);
         assert_eq!(warm_reads.keys(), cold_reads.keys());
+        assert_validation_only();
+    }
+
+    #[test]
+    #[hardwon(
+        "#12888: every external-owner dispatch replayed a workspace-sized supertype read set"
+    )]
+    fn a_retained_external_root_walk_names_one_certificate_and_replays_its_gaps() {
+        use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+        use brokk_bifrost_analysis::analyzer::common::capture_query_cache_build;
+        use brokk_bifrost_core::analyzer::config::{
+            AnalyzerConfig, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies,
+        };
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "app/Servlet.java",
+                "package app;\nimport dep.Base;\nclass Servlet extends Base { public void close() {} public void open() {} }\n",
+            )
+            .file(
+                "app/Missing.java",
+                "package app;\nclass Missing extends com.missing.Gone {}\n",
+            )
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("dependency.jar");
+        write_test_class_jar(
+            &jar,
+            &[
+                TestClassFile {
+                    internal_name: "dep/Base",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[],
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "java/lang/Object",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[],
+                    private_nested: false,
+                },
+            ],
+        );
+        let java = JavaAnalyzer::new_with_config(
+            project.project_dyn(),
+            AnalyzerConfig {
+                jvm: JvmAnalyzerConfig {
+                    external_dependencies: JvmExternalDependencies {
+                        artifact_paths: vec![JvmExternalArtifact {
+                            artifact_path: jar,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let family = |member: &str| {
+            let ((answer, receipt), reads) = capture_query_reads(&java, || {
+                capture_query_cache_build(&java, || {
+                    java.resolve_external_member_family(
+                        &java,
+                        &JvmExternalMemberIdentity::new(
+                            Language::Java,
+                            "dep.Base",
+                            member,
+                            0,
+                            JvmReceiverSemantics::Instance,
+                        ),
+                        usize::MAX,
+                        None,
+                    )
+                })
+            });
+            assert_eq!(
+                answer.status,
+                ExternalMemberFamilyStatus::Incomplete(
+                    ExternalMemberFamilyIncompleteReason::ExternalRootUnresolved,
+                ),
+                "{answer:?}"
+            );
+            let names = answer
+                .candidates
+                .iter()
+                .map(CodeUnit::fq_name)
+                .collect::<Vec<_>>();
+            let mut reasons = receipt
+                .stable_reasons()
+                .iter()
+                .map(|reason| reason.stable_replay_reason().unwrap())
+                .collect::<Vec<_>>();
+            reasons.sort();
+            (names, reads.keys(), reasons)
+        };
+
+        let (cold_names, cold_keys, cold_reasons) = family("close");
+        assert_eq!(cold_names, ["app.Servlet.close"]);
+        // The walk reads every workspace type; the caller sees one certificate
+        // for it instead. Only the walk reads `app/Missing.java`.
+        let subject = brokk_bifrost_analysis::analyzer::FactSubject::Named {
+            name: "dep.Base".into(),
+        };
+        let certificates = cold_keys
+            .iter()
+            .filter_map(|key| match key {
+                ReadKey::Lookup {
+                    question:
+                        LookupQuestion::WorkspaceFact {
+                            family:
+                                brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaExternalRootDescendants,
+                            language: Language::Java,
+                            subject: recorded,
+                        },
+                    digest,
+                    ..
+                } if *recorded == subject => Some(*digest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(certificates.len(), 1, "{cold_keys:?}");
+        assert!(
+            !format!("{cold_keys:?}").contains("app/Missing.java"),
+            "{cold_keys:?}"
+        );
+        // Verification recomputes the same answer on an unchanged head.
+        assert_eq!(
+            crate::analyzer::java::workspace_facts::answer(
+                &java,
+                brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaExternalRootDescendants,
+                Language::Java,
+                &subject,
+            ),
+            Some(certificates[0])
+        );
+        assert!(
+            cold_reasons
+                .iter()
+                .any(|reason| reason.contains("unresolved_supertype: com.missing.Gone")),
+            "{cold_reasons:?}"
+        );
+        // Another member of the same root reuses the retained walk, and its
+        // report of the unresolved supertype still reaches the caller.
+        let (open_names, _, open_reasons) = family("open");
+        assert_eq!(open_names, ["app.Servlet.open"]);
+        assert_eq!(open_reasons, cold_reasons);
+        let (warm_names, warm_keys, warm_reasons) = family("close");
+        assert_eq!(warm_names, cold_names);
+        assert_eq!(warm_keys, cold_keys);
+        assert_eq!(warm_reasons, cold_reasons);
     }
 }

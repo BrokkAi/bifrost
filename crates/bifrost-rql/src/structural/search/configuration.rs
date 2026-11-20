@@ -523,6 +523,10 @@ impl ConfigurationFactsTraversalCache {
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }),
             incompleteness.execution_cause(),
         )
@@ -913,6 +917,10 @@ pub(super) fn execute_configuration_facts_seed(
                     message: format!("configuration seed could not list workspace files: {error}"),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }),
                 Some(DerivationExecutionCause::Provider),
             ));
@@ -935,6 +943,7 @@ pub(super) fn execute_configuration_facts_seed(
             message: "configuration seed did not route to any workspace document for the requested path scope; absence is not provable".to_owned(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
 
@@ -1066,7 +1075,7 @@ pub(super) fn execute_configuration_facts_seed(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Budget),
                     related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
@@ -1078,6 +1087,7 @@ pub(super) fn execute_configuration_facts_seed(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
                 break;
             }

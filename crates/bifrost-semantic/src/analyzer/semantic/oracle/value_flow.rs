@@ -2062,10 +2062,12 @@ impl ValueFlowSnapshot {
         &self.backing.omission_causes
     }
 
-    /// Whether the relation list may lack a relation: a capacity cap cut it
-    /// (Truncated coverage), or the projection left out a stored member of a
-    /// returned join (#9766). Open coverage alone does not say this; it admits
-    /// more candidates and still carries every relation the projection found.
+    /// Whether the relation list may lack a relation: a capacity cap, a budget
+    /// stop or a cancellation cut it (Truncated coverage; an interrupted
+    /// projection always publishes Truncated, #13837), or the projection left
+    /// out a stored member of a returned join (#9766). Open coverage alone
+    /// does not say this; it admits more candidates and still carries every
+    /// relation the projection found.
     /// A consumer that treats the relations as complete must ask this, not
     /// match the coverage.
     pub fn relations_may_be_missing(&self) -> bool {

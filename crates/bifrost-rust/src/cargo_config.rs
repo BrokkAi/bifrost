@@ -304,33 +304,44 @@ impl RustCargoConfigDocument {
                     result = Changes;
                     true
                 }
+                // Build settings preserve sources only for the validated sub-keys.
                 "build" => known_table(value, |key, value| match key {
                     "target" => string_or_array(value),
                     "rustflags" => classified_rustflags(value),
-                    "target-dir" => value.is_str(),
+                    "target-dir" | "build-dir" | "dep-info-basedir" | "rustdoc" | "warnings" => {
+                        value.is_str()
+                    }
+                    "jobs" => value.is_integer(),
+                    "incremental" => value.is_bool(),
+                    "rustdocflags" => string_or_array(value),
                     _ => false,
                 }),
+                // Target flags keep their validation; links overrides remain Unknown.
                 "target" => known_table(value, |_, target| {
                     known_table(target, |key, value| match key {
                         "linker" => value.is_str(),
-                        "runner" => string_or_array(value),
+                        "runner" | "rustdocflags" => string_or_array(value),
                         "rustflags" => classified_rustflags(value),
                         _ => false,
                     })
                 }),
+                // Aliases name commands rather than dependency sources.
                 "alias" => known_table(value, |_, value| string_or_array(value)),
+                // Terminal settings only affect output.
                 "term" => known_table(value, |key, value| match key {
-                    "quiet" | "verbose" => value.is_bool(),
+                    "quiet" | "verbose" | "hyperlinks" | "unicode" => value.is_bool(),
                     "color" => value
                         .as_str()
                         .is_some_and(|v| matches!(v, "auto" | "always" | "never")),
                     _ => false,
                 }),
+                // Network policy changes transport, not package identity.
                 "net" => known_table(value, |key, value| match key {
                     "offline" | "git-fetch-with-cli" => value.is_bool(),
                     "retry" => value.is_integer(),
                     _ => false,
                 }),
+                // HTTP settings change transport, not package identity.
                 "http" => known_table(value, |key, value| match key {
                     "proxy" | "user-agent" | "cainfo" | "proxy-cainfo" => value.is_str(),
                     "timeout" | "low-speed-limit" => value.is_integer(),
@@ -444,7 +455,9 @@ fn string_or_array(value: &toml::Value) -> bool {
 
 // `--check-cfg` declares allowed names/values and does not enable them.
 // `--cfg` enables atoms through the existing shared evaluator. Malformed cfg
-// flags or a replaced sysroot cannot certify the selected toolchain artifact.
+// flags, external-crate overrides (--extern/-L), or a replaced sysroot cannot
+// certify the selected toolchain artifact. rustc documents external crate
+// selection at https://doc.rust-lang.org/rustc/command-line-arguments.html.
 fn classified_rustflags(value: &toml::Value) -> bool {
     if !string_or_array(value) {
         return false;
@@ -452,7 +465,12 @@ fn classified_rustflags(value: &toml::Value) -> bool {
     let flags = rustflags(Some(value.clone()));
     let mut arguments = flags.iter();
     while let Some(argument) = arguments.next() {
-        if argument == "--sysroot" || argument.starts_with("--sysroot=") {
+        if argument == "--sysroot"
+            || argument.starts_with("--sysroot=")
+            || argument == "--extern"
+            || argument.starts_with("--extern=")
+            || argument.starts_with("-L")
+        {
             return false;
         }
         if argument == "--cfg" {
@@ -1307,11 +1325,15 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12926: merged Cargo table classifications contradicted each other"
+    )]
     fn source_identity_classification_is_closed() {
         for source in [
             "",
             "[build]\ntarget='x86_64-unknown-linux-gnu'",
             "[alias]\ncheck-all='check --all'",
+            "[build]\nrustflags=['-Cmetadata=--extern=example-Lpath']",
             "[target.x86_64-unknown-linux-gnu]\nlinker='cc'",
             "[unstable]\nbuild-std=['std']",
             "[env]\nX='1'\nY={value='2',force=true,relative=true}",
@@ -1357,6 +1379,13 @@ mod tests {
         for source in [
             "[future]\nkey=true",
             "[build]\nfuture=true",
+            "[build]\nrustflags=['--extern=log=other.rlib']",
+            "[build]\nrustflags=['--extern','log=other.rlib']",
+            "[build]\nrustflags='--extern=log=other.rlib'",
+            "[build]\nrustflags='-L other'",
+            "[build]\nrustflags='-Lother'",
+            "[build]\nrustflags=['-L','other']",
+            "[target.x86_64-unknown-linux-gnu]\nrustflags=['-Lother']",
             "[unstable]\nbuild-std=true",
             "[unstable]\nbuild-std=[]",
             "[unstable]\nunknown=true",

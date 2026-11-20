@@ -1819,6 +1819,7 @@ impl Replay {
                 alternatives_truncated,
                 retained,
                 WitnessReconstructionWork::new(expansions, count),
+                crate::analyzer::reuse_verdict::ReuseVerdict::Content,
             )),
             checks,
         )))
@@ -2305,209 +2306,68 @@ impl IcfgTaintSession<'_> {
         let mut represented: HashMap<_, (usize, usize)> = HashMap::default();
         let mut unavailable = HashSet::default();
         let mut source_coverage = None;
-        'states: for (state_id, state) in replay.states.iter().enumerate() {
+        let meeting = |state: &State| {
             let fact = *facts
                 .fact(facts.reached()[state.key.row].fact())
                 .expect("a frozen state has a fact");
-            let Some(sink) = fact.sink() else {
-                continue;
-            };
+            let sink = fact.sink()?;
             let live = replay.values[state.key.classes].intersection(
                 plan.sink(sink)
                     .expect("a frozen meeting has a bound sink")
                     .accepted(),
             );
-            if live.is_empty() {
-                continue;
-            }
-            let mut candidates = Vec::new();
-            let mut frontier = PathQualityFrontier::default();
-            for prefix in replay.entries[state.key.entry]
+            (!live.is_empty()).then_some((fact, sink, live))
+        };
+        fn meeting_qualities<'a>(
+            replay: &'a Replay,
+            state: &'a State,
+            fact: TaintFact,
+        ) -> impl Iterator<Item = (PathQuality, usize)> + 'a {
+            replay.entries[state.key.entry]
                 .prefixes
                 .iter()
                 .flatten()
-                .copied()
-            {
-                let quality = replay.prefixes[prefix].quality.conjoin(state.key.quality);
-                let quality = if fact.is_uncertain() {
-                    quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
-                } else {
-                    quality
-                };
-                frontier.insert(quality);
-                candidates.push((quality, prefix));
-            }
-            for quality in frontier.iter() {
-                if let Some(&(pair, witness)) =
-                    represented.get(&(sink, fact.is_uncertain(), state.key.classes, quality))
-                {
-                    // This state was visited once. Its distinct meeting/entry
-                    // is not reconstructed after selecting a representative.
-                    Arc::get_mut(&mut passes[pair].witnesses[witness])
-                        .expect("pair construction owns its witness")
-                        .mark_alternatives_truncated();
+                .map(move |&prefix| {
+                    let quality = replay.prefixes[prefix].quality.conjoin(state.key.quality);
+                    let quality = if fact.is_uncertain() {
+                        quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
+                    } else {
+                        quality
+                    };
+                    (quality, prefix)
+                })
+        }
+        // Different meeting states of one pair and payload can reach the sink
+        // along the same steps, for example once through each dispatch arm of
+        // a call on the path. The pass keeps only the nondominated qualities,
+        // so a quality another state dominates would spend the witness budget
+        // on a path the report discards (#14210). Path quality does not
+        // capture closure obligations, though: a dominated path can establish
+        // certainty that its dominator cannot. Dominated meetings therefore
+        // run in a second phase, and only for a pair that is not yet certain;
+        // otherwise their representative records the skipped alternative.
+        let mut pair_frontiers: HashMap<_, PathQualityFrontier> = HashMap::default();
+        for state in &replay.states {
+            let Some((fact, sink, _)) = meeting(state) else {
+                continue;
+            };
+            let pair = (sink, fact.is_uncertain(), state.key.classes);
+            if !pair_frontiers.contains_key(&pair) {
+                // A pair the budget cannot admit is reported as incomplete
+                // coverage; admitted pairs keep exact frontiers and still
+                // produce their passes.
+                if source_coverage.is_some() {
                     continue;
                 }
-                let prefix = candidates
-                    .iter()
-                    .find(|(candidate, _)| *candidate == quality)
-                    .expect("a retained quality has a concrete prefix")
-                    .1;
-                let mut transient = RetainedHeap::default();
-                transient.map(&represented);
-                transient.hash_set(&unavailable);
-                transient.vec(&candidates);
-                transient.add(passes_owned_bytes(&passes));
-                transient.add(live.retained_heap_bytes());
-                let transient_bytes = transient.total();
-                let available = replay
-                    .max_retained_bytes
-                    .saturating_sub(replay.owned_bytes());
-                if transient_bytes > available {
-                    source_coverage = Some(IcfgTaintIncomplete::RetentionBudget {
-                        limit: self.max_refinement_bytes,
-                        attempted: replay
-                            .query_limit
-                            .saturating_sub(replay.max_retained_bytes)
-                            .saturating_add(replay.owned_bytes())
-                            .saturating_add(transient_bytes),
-                    });
-                    break 'states;
-                }
-                let witness = match replay.witness(
-                    state_id,
-                    prefix,
-                    self,
-                    recorded,
-                    WitnessCollection {
-                        limits: &mut *limits,
-                        request: &mut *request,
-                        attribution: &mut *attribution,
-                    },
-                    transient_bytes,
-                ) {
-                    Ok(witness) => witness,
-                    Err(error) => {
-                        source_coverage = Some(recoverable_stop(error)?);
-                        break 'states;
-                    }
-                };
-                let position = passes
-                    .iter()
-                    .position(|pass| {
-                        pass.sink == sink && pass.meeting.is_uncertain() == fact.is_uncertain()
-                    })
-                    .unwrap_or_else(|| {
-                        passes.push(PairPass {
-                            sink,
-                            meeting: fact,
-                            classes: plan.universe().empty_set(),
-                            contributed: plan.universe().empty_set(),
-                            qualities: PathQualityFrontier::default(),
-                            witnesses: Vec::new(),
-                            checks: PathChecks::default(),
-                            certain: false,
-                            unavailable: false,
-                            closures: Vec::new(),
-                        });
-                        passes.len() - 1
-                    });
-                let pass = &mut passes[position];
-                pass.classes.union_with(&live);
-                pass.contributed.union_with(source_class);
-                if let Some((mut witness, mut checks)) = witness {
-                    if candidates
-                        .iter()
-                        .filter(|(candidate, _)| *candidate == quality)
-                        .nth(1)
-                        .is_some()
-                    {
-                        Arc::get_mut(&mut witness)
-                            .expect("new witness has one owner")
-                            .mark_alternatives_truncated();
-                    }
-                    represented.insert(
-                        (sink, fact.is_uncertain(), state.key.classes, quality),
-                        (position, pass.witnesses.len()),
-                    );
-                    pass.qualities.insert(quality);
-                    let source_spec = plan
-                        .value_flow()
-                        .source(source.source())
-                        .expect("a selected source has a specification");
-                    for closure in plan
-                        .value_flow()
-                        .witness_arm_closures(&witness, source_spec.point())
-                    {
-                        if !pass.closures.contains(&closure) {
-                            pass.closures.push(closure);
-                        }
-                    }
-                    let sink_spec = plan
-                        .value_flow()
-                        .sink(sink)
-                        .expect("a frozen sink has a specification");
-                    if let Some(closures) = plan.value_flow().certain_witness_closures(
-                        facts,
-                        &witness,
-                        source_spec,
-                        sink_spec,
-                    ) {
-                        // Closure validation discharges native/authored path
-                        // and dispatch obligations, not an uncertain source or
-                        // meeting fact. Keep its dependencies in either case.
-                        pass.certain |= !fact.is_uncertain();
-                        for closure in closures {
-                            if !pass.closures.contains(&closure) {
-                                pass.closures.push(closure);
-                            }
-                        }
-                    }
-                    // Like composition, render checks on value-producing witness
-                    // steps. A terminal sink adds no step. Its observation still
-                    // filters both passes, but an identical failure already
-                    // represented by the value's producer needs no phase-only note.
-                    let redundant = checks
-                        .ids
-                        .iter()
-                        .copied()
-                        .filter(|&id| {
-                            let check = &classification_checks[id];
-                            check.observation.point() == sink_spec.point()
-                                && check.observation.phase() == ObservationPhase::BeforeEffects
-                                && concrete_value(sink_spec.carrier())
-                                    == Some(check.observation.value())
-                                && !(source_spec.point() == sink_spec.point()
-                                    && source_spec.phase()
-                                        == ValueFlowObservationPhase::BeforeEffects
-                                    && concrete_value(source_spec.carrier())
-                                        == Some(check.observation.value()))
-                                && checks.ids.iter().any(|&other| {
-                                    let other = &classification_checks[other];
-                                    other.observation.point().procedure()
-                                        == check.observation.point().procedure()
-                                        && other.observation.value() == check.observation.value()
-                                        && other.observation.phase()
-                                            == ObservationPhase::AfterEffects
-                                        && other.predicate == check.predicate
-                                        && other.decision == check.decision
-                                })
-                        })
-                        .collect::<Vec<_>>();
-                    checks.ids.retain(|id| !redundant.contains(id));
-                    pass.checks.extend(&checks);
-                    drop(redundant);
-                    drop(checks);
-                    pass.witnesses.push(witness);
-                    // Include the final pair growth while Replay is still live.
-                    let mut retained = RetainedHeap::default();
-                    retained.map(&represented);
-                    retained.hash_set(&unavailable);
-                    retained.vec(&candidates);
-                    retained.add(live.retained_heap_bytes());
-                    retain_passes(&passes, &mut retained);
-                    let live = replay.owned_bytes().saturating_add(retained.total());
+                let capacity = pair_frontiers.capacity();
+                pair_frontiers.insert(pair, PathQualityFrontier::default());
+                if pair_frontiers.capacity() != capacity {
+                    let mut heap = RetainedHeap::default();
+                    heap.map(&pair_frontiers);
+                    let live = replay.owned_bytes().saturating_add(heap.total());
                     if live > replay.max_retained_bytes {
+                        pair_frontiers.remove(&pair);
+                        pair_frontiers.shrink_to_fit();
                         source_coverage = Some(IcfgTaintIncomplete::RetentionBudget {
                             limit: replay.query_limit,
                             attempted: replay
@@ -2515,14 +2375,252 @@ impl IcfgTaintSession<'_> {
                                 .saturating_sub(replay.max_retained_bytes)
                                 .saturating_add(live),
                         });
+                        continue;
+                    }
+                }
+            }
+            let frontier = pair_frontiers
+                .get_mut(&pair)
+                .expect("an admitted pair has a frontier");
+            for (quality, _) in meeting_qualities(replay, state, fact) {
+                frontier.insert(quality);
+            }
+        }
+        'states: for dominated_phase in [false, true] {
+            for (state_id, state) in replay.states.iter().enumerate() {
+                let Some((fact, sink, live)) = meeting(state) else {
+                    continue;
+                };
+                let Some(&pair_frontier) =
+                    pair_frontiers.get(&(sink, fact.is_uncertain(), state.key.classes))
+                else {
+                    continue;
+                };
+                let mut candidates = Vec::new();
+                let mut frontier = PathQualityFrontier::default();
+                for (quality, prefix) in meeting_qualities(replay, state, fact) {
+                    frontier.insert(quality);
+                    candidates.push((quality, prefix));
+                }
+                for quality in frontier.iter() {
+                    let dominated = !pair_frontier.contains(quality);
+                    if dominated != dominated_phase {
+                        continue;
+                    }
+                    if dominated
+                        && passes.iter().any(|pass| {
+                            pass.sink == sink
+                                && pass.meeting.is_uncertain() == fact.is_uncertain()
+                                && pass.certain
+                        })
+                    {
+                        let representative = pair_frontier
+                            .iter()
+                            .filter(|stronger| stronger.dominates(quality))
+                            .find_map(|stronger| {
+                                represented.get(&(
+                                    sink,
+                                    fact.is_uncertain(),
+                                    state.key.classes,
+                                    stronger,
+                                ))
+                            });
+                        if let Some(&(pair, witness)) = representative {
+                            Arc::get_mut(&mut passes[pair].witnesses[witness])
+                                .expect("pair construction owns its witness")
+                                .mark_alternatives_truncated();
+                        }
+                        continue;
+                    }
+                    if let Some(&(pair, witness)) =
+                        represented.get(&(sink, fact.is_uncertain(), state.key.classes, quality))
+                    {
+                        // This state was visited once. Its distinct meeting/entry
+                        // is not reconstructed after selecting a representative.
+                        Arc::get_mut(&mut passes[pair].witnesses[witness])
+                            .expect("pair construction owns its witness")
+                            .mark_alternatives_truncated();
+                        continue;
+                    }
+                    let prefix = candidates
+                        .iter()
+                        .find(|(candidate, _)| *candidate == quality)
+                        .expect("a retained quality has a concrete prefix")
+                        .1;
+                    let mut transient = RetainedHeap::default();
+                    transient.map(&represented);
+                    transient.map(&pair_frontiers);
+                    transient.hash_set(&unavailable);
+                    transient.vec(&candidates);
+                    transient.add(passes_owned_bytes(&passes));
+                    transient.add(live.retained_heap_bytes());
+                    let transient_bytes = transient.total();
+                    let available = replay
+                        .max_retained_bytes
+                        .saturating_sub(replay.owned_bytes());
+                    if transient_bytes > available {
+                        source_coverage = Some(IcfgTaintIncomplete::RetentionBudget {
+                            limit: self.max_refinement_bytes,
+                            attempted: replay
+                                .query_limit
+                                .saturating_sub(replay.max_retained_bytes)
+                                .saturating_add(replay.owned_bytes())
+                                .saturating_add(transient_bytes),
+                        });
                         break 'states;
                     }
-                } else {
-                    unavailable.insert((sink, fact.is_uncertain(), state.key.classes, quality));
-                    source_coverage = Some(IcfgTaintIncomplete::WitnessLimit(
-                        TaintWitnessTruncationCause::CollectionBudget,
-                    ));
-                    break 'states;
+                    let witness = match replay.witness(
+                        state_id,
+                        prefix,
+                        self,
+                        recorded,
+                        WitnessCollection {
+                            limits: &mut *limits,
+                            request: &mut *request,
+                            attribution: &mut *attribution,
+                        },
+                        transient_bytes,
+                    ) {
+                        Ok(witness) => witness,
+                        Err(error) => {
+                            source_coverage = Some(recoverable_stop(error)?);
+                            break 'states;
+                        }
+                    };
+                    let position = passes
+                        .iter()
+                        .position(|pass| {
+                            pass.sink == sink && pass.meeting.is_uncertain() == fact.is_uncertain()
+                        })
+                        .unwrap_or_else(|| {
+                            passes.push(PairPass {
+                                sink,
+                                meeting: fact,
+                                classes: plan.universe().empty_set(),
+                                contributed: plan.universe().empty_set(),
+                                qualities: PathQualityFrontier::default(),
+                                witnesses: Vec::new(),
+                                checks: PathChecks::default(),
+                                certain: false,
+                                unavailable: false,
+                                closures: Vec::new(),
+                            });
+                            passes.len() - 1
+                        });
+                    let pass = &mut passes[position];
+                    pass.classes.union_with(&live);
+                    pass.contributed.union_with(source_class);
+                    if let Some((mut witness, mut checks)) = witness {
+                        if candidates
+                            .iter()
+                            .filter(|(candidate, _)| *candidate == quality)
+                            .nth(1)
+                            .is_some()
+                        {
+                            Arc::get_mut(&mut witness)
+                                .expect("new witness has one owner")
+                                .mark_alternatives_truncated();
+                        }
+                        represented.insert(
+                            (sink, fact.is_uncertain(), state.key.classes, quality),
+                            (position, pass.witnesses.len()),
+                        );
+                        pass.qualities.insert(quality);
+                        let source_spec = plan
+                            .value_flow()
+                            .source(source.source())
+                            .expect("a selected source has a specification");
+                        for closure in plan
+                            .value_flow()
+                            .witness_arm_closures(&witness, source_spec.point())
+                        {
+                            if !pass.closures.contains(&closure) {
+                                pass.closures.push(closure);
+                            }
+                        }
+                        let sink_spec = plan
+                            .value_flow()
+                            .sink(sink)
+                            .expect("a frozen sink has a specification");
+                        if let Some(closures) = plan.value_flow().certain_witness_closures(
+                            facts,
+                            &witness,
+                            source_spec,
+                            sink_spec,
+                        ) {
+                            // Closure validation discharges native/authored path
+                            // and dispatch obligations, not an uncertain source or
+                            // meeting fact. Keep its dependencies in either case.
+                            pass.certain |= !fact.is_uncertain();
+                            for closure in closures {
+                                if !pass.closures.contains(&closure) {
+                                    pass.closures.push(closure);
+                                }
+                            }
+                        }
+                        // Like composition, render checks on value-producing witness
+                        // steps. A terminal sink adds no step. Its observation still
+                        // filters both passes, but an identical failure already
+                        // represented by the value's producer needs no phase-only note.
+                        let redundant = checks
+                            .ids
+                            .iter()
+                            .copied()
+                            .filter(|&id| {
+                                let check = &classification_checks[id];
+                                check.observation.point() == sink_spec.point()
+                                    && check.observation.phase() == ObservationPhase::BeforeEffects
+                                    && concrete_value(sink_spec.carrier())
+                                        == Some(check.observation.value())
+                                    && !(source_spec.point() == sink_spec.point()
+                                        && source_spec.phase()
+                                            == ValueFlowObservationPhase::BeforeEffects
+                                        && concrete_value(source_spec.carrier())
+                                            == Some(check.observation.value()))
+                                    && checks.ids.iter().any(|&other| {
+                                        let other = &classification_checks[other];
+                                        other.observation.point().procedure()
+                                            == check.observation.point().procedure()
+                                            && other.observation.value()
+                                                == check.observation.value()
+                                            && other.observation.phase()
+                                                == ObservationPhase::AfterEffects
+                                            && other.predicate == check.predicate
+                                            && other.decision == check.decision
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        checks.ids.retain(|id| !redundant.contains(id));
+                        pass.checks.extend(&checks);
+                        drop(redundant);
+                        drop(checks);
+                        pass.witnesses.push(witness);
+                        // Include the final pair growth while Replay is still live.
+                        let mut retained = RetainedHeap::default();
+                        retained.map(&represented);
+                        retained.map(&pair_frontiers);
+                        retained.hash_set(&unavailable);
+                        retained.vec(&candidates);
+                        retained.add(live.retained_heap_bytes());
+                        retain_passes(&passes, &mut retained);
+                        let live = replay.owned_bytes().saturating_add(retained.total());
+                        if live > replay.max_retained_bytes {
+                            source_coverage = Some(IcfgTaintIncomplete::RetentionBudget {
+                                limit: replay.query_limit,
+                                attempted: replay
+                                    .query_limit
+                                    .saturating_sub(replay.max_retained_bytes)
+                                    .saturating_add(live),
+                            });
+                            break 'states;
+                        }
+                    } else {
+                        unavailable.insert((sink, fact.is_uncertain(), state.key.classes, quality));
+                        source_coverage = Some(IcfgTaintIncomplete::WitnessLimit(
+                            TaintWitnessTruncationCause::CollectionBudget,
+                        ));
+                        break 'states;
+                    }
                 }
             }
         }
@@ -2554,6 +2652,7 @@ impl IcfgTaintSession<'_> {
         // Check it while the complete Replay owner is still present.
         let mut retained = RetainedHeap::default();
         retained.map(&represented);
+        retained.map(&pair_frontiers);
         retain_passes(&passes, &mut retained);
         let live = replay.owned_bytes().saturating_add(retained.total());
         if live > replay.max_retained_bytes {

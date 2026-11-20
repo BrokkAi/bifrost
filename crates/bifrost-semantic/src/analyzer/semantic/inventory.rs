@@ -419,14 +419,95 @@ pub fn walk_procedure_tree<'tree, T>(
         &mut ProcedureInventoryBuilder<'_>,
     ) -> Result<ProcedureWalkStep<T>, SemanticProviderError>,
 ) -> Result<ProcedureTreeWalkOutcome<T>, SemanticProviderError> {
+    walk_procedure_tree_in_context(
+        crate::analyzer::semantic::lowering::ContextualWork {
+            item: root,
+            context: (),
+        },
+        root_path,
+        inventory,
+        cancellation,
+        &mut |bytes| assert_eq!(bytes, 0, "unit context adds no allocation"),
+        &mut |_, _| {},
+        |node, children| {
+            for child in children_of(node).into_iter().rev() {
+                children.push(child);
+            }
+        },
+        |frame, inventory| visit(frame.item, inventory),
+    )
+}
+
+/// Schedule children in reverse source order. Shared code owns all lexical
+/// and declaration-path overrides; the adapter supplies only physical context.
+pub struct ProcedureChildren<'queue, 'tree, C: Copy> {
+    queue: &'queue mut dyn crate::analyzer::semantic::lowering::WorkSink<
+        ProcedureEnumerationFrame<'tree>,
+        Context = C,
+    >,
+    scopes: ProcedureWalkScopes,
+}
+
+impl<'tree, C: Copy> ProcedureChildren<'_, 'tree, C> {
+    pub fn push(&mut self, node: Node<'tree>) {
+        self.push_with_context(node, self.queue.context());
+    }
+    pub fn push_with_context(&mut self, node: Node<'tree>, context: C) {
+        let child_path = self
+            .scopes
+            .container_body
+            .filter(|(body, _)| *body == node.id())
+            .map(|(_, path)| path)
+            .unwrap_or(self.scopes.child_declaration_path);
+        let (lexical_parent, declaration_path) = self
+            .scopes
+            .callable_body
+            .filter(|(body, _, _)| *body == node.id())
+            .map(|(_, procedure, path)| (Some(procedure), path))
+            .unwrap_or((self.scopes.child_lexical_parent, child_path));
+        self.queue.push_with_context(
+            ProcedureEnumerationFrame {
+                node,
+                lexical_parent,
+                declaration_path,
+            },
+            context,
+        );
+    }
+}
+
+/// One shared inventory traversal, with ownership captured at child scheduling.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_procedure_tree_in_context<'tree, T, C: Copy>(
+    root: crate::analyzer::semantic::lowering::ContextualWork<Node<'tree>, C>,
+    root_path: usize,
+    inventory: &mut ProcedureInventoryBuilder<'_>,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    observe_capacity: &mut dyn FnMut(usize),
+    observe_value_capacity: &mut dyn FnMut(usize, usize),
+    mut children_of: impl FnMut(Node<'tree>, &mut ProcedureChildren<'_, 'tree, C>),
+    mut visit: impl FnMut(
+        crate::analyzer::semantic::lowering::ContextualWork<ProcedureEnumerationFrame<'tree>, C>,
+        &mut ProcedureInventoryBuilder<'_>,
+    ) -> Result<ProcedureWalkStep<T>, SemanticProviderError>,
+) -> Result<ProcedureTreeWalkOutcome<T>, SemanticProviderError> {
+    use crate::analyzer::semantic::lowering::{ContextualWork, WorkQueue, WorkSink};
     let mut values = Vec::new();
-    let mut stack = vec![ProcedureEnumerationFrame {
-        node: root,
+    observe_capacity(crate::analyzer::semantic::lowering::contextual_vec_bytes::<
+        ProcedureEnumerationFrame<'tree>,
+        C,
+    >(1));
+    let mut stack = Vec::with_capacity(1);
+    WorkQueue::new(&mut stack, root.context, observe_capacity).push(ProcedureEnumerationFrame {
+        node: root.item,
         lexical_parent: None,
         declaration_path: root_path,
-    }];
-
-    while let Some(frame) = stack.pop() {
+    });
+    while let Some(ContextualWork {
+        item: frame,
+        context,
+    }) = stack.pop()
+    {
         match charge_prepass(inventory, cancellation) {
             Ok(()) => {}
             Err(ProcedureInventoryPrepassStop::Budget(stop)) => {
@@ -436,9 +517,21 @@ pub fn walk_procedure_tree<'tree, T>(
                 return Ok(ProcedureTreeWalkOutcome::Cancelled);
             }
         }
-        let scopes = match visit(frame, inventory)? {
+        let scopes = match visit(
+            ContextualWork {
+                item: frame,
+                context,
+            },
+            inventory,
+        )? {
             ProcedureWalkStep::Continue { value, scopes } => {
                 if let Some(value) = value {
+                    if values.len() == values.capacity() {
+                        let capacity = values.capacity().saturating_mul(2).max(4);
+                        observe_value_capacity(values.capacity(), capacity);
+                        values.reserve_exact(capacity - values.len());
+                        observe_value_capacity(0, values.capacity());
+                    }
                     values.push(value);
                 }
                 scopes
@@ -448,27 +541,15 @@ pub fn walk_procedure_tree<'tree, T>(
             }
             ProcedureWalkStep::Cancelled => return Ok(ProcedureTreeWalkOutcome::Cancelled),
         };
-
-        let child_path = scopes.child_declaration_path;
-        for child in children_of(frame.node).into_iter().rev() {
-            let child_path = scopes
-                .container_body
-                .filter(|(body_id, _)| *body_id == child.id())
-                .map(|(_, path)| path)
-                .unwrap_or(child_path);
-            let (lexical_parent, declaration_path) = scopes
-                .callable_body
-                .filter(|(body_id, _, _)| *body_id == child.id())
-                .map(|(_, procedure, path)| (Some(procedure), path))
-                .unwrap_or((scopes.child_lexical_parent, child_path));
-            stack.push(ProcedureEnumerationFrame {
-                node: child,
-                lexical_parent,
-                declaration_path,
-            });
-        }
+        let mut queue = WorkQueue::new(&mut stack, context, observe_capacity);
+        children_of(
+            frame.node,
+            &mut ProcedureChildren {
+                queue: &mut queue,
+                scopes,
+            },
+        );
     }
-
     Ok(ProcedureTreeWalkOutcome::Complete(values))
 }
 

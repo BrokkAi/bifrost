@@ -133,6 +133,7 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
         prepared: &PreparedSyntaxTree,
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
+        _memory_owner: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (mut specs, initial_work, inventory_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {

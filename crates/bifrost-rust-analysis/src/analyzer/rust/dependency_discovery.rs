@@ -25,6 +25,10 @@ use brokk_bifrost_analysis::analyzer::dependency_support::require_non_empty_evid
 
 use brokk_bifrost_analysis::analyzer::dependency_support::resolve_dependency_path as resolve_path;
 
+use crate::analyzer::semantic_model::ApproximationReason;
+
+use crate::analyzer::semantic_model::ApproximationReasons;
+
 use crate::analyzer::semantic_model::BoundedDependencyDiagnostics;
 
 use crate::analyzer::semantic_model::CatalogCoordinate;
@@ -654,8 +658,7 @@ pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
     cancellation: Option<&CancellationToken>,
     recorded: Option<&brokk_bifrost_rust::cargo_config::RustCargoConfiguration>,
 ) -> DependencyDiscoveryOutcome {
-    RUST_CARGO_ROWS
-        .with(|slot| *slot.borrow_mut() = CargoResolveView::from_rows(Vec::new(), Vec::new()));
+    let mut cargo_rows = CargoResolveView::from_rows(Vec::new(), Vec::new());
     let mut dependencies = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let mut metadata_inputs_considered = 0_usize;
@@ -690,8 +693,11 @@ pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
             &mut evidence_bytes_read,
             cancellation,
         ) {
-            Ok(decoded) => match resolve_rust_dependency_evidence(&evidence, decoded) {
-                Ok(mut resolved) => dependencies.append(&mut resolved),
+            Ok(decoded) => match resolve_rust_dependency_evidence_rows(&evidence, decoded) {
+                Ok((mut resolved, rows)) => {
+                    dependencies.append(&mut resolved);
+                    cargo_rows.extend(rows);
+                }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             },
             Err(diagnostic) => {
@@ -737,9 +743,11 @@ pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
                     RUST_STDLIB_PACK_ID,
                     vec![stdlib.dependency.id.clone()],
                 );
-                // The version remains exact for target-free packs; only a
-                // missing target may use the runtime's approximate fallback.
-                expectation.approximate = stdlib.dependency.evidence.target.is_none();
+                // The version remains exact for target-free packs; only an
+                // unresolved target may use the runtime's approximate
+                // fallback, and `approximation` is Some exactly then.
+                expectation.approximation =
+                    stdlib.approximation.map(RustStdlibApproximation::reasons);
                 stdlib_expectation = Some(expectation);
                 if stdlib.approximation == Some(RustStdlibApproximation::MixedCompileContexts) {
                     let mut warning = diagnostic(
@@ -754,7 +762,7 @@ pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
                 dependencies.push(stdlib.dependency);
             }
             Err(diagnostic) if diagnostic.code == "rust.toolchain.missing" => {
-                stdlib_expectation = Some(StandardLibraryPackExpectation::approximate(
+                stdlib_expectation = Some(StandardLibraryPackExpectation::unpinned(
                     Language::Rust,
                     RUST_STDLIB_PACK_ID,
                 ));
@@ -805,14 +813,8 @@ pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
     if let Some(expectation) = stdlib_expectation {
         outcome.expect_standard_library_pack(expectation);
     }
-    let view = RUST_CARGO_ROWS.with(|slot| {
-        std::mem::replace(
-            &mut *slot.borrow_mut(),
-            CargoResolveView::from_rows(Vec::new(), Vec::new()),
-        )
-    });
-    if !view.is_empty() {
-        match RustSelectedCargoGraph::from_cargo_resolve(view) {
+    if !cargo_rows.is_empty() {
+        match RustSelectedCargoGraph::from_cargo_resolve(cargo_rows) {
             Ok(graph) => {
                 brokk_bifrost_analysis::analyzer::semantic_model::publish_rust_selected_cargo_graph(
                     graph,
@@ -837,10 +839,6 @@ pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
     outcome
 }
 
-thread_local! {
-    static RUST_CARGO_ROWS: std::cell::RefCell<CargoResolveView> = std::cell::RefCell::new(CargoResolveView::from_rows(Vec::new(), Vec::new()));
-}
-
 #[cfg(test)]
 fn resolve_rust_stdlib_dependency(
     project: &dyn Project,
@@ -855,6 +853,37 @@ fn resolve_rust_stdlib_dependency(
         evidence_bytes_read,
         cancellation,
         &acquired.configuration,
+    )
+}
+
+/// The Cargo discovery diagnostics that are a function of the reads discovery
+/// records, so a discovery reporting only these can carry (#13517). An
+/// allow-list: every other kind refuses.
+///
+/// The five `rust.toolchain.*` kinds come from `rust-toolchain.toml` in
+/// `resolve_rust_stdlib_dependency_with_configuration`. A missing file records
+/// an absent-file read for it and for the legacy `rust-toolchain`; any other
+/// metadata failure calls `refuse_external_discovery_reads` first and is not
+/// listed. The content kinds are decided from bytes read through
+/// `read_external_evidence_file_with_budget`, which records the file read with
+/// its content digest, plus the pinned channel constant of the running binary.
+///
+/// `limit.dependencies` is a count check on a dependency list built from those
+/// recorded reads and the project snapshots, against `limits.max_dependencies`
+/// (the limits are a function of the configuration, which carry compares).
+/// `rust.lockfile.ambiguous_activation` is decided from the explicitly selected
+/// Cargo.toml and Cargo.lock snapshots alone; a snapshot read that fails or
+/// gives no snapshot is an unattributed project read, which refuses carry.
+pub(crate) fn diagnostic_follows_recorded_reads(code: &str) -> bool {
+    matches!(
+        code,
+        "rust.toolchain.missing"
+            | "rust.toolchain.invalid_utf8"
+            | "rust.toolchain.invalid_toml"
+            | "rust.toolchain.stdlib_channel_mismatch"
+            | "rust.toolchain.unknown_host"
+            | "limit.dependencies"
+            | "rust.lockfile.ambiguous_activation"
     )
 }
 
@@ -989,7 +1018,8 @@ fn resolve_rust_stdlib_dependency_with_configuration(
             }),
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
         provenance: vec![
             dependency_provenance_entry(
@@ -1061,6 +1091,24 @@ enum RustStdlibApproximation {
     MixedCompileContexts,
     StdlibRebuilt,
     BuildModeUnknown,
+}
+
+impl RustStdlibApproximation {
+    /// The one classification of approximation causes into typed reasons.
+    /// Exhaustive on purpose: a new cause must be classified to compile. Only
+    /// causes that leave the standard library's identity intact and the
+    /// target unknown are `TargetUnknown` alone.
+    fn reasons(self) -> ApproximationReasons {
+        match self {
+            Self::UnknownHost | Self::MixedCompileContexts => {
+                ApproximationReasons::only(ApproximationReason::TargetUnknown)
+            }
+            Self::StdlibRebuilt | Self::BuildModeUnknown => {
+                ApproximationReasons::only(ApproximationReason::TargetUnknown)
+                    .with(ApproximationReason::StdlibBuildUnverified)
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1304,6 +1352,7 @@ fn rust_stdlib_targets(
         }
     };
     let selected = effective(targets.clone());
+    let mut mixed_contexts = false;
     for owner in configuration.acquired_owner_directories() {
         match configuration.stdlib_build_mode(owner) {
             RustStdlibBuildMode::Unknown => {
@@ -1331,13 +1380,14 @@ fn rust_stdlib_targets(
         }
         member_targets.sort();
         member_targets.dedup();
-        if effective(member_targets) != selected {
-            // This matcher publishes one global row. Distinct member invocation
-            // contexts cannot borrow the root's target until per-unit attachment.
-            return Ok(RustStdlibActivation::Approximate(
-                RustStdlibApproximation::MixedCompileContexts,
-            ));
-        }
+        mixed_contexts |= effective(member_targets) != selected;
+    }
+    if mixed_contexts {
+        // This global row cannot certify distinct member targets. Only classify
+        // this as target-only after every acquired owner's build mode was checked.
+        return Ok(RustStdlibActivation::Approximate(
+            RustStdlibApproximation::MixedCompileContexts,
+        ));
     }
     let census = if targets.len() == 1 && host != Some(targets[0].as_str()) {
         rust_host_unit_census(project, limits, evidence_bytes_read, cancellation)
@@ -1350,10 +1400,111 @@ fn rust_stdlib_targets(
     Ok(rust_stdlib_activation(&targets, host, census))
 }
 
+/// Exact dependencies and their selected Cargo graph, owned by this call.
+///
+/// Artifact digests are verified by dependency preparation, not discovery.
+#[derive(Debug)]
+pub struct ExactRustDependencyEvidence {
+    pub dependencies: Vec<ResolvedDependency>,
+    pub cargo_graph: RustSelectedCargoGraph,
+}
+
+/// Resolve supplied Cargo metadata, lockfile and rustdoc evidence without a project.
+///
+/// Paths are read as supplied, under the existing artifact and dependency limits.
+/// No source discovery, tool execution, standard-library selection, or ambient
+/// graph/read publication occurs. Unlike runtime partial declaration discovery,
+/// this adapter requires equal artifact and Cargo-resolved feature sets and
+/// refuses every explicit approximation claim. Preparation remains responsible
+/// for verifying artifacts and producing declaration packs from these records.
+pub fn resolve_exact_rust_dependency_evidence(
+    evidence: &RustDependencyApiEvidence,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ExactRustDependencyEvidence, DependencyPackDiagnostic> {
+    if is_cancelled(cancellation) {
+        return Err(cancelled_diagnostic(None));
+    }
+    if evidence.packages.len() > limits.max_dependencies {
+        return Err(diagnostic(
+            "limit.dependencies",
+            None,
+            format!(
+                "Rust dependency discovery exceeds the {} dependency limit",
+                limits.max_dependencies
+            ),
+        ));
+    }
+    if let Some(binding) = evidence
+        .packages
+        .iter()
+        .find(|binding| binding.approximation.is_some())
+    {
+        return Err(diagnostic(
+            "rust.evidence.approximation_not_exact",
+            Some(&binding.rustdoc_json_path),
+            "exact Rust dependency evidence cannot use an approximation claim",
+        ));
+    }
+    let decoded = decode_rust_dependency_evidence_with_read_tracking(
+        evidence,
+        limits,
+        &mut 0,
+        cancellation,
+        false,
+    )?;
+    // Missing and duplicate nodes remain the shared resolver's typed failures.
+    // Only equal-feature admission is stricter than runtime partial discovery.
+    for artifact in &decoded.artifacts {
+        if decoded.metadata.resolve.as_ref().is_some_and(|resolve| {
+            resolve.nodes.iter().any(|node| {
+                if node.id != artifact.package_id {
+                    return false;
+                }
+                let mut features = node.features.clone();
+                features.sort();
+                features.dedup();
+                features != artifact.enabled_features
+            })
+        }) {
+            return Err(diagnostic(
+                "rust.evidence.features_not_exact",
+                Some(&evidence.metadata_path),
+                "exact Rust dependency evidence requires equal artifact and Cargo-resolved features",
+            ));
+        }
+    }
+    let (dependencies, rows) = resolve_rust_dependency_evidence_rows(evidence, decoded)?;
+    let cargo_graph = RustSelectedCargoGraph::from_cargo_resolve(rows).map_err(|error| {
+        diagnostic(
+            "rust.metadata.ambiguous_cargo_graph",
+            None,
+            format!("Cargo graph cannot identify selected Rust artifacts: {error:?}"),
+        )
+    })?;
+    if is_cancelled(cancellation) {
+        return Err(cancelled_diagnostic(None));
+    }
+    Ok(ExactRustDependencyEvidence {
+        dependencies,
+        cargo_graph,
+    })
+}
+
+// Preserve the existing resolver tests while the shared core also returns its
+// graph transport as an owned value to both production callers.
+#[cfg(test)]
 fn resolve_rust_dependency_evidence(
     evidence: &RustDependencyApiEvidence,
     decoded: DecodedRustDependencyEvidence,
 ) -> Result<Vec<ResolvedDependency>, DependencyPackDiagnostic> {
+    resolve_rust_dependency_evidence_rows(evidence, decoded).map(|(dependencies, _)| dependencies)
+}
+
+fn resolve_rust_dependency_evidence_rows(
+    evidence: &RustDependencyApiEvidence,
+    decoded: DecodedRustDependencyEvidence,
+) -> Result<(Vec<ResolvedDependency>, CargoResolveView), DependencyPackDiagnostic> {
     let packages_by_id: HashMap<_, _> = decoded
         .metadata
         .packages
@@ -1589,7 +1740,8 @@ fn resolve_rust_dependency_evidence(
                 toolchain: None,
                 target: Some(evidence.target.clone()),
                 configuration: Some(evidence.configuration.clone()),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance,
             artifacts: vec![reference_artifact],
@@ -1637,15 +1789,10 @@ fn resolve_rust_dependency_evidence(
                 .map(|target| (CargoPackageId(package.id.clone()), target.name.clone()))
         })
         .collect::<BTreeMap<_, _>>();
-    RUST_CARGO_ROWS.with(|slot| {
-        let mut view = slot.borrow_mut();
-        view.extend(CargoResolveView::from_rows_with_crate_names(
-            selected,
-            edges,
-            crate_names,
-        ));
-    });
-    Ok(resolved)
+    Ok((
+        resolved,
+        CargoResolveView::from_rows_with_crate_names(selected, edges, crate_names),
+    ))
 }
 
 fn decode_rust_dependency_evidence(
@@ -1654,6 +1801,27 @@ fn decode_rust_dependency_evidence(
     evidence_bytes_read: &mut u64,
     cancellation: Option<&CancellationToken>,
 ) -> Result<DecodedRustDependencyEvidence, DependencyPackDiagnostic> {
+    decode_rust_dependency_evidence_with_read_tracking(
+        evidence,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+        true,
+    )
+}
+
+fn decode_rust_dependency_evidence_with_read_tracking(
+    evidence: &RustDependencyApiEvidence,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+    record_discovery_reads: bool,
+) -> Result<DecodedRustDependencyEvidence, DependencyPackDiagnostic> {
+    let read_evidence = if record_discovery_reads {
+        read_external_evidence_file_with_budget
+    } else {
+        brokk_bifrost_analysis::analyzer::dependency_support::read_evidence_file_with_budget
+    };
     require_non_empty("target", &evidence.target)?;
     require_non_empty("configuration", &evidence.configuration)?;
     if evidence.selected_targets.is_empty() {
@@ -1671,7 +1839,7 @@ fn decode_rust_dependency_evidence(
         ));
     }
 
-    let metadata_artifact = read_external_evidence_file_with_budget(
+    let metadata_artifact = read_evidence(
         "Rust",
         &evidence.metadata_path,
         limits,
@@ -1686,6 +1854,12 @@ fn decode_rust_dependency_evidence(
                 format!("could not decode Cargo metadata JSON: {error}"),
             )
         })?;
+    if !record_discovery_reads {
+        // The passive exact adapter cannot turn omitted Cargo facts into known
+        // empty features/edges or a known local package source. Runtime partial
+        // discovery keeps its established serde defaults above.
+        validate_exact_cargo_metadata_field_presence(metadata_artifact.bytes(), evidence)?;
+    }
     if metadata.version != CARGO_METADATA_FORMAT_VERSION {
         return Err(diagnostic(
             "rust.metadata.unsupported_version",
@@ -1697,7 +1871,7 @@ fn decode_rust_dependency_evidence(
         ));
     }
 
-    let lockfile_artifact = read_external_evidence_file_with_budget(
+    let lockfile_artifact = read_evidence(
         "Rust",
         &evidence.lockfile_path,
         limits,
@@ -1735,7 +1909,7 @@ fn decode_rust_dependency_evidence(
             ));
         }
 
-        let artifact = read_external_evidence_file_with_budget(
+        let artifact = read_evidence(
             "Rust",
             &binding.rustdoc_json_path,
             limits,
@@ -1807,6 +1981,77 @@ fn decode_rust_dependency_evidence(
         lockfile,
         artifacts,
     })
+}
+
+fn validate_exact_cargo_metadata_field_presence(
+    bytes: &[u8],
+    evidence: &RustDependencyApiEvidence,
+) -> Result<(), DependencyPackDiagnostic> {
+    // The shared typed decoder has already rejected malformed/duplicate known
+    // fields. Retain only identities and presence bits; IgnoredAny skips values
+    // (including escaped strings) without allocating a second metadata tree.
+    fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(true)
+    }
+    #[derive(Deserialize)]
+    struct PackagePresence {
+        id: String,
+        #[serde(default, deserialize_with = "present")]
+        source: bool,
+    }
+    #[derive(Deserialize)]
+    struct NodePresence {
+        id: String,
+        #[serde(default, deserialize_with = "present")]
+        features: bool,
+        #[serde(default, deserialize_with = "present")]
+        deps: bool,
+    }
+    #[derive(Default, Deserialize)]
+    struct ResolvePresence {
+        #[serde(default)]
+        nodes: Vec<NodePresence>,
+    }
+    #[derive(Deserialize)]
+    struct MetadataPresence {
+        #[serde(default)]
+        packages: Vec<PackagePresence>,
+        #[serde(default)]
+        resolve: Option<ResolvePresence>,
+    }
+    let document: MetadataPresence = serde_json::from_slice(bytes).map_err(|error| {
+        diagnostic(
+            "rust.metadata.invalid_json",
+            Some(&evidence.metadata_path),
+            format!("could not inspect Cargo metadata field presence: {error}"),
+        )
+    })?;
+    let missing = |kind: &str, id: &str, field: &str| {
+        diagnostic(
+            "rust.evidence.metadata_field_missing",
+            Some(&evidence.metadata_path),
+            format!(
+                "exact Cargo evidence requires an explicit {field} field on {kind} {}",
+                serde_json::to_string(id).expect("Cargo package ID is a JSON string")
+            ),
+        )
+    };
+    for package in document.packages {
+        if !package.source {
+            return Err(missing("package", &package.id, "source"));
+        }
+    }
+    if let Some(resolve) = document.resolve {
+        for node in resolve.nodes {
+            for (field, present) in [("features", node.features), ("deps", node.deps)] {
+                if !present {
+                    return Err(missing("resolve node", &node.id, field));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn evidence_paths_from_root(
@@ -2632,7 +2877,7 @@ mod tests {
                     &selectors,
                     &evidence,
                     &semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
-                )
+                ,brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,)
                 .is_some(),
                 matches
             );
@@ -2644,7 +2889,7 @@ mod tests {
                     &selectors,
                     &evidence,
                     &semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
-                )
+                ,brokk_bifrost_analysis::analyzer::semantic_model::model::SemanticPackOrigin::Authored,)
                 .is_some()
             );
             selectors[0].targets = targets;
@@ -2665,6 +2910,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13674: a mixed-target owner hid a later owner rebuilding std or having unknown build mode"
+    )]
     fn global_stdlib_target_requires_agreement_across_acquired_member_contexts() {
         let root = tempfile::tempdir().unwrap();
         let put = |path: &str, source: &str| {
@@ -2738,6 +2986,37 @@ mod tests {
             mixed.approximation,
             Some(RustStdlibApproximation::MixedCompileContexts)
         );
+        // The earlier a owner already disagrees about the target. Its mismatch
+        // must not hide a later b owner's build uncertainty.
+        for (configuration, expected) in [
+            (
+                "[unstable]\nbuild-std=['std']\n",
+                RustStdlibApproximation::StdlibRebuilt,
+            ),
+            (
+                "[unknown_configuration]\nkey=true\n",
+                RustStdlibApproximation::BuildModeUnknown,
+            ),
+        ] {
+            put(
+                "b/.cargo/config.toml",
+                &format!("[build]\ntarget='x86_64-unknown-linux-gnu'\n{configuration}"),
+            );
+            let unverified = resolve();
+            assert_eq!(unverified.dependency.evidence.target, None);
+            assert_eq!(unverified.approximation, Some(expected));
+            assert!(
+                !unverified
+                    .approximation
+                    .unwrap()
+                    .reasons()
+                    .target_unknown_only()
+            );
+        }
+        put(
+            "b/.cargo/config.toml",
+            "[build]\ntarget='x86_64-unknown-linux-gnu'\n",
+        );
         fs::remove_file(root.path().join("a/.cargo/config.toml")).unwrap();
         fs::create_dir(root.path().join("a/.cargo/config.toml")).unwrap();
         let unreadable = resolve();
@@ -2770,12 +3049,16 @@ mod tests {
         assert_eq!(outcome.dependencies.len(), 1);
         assert!(outcome.dependencies[0].evidence.target.is_none());
         assert!(outcome.diagnostics.is_empty());
-        assert!(
+        assert_eq!(
             outcome
                 .standard_library_pack_expectations()
                 .next()
                 .unwrap()
-                .approximate
+                .approximation,
+            Some(ApproximationReasons::only(
+                ApproximationReason::TargetUnknown
+            )),
+            "a pinned channel without a host triple knows the version but not the target"
         );
         fs::write(
             fixture._root.path().join("rust-toolchain.toml"),
@@ -2815,7 +3098,7 @@ mod tests {
                 .standard_library_pack_expectations()
                 .next()
                 .unwrap()
-                .approximate
+                .approximate()
         );
     }
 
@@ -2910,7 +3193,7 @@ mod tests {
                     .standard_library_pack_expectations()
                     .next()
                     .unwrap()
-                    .approximate,
+                    .approximate(),
                 expected.is_none(),
                 "{name}"
             );
@@ -2941,7 +3224,14 @@ mod tests {
         assert!(outcome.dependencies.is_empty());
         assert!(outcome.diagnostics.is_empty());
         let expectation = outcome.standard_library_pack_expectations().next().unwrap();
-        assert!(expectation.approximate);
+        assert_eq!(
+            expectation.approximation,
+            Some(
+                ApproximationReasons::only(ApproximationReason::TargetUnknown)
+                    .with(ApproximationReason::ToolchainVersionUnknown)
+            ),
+            "a missing toolchain file knows neither the version nor the target"
+        );
         assert_eq!(expectation.pack_id, RUST_STDLIB_PACK_ID);
     }
 
@@ -3220,6 +3510,7 @@ mod tests {
         let request = prepared
             .compose_activation_request(
                 crate::analyzer::semantic_model::SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                     evidence: Vec::new(),
@@ -3319,6 +3610,8 @@ mod tests {
             );
         }
     }
+    include!("dependency_discovery/exact_evidence_tests.rs");
+
     struct EvidenceFixture {
         _root: TempDir,
         rustdoc_path: std::path::PathBuf,
@@ -3449,4 +3742,28 @@ fn rustdoc_provenance_probe_does_not_decode_the_item_index() {
     let envelope: RustdocVersionEnvelope = serde_json::from_slice(bytes).unwrap();
     assert!(!envelope.external_crates.is_empty());
     assert!(serde_json::from_slice::<rustdoc_types::Crate>(bytes).is_err());
+}
+
+#[cfg(test)]
+mod approximation_reason_tests {
+    use super::RustStdlibApproximation::{
+        BuildModeUnknown, MixedCompileContexts, StdlibRebuilt, UnknownHost,
+    };
+    use super::{ApproximationReason, ApproximationReasons};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13674: only target uncertainty may let an authored target-independent family claim survive"
+    )]
+    fn only_target_causes_classify_as_target_unknown_alone() {
+        let target = ApproximationReasons::only(ApproximationReason::TargetUnknown);
+        assert_eq!(UnknownHost.reasons(), target);
+        assert_eq!(MixedCompileContexts.reasons(), target);
+        for cause in [StdlibRebuilt, BuildModeUnknown] {
+            let reasons = cause.reasons();
+            assert!(reasons.contains(ApproximationReason::TargetUnknown));
+            assert!(reasons.contains(ApproximationReason::StdlibBuildUnverified));
+            assert!(!reasons.target_unknown_only());
+        }
+    }
 }

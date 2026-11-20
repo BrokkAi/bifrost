@@ -727,11 +727,13 @@ fn resolve_outgoing(
                             range: argument.range,
                             name: argument.name.clone(),
                             position: argument.name.is_none().then_some(argument.argument_index),
+                            written_position: argument.position,
                             formal_index: None,
                             formal_name: None,
                             variadic: false,
                             spread: argument.spread,
                         }).collect::<Vec<_>>();
+                        let site_start = result.sites.len();
                         for (callee, _) in callees.into_iter().take(limits.max_candidates) {
                             if !session.scope_step() || cancellation.is_cancelled() {
                                 break;
@@ -752,6 +754,11 @@ fn resolve_outgoing(
                                 receiver,
                                 arguments: arguments.clone(),
                             });
+                        }
+                        // A stop inside this call's candidates leaves it
+                        // partly recorded; only finished sites are kept.
+                        if session.is_stopped() {
+                            result.sites.truncate(site_start);
                         }
                     }
                 }
@@ -775,7 +782,12 @@ fn resolve_outgoing(
                 ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
             ));
         }
-        if !receiver_candidate_calls.is_empty() {
+        // The later phases would report unresolved calls that only a stop
+        // left unvisited, so a stopped session skips them. It still ends in
+        // `finish_native`, which revalidates the selection: kept sites must
+        // not come from a stale selection.
+        let stopped = session.is_stopped();
+        if !stopped && !receiver_candidate_calls.is_empty() {
             let prepared =
                 operation.go_file_import_context(context.context_id, &caller_path, cancellation)?;
             for (call_index, unmodeled, unavailable) in receiver_candidate_calls {
@@ -835,7 +847,8 @@ fn resolve_outgoing(
             }
         }
         for (index, shape) in shapes.iter().enumerate() {
-            if shape.coverage.is_exact()
+            if !stopped
+                && shape.coverage.is_exact()
                 && shape.callee_range.is_some()
                 && !selected_call_indices.contains(&index)
             {
@@ -902,21 +915,21 @@ fn resolve_outgoing(
         result.diagnostics.dedup();
         Ok(SelectedResolutionOperationOutcome::Native(result))
     })();
-    let mut result = match session.finish(selected) {
+    let (status, selected) = session.finish_keeping(selected);
+    let mut result = match status {
         BoundedResolution::Cancelled { .. } => CallRelationResult {
             cancelled: true,
             ..CallRelationResult::default()
         },
-        BoundedResolution::Exceeded { limit, work: _ } => {
-            let mut result = failed(
+        BoundedResolution::Exceeded { limit, work } => {
+            let mut failure = failed(
                 "native_call_budget",
-                CallRelationDiagnosticPayload::GoBudget { limit },
+                CallRelationDiagnosticPayload::GoBudget { limit, work },
                 caller,
             );
-            result.truncated = true;
-            result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
-            result.diagnostics[0].reason_kind = None;
-            result
+            failure.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+            failure.diagnostics[0].reason_kind = None;
+            CallRelationResult::budget_stopped(selected, failure)
         }
         BoundedResolution::Unavailable { .. } => {
             let mut result = failed(
@@ -929,36 +942,34 @@ fn resolve_outgoing(
             result.truncated = true;
             result
         }
-        BoundedResolution::Complete {
-            value: Err(_error), ..
-        } => failed(
-            "native_store_error",
-            CallRelationDiagnosticPayload::Failure {
-                reason: CallRelationFailure::StoreError,
-            },
-            caller,
-        ),
-        BoundedResolution::Complete {
-            value: Ok(outcome), ..
-        } => match outcome {
-            SelectedResolutionOperationOutcome::Native(result) => result,
-            SelectedResolutionOperationOutcome::Unavailable(reason) => failed(
-                "native_unavailable",
-                CallRelationDiagnosticPayload::NativeUnavailable {
-                    reason: (&reason).into(),
+        BoundedResolution::Complete { .. } => match selected {
+            Err(_error) => failed(
+                "native_store_error",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::StoreError,
                 },
                 caller,
             ),
-            SelectedResolutionOperationOutcome::Stale(reason) => failed(
-                "native_stale",
-                CallRelationDiagnosticPayload::NativeStale {
-                    reason: (&reason).into(),
+            Ok(outcome) => match outcome {
+                SelectedResolutionOperationOutcome::Native(result) => result,
+                SelectedResolutionOperationOutcome::Unavailable(reason) => failed(
+                    "native_unavailable",
+                    CallRelationDiagnosticPayload::NativeUnavailable {
+                        reason: (&reason).into(),
+                    },
+                    caller,
+                ),
+                SelectedResolutionOperationOutcome::Stale(reason) => failed(
+                    "native_stale",
+                    CallRelationDiagnosticPayload::NativeStale {
+                        reason: (&reason).into(),
+                    },
+                    caller,
+                ),
+                SelectedResolutionOperationOutcome::Cancelled(_) => CallRelationResult {
+                    cancelled: true,
+                    ..CallRelationResult::default()
                 },
-                caller,
-            ),
-            SelectedResolutionOperationOutcome::Cancelled(_) => CallRelationResult {
-                cancelled: true,
-                ..CallRelationResult::default()
             },
         },
     };
@@ -1091,6 +1102,7 @@ fn workspace_unqualified_call_site(
             range: argument.range,
             name: argument.name.clone(),
             position: argument.name.is_none().then_some(argument.argument_index),
+            written_position: argument.position,
             formal_index: None,
             formal_name: None,
             variadic: false,

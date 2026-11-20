@@ -490,7 +490,9 @@ fn validate_relation(
     relation: &IrRelation,
 ) -> Result<(), RelationalAssertionPlanError> {
     match &relation.op {
-        IrRelationOp::Source { binding, schema } => {
+        IrRelationOp::Source {
+            binding, schema, ..
+        } => {
             if schema != &relation.schema {
                 return Err(RelationalAssertionPlanError::UnknownField {
                     binding: binding.as_str().to_string(),

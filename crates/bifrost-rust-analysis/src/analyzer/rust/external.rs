@@ -51,6 +51,11 @@ use crate::analyzer::rust::RustdocJsonPackProducer;
 pub struct RustDependencyPackAdapter;
 
 /// Changes in the Rustdoc declaration producer for identical artifact bytes.
+/// #10258 introduces the version: schema-30 manifests keep external re-export evidence.
+/// #10945 resolves external impl owners after joining the source-set documents.
+/// #11130 emits exact type-alias target contracts.
+/// #11777 declares public functions of private modules at their re-export path.
+/// #11865 certifies module-owned free-function families.
 /// #12073: unresolved IDs now produce Unknown instead of binding by spelling.
 /// #12213: verified sysroot receipts change output for identical document bytes.
 /// #12213 also withholds hierarchy edges whose arguments remain Unknown.
@@ -58,8 +63,11 @@ pub struct RustDependencyPackAdapter;
 /// #12484 bounds known-owner hierarchy gaps to complete trait callable names.
 /// #12733 D1a writes a callable's own generics and a trait's `Self` as
 /// TypeParameter (not wildcard) and keeps impls whose conditions use Fn sugar.
+/// #11269 records structural Type/Const generic kinds; old productions cannot
+/// certify that a dependent claim selects only type arguments.
+/// #12734 records each item's rustdoc stability.
 pub(crate) const RUST_PACK_PRODUCER_VERSION: &str =
-    concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-12");
+    concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-15");
 
 impl DependencyPackAdapter for RustDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
@@ -67,10 +75,11 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer {
+        (Producer {
             name: "bifrost-rustdoc-json".to_owned(),
             version: RUST_PACK_PRODUCER_VERSION.to_owned(),
-        }
+        })
+        .with_dependency_revision()
     }
 
     fn adapter_version(&self) -> &str {
@@ -79,7 +88,7 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
 
     /// The production key is minted before the artifact is read, so it admits
     /// every supported schema up to the highest one this producer may write.
-    fn production_schema_version(&self, _dependency: &ResolvedDependency) -> u32 {
+    fn production_schema_version(&self) -> u32 {
         crate::analyzer::rust::rustdoc_artifact::RUSTDOC_PACK_MAX_SCHEMA_VERSION
     }
 
@@ -383,6 +392,15 @@ fn rust_dependency_production_request(
 
 #[cfg(test)]
 mod tests {
+    fn complete_symbols(
+        overlay: &SemanticModelOverlay,
+    ) -> Vec<std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol>>
+    {
+        let (symbols, complete) = overlay.symbols();
+        assert!(complete, "test requires complete symbol enumeration");
+        symbols
+    }
+
     use brokk_bifrost_semantic::analyzer::semantic_model::RustArtifactApproximation;
     use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
 
@@ -582,7 +600,8 @@ mod tests {
                 toolchain: None,
                 target: Some("x86_64-unknown-linux-gnu".to_owned()),
                 configuration: Some("default".to_owned()),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: vec![DependencyProvenance {
                 key: "cargo.feature".to_owned(),
@@ -629,11 +648,11 @@ mod tests {
             )
             .pack
             .unwrap_or_else(|| panic!("an alias-target pack must be produced"));
-        assert_eq!(produced.schema_version, 40);
-        assert!(
-            produced.schema_version
-                <= RustDependencyPackAdapter.production_schema_version(&dependency)
+        assert_eq!(
+            produced.schema_version,
+            brokk_bifrost_semantic::analyzer::semantic_model::model::RUST_GENERIC_PARAMETER_KINDS_MIN_SCHEMA_VERSION
         );
+        assert!(produced.schema_version <= RustDependencyPackAdapter.production_schema_version());
     }
 
     #[test]
@@ -771,6 +790,7 @@ mod tests {
             assert!(prepared.complete, "{:#?}", prepared.diagnostics);
             let request = prepared
                 .compose_activation_request(SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                     evidence: Vec::new(),
@@ -781,7 +801,7 @@ mod tests {
             let cancellation = CancellationToken::new();
             match resolve_active_semantic_models(&catalog, &request, &cancellation) {
                 SemanticModelResolutionOutcome::Ready(active) => {
-                    assert!(active.shards()[0].approximate);
+                    assert!(active.shards()[0].approximate());
                     let report = format!("{:#?}", active.activation_report());
                     assert!(report.contains(&format!("resolved={resolved}")), "{report}");
                     active.active_model_set_hash().to_owned()
@@ -934,6 +954,7 @@ mod tests {
 
         let request = second
             .compose_activation_request(SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: Vec::new(),
@@ -966,7 +987,7 @@ mod tests {
             "rust",
             SemanticModelNamespace::Unknown,
         );
-        assert_eq!(widget.records.len(), 1, "{:#?}", overlay.symbols());
+        assert_eq!(widget.records.len(), 1, "{:#?}", complete_symbols(&overlay));
         assert!(
             widget.records[0]
                 .location
@@ -1086,6 +1107,7 @@ mod tests {
         ] {
             let request = outcome
                 .compose_activation_request(SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                     evidence: Vec::new(),
@@ -1116,12 +1138,12 @@ mod tests {
             assert!(
                 publishes_crate_root(written),
                 "`{written}` is the spelling this workspace writes: {:#?}",
-                overlay.symbols()
+                complete_symbols(&overlay)
             );
             assert!(
                 !publishes_crate_root(unwritable),
                 "`{unwritable}` is not a crate root this workspace can write: {:#?}",
-                overlay.symbols()
+                complete_symbols(&overlay)
             );
             assert_eq!(
                 overlay
@@ -1134,7 +1156,7 @@ mod tests {
                     .len(),
                 1,
                 "the pack's own recorded path stays resolvable: {:#?}",
-                overlay.symbols()
+                complete_symbols(&overlay)
             );
         }
     }

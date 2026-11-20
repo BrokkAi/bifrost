@@ -19,8 +19,7 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
 };
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_js_ts::graph::receiver_analysis::{
-    JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
-    build_js_ts_receiver_syntax_index_bounded,
+    JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
 };
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, compute_import_binder as compute_jsts_import_binder, parse_js_ts_tree,
@@ -51,27 +50,19 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
         {
             return ReceiverFileSetup::Cancelled;
         }
-        match build_js_ts_receiver_syntax_index_bounded(
-            tree.root_node(),
-            ctx.source,
-            ctx.cancellation,
-            ctx.max_scope_nodes,
-        ) {
-            JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => {
-                let facts = ReceiverFileFacts::new(JsTsReceiverFileFacts {
-                    imports: compute_jsts_import_binder(ctx.source, &tree),
-                    syntax_index: index,
-                });
-                ReceiverFileSetup::Ready {
-                    tree,
-                    facts,
-                    visited,
-                }
-            }
-            JsTsReceiverSyntaxIndexBuild::ExceededScope { visited } => {
-                ReceiverFileSetup::ExceededScope { visited }
-            }
-            JsTsReceiverSyntaxIndexBuild::Cancelled => ReceiverFileSetup::Cancelled,
+        let Some((index, visited)) =
+            build_js_ts_receiver_syntax_index(tree.root_node(), ctx.source, ctx.cancellation)
+        else {
+            return ReceiverFileSetup::Cancelled;
+        };
+        let facts = ReceiverFileFacts::new(JsTsReceiverFileFacts {
+            imports: compute_jsts_import_binder(ctx.source, &tree),
+            syntax_index: index,
+        });
+        ReceiverFileSetup::Ready {
+            tree,
+            facts,
+            visited,
         }
     }
 
@@ -93,15 +84,18 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
         let host = resolve_js_ts_source(ctx.analyzer, ctx.language).expect(
             "JsTsReceiverFacts is registered only by the JavaScript and TypeScript language modules",
         );
-        Box::new(JsTsReceiverFactProvider::new_with_syntax_index(
-            host,
-            ctx.definitions,
-            ctx.language,
-            ctx.file,
-            ctx.source,
-            ctx.root,
-            facts.imports.clone(),
-            Arc::clone(&facts.syntax_index),
-        ))
+        Box::new(
+            JsTsReceiverFactProvider::new_with_syntax_index(
+                host,
+                ctx.definitions,
+                ctx.language,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                facts.imports.clone(),
+                Arc::clone(&facts.syntax_index),
+            )
+            .with_cancellation(ctx.cancellation),
+        )
     }
 }

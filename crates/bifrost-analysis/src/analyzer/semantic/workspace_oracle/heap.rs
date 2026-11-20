@@ -83,6 +83,7 @@ use crate::analyzer::semantic_model::CompiledSummaryValueTransferKind;
 use crate::analyzer::semantic_model::Completeness;
 use crate::analyzer::semantic_model::SemanticModelMatchDisposition;
 use crate::analyzer::semantic_model::compiled_flow_claims_agree;
+use crate::analyzer::semantic_model::target_needs_override_claim;
 
 use crate::analyzer::usages::CallRelationLimits;
 use crate::analyzer::usages::CallRelationService;
@@ -259,7 +260,8 @@ fn complete_external_summary_selection(
         }
     };
     (summary.record.completeness == Completeness::Complete
-        && (!target.has_receiver() || summary.record.covers_overrides))
+        && (!target_needs_override_claim(target.has_receiver(), false)
+            || summary.record.covers_overrides))
         .then_some((summary, matched.disposition))
 }
 
@@ -299,9 +301,9 @@ fn discharged_inert_drop_gaps(
                 Interruption::Cancelled,
             ));
         }
-        if let Some(refusal) = staged.budget.first_refusal() {
+        if let super::value_flow::GapDischargeVerdict::RefusedByRequestBudget(exceeded) = verdict {
             return Err(InterruptionOrProvider::Interruption(Interruption::Budget(
-                refusal.exceeded,
+                exceeded,
             )));
         }
         if verdict == super::value_flow::GapDischargeVerdict::Discharged {
@@ -1342,15 +1344,14 @@ fn fresh_return_origin(
         {
             return Ok(false);
         }
-        let Some((file, source)) = super::dispatch::exact_source_for_procedure(
+        let (file, source) = super::dispatch::exact_source_for_procedure(
             oracle.workspace(),
             root.callee(),
             staged.budget.limits().source_bytes,
         )
+        .and_then(|source| source.on_budget(&staged.budget))
         .map_err(InterruptionOrProvider::Provider)?
-        else {
-            return Ok(false);
-        };
+        .map_err(|exceeded| InterruptionOrProvider::Interruption(Interruption::Budget(exceeded)))?;
         staged
             .admit(SemanticWork {
                 source_bytes: source.len(),

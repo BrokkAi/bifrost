@@ -2042,6 +2042,102 @@ impl DemandQualifiedFrame {
     }
 }
 
+impl FactEvaluation<'_, '_> {
+    /// Observe the same receiver steps as member search. ReadyNone is only an
+    /// end to the observed walk: the language participation rule must still
+    /// certify its impl inventory before using this list to exclude an owner.
+    pub(super) fn deferred_member_receiver_types(
+        &mut self,
+        reference: SemanticId,
+        routes: &[&SourceSelectedQualifiedRoute],
+        states: &StateMap,
+    ) -> StoreResult<Option<Vec<super::super::fact_source::DeferredMemberReceiverType>>> {
+        let mut identities = BTreeSet::new();
+        for route in routes {
+            let slot = route.row().qualifier_slot();
+            let Some(state) = states.get(&slot) else {
+                return Ok(None);
+            };
+            if state.completion() != &ResolutionCompletion::Complete
+                || state.possible_values().is_empty()
+            {
+                return Ok(None);
+            }
+            let Some(support) = crate::analyzer::store::store_language_support(route.language())
+            else {
+                return Ok(None);
+            };
+            for &initial in state.possible_values() {
+                let mut value = initial;
+                let mut instantiation = SelectedReceiverInstantiation {
+                    application_slot: slot,
+                    substitutions: Vec::new(),
+                };
+                let mut visited = HashSet::default();
+                for depth in 0..=MAX_EXPLICIT_RECEIVER_STEPS {
+                    if self.poll_cancelled() {
+                        return Ok(None);
+                    }
+                    if !visited.insert((value.ty(), instantiation.clone())) {
+                        return Ok(None);
+                    }
+                    identities.insert(value.ty().identity());
+                    let step = support.selected_receiver_step(
+                        SelectedReceiverStepRequest {
+                            reference,
+                            call: None,
+                            qualifier_slot: slot,
+                            value,
+                            instantiation: &instantiation,
+                        },
+                        &mut ReceiverStepReads {
+                            evaluation: self,
+                            states,
+                        },
+                    )?;
+                    match step {
+                        SelectedReceiverStepRead::ReadyNone => break,
+                        SelectedReceiverStepRead::ReadyStep(step)
+                            if step.completion == ResolutionCompletion::Complete
+                                && step.stop_reason.is_none()
+                                && step.values.len() == 1
+                                && depth < MAX_EXPLICIT_RECEIVER_STEPS =>
+                        {
+                            value = step.values[0];
+                            instantiation = step.instantiation;
+                        }
+                        SelectedReceiverStepRead::Cancelled => {
+                            self.cancellation_observed = true;
+                            return Ok(None);
+                        }
+                        SelectedReceiverStepRead::Pending
+                        | SelectedReceiverStepRead::ReadyStep(_) => return Ok(None),
+                    }
+                }
+            }
+        }
+        let identities = identities.into_iter().collect::<Vec<_>>();
+        let Some(descriptors) = self.session.intrinsic_call_type_descriptors(&identities)? else {
+            self.cancellation_observed = true;
+            return Ok(None);
+        };
+        Ok(Some(
+            identities
+                .into_iter()
+                .map(
+                    |identity| super::super::fact_source::DeferredMemberReceiverType {
+                        identity,
+                        intrinsic_kind: descriptors
+                            .iter()
+                            .find(|descriptor| descriptor.identity() == identity)
+                            .map(FactIntrinsicTypeDescriptor::kind),
+                    },
+                )
+                .collect(),
+        ))
+    }
+}
+
 struct ReceiverStepReads<'evaluation, 'resources, 'source> {
     evaluation: &'evaluation mut FactEvaluation<'resources, 'source>,
     states: &'evaluation StateMap,

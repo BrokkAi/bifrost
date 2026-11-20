@@ -1356,6 +1356,14 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
         Some(self.session)
     }
 
+    fn proof_identity_content_digest(
+        &self,
+        key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<[u8; 32]>> {
+        self.base.proof_identity_content_digest(key, cancellation)
+    }
+
     fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,

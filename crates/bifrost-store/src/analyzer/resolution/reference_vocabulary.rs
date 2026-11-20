@@ -153,6 +153,29 @@ impl ReferenceEdgeRow {
     }
 }
 
+/// One gap site that keeps a reference inventory open.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpenInventorySite {
+    /// The label of the typed gap kind that lowering recorded for the site.
+    pub reason_kind: String,
+    /// The workspace-relative path of the file that holds the site.
+    pub file: String,
+    /// The 1-based line of the site.
+    pub line: u32,
+    /// The path of the macro invocation at the site, when it is one.
+    pub macro_name: Option<String>,
+}
+
+impl std::fmt::Display for OpenInventorySite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at {}:{}", self.reason_kind, self.file, self.line)?;
+        if let Some(name) = &self.macro_name {
+            write!(f, " in macro {name}!")?;
+        }
+        Ok(())
+    }
+}
+
 /// Why an edge derivation's rows are less than the whole truth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeIncompleteReason {
@@ -171,6 +194,10 @@ pub enum EdgeIncompleteReason {
     /// A selected inverse query reached its soft time budget after confirming
     /// only part of the requested candidate-blob inventory.
     TimeBudgetExceeded,
+    /// A selected inverse query's receiver-analysis budget ran out while it
+    /// confirmed a candidate file's sites, so the sites it had not reached are
+    /// unattempted. The sites it had finished are still reported.
+    ReceiverBudgetExhausted,
     /// The file's occurrence rows do not cover these reference-producing
     /// roles, so forward edges at sites of those roles may be missing. Roles
     /// the file does cover are unaffected: a consumer narrowed to one role
@@ -199,6 +226,11 @@ pub enum EdgeIncompleteReason {
     /// A selected native inverse index retained an open binding, so a target's
     /// indexed incoming rows may omit additional references.
     InverseIndexResolutionIncomplete,
+    /// One persisted gap site kept a selected inverse index's reference
+    /// inventory open. It accompanies `InverseIndexResolutionIncomplete` and
+    /// names the typed gap reason, the site's file and line, and the macro
+    /// invocation when the site is one, so a consumer can say what stays open.
+    InverseIndexOpenSite(OpenInventorySite),
     /// A selected inverse edge has an otherwise complete binding that depends
     /// on outstanding query obligations, so its proof remains conditional.
     InverseIndexQueryObligationsOutstanding,
@@ -267,10 +299,12 @@ impl EdgeCompleteness {
                 ),
                 EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
                 | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                | EdgeIncompleteReason::InverseIndexOpenSite(_)
                 | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding
                 | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
                 | EdgeIncompleteReason::InverseIndexTargetUncovered
                 | EdgeIncompleteReason::TimeBudgetExceeded
+                | EdgeIncompleteReason::ReceiverBudgetExhausted
                 | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => {
                     axis == EdgeAxis::InverseProjection
                 }

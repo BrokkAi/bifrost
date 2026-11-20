@@ -1,4 +1,7 @@
-//! Declaration index lookups under limits, budgets and cancellation.
+//! Declaration index lookups under limits, budgets and cancellation, and
+//! workspace publication ownership (#13346): construction selects its own
+//! publication, evidence reads use the request pin, and additional-mount
+//! publications do not overwrite each other. Both share the fake Python adapter.
 
 use super::*;
 use crate::analyzer::store::StoreLanguageAdapter;
@@ -18,6 +21,13 @@ struct PythonAdapter {
     cancel_after_storage_key_calls: usize,
     alternate_storage_key_on_call: Option<usize>,
     alternate_storage_key_enabled: Option<Arc<AtomicBool>>,
+    /// Test adapters that publish dependency evidence pose as another language.
+    language_override: Option<Language>,
+    /// Additional storage languages this adapter owns a generation for.
+    extra_storage_keys: Vec<&'static str>,
+    /// Declare one class per file, named by its stem, so that adding a file
+    /// changes the published path-symbol revision.
+    declare_file_classes: bool,
 }
 
 impl StoreLanguageAdapter for PythonAdapter {
@@ -28,7 +38,7 @@ impl StoreLanguageAdapter for PythonAdapter {
         None
     }
     fn language(&self) -> Language {
-        Language::Python
+        self.language_override.unwrap_or(Language::Python)
     }
 
     fn storage_language_key_for_file(&self, _file: &ProjectFile) -> &'static str {
@@ -52,7 +62,7 @@ impl StoreLanguageAdapter for PythonAdapter {
         {
             "python-alt"
         } else {
-            "python"
+            self.language().config_label()
         }
     }
 }
@@ -82,6 +92,13 @@ impl LanguageAdapter for PythonAdapter {
         })
     }
 
+    fn storage_language_keys(&self) -> Vec<(String, tree_sitter::Language)> {
+        std::iter::once(self.language().config_label())
+            .chain(self.extra_storage_keys.iter().copied())
+            .map(|key| (key.to_owned(), self.parser_language()))
+            .collect()
+    }
+
     fn query_directory(&self) -> &'static str {
         "python"
     }
@@ -102,6 +119,25 @@ impl LanguageAdapter for PythonAdapter {
     ) -> ParsedFile {
         let mut parsed = ParsedFile::new(String::new());
         parsed.add_file_scope(file, source);
+        if self.declare_file_classes {
+            let stem = file
+                .rel_path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture file stem");
+            let class = unit(file, stem, CodeUnitType::Class);
+            parsed.add_code_unit_with_range(
+                class.clone(),
+                crate::analyzer::Range {
+                    start_byte: 0,
+                    end_byte: source.len(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+                None,
+                Some(class),
+            );
+        }
         parsed
     }
 }
@@ -576,6 +612,7 @@ fn cancelled_reverse_reference_walk_discards_accumulated_candidates() {
         cancel_after_storage_key_calls: 3,
         alternate_storage_key_on_call: None,
         alternate_storage_key_enabled: None,
+        ..PythonAdapter::default()
     };
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
     let analyzer = TreeSitterAnalyzer::new(project, adapter);
@@ -878,4 +915,171 @@ fn retention_census_does_not_fill_cold_file_state_roots() {
             .iter()
             .any(|group| group.kind == Some("file_state_structural_estimate"))
     );
+}
+
+#[test]
+#[hardwon(
+    "#13346: construction adopted another process's store head instead of its own publication"
+)]
+fn construction_selects_its_own_publication() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let adapter = || PythonAdapter {
+        declare_file_classes: true,
+        ..PythonAdapter::default()
+    };
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().canonicalize().expect("absolute workspace root");
+    std::fs::write(root.join("sample.py"), "value = 1\n").expect("write fixture source");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Python));
+    let context = ephemeral_store_context(project.as_ref()).expect("shared store");
+    // The second analyzer is another process on the same store.
+    let second_context = context.for_second_build(project.as_ref());
+    let second = Rc::new(RefCell::new(None));
+    {
+        let second = Rc::clone(&second);
+        super::construction_selection_observer::install_after_build_state(move || {
+            // It publishes after the first analyzer's build_state and before
+            // the first selects.
+            std::fs::write(root.join("added.py"), "other = 3\n").expect("add fixture source");
+            let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+            let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                project,
+                adapter(),
+                AnalyzerConfig::default(),
+                second_context,
+                None,
+            )
+            .expect("second analyzer");
+            *second.borrow_mut() = Some(analyzer.selected_workspace_snapshots());
+        });
+    }
+    let first = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+        project,
+        adapter(),
+        AnalyzerConfig::default(),
+        context,
+        None,
+    )
+    .expect("first analyzer");
+    let second = second.borrow().clone().expect("the observer ran");
+    let selected = first.selected_workspace_snapshots();
+    assert_ne!(
+        selected.get("python"),
+        second.get("python"),
+        "the second analyzer must have published a different revision"
+    );
+    assert_eq!(
+        selected,
+        first.state.listed_snapshots.load_full(),
+        "construction selects what it published"
+    );
+}
+
+#[test]
+#[hardwon(
+    "#13346: a request's evidence reads straddled a publication that replaced the live selection"
+)]
+fn dependency_evidence_reads_use_the_request_pin() {
+    use crate::analyzer::AnalyzerQueryScope;
+
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Ruby,
+        ]);
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().canonicalize().expect("absolute workspace root");
+    std::fs::write(
+        root.join("Gemfile"),
+        "source \"https://rubygems.org\"\ngem \"rake\"\n",
+    )
+    .expect("write Gemfile");
+    std::fs::write(root.join("main.rb"), "x = 1\n").expect("write main.rb");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Ruby));
+    let analyzer = TreeSitterAnalyzer::new(
+        project,
+        PythonAdapter {
+            language_override: Some(Language::Ruby),
+            ..PythonAdapter::default()
+        },
+    );
+    let pinned = analyzer.selected_workspace_snapshots();
+    let mut successor = pinned.as_ref().clone();
+    successor.get_mut("ruby").unwrap().revision += 1;
+    let _request = AnalyzerQueryScope::new(&analyzer);
+    let before = IAnalyzer::dependency_file_evidence(&analyzer).expect("pinned evidence");
+    // A publication replaces the live selection inside the request.
+    analyzer
+        .relational_workspace_snapshots
+        .store(Arc::new(successor));
+    let after = IAnalyzer::dependency_file_evidence(&analyzer).expect("pinned evidence");
+    assert_eq!(before, after);
+    assert_eq!(
+        IAnalyzer::dependency_file_locations(&analyzer).expect("pinned locations"),
+        IAnalyzer::dependency_file_locations(&analyzer).expect("pinned locations")
+    );
+}
+
+#[test]
+#[hardwon(
+    "#13346: an additional-mount publication overwrote a concurrent publication of another language"
+)]
+fn concurrent_additional_mount_publications_both_survive() {
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().canonicalize().expect("absolute workspace root");
+    std::fs::write(root.join("sample.py"), "value = 1\n").expect("write fixture source");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Python));
+    let analyzer = Arc::new(TreeSitterAnalyzer::new(
+        project,
+        PythonAdapter {
+            extra_storage_keys: vec!["python:a", "python:b"],
+            ..PythonAdapter::default()
+        },
+    ));
+    let file = ProjectFile::new(root, "sample.py");
+    let initial = analyzer.selected_workspace_snapshots();
+    let competing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    {
+        let (analyzer, file, competing) = (
+            Arc::clone(&analyzer),
+            file.clone(),
+            std::rc::Rc::clone(&competing),
+        );
+        super::construction_selection_observer::install_before_mount_store(move || {
+            // The competing publication lands between the first one's load
+            // of the live selection and its store.
+            analyzer
+                .sync_content_reading_workspace_files("python:b", std::slice::from_ref(&file))
+                .expect("competing publication");
+            *competing.borrow_mut() = analyzer
+                .selected_workspace_snapshots()
+                .get("python:b")
+                .cloned();
+        });
+    }
+    analyzer
+        .sync_content_reading_workspace_files("python:a", std::slice::from_ref(&file))
+        .expect("first publication");
+    let selected = analyzer.selected_workspace_snapshots();
+    let competing = competing.borrow().clone().expect("the observer ran");
+    assert_ne!(
+        Some(&competing),
+        initial.get("python:b"),
+        "the competitor published a new revision"
+    );
+    assert_ne!(
+        selected.get("python:a"),
+        initial.get("python:a"),
+        "the first published a new revision"
+    );
+    assert_eq!(selected.get("python:b"), Some(&competing));
 }

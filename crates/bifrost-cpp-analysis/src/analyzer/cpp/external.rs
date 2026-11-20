@@ -1076,6 +1076,7 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
     let name =
         brokk_bifrost_analysis::analyzer::semantic::module_identity_owner(Path::new(header))?;
     Some(TypeFact {
+        type_parameter_kinds: Vec::new(),
         alias_target: None,
         tuple_fields: None,
         implemented_traits_complete: false,
@@ -1091,6 +1092,7 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
         type_kind: TypeKind::Module,
         visibility: Visibility::Public,
         is_abstract: false,
+        is_final: None,
         is_sealed: false,
         callable_surface_complete: false,
         has_explicit_type_terms: false,
@@ -1327,10 +1329,11 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer {
+        (Producer {
             name: self.adapter_name().to_owned(),
             version: self.adapter_version().to_owned(),
-        }
+        })
+        .with_dependency_revision()
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -1565,6 +1568,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
+                type_parameter_kinds: Vec::new(),
                 alias_target: None,
                 tuple_fields: None,
                 implemented_traits_complete: false,
@@ -1588,6 +1592,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     CppExternalVisibility::Private => Visibility::Private,
                 },
                 is_abstract: false,
+                is_final: None,
                 is_sealed: false,
                 callable_surface_complete: false,
                 has_explicit_type_terms: false,
@@ -1745,6 +1750,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 return_type: return_type.as_ref(),
             });
             let signature = (record.kind == CppExternalMemberKind::Function).then(|| Signature {
+                bounds: None,
                 type_parameters: Vec::new(),
                 parameters: parameters
                     .into_iter()
@@ -1774,6 +1780,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 && !parameter_variadics.iter().any(|variadic| *variadic)
                 && syntax_complete_headers.contains(&record.source_path);
             members.push(MemberFact {
+                target_independent: None,
+                inherent_impl_self_arguments: None,
                 implemented_trait: None,
                 self_form: None,
                 non_overridable: None,
@@ -1839,6 +1847,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     drop_glue: None,
                     drop_effects: None,
                     drop_review: None,
+                    interior_mutability: None,
                 });
             }
         }
@@ -1894,6 +1903,7 @@ schema_version:
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: vec![ActivationSelector {
+production_input_digest: None,
                         package: selector,
                         module: None,
                         toolchain: None,
@@ -2020,7 +2030,8 @@ pub fn resolve_cpp_semantic_pack_dependencies(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance: Vec::new(),
             artifacts: vec![ResolvedDependencyArtifact::source_set(
@@ -2465,6 +2476,15 @@ fn stable_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn complete_symbols(
+        overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    ) -> Vec<std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol>>
+    {
+        let (symbols, complete) = overlay.symbols();
+        assert!(complete, "test requires complete symbol enumeration");
+        symbols
+    }
+
     use brokk_bifrost_analysis::analyzer::semantic_model::compiler;
 
     use crate::analyzer::cpp::external::*;
@@ -3278,6 +3298,7 @@ mod tests {
                 drop_glue: None,
                 drop_effects: None,
                 drop_review: None,
+                interior_mutability: None,
             }) if basic_string_members.iter().any(|candidate| candidate.id == *member)
         ));
         let string_alias = types
@@ -4003,6 +4024,7 @@ mod tests {
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
             .expect("ephemeral catalog");
         let activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
@@ -4048,7 +4070,7 @@ mod tests {
             external_member_resolution(cpp, Some(&overlay), &file, "std::vector", "push_back")
                 == CppExternalMemberResolution::Indexed,
             "outcome={outcome:#?}\nsymbols={:#?}",
-            overlay.symbols()
+            complete_symbols(&overlay)
         );
         assert_eq!(
             CppExternalMemberResolution::Indexed,
@@ -4131,6 +4153,7 @@ mod tests {
             .expect("ephemeral catalog");
         let cancellation = CancellationToken::new();
         let activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
@@ -4861,6 +4884,7 @@ mod tests {
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
             .expect("ephemeral catalog");
         let activation = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
@@ -4902,7 +4926,7 @@ mod tests {
         let [published] = published.as_slice() else {
             panic!(
                 "the header pack publishes one connect: {:#?}",
-                overlay.symbols()
+                complete_symbols(&overlay)
             );
         };
         assert_eq!(SemanticModelSymbolKind::Function, published.kind);

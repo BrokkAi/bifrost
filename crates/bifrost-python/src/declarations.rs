@@ -3210,6 +3210,93 @@ mod primary_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: empty string in Python __all__ panicked intern_name"
+    )]
+    fn empty_string_in_all_degrades_the_export_surface_to_unreadable() {
+        use brokk_bifrost_core::analyzer::resolution_facts::PythonNativeCuratedSurface;
+
+        let parsed = parse("__all__ = ['']\n");
+        let facts = &parsed.resolution_facts;
+        assert_eq!(facts.python_export_surfaces.len(), 1);
+        assert_eq!(
+            facts.python_export_surfaces[0].curated,
+            PythonNativeCuratedSurface::Unreadable
+        );
+        assert!(facts.names.iter().all(|name| !name.spelling.is_empty()));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: empty string member names in getattr, setattr and ** mappings panicked intern_name"
+    )]
+    fn empty_string_member_names_stay_dynamic() {
+        use brokk_bifrost_core::analyzer::resolution_facts::PythonMemberNames;
+
+        for source in [
+            "def f(x):\n    return getattr(x, '')\n",
+            "def f(o, v):\n    setattr(o, '', v)\n",
+            "def f(x):\n    return getattr(x, '' + y)\n",
+            "def f(o):\n    o.__dict__.update({'': 1})\n",
+            "def f(o):\n    o.__dict__.update(**{'': 1})\n",
+        ] {
+            let facts = parse(source).resolution_facts;
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}"
+            );
+            assert!(
+                facts
+                    .python_member_operations
+                    .iter()
+                    .any(|op| op.names == PythonMemberNames::Any),
+                "empty member name degrades to PythonMemberNames::Any for {source:?}: {facts:#?}"
+            );
+        }
+    }
+
+    /// A MISSING or zero-width name leaves a malformed-syntax gap and no empty
+    /// spelling (the Python counterpart of Rust's
+    /// `missing_names_leave_gaps_not_empty_spellings`, #4286).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: a MISSING Python name panicked the producer on an empty spelling"
+    )]
+    fn missing_names_leave_gaps_not_empty_spellings() {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+
+        let mut saw_missing = false;
+        for source in [
+            "for in x: pass\n",
+            "from x import\n",
+            "import \n",
+            "from . import (a,\n",
+            "class C(metaclass=): pass\n",
+            "class C(=x): pass\n",
+            "def f(,): pass\n",
+            "x = (\n",
+            "lambda: (yield\n",
+        ] {
+            let tree = parse_python_tree(source).expect("Python fixture tree");
+            assert!(tree.root_node().has_error(), "{source:?} is recovered");
+            saw_missing |= tree.root_node().to_sexp().contains("MISSING");
+            let facts = parse(source).resolution_facts;
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}: {facts:#?}"
+            );
+            assert!(
+                facts
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.kind == ResolutionGapKind::MalformedSyntax),
+                "the recovered tree keeps malformed-syntax evidence for {source:?}"
+            );
+        }
+        assert!(saw_missing, "recovery inserts a MISSING node in this table");
+    }
+
+    #[test]
     fn unmounted_annotated_functions_keep_source_declarations_and_return_facts() {
         let source = "if outer:\n    if inner:\n        def hidden(value: int) -> Hidden:\n            pass\n\ndef visible() -> Visible:\n    pass\n";
         let parsed = parse(source);

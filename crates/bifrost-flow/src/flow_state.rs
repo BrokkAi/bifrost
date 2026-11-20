@@ -31,27 +31,29 @@ use crate::analyzer::semantic::binding_initialization::{
     BindingDefinitions, BindingEventKey, BindingInitializationEvent, invalidated_binding,
 };
 use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseBidirectionalGraph,
-    Dominators, FeasibleSuccessors, GenKillFacts, LiveValueSets, Reachability, ReachingSets,
-    dominators, forward_reachability, forward_reachability_from_all, live_values,
-    reaching_definitions, reverse_reachability, strongly_connected_components_with_order,
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, CfgAlgorithmWork,
+    DenseBidirectionalGraph, Dominators, FeasibleSuccessors, GenKillFacts, LiveValueSets,
+    Reachability, ReachingSets, dominators, forward_reachability, forward_reachability_from_all,
+    live_values, reaching_definitions, reverse_reachability,
+    strongly_connected_components_with_order,
 };
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::statement_entries::CandidateControlRouteIndex;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId,
     CallToReturnModel, CallTransferSet, CallableTarget, CallableTargetResolution,
-    CandidateCoverage, CapabilitySupport, ContentIdentity, ControlContinuation, ControlEdgeHandle,
-    ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, IcfgProvider, LengthDelimitedDigest,
-    MemoryAccessKind, MemoryLocationId, MemoryLocationKind, OracleCallContext, ProcedureHandle,
-    ProcedureId, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
-    PropertyReachCertainty, PropertyReachingIncompleteReason, PropertyReachingLimits,
-    PropertyReachingResult, SemanticArtifact, SemanticArtifactKey, SemanticBudget,
-    SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap,
-    SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId,
-    SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation, SynchronizationPayload,
-    ValueFlowKind, ValueFlowOracle, ValueId, WorkspaceIcfgProvider,
+    CandidateCoverage, CapabilitySupport, CaptureSource, ContentIdentity, ControlContinuation,
+    ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, EvidenceId,
+    IcfgProvider, LengthDelimitedDigest, MemoryAccessKind, MemoryLocationId, MemoryLocationKind,
+    OracleCallContext, ProcedureHandle, ProcedureId, ProcedureSemantics, ProgramPointHandle,
+    ProgramPointId, ProofStatus, PropertyReachCertainty, PropertyReachingIncompleteReason,
+    PropertyReachingLimits, PropertyReachingRelation, PropertyReachingResult, PropertyReadRecord,
+    PropertyStoreRecord, SemanticArtifact, SemanticArtifactKey, SemanticBudget, SemanticCallSite,
+    SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap, SemanticGapDischarge,
+    SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
+    SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId, SourceMappingKind,
+    SourceSpan, StableDigest, SynchronizationOperation, SynchronizationPayload, ValueFlowKind,
+    ValueFlowOracle, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -342,7 +344,7 @@ pub enum FlowStateIncompleteReason {
         kind: SemanticGapKind,
         detail: String,
     },
-    /// A CFG algorithm ran out of its request budget. Truncation is never
+    /// A semantic or CFG algorithm ran out of its request budget. Truncation is never
     /// silent: the affected relation emits no rows at all.
     BudgetExhausted { axis: FlowStateAxis, detail: String },
     /// A field access whose base value the IR does not flow from any binding.
@@ -366,6 +368,10 @@ pub enum FlowStateIncompleteReason {
     /// The structured property provider was not available for an artifact that
     /// advertises field memory. Property rows cannot be treated as complete.
     PropertyProviderUnavailable,
+    /// Acquiring the property snapshot exhausted a semantic resident budget.
+    /// Missing property rows block property axes, while a binding-only
+    /// evaluation chain with no memory access remains independently provable.
+    PropertySnapshotBudgetExhausted { detail: String },
     /// Acquiring the structured property snapshot returned a typed provider
     /// failure. Binding and control relations derived from the already
     /// materialized procedure remain independently answerable.
@@ -448,6 +454,10 @@ impl std::fmt::Debug for FlowStateIncompleteReason {
                 .debug_struct("BindingStateNotClosed")
                 .field("binding", binding)
                 .finish(),
+            Self::PropertySnapshotBudgetExhausted { detail } => f
+                .debug_struct("BudgetExhausted")
+                .field("detail", detail)
+                .finish(),
             Self::PropertyProviderUnavailable => f.write_str("PropertyProviderUnavailable"),
             Self::PropertyProviderFailed { detail } => f
                 .debug_struct("PropertyProviderFailed")
@@ -498,7 +508,8 @@ impl FlowStateIncompleteReason {
             ),
             PropertyProviderUnavailable
             | PropertyProviderFailed { .. }
-            | PropertyAnalysisPartial { .. } => property_axes().contains(&axis),
+            | PropertyAnalysisPartial { .. }
+            | PropertySnapshotBudgetExhausted { .. } => property_axes().contains(&axis),
             PropertyReaching { reason } => property_reason_blocks(reason, axis),
             ControlProjectionRejected { .. } | ModeledControlProjectionIncomplete { .. } => {
                 matches!(
@@ -815,6 +826,7 @@ pub struct FlowStateDerivation {
     control_edge_mask: ControlEdgeMask,
     binding_initialization: Option<BindingInitializationFacts>,
     event_keys: Vec<SemanticEventKey>,
+    skipped_copies: SkippedCopies,
 }
 
 /// A proof about a binding at one modeled read, independent of which write
@@ -1395,6 +1407,31 @@ impl FlowStateDerivation {
             })
     }
 
+    /// The subset of `reads` whose value is carried into the value the
+    /// establishment assigns. A read whose value is used only as the base,
+    /// index or address operand of a memory access selects the loaded value
+    /// without being it, so it is dropped; a read used both ways is kept.
+    /// Builds the procedure's dependence once per call: ask only when more
+    /// than one read competes for one assigned value.
+    pub fn reads_carried_into(
+        &self,
+        procedure: &ProcedureHandle,
+        establishment_event: usize,
+        reads: &[usize],
+    ) -> Vec<usize> {
+        assert_eq!(self.procedure, procedure.id());
+        let establishment = self.event(establishment_event);
+        assert_eq!(establishment.event_class, StateEventClass::Establish);
+        let semantics = procedure.semantics();
+        let carried = EvaluationDependence::build(semantics)
+            .carried_operands_of(establishment.value, semantics.values().len());
+        reads
+            .iter()
+            .copied()
+            .filter(|read| carried.contains(&self.event(*read).value))
+            .collect()
+    }
+
     /// Whether one binding read feeds one establishment within that
     /// establishment's own evaluation, and whether that evaluation has an open
     /// account.
@@ -1411,7 +1448,9 @@ impl FlowStateDerivation {
     /// relation is procedure-scoped, is placed on the chain, or names the
     /// read or written binding, or when a non-gap reason blocks that relation.
     /// A property completeness reason blocks it only when the read or the
-    /// establishment is a property, or a chain point accesses memory.
+    /// establishment is a property, or a chain point accesses memory; on a
+    /// binding-to-binding chain that accesses memory, open candidate coverage
+    /// alone is still exempt because it hides no event.
     /// A gap elsewhere in the procedure, such as an unresolved call in another
     /// statement, cannot add a read to this evaluation.
     pub fn read_feeds_establishment(
@@ -1477,8 +1516,9 @@ impl FlowStateDerivation {
         // Property completeness can hide a property event only where memory
         // is accessed. A binding read that feeds a binding establishment with
         // no memory access on its chain has no property event to miss.
-        let property_scoped = matches!(read.subject, FlowSubject::Binding { .. })
-            && matches!(establishment.subject, FlowSubject::Binding { .. })
+        let binding_pair = matches!(read.subject, FlowSubject::Binding { .. })
+            && matches!(establishment.subject, FlowSubject::Binding { .. });
+        let property_scoped = binding_pair
             && !chain.iter().any(|point| {
                 semantics.point(*point).is_some_and(|point| {
                     point.events.iter().any(|event| {
@@ -1500,6 +1540,26 @@ impl FlowStateDerivation {
                         FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
                             | FlowStateIncompleteReason::LoweringGap { .. }
                     )
+                    // Open candidate coverage says other stores may reach a
+                    // retained property read (a non-closed receiver, or an
+                    // ancestor store). Every read and store is already
+                    // projected as an event before coverage is judged, so it
+                    // cannot add or remove a read in this evaluation. It is
+                    // the only reason exempted on a chain that accesses
+                    // memory. Truncated coverage can mean dropped relations
+                    // and stays blocking, as do the reasons that name a
+                    // missing event.
+                    && !(binding_pair
+                        && matches!(
+                            reason,
+                            FlowStateIncompleteReason::PropertyReaching { reason }
+                                if matches!(
+                                    reason.as_ref(),
+                                    PropertyReachingIncompleteReason::CandidateCoverage(
+                                        CandidateCoverage::Open
+                                    )
+                                )
+                        ))
                     && !(property_scoped
                         && matches!(
                             reason,
@@ -1507,6 +1567,7 @@ impl FlowStateDerivation {
                                 | FlowStateIncompleteReason::PropertyProviderUnavailable
                                 | FlowStateIncompleteReason::PropertyProviderFailed { .. }
                                 | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                                | FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. }
                                 | FlowStateIncompleteReason::PropertyReaching { .. }
                         ))
             })
@@ -1993,6 +2054,7 @@ impl FlowStateDerivation {
                 | FlowStateIncompleteReason::PropertyProviderUnavailable
                 | FlowStateIncompleteReason::PropertyProviderFailed { .. }
                 | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                | FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. }
                 | FlowStateIncompleteReason::PropertyReaching { .. } => false,
             });
             if !located
@@ -3686,6 +3748,7 @@ impl FlowStateDerivation {
                     SemanticGapDischarge::CanonicalIndexIdentity
                     | SemanticGapDischarge::ExactFieldLayout => true,
                     SemanticGapDischarge::ModeledEffectPartition
+                    | SemanticGapDischarge::CreatingRealizationBindsCaptures
                     | SemanticGapDischarge::DataDependency => true,
                     // Runtime-read discharge belongs to the activation-aware
                     // refinement, not this raw flow-state completeness proof.
@@ -3876,6 +3939,7 @@ impl FlowStateDerivation {
                         | FlowStateIncompleteReason::PropertyProviderUnavailable
                         | FlowStateIncompleteReason::PropertyProviderFailed { .. }
                         | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                        | FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. }
                         | FlowStateIncompleteReason::PropertyReaching { .. }
                 )
         })
@@ -5213,6 +5277,23 @@ fn semantic_outcome_verdict<T>(outcome: &SemanticOutcome<T>) -> ReuseVerdict {
     }
 }
 
+/// Preserve execution stops independently of whether a partial value survived.
+fn semantic_outcome_stop_reason<T>(
+    outcome: &SemanticOutcome<T>,
+    axis: FlowStateAxis,
+) -> Option<FlowStateIncompleteReason> {
+    match outcome {
+        SemanticOutcome::Cancelled { .. } => Some(FlowStateIncompleteReason::Cancelled),
+        SemanticOutcome::ExceededBudget { exceeded, .. } => {
+            Some(FlowStateIncompleteReason::BudgetExhausted {
+                axis,
+                detail: exceeded.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Borrowed controls for one derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DeadWriteProcedureKey(
@@ -5282,6 +5363,10 @@ pub struct FlowStateRequest<'request> {
     /// work vocabulary, and an out-of-crate caller configures a derivation
     /// through [`FlowStateRequest::new`], not by naming budget dimensions.
     pub(crate) cfg_budget: CfgAlgorithmBudget,
+    /// The separate optional nonreturn-proof ledger of a lent operation. `None`
+    /// (every standalone request) keeps the legacy rule: each derivation clones
+    /// `cfg_budget` at entry for that proof and discards its spending.
+    nonreturn_cfg_budget: Option<CfgAlgorithmBudget>,
     candidate_routes: Option<(ProcedureHandle, CandidateControlRouteIndex)>,
     control_projection: Option<&'request FlowControlProjection>,
     /// Outer `None` means this raw derivation did not select semantic models.
@@ -5333,6 +5418,7 @@ impl<'request> FlowStateRequest<'request> {
             dead_write_component_order_cache: HashMap::default(),
             dead_write_prefix_reachability_cache: HashMap::default(),
             cfg_budget: CfgAlgorithmBudget::default(),
+            nonreturn_cfg_budget: None,
             candidate_routes: None,
             control_projection: None,
             active_semantic_model_snapshot: None,
@@ -5360,7 +5446,7 @@ impl<'request> FlowStateRequest<'request> {
         mut self,
         snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Self {
-        self.active_semantic_model_snapshot = Some(snapshot);
+        self.install_active_semantic_model_snapshot(snapshot);
         self
     }
 
@@ -5368,8 +5454,211 @@ impl<'request> FlowStateRequest<'request> {
         mut self,
         cache: &'request NonreturnDiscoveryCache,
     ) -> Self {
-        self.nonreturn_discovery_cache = Some(cache);
+        self.install_nonreturn_discovery_cache(cache);
         self
+    }
+
+    /// The borrowing form of [`Self::with_active_semantic_model_snapshot`], for
+    /// a request lent by [`FlowStateOperation::with_request`].
+    pub fn install_active_semantic_model_snapshot(
+        &mut self,
+        snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) {
+        self.active_semantic_model_snapshot = Some(snapshot);
+    }
+
+    /// The borrowing form of [`Self::with_nonreturn_discovery_cache`].
+    pub fn install_nonreturn_discovery_cache(&mut self, cache: &'request NonreturnDiscoveryCache) {
+        self.nonreturn_discovery_cache = Some(cache);
+    }
+
+    /// Split off the owned work state; everything else is per-call. Destructured
+    /// without `..` so a new field must be classified as owned or per-call.
+    fn into_owned_state(self) -> FlowStateOwnedState {
+        let Self {
+            cancellation: _,
+            discharged_observation_gaps,
+            memos,
+            dead_write_prefix_reachability_cache,
+            dead_write_component_order_cache,
+            cfg_budget,
+            nonreturn_cfg_budget,
+            candidate_routes,
+            control_projection: _,
+            active_semantic_model_snapshot: _,
+            nonreturn_discovery_cache: _,
+        } = self;
+        // A request carrying a discharge selection ran under a memo namespace
+        // the shared keys do not name; its state never returns to an operation.
+        // `debug_assert`: this also runs from a drop guard, where a panic
+        // during unwind would abort. No lent request can acquire a selection:
+        // the only installer consumes the request.
+        debug_assert!(
+            discharged_observation_gaps.is_none(),
+            "a request with discharged observation gaps cannot restore memo state into a shared operation"
+        );
+        FlowStateOwnedState {
+            memos,
+            dead_write_prefix_reachability_cache,
+            dead_write_component_order_cache,
+            cfg_budget,
+            // Only `from_owned_state` makes a restorable request, and it always
+            // installs the optional ledger. No default ledger is invented here:
+            // this runs from a drop guard, and a refund would hide spending.
+            nonreturn_cfg_budget: nonreturn_cfg_budget
+                .expect("a lent request keeps its operation's optional nonreturn ledger"),
+            candidate_routes,
+        }
+    }
+
+    fn from_owned_state(
+        cancellation: &'request CancellationToken,
+        state: FlowStateOwnedState,
+    ) -> Self {
+        let FlowStateOwnedState {
+            memos,
+            dead_write_prefix_reachability_cache,
+            dead_write_component_order_cache,
+            cfg_budget,
+            nonreturn_cfg_budget,
+            candidate_routes,
+        } = state;
+        Self {
+            cancellation,
+            discharged_observation_gaps: None,
+            memos,
+            dead_write_prefix_reachability_cache,
+            dead_write_component_order_cache,
+            cfg_budget,
+            nonreturn_cfg_budget: Some(nonreturn_cfg_budget),
+            candidate_routes,
+            control_projection: None,
+            active_semantic_model_snapshot: None,
+            nonreturn_discovery_cache: None,
+        }
+    }
+}
+
+/// The request fields whose lifetime is a resource owner's, not one call's:
+/// the memo regions under the analyzer's retention budget, the prefix and
+/// order maps, the candidate routes and the CFG work ledger. Keys unchanged.
+#[derive(Debug)]
+struct FlowStateOwnedState {
+    memos: FlowStateRequestMemos,
+    dead_write_prefix_reachability_cache:
+        HashMap<DeadWritePrefixKey, DeadWriteReachabilityCacheEntry>,
+    dead_write_component_order_cache:
+        HashMap<(DeadWriteProcedureKey, Vec<ControlEdgeId>), DeadWriteComponentOrderCacheEntry>,
+    cfg_budget: CfgAlgorithmBudget,
+    /// The optional nonreturn-proof ledger, kept apart from `cfg_budget`: the
+    /// legacy rule gave that proof its own clone of the ordinary balance and
+    /// limits so exhausting it never starves ordinary flow relations. It starts
+    /// at the pristine ordinary default and then accumulates across derivations.
+    nonreturn_cfg_budget: CfgAlgorithmBudget,
+    candidate_routes: Option<(ProcedureHandle, CandidateControlRouteIndex)>,
+}
+
+/// One work owner's spent grant and memos across several derivations: the
+/// semantic ledger that otherwise lives inside one derivation call, plus the
+/// request-owned state above. An RQL traversal cache keeps one per file for
+/// seeds that shared the old whole-file allowance.
+///
+/// The operation is lent, never replaced: `with_request` moves the owned state
+/// into a temporary [`FlowStateRequest`] and a drop guard moves the SAME
+/// spent state back, also on unwind, so a panic neither refunds a ledger nor
+/// discards a memo region. There is no constructor from a standalone request,
+/// so a request with discharged observation gaps cannot become one. Memo keys
+/// carry the artifact allocation address, so the owner must keep the strong
+/// artifact Arc alive for the operation's lifetime.
+#[derive(Debug)]
+pub struct FlowStateOperation {
+    semantic_budget: SemanticBudget,
+    /// `None` only while a request is lent out.
+    state: Option<FlowStateOwnedState>,
+}
+
+/// Read-only spent-work view of an operation, for controls that show grants
+/// accumulate or restart. Not a budget override.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowStateOperationConsumption {
+    pub cfg_used: CfgAlgorithmWork,
+    pub semantic_used: SemanticWork,
+    pub cfg_refusals: usize,
+    pub semantic_refusals: usize,
+    pub nonreturn_cfg_used: CfgAlgorithmWork,
+    pub nonreturn_cfg_refusals: usize,
+}
+
+impl FlowStateOperation {
+    pub fn new(memos: FlowStateRequestMemos) -> Self {
+        Self {
+            semantic_budget: SemanticBudget::default(),
+            state: Some(FlowStateOwnedState {
+                memos,
+                dead_write_prefix_reachability_cache: HashMap::default(),
+                dead_write_component_order_cache: HashMap::default(),
+                cfg_budget: CfgAlgorithmBudget::default(),
+                nonreturn_cfg_budget: CfgAlgorithmBudget::default(),
+                candidate_routes: None,
+            }),
+        }
+    }
+
+    /// Lend the operation's semantic ledger and a temporary request borrowing
+    /// this call's token. The request's other per-call controls (snapshot,
+    /// nonreturn cache) are installed by `run` through the `install_*`
+    /// methods; nothing but the owned state survives the call.
+    pub fn with_request<'t, R>(
+        &mut self,
+        cancellation: &'t CancellationToken,
+        run: impl FnOnce(&mut SemanticBudget, &mut FlowStateRequest<'t>) -> R,
+    ) -> R {
+        let state = self
+            .state
+            .take()
+            .expect("a flow-state operation is lent to one request at a time");
+        let mut lease = OperationRequestLease {
+            slot: &mut self.state,
+            request: Some(FlowStateRequest::from_owned_state(cancellation, state)),
+        };
+        run(
+            &mut self.semantic_budget,
+            lease
+                .request
+                .as_mut()
+                .expect("the lease holds its request until drop"),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn consumption(&self) -> FlowStateOperationConsumption {
+        let state = self
+            .state
+            .as_ref()
+            .expect("consumption is read while no request is lent");
+        FlowStateOperationConsumption {
+            cfg_used: state.cfg_budget.used(),
+            semantic_used: self.semantic_budget.used(),
+            cfg_refusals: state.cfg_budget.refusal_count(),
+            semantic_refusals: self.semantic_budget.refusal_count(),
+            nonreturn_cfg_used: state.nonreturn_cfg_budget.used(),
+            nonreturn_cfg_refusals: state.nonreturn_cfg_budget.refusal_count(),
+        }
+    }
+}
+
+/// Returns the lent state to its operation on every exit, including unwind.
+struct OperationRequestLease<'a, 't> {
+    slot: &'a mut Option<FlowStateOwnedState>,
+    request: Option<FlowStateRequest<'t>>,
+}
+
+impl Drop for OperationRequestLease<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            *self.slot = Some(request.into_owned_state());
+        }
     }
 }
 
@@ -6954,18 +7243,28 @@ pub fn flow_state_for_materialized_artifact(
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
     request: &mut FlowStateRequest<'_>,
 ) -> FileFlowState {
-    flow_state_for_materialized_selection(workspace, file, outcome, None, request, None)
+    flow_state_for_materialized_fresh_budget(workspace, file, outcome, None, request, None)
 }
 
-/// Derive all procedures while reusing one query's ICFG provider.
+/// Derive all procedures while reusing one query's ICFG provider, charging
+/// the caller's semantic ledger (a `FlowStateOperation`'s, for a retained one).
 pub fn flow_state_for_materialized_artifact_with_provider(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
     request: &mut FlowStateRequest<'_>,
+    semantic_budget: &mut SemanticBudget,
     provider: &WorkspaceIcfgProvider<'_>,
 ) -> FileFlowState {
-    flow_state_for_materialized_selection(workspace, file, outcome, None, request, Some(provider))
+    flow_state_for_materialized_selection(
+        workspace,
+        file,
+        outcome,
+        None,
+        request,
+        semantic_budget,
+        Some(provider),
+    )
 }
 
 /// Derive state events and flow relations for one procedure from the exact
@@ -6990,16 +7289,25 @@ pub fn flow_state_for_materialized_procedure(
         );
     }
 
-    flow_state_for_materialized_selection(workspace, file, outcome, Some(procedure), request, None)
+    flow_state_for_materialized_fresh_budget(
+        workspace,
+        file,
+        outcome,
+        Some(procedure),
+        request,
+        None,
+    )
 }
 
-/// Derive one exact procedure while reusing one query's ICFG provider.
+/// Derive one exact procedure while reusing one query's ICFG provider,
+/// charging the caller's semantic ledger.
 pub fn flow_state_for_materialized_procedure_with_provider(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
     procedure: &ProcedureHandle,
     request: &mut FlowStateRequest<'_>,
+    semantic_budget: &mut SemanticBudget,
     provider: &WorkspaceIcfgProvider<'_>,
 ) -> FileFlowState {
     if let Some(artifact) = outcome.available_value() {
@@ -7011,6 +7319,7 @@ pub fn flow_state_for_materialized_procedure_with_provider(
         outcome,
         Some(procedure),
         request,
+        semantic_budget,
         Some(provider),
     )
 }
@@ -7091,7 +7400,9 @@ pub fn flow_state_for_selected_property(
     }
     // These are acquisition/control failures, independent of a property
     // subject. Aggregate memory/lowering reasons are checked by the selected
-    // provider against their original semantic identities below.
+    // provider against their original semantic identities below. A snapshot
+    // budget stop also withheld the original event endpoints: a fresh
+    // snapshot cannot repair that event projection, so its cause stays.
     reasons.extend(
         original
             .completeness
@@ -7111,6 +7422,32 @@ pub fn flow_state_for_selected_property(
             })
             .cloned(),
     );
+    // No selected relation can join to an aggregate projection that withheld
+    // every property endpoint. Do not acquire or solve another snapshot for
+    // each point; cancellation is still observed as a separate typed stop.
+    if original.completeness.reasons().iter().any(|reason| {
+        matches!(
+            reason,
+            FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. }
+        )
+    }) {
+        analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
+        if let Err(reason) =
+            crate::analyzer::semantic::selected_property_read_event_index(procedure, point)
+        {
+            reasons.push(FlowStateIncompleteReason::PropertyReaching { reason });
+        }
+        if request.cancellation.is_cancelled() {
+            reasons.push(FlowStateIncompleteReason::Cancelled);
+        }
+        return FileFlowState::incomplete(
+            reasons,
+            state.generation,
+            state.active_model_set_hash.clone(),
+            reuse,
+        );
+    }
     let mut derived = original.clone();
     derived.relations.clear();
     let outcome = workspace.semantic_oracle_provider().procedure_relations(
@@ -7123,15 +7460,32 @@ pub fn flow_state_for_selected_property(
             detail: error.to_string(),
         }),
         Ok(outcome) => {
-            if !matches!(outcome, SemanticOutcome::Complete { .. }) {
-                reasons.push(FlowStateIncompleteReason::PropertyAnalysisPartial {
-                    detail: format!(
-                        "selected property acquisition is `{}`",
-                        outcome_label(&outcome)
-                    ),
-                });
+            let verdict = semantic_outcome_verdict(&outcome);
+            if !verdict.is_content() {
+                analyzer.mark_execution_dependent();
+                reuse.join_in(verdict);
+                if let Err(reason) =
+                    crate::analyzer::semantic::selected_property_read_event_index(procedure, point)
+                {
+                    reasons.push(FlowStateIncompleteReason::PropertyReaching { reason });
+                }
             }
-            if let Some(snapshot) = outcome.available_value() {
+            if !matches!(outcome, SemanticOutcome::Complete { .. }) {
+                reasons.push(
+                    semantic_outcome_stop_reason(&outcome, FlowStateAxis::PropertyReachingRelation)
+                        .unwrap_or_else(|| FlowStateIncompleteReason::PropertyAnalysisPartial {
+                            detail: format!(
+                                "selected property acquisition is `{}`",
+                                outcome_label(&outcome)
+                            ),
+                        }),
+                );
+            }
+            // A stopped snapshot may omit stores and therefore kill facts;
+            // even a retained may-reaching pair need not hold in the full graph.
+            if verdict.is_content()
+                && let Some(snapshot) = outcome.available_value()
+            {
                 let graph =
                     ProjectedProcedureGraph::new(procedure.semantics(), &derived.control_edge_mask);
                 let selected =
@@ -7174,15 +7528,16 @@ pub fn flow_state_for_selected_property(
                         )
                     }))
                 {
-                    if property_event_id(
-                        &derived.events,
-                        &derived.event_keys,
-                        class,
-                        point,
-                        event_index,
-                        source,
-                    )
-                    .is_none()
+                    if !derived.skipped_copies.contains((point, event_index))
+                        && property_event_id(
+                            &derived.events,
+                            &derived.event_keys,
+                            class,
+                            point,
+                            event_index,
+                            source,
+                        )
+                        .is_none()
                     {
                         reasons.push(
                             FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable {
@@ -7197,20 +7552,24 @@ pub fn flow_state_for_selected_property(
                     &derived.events,
                     &derived.event_keys,
                     &selected,
+                    &derived.skipped_copies,
                     state.generation,
                 );
-            } else {
-                reasons.push(FlowStateIncompleteReason::PropertyAnalysisPartial {
-                    detail: format!(
-                        "selected property snapshot outcome is `{}`",
-                        outcome_label(&outcome)
-                    ),
-                });
             }
         }
     }
     if analyzer.project().analysis_generation() != state.generation {
         reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
+    }
+    // Acquisition can retain a budget outcome when cancellation arrives
+    // after that refusal. Observe the request independently at completion.
+    if request.cancellation.is_cancelled() {
+        analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
+        if !reasons.contains(&FlowStateIncompleteReason::Cancelled) {
+            reasons.push(FlowStateIncompleteReason::Cancelled);
+        }
+        derived.relations.clear();
     }
     derived.completeness = FlowStateCompleteness::from_reasons(reasons.clone());
     FileFlowState {
@@ -7222,12 +7581,15 @@ pub fn flow_state_for_selected_property(
     }
 }
 
+/// The one selection body. Every materialized entry point funnels here with
+/// the semantic ledger it wants this derivation charged to.
 fn flow_state_for_materialized_selection(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
     selected_procedure: Option<&ProcedureHandle>,
     request: &mut FlowStateRequest<'_>,
+    budget: &mut SemanticBudget,
     provider: Option<&WorkspaceIcfgProvider<'_>>,
 ) -> FileFlowState {
     let analyzer = workspace.analyzer();
@@ -7246,28 +7608,6 @@ fn flow_state_for_materialized_selection(
     let active_model_set_hash = active_snapshot
         .as_ref()
         .map(|snapshot| Box::<str>::from(snapshot.active_models().active_model_set_hash()));
-    let mut budget = match SemanticBudget::new(SemanticWork::default_limits()) {
-        Ok(budget) => budget,
-        Err(error) => {
-            brokk_bifrost_core::profiling::note_with(|| {
-                format!(
-                    "policy.units unbounded origin={}:{} cause=provider:budget_configuration",
-                    file!(),
-                    line!()
-                )
-            });
-            analyzer.mark_execution_dependent();
-            return FileFlowState::incomplete(
-                vec![FlowStateIncompleteReason::SemanticProviderFailed {
-                    detail: error.to_string(),
-                }],
-                generation,
-                active_model_set_hash,
-                EXECUTION_STOP,
-            );
-        }
-    };
-
     flow_state_for_materialized_outcome(
         workspace,
         file,
@@ -7276,14 +7616,106 @@ fn flow_state_for_materialized_selection(
         generation,
         active_snapshot,
         active_model_set_hash,
-        &mut budget,
+        budget,
         request,
         provider,
     )
 }
 
+/// The legacy direct entry points keep one fresh semantic grant per call,
+/// even when a standalone caller reuses one request across derivations.
+fn flow_state_for_materialized_fresh_budget(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+    selected_procedure: Option<&ProcedureHandle>,
+    request: &mut FlowStateRequest<'_>,
+    provider: Option<&WorkspaceIcfgProvider<'_>>,
+) -> FileFlowState {
+    let mut budget = match SemanticBudget::new(SemanticWork::default_limits()) {
+        Ok(budget) => budget,
+        Err(error) => {
+            let analyzer = workspace.analyzer();
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:budget_configuration",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
+            let active_model_set_hash = request
+                .active_semantic_model_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.as_ref())
+                .map(|snapshot| Box::<str>::from(snapshot.active_models().active_model_set_hash()));
+            return FileFlowState::incomplete(
+                vec![FlowStateIncompleteReason::SemanticProviderFailed {
+                    detail: error.to_string(),
+                }],
+                analyzer.project().analysis_generation(),
+                active_model_set_hash,
+                EXECUTION_STOP,
+            );
+        }
+    };
+    flow_state_for_materialized_selection(
+        workspace,
+        file,
+        outcome,
+        selected_procedure,
+        request,
+        &mut budget,
+        provider,
+    )
+}
+
+/// Every flow-state derivation ends here. A cancelled token makes the result
+/// an execution stop on EVERY return path, including the early returns and the
+/// paths that only abandon optional work silently (the nonreturn projection
+/// returns an empty derivation on cancellation) or record a bare `Cancelled`
+/// reason without a verdict. Reason rows are unchanged.
 #[allow(clippy::too_many_arguments)]
 fn flow_state_for_materialized_outcome(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+    selected_procedure: Option<&ProcedureHandle>,
+    generation: u64,
+    active_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    active_model_set_hash: Option<Box<str>>,
+    budget: &mut SemanticBudget,
+    request: &mut FlowStateRequest<'_>,
+    provider: Option<&WorkspaceIcfgProvider<'_>>,
+) -> FileFlowState {
+    let mut state = derive_flow_state_for_materialized_outcome(
+        workspace,
+        file,
+        outcome,
+        selected_procedure,
+        generation,
+        active_snapshot,
+        active_model_set_hash,
+        budget,
+        request,
+        provider,
+    );
+    if request.cancellation.is_cancelled() {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=cancelled",
+                file!(),
+                line!()
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+        state.reuse.join_in(EXECUTION_STOP);
+    }
+    state
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_flow_state_for_materialized_outcome(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
@@ -7300,6 +7732,12 @@ fn flow_state_for_materialized_outcome(
     let active_models = active_snapshot
         .as_ref()
         .map(|snapshot| snapshot.active_models().as_ref());
+    // Both ledgers may be shared with earlier derivations (a retained
+    // `FlowStateOperation`). Only a refusal this derivation itself caused is
+    // its own cause; an outer query's recorded stop stays sticky through the
+    // analyzer's execution-dependence marks.
+    let cfg_refusals_at_entry = request.cfg_budget.refusal_count();
+    let semantic_refusals_at_entry = budget.refusal_count();
 
     let mut reuse = semantic_outcome_verdict(&outcome);
     if !reuse.is_content() {
@@ -7450,7 +7888,24 @@ fn flow_state_for_materialized_outcome(
         // separate ledger. Exhausting wrapper discovery must retain raw edges;
         // it must not consume the budget for the ordinary flow relations that
         // remain valid without this precision improvement.
-        let mut nonreturn_cfg_budget = request.cfg_budget.clone();
+        //
+        // A lent operation owns this ledger across derivations (its recorded
+        // spending is the only provenance of "pristine"); a standalone request
+        // keeps the per-call clone, byte for byte as before.
+        let mut per_call_budget;
+        let optional_at_entry = request.nonreturn_cfg_budget.as_ref().map(|owned| {
+            (
+                owned.used() != CfgAlgorithmWork::default(),
+                owned.refusal_count(),
+            )
+        });
+        let nonreturn_cfg_budget = match request.nonreturn_cfg_budget.as_mut() {
+            Some(owned) => owned,
+            None => {
+                per_call_budget = request.cfg_budget.clone();
+                &mut per_call_budget
+            }
+        };
         let _scope = profiling::scope("flow.workspace_nonreturn_projection");
         modeled_projection.extend(derive_workspace_nonreturn_projection(
             workspace,
@@ -7459,11 +7914,32 @@ fn flow_state_for_materialized_outcome(
             requested_procedure,
             active_snapshot.as_ref(),
             budget,
-            &mut nonreturn_cfg_budget,
+            nonreturn_cfg_budget,
             request.cancellation,
             provider,
             request.nonreturn_discovery_cache,
         ));
+        // A refusal on an owned ledger that earlier derivations already spent
+        // depends on those seeds, not on this file's content: an execution
+        // stop. A refusal from a ledger with no recorded spending is what the
+        // legacy whole-file pass would have produced too: the reason stays
+        // Content-incomplete. The delta is relative to entry, so an earlier
+        // seed's refusal never becomes this derivation's cause.
+        if let (Some((spent_at_entry, refusals_at_entry)), Some(owned)) =
+            (optional_at_entry, request.nonreturn_cfg_budget.as_ref())
+            && spent_at_entry
+            && owned.refusal_count() > refusals_at_entry
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:nonreturn_shared",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_STOP);
+        }
     }
     file_reasons.extend(modeled_projection.file_reasons);
     let mut procedure_projection_reasons = modeled_projection.procedure_reasons;
@@ -7537,14 +8013,14 @@ fn flow_state_for_materialized_outcome(
         .collect();
     drop(derive_selected_procedures_scope);
 
-    if request.cfg_budget.refusal_count() > 0 || budget.refusal_count() > 0 {
+    let cfg_refused = request.cfg_budget.refusal_count() > cfg_refusals_at_entry;
+    let semantic_refused = budget.refusal_count() > semantic_refusals_at_entry;
+    if cfg_refused || semantic_refused {
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
-                "policy.units unbounded origin={}:{} cause=budget:flow_derivation cfg={} semantic={}",
+                "policy.units unbounded origin={}:{} cause=budget:flow_derivation cfg={cfg_refused} semantic={semantic_refused}",
                 file!(),
                 line!(),
-                request.cfg_budget.refusal_count() > 0,
-                budget.refusal_count() > 0
             )
         });
         analyzer.mark_execution_dependent();
@@ -7867,6 +8343,11 @@ fn derive_procedure(
                 }
                 Some(result)
             }
+            Err(FlowStateIncompleteReason::BudgetExhausted { detail, .. }) => {
+                // Preserve property provenance for scoped binding proofs.
+                reasons.push(FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { detail });
+                None
+            }
             Err(reason) => {
                 reasons.push(reason);
                 None
@@ -7888,6 +8369,7 @@ fn derive_procedure(
         event_keys: Vec::new(),
         uncanonical_accesses: 0,
         properties_available,
+        skipped_copies: SkippedCopies::default(),
     };
     reasons.extend(
         builder
@@ -7913,7 +8395,13 @@ fn derive_procedure(
         );
     }
 
-    append_kill_events(&mut events, &mut event_keys, property_result.as_ref());
+    let skipped_copies = builder.skipped_copies;
+    append_kill_events(
+        &mut events,
+        &mut event_keys,
+        property_result.as_ref(),
+        &skipped_copies,
+    );
     let unestablished = unestablished_local_bindings(procedure, &events);
     if unestablished > 0 {
         reasons.push(FlowStateIncompleteReason::BindingWithoutEstablishment {
@@ -7927,6 +8415,7 @@ fn derive_procedure(
         &events,
         &event_keys,
         property_result.as_ref(),
+        &skipped_copies,
         generation,
         request,
         &mut reasons,
@@ -8001,6 +8490,7 @@ fn derive_procedure(
         control_edge_mask,
         binding_initialization,
         event_keys,
+        skipped_copies,
     };
     (derivation, reuse)
 }
@@ -8264,6 +8754,30 @@ fn push_gap_reason(reasons: &mut Vec<FlowStateIncompleteReason>, gap: &SemanticG
     }
 }
 
+/// The single property-reaching acquisition path for one exact procedure
+/// over its unmodified control graph.
+///
+/// Flow-state derivation and the RQL field access steps both obtain their
+/// `PropertyReachingResult` here, so a store or load is classified by one
+/// owner. The result's own incompleteness is never summarized away.
+pub fn property_reaching_for_procedure(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    request: &FlowStateRequest<'_>,
+    semantic_budget: &mut SemanticBudget,
+) -> (
+    Result<PropertyReachingResult, FlowStateIncompleteReason>,
+    ReuseVerdict,
+) {
+    materialize_property_reaching(
+        workspace,
+        procedure,
+        &ControlEdgeMask::default(),
+        request,
+        semantic_budget,
+    )
+}
+
 /// Materialize the analysis-owned property relation for one exact procedure.
 ///
 /// The value-flow snapshot and its structured location identities are owned by
@@ -8281,6 +8795,7 @@ fn materialize_property_reaching(
     Result<PropertyReachingResult, FlowStateIncompleteReason>,
     ReuseVerdict,
 ) {
+    let admissions = semantic_budget.scratch_mark();
     let outcome = match workspace.semantic_oracle_provider().procedure_relations(
         procedure,
         &OracleCallContext::empty(),
@@ -8317,6 +8832,16 @@ fn materialize_property_reaching(
             )
         });
         workspace.analyzer().mark_execution_dependent();
+    }
+    // Collection stops refuse: missing MemoryStore rows remove kills and can
+    // invent reaching pairs. Post-solve caps such as max_reaching_pairs only
+    // truncate the solved relation and keep its rows.
+    if let Some(reason) =
+        semantic_outcome_stop_reason(&outcome, FlowStateAxis::PropertyReachingRelation)
+    {
+        drop(outcome);
+        semantic_budget.release_scratch_since(&admissions);
+        return (Err(reason), reuse);
     }
     let Some(snapshot) = outcome.available_value() else {
         let reason = FlowStateIncompleteReason::PropertyAnalysisPartial {
@@ -8394,6 +8919,13 @@ fn materialize_property_reaching(
     (Ok(result), reuse)
 }
 
+/// What one field access presents as, before any counting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PropertyProbe {
+    Subject(FlowSubject),
+    UncanonicalBase,
+}
+
 /// The semantic identity of a projected event. This stays parallel to the
 /// public rows instead of widening `StateEventRow`: downstream RQL fixtures
 /// construct those rows directly, while structured property records need the
@@ -8412,6 +8944,88 @@ struct EventBuilder<'a> {
     event_keys: Vec<SemanticEventKey>,
     uncanonical_accesses: usize,
     properties_available: bool,
+    skipped_copies: SkippedCopies,
+}
+
+/// Position of one event inside a procedure: its point and event index.
+type EventPosition = (ProgramPointId, u32);
+
+/// Same-point field copies that the event projection omits.
+///
+/// Rust lowers `let m = Meta { count: 1 };` to a load of the literal's field
+/// into a temporary and a store of that temporary into the same field of `m`.
+/// When the literal and `m` are one subject, that pair moves a value from a
+/// slot to itself. It is not an access in the source, so it emits neither a
+/// Read nor an Establish. Reaching rows that name the skipped store forward
+/// to the stores that reach the skipped load.
+#[derive(Debug, Default, Clone)]
+struct SkippedCopies {
+    /// Skipped store position to the position of the load that feeds it.
+    store_to_load: HashMap<EventPosition, EventPosition>,
+    /// The loads that `store_to_load` maps to, so membership is one lookup.
+    loads: HashSet<EventPosition>,
+}
+
+impl SkippedCopies {
+    fn contains(&self, position: EventPosition) -> bool {
+        self.store_to_load.contains_key(&position) || self.loads.contains(&position)
+    }
+}
+
+/// Reaching rows indexed by the position of the read they end at, to resolve
+/// a skipped copy store to the stores that supply its value.
+struct ForwardedReaching<'a> {
+    skipped: &'a SkippedCopies,
+    by_read: HashMap<EventPosition, Vec<&'a PropertyReachingRelation>>,
+}
+
+impl<'a> ForwardedReaching<'a> {
+    fn new(result: &'a PropertyReachingResult, skipped: &'a SkippedCopies) -> Self {
+        let mut by_read = HashMap::<_, Vec<_>>::default();
+        if !skipped.store_to_load.is_empty() {
+            for relation in result.reaching() {
+                by_read
+                    .entry((relation.read.point.id(), relation.read.event_index))
+                    .or_default()
+                    .push(relation);
+            }
+        }
+        Self { skipped, by_read }
+    }
+
+    /// The stores that supply the value `store` writes, with the certainty of
+    /// the whole chain. An ordinary store supplies itself. A skipped copy
+    /// store supplies whatever reaches the load it copies, and the chain is
+    /// exact only when every link is.
+    fn origins(
+        &self,
+        store: &'a PropertyStoreRecord,
+        certainty: PropertyReachCertainty,
+    ) -> Vec<(&'a PropertyStoreRecord, PropertyReachCertainty)> {
+        let mut origins = Vec::new();
+        let mut visited = HashSet::default();
+        let mut pending = vec![(store, certainty)];
+        while let Some((store, certainty)) = pending.pop() {
+            let position = (store.point.id(), store.event_index);
+            let Some(load) = self.skipped.store_to_load.get(&position) else {
+                origins.push((store, certainty));
+                continue;
+            };
+            if !visited.insert(position) {
+                continue;
+            }
+            for relation in self.by_read.get(load).into_iter().flatten() {
+                let chained = match (certainty, relation.certainty) {
+                    (PropertyReachCertainty::Exact, PropertyReachCertainty::Exact) => {
+                        PropertyReachCertainty::Exact
+                    }
+                    _ => PropertyReachCertainty::May,
+                };
+                pending.push((&relation.store, chained));
+            }
+        }
+        origins
+    }
 }
 
 impl EventBuilder<'_> {
@@ -8423,8 +9037,8 @@ impl EventBuilder<'_> {
         procedure: &ProcedureSemantics,
         property_result: Option<&PropertyReachingResult>,
     ) -> Vec<String> {
-        let bases = BindingBases::build(procedure);
         let binding_origins = BindingOriginIndex::from_semantics(procedure);
+        let bases = BindingBases::build(procedure, &binding_origins);
         let receiver_preparations = procedure.implicit_receiver_preparation_memory_events();
         let property_stores = property_result.map_or_else(HashMap::default, |result| {
             result
@@ -8440,9 +9054,18 @@ impl EventBuilder<'_> {
                 .map(|read| ((read.point.id(), read.event_index), read))
                 .collect::<HashMap<_, _>>()
         });
+        self.skipped_copies = self.find_self_copies(
+            procedure,
+            &bases,
+            &receiver_preparations,
+            &property_stores,
+            &property_reads,
+        );
         for point in procedure.points() {
             for (event_index, event) in point.events.iter().enumerate() {
-                if receiver_preparations.contains(&(point.id, event_index)) {
+                if receiver_preparations.contains(&(point.id, event_index))
+                    || self.skipped_copies.contains((point.id, event_index as u32))
+                {
                     continue;
                 }
                 let (class, subject, value) = match &event.effect {
@@ -8843,6 +9466,106 @@ impl EventBuilder<'_> {
         incomplete
     }
 
+    /// Find the field copies whose load and store name one subject.
+    ///
+    /// A pair qualifies only when the original load base is an allocation
+    /// result of this procedure, both events are at one point, the load comes
+    /// first, the store writes exactly the loaded value, nothing else reads
+    /// that value, and both locations present as the same property subject.
+    /// When the literal does not canonicalize to its holder the subjects
+    /// differ and the transfer stays a real transfer. Probing never counts an
+    /// uncanonical access: the events that survive are counted when emitted.
+    fn find_self_copies(
+        &self,
+        procedure: &ProcedureSemantics,
+        bases: &BindingBases,
+        receiver_preparations: &HashSet<(ProgramPointId, usize)>,
+        property_stores: &HashMap<(ProgramPointId, u32), &PropertyStoreRecord>,
+        property_reads: &HashMap<(ProgramPointId, u32), &PropertyReadRecord>,
+    ) -> SkippedCopies {
+        let mut skipped = SkippedCopies::default();
+        let allocation_results: HashSet<_> = procedure
+            .allocations()
+            .iter()
+            .map(|allocation| allocation.result)
+            .collect();
+        for point in procedure.points() {
+            for (load_index, load_event) in point.events.iter().enumerate() {
+                let SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field | MemoryAccessKind::Property,
+                    location: load_location,
+                    result,
+                } = &load_event.effect
+                else {
+                    continue;
+                };
+                let load_position = (point.id, load_index as u32);
+                let Some(read) = property_reads.get(&load_position) else {
+                    continue;
+                };
+                let Some(base) = procedure
+                    .memory_location(*load_location)
+                    .and_then(|location| match &location.kind {
+                        MemoryLocationKind::Field { base, .. }
+                        | MemoryLocationKind::Property { base, .. } => Some(*base),
+                        _ => None,
+                    })
+                else {
+                    continue;
+                };
+                if !allocation_results.contains(&base) {
+                    continue;
+                }
+                if receiver_preparations.contains(&(point.id, load_index))
+                    || !bases.consumed_only_by_one_store(*result)
+                {
+                    continue;
+                }
+                let Some(PropertyProbe::Subject(load_subject)) =
+                    self.probe_property_subject(procedure, bases, *load_location)
+                else {
+                    continue;
+                };
+                for (store_index, store_event) in
+                    point.events.iter().enumerate().skip(load_index + 1)
+                {
+                    let SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Field | MemoryAccessKind::Property,
+                        location: store_location,
+                        value,
+                    } = &store_event.effect
+                    else {
+                        continue;
+                    };
+                    let store_position = (point.id, store_index as u32);
+                    if value != result
+                        || receiver_preparations.contains(&(point.id, store_index))
+                        || !property_stores
+                            .get(&store_position)
+                            .is_some_and(|store| store.value.id() == read.value.id())
+                    {
+                        continue;
+                    }
+                    if self.probe_property_subject(procedure, bases, *store_location)
+                        == Some(PropertyProbe::Subject(load_subject.clone()))
+                    {
+                        // Two loads may write the same value, so a later load can
+                        // re-pair a store; the earlier load stays an ordinary read.
+                        // Each load pairs with at most one store (the loop breaks).
+                        if let Some(previous) =
+                            skipped.store_to_load.insert(store_position, load_position)
+                        {
+                            skipped.loads.remove(&previous);
+                        }
+                        skipped.loads.insert(load_position);
+                    }
+                    break;
+                }
+            }
+        }
+        skipped
+    }
+
     /// The source-facing property subject of one field access. This is only a
     /// presentation projection: structured property relations use the
     /// analysis-owned durable object/path/member key and never this binding or
@@ -8854,6 +9577,23 @@ impl EventBuilder<'_> {
         bases: &BindingBases,
         location: MemoryLocationId,
     ) -> Option<FlowSubject> {
+        match self.probe_property_subject(procedure, bases, location)? {
+            PropertyProbe::Subject(subject) => Some(subject),
+            PropertyProbe::UncanonicalBase => {
+                self.uncanonical_accesses = self.uncanonical_accesses.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// [`Self::property_subject`] without the side effect of counting an
+    /// uncanonical base.
+    fn probe_property_subject(
+        &self,
+        procedure: &ProcedureSemantics,
+        bases: &BindingBases,
+        location: MemoryLocationId,
+    ) -> Option<PropertyProbe> {
         if !self.properties_available {
             return None;
         }
@@ -8872,13 +9612,12 @@ impl EventBuilder<'_> {
             _ => return None,
         };
         let Some(canonical) = bases.canonical(base) else {
-            self.uncanonical_accesses = self.uncanonical_accesses.saturating_add(1);
-            return None;
+            return Some(PropertyProbe::UncanonicalBase);
         };
-        Some(FlowSubject::Property {
+        Some(PropertyProbe::Subject(FlowSubject::Property {
             base: canonical,
             member,
-        })
+        }))
     }
 
     /// The stable wire id of one program point, minted from the same artifact
@@ -9018,13 +9757,32 @@ fn binding_live_on_path_to_suspend(
     false
 }
 
-/// The binding each value is the IR's own copy of.
+/// The subject each value presents as in a property access.
 ///
-/// Built from `ValueFlow` alone: an effect that says "this binding's value
-/// flows into that value" is the lowering's own statement that the target
-/// holds the binding. Nothing else canonicalizes a base.
+/// A value read from a binding presents as that binding (`ValueFlow`). A
+/// value loaded from static storage presents as the first value loaded from
+/// that location. An allocation result presents as itself, or as the one
+/// binding that provably holds exactly that allocation. Nothing else
+/// canonicalizes a base.
 struct BindingBases {
     canonical: HashMap<ValueId, ValueId>,
+    /// Consumers of each allocation result and each field or property load
+    /// result, other than the object slot accesses that name it as a base.
+    other_uses: HashMap<ValueId, usize>,
+    /// Every value that is the object of a field, property or index slot.
+    slot_bases: HashSet<ValueId>,
+}
+
+/// What one pass over a procedure learns about an allocation result and the
+/// bindings that receive it.
+#[derive(Default)]
+struct AllocationFlows {
+    /// Each `Assignment { target, value: allocation }`, with the assignment's
+    /// event evidence.
+    assigned_to: Vec<(ValueId, EvidenceId)>,
+    /// Reads of the allocation other than its own slot accesses and the
+    /// binding assignments in `assigned_to`.
+    other_uses: usize,
 }
 
 impl BindingBases {
@@ -9032,7 +9790,13 @@ impl BindingBases {
     /// from static storage (a Java or C# static, a Go package variable, a
     /// Python module global) presents as the first value loaded from the
     /// same location, the storage-rooted counterpart of a binding.
-    fn build(procedure: &ProcedureSemantics) -> Self {
+    ///
+    /// An allocation result (a struct or object literal) is its own subject.
+    /// It presents as a binding `B` only when the allocation flows nowhere but
+    /// into `B` and `B` is established nowhere else, so that `B.f` and the
+    /// literal's `f` are one slot. Two allocation sites never share a subject:
+    /// `let mut x = A { f: 1 }; x = A { f: 2 };` keeps both literals apart.
+    fn build(procedure: &ProcedureSemantics, origins: &BindingOriginIndex) -> Self {
         let mut canonical = HashMap::default();
         let mut static_roots = HashMap::<MemoryLocationId, ValueId>::default();
         for point in procedure.points() {
@@ -9061,12 +9825,272 @@ impl BindingBases {
                 }
             }
         }
-        Self { canonical }
+        let (flows, establishments) = allocation_flows(procedure);
+        for allocation in procedure.allocations() {
+            let allocation = allocation.result;
+            let flow = flows
+                .get(&allocation)
+                .expect("every allocation result has a flow record");
+            // A binding is a candidate holder only for one proven, sole flow.
+            let holder = match flow.assigned_to.as_slice() {
+                [(binding, evidence)]
+                    if flow.other_uses == 0
+                        && establishments.get(binding) == Some(&1)
+                        && !origins.address_taken_binding_set().contains(binding)
+                        && procedure
+                            .value(*binding)
+                            .is_some_and(|value| value.kind == SemanticValueKind::Local)
+                        && procedure.evidence_row(*evidence).is_some_and(|row| {
+                            row.proof.establishes_complete_evidence(&row.completeness)
+                        }) =>
+                {
+                    Some(*binding)
+                }
+                _ => None,
+            };
+            canonical
+                .entry(allocation)
+                .or_insert(holder.unwrap_or(allocation));
+            // A binding that receives an allocation presents as itself, so the
+            // copy store into its field (`m.f` in `let m = Meta { f: 1 }`) has
+            // a subject: the allocation's own subject when the binding is its
+            // sole holder, the binding's own otherwise (`x = Meta { f: 2 }`
+            // after `let mut x = Meta { f: 1 }`). Bindings that receive no
+            // allocation keep their old presentation (#13899).
+            for (binding, _) in &flow.assigned_to {
+                if procedure
+                    .value(*binding)
+                    .is_some_and(|value| value.kind.is_binding())
+                {
+                    canonical.entry(*binding).or_insert(*binding);
+                }
+            }
+        }
+        let slot_bases = procedure
+            .memory_locations()
+            .iter()
+            .filter_map(|location| match &location.kind {
+                MemoryLocationKind::Field { base, .. }
+                | MemoryLocationKind::Property { base, .. }
+                | MemoryLocationKind::Index { base, .. } => Some(*base),
+                _ => None,
+            })
+            .collect();
+        let other_uses = flows
+            .into_iter()
+            .map(|(value, flow)| (value, flow.other_uses))
+            .collect();
+        Self {
+            canonical,
+            other_uses,
+            slot_bases,
+        }
+    }
+
+    /// Whether `result`, a field or property load result, is consumed by
+    /// exactly one store and by nothing else.
+    fn consumed_only_by_one_store(&self, result: ValueId) -> bool {
+        self.other_uses.get(&result) == Some(&1) && !self.slot_bases.contains(&result)
     }
 
     fn canonical(&self, value: ValueId) -> Option<ValueId> {
         self.canonical.get(&value).copied()
     }
+}
+
+/// Every flow of every allocation result, and how many times each binding is
+/// established, in one pass.
+///
+/// The read-side match is exhaustive on purpose: a new effect that reads a
+/// value must be classified here before it can compile, because a missed read
+/// would let an escaping allocation present as a binding.
+fn allocation_flows(
+    procedure: &ProcedureSemantics,
+) -> (HashMap<ValueId, AllocationFlows>, HashMap<ValueId, usize>) {
+    let mut flows = procedure
+        .allocations()
+        .iter()
+        .map(|allocation| (allocation.result, AllocationFlows::default()))
+        .collect::<HashMap<_, _>>();
+    // Field and property load results are tracked the same way, so a copy
+    // temporary can be proven to feed one store and nothing else.
+    for point in procedure.points() {
+        for event in point.events.iter() {
+            if let SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field | MemoryAccessKind::Property,
+                result,
+                ..
+            } = &event.effect
+            {
+                flows.entry(*result).or_default();
+            }
+        }
+    }
+    let mut establishments = HashMap::<ValueId, usize>::default();
+    let use_of = |flows: &mut HashMap<ValueId, AllocationFlows>, value: ValueId| {
+        if let Some(flow) = flows.get_mut(&value) {
+            flow.other_uses += 1;
+        }
+    };
+    for location in procedure.memory_locations() {
+        // The base of a field, property or index access is the object's own
+        // slot. Any other consumer of the allocation value is a flow.
+        match &location.kind {
+            MemoryLocationKind::Index {
+                index: Some(index), ..
+            } => use_of(&mut flows, *index),
+            MemoryLocationKind::Dereference { address } => use_of(&mut flows, *address),
+            // A cell or capture slot names a binding, never an allocation.
+            MemoryLocationKind::Field { .. }
+            | MemoryLocationKind::Property { .. }
+            | MemoryLocationKind::Index { index: None, .. }
+            | MemoryLocationKind::LexicalCell { .. }
+            | MemoryLocationKind::Capture { .. }
+            | MemoryLocationKind::Static { .. } => {}
+        }
+    }
+    for call in procedure.call_sites() {
+        use_of(&mut flows, call.callee);
+        for value in call.receiver.iter().chain(call.thrown.iter()) {
+            use_of(&mut flows, *value);
+        }
+        for argument in call.arguments.iter() {
+            use_of(&mut flows, argument.value);
+        }
+    }
+    // A captured binding can be rebound by the child procedure, whose writes
+    // this procedure does not see. Counting the capture as an establishment
+    // keeps such a binding from ever presenting as one allocation.
+    for capture in procedure.captures() {
+        let captured = match capture.captured {
+            CaptureSource::Value(value) => Some(value),
+            CaptureSource::Location(location) => {
+                procedure
+                    .memory_location(location)
+                    .and_then(|row| match row.kind {
+                        MemoryLocationKind::LexicalCell { binding } => Some(binding),
+                        _ => None,
+                    })
+            }
+        };
+        if let Some(binding) = captured {
+            *establishments.entry(binding).or_default() += 1;
+        }
+    }
+    for move_out in procedure.move_outs() {
+        use_of(&mut flows, move_out.source_value);
+        use_of(&mut flows, move_out.target_value);
+    }
+    for point in procedure.points() {
+        for event in point.events.iter() {
+            match &event.effect {
+                SemanticEffect::Assignment { target, value } => {
+                    *establishments.entry(*target).or_default() += 1;
+                    if let Some(flow) = flows.get_mut(value) {
+                        flow.assigned_to.push((*target, event.evidence));
+                    }
+                }
+                SemanticEffect::AggregateInitializer {
+                    aggregate, value, ..
+                } => {
+                    use_of(&mut flows, *aggregate);
+                    use_of(&mut flows, *value);
+                }
+                SemanticEffect::ValueFlow { source, target, .. } => {
+                    // The lowering records one binding write as an
+                    // `Assignment` and a `ValueFlow` of the same value at one
+                    // point; the second record is not another establishment.
+                    let paired = point.events.iter().any(|other| {
+                        matches!(
+                            other.effect,
+                            SemanticEffect::Assignment { target: assigned_to, value: assigned }
+                                if assigned_to == *target && assigned == *source
+                        )
+                    });
+                    if !paired {
+                        *establishments.entry(*target).or_default() += 1;
+                        use_of(&mut flows, *source);
+                    }
+                }
+                SemanticEffect::ValueUse { value, .. } => use_of(&mut flows, *value),
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } => {
+                    let cell_binding =
+                        procedure
+                            .memory_location(*location)
+                            .and_then(|row| match row.kind {
+                                MemoryLocationKind::LexicalCell { binding }
+                                | MemoryLocationKind::Capture {
+                                    binding: Some(binding),
+                                    ..
+                                } => Some(binding),
+                                _ => None,
+                            });
+                    let paired = cell_binding.is_some_and(|binding| {
+                        point.events.iter().any(|other| {
+                            matches!(
+                                other.effect,
+                                SemanticEffect::Assignment { target, value: assigned }
+                                    if target == binding && assigned == *value
+                            )
+                        })
+                    });
+                    // A cell store beside the assignment of the same value to
+                    // the same binding is the lowering's second record of one
+                    // establishment, not another flow.
+                    if !paired {
+                        use_of(&mut flows, *value);
+                        if let Some(binding) = cell_binding {
+                            *establishments.entry(binding).or_default() += 1;
+                        }
+                    }
+                }
+                SemanticEffect::Synchronization {
+                    subject, payload, ..
+                } => {
+                    use_of(&mut flows, *subject);
+                    if let Some(SynchronizationPayload::Send { value, .. }) = payload {
+                        use_of(&mut flows, *value);
+                    }
+                }
+                SemanticEffect::CallableCreation { callable, .. }
+                | SemanticEffect::CallableReference { callable, .. } => {
+                    if let Some(receiver) = callable.bound_receiver {
+                        use_of(&mut flows, receiver);
+                    }
+                }
+                SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
+                    if let Some(value) = value {
+                        use_of(&mut flows, *value);
+                    }
+                }
+                SemanticEffect::AsyncSuspend { awaited, .. } => {
+                    if let Some(value) = awaited {
+                        use_of(&mut flows, *value);
+                    }
+                }
+                SemanticEffect::CaptureBind { capture } => {
+                    if let Some(CaptureSource::Value(value)) =
+                        procedure.capture(*capture).map(|row| row.captured)
+                    {
+                        use_of(&mut flows, value);
+                    }
+                }
+                SemanticEffect::Entry
+                | SemanticEffect::NormalExit
+                | SemanticEffect::ExceptionalExit
+                | SemanticEffect::Allocation { .. }
+                | SemanticEffect::MemoryLoad { .. }
+                | SemanticEffect::Invoke { .. }
+                | SemanticEffect::CallContinuation { .. }
+                | SemanticEffect::AsyncResume { .. }
+                | SemanticEffect::Gap { .. }
+                | SemanticEffect::MemoryInterference => {}
+            }
+        }
+    }
+    (flows, establishments)
 }
 
 /// A binding write with more than one establishment terminates the binding's
@@ -9083,6 +10107,7 @@ fn append_kill_events(
     events: &mut Vec<StateEventRow>,
     event_keys: &mut Vec<SemanticEventKey>,
     property_result: Option<&PropertyReachingResult>,
+    skipped: &SkippedCopies,
 ) {
     assert_eq!(
         events.len(),
@@ -9090,13 +10115,20 @@ fn append_kill_events(
         "each projected event has one semantic join key"
     );
     let strong_property_events = property_result.map_or_else(HashSet::default, |result| {
+        // A skipped copy store is not a write of the source program, so it
+        // neither kills the store that fed it nor counts toward a second store.
+        let projected = || {
+            result.stores().iter().filter(|store| {
+                !skipped
+                    .store_to_load
+                    .contains_key(&(store.point.id(), store.event_index))
+            })
+        };
         let mut store_counts = HashMap::<_, usize>::default();
-        for store in result.stores() {
+        for store in projected() {
             *store_counts.entry(store.location.clone()).or_default() += 1;
         }
-        result
-            .stores()
-            .iter()
+        projected()
             .filter(|store| {
                 store.strong_update
                     && store_counts
@@ -9178,6 +10210,7 @@ fn derive_relations(
     events: &[StateEventRow],
     event_keys: &[SemanticEventKey],
     property_result: Option<&PropertyReachingResult>,
+    skipped: &SkippedCopies,
     generation: u64,
     request: &mut FlowStateRequest<'_>,
     reasons: &mut Vec<FlowStateIncompleteReason>,
@@ -9194,6 +10227,7 @@ fn derive_relations(
             events,
             event_keys,
             property_result,
+            skipped,
             generation,
             request,
             reasons,
@@ -9207,6 +10241,7 @@ fn derive_relations(
         events,
         event_keys,
         property_result,
+        skipped,
         generation,
         request,
         reasons,
@@ -9221,6 +10256,7 @@ fn derive_control_relations<G>(
     events: &[StateEventRow],
     event_keys: &[SemanticEventKey],
     property_result: Option<&PropertyReachingResult>,
+    skipped: &SkippedCopies,
     generation: u64,
     request: &mut FlowStateRequest<'_>,
     reasons: &mut Vec<FlowStateIncompleteReason>,
@@ -9267,6 +10303,7 @@ where
                     events,
                     event_keys,
                     property_result,
+                    skipped,
                     &dominance,
                     generation,
                 ));
@@ -9290,6 +10327,7 @@ where
             events,
             event_keys,
             property_result,
+            skipped,
             &dominance,
             generation,
         ));
@@ -10633,20 +11671,12 @@ fn property_reaching_relations(
     events: &[StateEventRow],
     event_keys: &[SemanticEventKey],
     property_result: &PropertyReachingResult,
+    skipped: &SkippedCopies,
     generation: u64,
 ) -> Vec<FlowRelationRow> {
+    let forwarded = ForwardedReaching::new(property_result, skipped);
     let mut rows = Vec::new();
     for relation in property_result.reaching() {
-        let Some(source_event) = property_event_id(
-            events,
-            event_keys,
-            StateEventClass::Establish,
-            relation.store.point.id(),
-            relation.store.event_index,
-            relation.store.source,
-        ) else {
-            continue;
-        };
         let Some(target_event) = property_event_id(
             events,
             event_keys,
@@ -10657,20 +11687,57 @@ fn property_reaching_relations(
         ) else {
             continue;
         };
-        rows.push(FlowRelationRow {
-            relation: FlowRelation::Reaching,
-            certainty: match relation.certainty {
-                PropertyReachCertainty::Exact => FlowCertainty::Exact,
-                PropertyReachCertainty::May => FlowCertainty::May,
-            },
-            source_event,
-            target_event,
-            procedure: relation.read.procedure.id(),
-            generation,
-        });
+        for (store, certainty) in forwarded.origins(&relation.store, relation.certainty) {
+            let Some(source_event) = property_event_id(
+                events,
+                event_keys,
+                StateEventClass::Establish,
+                store.point.id(),
+                store.event_index,
+                store.source,
+            ) else {
+                continue;
+            };
+            rows.push(FlowRelationRow {
+                relation: FlowRelation::Reaching,
+                certainty: match certainty {
+                    PropertyReachCertainty::Exact => FlowCertainty::Exact,
+                    PropertyReachCertainty::May => FlowCertainty::May,
+                },
+                source_event,
+                target_event,
+                procedure: relation.read.procedure.id(),
+                generation,
+            });
+        }
     }
 
-    rows
+    merge_forwarded_relation_rows(rows)
+}
+
+/// Merge relation rows that name the same pair of events.
+///
+/// A store reaches a read both directly and through a skipped copy whose load
+/// it feeds, so forwarding can project one pair twice. The pair keeps one row,
+/// and its certainty is `May` when either projection is `May`.
+fn merge_forwarded_relation_rows(rows: Vec<FlowRelationRow>) -> Vec<FlowRelationRow> {
+    let mut merged: Vec<FlowRelationRow> = Vec::with_capacity(rows.len());
+    let mut positions = HashMap::<(FlowRelation, usize, usize), usize>::default();
+    for row in rows {
+        match positions.entry((row.relation, row.source_event, row.target_event)) {
+            std::collections::hash_map::Entry::Occupied(position) => {
+                let kept = &mut merged[*position.get()];
+                if row.certainty == FlowCertainty::May {
+                    kept.certainty = FlowCertainty::May;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(position) => {
+                position.insert(merged.len());
+                merged.push(row);
+            }
+        }
+    }
+    merged
 }
 
 fn property_flow_relations<G>(
@@ -10678,74 +11745,81 @@ fn property_flow_relations<G>(
     events: &[StateEventRow],
     event_keys: &[SemanticEventKey],
     property_result: &PropertyReachingResult,
+    skipped: &SkippedCopies,
     dominance: &Dominators<ProgramPointId>,
     generation: u64,
 ) -> Vec<FlowRelationRow>
 where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
-    let mut rows = property_reaching_relations(events, event_keys, property_result, generation);
+    let mut rows =
+        property_reaching_relations(events, event_keys, property_result, skipped, generation);
+    let forwarded = ForwardedReaching::new(property_result, skipped);
 
-    for store in property_result.stores() {
-        let Some(source_event) = property_event_id(
-            events,
-            event_keys,
-            StateEventClass::Establish,
-            store.point.id(),
-            store.event_index,
-            store.source,
-        ) else {
-            continue;
-        };
-        for read in property_result
-            .reads()
-            .iter()
-            .filter(|read| read.location == store.location)
-            .filter(|read| read.point.id() != store.point.id())
-        {
-            if !dominance.dominates(graph, store.point.id(), read.point.id()) {
-                continue;
-            }
-            let Some(target_event) = property_event_id(
+    for written in property_result.stores() {
+        // A skipped copy store dominates nothing itself; the stores that
+        // supply its value dominate the reads of the location it wrote.
+        for (store, _) in forwarded.origins(written, PropertyReachCertainty::Exact) {
+            let Some(source_event) = property_event_id(
                 events,
                 event_keys,
-                StateEventClass::Read,
-                read.point.id(),
-                read.event_index,
-                read.source,
+                StateEventClass::Establish,
+                store.point.id(),
+                store.event_index,
+                store.source,
             ) else {
                 continue;
             };
-            rows.push(FlowRelationRow {
-                relation: FlowRelation::Dominates,
-                certainty: FlowCertainty::Exact,
-                source_event,
-                target_event,
-                procedure: store.procedure.id(),
-                generation,
-            });
-            if store.strong_update
-                && let Some(kill_event) = property_event_id(
+            for read in property_result
+                .reads()
+                .iter()
+                .filter(|read| read.location == written.location)
+                .filter(|read| read.point.id() != store.point.id())
+            {
+                if !dominance.dominates(graph, store.point.id(), read.point.id()) {
+                    continue;
+                }
+                let Some(target_event) = property_event_id(
                     events,
                     event_keys,
-                    StateEventClass::Kill,
-                    store.point.id(),
-                    store.event_index,
-                    store.source,
-                )
-            {
+                    StateEventClass::Read,
+                    read.point.id(),
+                    read.event_index,
+                    read.source,
+                ) else {
+                    continue;
+                };
                 rows.push(FlowRelationRow {
                     relation: FlowRelation::Dominates,
                     certainty: FlowCertainty::Exact,
-                    source_event: kill_event,
+                    source_event,
                     target_event,
                     procedure: store.procedure.id(),
                     generation,
                 });
+                if store.strong_update
+                    && let Some(kill_event) = property_event_id(
+                        events,
+                        event_keys,
+                        StateEventClass::Kill,
+                        store.point.id(),
+                        store.event_index,
+                        store.source,
+                    )
+                {
+                    rows.push(FlowRelationRow {
+                        relation: FlowRelation::Dominates,
+                        certainty: FlowCertainty::Exact,
+                        source_event: kill_event,
+                        target_event,
+                        procedure: store.procedure.id(),
+                        generation,
+                    });
+                }
             }
         }
     }
-    rows
+    merge_forwarded_relation_rows(rows)
 }
 
 fn property_event_id(
@@ -10861,15 +11935,28 @@ fn same_evaluation_relations(
 
 /// Intra-evaluation value dependence: value -> the values it is computed from.
 struct EvaluationDependence {
-    sources: HashMap<ValueId, Vec<ValueId>>,
+    sources: HashMap<ValueId, Vec<DependenceEdge>>,
+}
+
+/// One value-dependence edge. An `address` edge is the base, index or address
+/// operand of a memory access: the loaded value is selected by that operand
+/// but does not carry it.
+#[derive(Clone, Copy)]
+struct DependenceEdge {
+    source: ValueId,
+    address: bool,
 }
 
 impl EvaluationDependence {
     fn build(procedure: &ProcedureSemantics) -> Self {
-        let mut sources: HashMap<ValueId, Vec<ValueId>> = HashMap::default();
-        let mut record = |target: ValueId, source: ValueId| {
-            sources.entry(target).or_default().push(source);
+        let mut sources: HashMap<ValueId, Vec<DependenceEdge>> = HashMap::default();
+        let mut record_edge = |target: ValueId, source: ValueId, address: bool| {
+            sources
+                .entry(target)
+                .or_default()
+                .push(DependenceEdge { source, address });
         };
+
         for point in procedure.points() {
             for event in point.events.iter() {
                 match &event.effect {
@@ -10878,10 +11965,12 @@ impl EvaluationDependence {
                             .value(*target)
                             .is_some_and(|value| value.kind.is_binding());
                         if !binding {
-                            record(*target, *value);
+                            record_edge(*target, *value, false);
                         }
                     }
-                    SemanticEffect::ValueFlow { source, target, .. } => record(*target, *source),
+                    SemanticEffect::ValueFlow { source, target, .. } => {
+                        record_edge(*target, *source, false)
+                    }
                     SemanticEffect::MemoryLoad {
                         location, result, ..
                     } => {
@@ -10890,16 +11979,19 @@ impl EvaluationDependence {
                                 MemoryLocationKind::Field { base, .. }
                                 | MemoryLocationKind::Property { base, .. }
                                 | MemoryLocationKind::Dereference { address: base } => {
-                                    record(*result, *base)
+                                    record_edge(*result, *base, true)
                                 }
                                 MemoryLocationKind::Index { base, index, .. } => {
-                                    record(*result, *base);
+                                    record_edge(*result, *base, true);
                                     if let Some(index) = index {
-                                        record(*result, *index);
+                                        record_edge(*result, *index, true);
                                     }
                                 }
+                                // A lexical cell load reads the binding's own
+                                // value, so the binding is carried, not an
+                                // address that selects some other value.
                                 MemoryLocationKind::LexicalCell { binding } => {
-                                    record(*result, *binding);
+                                    record_edge(*result, *binding, false);
                                 }
                                 MemoryLocationKind::Static { .. }
                                 | MemoryLocationKind::Capture { .. } => {}
@@ -10914,12 +12006,12 @@ impl EvaluationDependence {
             let Some(result) = call_site.result else {
                 continue;
             };
-            record(result, call_site.callee);
+            record_edge(result, call_site.callee, false);
             if let Some(receiver) = call_site.receiver {
-                record(result, receiver);
+                record_edge(result, receiver, false);
             }
             for argument in call_site.arguments.iter() {
-                record(result, argument.value);
+                record_edge(result, argument.value, false);
             }
         }
         Self { sources }
@@ -10929,6 +12021,21 @@ impl EvaluationDependence {
     /// explicit stack bounded by the procedure's own value count, so a cyclic
     /// dependence cannot make it diverge.
     fn operands_of(&self, value: ValueId, value_count: usize) -> HashSet<ValueId> {
+        self.walk(value, value_count, true)
+    }
+
+    /// The values `value` carries: [`Self::operands_of`] without the base,
+    /// index and address operands of memory accesses.
+    fn carried_operands_of(&self, value: ValueId, value_count: usize) -> HashSet<ValueId> {
+        self.walk(value, value_count, false)
+    }
+
+    fn walk(
+        &self,
+        value: ValueId,
+        value_count: usize,
+        through_addresses: bool,
+    ) -> HashSet<ValueId> {
         let mut visited = HashSet::default();
         let mut stack = vec![value];
         while let Some(current) = stack.pop() {
@@ -10939,8 +12046,13 @@ impl EvaluationDependence {
                 visited.len() <= value_count.saturating_add(1),
                 "value dependence visited more values than the procedure owns"
             );
-            if let Some(sources) = self.sources.get(&current) {
-                stack.extend(sources.iter().copied());
+            if let Some(edges) = self.sources.get(&current) {
+                stack.extend(
+                    edges
+                        .iter()
+                        .filter(|edge| through_addresses || !edge.address)
+                        .map(|edge| edge.source),
+                );
             }
         }
         visited
@@ -18406,6 +19518,794 @@ func second(input int) int {
         assert_eq!(scoped.active_model_set_hash(), full.active_model_set_hash());
     }
 
+    const GO_TWO_FUNCTIONS: &str = r#"package sample
+
+func first(input int) int {
+    value := input
+    return value
+}
+
+func second(input int) int {
+    value := input
+    return value
+}
+"#;
+
+    /// A fresh operation over the test retention owner, and the two exact
+    /// procedure handles of `GO_TWO_FUNCTIONS` from one artifact allocation.
+    fn operation_fixture() -> (
+        Fixture,
+        SemanticOutcome<Arc<SemanticArtifact>>,
+        [ProcedureHandle; 2],
+    ) {
+        let fixture = Fixture::new(Language::Go, &[("main.go", GO_TWO_FUNCTIONS)]);
+        let outcome = fixture.materialized(0);
+        let artifact = outcome
+            .available_value()
+            .cloned()
+            .expect("Go semantics are available");
+        let mut handles = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| {
+                artifact
+                    .procedure_handle(procedure.id())
+                    .expect("the artifact owns its procedures")
+            })
+            .collect::<Vec<_>>();
+        assert!(handles.len() >= 2, "both functions lower: {handles:#?}");
+        handles.truncate(2);
+        let [first, second] = <[ProcedureHandle; 2]>::try_from(handles).expect("two handles");
+        (fixture, outcome, [first, second])
+    }
+
+    fn test_operation() -> FlowStateOperation {
+        FlowStateOperation::new(FlowStateRequestMemos::new(
+            &RetentionBudget::for_test_capacity(64 * 1024 * 1024),
+        ))
+    }
+
+    /// The provider-aware entry point, entered through the operation.
+    fn derive_through(
+        operation: &mut FlowStateOperation,
+        fixture: &Fixture,
+        outcome: &SemanticOutcome<Arc<SemanticArtifact>>,
+        procedure: &ProcedureHandle,
+        cancellation: &CancellationToken,
+    ) -> FileFlowState {
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        operation.with_request(cancellation, |budget, request| {
+            flow_state_for_materialized_procedure_with_provider(
+                &fixture.workspace,
+                &fixture.files[0],
+                outcome.clone(),
+                procedure,
+                request,
+                budget,
+                &provider,
+            )
+        })
+    }
+
+    fn marker_index(
+        procedure: &ProcedureHandle,
+    ) -> (DeadWriteProcedureKey, DeadWriteProcedureIndex) {
+        (
+            DeadWriteProcedureKey(
+                Arc::as_ptr(procedure.artifact()) as usize,
+                procedure.id(),
+                procedure.interpretation(),
+                u64::MAX,
+            ),
+            DeadWriteProcedureIndex {
+                _artifact: Arc::clone(procedure.artifact()),
+                events_by_binding: HashMap::default(),
+                escaped_bindings: HashSet::default(),
+                macro_gap_points_by_source: HashMap::default(),
+            },
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: same-file procedure derivations each received a fresh semantic and CFG grant"
+    )]
+    fn operation_carries_one_spent_grant_and_memos_across_derivations() {
+        let (fixture, outcome, [first, second]) = operation_fixture();
+        let cancellation = CancellationToken::default();
+        let mut operation = test_operation();
+        let pristine = operation.consumption();
+        assert_eq!(pristine.cfg_used, CfgAlgorithmWork::default());
+
+        let first_state = derive_through(&mut operation, &fixture, &outcome, &first, &cancellation);
+        let after_first = operation.consumption();
+        assert!(
+            after_first.cfg_used != pristine.cfg_used,
+            "the first derivation charged the CFG ledger"
+        );
+
+        // A memo region written between derivations survives, with its keys.
+        let (key, index) = marker_index(&first);
+        operation.with_request(&cancellation, |_, request| {
+            assert!(request.memos.dead_write_procedure_cache.is_unused());
+            request.memos.dead_write_procedure_cache.insert(key, index);
+        });
+
+        let second_state =
+            derive_through(&mut operation, &fixture, &outcome, &second, &cancellation);
+        let after_second = operation.consumption();
+        assert!(
+            after_second.cfg_used != after_first.cfg_used,
+            "the second derivation spends on top of the first, not from zero"
+        );
+        assert_eq!(
+            (after_second.cfg_refusals, after_second.semantic_refusals),
+            (0, 0)
+        );
+        operation.with_request(&cancellation, |_, request| {
+            assert!(request.memos.dead_write_procedure_cache.get(&key).is_some());
+            assert!(!request.memos.dead_write_procedure_cache.is_unused());
+            // Derivation itself never touches the other dead-write memos.
+            assert!(request.memos.dead_write_cache.is_unused());
+            assert!(request.memos.dead_write_reachability_cache.is_unused());
+        });
+
+        // Same rows as a legacy fresh-per-call derivation: only the grant moved.
+        let legacy = flow_state_for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome.clone(),
+            &second,
+            &mut test_request(&cancellation),
+        );
+        let [lent] = second_state.procedures.as_slice() else {
+            panic!("only the selected procedure derives");
+        };
+        let [fresh] = legacy.procedures.as_slice() else {
+            panic!("only the selected procedure derives");
+        };
+        assert_eq!(lent.events, fresh.events);
+        assert_eq!(lent.relations, fresh.relations);
+        assert_eq!(lent.completeness, fresh.completeness);
+        assert_eq!(first_state.procedures.len(), 1);
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a panic during a lent derivation must not refund the spent ledgers or drop the memos"
+    )]
+    fn unwinding_derivation_restores_the_same_spent_operation_state() {
+        let (fixture, outcome, [first, second]) = operation_fixture();
+        let cancellation = CancellationToken::default();
+        let mut operation = test_operation();
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        let (key, index) = marker_index(&first);
+        let mut charged = None;
+        let mut optional_charged = None;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation.with_request(&cancellation, |budget, request| {
+                drop(flow_state_for_materialized_procedure_with_provider(
+                    &fixture.workspace,
+                    &fixture.files[0],
+                    outcome.clone(),
+                    &first,
+                    request,
+                    budget,
+                    &provider,
+                ));
+                request.memos.dead_write_procedure_cache.insert(key, index);
+                budget
+                    .admit(SemanticWork {
+                        events: 1,
+                        ..SemanticWork::default()
+                    })
+                    .expect("the injected semantic charge fits the existing grant");
+                {
+                    // Charge the third (optional nonreturn) ledger too.
+                    let semantics = first.semantics();
+                    let optional = request
+                        .nonreturn_cfg_budget
+                        .as_mut()
+                        .expect("a lent request carries the operation's optional ledger");
+                    forward_reachability(
+                        semantics,
+                        semantics.entry_point(),
+                        &mut CfgAlgorithmRequest::new(optional, &cancellation),
+                    )
+                    .expect("the default optional allowance covers one pass");
+                    optional_charged = Some(optional.used());
+                }
+                charged = Some((request.cfg_budget.used(), budget.used()));
+                panic!("injected panic after charging all three ledgers and writing a memo");
+            })
+        }));
+        assert!(unwound.is_err());
+        let (cfg_used, semantic_used) = charged.expect("charges happened before the panic");
+        assert!(cfg_used != CfgAlgorithmWork::default());
+        assert!(semantic_used != SemanticWork::default());
+        // Restored, not replaced by a default grant.
+        assert_eq!(operation.consumption().cfg_used, cfg_used);
+        assert_eq!(operation.semantic_budget.used(), semantic_used);
+        let optional_used = optional_charged.expect("optional charge happened before the panic");
+        assert!(optional_used != CfgAlgorithmWork::default());
+        assert_eq!(operation.consumption().nonreturn_cfg_used, optional_used);
+        operation.with_request(&cancellation, |_, request| {
+            assert!(request.memos.dead_write_procedure_cache.get(&key).is_some());
+        });
+        // The operation keeps serving seeds on top of the spent allowance.
+        drop(derive_through(
+            &mut operation,
+            &fixture,
+            &outcome,
+            &second,
+            &cancellation,
+        ));
+        assert!(operation.consumption().cfg_used != cfg_used);
+    }
+
+    const PYTHON_NONRETURN_SEEDS: &str = r#"class Terminates:
+    def __init__(self):
+        self.ready = True
+        raise
+
+def caller_a(flag):
+    if flag:
+        value = 1
+    else:
+        Terminates()
+    return value
+
+def caller_b(flag):
+    if flag:
+        value = 2
+    else:
+        Terminates()
+    return value
+"#;
+    const PYTHON_PLAIN: &str = "def plain(x):\n    return x\n";
+
+    /// `src/main.py` (raising constructor plus two callers that make every
+    /// derivation of them run the optional nonreturn proof) and `src/plain.py`
+    /// (a body with no nonreturn candidate in its closure).
+    fn python_nonreturn_fixture() -> (Fixture, [SemanticOutcome<Arc<SemanticArtifact>>; 2]) {
+        let fixture = Fixture::new(
+            Language::Python,
+            &[
+                ("src/main.py", PYTHON_NONRETURN_SEEDS),
+                ("src/plain.py", PYTHON_PLAIN),
+            ],
+        );
+        let outcomes = [fixture.materialized(0), fixture.materialized(1)];
+        (fixture, outcomes)
+    }
+
+    fn handles_of(outcome: &SemanticOutcome<Arc<SemanticArtifact>>) -> Vec<ProcedureHandle> {
+        let artifact = outcome
+            .available_value()
+            .expect("fixture semantics are available");
+        artifact
+            .procedures()
+            .iter()
+            .map(|procedure| {
+                artifact
+                    .procedure_handle(procedure.id())
+                    .expect("the artifact owns its procedures")
+            })
+            .collect()
+    }
+
+    /// The procedures that call something: here exactly the two callers, whose
+    /// closure reaches the raising constructor.
+    fn callers_of(handles: &[ProcedureHandle]) -> Vec<ProcedureHandle> {
+        let callers = handles
+            .iter()
+            .filter(|handle| !handle.semantics().call_sites().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(callers.len() >= 2, "both callers lower: {handles:#?}");
+        callers
+    }
+
+    fn derive_file_through(
+        operation: &mut FlowStateOperation,
+        fixture: &Fixture,
+        file_index: usize,
+        outcome: &SemanticOutcome<Arc<SemanticArtifact>>,
+        procedure: &ProcedureHandle,
+        cancellation: &CancellationToken,
+    ) -> FileFlowState {
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        operation.with_request(cancellation, |budget, request| {
+            flow_state_for_materialized_procedure_with_provider(
+                &fixture.workspace,
+                &fixture.files[file_index],
+                outcome.clone(),
+                procedure,
+                request,
+                budget,
+                &provider,
+            )
+        })
+    }
+
+    fn has_modeled_incomplete(state: &FileFlowState) -> bool {
+        state.procedures.iter().any(|derivation| {
+            derivation.completeness.reasons().iter().any(|reason| {
+                matches!(
+                    reason,
+                    FlowStateIncompleteReason::ModeledControlProjectionIncomplete { .. }
+                )
+            })
+        })
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: the optional nonreturn proof ledger restarted for every seed, enlarging the legacy per-file allowance"
+    )]
+    fn optional_nonreturn_ledger_accumulates_across_seeds_apart_from_the_ordinary_ledger() {
+        let (fixture, [main, _]) = python_nonreturn_fixture();
+        let cancellation = CancellationToken::default();
+        let handles = handles_of(&main);
+        assert!(handles.len() >= 3, "constructor and both callers lower");
+
+        let mut operation = test_operation();
+        let mut optional_after = Vec::new();
+        for handle in &handles {
+            drop(derive_file_through(
+                &mut operation,
+                &fixture,
+                0,
+                &main,
+                handle,
+                &cancellation,
+            ));
+            optional_after.push(operation.consumption().nonreturn_cfg_used);
+        }
+        let shared = operation.consumption();
+        assert!(
+            optional_after[0] != CfgAlgorithmWork::default(),
+            "the first seed's optional proof spent its own ledger"
+        );
+        assert!(
+            shared.nonreturn_cfg_used != optional_after[0],
+            "later seeds spend on top of the first, not from a fresh allowance: {optional_after:?}"
+        );
+        assert_eq!((shared.cfg_refusals, shared.nonreturn_cfg_refusals), (0, 0));
+
+        // Independence: the same seeds through one reused legacy request. Its
+        // optional proof clones the ordinary ledger per call and discards the
+        // spending, so only ordinary flow work reaches its cumulative ledger.
+        let mut legacy = test_request(&cancellation);
+        for handle in &handles {
+            drop(flow_state_for_materialized_procedure(
+                &fixture.workspace,
+                &fixture.files[0],
+                main.clone(),
+                handle,
+                &mut legacy,
+            ));
+        }
+        assert!(legacy.nonreturn_cfg_budget.is_none());
+        assert_eq!(
+            shared.cfg_used,
+            legacy.cfg_budget.used(),
+            "optional proof spending never reaches the ordinary ledger"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a pristine optional nonreturn refusal must stay Content-incomplete, as the legacy whole-file pass reported it"
+    )]
+    fn pristine_optional_refusals_stay_content_incomplete_even_twice() {
+        let (fixture, [main, _]) = python_nonreturn_fixture();
+        let cancellation = CancellationToken::default();
+        let callers = callers_of(&handles_of(&main));
+        let mut operation = test_operation();
+        operation
+            .state
+            .as_mut()
+            .expect("not lent")
+            .nonreturn_cfg_budget = CfgAlgorithmBudget::uniform(0);
+        for handle in callers.iter().take(2) {
+            let before = operation.consumption();
+            let state =
+                derive_file_through(&mut operation, &fixture, 0, &main, handle, &cancellation);
+            let after = operation.consumption();
+            assert!(after.nonreturn_cfg_refusals > before.nonreturn_cfg_refusals);
+            assert_eq!(
+                after.nonreturn_cfg_used,
+                CfgAlgorithmWork::default(),
+                "a zero allowance refuses without recording any spending"
+            );
+            assert!(has_modeled_incomplete(&state), "{state:#?}");
+            assert!(
+                state.reuse.is_content(),
+                "no recorded spending means this refusal is a pristine one: {state:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a shared optional ledger exhausted by earlier seeds was reported as file content for later seeds"
+    )]
+    fn optional_refusal_after_recorded_spending_is_an_execution_stop_then_clean_seeds_stay_clean() {
+        let (fixture, [main, plain_outcome]) = python_nonreturn_fixture();
+        let cancellation = CancellationToken::default();
+        let callers = callers_of(&handles_of(&main));
+        let plain = handles_of(&plain_outcome)
+            .into_iter()
+            .next()
+            .expect("plain.py lowers one procedure");
+
+        // An allowance that fits one reachability pass but not a whole proof.
+        let mut probe = CfgAlgorithmBudget::default();
+        let semantics = callers[0].semantics();
+        forward_reachability(
+            semantics,
+            semantics.entry_point(),
+            &mut CfgAlgorithmRequest::new(&mut probe, &cancellation),
+        )
+        .expect("an unconstrained reachability pass completes");
+        let one = probe.used();
+        let mut operation = test_operation();
+        operation
+            .state
+            .as_mut()
+            .expect("not lent")
+            .nonreturn_cfg_budget =
+            CfgAlgorithmBudget::uniform(one.node_visits.max(one.edge_visits));
+
+        let first = derive_file_through(
+            &mut operation,
+            &fixture,
+            0,
+            &main,
+            &callers[0],
+            &cancellation,
+        );
+        let after_first = operation.consumption();
+        assert!(
+            after_first.nonreturn_cfg_used != CfgAlgorithmWork::default(),
+            "the first seed recorded optional spending"
+        );
+        assert!(
+            after_first.nonreturn_cfg_refusals > 0,
+            "the allowance cannot cover the whole proof"
+        );
+        assert!(
+            first.reuse.is_content(),
+            "the first refusal began from a ledger with no recorded spending: {first:#?}"
+        );
+
+        let second = derive_file_through(
+            &mut operation,
+            &fixture,
+            0,
+            &main,
+            &callers[1],
+            &cancellation,
+        );
+        assert!(
+            operation.consumption().nonreturn_cfg_refusals > after_first.nonreturn_cfg_refusals
+        );
+        assert!(
+            has_modeled_incomplete(&second),
+            "the reason rows are unchanged"
+        );
+        assert!(
+            !second.reuse.is_content(),
+            "a refusal after recorded spending depends on earlier seeds: {second:#?}"
+        );
+
+        // The next seed never runs the optional proof: the earlier refusal is
+        // not its cause (deltas are relative to entry).
+        let clean = derive_file_through(
+            &mut operation,
+            &fixture,
+            1,
+            &plain_outcome,
+            &plain,
+            &cancellation,
+        );
+        assert!(clean.reuse.is_content(), "{clean:#?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a cancelled token left a Content verdict on early returns and on silently abandoned optional work"
+    )]
+    fn cancelled_token_makes_every_return_path_an_execution_stop() {
+        let (fixture, [main, _]) = python_nonreturn_fixture();
+        let callers = callers_of(&handles_of(&main));
+        let live = CancellationToken::default();
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+
+        // Late path: the nonreturn proof returns an empty derivation silently.
+        let mut operation = test_operation();
+        let state =
+            derive_file_through(&mut operation, &fixture, 0, &main, &callers[0], &cancelled);
+        assert!(!state.reuse.is_content(), "{state:#?}");
+
+        // Early return: an outcome with no artifact.
+        let unsupported = || SemanticOutcome::Unsupported {
+            capability: SemanticCapability::Procedures,
+            partial: None,
+            work: SemanticWork::default(),
+        };
+        let run = |token: &CancellationToken| {
+            let mut request = test_request(token);
+            flow_state_for_materialized_artifact(
+                &fixture.workspace,
+                &fixture.files[0],
+                unsupported(),
+                &mut request,
+            )
+        };
+        let healthy_none = run(&live);
+        assert!(healthy_none.reuse.is_content());
+        let cancelled_none = run(&cancelled);
+        assert!(!cancelled_none.reuse.is_content());
+        assert_eq!(
+            healthy_none.completeness.reasons(),
+            cancelled_none.completeness.reasons(),
+            "reason rows are unchanged by the verdict join"
+        );
+    }
+
+    #[test]
+    #[hardwon("#14156: seed rows must equal the legacy per-call rows when no ledger refuses")]
+    fn operation_seeds_match_legacy_direct_derivations_without_refusals() {
+        let (fixture, [main, _]) = python_nonreturn_fixture();
+        let cancellation = CancellationToken::default();
+        let handles = handles_of(&main);
+        let mut operation = test_operation();
+        for handle in &handles {
+            let lent =
+                derive_file_through(&mut operation, &fixture, 0, &main, handle, &cancellation);
+            let direct = flow_state_for_materialized_procedure(
+                &fixture.workspace,
+                &fixture.files[0],
+                main.clone(),
+                handle,
+                &mut test_request(&cancellation),
+            );
+            let ([lent_row], [direct_row]) =
+                (lent.procedures.as_slice(), direct.procedures.as_slice())
+            else {
+                panic!("one procedure each");
+            };
+            assert_eq!(lent_row.events, direct_row.events);
+            assert_eq!(lent_row.relations, direct_row.relations);
+            assert_eq!(lent_row.completeness, direct_row.completeness);
+            assert_eq!(
+                lent_row.control_edge_mask.omitted,
+                direct_row.control_edge_mask.omitted
+            );
+            assert_eq!(lent.reuse, direct.reuse);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: Go seeds under active nonreturn models restarted the optional proof ledger and rediscovered shared callees"
+    )]
+    fn go_seeds_share_one_optional_ledger_and_the_existing_discovery_cache() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[
+                ("main.go", GO_WORKSPACE_NONRETURN_CALLERS),
+                ("helper.go", GO_WORKSPACE_NONRETURN_HELPERS),
+            ],
+        );
+        let models = fixture.activate_exact_nonreturn_models();
+        let outcome = fixture.materialized(0);
+        let handles = handles_of(&outcome);
+        assert!(
+            handles.len() >= 4,
+            "the caller file lowers several procedures sharing die()"
+        );
+        let cancellation = CancellationToken::default();
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &fixture.workspace,
+            Some(Arc::clone(&models)),
+        );
+        let seed = |operation: &mut FlowStateOperation,
+                    cache: &NonreturnDiscoveryCache,
+                    handle: &ProcedureHandle| {
+            operation.with_request(&cancellation, |budget, request| {
+                request.install_active_semantic_model_snapshot(Some(Arc::clone(&models)));
+                request.install_nonreturn_discovery_cache(cache);
+                flow_state_for_materialized_procedure_with_provider(
+                    &fixture.workspace,
+                    &fixture.files[0],
+                    outcome.clone(),
+                    handle,
+                    request,
+                    budget,
+                    &provider,
+                )
+            })
+        };
+
+        // K seeds on ONE operation and ONE discovery cache.
+        let cache = NonreturnDiscoveryCache::default();
+        let mut operation = test_operation();
+        let mut optional_after = Vec::new();
+        for handle in &handles {
+            drop(seed(&mut operation, &cache, handle));
+            optional_after.push(operation.consumption().nonreturn_cfg_used);
+        }
+        let shared = operation.consumption();
+        assert!(
+            optional_after[0] != CfgAlgorithmWork::default(),
+            "the optional proof ran under the active models and spent its ledger"
+        );
+        assert!(
+            shared.nonreturn_cfg_used != optional_after[0],
+            "later seeds spend on the same ledger instead of a fresh allowance: {optional_after:?}"
+        );
+        assert_eq!(
+            (shared.cfg_refusals, shared.nonreturn_cfg_refusals),
+            (0, 0),
+            "no ledger refuses under the default allowances"
+        );
+        assert!(
+            !cache.entries.lock().unwrap().is_empty(),
+            "the existing request-wide discovery cache holds the shared callees"
+        );
+
+        // Counter-evidence that the existing cache (not a new one) serves the
+        // shared callee discovery: the same seed on a fresh operation spends
+        // less optional work when the cache is already warm than when cold.
+        let probe = handles
+            .iter()
+            .find(|handle| !handle.semantics().call_sites().is_empty())
+            .expect("a caller exists");
+        let mut cold_operation = test_operation();
+        drop(seed(
+            &mut cold_operation,
+            &NonreturnDiscoveryCache::default(),
+            probe,
+        ));
+        let cold = cold_operation.consumption().nonreturn_cfg_used;
+        let mut warm_operation = test_operation();
+        drop(seed(&mut warm_operation, &cache, probe));
+        let warm = warm_operation.consumption().nonreturn_cfg_used;
+        let total = |work: CfgAlgorithmWork| work.node_visits + work.edge_visits;
+        assert!(
+            total(warm) < total(cold),
+            "a warm discovery cache removes callee rediscovery from the optional ledger: cold={cold:?} warm={warm:?}"
+        );
+
+        // Independence: the same seeds through one reused legacy request. Its
+        // optional proof clones the ordinary ledger per call and discards the
+        // spending, so the ordinary totals must match the operation's.
+        let legacy_cache = NonreturnDiscoveryCache::default();
+        let mut legacy = test_request(&cancellation)
+            .with_active_semantic_model_snapshot(Some(Arc::clone(&models)))
+            .with_nonreturn_discovery_cache(&legacy_cache);
+        for handle in &handles {
+            drop(flow_state_for_materialized_procedure(
+                &fixture.workspace,
+                &fixture.files[0],
+                outcome.clone(),
+                handle,
+                &mut legacy,
+            ));
+        }
+        assert!(legacy.nonreturn_cfg_budget.is_none());
+        assert_eq!(
+            shared.cfg_used,
+            legacy.cfg_budget.used(),
+            "optional proof spending never reaches the ordinary ledger"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a shared per-file allowance must exhaust across seeds, not restart per seed"
+    )]
+    fn exhausted_operation_stays_exhausted_for_the_next_seed() {
+        let (fixture, outcome, [first, second]) = operation_fixture();
+        let cancellation = CancellationToken::default();
+        let mut operation = test_operation();
+        operation.state.as_mut().expect("not lent").cfg_budget = CfgAlgorithmBudget::uniform(1);
+        let first_state = derive_through(&mut operation, &fixture, &outcome, &first, &cancellation);
+        let refused = operation.consumption().cfg_refusals;
+        assert!(refused > 0, "a one-unit CFG allowance refuses");
+        assert!(!first_state.reuse.is_content());
+        // The second seed spends the same exhausted ledger: it refuses on its
+        // own account too, so it is typed incomplete rather than silently clean.
+        let second_state =
+            derive_through(&mut operation, &fixture, &outcome, &second, &cancellation);
+        assert!(operation.consumption().cfg_refusals > refused);
+        assert!(!second_state.reuse.is_content());
+        assert!(
+            second_state.procedures[0]
+                .completeness
+                .reasons()
+                .iter()
+                .any(|reason| matches!(reason, FlowStateIncompleteReason::BudgetExhausted { .. })),
+            "{second_state:#?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: an earlier seed's refusal on a shared ledger tainted a later seed that did not refuse"
+    )]
+    fn earlier_refusal_is_not_a_cause_for_a_later_clean_derivation() {
+        let (fixture, outcome, [first, _]) = operation_fixture();
+        let cancellation = CancellationToken::default();
+        let mut operation = test_operation();
+        // Record one refusal on the shared semantic ledger while leaving its
+        // limits generous, as an earlier seed's stop would.
+        assert!(
+            operation
+                .semantic_budget
+                .admit(SemanticWork::uniform(usize::MAX / 2))
+                .is_err()
+        );
+        let before = operation.consumption();
+        assert!(
+            before.semantic_refusals > 0,
+            "the setup refusal is recorded on the shared ledger"
+        );
+        let state = derive_through(&mut operation, &fixture, &outcome, &first, &cancellation);
+        assert_eq!(
+            operation.consumption().semantic_refusals,
+            before.semantic_refusals
+        );
+        assert!(
+            state.reuse.is_content(),
+            "only a refusal this derivation caused is its cause: {state:#?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#14156: the direct flow entry points must keep one fresh semantic grant per call")]
+    fn legacy_direct_entry_points_ignore_a_spent_operation_ledger() {
+        let (fixture, outcome, [first, _]) = operation_fixture();
+        let cancellation = CancellationToken::default();
+        let mut operation = test_operation();
+        drop(derive_through(
+            &mut operation,
+            &fixture,
+            &outcome,
+            &first,
+            &cancellation,
+        ));
+        // A legacy call with a reused request is unaffected by the operation.
+        let mut request = test_request(&cancellation);
+        let one = flow_state_for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome.clone(),
+            &first,
+            &mut request,
+        );
+        let two = flow_state_for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome,
+            &first,
+            &mut request,
+        );
+        assert_eq!(one.procedures[0].events, two.procedures[0].events);
+        assert_eq!(
+            one.procedures[0].completeness,
+            two.procedures[0].completeness
+        );
+        assert!(one.reuse.is_content() && two.reuse.is_content());
+    }
+
     #[test]
     #[hardwon(
         "3ac44dca99bb: unresolved property access was treated as a complete Go base observation"
@@ -18719,11 +20619,10 @@ func check() int {
             let mut derivation = derivation.clone();
             derivation.completeness = FlowStateCompleteness::from_reasons(reasons);
             let mut request = test_request(&cancellation);
-            for write in derivation
-                .events
-                .iter()
-                .filter(|event| event.event_class == StateEventClass::Establish)
-            {
+            for write in derivation.events.iter().filter(|event| {
+                event.event_class == StateEventClass::Establish
+                    && matches!(event.subject, FlowSubject::Binding { .. })
+            }) {
                 let answer = derivation.dead_write_local(&procedure, write.event, &mut request);
                 assert!(matches!(answer, DeadWriteAnswer::Open { .. }), "{answer:?}");
                 checked += 1;
@@ -19590,6 +21489,862 @@ def outer():
                     FlowStateIncompleteReason::BudgetExhausted { .. }
                 ))
         ));
+    }
+
+    #[test]
+    #[hardwon(
+        "#14370: property snapshot cancel/budget stops were collapsed into PropertyAnalysisPartial"
+    )]
+    fn property_snapshot_cancellation_preserves_stop_reason() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value"),
+        );
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let read = derivation.events.iter().find(|event| {
+            event.event_class == StateEventClass::Read
+                && matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value")
+        }).expect("property read");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let (result, reuse) = property_reaching_for_procedure(
+            &fixture.workspace,
+            &procedure,
+            &test_request(&cancellation),
+            &mut SemanticBudget::default(),
+        );
+        assert_eq!(result.unwrap_err(), FlowStateIncompleteReason::Cancelled);
+        assert_eq!(reuse, EXECUTION_STOP);
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            read.point,
+            &mut test_request(&cancellation),
+        );
+        assert_eq!(selected.reuse, EXECUTION_STOP);
+        assert!(selected.procedures[0].relations.is_empty());
+        assert!(
+            selected
+                .completeness
+                .reasons()
+                .contains(&FlowStateIncompleteReason::Cancelled)
+        );
+        assert!(
+            !selected.completeness.reasons().iter().any(|reason| {
+                matches!(
+                    reason,
+                    FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                )
+            }),
+            "{selected:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14370: property snapshot cancel/budget stops were collapsed into PropertyAnalysisPartial"
+    )]
+    fn property_snapshot_budget_preserves_stop_reason() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value"),
+        );
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::uniform(1).expect("valid test budget");
+        // The real oracle can retain a partial snapshot on refusal. Its stop
+        // must still reach the property caller as budget, not generic coverage.
+        let outcome = fixture
+            .workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("snapshot acquisition");
+        let SemanticOutcome::ExceededBudget {
+            partial: Some(_),
+            exceeded,
+            ..
+        } = outcome
+        else {
+            panic!("expected an oracle budget stop with a partial snapshot, got {outcome:?}");
+        };
+        let (result, reuse) = property_reaching_for_procedure(
+            &fixture.workspace,
+            &procedure,
+            &test_request(&cancellation),
+            &mut SemanticBudget::uniform(1).expect("valid test budget"),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            FlowStateIncompleteReason::BudgetExhausted {
+                axis: FlowStateAxis::PropertyReachingRelation,
+                detail: exceeded.to_string(),
+            }
+        );
+        assert_eq!(reuse, EXECUTION_STOP);
+        let stopped = flow_state_for_materialized_outcome(
+            &fixture.workspace,
+            &fixture.files[0],
+            fixture.materialized(0),
+            Some(&procedure),
+            state.generation,
+            None,
+            state.active_model_set_hash.clone(),
+            &mut SemanticBudget::uniform(1).expect("valid test budget"),
+            &mut test_request(&cancellation),
+            None,
+        );
+        let [derived] = stopped.procedures.as_slice() else {
+            panic!("one selected derivation: {stopped:?}");
+        };
+        assert!(
+            derived
+                .events
+                .iter()
+                .all(|event| { !matches!(event.subject, FlowSubject::Property { .. }) })
+        );
+        for axis in property_axes() {
+            assert!(!derived.completeness.covers(*axis), "{axis:?}: {derived:?}");
+            assert!(
+                derived.completeness.reasons().iter().any(|reason| {
+                    matches!(reason, FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { detail }
+                        if detail == &exceeded.to_string())
+                }),
+                "missing typed budget cause for {axis:?}: {derived:?}"
+            );
+        }
+        let read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && matches!(event.subject, FlowSubject::Property { .. })
+            })
+            .expect("healthy property read endpoint");
+        let refreshed = fixture
+            .workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+            )
+            .expect("fresh snapshot acquisition");
+        assert!(
+            matches!(refreshed, SemanticOutcome::Complete { .. }),
+            "{refreshed:?}"
+        );
+        // A fresh snapshot could complete, but cannot repair the withheld
+        // aggregate endpoints. Selection keeps the refusal without solving.
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &stopped,
+            &procedure,
+            read.point,
+            &mut test_request(&cancellation),
+        );
+        assert!(
+            !selected.completeness.reasons().iter().any(|reason| {
+                matches!(
+                    reason,
+                    FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable { .. }
+                )
+            }),
+            "budget-withheld endpoints are not independent content gaps: {selected:?}"
+        );
+        assert!(selected.completeness.reasons().iter().any(|reason| {
+            matches!(reason, FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { detail }
+                if detail == &exceeded.to_string())
+        }), "selected retry lost the aggregate budget cause: {selected:?}");
+        assert_eq!(selected.completeness.reasons().len(), 1, "{selected:?}");
+        assert!(
+            selected
+                .procedures
+                .iter()
+                .all(|derived| derived.relations.is_empty())
+        );
+        assert_eq!(selected.reuse, EXECUTION_STOP);
+        let entry = procedure.semantics().entry_point();
+        let absent = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &stopped,
+            &procedure,
+            entry,
+            &mut test_request(&cancellation),
+        );
+        assert!(absent.completeness.reasons().iter().any(|reason| {
+            matches!(reason, FlowStateIncompleteReason::PropertyReaching { reason }
+                if matches!(reason.as_ref(), PropertyReachingIncompleteReason::SelectedReadMissing { point } if *point == entry))
+        }), "immutable entry read inventory was lost: {absent:?}");
+        assert!(absent.completeness.reasons().iter().any(|reason| matches!(
+            reason,
+            FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { .. }
+        )));
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let cancelled_retry = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &stopped,
+            &procedure,
+            read.point,
+            &mut test_request(&cancelled),
+        );
+        assert!(
+            cancelled_retry
+                .completeness
+                .reasons()
+                .contains(&FlowStateIncompleteReason::Cancelled,)
+        );
+        assert!(cancelled_retry.completeness.reasons().iter().any(|reason| {
+            matches!(reason, FlowStateIncompleteReason::PropertySnapshotBudgetExhausted { detail }
+                if detail == &exceeded.to_string())
+        }));
+        assert!(
+            cancelled_retry
+                .procedures
+                .iter()
+                .all(|derived| derived.relations.is_empty())
+        );
+        assert_eq!(cancelled_retry.reuse, EXECUTION_STOP);
+    }
+
+    #[test]
+    #[hardwon(
+        "#14370: refused property snapshots left dropped rows on the caller's resident ledger"
+    )]
+    fn property_snapshot_refusal_releases_scratch_admissions() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            matches!(event.subject, FlowSubject::Property { .. })
+        });
+        let procedure = fixture.procedure(0, original.procedure);
+        let token = CancellationToken::default();
+        let retained = SemanticWork {
+            values: 1,
+            ..SemanticWork::default()
+        };
+        let mut witnessed_admitted_refusal = false;
+        for limit in 2..=128 {
+            let mut probe = SemanticBudget::uniform(limit).expect("valid budget");
+            probe.admit(retained).expect("preexisting caller rows fit");
+            let outcome = fixture
+                .workspace
+                .semantic_oracle_provider()
+                .procedure_relations(
+                    &procedure,
+                    &OracleCallContext::empty(),
+                    &mut SemanticRequest::new(&mut probe, &token),
+                )
+                .expect("oracle snapshot");
+            if !matches!(
+                outcome,
+                SemanticOutcome::ExceededBudget {
+                    partial: Some(_),
+                    ..
+                }
+            ) || probe.resident_census().unowned == retained
+            {
+                continue;
+            }
+            witnessed_admitted_refusal = true;
+            let mut budget = SemanticBudget::uniform(limit).expect("valid budget");
+            budget.admit(retained).expect("preexisting caller rows fit");
+            let (result, reuse) = property_reaching_for_procedure(
+                &fixture.workspace,
+                &procedure,
+                &test_request(&token),
+                &mut budget,
+            );
+            let FlowStateIncompleteReason::BudgetExhausted { detail, .. } = result.unwrap_err()
+            else {
+                panic!("expected typed snapshot budget refusal");
+            };
+            assert_eq!(reuse, EXECUTION_STOP);
+            assert_eq!(
+                budget.resident_census().unowned,
+                retained,
+                "discarded snapshot leaked scratch at limit {limit}"
+            );
+            assert_ne!(
+                budget.used(),
+                retained,
+                "performed admissions must remain in telemetry"
+            );
+            assert_ne!(
+                budget.resident_peak(),
+                retained,
+                "the attempted peak must survive refund"
+            );
+            assert!(budget.refusal_count() > 0);
+            assert_eq!(
+                budget
+                    .first_refusal()
+                    .expect("preserved refusal")
+                    .exceeded
+                    .to_string(),
+                detail
+            );
+            budget
+                .admit(retained)
+                .expect("later caller may reuse the released capacity");
+            break;
+        }
+        assert!(
+            witnessed_admitted_refusal,
+            "fixture must admit rows before stopping"
+        );
+    }
+
+    #[test]
+    #[hardwon("#14370: fresh selected acquisition stops lost immutable read-selection evidence")]
+    fn property_snapshot_fresh_stop_preserves_ir_read_selection() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            matches!(event.subject, FlowSubject::Property { .. })
+        });
+        let procedure = fixture.procedure(0, original.procedure);
+        let entry = procedure.semantics().entry_point();
+        let mut witnessed_partial_cancellation = false;
+        for checks in 1..=4096 {
+            let probe = CancellationToken::cancel_after_checks_for_test(checks);
+            let outcome = fixture
+                .workspace
+                .semantic_oracle_provider()
+                .procedure_relations(
+                    &procedure,
+                    &OracleCallContext::empty(),
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &probe),
+                )
+                .expect("oracle snapshot");
+            if !matches!(
+                outcome,
+                SemanticOutcome::Cancelled {
+                    partial: Some(_),
+                    ..
+                }
+            ) {
+                if !probe.cancel_after_checks_tripped_for_test() {
+                    break;
+                }
+                continue;
+            }
+            witnessed_partial_cancellation = true;
+            let token = CancellationToken::cancel_after_checks_for_test(checks);
+            let selected = flow_state_for_selected_property(
+                &fixture.workspace,
+                &fixture.files[0],
+                &state,
+                &procedure,
+                entry,
+                &mut test_request(&token),
+            );
+            assert!(
+                selected
+                    .completeness
+                    .reasons()
+                    .contains(&FlowStateIncompleteReason::Cancelled),
+                "{selected:?}"
+            );
+            assert!(selected.completeness.reasons().iter().any(|reason| {
+                matches!(reason, FlowStateIncompleteReason::PropertyReaching { reason }
+                    if matches!(reason.as_ref(), PropertyReachingIncompleteReason::SelectedReadMissing { point } if *point == entry))
+            }), "fresh stopped acquisition lost the IR selection fact: {selected:?}");
+            assert!(
+                selected
+                    .procedures
+                    .iter()
+                    .all(|row| row.relations.is_empty())
+            );
+            assert_eq!(selected.reuse, EXECUTION_STOP);
+            break;
+        }
+        assert!(
+            witnessed_partial_cancellation,
+            "fixture must cancel with a partial snapshot"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14370: snapshot budget provenance blocked intact binding-only same-evaluation proofs"
+    )]
+    fn property_snapshot_budget_preserves_binding_only_evaluation() {
+        const SOURCE: &str = r#"
+function copyAndLoad() {
+    const local = 1;
+    const copy = local;
+    const ns = {};
+    ns.value = 1;
+    const field = ns.value;
+    return copy + field;
+}
+"#;
+        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", SOURCE)]);
+        let state = fixture.state(0);
+        let original =
+            procedure_containing(&state, |event| spelling(SOURCE, event).contains("copy"));
+        let procedure = fixture.procedure(0, original.procedure);
+        let cancellation = CancellationToken::default();
+        let stopped = flow_state_for_materialized_outcome(
+            &fixture.workspace,
+            &fixture.files[0],
+            fixture.materialized(0),
+            Some(&procedure),
+            state.generation,
+            None,
+            state.active_model_set_hash.clone(),
+            &mut SemanticBudget::uniform(1).expect("valid test budget"),
+            &mut test_request(&cancellation),
+            None,
+        );
+        let [derived] = stopped.procedures.as_slice() else {
+            panic!("one selected derivation: {stopped:?}");
+        };
+        let pair = |binding_name: &str| {
+            derived
+                .relations
+                .iter()
+                .find(|relation| {
+                    relation.relation == FlowRelation::SameEvaluation
+                        && matches!(
+                            derived.events[relation.source_event].subject,
+                            FlowSubject::Binding { .. }
+                        )
+                        && matches!(
+                            derived.events[relation.target_event].subject,
+                            FlowSubject::Binding { .. }
+                        )
+                        && spelling(SOURCE, &derived.events[relation.source_event])
+                            .contains(binding_name)
+                })
+                .expect("retained exact binding same-evaluation pair")
+        };
+        let copy = pair("copy");
+        let field = pair("field");
+        assert_eq!(
+            derived.read_feeds_establishment(&procedure, copy.target_event, copy.source_event,),
+            SameEvaluationAnswer::Closed
+        );
+        assert!(matches!(derived.read_feeds_establishment(
+            &procedure, field.target_event, field.source_event,
+        ), SameEvaluationAnswer::Open { reasons } if reasons.iter().any(|reason| {
+            reason.blocks(FlowStateAxis::SameEvaluationRelation)
+        })));
+        for axis in property_axes() {
+            assert!(!derived.completeness.covers(*axis), "{axis:?}: {derived:?}");
+        }
+        // A genuine same-evaluation stop still blocks the memory-free pair.
+        let mut evaluation_stopped = derived.clone();
+        evaluation_stopped.completeness =
+            FlowStateCompleteness::from_reasons(vec![FlowStateIncompleteReason::BudgetExhausted {
+                axis: FlowStateAxis::SameEvaluationRelation,
+                detail: "same-evaluation control budget exhausted".into(),
+            }]);
+        assert!(matches!(evaluation_stopped.read_feeds_establishment(
+            &procedure, copy.target_event, copy.source_event,
+        ), SameEvaluationAnswer::Open { reasons } if reasons.iter().any(|reason| {
+            matches!(reason, FlowStateIncompleteReason::BudgetExhausted {
+                axis: FlowStateAxis::SameEvaluationRelation, ..
+            })
+        })));
+    }
+
+    #[test]
+    #[hardwon("#14370: late cancellation was hidden by a selected-property budget refusal")]
+    fn property_snapshot_budget_preserves_late_cancellation() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Read
+                && matches!(event.subject, FlowSubject::Property { .. })
+        });
+        let procedure = fixture.procedure(0, original.procedure);
+        let read = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && matches!(event.subject, FlowSubject::Property { .. })
+            })
+            .expect("property read");
+        let mut saw_budget_and_cancellation = false;
+        let mut reached_uncancelled_return = false;
+        // Sweep deterministic token checkpoints through acquisition and the
+        // stopped solver, including cancellation after its budget refusal.
+        for checks in 1..=4096 {
+            let token = CancellationToken::cancel_after_checks_for_test(checks);
+            let mut request = test_request(&token);
+            request.cfg_budget = CfgAlgorithmBudget::uniform(0);
+            let selected = flow_state_for_selected_property(
+                &fixture.workspace,
+                &fixture.files[0],
+                &state,
+                &procedure,
+                read.point,
+                &mut request,
+            );
+            if !token.cancel_after_checks_tripped_for_test() {
+                reached_uncancelled_return = true;
+                break;
+            }
+            let budget_stopped = selected.completeness.reasons().iter().any(|reason| {
+                matches!(reason, FlowStateIncompleteReason::PropertyReaching { reason }
+                if matches!(reason.as_ref(), PropertyReachingIncompleteReason::Reachability(
+                    CfgAlgorithmError::ExceededBudget(_)
+                )))
+            });
+            if budget_stopped {
+                saw_budget_and_cancellation = true;
+                assert!(
+                    selected
+                        .completeness
+                        .reasons()
+                        .contains(&FlowStateIncompleteReason::Cancelled,),
+                    "late cancellation lost behind budget refusal at check {checks}: {selected:?}"
+                );
+                assert!(
+                    selected
+                        .procedures
+                        .iter()
+                        .all(|derived| derived.relations.is_empty())
+                );
+                assert_eq!(selected.reuse, EXECUTION_STOP);
+            }
+        }
+        assert!(
+            reached_uncancelled_return,
+            "checkpoint sweep did not reach an uncancelled return"
+        );
+        assert!(
+            saw_budget_and_cancellation,
+            "no completion checkpoint observed cancellation after budget refusal"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14370: interrupted selected projection misreported a valid property read as missing"
+    )]
+    fn property_snapshot_interrupted_projection_does_not_invent_missing_read() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_AFTER_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Read
+                && matches!(event.subject, FlowSubject::Property { .. })
+        });
+        let procedure = fixture.procedure(0, original.procedure);
+        let point = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && matches!(event.subject, FlowSubject::Property { .. })
+            })
+            .expect("valid property read")
+            .point;
+        let live = CancellationToken::default();
+        let outcome = fixture
+            .workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .expect("complete property snapshot");
+        let snapshot = outcome
+            .available_value()
+            .expect("retained property snapshot");
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let selected = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            snapshot,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits::default(),
+            &cancelled,
+        );
+        assert!(
+            selected
+                .incomplete_reasons()
+                .contains(&PropertyReachingIncompleteReason::Cancelled)
+        );
+        assert!(
+            !selected.incomplete_reasons().iter().any(|reason| {
+                matches!(
+                    reason,
+                    PropertyReachingIncompleteReason::SelectedReadMissing { .. }
+                )
+            }),
+            "cancelled scan did not certify missing read: {selected:?}"
+        );
+        let complete = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            snapshot,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits::default(),
+            &live,
+        );
+        assert!(
+            complete.is_complete(),
+            "uninterrupted selected proof: {complete:?}"
+        );
+        let mut reached_complete = false;
+        for checks in 1..=4096 {
+            let token = CancellationToken::cancel_after_checks_for_test(checks);
+            let interrupted =
+                crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+                    snapshot,
+                    procedure.semantics(),
+                    procedure.semantics().entry_point(),
+                    point,
+                    PropertyReachingLimits::default(),
+                    &token,
+                );
+            if !token.cancel_after_checks_tripped_for_test() {
+                assert!(interrupted.is_complete(), "{interrupted:?}");
+                reached_complete = true;
+                break;
+            }
+            assert!(
+                interrupted.incomplete_reasons().iter().all(|reason| {
+                    matches!(
+                        reason,
+                        PropertyReachingIncompleteReason::Cancelled
+                            | PropertyReachingIncompleteReason::Reachability(
+                                CfgAlgorithmError::Cancelled { .. }
+                            )
+                            | PropertyReachingIncompleteReason::ReachingDefinitions(
+                                CfgAlgorithmError::Cancelled { .. }
+                            )
+                            | PropertyReachingIncompleteReason::Dominators(
+                                CfgAlgorithmError::Cancelled { .. }
+                            )
+                            | PropertyReachingIncompleteReason::ReachingPairs(
+                                CfgAlgorithmError::Cancelled { .. }
+                            )
+                    )
+                }),
+                "interrupted proof invented a non-cancellation cause at check {checks}: {interrupted:?}"
+            );
+        }
+        assert!(
+            reached_complete,
+            "checkpoint sweep did not reach a complete proof"
+        );
+        let limited = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            snapshot,
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            point,
+            PropertyReachingLimits {
+                max_input_relations: 0,
+                ..PropertyReachingLimits::default()
+            },
+            &live,
+        );
+        assert!(limited.incomplete_reasons().iter().any(|reason| {
+            matches!(
+                reason,
+                PropertyReachingIncompleteReason::InputRelationBudgetExceeded { .. }
+            )
+        }));
+        assert!(
+            !limited.incomplete_reasons().iter().any(|reason| {
+                matches!(
+                    reason,
+                    PropertyReachingIncompleteReason::SelectedReadMissing { .. }
+                )
+            }),
+            "limited scan did not certify missing read: {limited:?}"
+        );
+        // Immutable IR certifies that the entry contains no property read;
+        // this content gap remains valid independently of cancellation.
+        let entry = procedure.semantics().entry_point();
+        let absent = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+            snapshot,
+            procedure.semantics(),
+            entry,
+            entry,
+            PropertyReachingLimits::default(),
+            &cancelled,
+        );
+        assert!(absent.incomplete_reasons().iter().any(|reason| {
+            matches!(reason, PropertyReachingIncompleteReason::SelectedReadMissing { point } if *point == entry)
+        }));
+        assert!(
+            absent
+                .incomplete_reasons()
+                .contains(&PropertyReachingIncompleteReason::Cancelled)
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#14370: cancelled selected projection attributed unrelated property gaps to the read"
+    )]
+    fn property_snapshot_cancelled_projection_scopes_content_gaps() {
+        use crate::analyzer::semantic::ProcedureSemanticsParts;
+
+        const SOURCE: &str = r#"
+function mixed() {
+    const other = {};
+    other.unrelated = 1;
+    const ns = {};
+    ns.value = 1;
+    return ns.value;
+}
+"#;
+        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", SOURCE)]);
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Read
+                && matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value")
+        });
+        let procedure = fixture.procedure(0, original.procedure);
+        let point = original.events.iter().find(|event| {
+            event.event_class == StateEventClass::Read
+                && matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "value")
+        }).expect("selected read").point;
+        // Supply a valid partial producer fact at an unrelated store before
+        // asking the real oracle to seal and project the memory relations.
+        let semantics = procedure.semantics();
+        let mut parts = ProcedureSemanticsParts::new(
+            ProcedureId::new(0),
+            semantics.locator().clone(),
+            semantics.kind(),
+            semantics.source(),
+            semantics.evidence(),
+        );
+        parts.properties = semantics.properties();
+        parts.values = semantics.values().to_vec();
+        parts.allocations = semantics.allocations().to_vec();
+        parts.memory_locations = semantics.memory_locations().to_vec();
+        parts.captures = semantics.captures().to_vec();
+        parts.call_sites = semantics.call_sites().to_vec();
+        parts.source_mappings = semantics.source_mappings().to_vec();
+        parts.evidence_rows = semantics.evidence_rows().to_vec();
+        parts.gaps = semantics.gaps().to_vec();
+        parts.blocks = semantics.blocks().to_vec();
+        parts.points = semantics.points().to_vec();
+        parts.control_edges = semantics.control_edges().to_vec();
+        let store = original.events.iter().find(|event| {
+            event.event_class == StateEventClass::Establish
+                && matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "unrelated")
+        }).expect("unrelated store");
+        let evidence = crate::analyzer::semantic::EvidenceId::new(parts.evidence_rows.len() as u32);
+        let event = parts.points[store.point.index()]
+            .events
+            .iter_mut()
+            .find(|event| matches!(event.effect, SemanticEffect::MemoryStore { .. }))
+            .expect("store IR event");
+        let mut row = semantics
+            .evidence_row(event.evidence)
+            .expect("store evidence")
+            .clone();
+        row.id = evidence;
+        row.completeness =
+            EvidenceCompleteness::Partial("test-only unrelated store evidence".into());
+        event.evidence = evidence;
+        parts.evidence_rows.push(row);
+        let artifact = SemanticArtifact::try_new(
+            procedure.artifact().key().clone(),
+            procedure.artifact().capabilities().clone(),
+            vec![parts],
+        )
+        .expect("valid partial producer artifact");
+        let procedure = Arc::new(artifact)
+            .procedure_handle(ProcedureId::new(0))
+            .expect("test procedure");
+        let live = CancellationToken::default();
+        let outcome = fixture
+            .workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .expect("property snapshot");
+        let snapshot = outcome.available_value().expect("available snapshot");
+        let aggregate = crate::analyzer::semantic::derive_property_reaching(
+            snapshot,
+            PropertyReachingLimits::default(),
+            &live,
+        );
+        let unrelated_gaps = aggregate.incomplete_reasons().iter().filter(|reason| {
+            matches!(reason, PropertyReachingIncompleteReason::StoreEvidenceIncomplete { point: gap_point, .. } if *gap_point != point)
+        }).collect::<Vec<_>>();
+        assert!(
+            !unrelated_gaps.is_empty(),
+            "fixture must project an unrelated content gap: {aggregate:?}"
+        );
+        let mut reached_uncancelled = false;
+        for checks in 1..=4096 {
+            let token = CancellationToken::cancel_after_checks_for_test(checks);
+            let selected = crate::analyzer::semantic::derive_selected_property_reaching_over_graph(
+                snapshot,
+                procedure.semantics(),
+                procedure.semantics().entry_point(),
+                point,
+                PropertyReachingLimits::default(),
+                &token,
+            );
+            if !token.cancel_after_checks_tripped_for_test() {
+                reached_uncancelled = true;
+                break;
+            }
+            if selected.reads().is_empty() {
+                assert!(
+                    selected
+                        .incomplete_reasons()
+                        .contains(&PropertyReachingIncompleteReason::Cancelled),
+                    "{selected:?}"
+                );
+                assert!(
+                    selected
+                        .incomplete_reasons()
+                        .iter()
+                        .all(|reason| !unrelated_gaps.contains(&reason)),
+                    "unrelated content attributed before selected receiver was known at check {checks}: {selected:?}"
+                );
+            }
+        }
+        assert!(reached_uncancelled, "checkpoint sweep did not finish");
     }
 
     /// The selected analysis and public event projection evolve separately:
@@ -20750,6 +23505,262 @@ end
                 .iter()
                 .any(|event| event.site.ast_id.is_some()),
             "at least one event must land on a facts-arena node"
+        );
+    }
+
+    /// The `f` property events of the one procedure that has any, as
+    /// (class, subject base, spelling).
+    fn f_property_events<'a>(
+        state: &FileFlowState,
+        source: &'a str,
+    ) -> Vec<(StateEventClass, ValueId, &'a str)> {
+        let rows = state
+            .procedures
+            .iter()
+            .flat_map(|derivation| derivation.events.iter())
+            .filter_map(|event| match &event.subject {
+                FlowSubject::Property { base, member } if member.as_ref() == "f" => {
+                    Some((event.event_class, *base, spelling(source, event)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!rows.is_empty(), "the source has `f` property events");
+        rows
+    }
+
+    fn base_of(
+        rows: &[(StateEventClass, ValueId, &str)],
+        class: StateEventClass,
+        spelled: &str,
+    ) -> ValueId {
+        let mut matching = rows
+            .iter()
+            .filter(|(row_class, _, row_spelling)| *row_class == class && *row_spelling == spelled);
+        let (_, base, _) = matching
+            .next()
+            .unwrap_or_else(|| panic!("{class:?} event spelled {spelled:?} in {rows:?}"));
+        assert!(
+            matching.all(|(_, other, _)| other == base),
+            "{class:?} events spelled {spelled:?} share one base in {rows:?}"
+        );
+        *base
+    }
+
+    #[test]
+    #[hardwon(
+        "#13211: struct-literal field establish events were silently dropped by uncanonical allocation bases"
+    )]
+    fn struct_literal_fields_present_as_the_binding_that_solely_holds_it() {
+        const SOURCE: &str = "struct Meta { f: i32 }\n\
+            fn held() -> i32 { let mut m = Meta { f: 1 }; m.f = 2; m.f }";
+        let fixture = Fixture::new(Language::Rust, &[("sample.rs", SOURCE)]);
+        let state = fixture.state(0);
+        let rows = f_property_events(&state, SOURCE);
+        let binding = state
+            .procedures
+            .iter()
+            .flat_map(|derivation| derivation.events.iter())
+            .find_map(|event| match event.subject {
+                FlowSubject::Binding { value }
+                    if event.event_class == StateEventClass::Establish =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("`m` is established");
+        let literal = base_of(&rows, StateEventClass::Establish, "Meta { f: 1 }");
+        assert_eq!(literal, binding, "the literal's slot is `m`'s slot");
+        assert_eq!(
+            base_of(&rows, StateEventClass::Establish, "m.f = 2"),
+            binding
+        );
+        assert_eq!(base_of(&rows, StateEventClass::Read, "m.f"), binding);
+        assert!(
+            rows.iter()
+                .any(|(class, base, _)| *class == StateEventClass::Kill && *base == binding),
+            "the overwrite kills the literal's definition: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn struct_literals_that_are_not_solely_held_keep_distinct_subjects() {
+        for (source, literals) in [
+            (
+                "struct Meta { f: i32 }\n\
+                 fn two() -> i32 { let a = Meta { f: 1 }; let b = Meta { f: 2 }; a.f + b.f }",
+                ["Meta { f: 1 }", "Meta { f: 2 }"],
+            ),
+            (
+                "struct Meta { f: i32 }\n\
+                 fn unbound() { let _t = (Meta { f: 1 }, Meta { f: 2 }); }",
+                ["Meta { f: 1 }", "Meta { f: 2 }"],
+            ),
+            (
+                "struct Meta { f: i32 }\n\
+                 fn reassigned() { let mut x = Meta { f: 1 }; x = Meta { f: 2 }; }",
+                ["Meta { f: 1 }", "Meta { f: 2 }"],
+            ),
+            (
+                "struct Meta { f: i32 }\n\
+                 fn conditional(c: bool) { let _x = if c { Meta { f: 1 } } else { Meta { f: 2 } }; }",
+                ["Meta { f: 1 }", "Meta { f: 2 }"],
+            ),
+            (
+                "struct Meta { f: i32 }\n\
+                 fn consume(_m: Meta) {}\n\
+                 fn moved() -> Meta { consume(Meta { f: 1 }); Meta { f: 2 } }",
+                ["Meta { f: 1 }", "Meta { f: 2 }"],
+            ),
+        ] {
+            let fixture = Fixture::new(Language::Rust, &[("sample.rs", source)]);
+            let state = fixture.state(0);
+            let rows = f_property_events(&state, source);
+            let first = base_of(&rows, StateEventClass::Establish, literals[0]);
+            let second = base_of(&rows, StateEventClass::Establish, literals[1]);
+            assert_ne!(first, second, "{source}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn captured_or_addressed_holder_does_not_absorb_the_literal() {
+        for source in [
+            "struct Meta { f: i32 }\n\
+             fn captured() -> i32 { let m = Meta { f: 1 }; let c = || m.f; c() }",
+            "struct Meta { f: i32 }\n\
+             fn addressed() -> i32 { let m = Meta { f: 1 }; let r = &m; r.f }",
+        ] {
+            let fixture = Fixture::new(Language::Rust, &[("sample.rs", source)]);
+            let state = fixture.state(0);
+            let rows = f_property_events(&state, source);
+            let literal = base_of(&rows, StateEventClass::Establish, "Meta { f: 1 }");
+            let binding = state
+                .procedures
+                .iter()
+                .flat_map(|derivation| derivation.events.iter())
+                .find_map(|event| match event.subject {
+                    FlowSubject::Binding { value }
+                        if event.event_class == StateEventClass::Establish
+                            && spelling(source, event).starts_with("let m") =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .expect("`m` is established");
+            assert_ne!(literal, binding, "{source}");
+        }
+    }
+
+    /// `let m = Meta { f: 1 }; m.f` copies the literal's field into `m.f` at
+    /// the `let` point. That self-copy is not a source access: it emits no
+    /// event, kills nothing, and the reaching and dominance rows and the
+    /// selected proof still run from the literal's store to the later read.
+    #[test]
+    fn struct_literal_self_copy_is_skipped_and_flows_forward() {
+        const SOURCE: &str = "struct Meta { f: i32 }\n\
+            fn build() -> i32 { let m = Meta { f: 1 }; m.f }";
+        let fixture = Fixture::new(Language::Rust, &[("sample.rs", SOURCE)]);
+        let outcome = fixture.materialized(0);
+        let artifact = outcome.available_value().cloned().expect("Rust artifact");
+        let token = CancellationToken::default();
+        let state = flow_state_for_materialized_artifact(
+            &fixture.workspace,
+            &fixture.files[0],
+            outcome,
+            &mut test_request(&token),
+        );
+        let derivation = state
+            .procedures
+            .iter()
+            .find(|derivation| {
+                derivation.events.iter().any(|event| {
+                    matches!(&event.subject, FlowSubject::Property { member, .. } if member.as_ref() == "f")
+                })
+            })
+            .expect("`build` has property events");
+        // This inline fixture is not a Cargo crate, so it lacks the crate-wide
+        // Drop absence proof and its derivation carries Drop lowering gaps.
+        // The field-access golden rust-state-events pins completeness.
+        let property_events = derivation
+            .events
+            .iter()
+            .filter(|event| matches!(&event.subject, FlowSubject::Property { .. }))
+            .collect::<Vec<_>>();
+        let count = |class| {
+            property_events
+                .iter()
+                .filter(|event| event.event_class == class)
+                .count()
+        };
+        assert_eq!(count(StateEventClass::Establish), 1, "{property_events:?}");
+        assert_eq!(count(StateEventClass::Read), 1, "{property_events:?}");
+        assert_eq!(count(StateEventClass::Kill), 0, "{property_events:?}");
+        let establish = property_events
+            .iter()
+            .find(|event| event.event_class == StateEventClass::Establish)
+            .expect("establish");
+        let read = property_events
+            .iter()
+            .find(|event| event.event_class == StateEventClass::Read)
+            .expect("read");
+        assert_eq!(establish.subject, read.subject);
+        // The oracle reaches the read from two non-killing candidate stores,
+        // the literal's initializer and the copy, so the literal's row is
+        // `May`. Forwarding the copy reaches the same pair again; it must merge
+        // into one row, never a second one or a stronger certainty.
+        let pair_rows = |relation| {
+            derivation
+                .relations
+                .iter()
+                .filter(|row| {
+                    row.relation == relation
+                        && row.source_event == establish.event
+                        && row.target_event == read.event
+                })
+                .collect::<Vec<_>>()
+        };
+        let reaching = pair_rows(FlowRelation::Reaching);
+        assert_eq!(
+            reaching.len(),
+            1,
+            "one Reaching row from the literal store to the read: {:?}",
+            derivation.relations
+        );
+        let dominates = pair_rows(FlowRelation::Dominates);
+        assert!(
+            dominates.len() == 1 && dominates[0].certainty == FlowCertainty::Exact,
+            "one Exact Dominates row from the literal store to the read: {:?}",
+            derivation.relations
+        );
+        let procedure = artifact
+            .procedure_handle(derivation.procedure)
+            .expect("procedure");
+        let selected = flow_state_for_selected_property(
+            &fixture.workspace,
+            &fixture.files[0],
+            &state,
+            &procedure,
+            read.point,
+            &mut test_request(&token),
+        );
+        // The selected proof carries the fixture's cleanup Drop gap, so its
+        // coverage is not asserted here (see the comment above).
+        let selected = &selected.procedures[0];
+        let selected_reaching = selected
+            .relations
+            .iter()
+            .filter(|row| {
+                row.relation == FlowRelation::Reaching
+                    && row.source_event == establish.event
+                    && row.target_event == read.event
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            selected_reaching.len() == 1 && selected_reaching[0].certainty == reaching[0].certainty,
+            "the selected proof has the derivation's one Reaching row: {:?}",
+            selected.relations
         );
     }
 }

@@ -700,10 +700,20 @@ def main():
                 kind, detail = outcome(warmed)
                 if kind == "OK":
                     break
-                transient = (
-                    "workspace snapshot was not ready" in detail
-                    or "exhausted its 5s request budget" in detail
-                )
+                incomplete = warmed.get("result", {}).get("_meta", {}).get("io.bifrost/incomplete", {})
+                if incomplete:
+                    transient = (
+                        incomplete.get("stage") == "workspace_readiness"
+                        and any(reason in {"deadline_exceeded", "workspace_not_ready"}
+                                for reason in incomplete.get("completion", {}).get("reasons", []))
+                    )
+                else:
+                    # Older servers have no typed stage. Do not let their
+                    # message heuristic override a new server's typed result.
+                    transient = (
+                        "workspace snapshot was not ready" in detail
+                        or "exhausted its 5s request budget" in detail
+                    )
                 if not transient or time.monotonic() >= deadline:
                     raise RuntimeError(f"workspace warmup failed: {kind}: {detail}")
                 time.sleep(0.1)

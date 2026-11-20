@@ -35,7 +35,8 @@ WITH RECURSIVE chase(blob_id, relation_key, module_path, side, declaration_blob_
          exports.declaration_blob_id, exports.declaration_site,
          binding.target_crate_key, binding.target_module_path, binding.target_name
   FROM cr_impl_bindings AS binding
-  CROSS JOIN cr_exports AS exports ON exports.crate_key=binding.target_crate_key
+  -- Namespace-specific: stay on the primary key, not the gap probes' partial cr_exports_name index.
+  CROSS JOIN cr_exports AS exports INDEXED BY sqlite_autoindex_cr_exports_1 ON exports.crate_key=binding.target_crate_key
     AND exports.module_path=binding.target_module_path
     AND exports.namespace='type' AND exports.name=binding.target_name
   UNION
@@ -55,7 +56,7 @@ WITH RECURSIVE chase(blob_id, relation_key, module_path, side, declaration_blob_
   WHERE NOT EXISTS(SELECT 1 FROM cr_reexport_steps AS named
                    WHERE named.crate_key=chase.crate_key AND named.module_path=chase.at_module
                      AND named.bound_name=chase.at_name)
-    AND NOT EXISTS(SELECT 1 FROM cr_exports AS declared
+    AND NOT EXISTS(SELECT 1 FROM cr_exports AS declared INDEXED BY sqlite_autoindex_cr_exports_1
                    WHERE declared.crate_key=chase.crate_key
                      AND declared.module_path=chase.at_module
                      AND declared.namespace='type' AND declared.name=chase.at_name
@@ -76,7 +77,7 @@ placements(blob_id, relation_key, module_path, side, declaration_blob_id,
          chase.crate_key, chase.at_module, chase.at_name
   FROM chase
   CROSS JOIN cr_identity AS identity ON identity.crate_key=chase.crate_key
-  CROSS JOIN cr_exports AS declared ON declared.crate_key=chase.crate_key
+  CROSS JOIN cr_exports AS declared INDEXED BY sqlite_autoindex_cr_exports_1 ON declared.crate_key=chase.crate_key
     AND declared.module_path=chase.at_module
     AND declared.namespace='type' AND declared.name=chase.at_name
   CROSS JOIN cr_members AS member ON member.module_path=chase.at_module

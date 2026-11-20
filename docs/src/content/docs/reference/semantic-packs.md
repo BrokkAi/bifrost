@@ -20,8 +20,8 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `22`, inclusive, and versions `26` through `32`. Its newest version is
-`32`. Version `1`, versions `23` through `25`, and any other value fail with
+through `22`, `26` through `32`, `35`, `37` through `41`, and `43` through `44`.
+Its newest version is `44`. Version `1`, versions `23` through `25`, and any other value fail with
 `schema.unsupported_version`. The field is required; there is no default.
 
 `bifrost-semantic-pack generate` writes each pack produced from a pinned
@@ -31,6 +31,9 @@ no field newer than version 8 is written as version 8, so a reader that predates
 later fields still accepts it. A pack loaded from an `authored_semantic_model`
 spec keeps the version its author declared. Current artifact producers supply
 schema-19 extraction authority, so their output requires at least version 19.
+New-schema JVM extractions with type facts retain schema 43 during
+minimization: is_sealed now means PermittedSubclasses only, rather than the
+legacy sealed-or-final bit. Lowering the schema would change that meaning.
 C# assembly packs also carry assembly identities, requiring version 20. JVM
 packs that record enclosing type parameters on owner inventories require
 version 21. Rust packs that state `drop_glue` in value semantics require
@@ -74,6 +77,10 @@ of an older version parse every pack that it accepts by number.
 | 38 | Verified Rust toolchain sysroot receipts on compiled extraction. Authored and curated packs cannot carry them. | `extraction.schema_version` |
 | 39 | A Rust trait member's signature may name the trait's implicit `Self` as a type parameter. | `signature.trait_self_schema_version` |
 | 40 | Optional `rust_stability` on Rust types, members and implemented-trait facts: stable release, unstable feature set, or uncertified. Non-Rust packs cannot carry this field. | `declaration.rust_stability_schema_version`, `declaration.rust_stability_language` |
+| 41 | Optional `Signature.bounds`: absent means unknown; a present list records all declared method type-parameter predicates. | `signature.bounds_schema_version` |
+| 43 | Optional `is_final` on type facts and generator type emissions. Both boolean values require 43; null/absence is unknown and allowed in older packs. New JVM `is_sealed` means restricted inheritance only. | `declaration.finality_schema_version` |
+| 44 | `target_independent: true` on a callable `MemberFact`, stating that a `callable_family_complete` claim holds for every target the declared toolchain builds for. Only authored packs may carry it; generated and extraction packs reject it. | `declaration.target_independent_schema_version`, `declaration.target_independent_without_family_complete`, `declaration.target_independent_on_generated_pack` |
+| 45 | Optional `inherent_impl_self_arguments` on a Rust inherent callable `MemberFact`: the type arguments of its declaring impl block. | `declaration.inherent_impl_self_arguments_schema_version`, `declaration.inherent_impl_self_arguments_owner`, `declaration.inherent_impl_self_arguments_arity` |
 
 A declaration payload can record its provider's `assembly_identity` and a
 `type_forwards` vector. Forward names retain CLR spelling, including generic
@@ -91,12 +98,12 @@ forward rows.
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v40.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v40.schema.json).
+[`schemas/semantic-model-pack-v44.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v44.schema.json).
 `cargo run --profile measure --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `22` and `26` through `40`, and rejects `23` through `25`. It
+`2` through `22`, `26` through `32`, `35`, `37` through `41`, and `43` through `44`; it rejects the gaps. It
 requires `compatibility.bifrost` for versions `2` through `7` and forbids it
 for versions `8` and newer. It does not express the other per-field version
 gates in the table above; the validator enforces them.
@@ -113,7 +120,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 22, 26 to 40 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 22, 26 to 32, 35, 37 to 41 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -221,7 +228,8 @@ otherwise it is a language selector. See
 | `visibility` | [`Visibility`](#declaration-enumerations) | required | 2 | Declared visibility. |
 | `locator` | [`Locator`](#locator) | required | 2 | Where the declaration lives. |
 | `is_abstract` | boolean | `false` | 2 | The type is abstract. |
-| `is_sealed` | boolean | `false` | 2 | The type is sealed or final. |
+| `is_sealed` | boolean | `false` | 2 | Language-specific sealed inheritance. For JVM schema 43 and newer, Java `sealed` or the class-file `PermittedSubclasses` attribute only. Older JVM records retain a legacy "sealed or final" bit; it cannot prove finality. C#/PHP meanings are unchanged. |
+| `is_final` | boolean or null | absent | 43 | Independent class finality. Only `true` proves finality; `false` means the producer read non-final, and absent/null means unknown. Java class files use class access flags, Java source classes use explicit `final`, and source records are implicitly final. Java source enums and Kotlin/Scala source producers leave it unknown. |
 | `callable_surface_complete` | boolean | `false` | 6 | Every directly declared, externally visible callable and every direct hierarchy edge of this type is in the pack. It does not cover inherited members, fields, effects, or overload applicability. `false` means not reviewed. |
 | `has_explicit_type_terms` | boolean | `false` | 2 | The type is a Go interface that lists explicit type terms (a type-set constraint). |
 | `type_parameters` | list of names | `[]` | 2 | Generic parameter names, in order. Names must be unique. |
@@ -268,6 +276,8 @@ do not assert that a bound has been solved for an arbitrary receiver.
 | `explicit_operation` | [`ExplicitValueOperation`](#value-semantics) | absent | 2 | The member's role in a value operation that the call site writes out. |
 | `ambient_use` | `not_ambient`, `implicit`, or `given` | absent | 3 | See [Ambient use](#ambient-use). |
 | `callable_family_complete` | boolean | `false` | 2 | The pack contains every callable with this member's exact owner, name, receiver form, and declared arity; variadic signatures retain their fixed prefix and repeated final parameter. Rejected on a non-callable or on a member without a signature. |
+| `target_independent` | `true` | absent | 44 | The reviewed `callable_family_complete` claim holds for every target the declared toolchain builds for. Requires `callable_family_complete`; rejected on generated and extraction packs. |
+| `inherent_impl_self_arguments` | array of [`TypeRef`](#typeref) | absent | 45 | Rust only. The type arguments of the inherent impl block that declares this member, one per type parameter of the owner: `impl<R: Read> ZipArchive<R>` records one `type_parameter`, `impl Partial<u8>` records the named type. Absence means the impl block was not recorded. Rejected on a trait implementation member, on a non-callable, and when the argument count differs from the owner's type parameters. |
 | `value_type` | [`TypeRef`](#typeref) | absent | 15 | Declared class of a modeled field value; requires a non-null nominal type without type arguments. |
 | `proxied_type` | [`TypeRef`](#typeref) | absent | 15 | Class used for member dispatch on a proxy field value. Requires `value_type` and the same nominal type shape. |
 | `exact_return_classes` | list of [`TypeRef`](#typeref) | `[]` | 16 | Exhaustive runtime classes returned by this member. Requires a signature and a constructor, method, function, static, or property member. Entries must be unique, non-null `named` or `declared` type references; declared IDs must name a type in this pack. |
@@ -582,7 +592,7 @@ Position rules:
 
 | `kind` | Fields |
 | --- | --- |
-| `type` | `type_kind`, `visibility`, `is_abstract` (default `false`), `is_sealed` (default `false`), `type_parameters` (templates, default `[]`), `hierarchy` (list of `{hierarchy_kind, target}` with a template type, default `[]`), `extension_surfaces` (templates, default `[]`) |
+| `type` | `type_kind`, `visibility`, `is_abstract` (default `false`), `is_sealed` (default `false`), `is_final` (optional boolean, schema 43), `type_parameters` (templates, default `[]`), `hierarchy` (list of `{hierarchy_kind, target}` with a template type, default `[]`), `extension_surfaces` (templates, default `[]`) |
 | `member` | `member_kind`, `visibility`, `owner` (optional template), `signature` (optional `TemplateSignature`), `is_static`, `is_abstract`, `is_virtual` (each default `false`) |
 
 `TemplateSignature`:
@@ -835,6 +845,41 @@ ports and do not add value-flow edges.
 | `id` | stable ID with at least one `.` | A namespaced effect name, such as `acme.network_io` (`summary.effect_namespace`). Unique within one summary. |
 | `timing` | `immediate`, `deferred`, or `unknown` | Before the call returns, scheduled by the call, or not stated. |
 | `certainty` | `definite` or `possible` | Every execution, or some execution. |
+
+### Lifecycle coverage claims
+
+`subject_effects` and `lifecycle_coverage` (schema 26) let a reviewed summary
+state that, for one exit, its witness rows are every effect of a named,
+versioned event set on the receiver. An empty witness list says the exit has
+none. A typestate policy whose automaton declares the same `:event-set`, and
+maps its events to those effects with `:semantic-effect`, can then treat a call
+to the external member as a modeled boundary for that exit instead of an
+external-call uncertainty.
+
+A claim takes effect at one call only when the policy can certify that the
+claim speaks about the tracked object. Every condition below must hold, or the
+exit stays uncertain and the run cannot report a complete result:
+
+- The call's only actual is its receiver. The tracked object is bound to that
+  receiver definitively. For an object returned by another external call, the
+  producer's own summary must declare that result fresh, with an `allocation`
+  effect on it. The receiver is handed to the method by reference: a Go pointer
+  to a pointer-receiver method qualifies, but a copied value does not. Go
+  interface receivers do not qualify yet.
+- The policy observes the object at this call only after a return. An event
+  bound `before-call` on the same receiver is outside every claim.
+- Each exit has a claim, and its witnesses match the policy's candidate events
+  one to one, with `always`, `immediate` and `definite` witness rows. A
+  normal-only claim leaves the exceptional exit uncertain.
+- The summary keeps the receiver within the call. Every transfer reads the
+  receiver and writes only the receiver or a result, every effect is an
+  allocation, and the summary has no returned callables and no conditional
+  indirect writes. It must also claim `no_concurrency_effects: true`, because
+  an empty concurrency list does not prove that nothing is retained.
+
+Ship claims only on summaries that meet these conditions. A record that has
+claims but fails them is strictly more uncertain than the same record without
+claims, which keeps the legacy whole-call treatment.
 
 ### Preconditions and refinements
 
@@ -1539,7 +1584,7 @@ this build supports. A host passes it to pack selection tools.
 | `schemas.policy_document` | Supported policy document versions. |
 | `schemas.rql` | Supported RQL schema versions. |
 | `schemas.builtin_catalog` | Supported built-in policy catalog versions. |
-| `schemas.semantic_model_read` | `[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40]`. |
+| `schemas.semantic_model_read` | `[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41]`. |
 | `schemas.semantic_model_write` | `[22]`, the newest version. Generated packs may declare a lower one. |
 | `schemas.release_index` | `[3, 4]`, the readable release bundle index versions. |
 | `schemas.policy_bundle`, `schemas.semantic_spec`, `schemas.runtime` | Empty lists. |

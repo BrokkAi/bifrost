@@ -265,11 +265,32 @@ pub const MACROS: &str = "WITH RECURSIVE
      CROSS JOIN blobs AS keys ON keys.id = occurrence.blob_id
      CROSS JOIN blobs AS defining ON defining.id = macros.blob_id";
 
-/// Readiness evidence owned exclusively by one outer query. Each selected
-/// snapshot is checked once, independently of spelling and inventory shape.
-#[derive(Default)]
-pub struct RustInventoryReadinessMemo {
-    entries: std::sync::Mutex<Vec<(WorkspaceSnapshots, RustInventoryReadiness)>>,
+brokk_bifrost_core::domain_memo_set! {
+    /// Readiness evidence owned exclusively by one outer query. Each selected
+    /// snapshot is checked once, independently of spelling and inventory shape.
+    #[derive(Default)]
+    pub struct RustInventoryReadinessMemo {
+        readiness: brokk_bifrost_core::domain_memo::CertifyingSlot<
+            SelectedSnapshots,
+            RustInventoryReadiness,
+        >,
+    }
+}
+
+/// The exact selected snapshots the caller read: the authority of readiness.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedSnapshots(WorkspaceSnapshots);
+impl brokk_bifrost_core::domain_memo::CertifiedAuthority for SelectedSnapshots {
+    fn covers(&self, fill: &Self) -> bool {
+        self == fill
+    }
+}
+struct SelectedSnapshotsWitness<'a>(&'a WorkspaceSnapshots);
+impl brokk_bifrost_core::domain_memo::CertificationWitness for SelectedSnapshotsWitness<'_> {
+    type Authority = SelectedSnapshots;
+    fn authority(&self) -> SelectedSnapshots {
+        SelectedSnapshots(self.0.clone())
+    }
 }
 
 impl RustInventoryReadinessMemo {
@@ -278,30 +299,36 @@ impl RustInventoryReadinessMemo {
         conn: &rusqlite::Connection,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<RustInventoryReadiness> {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("inventory readiness mutex poisoned");
-        if let Some((_, readiness)) = entries.iter().find(|(key, _)| key == snapshots) {
-            return Ok(*readiness);
+        let witness = SelectedSnapshotsWitness(snapshots);
+        let proof = brokk_bifrost_core::domain_memo::CertificationProof::from_witness(&witness);
+        if let Some(readiness) = self.readiness.read(&proof, |readiness| *readiness) {
+            return Ok(readiness);
         }
-        let readiness = conn.prepare_cached(READINESS)?.query_row(
-            params![super::rust_unit_summaries::rust_unit_summary_derivation_identity()],
-            |row| {
-                Ok(RustInventoryReadiness([
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ]))
-            },
-        )?;
-        entries.push((snapshots.clone(), readiness));
+        // A failed or refused query is never stored; another selection or a
+        // retired memo computes uncached.
+        let readiness = Self::query(conn)?;
+        self.readiness.replace(&proof, readiness);
         Ok(readiness)
+    }
+
+    fn query(conn: &rusqlite::Connection) -> Result<RustInventoryReadiness> {
+        conn.prepare_cached(READINESS)?
+            .query_row(
+                params![super::rust_unit_summaries::rust_unit_summary_derivation_identity()],
+                |row| {
+                    Ok(RustInventoryReadiness([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ]))
+                },
+            )
+            .map_err(Into::into)
     }
 }
 
@@ -334,6 +361,14 @@ const READINESS: &str = "SELECT
  NOT EXISTS(SELECT 1 FROM selected_rust_unit_summaries u
  JOIN rust_crate_topologies t ON t.topology_id=u.topology_id
  WHERE t.inventory_complete<>1)
+ -- An intentionally unavailable target publishes no topology, so no crate flag
+ -- records its unseen placements. A workspace-wide inventory cannot name the
+ -- affected files, so the target set fails it closed (#13400).
+ AND NOT EXISTS(SELECT 1 FROM selected_workspace_revisions s
+ JOIN rust_package_route_versions p ON p.workspace_id=s.workspace_id AND p.generation=s.generation
+  AND p.valid_from<=s.revision AND (p.valid_until IS NULL OR s.revision<p.valid_until)
+ JOIN rust_package_unavailable_targets u ON u.route_set_id=p.route_set_id
+ WHERE s.lang='rust')
 ";
 
 impl AnalyzerStore {
@@ -346,6 +381,7 @@ impl AnalyzerStore {
     /// unresolved impls require published selected summaries and crate topologies;
     /// incomplete unit or topology inventories return their sound rows with typed
     /// incompleteness. Unresolved names do not prevent enumeration.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_inventory_answer(
         &self,
         snapshots: &WorkspaceSnapshots,
@@ -643,6 +679,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_inventory_queries_seek_spelling_indexes() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store.conn.execute_fixture(|conn| {

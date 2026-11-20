@@ -54,6 +54,7 @@ use crate::analyzer::resolution::{QueryObligation, QueryObligations};
 /// for both query directions; labels retain the reverse contract. The
 /// dynamic-receiver obligation needs the summary-wide structural mutation
 /// inventory, so each direction adds it only where it has that inventory.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn selected_environment_obligations(
     ready: &ReadySelectedResolution<'_, '_>,
     summary: i64,
@@ -400,6 +401,7 @@ fn cached_module_site(
     Ok(site)
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn is_module_definition(
     selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
     definition: SemanticId,
@@ -577,6 +579,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
         true
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn poll_construction(
         &mut self,
         input: &crate::analyzer::resolution::TypedConstructionInput,
@@ -1195,6 +1198,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
         self.qualified_members.insert(id, slot);
         Ok(result)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn poll_qualified_member(
         &mut self,
         id: crate::analyzer::resolution::QualifiedMemberId,
@@ -1579,6 +1583,7 @@ struct PythonRootPrefix {
     name: String,
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn conditional_imports(
     ready: &ReadySelectedResolution<'_, '_>,
     summary: i64,
@@ -1605,6 +1610,7 @@ pub(super) fn conditional_imports(
     Ok(sites)
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn unit_metadata(
     ready: &ReadySelectedResolution<'_, '_>,
     summary: i64,
@@ -1760,6 +1766,7 @@ impl PythonRules<'_, '_, '_> {
         }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn root_prefix(&self, blob: i64, reference: SemanticId) -> Result<Option<PythonRootPrefix>> {
         let find = |rows: &[PythonRootPrefix]| {
             rows.binary_search_by_key(&reference.local_key().expect("local member"), |row| {
@@ -1800,6 +1807,7 @@ impl PythonRules<'_, '_, '_> {
     // A runtime value alone does not prove nominal parameter provenance:
     // constructed locals retain their closed negative member proofs. Reuse
     // lexical selection so captures and rebindings follow the native binder.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn nominal_parameter_receiver(
         &self,
         blob: i64,
@@ -1868,18 +1876,38 @@ impl PythonRules<'_, '_, '_> {
                 let seed = super::super::python_member_rows::receiver_seed(
                     &self.ready.inventory,
                     SemanticId::local(reference.ordinal().expect("mounted Python receiver"), slot),
+                    &crate::analyzer::resolution::ConditionalTypeSeedContext::new(
+                        &self.ready.context_identities,
+                    ),
                     self.cancellation,
                 )?;
-                if seed.is_some_and(|seed| {
-                    seed.value.obligation().is_none() && seed.prerequisites.is_empty()
-                }) {
-                    return Ok(Read::ready(true));
+                match seed {
+                    crate::analyzer::resolution::ConditionalTypeSeedRead::Ready(seed)
+                        if seed.value.obligation().is_none() && seed.prerequisites.is_empty() =>
+                    {
+                        return Ok(Read::ready(true));
+                    }
+                    crate::analyzer::resolution::ConditionalTypeSeedRead::Open {
+                        completion,
+                        ..
+                    } => {
+                        return Ok(if self.cancellation.is_cancelled() {
+                            Read::Cancelled(completion)
+                        } else {
+                            Read::Ready {
+                                value: false,
+                                completion,
+                            }
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
         Ok(Read::ready(false))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn none_definition(&self, definition: SemanticId) -> Result<bool> {
         let Some(ordinal) = definition.ordinal() else {
             return Ok(false);
@@ -1942,6 +1970,7 @@ impl PythonRules<'_, '_, '_> {
     /// writer rule for a Python qualifier: the None projection and the one-hop
     /// module alias both read it, so a global or other-scope writer is judged by
     /// `select_lexical`'s identity proofs for both.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn settled_prefix(&self, prefix: SemanticId) -> Result<Option<SettledPrefix>> {
         let ordinal = prefix.ordinal().expect("mounted Python prefix");
         let mount = self
@@ -2010,6 +2039,7 @@ impl PythonRules<'_, '_, '_> {
     /// qualifier (`prefix_has_import`): a reference prerequisite that closes a
     /// typed cycle drops the cycle reason, and a source with no reaching import
     /// can sit in one (`x = y; y = x.member` in a loop).
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn alias_source(
         &self,
         rows: &PythonBindingRows,
@@ -2086,6 +2116,7 @@ impl PythonRules<'_, '_, '_> {
     /// Project the prefix for this member access, independently of its ordinary
     /// value read. None is still a reaching value, but its missing member raises
     /// AttributeError and contributes no declaration to the successful access.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_member_prefix(
         &self,
         prefix: SemanticId,
@@ -2255,6 +2286,7 @@ impl PythonRules<'_, '_, '_> {
         Ok(Some(ResolutionAnswer::new(targets, Vec::new(), completion)))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prefix_has_import(
         &self,
         rows: &PythonBindingRows,
@@ -2387,6 +2419,7 @@ impl PythonRules<'_, '_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn import_route_completion(
         &self,
         caller: &str,
@@ -2451,6 +2484,7 @@ impl PythonRules<'_, '_, '_> {
         Ok(sites)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn import_activation_reasons(
         &self,
         blob: i64,
@@ -2467,6 +2501,7 @@ impl PythonRules<'_, '_, '_> {
     /// An alias prerequisite can copy its import's provisional reasons into
     /// this caller. Carry the same exact selected writer proof to that caller;
     /// never treat the prerequisite's other incomplete reasons as discharged.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn alias_import_activation_reasons(&self, reference: SemanticId) -> Result<Vec<SemanticId>> {
         let Some(ordinal) = reference.ordinal() else {
             return Ok(Vec::new());
@@ -2498,6 +2533,7 @@ impl PythonRules<'_, '_, '_> {
         Ok(reasons)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn source_import_site(
         &self,
         blob: i64,
@@ -2524,6 +2560,7 @@ impl PythonRules<'_, '_, '_> {
             .map_err(Into::into)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn load_binding_rows(
         &self,
         mount: &crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord,
@@ -2565,6 +2602,7 @@ impl PythonRules<'_, '_, '_> {
         Ok(Some(rows))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_bindings(&self, container: &str) -> Result<Read<Option<PythonModuleBindings>>> {
         let selected = self.ready.inventory.connection().prepare_cached(
             "SELECT mounted.mount_ordinal,mounted.blob_id FROM python_unit_summary_providers provider
@@ -2588,6 +2626,7 @@ impl PythonRules<'_, '_, '_> {
         Ok(Read::ready(rows.map(|rows| (ordinal, blob, rows))))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_reference_inputs(&self, reference: SemanticId) -> Result<Read<PythonReferenceInputs>> {
         let ordinal = reference
             .ordinal()
@@ -2706,6 +2745,7 @@ impl PythonRules<'_, '_, '_> {
 
     /// Invert module_owner for a selected prefix, preserving the selected mount.
     /// Bare names never pass through this continuation boundary.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_container(&self, location: &RouteLocation) -> Result<Option<RouteLocation>> {
         let RouteLocation::Owner { definition, .. } = location else {
             return Ok(None);
@@ -2749,6 +2789,7 @@ impl PythonRules<'_, '_, '_> {
 
     // A namespace portion has no authored module declaration. Retain its
     // selected import binding as a query-local route to the package container.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn namespace_import_route(
         &self,
         prefix: SemanticId,
@@ -2912,6 +2953,7 @@ impl PythonRules<'_, '_, '_> {
 
     /// Select the target module's reaching import writers and hand their source
     /// references to the shared scheduler. This also serves bare from-imports.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_import_aliases(
         &self,
         container: &str,
@@ -2993,6 +3035,7 @@ impl PythonRules<'_, '_, '_> {
 
     /// Only a from-import executed by this selected package reads the package
     /// before initialization completes. Equal blobs at other paths do not count.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn initializing_package_import(
         &self,
         container: &str,
@@ -3033,6 +3076,7 @@ impl PythonRules<'_, '_, '_> {
 }
 
 impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_module_imports(
         &mut self,
         frame: &RootFrame,
@@ -3357,6 +3401,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         }
         Ok(Read::ready(None))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn resolve_prefix_operands(
         &mut self,
         frame: &mut RootFrame,
@@ -3746,6 +3791,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
     ) -> CandidateDecision {
         self.activation(frame, cursor.half)
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn half_rows<'b>(
         &'b self,
         source: &'b SourceHalf,
@@ -4300,6 +4346,7 @@ impl PythonHalf<'_, '_, '_> {
             scope: None,
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn import_starts(
         &self,
         container: &str,
@@ -4427,6 +4474,7 @@ impl PythonHalf<'_, '_, '_> {
         Ok(proofs)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn import_binding_proofs(
         &self,
         ordinal: u32,
@@ -4509,6 +4557,7 @@ impl PythonHalf<'_, '_, '_> {
     }
     // Regular packages/modules have one selected provider. Namespace portions
     // are closed only when every retained portion belongs to analysis roots.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn provider_completion(&self, container: &str) -> Result<ResolutionCompletion> {
         self.record_environment(self.source.token);
         if container.is_empty() {
@@ -4568,6 +4617,7 @@ impl PythonHalf<'_, '_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn wildcard_inventory_closed(&self, container: &str, name: &str) -> Result<bool> {
         let cached = self
             .rules
@@ -4650,6 +4700,7 @@ impl PythonHalf<'_, '_, '_> {
         })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_attribute_space_inputs(&self, container: &str) -> Result<PythonModuleAttributeSpace> {
         let cached = self.rules.module_spaces.borrow().get(container).cloned();
         self.record_environment(self.source.token);
@@ -4785,6 +4836,7 @@ impl PythonHalf<'_, '_, '_> {
     }
 
     /// Namespace packages have no authored module declaration.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_owner(&self, container: &str) -> Result<Option<RouteLocation>> {
         let selected = self.rules.ready.inventory.connection().prepare_cached("SELECT mounted.mount_ordinal, member.blob_id
              FROM python_unit_summary_providers provider
@@ -4819,6 +4871,7 @@ impl PythonHalf<'_, '_, '_> {
         }))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn imported_child_is_attached(&self, child: &str) -> Result<bool> {
         let source_reference = self.rules.reference_for_source(self.source);
         let reference: Option<u32> = self.rules.ready.inventory.connection().prepare_cached("SELECT source_site FROM resolution_semantic_sites WHERE blob_id=?1 AND semantic_key=?2 AND semantic_role='reference'")?.query_row(
@@ -4877,6 +4930,7 @@ impl PythonHalf<'_, '_, '_> {
         Ok(false)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn module_locations(
         &self,
         container: &str,
@@ -5949,6 +6003,7 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
     fn target_location(&self, target: &PythonTarget) -> RouteLocation {
         target.location.clone()
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn exports(
         &self,
         placement: &PythonPlacement,
@@ -6026,6 +6081,7 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             coverage: ExportCoverage::default(),
         }))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn proven_targets(
         &self,
         placement: &PythonPlacement,
@@ -6265,6 +6321,7 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
             self.half.owner_request(&cursor.location, lookup)?,
         ))
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn root_starts(
         &self,
         start: &WalkCursor<T>,
@@ -6456,6 +6513,7 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
             consumed: 0,
         })
     }
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn route_tier(
         &self,
         cursor: &WalkCursor<T>,
@@ -7003,6 +7061,7 @@ impl PythonRules<'_, '_, '_> {
         retain_external_import_observations(selected, imports);
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn external_import_boundary(
         &self,
         fragment: BindingFragmentId,
@@ -7139,6 +7198,7 @@ pub(super) fn project_python_named_argument<
         mutations: &'a super::PythonMutationQuery<'a, 'a>,
     }
     impl<P: crate::analyzer::resolution::DemandRootProvider + ?Sized> PythonNamedArguments<'_, P> {
+        #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
         fn load_binding_rows(
             &self,
             mount: &crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord,
@@ -7158,6 +7218,7 @@ pub(super) fn project_python_named_argument<
                 self.cancellation,
             )
         }
+        #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
         fn class_member_absent(
             &mut self,
             operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
@@ -7319,6 +7380,7 @@ pub(super) fn project_python_named_argument<
             Ok(answer.binding().completion() == &ResolutionCompletion::Complete)
         }
 
+        #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
         fn parameter(
             &mut self,
             operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
@@ -7889,6 +7951,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// None means the caller is outside the selected Python mounts; a mounted
     /// file with no external imports returns Some with an empty vector.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn python_selected_external_imports(
         &self,
         summary: i64,
@@ -8011,6 +8074,10 @@ impl SelectedResolutionOperation<'_, '_> {
     /// their ordinary hooks; class-route evaluation remains a separate bridge.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn python_native_builtin_hierarchy_probe(
         &self,
         summary: i64,
@@ -8446,6 +8513,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn python_definition_reference(
         &self,
         locator: &SelectedSemanticLocator,
@@ -8502,6 +8570,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Resolve exactly one selected source reference in the caller's environment.
     /// Declaration inventory lookup is a separate product path, not a binding query.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn python_definition_at(
         &mut self,
         environment: &super::super::python_unit_summaries::PythonSelectedEnvironment,
@@ -8732,11 +8801,14 @@ impl SelectedResolutionOperation<'_, '_> {
                         selected_external_imports,
                         source_root_gap,
                         reference: SelectedNativeReferenceUnits {
+                            java_qualified_super_proven: false,
+                            java_inherited_external_member: None,
                             argument_binding: None,
                             argument_reason_digests: Vec::new(),
                             call_binding_reason_digests: Vec::new(),
                             constructor_hierarchy_reason_digests: Vec::new(),
                             static_type_qualifier_reason_digests: Vec::new(),
+                            obscuring_name_reason_digests: Vec::new(),
                             model_member_selection: None,
                             query_obligations: answer.query_obligations.clone(),
                             answer,
@@ -8803,6 +8875,10 @@ impl SelectedResolutionOperation<'_, '_> {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub fn python_native_route_probe_in_session(
         &self,
         summary: i64,

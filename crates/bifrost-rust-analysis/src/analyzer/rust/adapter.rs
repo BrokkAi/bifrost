@@ -283,6 +283,20 @@ impl LanguageAdapter for RustAdapter {
         parse_rust_file_with(&self.naming, file, source, tree)
     }
 
+    fn parse_declaration_projection(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+    ) -> brokk_bifrost_core::analyzer::parsed_file::DeclarationProjection {
+        brokk_bifrost_rust::declarations::parse_rust_declaration_projection_with(
+            &self.naming,
+            file,
+            source,
+            tree,
+        )
+    }
+
     fn parse_file_prepared(
         &self,
         file: &ProjectFile,

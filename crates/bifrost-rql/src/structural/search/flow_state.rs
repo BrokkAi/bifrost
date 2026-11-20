@@ -12,11 +12,12 @@
 //! per-procedure lowering completeness. The per-procedure lowering result is
 //! the honest source, and it is what [`FlowStateCompleteness`] reports (#1480).
 
+#[cfg(test)]
+use super::super::flow_state::flow_state_for_file_with_snapshot;
 use super::super::flow_state::{
     FLOW_STATE_AXES, FileFlowState, FlowRelationRow, FlowStateAxis, FlowStateCompleteness,
     FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, NonreturnDiscoveryCache,
-    StateEventRow, flow_state_for_file_with_snapshot,
-    flow_state_for_materialized_artifact_with_provider,
+    StateEventRow, flow_state_for_materialized_artifact_with_provider,
     flow_state_for_materialized_procedure_with_provider, flow_state_for_selected_property,
 };
 use super::EXECUTION_DEPENDENT;
@@ -26,12 +27,13 @@ use super::results::{
     CodeQueryDiagnosticImpact, CodeQueryFlowRelation, CodeQueryRange, CodeQueryStateEvent,
     CodeQueryStateEventRef,
 };
-use super::{DerivationExecutionCause, rel_path_string};
+use super::{CarriesReuseVerdict, DerivationExecutionCause, rel_path_string};
 #[cfg(test)]
 use crate::analyzer::semantic::SemanticGapKind;
 use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, ProcedureId, ProgramPointId, SemanticArtifact,
-    SemanticCapability, SemanticOutcome, WorkspaceIcfgProvider,
+    SemanticBudget, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
+    WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, WorkspaceAnalyzer};
@@ -39,6 +41,7 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
+use brokk_bifrost_flow::flow_state::{FlowStateOperation, FlowStateRequestMemos};
 use brokk_bifrost_rql::{FlowRelationFilter, StateEventFilter};
 use std::sync::Arc;
 
@@ -54,7 +57,7 @@ pub(super) struct FlowStateTraversalCache<'a> {
     /// The same snapshot identity carried into every memo key. `None` remains
     /// distinct from the hash of an activated but empty model set.
     active_model_set_hash: CaptureScopedMemo<Option<Arc<str>>>,
-    files: CaptureScopedMemo<HashMap<FlowStateCacheKey, CachedFileFlowState>>,
+    files: CaptureScopedMemo<FlowStateFiles>,
     nonreturn_provider: Option<WorkspaceIcfgProvider<'a>>,
     nonreturn_discovery_cache: NonreturnDiscoveryCache,
     /// The execution dependences marked while deriving flow state; the query
@@ -62,21 +65,158 @@ pub(super) struct FlowStateTraversalCache<'a> {
     pub(super) reuse: ReuseVerdict,
 }
 
-#[derive(Clone)]
-struct CachedFileFlowState {
-    /// Retain the exact artifact allocation whose handles the derivation
-    /// accepts. `None` marks the standalone acquisition path, which cannot
-    /// prove identity with a separately materialized query artifact.
-    artifact: Option<Arc<SemanticArtifact>>,
-    state: Arc<FileFlowState>,
-}
+type FlowStateFiles = HashMap<FlowStateFileKey, FlowStateFileEntry>;
 
+/// One file under one model snapshot and one outcome quality. The scope that
+/// used to be part of the key now lives in the entry, so one entry can carry
+/// the per-file seed operation next to every scope's states.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FlowStateCacheKey {
+struct FlowStateFileKey {
     file: ProjectFile,
     active_model_set_hash: Option<Arc<str>>,
-    scope: FlowStateCacheScope,
     outcome: FlowStateOutcomeIdentity,
+}
+
+#[derive(Default)]
+struct FlowStateFileEntry {
+    /// The exact native file artifact the seed operation is anchored to. Only
+    /// the seed adapter sets it. A different selected view never changes it;
+    /// a different native allocation replaces the whole entry.
+    native: Option<Arc<SemanticArtifact>>,
+    scopes: HashMap<FlowStateCacheScope, ScopeStates>,
+    /// The retained per-file grant of the formerly whole-file seeds. `None` for
+    /// a query whose consumers all take per-miss grants.
+    seed: Option<SeedOperation>,
+}
+
+/// The owner KIND of a derivation's resource grant. It is independent of the
+/// File/Procedure scope key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowStateOwner {
+    /// The retained per-file seed operation.
+    SeedOperation,
+    /// A fresh grant per cache miss (every other consumer).
+    PerMiss,
+}
+
+/// Everything derived for one scope under one exact allocation.
+#[derive(Default)]
+struct ScopeStates {
+    /// The exact allocation these states were derived from (the selected Arc
+    /// for a procedure scope), held strongly so address-keyed memos stay valid.
+    /// `None` marks the standalone acquisition path, which cannot prove
+    /// identity with a separately materialized query artifact.
+    artifact: Option<Arc<SemanticArtifact>>,
+    /// Shared content: a state with a Content verdict and no operational cause
+    /// anywhere in its completeness. Either owner kind may serve it.
+    content: Option<Arc<FileFlowState>>,
+    /// The paid outcome of the seed owner, served before shared content.
+    seed_slot: Option<SeedSlot>,
+    /// The paid stopped state of the per-miss owner, served before content.
+    per_miss_stop: Option<Arc<FileFlowState>>,
+}
+
+#[derive(Clone)]
+enum SeedSlot {
+    Stopped(Arc<FileFlowState>),
+    /// Admitting this scope's distinct selected allocation was refused.
+    Refused(SemanticBudgetExceeded),
+}
+
+/// The file operation and what its single initial admission decided.
+struct SeedOperation {
+    /// `None` only while a derivation leases it.
+    operation: Option<FlowStateOperation>,
+    admission: SeedAdmission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedAdmission {
+    /// Not yet decided: decided inside the first lend of the operation.
+    Pending,
+    /// The native Complete artifact was admitted once.
+    Admitted,
+    /// A partial native artifact is not prepaid; legacy left resident
+    /// admission to the first actual provider access.
+    NotApplicable,
+    /// The native census was refused; every seed of the file stops with this.
+    Refused(SemanticBudgetExceeded),
+}
+
+impl ScopeStates {
+    fn matches(&self, wanted: &Arc<SemanticArtifact>) -> bool {
+        self.artifact
+            .as_ref()
+            .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
+    }
+
+    /// The paid result this owner kind may be served: its own stopped slot
+    /// first, then shared content. Another owner's stop is never served.
+    fn lookup(&self, owner: FlowStateOwner) -> Option<Arc<FileFlowState>> {
+        match owner {
+            FlowStateOwner::PerMiss => self.per_miss_stop.clone().or_else(|| self.content.clone()),
+            FlowStateOwner::SeedOperation => match &self.seed_slot {
+                Some(SeedSlot::Stopped(state)) => Some(Arc::clone(state)),
+                _ => self.content.clone(),
+            },
+        }
+    }
+
+    /// File a derived state: admissible content is shared, anything else only
+    /// fills its owner's slot, leaving the other owner's paid results intact.
+    fn store(&mut self, owner: FlowStateOwner, state: &Arc<FileFlowState>) {
+        if state_is_cross_owner_content(state) {
+            self.content = Some(Arc::clone(state));
+            return;
+        }
+        match owner {
+            FlowStateOwner::PerMiss => self.per_miss_stop = Some(Arc::clone(state)),
+            FlowStateOwner::SeedOperation => {
+                self.seed_slot = Some(SeedSlot::Stopped(Arc::clone(state)));
+            }
+        }
+    }
+}
+
+impl FlowStateFileEntry {
+    /// The scope's states for exactly `artifact`; a different allocation (or
+    /// the standalone `None`) replaces that scope only, never the operation.
+    fn scope_for(
+        &mut self,
+        scope: FlowStateCacheScope,
+        artifact: Option<Arc<SemanticArtifact>>,
+    ) -> &mut ScopeStates {
+        let states = self.scopes.entry(scope).or_default();
+        let same = match (&states.artifact, &artifact) {
+            (Some(retained), Some(wanted)) => Arc::ptr_eq(retained, wanted),
+            _ => false,
+        };
+        if !same {
+            *states = ScopeStates {
+                artifact,
+                ..ScopeStates::default()
+            };
+        }
+        states
+    }
+}
+
+/// A state may cross owners only if it is a function of the inputs it read
+/// (Content verdict) and carries no typed operational cause in its global or
+/// ANY procedure's completeness, whatever axes the consumer publishes.
+fn state_is_cross_owner_content(state: &FileFlowState) -> bool {
+    let operational = |completeness: &FlowStateCompleteness| {
+        completeness
+            .reasons()
+            .iter()
+            .any(|reason| classify_reason(reason).2.is_some())
+    };
+    state.reuse_verdict().is_content()
+        && !operational(&state.completeness)
+        && state
+            .procedures
+            .iter()
+            .all(|derivation| !operational(&derivation.completeness))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,6 +235,7 @@ enum FlowStateCacheScope {
 /// the outcome discriminant and exact artifact allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FlowStateOutcomeIdentity {
+    #[cfg(test)]
     Standalone,
     Complete,
     Ambiguous,
@@ -115,6 +256,88 @@ impl FlowStateOutcomeIdentity {
             SemanticOutcome::Unproven { .. } => Self::Unproven,
             SemanticOutcome::ExceededBudget { .. } => Self::ExceededBudget,
             SemanticOutcome::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+}
+
+/// What the scope lookup of a seed derivation found.
+enum SeedLookup {
+    Hit(Arc<FileFlowState>),
+    Refused(SemanticBudgetExceeded),
+    Miss,
+}
+
+/// What one lend of the seed operation produced.
+enum SeedAttempt {
+    NativeRefused(SemanticBudgetExceeded),
+    ScopeRefused(SemanticBudgetExceeded),
+    /// The derived state and whether the ordinary CFG ledger refused.
+    Derived(FileFlowState, bool),
+}
+
+enum SeedCommit {
+    Nothing,
+    ScopeRefused(SemanticBudgetExceeded),
+    Derived(Arc<FileFlowState>),
+}
+
+/// Holds the checked-out seed operation during one derivation and returns the
+/// SAME spent operation to its entry on every exit, including unwind. No map
+/// access is held while it derives.
+struct SeedOperationLease<'g> {
+    files: &'g mut CaptureScopedMemo<FlowStateFiles>,
+    analyzer: &'g dyn IAnalyzer,
+    key: FlowStateFileKey,
+    operation: Option<FlowStateOperation>,
+    admission: SeedAdmission,
+}
+
+impl SeedOperationLease<'_> {
+    /// Return the operation and file the scope's paid outcome in one access.
+    fn commit(
+        mut self,
+        scope: FlowStateCacheScope,
+        selected: &Arc<SemanticArtifact>,
+        commit: SeedCommit,
+    ) {
+        let operation = self.operation.take();
+        let admission = self.admission;
+        let key = self.key.clone();
+        self.files
+            .read_mut(&memo_attribution(self.analyzer), |files| {
+                let entry = files.entry(key).or_default();
+                entry.seed = Some(SeedOperation {
+                    operation,
+                    admission,
+                });
+                match commit {
+                    SeedCommit::Nothing => {}
+                    SeedCommit::ScopeRefused(exceeded) => {
+                        entry.scope_for(scope, Some(Arc::clone(selected))).seed_slot =
+                            Some(SeedSlot::Refused(exceeded));
+                    }
+                    SeedCommit::Derived(state) => entry
+                        .scope_for(scope, Some(Arc::clone(selected)))
+                        .store(FlowStateOwner::SeedOperation, &state),
+                }
+            });
+    }
+}
+
+impl Drop for SeedOperationLease<'_> {
+    fn drop(&mut self) {
+        // Only reached with the operation still checked out: an unwind. Put
+        // back the same spent operation; never construct a replacement grant.
+        if let Some(operation) = self.operation.take() {
+            let admission = self.admission;
+            let key = self.key.clone();
+            self.files
+                .read_mut(&memo_attribution(self.analyzer), |files| {
+                    files.entry(key).or_default().seed = Some(SeedOperation {
+                        operation: Some(operation),
+                        admission,
+                    });
+                });
         }
     }
 }
@@ -172,34 +395,57 @@ impl<'a> FlowStateTraversalCache<'a> {
         self.files = CaptureScopedMemo::default();
     }
 
+    /// The cache key of one file's entry. The outcome identity is taken from
+    /// the outcome as given: mapping a native outcome onto a selected Arc
+    /// preserves its variant, so every adapter lands on the same entry.
+    fn file_key<T>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        outcome: &SemanticOutcome<T>,
+    ) -> FlowStateFileKey {
+        FlowStateFileKey {
+            file: file.clone(),
+            active_model_set_hash: self
+                .active_model_set_hash
+                .read(&memo_attribution(analyzer), Clone::clone),
+            outcome: FlowStateOutcomeIdentity::for_outcome(outcome),
+        }
+    }
+
     /// Derive (or replay) the flow state of one file.
     ///
     /// No read key is formed here: the semantic artifact this state is derived
     /// from records its own `Artifact` key at the materialization funnel, which
-    /// runs below this call. The two materialized entry points below *do* form
+    /// runs below this call. The materialized entry points below *do* form
     /// one, because the caller already owns the artifact and this cache can
     /// answer from a retained state without crossing that funnel again.
+    ///
+    /// Supply an unbound state for the exact-artifact cache regression.
+    #[cfg(test)]
     pub(super) fn for_file(
         &mut self,
         workspace: &WorkspaceAnalyzer,
         file: &ProjectFile,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<FileFlowState> {
-        let key = FlowStateCacheKey {
+        let key = FlowStateFileKey {
             file: file.clone(),
             active_model_set_hash: self
                 .active_model_set_hash
                 .read(&memo_attribution(workspace.analyzer()), Clone::clone),
-            scope: FlowStateCacheScope::File,
             outcome: FlowStateOutcomeIdentity::Standalone,
         };
         if let Some(cached) = self
             .files
             .read(&memo_attribution(workspace.analyzer()), |files| {
-                files.get(&key).cloned()
+                files
+                    .get(&key)
+                    .and_then(|entry| entry.scopes.get(&FlowStateCacheScope::File))
+                    .and_then(|states| states.content.clone())
             })
         {
-            return Arc::clone(&cached.state);
+            return cached;
         }
         let derived = Arc::new(flow_state_for_file_with_snapshot(
             workspace,
@@ -210,13 +456,13 @@ impl<'a> FlowStateTraversalCache<'a> {
         ));
         self.files
             .read_mut(&memo_attribution(workspace.analyzer()), |files| {
-                files.insert(
-                    key,
-                    CachedFileFlowState {
-                        artifact: None,
-                        state: Arc::clone(&derived),
-                    },
-                )
+                // The standalone path has no outcome to pair a state with, so
+                // it is filed as content for its one (unbound) scope.
+                files
+                    .entry(key)
+                    .or_default()
+                    .scope_for(FlowStateCacheScope::File, None)
+                    .content = Some(Arc::clone(&derived));
             });
         derived
     }
@@ -240,15 +486,22 @@ impl<'a> FlowStateTraversalCache<'a> {
             FlowStateCacheScope::File,
             cancellation,
             |outcome, request, provider| {
+                let mut budget = crate::analyzer::semantic::SemanticBudget::default();
                 flow_state_for_materialized_artifact_with_provider(
-                    workspace, file, outcome, request, provider,
+                    workspace,
+                    file,
+                    outcome,
+                    request,
+                    &mut budget,
+                    provider,
                 )
             },
         )
     }
 
     /// Derive (or replay) flow state for one exact procedure from the semantic
-    /// artifact allocation that minted its handle.
+    /// artifact allocation that minted its handle. Every miss takes a fresh
+    /// grant; the retained seed operation is never touched here.
     pub(super) fn for_materialized_procedure(
         &mut self,
         workspace: &'a WorkspaceAnalyzer,
@@ -273,11 +526,237 @@ impl<'a> FlowStateTraversalCache<'a> {
             FlowStateCacheScope::Procedure(procedure.id(), procedure.interpretation()),
             cancellation,
             |outcome, request, provider| {
+                let mut budget = crate::analyzer::semantic::SemanticBudget::default();
                 flow_state_for_materialized_procedure_with_provider(
-                    workspace, file, outcome, procedure, request, provider,
+                    workspace,
+                    file,
+                    outcome,
+                    procedure,
+                    request,
+                    &mut budget,
+                    provider,
                 )
             },
         )
+    }
+
+    /// Derive (or replay) flow state for one seed procedure on the file's
+    /// retained operation: the one per-file allowance the formerly whole-file
+    /// seeds (state events, flow relations, initializers) share.
+    ///
+    /// `native` is exactly the file's materialized outcome and `procedure` the
+    /// already selected handle (selection authority and receipt were applied by
+    /// the caller). The operation is anchored to the native artifact only; the
+    /// selected view's allocation lives in the scope's states, so changing the
+    /// view never resets paid work. `Err` is only an admission refusal: the
+    /// native census (every seed of the file stops) or this scope's distinct
+    /// selected allocation (this scope stops). A refusal is retained and
+    /// replayed without deriving, re-admitting or refreshing any grant.
+    pub(super) fn for_seed_procedure(
+        &mut self,
+        workspace: &'a WorkspaceAnalyzer,
+        file: &ProjectFile,
+        native: SemanticOutcome<Arc<SemanticArtifact>>,
+        procedure: &ProcedureHandle,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Arc<FileFlowState>, SemanticBudgetExceeded> {
+        self.seed_scope(
+            workspace,
+            file,
+            native,
+            procedure,
+            cancellation,
+            |outcome, budget, request, provider| {
+                flow_state_for_materialized_procedure_with_provider(
+                    workspace, file, outcome, procedure, request, budget, provider,
+                )
+            },
+        )
+    }
+
+    fn seed_scope<F>(
+        &mut self,
+        workspace: &'a WorkspaceAnalyzer,
+        file: &ProjectFile,
+        native: SemanticOutcome<Arc<SemanticArtifact>>,
+        procedure: &ProcedureHandle,
+        cancellation: Option<&CancellationToken>,
+        derive: F,
+    ) -> Result<Arc<FileFlowState>, SemanticBudgetExceeded>
+    where
+        F: FnOnce(
+            SemanticOutcome<Arc<SemanticArtifact>>,
+            &mut SemanticBudget,
+            &mut FlowStateRequest<'_>,
+            &WorkspaceIcfgProvider<'a>,
+        ) -> FileFlowState,
+    {
+        let analyzer = workspace.analyzer();
+        let native_artifact = native
+            .available_value()
+            .cloned()
+            .expect("unavailable outcomes are reported before seeding a procedure");
+        record_flow_artifact_read(workspace, Some(native_artifact.as_ref()));
+        assert_eq!(
+            native_artifact.key(),
+            procedure.artifact().key(),
+            "the selected procedure belongs to the native file artifact's public key"
+        );
+        let selected = Arc::clone(procedure.artifact());
+        // Keep the native variant and work; derive from the exact selected
+        // allocation. Never conditioned on pointer equality.
+        let derived_outcome = native.clone().map(|_| Arc::clone(&selected));
+        let key = self.file_key(analyzer, file, &native);
+        let scope = FlowStateCacheScope::Procedure(procedure.id(), procedure.interpretation());
+
+        // Anchor, then look the scope up. Attributed like every other access.
+        let lookup = self.files.read_mut(&memo_attribution(analyzer), |files| {
+            let entry = files.entry(key.clone()).or_default();
+            match &entry.native {
+                None => entry.native = Some(Arc::clone(&native_artifact)),
+                Some(anchor) if Arc::ptr_eq(anchor, &native_artifact) => {}
+                Some(_) => {
+                    *entry = FlowStateFileEntry {
+                        native: Some(Arc::clone(&native_artifact)),
+                        ..FlowStateFileEntry::default()
+                    };
+                }
+            }
+            if let Some(SeedOperation {
+                admission: SeedAdmission::Refused(exceeded),
+                ..
+            }) = &entry.seed
+            {
+                return SeedLookup::Refused(*exceeded);
+            }
+            match entry.scopes.get(&scope) {
+                Some(states) if states.matches(&selected) => match &states.seed_slot {
+                    Some(SeedSlot::Refused(exceeded)) => SeedLookup::Refused(*exceeded),
+                    _ => states
+                        .lookup(FlowStateOwner::SeedOperation)
+                        .map_or(SeedLookup::Miss, SeedLookup::Hit),
+                },
+                _ => SeedLookup::Miss,
+            }
+        });
+        match lookup {
+            SeedLookup::Hit(state) => {
+                self.reuse.join_in(state.reuse_verdict());
+                return Ok(state);
+            }
+            SeedLookup::Refused(exceeded) => {
+                // The refusal is retained and replayed with its legacy marks;
+                // nothing is derived, re-admitted or refreshed.
+                analyzer.mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
+                return Err(exceeded);
+            }
+            SeedLookup::Miss => {}
+        }
+
+        let token = cancellation.cloned().unwrap_or_default();
+        let snapshot = self
+            .active_semantic_model_snapshot
+            .read(&memo_attribution(analyzer), Clone::clone);
+        let provider = self.nonreturn_provider.get_or_insert_with(|| {
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(workspace, snapshot.clone())
+        });
+        let discovery_cache = &self.nonreturn_discovery_cache;
+
+        // Check the operation out. No map access is held during derivation.
+        let (operation, admission) = self.files.read_mut(&memo_attribution(analyzer), |files| {
+            let entry = files.get_mut(&key).expect("anchored above");
+            match entry.seed.as_mut() {
+                Some(seed) => (
+                    Some(
+                        seed.operation
+                            .take()
+                            .expect("a seed operation is leased by one derivation at a time"),
+                    ),
+                    seed.admission,
+                ),
+                None => (None, SeedAdmission::Pending),
+            }
+        });
+        let operation = operation.unwrap_or_else(|| {
+            FlowStateOperation::new(FlowStateRequestMemos::new(workspace.retention_budget()))
+        });
+        let mut lease = SeedOperationLease {
+            files: &mut self.files,
+            analyzer,
+            key,
+            operation: Some(operation),
+            admission,
+        };
+        let native_complete = matches!(native, SemanticOutcome::Complete { .. });
+        let attempt = {
+            let SeedOperationLease {
+                operation,
+                admission,
+                ..
+            } = &mut lease;
+            operation
+                .as_mut()
+                .expect("leased operation")
+                .with_request(&token, |budget, request| {
+                    if *admission == SeedAdmission::Pending {
+                        // Decided exactly once per native anchor. A partial
+                        // native artifact is not prepaid.
+                        *admission = if native_complete {
+                            match budget.admit_held_artifact(&native_artifact) {
+                                Ok(()) => SeedAdmission::Admitted,
+                                Err(exceeded) => SeedAdmission::Refused(exceeded),
+                            }
+                        } else {
+                            SeedAdmission::NotApplicable
+                        };
+                    }
+                    if let SeedAdmission::Refused(exceeded) = *admission {
+                        return SeedAttempt::NativeRefused(exceeded);
+                    }
+                    if *admission == SeedAdmission::Admitted
+                        && let Err(exceeded) = budget.admit_held_artifact(&selected)
+                    {
+                        return SeedAttempt::ScopeRefused(exceeded);
+                    }
+                    request.install_active_semantic_model_snapshot(snapshot);
+                    request.install_nonreturn_discovery_cache(discovery_cache);
+                    let refusals_before = request.refusal_count();
+                    let state = derive(derived_outcome, budget, request, provider);
+                    SeedAttempt::Derived(state, request.refusal_count() > refusals_before)
+                })
+        };
+        match attempt {
+            SeedAttempt::NativeRefused(exceeded) => {
+                lease.commit(scope, &selected, SeedCommit::Nothing);
+                analyzer.mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
+                Err(exceeded)
+            }
+            SeedAttempt::ScopeRefused(exceeded) => {
+                lease.commit(scope, &selected, SeedCommit::ScopeRefused(exceeded));
+                analyzer.mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
+                Err(exceeded)
+            }
+            SeedAttempt::Derived(state, refused) => {
+                let state = Arc::new(state);
+                lease.commit(scope, &selected, SeedCommit::Derived(Arc::clone(&state)));
+                self.reuse.join_in(state.reuse_verdict());
+                if refused {
+                    brokk_bifrost_core::profiling::note_with(|| {
+                        format!(
+                            "policy.units unbounded origin={}:{} cause=budget:cfg",
+                            file!(),
+                            line!()
+                        )
+                    });
+                    analyzer.mark_execution_dependent();
+                    self.reuse.join_in(EXECUTION_DEPENDENT);
+                }
+                Ok(state)
+            }
+        }
     }
 
     /// Derive property-reaching rows for one exact point from its retained
@@ -339,25 +818,17 @@ impl<'a> FlowStateTraversalCache<'a> {
         ) -> FileFlowState,
     {
         let artifact = outcome.available_value().cloned();
-        let key = FlowStateCacheKey {
-            file: file.clone(),
-            active_model_set_hash: self
-                .active_model_set_hash
-                .read(&memo_attribution(analyzer), Clone::clone),
-            scope,
-            outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
-        };
-        if let (Some(wanted), Some(cached)) = (
-            artifact.as_ref(),
-            self.files.read(&memo_attribution(analyzer), |files| {
-                files.get(&key).cloned()
-            }),
-        ) && cached
-            .artifact
-            .as_ref()
-            .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
+        let key = self.file_key(analyzer, file, &outcome);
+        if let Some(wanted) = artifact.as_ref()
+            && let Some(cached) = self.files.read(&memo_attribution(analyzer), |files| {
+                files
+                    .get(&key)
+                    .and_then(|entry| entry.scopes.get(&scope))
+                    .filter(|states| states.matches(wanted))
+                    .and_then(|states| states.lookup(FlowStateOwner::PerMiss))
+            })
         {
-            return Arc::clone(&cached.state);
+            return cached;
         }
         let token = cancellation.cloned().unwrap_or_default();
         let provider = self.nonreturn_provider.get_or_insert_with(|| {
@@ -391,13 +862,11 @@ impl<'a> FlowStateTraversalCache<'a> {
             self.reuse.join_in(EXECUTION_DEPENDENT);
         }
         self.files.read_mut(&memo_attribution(analyzer), |files| {
-            files.insert(
-                key,
-                CachedFileFlowState {
-                    artifact,
-                    state: Arc::clone(&derived),
-                },
-            )
+            files
+                .entry(key)
+                .or_default()
+                .scope_for(scope, artifact)
+                .store(FlowStateOwner::PerMiss, &derived);
         });
         derived
     }
@@ -451,6 +920,14 @@ impl<'a> FlowStateTraversalCache<'a> {
                     )
                 })
                 .unwrap_or_default();
+            let detail = if let FlowStateIncompleteReason::PropertySnapshotBudgetExhausted {
+                detail: refusal,
+            } = reason
+            {
+                std::borrow::Cow::Owned(format!("{detail}: {refusal}"))
+            } else {
+                std::borrow::Cow::Borrowed(detail)
+            };
             let uncovered = FLOW_STATE_AXES
                 .iter()
                 .filter(|axis| !completeness.covers(**axis))
@@ -474,6 +951,7 @@ impl<'a> FlowStateTraversalCache<'a> {
                 ),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
             }), cause));
         }
     }
@@ -556,7 +1034,12 @@ pub(super) fn classify_reason(
         ),
         BudgetExhausted { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
-            "a control-flow algorithm exhausted its budget, so its relation emitted no rows",
+            "a semantic or control-flow algorithm exhausted its budget, so its relation emitted no rows",
+            Some(DerivationExecutionCause::Budget),
+        ),
+        PropertySnapshotBudgetExhausted { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "the property snapshot exhausted its semantic budget; property events and their relations were withheld",
             Some(DerivationExecutionCause::Budget),
         ),
         SelectedPropertyEndpointUnavailable { .. } => (
@@ -995,6 +1478,65 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "#14370: RQL dropped snapshot budget details and described retained binding rows as absent"
+    )]
+    fn property_snapshot_budget_diagnostic_reports_resource_and_withheld_property_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer = crate::analyzer::JavascriptAnalyzer::from_project(
+            crate::analyzer::TestProject::new(directory.path().to_path_buf(), Language::JavaScript),
+        );
+        let refusal = crate::analyzer::semantic::SemanticBudgetExceeded::new(
+            crate::analyzer::semantic::SemanticBudgetDimension::Values,
+            1,
+            2,
+        )
+        .to_string();
+        let completeness = FlowStateCompleteness::Incomplete {
+            reasons: vec![FlowStateIncompleteReason::PropertySnapshotBudgetExhausted {
+                detail: refusal.clone(),
+            }],
+        };
+        let mut cache = FlowStateTraversalCache::default();
+        let mut diagnostics = Vec::new();
+        for axes in [STATE_EVENT_AXES, FLOW_RELATION_AXES] {
+            cache.report_completeness(
+                &analyzer,
+                "src/main.js",
+                None,
+                Language::JavaScript,
+                &completeness,
+                axes,
+                7,
+                &mut diagnostics,
+            );
+        }
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::FlowStateDerivationIncomplete
+            );
+            assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+            assert_eq!(
+                diagnostic.incompleteness,
+                Incompleteness::Operational(DerivationExecutionCause::Budget)
+            );
+            assert!(diagnostic.message.contains(&refusal), "{diagnostic:?}");
+            assert!(
+                diagnostic
+                    .message
+                    .contains("property events and their relations were withheld"),
+                "{diagnostic:?}"
+            );
+            assert!(
+                !diagnostic.message.contains("relation emitted no rows"),
+                "{diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
     #[hardwon("#7107: flow-state value memo suppressed diagnostics across invocation boundaries")]
     fn an_incomplete_derivation_replays_every_invocation() {
         let directory = tempfile::tempdir().unwrap();
@@ -1095,5 +1637,750 @@ mod tests {
             "the same reason does block the relation family: {diagnostics:?}"
         );
         assert!(!completeness.covers(FlowStateAxis::SameEvaluationRelation));
+    }
+
+    // ---- C3 cache controls: owner kinds, the retained seed operation, refusals ----
+
+    use super::super::tests::inline_project::{BuiltInlineTestProject, InlineTestProject};
+    use crate::analyzer::AnalyzerConfig;
+    use crate::analyzer::semantic::{SemanticRequest, SemanticWork};
+    use brokk_bifrost_flow::flow_state::FlowStateOperationConsumption;
+
+    const SEED_SOURCE: &str = r#"package main
+
+func first(input int) int {
+    value := input
+    return value
+}
+
+func second(input int) int {
+    value := input
+    return value
+}
+"#;
+
+    /// One project, two analyzer allocations of the same durable file key. The
+    /// second one gives distinct same-key artifact allocations: the shape of a
+    /// separately admitted selected arena next to the native artifact.
+    struct SeedFixture {
+        _project: BuiltInlineTestProject,
+        workspace: WorkspaceAnalyzer,
+        other_workspace: WorkspaceAnalyzer,
+        file: ProjectFile,
+        native: SemanticOutcome<Arc<SemanticArtifact>>,
+        other_native: SemanticOutcome<Arc<SemanticArtifact>>,
+    }
+
+    impl SeedFixture {
+        fn new() -> Self {
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("main.go", SEED_SOURCE)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let other_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let file = project.file("main.go");
+            let materialize = |workspace: &WorkspaceAnalyzer| {
+                let cancellation = CancellationToken::default();
+                workspace
+                    .materialize_program_semantics(
+                        &file,
+                        &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                    )
+                    .expect("Go artifact materialization")
+            };
+            let native = materialize(&workspace);
+            let other_native = materialize(&other_workspace);
+            Self {
+                _project: project,
+                workspace,
+                other_workspace,
+                file,
+                native,
+                other_native,
+            }
+        }
+
+        fn handles(outcome: &SemanticOutcome<Arc<SemanticArtifact>>) -> Vec<ProcedureHandle> {
+            let artifact = outcome.available_value().expect("Go artifact is available");
+            let handles = artifact
+                .procedures()
+                .iter()
+                .map(|procedure| {
+                    artifact
+                        .procedure_handle(procedure.id())
+                        .expect("the artifact owns its procedures")
+                })
+                .collect::<Vec<_>>();
+            assert!(handles.len() >= 2, "both functions lower");
+            handles
+        }
+    }
+
+    fn pristine_consumption(fixture: &SeedFixture) -> FlowStateOperationConsumption {
+        FlowStateOperation::new(FlowStateRequestMemos::new(
+            fixture.workspace.retention_budget(),
+        ))
+        .consumption()
+    }
+
+    fn with_entry<R>(
+        cache: &mut FlowStateTraversalCache<'_>,
+        fixture: &SeedFixture,
+        probe: impl FnOnce(Option<&FlowStateFileEntry>) -> R,
+    ) -> R {
+        let analyzer = fixture.workspace.analyzer();
+        let key = cache.file_key(analyzer, &fixture.file, &fixture.native);
+        cache
+            .files
+            .read(&memo_attribution(analyzer), |files| probe(files.get(&key)))
+    }
+
+    fn consumption(
+        cache: &mut FlowStateTraversalCache<'_>,
+        fixture: &SeedFixture,
+    ) -> FlowStateOperationConsumption {
+        with_entry(cache, fixture, |entry| {
+            entry
+                .and_then(|entry| entry.seed.as_ref())
+                .and_then(|seed| seed.operation.as_ref())
+                .expect("a retained seed operation")
+                .consumption()
+        })
+    }
+
+    fn seed_with<'a>(
+        cache: &mut FlowStateTraversalCache<'a>,
+        fixture: &'a SeedFixture,
+        handle: &ProcedureHandle,
+        token: &CancellationToken,
+    ) -> Result<Arc<FileFlowState>, SemanticBudgetExceeded> {
+        cache.for_seed_procedure(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            handle,
+            Some(token),
+        )
+    }
+
+    fn per_miss_with<'a>(
+        cache: &mut FlowStateTraversalCache<'a>,
+        fixture: &'a SeedFixture,
+        handle: &ProcedureHandle,
+        token: &CancellationToken,
+    ) -> Arc<FileFlowState> {
+        cache.for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            handle,
+            Some(token),
+        )
+    }
+
+    #[test]
+    #[hardwon("#14156: one owner's paid stopped state was lost or served to the other owner kind")]
+    fn owner_kinds_keep_their_own_paid_stops_in_both_orders() {
+        let fixture = SeedFixture::new();
+        let handle = SeedFixture::handles(&fixture.native).remove(0);
+        let live = CancellationToken::default();
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        // SeedOperation stop -> PerMiss content -> SeedOperation.
+        let mut cache = FlowStateTraversalCache::default();
+        let seed_stop = seed_with(&mut cache, &fixture, &handle, &cancelled).expect("admitted");
+        assert!(!state_is_cross_owner_content(&seed_stop));
+        let after_stop = consumption(&mut cache, &fixture);
+        let content = per_miss_with(&mut cache, &fixture, &handle, &live);
+        assert!(state_is_cross_owner_content(&content));
+        assert!(
+            !Arc::ptr_eq(&seed_stop, &content),
+            "another owner's stop is never served as content"
+        );
+        let again = seed_with(&mut cache, &fixture, &handle, &live).expect("admitted");
+        assert!(
+            Arc::ptr_eq(&again, &seed_stop),
+            "the owner's own paid stop wins before shared content"
+        );
+        assert_eq!(consumption(&mut cache, &fixture), after_stop);
+
+        // PerMiss stop -> SeedOperation content -> PerMiss.
+        let mut cache = FlowStateTraversalCache::default();
+        let per_miss_stop = per_miss_with(&mut cache, &fixture, &handle, &cancelled);
+        assert!(!state_is_cross_owner_content(&per_miss_stop));
+        let seed_content = seed_with(&mut cache, &fixture, &handle, &live).expect("admitted");
+        assert!(state_is_cross_owner_content(&seed_content));
+        assert!(!Arc::ptr_eq(&per_miss_stop, &seed_content));
+        let again = per_miss_with(&mut cache, &fixture, &handle, &live);
+        assert!(Arc::ptr_eq(&again, &per_miss_stop));
+        // The shared content serves the seed owner afterwards, with no spending.
+        let before = consumption(&mut cache, &fixture);
+        assert!(Arc::ptr_eq(
+            &seed_with(&mut cache, &fixture, &handle, &live).expect("admitted"),
+            &seed_content
+        ));
+        assert_eq!(consumption(&mut cache, &fixture), before);
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: same-file seeds each received a fresh grant, and a cache hit reset or respent it"
+    )]
+    fn seeds_share_one_cumulative_operation_and_a_hit_spends_nothing() {
+        let fixture = SeedFixture::new();
+        let handles = SeedFixture::handles(&fixture.native);
+        let live = CancellationToken::default();
+        let mut cache = FlowStateTraversalCache::default();
+        let pristine = pristine_consumption(&fixture);
+        let first = seed_with(&mut cache, &fixture, &handles[0], &live).expect("admitted");
+        let after_first = consumption(&mut cache, &fixture);
+        assert!(after_first.cfg_used != pristine.cfg_used);
+        assert!(
+            after_first.semantic_used != pristine.semantic_used,
+            "the native census was admitted once"
+        );
+        seed_with(&mut cache, &fixture, &handles[1], &live).expect("admitted");
+        let after_second = consumption(&mut cache, &fixture);
+        assert!(
+            after_second.cfg_used != after_first.cfg_used,
+            "the second seed spends on the same ledger"
+        );
+        let hit = seed_with(&mut cache, &fixture, &handles[0], &live).expect("admitted");
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(
+            consumption(&mut cache, &fixture),
+            after_second,
+            "a cache hit neither resets nor spends"
+        );
+        with_entry(&mut cache, &fixture, |entry| {
+            let entry = entry.expect("entry");
+            assert!(Arc::ptr_eq(
+                entry.native.as_ref().expect("anchored"),
+                fixture.native.available_value().expect("native"),
+            ));
+            assert_eq!(entry.scopes.len(), 2);
+        });
+        // Per-miss consumers keep their own grants and never touch the seed op.
+        let mut legacy_only = FlowStateTraversalCache::default();
+        legacy_only.for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            &handles[0],
+            Some(&live),
+        );
+        with_entry(&mut legacy_only, &fixture, |entry| {
+            let entry = entry.expect("entry");
+            assert!(entry.seed.is_none() && entry.native.is_none());
+        });
+    }
+
+    /// An operation whose resident semantic allowance is spent, anchored to the
+    /// fixture's native artifact before its first (admission) lend.
+    fn prime_seed_operation(
+        cache: &mut FlowStateTraversalCache<'_>,
+        fixture: &SeedFixture,
+        remaining: impl FnOnce(&SemanticWork, &SemanticWork) -> SemanticWork,
+    ) {
+        let analyzer = fixture.workspace.analyzer();
+        let native = fixture.native.available_value().expect("native").clone();
+        let mut operation = FlowStateOperation::new(FlowStateRequestMemos::new(
+            fixture.workspace.retention_budget(),
+        ));
+        let token = CancellationToken::default();
+        operation.with_request(&token, |budget, _| {
+            let limits = budget.limits();
+            let spend = remaining(&limits, &native.work());
+            budget
+                .admit(spend)
+                .expect("priming spends within the allowance");
+        });
+        let key = cache.file_key(analyzer, &fixture.file, &fixture.native);
+        cache.files.read_mut(&memo_attribution(analyzer), |files| {
+            let entry = files.entry(key).or_default();
+            entry.native = Some(native);
+            entry.seed = Some(SeedOperation {
+                operation: Some(operation),
+                admission: SeedAdmission::Pending,
+            });
+        });
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a refused native admission was re-derived, re-admitted or refreshed on repeat"
+    )]
+    fn a_native_admission_refusal_is_retained_and_replayed_without_deriving() {
+        let fixture = SeedFixture::new();
+        let handles = SeedFixture::handles(&fixture.native);
+        let live = CancellationToken::default();
+        let mut cache = FlowStateTraversalCache::default();
+        // Fill the whole resident allowance: the native census cannot fit.
+        prime_seed_operation(&mut cache, &fixture, |limits, _| *limits);
+        let first = seed_with(&mut cache, &fixture, &handles[0], &live)
+            .expect_err("the native census is refused");
+        let spent = consumption(&mut cache, &fixture);
+        for handle in &handles {
+            assert_eq!(
+                seed_with(&mut cache, &fixture, handle, &live)
+                    .expect_err("every seed of the file stops"),
+                first
+            );
+        }
+        assert_eq!(
+            consumption(&mut cache, &fixture),
+            spent,
+            "no derivation, re-admission or reset on repeat"
+        );
+        with_entry(&mut cache, &fixture, |entry| {
+            let entry = entry.expect("entry");
+            assert!(entry.scopes.is_empty(), "nothing was derived");
+            assert_eq!(
+                entry.seed.as_ref().expect("retained").admission,
+                SeedAdmission::Refused(first)
+            );
+        });
+        assert!(!cache.reuse.is_content(), "the stop is sticky");
+        // Per-miss consumers are not part of the seed allowance.
+        let state = cache.for_materialized_procedure(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            &handles[0],
+            Some(&live),
+        );
+        assert!(state_is_cross_owner_content(&state));
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a distinct selected allocation was refused for the whole file or admitted for free"
+    )]
+    fn a_selected_admission_refusal_stops_only_its_scope() {
+        let fixture = SeedFixture::new();
+        let native_handles = SeedFixture::handles(&fixture.native);
+        let selected_handles = SeedFixture::handles(&fixture.other_native);
+        assert!(
+            !Arc::ptr_eq(selected_handles[0].artifact(), native_handles[0].artifact()),
+            "the second analyzer's artifact is a distinct allocation of the same key"
+        );
+        let live = CancellationToken::default();
+        let mut cache = FlowStateTraversalCache::default();
+        // Leave room for exactly the native census.
+        let prime = |limits: &SemanticWork, census: &SemanticWork| limits.saturating_sub(*census);
+        prime_seed_operation(&mut cache, &fixture, prime);
+        let refused = cache
+            .for_seed_procedure(
+                &fixture.workspace,
+                &fixture.file,
+                fixture.native.clone(),
+                &selected_handles[0],
+                Some(&live),
+            )
+            .expect_err("the distinct selected allocation does not fit");
+        with_entry(&mut cache, &fixture, |entry| {
+            assert_eq!(
+                entry.expect("entry").seed.as_ref().expect("op").admission,
+                SeedAdmission::Admitted,
+                "the native census itself was admitted"
+            );
+        });
+        let spent = consumption(&mut cache, &fixture);
+        assert_eq!(
+            cache
+                .for_seed_procedure(
+                    &fixture.workspace,
+                    &fixture.file,
+                    fixture.native.clone(),
+                    &selected_handles[0],
+                    Some(&live),
+                )
+                .expect_err("replayed"),
+            refused
+        );
+        assert_eq!(consumption(&mut cache, &fixture), spent);
+        // Another scope selecting the native allocation itself is not touched by
+        // the refused alternate. The priming above fills the allowance up to the
+        // native census, so a real later derivation may legitimately stop under
+        // that artificial pressure. Prove the refused alternate and its
+        // retained refusal change nothing by comparing with an independently
+        // primed operation that never attempted the alternate: same limits and
+        // allowance, same facts, verdict, completeness and ledger deltas.
+        let state = cache
+            .for_seed_procedure(
+                &fixture.workspace,
+                &fixture.file,
+                fixture.native.clone(),
+                &native_handles[1],
+                Some(&live),
+            )
+            .expect("an already admitted allocation costs nothing more");
+        let mut control = FlowStateTraversalCache::default();
+        prime_seed_operation(&mut control, &fixture, prime);
+        let control_before = consumption(&mut control, &fixture);
+        let expected = seed_with(&mut control, &fixture, &native_handles[1], &live)
+            .expect("the matched native scope is admitted");
+        assert_eq!(
+            state.reuse_verdict(),
+            expected.reuse_verdict(),
+            "{state:?} vs {expected:?}"
+        );
+        assert_eq!(
+            state_is_cross_owner_content(&state),
+            state_is_cross_owner_content(&expected)
+        );
+        assert_eq!(state.completeness, expected.completeness);
+        let ([actual], [expected]) = (state.procedures.as_slice(), expected.procedures.as_slice())
+        else {
+            panic!("one derived procedure per native scope");
+        };
+        assert_eq!(actual.completeness, expected.completeness);
+        assert_eq!(actual.events, expected.events);
+        assert_eq!(actual.relations, expected.relations);
+        let mut actual_work = consumption(&mut cache, &fixture);
+        let mut expected_work = consumption(&mut control, &fixture);
+        actual_work.semantic_refusals -= spent.semantic_refusals;
+        expected_work.semantic_refusals -= control_before.semantic_refusals;
+        assert_eq!(
+            actual_work, expected_work,
+            "the refused alternate changed the later scope's work"
+        );
+        assert_eq!(
+            seed_with(&mut cache, &fixture, &selected_handles[0], &live)
+                .expect_err("the alternate refusal remains retained"),
+            refused
+        );
+    }
+
+    fn seed_charging<'a>(
+        cache: &mut FlowStateTraversalCache<'a>,
+        fixture: &'a SeedFixture,
+        handle: &ProcedureHandle,
+        token: &CancellationToken,
+        panic: bool,
+    ) -> std::thread::Result<Result<Arc<FileFlowState>, SemanticBudgetExceeded>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.seed_scope(
+                &fixture.workspace,
+                &fixture.file,
+                fixture.native.clone(),
+                handle,
+                Some(token),
+                |outcome, budget, request, provider| {
+                    let state = flow_state_for_materialized_procedure_with_provider(
+                        &fixture.workspace,
+                        &fixture.file,
+                        outcome,
+                        handle,
+                        request,
+                        budget,
+                        provider,
+                    );
+                    budget
+                        .admit(SemanticWork {
+                            events: 1,
+                            ..SemanticWork::default()
+                        })
+                        .expect("the injected charge fits");
+                    assert!(!panic, "injected panic after charging the ledgers");
+                    state
+                },
+            )
+        }))
+    }
+
+    #[test]
+    #[hardwon("#14156: unwinding out of a seed derivation refunded or dropped the file operation")]
+    fn unwinding_seed_derivation_restores_the_same_spent_operation() {
+        let fixture = SeedFixture::new();
+        let handles = SeedFixture::handles(&fixture.native);
+        let live = CancellationToken::default();
+        let mut control = FlowStateTraversalCache::default();
+        seed_charging(&mut control, &fixture, &handles[0], &live, false)
+            .expect("no panic")
+            .expect("admitted");
+        let expected = consumption(&mut control, &fixture);
+
+        let mut cache = FlowStateTraversalCache::default();
+        assert!(seed_charging(&mut cache, &fixture, &handles[0], &live, true).is_err());
+        assert_eq!(
+            consumption(&mut cache, &fixture),
+            expected,
+            "the same spent operation came back, not a default grant"
+        );
+        // The operation is back in its entry and keeps serving seeds.
+        cache
+            .for_seed_procedure(
+                &fixture.workspace,
+                &fixture.file,
+                fixture.native.clone(),
+                &handles[1],
+                Some(&live),
+            )
+            .expect("admitted");
+        assert!(consumption(&mut cache, &fixture) != expected);
+    }
+
+    #[test]
+    #[hardwon(
+        "#14156: a legacy File derivation disturbed the seed grant, or a native change did not replace it"
+    )]
+    fn legacy_file_derivations_keep_the_operation_and_native_changes_replace_it() {
+        let fixture = SeedFixture::new();
+        let native_handles = SeedFixture::handles(&fixture.native);
+        let other_handles = SeedFixture::handles(&fixture.other_native);
+        let live = CancellationToken::default();
+
+        // File-before-Procedure initially has no native operation anchor. Adding
+        // that anchor must preserve the exact paid File result for a later hit.
+        let mut reverse = FlowStateTraversalCache::default();
+        let file_state = reverse.for_materialized_file(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            Some(&live),
+        );
+        with_entry(&mut reverse, &fixture, |entry| {
+            let entry = entry.expect("the File derivation populated the entry");
+            assert!(entry.native.is_none());
+            assert!(entry.seed.is_none());
+        });
+        reverse
+            .for_seed_procedure(
+                &fixture.workspace,
+                &fixture.file,
+                fixture.native.clone(),
+                &native_handles[0],
+                Some(&live),
+            )
+            .expect("admitted after the File derivation");
+        let after_seed = consumption(&mut reverse, &fixture);
+        with_entry(&mut reverse, &fixture, |entry| {
+            assert!(Arc::ptr_eq(
+                entry
+                    .expect("the entry survives anchoring")
+                    .native
+                    .as_ref()
+                    .expect("anchored"),
+                fixture.native.available_value().expect("native"),
+            ));
+        });
+        let file_hit = reverse.for_materialized_file(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            Some(&live),
+        );
+        assert!(
+            Arc::ptr_eq(&file_state, &file_hit),
+            "anchoring the seed operation preserves the paid File result"
+        );
+        assert_eq!(
+            consumption(&mut reverse, &fixture),
+            after_seed,
+            "the File hit leaves every seed ledger unchanged"
+        );
+
+        let mut cache = FlowStateTraversalCache::default();
+        cache
+            .for_seed_procedure(
+                &fixture.workspace,
+                &fixture.file,
+                fixture.native.clone(),
+                &native_handles[0],
+                Some(&live),
+            )
+            .expect("admitted");
+        let before = consumption(&mut cache, &fixture);
+
+        // File-after-Procedure keeps its own fresh grant and leaves the seed one alone.
+        cache.for_materialized_file(
+            &fixture.workspace,
+            &fixture.file,
+            fixture.native.clone(),
+            Some(&live),
+        );
+        assert_eq!(consumption(&mut cache, &fixture), before);
+
+        // A different native allocation replaces the whole entry.
+        let other_native_artifact = fixture.other_native.available_value().expect("native");
+        cache
+            .for_seed_procedure(
+                &fixture.other_workspace,
+                &fixture.file,
+                fixture.other_native.clone(),
+                &other_handles[0],
+                Some(&live),
+            )
+            .expect("admitted");
+        with_entry(&mut cache, &fixture, |entry| {
+            let entry = entry.expect("entry");
+            assert!(Arc::ptr_eq(
+                entry.native.as_ref().expect("anchored"),
+                other_native_artifact,
+            ));
+            assert_eq!(entry.scopes.len(), 1);
+        });
+    }
+
+    const SCALING_CARGO: &str =
+        "[package]\nname = \"scaling\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    const SCALING_SELECTED: &str =
+        "pub fn selected(input: i32) -> i32 {\n    let value = input;\n    value\n}\n";
+
+    /// `count` unrelated Drop-bearing procedures under `prefix`.
+    fn scaling_siblings(prefix: &str, count: usize) -> String {
+        let mut source = format!(
+            "pub struct {prefix}Guard(i32);\nimpl Drop for {prefix}Guard {{\n    fn drop(&mut self) {{}}\n}}\n"
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "pub fn {prefix}sibling_{index}(input: i32) -> i32 {{\n    let guard = {prefix}Guard(input);\n    let value = guard.0;\n    value\n}}\n"
+            ));
+        }
+        source
+    }
+
+    /// Everything the control compares, owned so it outlives the project.
+    struct ScalingRun {
+        derived_procedures: usize,
+        event_sites: Vec<(usize, usize)>,
+        relation_count: usize,
+        completeness: FlowStateCompleteness,
+        ordinary_cfg: FlowStateOperationConsumption,
+        /// File-wide materialization census of the selected body's file.
+        census: SemanticWork,
+        /// Procedures a whole-file derivation of the same file produces.
+        whole_file_procedures: usize,
+    }
+
+    /// The selected body is always the first function of `src/lib.rs`, so its
+    /// source offsets are identical in every variant. `other_siblings` lives
+    /// in a separate file declared at the end of `lib.rs`.
+    fn scaling_run(lib_siblings: usize, other_siblings: usize) -> ScalingRun {
+        let lib = format!(
+            "{SCALING_SELECTED}{}mod other;\n",
+            scaling_siblings("Lib", lib_siblings)
+        );
+        let other = scaling_siblings("Other", other_siblings);
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", SCALING_CARGO)
+            .file("src/lib.rs", lib)
+            .file("src/other.rs", other)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("src/lib.rs");
+        let cancellation = CancellationToken::default();
+        let native = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+            )
+            .expect("Rust artifact materialization");
+        let artifact = native
+            .available_value()
+            .expect("Rust artifact is available");
+        let mut selected = artifact.procedures().iter().filter(|procedure| {
+            procedure.locator().declaration().last_segment_name() == Some("selected")
+        });
+        let id = selected
+            .next()
+            .expect("the fixed body has a procedure")
+            .id();
+        assert!(
+            selected.next().is_none(),
+            "the fixed body has one procedure"
+        );
+        let handle = artifact
+            .procedure_handle(id)
+            .expect("the artifact owns its procedures");
+
+        let mut cache = FlowStateTraversalCache::default();
+        let state = cache
+            .for_seed_procedure(&workspace, &file, native.clone(), &handle, None)
+            .expect("the native census is admitted under the default budget");
+        let derivation = state.procedures.first().expect("the selected derivation");
+        assert_eq!(derivation.procedure, handle.id());
+        let analyzer = workspace.analyzer();
+        let key = cache.file_key(analyzer, &file, &native);
+        let ordinary_cfg = cache.files.read(&memo_attribution(analyzer), |files| {
+            files[&key]
+                .seed
+                .as_ref()
+                .expect("a retained seed")
+                .operation
+                .as_ref()
+                .expect("its operation")
+                .consumption()
+        });
+        assert_eq!(
+            (
+                ordinary_cfg.cfg_refusals,
+                ordinary_cfg.nonreturn_cfg_refusals,
+                ordinary_cfg.semantic_refusals
+            ),
+            (0, 0, 0),
+        );
+        let mut whole_cache = FlowStateTraversalCache::default();
+        let whole = whole_cache.for_materialized_file(&workspace, &file, native.clone(), None);
+        ScalingRun {
+            derived_procedures: state.procedures.len(),
+            event_sites: derivation
+                .events
+                .iter()
+                .map(|event| (event.site.range.start_byte, event.site.range.end_byte))
+                .collect(),
+            relation_count: derivation.relations.len(),
+            completeness: derivation.completeness.clone(),
+            ordinary_cfg,
+            census: artifact.work(),
+            whole_file_procedures: whole.procedures.len(),
+        }
+    }
+
+    fn assert_selected_work_eq(run: &ScalingRun, base: &ScalingRun) {
+        assert_eq!(run.derived_procedures, 1);
+        assert_eq!(run.event_sites, base.event_sites);
+        assert_eq!(run.relation_count, base.relation_count);
+        assert_eq!(run.completeness, base.completeness);
+        assert_eq!(run.ordinary_cfg.cfg_used, base.ordinary_cfg.cfg_used);
+        assert_eq!(
+            run.ordinary_cfg.nonreturn_cfg_used,
+            base.ordinary_cfg.nonreturn_cfg_used
+        );
+    }
+
+    #[test]
+    #[hardwon("#14156: procedure-seeded flow derived unrelated siblings")]
+    fn a_selected_seed_does_not_scale_with_unrelated_siblings() {
+        let base = scaling_run(8, 1);
+        assert_eq!(base.derived_procedures, 1, "only the selected body derives");
+        assert!(
+            base.whole_file_procedures > base.derived_procedures,
+            "the whole-file derivation covers the siblings the seed does not"
+        );
+
+        let mut previous = (base.census.procedures, base.whole_file_procedures);
+        for siblings in [16, 32] {
+            let run = scaling_run(siblings, 1);
+            assert_selected_work_eq(&run, &base);
+            // The file-wide census and whole-file derivation DO grow, which is
+            // what makes this control distinguish whole-file work.
+            assert!(
+                run.census.procedures > previous.0,
+                "the materialization census covers the whole file: {} vs {}",
+                run.census.procedures,
+                previous.0
+            );
+            assert!(run.whole_file_procedures > previous.1);
+            previous = (run.census.procedures, run.whole_file_procedures);
+        }
+
+        // A sibling in a SEPARATE file changes neither the selected body's file
+        // census nor its derivation work.
+        let separate = scaling_run(8, 32);
+        assert_selected_work_eq(&separate, &base);
+        assert_eq!(separate.census, base.census);
+        assert_eq!(separate.whole_file_procedures, base.whole_file_procedures);
     }
 }

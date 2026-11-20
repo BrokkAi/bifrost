@@ -395,7 +395,8 @@ fn bundler_lock_activation_rows(
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 },
                 provenance,
                 artifacts,
@@ -538,6 +539,31 @@ fn vendored_gem_archive(
         }
     }
     Ok(None)
+}
+
+/// The Ruby discovery diagnostics that are a function of the reads discovery
+/// records, so a discovery reporting only these can carry (#13517). An
+/// allow-list: every other kind refuses.
+///
+/// These are the kinds `resolve_evidence` returns before it touches the
+/// approved archive roots or any gem archive: pure checks of the configured
+/// evidence, and checks of the `Gemfile.lock` bytes read through
+/// `read_external_evidence_file_with_budget` (a file read with its content
+/// digest). Every later kind (`gem_not_locked`, the source and checksum
+/// mismatches, `duplicate_gem`, and `empty_field`, which a later per-gem check
+/// also uses) is reached only after `canonicalize` and `is_dir` calls on the
+/// archive roots that record nothing, so it is not a function of recorded
+/// reads. The archive root and gem archive kinds probe the filesystem directly.
+pub(crate) fn diagnostic_follows_recorded_reads(code: &str) -> bool {
+    matches!(
+        code,
+        "ruby.evidence.missing_archive_roots"
+            | "ruby.evidence.invalid_lockfile_digest"
+            | "ruby.evidence.lockfile_digest_mismatch"
+            | "ruby.evidence.lockfile_encoding"
+            | "ruby.evidence.platform_not_locked"
+            | "ruby.evidence.ruby_version_mismatch"
+    )
 }
 
 fn resolve_evidence(
@@ -761,7 +787,8 @@ fn resolve_evidence(
                 toolchain: None,
                 target: Some(evidence.platform.clone()),
                 configuration: Some(evidence.ruby_version.clone()),
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             },
             provenance,
             artifacts: vec![ResolvedDependencyArtifact::exact_file(
@@ -898,6 +925,33 @@ mod tests {
     use brokk_bifrost_core::analyzer::model::Language;
 
     use brokk_bifrost_core::analyzer::project::TestProject;
+
+    #[test]
+    fn only_kinds_decided_before_the_archive_probes_follow_recorded_reads() {
+        for code in [
+            "ruby.evidence.missing_archive_roots",
+            "ruby.evidence.invalid_lockfile_digest",
+            "ruby.evidence.lockfile_digest_mismatch",
+            "ruby.evidence.lockfile_encoding",
+            "ruby.evidence.platform_not_locked",
+            "ruby.evidence.ruby_version_mismatch",
+        ] {
+            assert!(diagnostic_follows_recorded_reads(code), "{code}");
+        }
+        for code in [
+            "ruby.evidence.archive_root",
+            "ruby.evidence.archive_root_not_directory",
+            "ruby.evidence.gem_archive",
+            "ruby.evidence.gem_archive_not_file",
+            "ruby.evidence.gem_archive_outside_roots",
+            "ruby.evidence.gem_not_locked",
+            "ruby.evidence.empty_field",
+            "ruby.evidence.cancelled",
+            "a.kind.nobody.listed",
+        ] {
+            assert!(!diagnostic_follows_recorded_reads(code), "{code}");
+        }
+    }
 
     const LOCKFILE: &[u8] = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3.pre)\n\nPLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  widget\n\nRUBY VERSION\n   ruby 3.4.1p0\n";
 

@@ -114,3 +114,9 @@ Current history:
   A reader admits it when the request's caps cover those measures and the
   manifest's own size and count census. The old rows hold no measures, so they
   are dropped and each shard validates once more.
+
+- `0031-production-inputs.sql`: BREAKING. Stores consumed production slots as
+  normalized rows and adds an indexed production selector scalar. Version 30
+  binaries ignore this selector and cannot preserve inputs on copy, so the
+  existing pre-write user_version fence refuses version 31. Historical
+  productions have no verified input rows and must regenerate.

@@ -15,6 +15,7 @@ pub(in crate::analyzer::store) const RULE_ITEMS_SQL: &str = "SELECT compilation_
 #[derive(Debug, Default)]
 pub struct CSharpRuleIndexHandle(OnceLock<Result<Option<Arc<CSharpRuleIndex>>>>);
 impl CSharpRuleIndexHandle {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn get(
         &self,
         store: &AnalyzerStore,

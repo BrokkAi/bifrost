@@ -1,6 +1,4 @@
 use crate::analyzer::structural::{FileFacts, NormalizedKind};
-use crate::analyzer::usages::get_definition::BoundedResolution;
-use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::path_utils::rel_path_string;
@@ -79,23 +77,6 @@ pub fn wide_deep_member_fixture(
         focus_end_byte: end_byte,
     };
     (fixture, file, source, tree, site)
-}
-
-#[doc(hidden)]
-pub fn assert_scope_budget_exceeded<T: std::fmt::Debug>(
-    outcome: &BoundedResolution<T>,
-    budget: ReceiverAnalysisBudget,
-) {
-    assert!(
-        matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ),
-        "{outcome:#?}"
-    );
 }
 
 #[doc(hidden)]

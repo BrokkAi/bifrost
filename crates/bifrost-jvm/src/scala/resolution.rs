@@ -24,11 +24,11 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionJvmAliasFact, ResolutionJvmAliasId, ResolutionJvmAliasKind,
     ResolutionJvmAliasOwnerSegmentFact, ResolutionJvmAliasStatus, ResolutionLocalWriteFact,
     ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberOwnerFact,
-    ResolutionMemberQualifierCompatibility, ResolutionNameFact, ResolutionNameId,
-    ResolutionNamedArgumentLabelFact, ResolutionNamespace, ResolutionPackageFact,
-    ResolutionPackageObjectExportFact, ResolutionPackageSegmentFact,
-    ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact, ResolutionRootExportFact,
-    ResolutionRootImportAnchor, ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
+    ResolutionMemberQualifierCompatibility, ResolutionNameId, ResolutionNamedArgumentLabelFact,
+    ResolutionNamespace, ResolutionPackageFact, ResolutionPackageObjectExportFact,
+    ResolutionPackageSegmentFact, ResolutionReferenceEnumerationGapFact,
+    ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
+    ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
     ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
     ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
     ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionRouteOwner,
@@ -958,7 +958,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             self.gap(parameter, ResolutionGapKind::MalformedSyntax);
             return;
         }
-        let label = self.intern_name(node_text(name, self.source));
+        let label = self.intern_synthetic(node_text(name, self.source));
         self.facts
             .callable_parameter_semantics
             .push(ResolutionCallableParameterSemanticsFact {
@@ -994,7 +994,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             })
             .expect("an anonymous Scala template has its source-backed owner");
         let site = self.add_site(body, ResolutionSiteKind::TypeDeclaration, scope);
-        let name = self.intern_name(unit.identifier());
+        let name = self.intern_synthetic(unit.identifier());
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -1427,7 +1427,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let name = name?;
         self.declaration_sites.insert(node.id(), site);
         self.declaration_nodes.insert(site, node);
-        let name = self.intern_name(&name);
+        let name = self.intern_synthetic(&name);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -1673,7 +1673,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         scope,
                         terminal: terminal_identifier(chain)
                             .filter(|terminal| !crate::recovered_name(*terminal, self.source))
-                            .map(|terminal| self.intern_name(node_text(terminal, self.source))),
+                            .map(|terminal| {
+                                self.intern_synthetic(node_text(terminal, self.source))
+                            }),
                         namespace: terminal_identifier(chain).and_then(|terminal| {
                             scala_occurrence_role(terminal).and_then(|role| {
                                 scala_occurrence_namespace(terminal, role, self.source)
@@ -2390,8 +2392,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         {
                             let classified_route = ResolutionRouteGap::UnknownBinder {
                                 scope,
-                                name: local
-                                    .map(|local| self.intern_name(node_text(local, self.source))),
+                                name: local.map(|local| {
+                                    self.intern_synthetic(node_text(local, self.source))
+                                }),
                                 namespace: None,
                                 may_publish: false,
                             };
@@ -2407,7 +2410,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     }
                     let route_names = path
                         .iter()
-                        .map(|segment| self.intern_name(node_text(*segment, self.source)))
+                        .map(|segment| self.intern_synthetic(node_text(*segment, self.source)))
                         .collect::<Vec<_>>();
                     self.publish_import_route(ScalaImportRoute {
                         site,
@@ -2427,9 +2430,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         self.publish_import_reference(&path, scope, root_anchor);
                     }
                     let source_name =
-                        source.map(|source| self.intern_name(node_text(source, self.source)));
+                        source.map(|source| self.intern_synthetic(node_text(source, self.source)));
                     let local_name =
-                        local.map(|local| self.intern_name(node_text(local, self.source)));
+                        local.map(|local| self.intern_synthetic(node_text(local, self.source)));
                     self.facts
                         .import_selectors
                         .push(ResolutionImportSelectorFact {
@@ -2468,7 +2471,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let route_prefix = &path[..path.len() - 1];
             let route_names = route_prefix
                 .iter()
-                .map(|segment| self.intern_name(node_text(*segment, self.source)))
+                .map(|segment| self.intern_synthetic(node_text(*segment, self.source)))
                 .collect::<Vec<_>>();
             let site = self.add_site_distinct(node, ResolutionSiteKind::ImportDeclaration, scope);
             self.publish_import_route(ScalaImportRoute {
@@ -2482,7 +2485,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 activation_start: node.end_byte(),
             });
             self.publish_import_reference(&path, scope, root_anchor);
-            let target_name = self.intern_name(node_text(target, self.source));
+            let target_name = self.intern_synthetic(node_text(target, self.source));
             self.facts
                 .import_selectors
                 .push(ResolutionImportSelectorFact {
@@ -2518,10 +2521,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         } else {
             ResolutionImportRouteKind::Named
         };
-        let bound_name = local.map(|local| self.intern_name(node_text(local, self.source)));
+        let bound_name = local.map(|local| self.intern_synthetic(node_text(local, self.source)));
         let mut names = path.to_vec();
         if let Some(source) = source {
-            names.push(self.intern_name(node_text(source, self.source)));
+            names.push(self.intern_synthetic(node_text(source, self.source)));
         }
         self.facts.import_routes.push(ResolutionImportRouteFact {
             site,
@@ -2579,8 +2582,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             // symbol, including a rename. A local declaration would invent a
             // second symbol and a partial scope-wide activation.
             let demand_name = source
-                .map(|source| self.intern_name(node_text(source, self.source)))
-                .unwrap_or_else(|| self.intern_name(node_text(local, self.source)));
+                .map(|source| self.intern_synthetic(node_text(source, self.source)))
+                .unwrap_or_else(|| self.intern_synthetic(node_text(local, self.source)));
             for namespace in [
                 ResolutionNamespace::Type,
                 ResolutionNamespace::Value,
@@ -2922,7 +2925,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 continue;
             }
             for (ordinal, segment) in segments.into_iter().enumerate() {
-                let name = self.intern_name(node_text(segment, self.source));
+                let name = self.intern_synthetic(node_text(segment, self.source));
                 self.facts
                     .package_segments
                     .push(ResolutionPackageSegmentFact {
@@ -3256,8 +3259,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 let scope = self.facts.sites[subtype.index()].scope;
                 let reference =
                     self.push_site(occurrence, ResolutionSiteKind::SyntheticReference, scope);
-                let name = self.intern_name("AnyRef");
-                let prefix = [self.intern_name("scala")];
+                let name = self.intern_synthetic("AnyRef");
+                let prefix = [self.intern_synthetic("scala")];
                 crate::implicit_supertype::publish_implicit_supertype(
                     &mut self.facts,
                     brokk_bifrost_core::analyzer::Language::Scala,
@@ -3359,7 +3362,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let occurrence = self.site_occurrences[subtype.index()];
         let scope = self.facts.sites[subtype.index()].scope;
         let reference = self.push_site(occurrence, ResolutionSiteKind::SyntheticReference, scope);
-        let name = self.intern_name(name);
+        let name = self.intern_synthetic(name);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site: reference,
             name,
@@ -3384,7 +3387,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 owner_continued: false,
             });
         for (position, spelling) in route.iter().enumerate() {
-            let name = self.intern_name(spelling);
+            let name = self.intern_synthetic(spelling);
             self.facts
                 .root_reference_segments
                 .push(ResolutionRootReferenceSegmentFact {
@@ -3755,7 +3758,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let route = route_names.map(|names| {
                 names
                     .iter()
-                    .map(|name| self.intern_name(name))
+                    .map(|name| self.intern_synthetic(name))
                     .collect::<Vec<_>>()
             });
             companions.insert(enum_site, (companion, scope, node, route));
@@ -3814,7 +3817,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 {
                     let classified_route = ResolutionRouteGap::UnknownBinder {
                         scope: enum_scope,
-                        name: Some(self.intern_name(node_text(name, self.source))),
+                        name: Some(self.intern_synthetic(node_text(name, self.source))),
                         namespace: None,
                         may_publish: false,
                     };
@@ -3838,7 +3841,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 star: false,
                 activation_start: owner.start_byte(),
             });
-            let name = self.intern_name(node_text(name, self.source));
+            let name = self.intern_synthetic(node_text(name, self.source));
             self.facts
                 .import_selectors
                 .push(ResolutionImportSelectorFact {
@@ -3863,7 +3866,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let same_count = (member.owner.id() != class.node.id())
             .then(|| member.parameters.as_ref().map(Vec::len))
             .flatten();
-        let member_name = self.intern_name(member.name);
+        let member_name = self.intern_synthetic(member.name);
         if crate::synthetic_members::declares_callable(
             &self.facts,
             owner_scope,
@@ -3940,7 +3943,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let ordinal = u32::try_from(ordinal).expect("Scala parameter count fits u32");
             let parameter_site =
                 self.push_site(occurrence, ResolutionSiteKind::ValueDeclaration, scope);
-            let label = self.intern_name(parameter.label);
+            let label = self.intern_synthetic(parameter.label);
             self.facts.identifiers.push(PositionedIdentifierFact {
                 site: parameter_site,
                 name: label,
@@ -4053,7 +4056,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             source,
         )
         .trim();
-        let name = self.intern_name(spelling);
+        let name = self.intern_synthetic(spelling);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site: reference,
             name,
@@ -4092,7 +4095,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         self.gap(call, ResolutionGapKind::MalformedSyntax);
                         continue;
                     }
-                    let name = self.intern_name(node_text(label_node, self.source));
+                    let name = self.intern_synthetic(node_text(label_node, self.source));
                     let scope = self.facts.sites[call.index()].scope;
                     let reference = self.add_site_distinct(
                         label_node,
@@ -4488,7 +4491,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 self.gap(type_site, ResolutionGapKind::UnsupportedTypeSyntax);
                 return slot;
             }
-            let name = self.intern_name(&name);
+            let name = self.intern_synthetic(&name);
             self.facts.intrinsic_type_seeds.push(
                 brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeSeedFact::direct(
                     slot,
@@ -4873,7 +4876,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                             owner: ResolutionRouteOwner::Declaration(site),
                             binary_owner: self
                                 .binary_owner_prefix(self.facts.sites[site.index()].scope),
-                            name: Some(self.intern_name("MODULE$")),
+                            name: Some(self.intern_synthetic("MODULE$")),
                             kind: Some(ResolutionJvmAliasKind::SingletonInstance),
                         };
                         self.facts.add_route_gap(site, classified_route);
@@ -4891,7 +4894,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                             owner: ResolutionRouteOwner::Declaration(site),
                             binary_owner: self
                                 .binary_owner_prefix(self.facts.sites[site.index()].scope),
-                            name: Some(self.intern_name("MODULE$")),
+                            name: Some(self.intern_synthetic("MODULE$")),
                             kind: Some(ResolutionJvmAliasKind::SingletonInstance),
                         };
                         self.facts.add_route_gap(site, classified_route);
@@ -4903,7 +4906,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                         owner: ResolutionRouteOwner::Declaration(site),
                         binary_owner: self
                             .binary_owner_prefix(self.facts.sites[site.index()].scope),
-                        name: Some(self.intern_name("MODULE$")),
+                        name: Some(self.intern_synthetic("MODULE$")),
                         kind: Some(ResolutionJvmAliasKind::SingletonInstance),
                     };
                     self.facts.add_route_gap(site, classified_route);
@@ -4927,7 +4930,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let Some(owner_segments) = self.jvm_type_owner_segments(scope, name, "$") else {
             return false;
         };
-        let member_name = self.intern_name("MODULE$");
+        let member_name = self.intern_synthetic("MODULE$");
         let alias = ResolutionJvmAliasId::try_from_index(self.facts.jvm_aliases.len())
             .expect("Scala JVM alias count fits u32");
         self.facts.jvm_aliases.push(ResolutionJvmAliasFact {
@@ -4964,6 +4967,10 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let children = node.named_children(&mut cursor).collect::<Vec<_>>();
             stack.extend(children.iter().copied().rev());
             if node.kind() != "export_declaration" {
+                continue;
+            }
+            if node.has_error() {
+                self.unsupported_export(node);
                 continue;
             }
 
@@ -5169,7 +5176,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             }).collect::<Vec<_>>()
         }).unwrap_or_else(|| vec![None]);
         for name in names {
-            let name = name.as_deref().map(|name| self.intern_name(name));
+            let name = name.as_deref().and_then(|name| self.intern_name(name));
             self.facts.add_route_gap(
                 site,
                 ResolutionRouteGap::UnknownBinder {
@@ -5325,10 +5332,12 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 slot
             }
         };
+        let Some(name) = self.intern_name(visible_name) else {
+            return false;
+        };
         let target_identity =
             self.lower_exported_member_reference(syntax, source_name, scope, exporter, owner_slot);
         let alias = self.add_site_distinct(syntax, ResolutionSiteKind::TypeAliasDeclaration, scope);
-        let name = self.intern_name(visible_name);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site: alias,
             name,
@@ -5442,7 +5451,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         owner: ResolutionTypeSlotId,
     ) -> ResolutionTypeSlotId {
         let site = self.add_site_distinct(selector, ResolutionSiteKind::MemberReference, scope);
-        let name = self.intern_name(source_name);
+        let name = self.intern_synthetic(source_name);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -5531,7 +5540,9 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         let Some(target_node) = self.declaration_nodes.get(&target).copied() else {
             return false;
         };
-        let member_name = self.intern_name(&scala_jvm_member_name(visible_name));
+        let Some(member_name) = self.intern_name(&scala_jvm_member_name(visible_name)) else {
+            return false;
+        };
         match target_node.kind() {
             "function_definition" | "function_declaration" | "given_definition" => {
                 self.add_jvm_alias(
@@ -5556,7 +5567,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     owner_segments.clone(),
                 );
                 if matches!(target_node.kind(), "var_definition" | "var_declaration") {
-                    let setter_name = self.intern_name(&format!("{visible_name}_$eq"));
+                    let setter_name = self.intern_synthetic(&format!("{visible_name}_$eq"));
                     self.add_jvm_alias(
                         target,
                         setter_name,
@@ -5596,8 +5607,8 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             .into_iter()
             .map(|(_, name)| name)
             .collect::<Vec<_>>();
-        owner_segments.push(self.intern_name("package$"));
-        let member_name = self.intern_name("MODULE$");
+        owner_segments.push(self.intern_synthetic("package$"));
+        let member_name = self.intern_synthetic("MODULE$");
         self.add_jvm_alias(
             declaration,
             member_name,
@@ -5693,7 +5704,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             parameter_count,
         ) in members
         {
-            let name = self.intern_name(&member_name);
+            let name = self.intern_synthetic(&member_name);
             if is_callable {
                 self.add_jvm_alias(
                     member,
@@ -5728,7 +5739,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     interface_owner.clone(),
                 );
                 if is_var {
-                    let setter_name = self.intern_name(&format!("{member_name}_$eq"));
+                    let setter_name = self.intern_synthetic(&format!("{member_name}_$eq"));
                     self.add_jvm_alias(
                         member,
                         setter_name,
@@ -5743,7 +5754,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             }
         }
         if has_initializers {
-            let initializer = self.intern_name("$init$");
+            let initializer = self.intern_synthetic("$init$");
             self.add_jvm_alias(
                 declaration,
                 initializer,
@@ -5781,7 +5792,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 ),
             ] {
                 if let Some(member) = member {
-                    let name = self.intern_name(spelling);
+                    let name = self.intern_synthetic(spelling);
                     self.facts.add_route_gap(
                         member,
                         ResolutionRouteGap::UnknownAlias {
@@ -5796,7 +5807,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             return;
         };
         if let Some(apply) = apply {
-            let apply_name = self.intern_name("apply");
+            let apply_name = self.intern_synthetic("apply");
             self.add_jvm_alias(
                 apply,
                 apply_name,
@@ -5808,11 +5819,12 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             );
         }
         if let Some(unapply) = unapply {
-            let unapply_name = self.intern_name(if scala_case_class_has_repeated_parameter(node) {
-                "unapplySeq"
-            } else {
-                "unapply"
-            });
+            let unapply_name =
+                self.intern_synthetic(if scala_case_class_has_repeated_parameter(node) {
+                    "unapplySeq"
+                } else {
+                    "unapply"
+                });
             self.add_jvm_alias(
                 unapply,
                 unapply_name,
@@ -5864,7 +5876,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         }
         owner_names.reverse();
         owner_names.push(scala_identifier_spelling(node_text(name, self.source)).to_owned());
-        let binary_name = self.intern_name(&format!("{}{}", owner_names.join("$"), suffix));
+        let binary_name = self.intern_synthetic(&format!("{}{}", owner_names.join("$"), suffix));
         let mut segments = self
             .facts
             .package_segments
@@ -6180,7 +6192,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
     ) -> ResolutionTypeSlotId {
         let site = self.add_site(literal, ResolutionSiteKind::Literal, scope);
         let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-        let name = self.intern_name(type_name);
+        let name = self.intern_synthetic(type_name);
         self.facts.intrinsic_type_seeds.push(
             brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeSeedFact::direct(
                 output,
@@ -6278,7 +6290,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             !spelling.is_empty(),
             "Scala identifier nodes have source text"
         );
-        let name = self.intern_name(spelling);
+        let name = self.intern_synthetic(spelling);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -6476,7 +6488,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         }
         let route_segments = segments[..segments.len() - 1]
             .iter()
-            .map(|segment| self.intern_name(node_text(*segment, self.source)))
+            .map(|segment| self.intern_synthetic(node_text(*segment, self.source)))
             .collect::<Vec<_>>();
         if let Some(existing) = self
             .facts
@@ -6664,16 +6676,16 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         });
     }
 
-    fn intern_name(&mut self, spelling: &str) -> ResolutionNameId {
-        if let Some(id) = self.name_ids.get(spelling) {
-            return *id;
-        }
-        let id = ResolutionNameId::try_from_index(self.facts.names.len())
-            .expect("Scala name count fits u32");
-        let spelling = spelling.to_string();
-        self.name_ids.insert(spelling.clone(), id);
-        self.facts.names.push(ResolutionNameFact { id, spelling });
-        id
+    /// An empty spelling (a MISSING token, empty backticks) is not a name.
+    fn intern_name(&mut self, spelling: &str) -> Option<ResolutionNameId> {
+        self.facts.intern_name(&mut self.name_ids, spelling)
+    }
+
+    /// A name the producer synthesizes (a literal, a `format!` of non-empty
+    /// parts, or a declaration's own checked name) is non-empty by construction.
+    fn intern_synthetic(&mut self, spelling: &str) -> ResolutionNameId {
+        self.intern_name(spelling)
+            .expect("synthetic resolution name is non-empty")
     }
 
     fn scope(&self, id: ResolutionScopeId) -> &ResolutionScopeFact {
@@ -11141,5 +11153,48 @@ object Writes {
             projection.reference == reference
                 && projection.kind == BindingProjectionKind::BareTermBindingNoExpectedType
         }));
+    }
+
+    /// A MISSING, zero-width or empty-backtick name leaves a gap and no empty
+    /// spelling (counterpart of Rust's `missing_names_leave_gaps_not_empty_spellings`,
+    /// #4286).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: a MISSING or empty-backtick Scala name panicked the producer on an empty spelling"
+    )]
+    fn missing_names_leave_gaps_not_empty_spellings() {
+        let mut saw_missing = false;
+        for source in [
+            "val = 1",
+            "import a.\nclass C",
+            "export a.\nclass C",
+            "export a.{b as }\nclass C",
+            "object A { class B; def f = 1 }\nclass C { export A.{B as , f as } }",
+            "object A { class B }\nexport A.{B as ``}",
+            "def (x: Int) = 1",
+            "type = Int",
+            "enum E { case }",
+            "val `` = 1",
+            "class C { def `` = 1 }",
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&crate::scala::language::LANGUAGE.into())
+                .expect("Scala grammar");
+            let tree = parser.parse(source, None).expect("Scala tree");
+            let sexp = tree.root_node().to_sexp();
+            saw_missing |= sexp.contains("MISSING");
+            let file = ProjectFile::new(
+                std::env::current_dir().expect("test current directory"),
+                "src/Resolution.scala",
+            );
+            let facts =
+                crate::scala::declarations::parse_scala_file(&file, source, &tree).resolution_facts;
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}"
+            );
+        }
+        assert!(saw_missing, "recovery inserts a MISSING node in this table");
     }
 }

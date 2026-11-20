@@ -134,6 +134,10 @@ mod jvm_extraction_tests {
         }));
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn missing_java_type_constructor_metadata_fails_publication_atomically() {
         let fixture = InlineTestProject::with_language(Language::Java)
             .file("Plain.java", "class Plain {}")

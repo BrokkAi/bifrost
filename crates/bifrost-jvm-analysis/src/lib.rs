@@ -131,6 +131,7 @@ pub mod native_resolution_test_support {
             )
             .unwrap();
         let request = SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -144,7 +145,8 @@ pub mod native_resolution_test_support {
                 toolchain: None,
                 target: Some("jvm".into()),
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -155,6 +157,10 @@ pub mod native_resolution_test_support {
         assert!(
             matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
             "{outcome:?}"
+        );
+        let _scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_outer_request(
+            analyzer,
+            brokk_bifrost_analysis::analyzer::OuterRequest::new(),
         );
         let overlay = analyzer.semantic_model_overlay_read().published().unwrap();
         let provider = brokk_bifrost_analysis::analyzer::semantic_model::overlay::jvm_external::model_declared_external_owner(

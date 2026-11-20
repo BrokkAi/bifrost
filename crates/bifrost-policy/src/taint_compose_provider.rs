@@ -47,9 +47,9 @@ use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::{
     GuardEdgeKill, conditional_guard_edge_kills,
 };
 use brokk_bifrost_analysis::analyzer::semantic::partial_flow::{
-    ExtendedPartialFlows, ExtraObservation, ExtraSeed, ImplicitHeapRead, ObservationFilter,
-    PartialFlowPort, ProcedurePartialFlows, compute_partial_flows_filtered,
-    compute_partial_flows_with_edge_kills, compute_partial_flows_with_implicit_reads,
+    ExtendedPartialFlows, ExtraObservation, ExtraSeed, GuardProjectionMode, ImplicitHeapRead,
+    ObservationFilter, PartialFlowPort, ProcedurePartialFlows, compute_partial_flows_filtered,
+    compute_partial_flows_in_mode, compute_partial_flows_with_implicit_reads,
     file_local_procedure_relations, observation_value,
 };
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::ProcedureOpenness;
@@ -139,14 +139,17 @@ impl ProjectionCounter {
 pub(crate) struct ConditionalPartitions {
     pub(crate) baseline: Option<TaintEdgeFunction>,
     pub(crate) groups: Vec<(TaintEdgeFunction, Vec<GuardEdgeKill>)>,
+    pub(crate) guard_declines: Vec<brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardBindingDecline>,
 }
 
 type ConditionalPartialFlows = Vec<(Option<TaintEdgeFunction>, Arc<ProcedurePartialFlows>)>;
 
 type ProcedureMemo<T, K = ExactProcedureIdentity> = RefCell<HashMap<K, AdmittedReplayEntry<T>>>;
+type ModeProcedureKey = (ExactProcedureIdentity, GuardProjectionMode);
 type PayloadProcedureKey = (
     ExactProcedureIdentity,
     Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest>,
+    GuardProjectionMode,
 );
 type PayloadProcedureMemo<T> = ProcedureMemo<T, PayloadProcedureKey>;
 
@@ -158,14 +161,14 @@ pub(crate) struct ProviderInputBacking {
     pub(crate) served: ProcedureMemo<ProcedureHandle>,
     /// Partial flows by procedure: the first read or computation per compile.
     pub(crate) partial_flows: PayloadProcedureMemo<Arc<ProcedurePartialFlows>>,
-    pub(crate) conditional_partitions: ProcedureMemo<ConditionalPartitions>,
+    pub(crate) conditional_partitions: ProcedureMemo<ConditionalPartitions, ModeProcedureKey>,
     pub(crate) conditional_declines: RefCell<Vec<SanitizerDecline>>,
     pub(crate) conditional_partial: PayloadProcedureMemo<ConditionalPartialFlows>,
     /// Incoming relation indexes for the compile's immutable procedure snapshots.
     pub(crate) call_storage_indexes: PayloadProcedureMemo<Arc<CallStorageRelationIndex>>,
     pub(crate) filtered_flows: PayloadProcedureMemo<Arc<ProcedurePartialFlows>>,
     /// Openness per procedure, decided once per compile.
-    pub(crate) openness_memo: ProcedureMemo<Openness>,
+    pub(crate) openness_memo: ProcedureMemo<Openness, ModeProcedureKey>,
     /// The gap sweep of each procedure whose partial flows the search read.
     /// It runs at that read, before the openness decision needs it, so the
     /// procedure's refinement calls join its file's next dispatch batch.
@@ -252,7 +255,8 @@ impl ProviderInputBacking {
             &self.conditional_partitions,
             &other.conditional_partitions,
             |left, right| {
-                left.baseline.is_none()
+                left.guard_declines == right.guard_declines
+                    && left.baseline.is_none()
                     && left.groups.is_empty()
                     && right.baseline.is_none()
                     && right.groups.is_empty()
@@ -372,10 +376,17 @@ impl ProviderInputBacking {
         retained_procedure_memo(
             &self.conditional_partitions,
             heap,
-            retained_exact_procedure_key,
+            |key, heap| retained_exact_procedure_key(&key.0, heap),
             |parts, heap| {
                 if let Some(function) = &parts.baseline {
                     function.retained_heap(heap);
+                }
+                heap.vec(&parts.guard_declines);
+                for decline in &parts.guard_declines {
+                    heap.owned_slice(decline.id.as_bytes());
+                    let mut artifacts = RetainedArtifactWalker::new(heap);
+                    artifacts.procedure(&decline.procedure);
+                    artifacts.finish();
                 }
                 heap.vec(&parts.groups);
                 for (function, kills) in &parts.groups {
@@ -418,7 +429,7 @@ impl ProviderInputBacking {
         retained_procedure_memo(
             &self.openness_memo,
             heap,
-            retained_exact_procedure_key,
+            |key, heap| retained_exact_procedure_key(&key.0, heap),
             |openness, heap| openness.retained_heap(heap),
         );
         retained_procedure_memo(
@@ -1573,14 +1584,29 @@ impl<'a> PolicyCompositionProvider<'a> {
             self.workspace.analyzer(),
             &self.inputs.conditional_partitions,
             &hits,
-            handle.exact_identity(),
+            (
+                handle.exact_identity(),
+                self.plan.value_flow().guard_projection_mode(),
+            ),
             |f| f(self.binder.borrow_mut().semantic_budget()),
             || {
                 self.served_procedure(&handle.durable_key());
-                if !self.binder.borrow().has_conditional_sanitizers() {
+                if !self.binder.borrow().has_conditional_sanitizers()
+                    && !self.binder.borrow().has_guard_barriers()
+                {
                     return Ok(ConditionalPartitions::default());
                 }
                 let selected = self.binder.borrow_mut().conditional_in(handle)?;
+                let observations = self
+                    .plan
+                    .value_flow()
+                    .sinks()
+                    .filter(|(_, sink)| {
+                        sink.point().procedure().durable_key() == handle.durable_key()
+                    })
+                    .map(|(_, sink)| sink.point().id())
+                    .collect::<Vec<_>>();
+                let policy_guards = self.binder.borrow_mut().guards_in(handle, &observations)?;
                 let universe = self.plan.universe();
                 let guards = selected
                     .iter()
@@ -1618,24 +1644,74 @@ impl<'a> PolicyCompositionProvider<'a> {
                         by_sanitizer[kill.sanitizer].push(kill.kill);
                     }
                 }
+                for decline in &policy_guards.declines {
+                    let point = decline
+                        .guard
+                        .and_then(|id| {
+                            handle
+                                .semantics()
+                                .guard_facts()
+                                .iter()
+                                .find(|guard| guard.id == id)
+                                .map(|guard| guard.point)
+                        })
+                        .and_then(|point| handle.point_handle(point))
+                        .unwrap_or_else(|| {
+                            handle
+                                .point_handle(handle.semantics().entry_point())
+                                .expect("entry point")
+                        });
+                    self.inputs
+                        .conditional_declines
+                        .borrow_mut()
+                        .push(SanitizerDecline {
+                            sanitizer: decline.id.clone(),
+                            point,
+                            target: None,
+                            reason: format!(
+                                "guard `{}` is undecided: {:?}",
+                                decline.id, decline.reason
+                            ),
+                        });
+                }
+                let mut removes = selected
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .removes
+                            .iter()
+                            .map(|label| label.as_str().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                for guard in &policy_guards.bindings {
+                    removes.push(
+                        guard
+                            .removes
+                            .taint_labels()
+                            .iter()
+                            .map(|label| label.to_string())
+                            .collect(),
+                    );
+                    by_sanitizer.push(vec![guard.binding.kill.clone()]);
+                }
                 if by_sanitizer.iter().all(Vec::is_empty) {
-                    let partitions = ConditionalPartitions::default();
-                    return Ok(partitions);
+                    return Ok(ConditionalPartitions {
+                        guard_declines: policy_guards.declines,
+                        ..ConditionalPartitions::default()
+                    });
                 }
                 let mut classes_by_kills: HashMap<
                     Vec<usize>,
                     Vec<&brokk_bifrost_flow::taint::SourceClassId>,
                 > = HashMap::new();
                 for class in universe.classes() {
-                    let kills = selected
+                    let kills = removes
                         .iter()
                         .enumerate()
-                        .filter_map(|(index, entry)| {
+                        .filter_map(|(index, removes)| {
                             (!by_sanitizer[index].is_empty()
-                                && entry
-                                    .removes
-                                    .iter()
-                                    .any(|label| label.as_str() == class.as_str()))
+                                && removes.iter().any(|label| label == class.as_str()))
                             .then_some(index)
                         })
                         .collect::<Vec<_>>();
@@ -1665,7 +1741,11 @@ impl<'a> PolicyCompositionProvider<'a> {
                     })
                     .collect::<Vec<_>>();
                 groups.sort_by(|left, right| left.0.cmp(&right.0));
-                let partitions = ConditionalPartitions { baseline, groups };
+                let partitions = ConditionalPartitions {
+                    baseline,
+                    groups,
+                    guard_declines: policy_guards.declines,
+                };
                 Ok(partitions)
             },
             |_| true,
@@ -1838,6 +1918,7 @@ impl<'a> PolicyCompositionProvider<'a> {
             (
                 procedure.exact_identity(),
                 snapshot.payload_projection().identity,
+                self.plan.value_flow().guard_projection_mode(),
             ),
             |f| f(request.borrow_mut().budget),
             || {
@@ -2186,6 +2267,7 @@ impl<'a> PolicyCompositionProvider<'a> {
         Ok((
             handle.exact_identity(),
             projection.available_value().copied().flatten(),
+            self.plan.value_flow().guard_projection_mode(),
         ))
     }
 
@@ -2398,8 +2480,11 @@ impl brokk_bifrost_flow::composition::InteriorProjectionClient for PolicyComposi
         request: &mut SemanticRequest<'_>,
     ) -> Result<ExtendedPartialFlows, Self::Error> {
         let procedure = handle.durable_key();
-        if !edge_kills.is_empty() {
-            compute_partial_flows_with_edge_kills(
+        if !edge_kills.is_empty()
+            || self.plan.value_flow().guard_projection_mode()
+                == GuardProjectionMode::PolicyProvedOnly
+        {
+            compute_partial_flows_in_mode(
                 handle,
                 snapshot,
                 seeds,
@@ -2407,6 +2492,7 @@ impl brokk_bifrost_flow::composition::InteriorProjectionClient for PolicyComposi
                 witnesses,
                 implicit_reads,
                 edge_kills,
+                self.plan.value_flow().guard_projection_mode(),
                 &mut ProcedureBarrierFilter {
                     provider: self,
                     procedure: handle,
@@ -3465,100 +3551,132 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         let projection_key = self.payload_flow_key(procedure, request)?;
         let hits = Cell::new(0);
         let request = RefCell::new(request);
-        let cached =
-            read_shared(
-                self.workspace.analyzer(),
+        let cached = read_shared(
+            self.workspace.analyzer(),
+            if self.barrier_chop.borrow().contains(procedure) {
+                &self.inputs.filtered_flows
+            } else {
+                &self.inputs.partial_flows
+            },
+            &hits,
+            projection_key,
+            |f| f(request.borrow_mut().budget),
+            || {
+                let mut request_ref = request.borrow_mut();
+                let request = &mut **request_ref;
                 if self.barrier_chop.borrow().contains(procedure) {
-                    &self.inputs.filtered_flows
-                } else {
-                    &self.inputs.partial_flows
-                },
-                &hits,
-                projection_key,
-                |f| f(request.borrow_mut().budget),
-                || {
-                    let mut request_ref = request.borrow_mut();
-                    let request = &mut **request_ref;
-                    if self.barrier_chop.borrow().contains(procedure) {
-                        let handle = self.procedure(procedure, request)?;
-                        let mut fixpoint_request =
-                            request.staged_with_execution_budget(&self.execution_budget);
-                        let outcome = if projection_key.1.is_some() {
-                            self.discovery.procedure_snapshot(
-                                &handle,
-                                &OracleCallContext::empty(),
-                                &mut fixpoint_request,
-                            )?
-                        } else {
-                            file_local_procedure_relations(
-                                &handle,
-                                &OracleCallContext::empty(),
-                                &mut fixpoint_request,
-                            )
-                            .map_err(|error| {
-                                TaintPolicyCompileError::SemanticProvider(error.to_string())
-                            })?
-                        };
-                        self.discovery
-                            .require_outcome(&outcome, "barrier partial flows")?;
-                        let snapshot = outcome.available_value().ok_or_else(|| {
-                            TaintPolicyCompileError::SemanticUnavailable(
-                                "barrier partial-flow projection is unavailable".to_owned(),
-                            )
-                        })?;
-                        let _timing =
-                            brokk_bifrost_analysis::profiling::scope("taint.barriers.fixpoint");
-                        self.barrier_fixpoints.set(self.barrier_fixpoints.get() + 1);
-                        self.barrier_procedures
-                            .borrow_mut()
-                            .insert(procedure.clone());
-                        let overlay_cpu_start = ProjectionCounter::start();
-                        let filtered = compute_partial_flows_filtered(
+                    let handle = self.procedure(procedure, request)?;
+                    let mut fixpoint_request =
+                        request.staged_with_execution_budget(&self.execution_budget);
+                    let outcome = if projection_key.1.is_some() {
+                        self.discovery.procedure_snapshot(
                             &handle,
-                            snapshot,
-                            &[],
-                            &[],
-                            false,
-                            &[],
-                            &mut ProcedureBarrierFilter {
-                                provider: self,
-                                procedure: &handle,
-                            },
+                            &OracleCallContext::empty(),
                             &mut fixpoint_request,
                         )?
-                        .partial;
-                        self.overlay_cost.record(overlay_cpu_start);
-                        let stored = self.inputs.partial_flows.borrow();
-                        let baseline = stored
-                            .get(&projection_key)
-                            .expect("the chop only names procedures read by the baseline search");
-                        let baseline = baseline.value();
-                        debug_assert!(
-                            filtered.flows.iter().all(|flow| baseline.flows.iter().any(
-                                |original| baseline.ports[original.from.index()]
-                                    == filtered.ports[flow.from.index()]
-                                    && baseline.ports[original.to.index()]
-                                        == filtered.ports[flow.to.index()]
-                            )),
-                            "barrier filtering only removes stored port flows"
-                        );
-                        drop(stored);
-                        let filtered = Arc::new(filtered);
-                        return Ok(filtered);
-                    }
-                    let baseline_cpu_start = ProjectionCounter::start();
-                    let handle = self.procedure(procedure, request)?;
-                    let selected = self
-                        .discovery
-                        .selected_procedure_and_flows_handle(&handle, request)?;
-                    let flows = Arc::new(selected.flows);
+                    } else {
+                        file_local_procedure_relations(
+                            &handle,
+                            &OracleCallContext::empty(),
+                            &mut fixpoint_request,
+                        )
+                        .map_err(|error| {
+                            TaintPolicyCompileError::SemanticProvider(error.to_string())
+                        })?
+                    };
+                    self.discovery
+                        .require_outcome(&outcome, "barrier partial flows")?;
+                    let snapshot = outcome.available_value().ok_or_else(|| {
+                        TaintPolicyCompileError::SemanticUnavailable(
+                            "barrier partial-flow projection is unavailable".to_owned(),
+                        )
+                    })?;
+                    let _timing =
+                        brokk_bifrost_analysis::profiling::scope("taint.barriers.fixpoint");
+                    self.barrier_fixpoints.set(self.barrier_fixpoints.get() + 1);
+                    self.barrier_procedures
+                        .borrow_mut()
+                        .insert(procedure.clone());
+                    let overlay_cpu_start = ProjectionCounter::start();
+                    let filtered = compute_partial_flows_in_mode(
+                        &handle,
+                        snapshot,
+                        &[],
+                        &[],
+                        false,
+                        &[],
+                        &[],
+                        projection_key.2,
+                        &mut ProcedureBarrierFilter {
+                            provider: self,
+                            procedure: &handle,
+                        },
+                        &mut fixpoint_request,
+                    )?
+                    .partial;
+                    self.overlay_cost.record(overlay_cpu_start);
+                    let stored = self.inputs.partial_flows.borrow();
+                    let baseline = stored
+                        .get(&projection_key)
+                        .expect("the chop only names procedures read by the baseline search");
+                    let baseline = baseline.value();
+                    debug_assert!(
+                        filtered
+                            .flows
+                            .iter()
+                            .all(|flow| baseline.flows.iter().any(|original| baseline.ports
+                                [original.from.index()]
+                                == filtered.ports[flow.from.index()]
+                                && baseline.ports[original.to.index()]
+                                    == filtered.ports[flow.to.index()])),
+                        "barrier filtering only removes stored port flows"
+                    );
+                    drop(stored);
+                    let filtered = Arc::new(filtered);
+                    return Ok(filtered);
+                }
+                let baseline_cpu_start = ProjectionCounter::start();
+                let handle = self.procedure(procedure, request)?;
+                if projection_key.2 == GuardProjectionMode::PolicyProvedOnly {
+                    let mut fixpoint_request =
+                        request.staged_with_execution_budget(&self.execution_budget);
+                    let outcome = if projection_key.1.is_some() {
+                        self.discovery.procedure_snapshot(
+                            &handle,
+                            &OracleCallContext::empty(),
+                            &mut fixpoint_request,
+                        )?
+                    } else {
+                        file_local_procedure_relations(
+                            &handle,
+                            &OracleCallContext::empty(),
+                            &mut fixpoint_request,
+                        )
+                        .map_err(|error| {
+                            TaintPolicyCompileError::SemanticProvider(error.to_string())
+                        })?
+                    };
+                    self.discovery
+                        .require_outcome(&outcome, "policy-proved partial flows")?;
+                    let flows = brokk_bifrost_analysis::analyzer::semantic::partial_flow::partial_flows_from_projection_in_mode(
+                            &handle, Ok(outcome), projection_key.2, &mut fixpoint_request)
+                            .ok_or_else(|| TaintPolicyCompileError::SemanticUnavailable("unfiltered guard baseline cancelled".into()))?;
                     self.baseline_reads_cost.record(baseline_cpu_start);
                     self.computed.set(self.computed.get() + 1);
-                    self.announce_refinement_calls(&selected.procedure, request)?;
-                    Ok(flows)
-                },
-                |_| true,
-            )?;
+                    self.announce_refinement_calls(&handle, request)?;
+                    return Ok(Arc::new(flows));
+                }
+                let selected = self
+                    .discovery
+                    .selected_procedure_and_flows_handle(&handle, request)?;
+                let flows = Arc::new(selected.flows);
+                self.baseline_reads_cost.record(baseline_cpu_start);
+                self.computed.set(self.computed.get() + 1);
+                self.announce_refinement_calls(&selected.procedure, request)?;
+                Ok(flows)
+            },
+            |_| true,
+        )?;
         Ok(cached.clone())
     }
 
@@ -3607,7 +3725,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 };
                 for (function, kills) in partitions.groups {
                     let partial = if let Some(snapshot) = outcome.available_value() {
-                        compute_partial_flows_with_edge_kills(
+                        compute_partial_flows_in_mode(
                             &handle,
                             snapshot,
                             &[],
@@ -3615,6 +3733,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                             false,
                             &[],
                             &kills,
+                            self.plan.value_flow().guard_projection_mode(),
                             &mut ProcedureBarrierFilter {
                                 provider: self,
                                 procedure: &handle,
@@ -3900,7 +4019,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             self.workspace.analyzer(),
             &self.inputs.openness_memo,
             &hits,
-            identity,
+            (identity, self.plan.value_flow().guard_projection_mode()),
             |f| f(request.borrow_mut().budget),
             || {
                 let mut request_ref = request.borrow_mut();
@@ -4293,7 +4412,68 @@ impl PolicyCompositionProvider<'_> {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Openness, TaintPolicyCompileError> {
-        brokk_bifrost_flow::composition::decide_openness(&self.discovery, self, procedure, request)
+        use brokk_bifrost_flow::taint::compose::{BudgetLane, IncompleteCause, OperationalCause};
+        let mut openness = brokk_bifrost_flow::composition::decide_openness(
+            &self.discovery,
+            self,
+            procedure,
+            request,
+        )?;
+        if self.plan.value_flow().guard_projection_mode() == GuardProjectionMode::LegacyAutomatic {
+            return Ok(openness);
+        }
+        let handle = self.procedure(procedure, request)?;
+        let partitions = self.conditional_partitions(&handle)?;
+        if !partitions.guard_declines.is_empty() {
+            use brokk_bifrost_analysis::analyzer::semantic::partial_flow::guard_bindings::GuardBindingReason;
+            let cause = partitions
+                .guard_declines
+                .iter()
+                .find_map(|decline| match decline.reason {
+                    GuardBindingReason::Cancelled => {
+                        Some(IncompleteCause::Operational(OperationalCause::Cancelled))
+                    }
+                    GuardBindingReason::BudgetExceeded => Some(IncompleteCause::Operational(
+                        OperationalCause::Budget(BudgetLane::Semantic),
+                    )),
+                    _ => None,
+                })
+                .unwrap_or(IncompleteCause::Content);
+            let guard_reason = partitions
+                .guard_declines
+                .iter()
+                .map(|decline| format!("guard `{}` is undecided: {:?}", decline.id, decline.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            match &mut openness {
+                Openness::Closed => {
+                    openness = Openness::Open {
+                        residual: Box::default(),
+                        residual_causes: Box::default(),
+                        relation_cause: Some(cause),
+                        cause,
+                        blocked: None,
+                        status: SemanticInputStatus::Unproven,
+                        reason: guard_reason.into(),
+                    }
+                }
+                Openness::Open {
+                    reason,
+                    relation_cause,
+                    cause: existing,
+                    ..
+                } => {
+                    *reason = format!("{reason}; {guard_reason}").into();
+                    if !matches!(existing, IncompleteCause::Operational(_)) {
+                        *existing = cause;
+                    }
+                    if !matches!(relation_cause, Some(IncompleteCause::Operational(_))) {
+                        *relation_cause = Some(cause);
+                    }
+                }
+            }
+        }
+        Ok(openness)
     }
 
     /// The gap sweep of one procedure: whether it is open and the gaps that
@@ -4384,9 +4564,12 @@ fn continuation_quality(
         .is_some_and(CuratedCallModel::is_proven_complete);
     // A transfer's quality does not certify the call's continuation. An
     // authored closure certifies a residual arm only when covering-model
-    // selection proved every other arm. An exact external arm needs its own
-    // override-coverage claim and complete call evidence; the summary's data
-    // transfer alone does not certify its continuation.
+    // selection proved every other arm. An exact external arm is certified by
+    // a complete, effect-free authored summary with complete call evidence.
+    // Exact dispatch selects one implementation, so it needs no
+    // `covers_overrides` claim (`target_needs_override_claim`, #12846); pack
+    // validation refuses that claim on a receiverless target, so requiring it
+    // left every exact free-function summary unproven (#12568).
     let authored_closed = model.is_some_and(|model| {
         let residual = result
             .boundaries()
@@ -4403,9 +4586,6 @@ fn continuation_quality(
             })
             && (residual
                 || (models.resolved_external
-                    && model.authored.as_ref().is_some_and(|closures| {
-                        closures.iter().all(|closure| closure.origin().covers_overrides())
-                    })
                     && brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::scoped_call_dispatch_gap(call.procedure().semantics(), row).is_none()
                     && [row.evidence, row.target_evidence].iter().all(|evidence| {
                         let evidence = call
@@ -4850,3 +5030,7 @@ fn call_model(
 fn content_incomplete(reason: impl Into<Box<str>>) -> Completeness {
     Completeness::content(reason)
 }
+
+#[cfg(test)]
+#[path = "taint_compose_provider/override_claim_tests.rs"]
+mod override_claim_tests;

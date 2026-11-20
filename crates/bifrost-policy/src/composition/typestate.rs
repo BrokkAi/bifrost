@@ -73,7 +73,23 @@ pub(crate) fn compose_typestate_policy(
             .chain(events.manifests)
             .chain(expectations.manifests),
     )?;
+    let transfers = spec
+        .automaton
+        .transfers
+        .iter()
+        .map(|transfer| {
+            Ok(ResolvedTypestateTransferSpec {
+                id: transfer.id.clone(),
+                from: transfer.from.clone(),
+                selector_path: PolicySelectorPath::new(typestate_transfer_selector_path(
+                    &transfer.id,
+                ))
+                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
+            })
+        })
+        .collect::<Result<Vec<_>, CompositionError>>()?;
     let automaton = ResolvedTypestateAutomatonSpec {
+        transfers,
         event_set: spec.automaton.event_set.clone(),
         states: spec.automaton.states.clone(),
         initial: spec.automaton.initial.clone(),
@@ -957,11 +973,29 @@ fn validate_automaton_shape(
     {
         return invalid_automaton("accepting and error state sets must be disjoint");
     }
-    if automaton.events.len() > limits.max_typestate_events()
+    if automaton.transfers.len() > limits.max_typestate_events()
+        || automaton.events.len() > limits.max_typestate_events()
         || automaton.terminal_expectations.len() > limits.max_typestate_expectations()
         || automaton.transitions.len() > 4_096
     {
         return invalid_automaton("typestate automaton exceeds a schema-v1 collection bound");
+    }
+    let transfer_ids = automaton
+        .transfers
+        .iter()
+        .map(|transfer| &transfer.id)
+        .collect::<HashSet<_>>();
+    if transfer_ids.len() != automaton.transfers.len()
+        || automaton.transfers.iter().any(|transfer| {
+            !matches!(
+                transfer.from,
+                TypestateCallBinding::Receiver | TypestateCallBinding::ArgumentIndex { .. }
+            )
+        })
+    {
+        return invalid_automaton(
+            "typestate transfer IDs must be unique and sources must be receivers or indexed arguments",
+        );
     }
     let event_ids: HashSet<_> = automaton.events.iter().map(|event| &event.id).collect();
     if event_ids.len() != automaton.events.len() {
@@ -1132,6 +1166,7 @@ mod tests {
                 escape: InconclusivePolicy::Inconclusive,
             },
             automaton: TypestateAutomatonSpec {
+                transfers: Vec::new(),
                 event_set: None,
                 states: vec![error.clone(), open.clone(), closed.clone()],
                 initial: open.clone(),

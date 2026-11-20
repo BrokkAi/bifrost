@@ -67,6 +67,7 @@ impl GoMethodFamily {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn go_method_identity(
         &self,
         context_id: i64,
@@ -90,6 +91,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .map_err(Into::into)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn go_method_family(
         &self,
         context_id: i64,

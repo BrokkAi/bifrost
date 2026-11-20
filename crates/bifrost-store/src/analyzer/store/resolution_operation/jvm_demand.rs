@@ -2,7 +2,9 @@
 use super::demand::{
     ClosedForwardSource, ClosedRelations, LanguageContextPreparation, LanguageRootDiscovery,
 };
-use super::demand_closure::{BaseEligibility, ClosureWitness, Read};
+use super::demand_closure::{
+    BaseEligibility, ClosureWitness, Read, context_publishable_qualifier_completion,
+};
 use super::imports::{
     ImportBindingRules, ImportTokenMetadata, authored_reference_local_path_evidence,
     import_bindings_for_lookup,
@@ -588,6 +590,7 @@ impl JvmDemandState<'_, '_, '_> {
         }))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn scala_import_member_request(
         &self,
         source: &JvmSourceDemand,
@@ -865,6 +868,7 @@ impl JvmDemandState<'_, '_, '_> {
 
     // Compare providers only after an actual binding with complete inventory
     // has been proved. An empty provider set never shadows an unavailable one.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn complete_binding_origins(
         &self,
         context: &SelectedResolutionContextSet,
@@ -1808,43 +1812,6 @@ fn completion_without_unsupported_semantics(
                 ResolutionIncompleteReason::UnsupportedSemantic(semantic)
                     if retired.contains(semantic)
             )
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    if retained.is_empty() {
-        ResolutionCompletion::Complete
-    } else {
-        ResolutionCompletion::incomplete(retained)
-    }
-}
-
-fn context_publishable_qualifier_completion(
-    completion: &ResolutionCompletion,
-) -> ResolutionCompletion {
-    let ResolutionCompletion::Incomplete(reasons) = completion else {
-        return ResolutionCompletion::Complete;
-    };
-    let retained = reasons
-        .iter()
-        .filter(|reason| match reason {
-            ResolutionIncompleteReason::OpenBoundary { semantic, .. }
-            | ResolutionIncompleteReason::UnsupportedSemantic(semantic)
-            | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)
-            | ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
-                !semantic.is_operation_local()
-            }
-            ResolutionIncompleteReason::CyclicExpansion(path) => {
-                path.operation_local_number().is_none() || path.is_context_local()
-            }
-            // These describe this request's cancellation, cycle, budget, or
-            // live mount selection, not the import context's inventory.
-            ResolutionIncompleteReason::Cancelled
-            | ResolutionIncompleteReason::CyclicPrefixDependency(_)
-            | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
-            | ResolutionIncompleteReason::TimeBudgetExceeded(_)
-            | ResolutionIncompleteReason::UnmountedFile { .. }
-            | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
-            | ResolutionIncompleteReason::Unclassified(_) => false,
         })
         .copied()
         .collect::<Vec<_>>();
@@ -4585,9 +4552,26 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     authority.external_nominal,
                 ));
             }
-            // Java's name classification leaves terminal target and absence
-            // authority to typed member resolution.
-            if complete && !jvm_prefix_defers_member_selection(state.reader.language) {
+            // Typed owner-member selection remains deferred for Java. A
+            // package route with every positioned alternative closed has no
+            // owner-member interpretation left to resolve: its ProvenEmpty
+            // inventory may retire the provisional qualified-name gaps too.
+            // Unacquired and Partial reads keep positioned_absence_closed false.
+            let closed_package_absence = facts.positioned_absence_closed
+                && half.selected_targets.is_empty()
+                && authority.external_nominal.is_none()
+                && !half.keeps_complete_terminal
+                && !half.deferred_member_selection
+                && matches!(
+                    state.start,
+                    JvmSourceStart::Absolute
+                        | JvmSourceStart::PositionedPackage(_)
+                        | JvmSourceStart::SelectedPackageAlias { .. }
+                );
+            if complete
+                && (!jvm_prefix_defers_member_selection(state.reader.language)
+                    || closed_package_absence)
+            {
                 if authority.prefix.is_none() {
                     exact.merge(DemandClosureDischarges::with_operation_local_placeholders(
                         [],

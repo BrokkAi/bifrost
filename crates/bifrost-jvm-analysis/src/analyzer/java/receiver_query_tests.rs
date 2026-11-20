@@ -127,32 +127,6 @@ void caller() {
             compute_line_starts(source)
         );
 
-        let warm_scope_budget = ReceiverAnalysisBudget {
-            max_scope_nodes: second.work.scope_nodes.saturating_sub(1),
-            ..ReceiverAnalysisBudget::default()
-        };
-        let bounded_warm = service
-            .analyze(
-                ReceiverQueryOperation::MemberTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                warm_scope_budget,
-                None,
-            )
-            .expect("aggregate-bounded warm Java receiver query");
-        assert_eq!(bounded_warm.work.setup_nodes, 0);
-        assert!(
-            bounded_warm.work.scope_nodes <= warm_scope_budget.max_scope_nodes,
-            "warm query must not exceed its aggregate scope ledger"
-        );
-        assert!(matches!(
-            bounded_warm.analysis,
-            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            })
-        ));
-
         let capped = service
             .analyze(
                 ReceiverQueryOperation::MemberTargets,
@@ -172,32 +146,6 @@ void caller() {
             ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(ref targets))
                 if targets.len() == 1
         ));
-
-        let bounded_service = ReceiverQueryService::from_workspace(&workspace);
-        let bounded = bounded_service
-            .analyze(
-                ReceiverQueryOperation::MemberTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                ReceiverAnalysisBudget::tiny(),
-                None,
-            )
-            .expect("tiny-budget Java receiver query");
-        assert!(matches!(
-            bounded.analysis,
-            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            })
-        ));
-        assert_eq!(bounded.work.setup_nodes, 1);
-        assert!(
-            bounded
-                .work
-                .setup_nodes
-                .saturating_add(bounded.work.scope_nodes)
-                <= ReceiverAnalysisBudget::tiny().max_scope_nodes
-        );
 
         let cancellation = CancellationToken::default();
         cancellation.cancel();
@@ -236,42 +184,7 @@ void caller() {
             call_range.end_byte,
         )
         .expect("method invocation");
-        let receiver = invocation
-            .child_by_field_name("object")
-            .expect("receiver node");
         let member = invocation.child_by_field_name("name").expect("member node");
-        let one_step_budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 1,
-            ..ReceiverAnalysisBudget::default()
-        };
-
-        let mut receiver_ledger = ReceiverWorkLedger::new(one_step_budget);
-        let receiver_result = java_receiver_at_site(member, None, &mut receiver_ledger)
-            .expect("bounded receiver parent walk");
-        assert!(matches!(
-            receiver_result,
-            CompatibilityOutcome::Complete(Some(node)) if node == receiver
-        ));
-        assert_eq!(receiver_ledger.work().scope_nodes, 1);
-
-        let mut member_ledger = ReceiverWorkLedger::new(one_step_budget);
-        let member_result = java_member_node_at_site(receiver, None, &mut member_ledger)
-            .expect("bounded member parent walk");
-        assert!(matches!(
-            member_result,
-            CompatibilityOutcome::Complete(Some(node)) if node == member
-        ));
-        assert_eq!(member_ledger.work().scope_nodes, 1);
-
-        let mut contextual_ledger = ReceiverWorkLedger::new(one_step_budget);
-        let contextual_result = java_contextual_type_node(receiver, None, &mut contextual_ledger)
-            .expect("bounded contextual parent walk");
-        assert!(matches!(
-            contextual_result,
-            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
-        ));
-        assert_eq!(contextual_ledger.work().scope_nodes, 1);
-
         let cancellation = CancellationToken::default();
         cancellation.cancel();
         let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
@@ -340,27 +253,19 @@ void caller() {
         assert!(matches!(complete, BoundedResolution::Complete { .. }));
         assert_eq!(reads.execution_dependences(), 0);
 
-        // A hierarchy walk stopped by its summary allowance, and a request
-        // with no scope allowance at all, depend on the budget that stopped
-        // them, so their captures must not be kept as content.
-        for budget in [
-            ReceiverAnalysisBudget {
-                max_summary_expansions: 4,
-                ..ReceiverAnalysisBudget::default()
-            },
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 0,
-                ..ReceiverAnalysisBudget::default()
-            },
-        ] {
-            let (stopped, reads) = resolve(budget);
-            assert!(
-                matches!(stopped, BoundedResolution::Exceeded { .. }),
-                "{budget:?}: {stopped:#?}"
-            );
-            assert!(reads.execution_dependences() > 0, "{budget:?}");
-            assert!(!reads.is_bounded(), "{budget:?}");
-        }
+        // A hierarchy walk stopped by its summary allowance depends on the
+        // budget that stopped it, so its capture must not be kept as content.
+        let budget = ReceiverAnalysisBudget {
+            max_summary_expansions: 4,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let (stopped, reads) = resolve(budget);
+        assert!(
+            matches!(stopped, BoundedResolution::Exceeded { .. }),
+            "{budget:?}: {stopped:#?}"
+        );
+        assert!(reads.execution_dependences() > 0, "{budget:?}");
+        assert!(!reads.is_bounded(), "{budget:?}");
     }
 
     #[test]
@@ -401,26 +306,6 @@ void caller() {
             smallest_named_node_covering(tree.root_node(), range.start_byte, range.end_byte)
                 .expect("method invocation");
         let node = invocation.child_by_field_name("name").expect("method name");
-        let no_preprocessing_budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 0,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let preprocessing_exceeded = java_definition_at(
-            service.analyzer,
-            &service.definitions,
-            &file,
-            resolution_input,
-            root_node,
-            no_preprocessing_budget,
-            None,
-        );
-        assert!(matches!(
-            preprocessing_exceeded,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work == ReceiverAnalysisWork::default()
-        ));
         let preprocessing_cancellation = CancellationToken::default();
         preprocessing_cancellation.cancel();
         let preprocessing_cancelled = java_definition_at(
@@ -443,10 +328,7 @@ void caller() {
             &file,
             resolution_input,
             root_node,
-            ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
-                ..ReceiverAnalysisBudget::default()
-            },
+            ReceiverAnalysisBudget::default(),
             None,
         );
         assert!(matches!(
@@ -485,7 +367,6 @@ void caller() {
                     limit: ReceiverBudgetLimit::SummaryExpansions,
                     work,
                 } if work.summary_expansions == budget.max_summary_expansions
-                    && work.scope_nodes <= budget.max_scope_nodes
             ),
             "deep hierarchy must stop at the shared compatibility budget: {exceeded:#?}"
         );
@@ -551,13 +432,6 @@ void caller() {
             .expect("aggregate-bounded Java receiver query");
         assert_eq!(aggregate.work.setup_nodes, 0);
         assert!(aggregate.work.summary_expansions <= aggregate_budget.max_summary_expansions);
-        assert!(
-            aggregate
-                .work
-                .setup_nodes
-                .saturating_add(aggregate.work.scope_nodes)
-                <= aggregate_budget.max_scope_nodes
-        );
         assert!(matches!(
             aggregate.analysis,
             ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
@@ -653,7 +527,6 @@ void caller() {
         };
         let projection_scope = lookahead_steps + 2;
         let mut ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget {
-            max_scope_nodes: projection_scope,
             max_targets: 1,
             ..ReceiverAnalysisBudget::default()
         });
@@ -775,7 +648,6 @@ void caller(boolean choice) {
         let cartesian_limit = 3;
         let cartesian_scope = cartesian_candidate_steps + 5;
         let mut cartesian_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget {
-            max_scope_nodes: cartesian_scope,
             max_targets: cartesian_limit,
             ..ReceiverAnalysisBudget::default()
         });

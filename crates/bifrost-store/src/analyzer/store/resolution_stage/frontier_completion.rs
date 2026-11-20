@@ -8,6 +8,7 @@ use super::super::resolution_selection::SelectedResolutionMountInventory;
 use super::{codec, lexical};
 use crate::CancellationToken;
 use crate::analyzer::Language;
+use crate::analyzer::resolution::fact_source::TypedFactInventoryEvidence;
 use crate::analyzer::resolution::{
     BindingFragmentId, LoweringGapOrigin, PolledCompletionAccumulator, ResolutionCompletion,
     ResolutionIncompleteReason, SelectedJavaGapOccurrence, SelectedJavaTypeFrontierContribution,
@@ -133,6 +134,7 @@ ORDER BY d.host,d.subject_key,d.subject_shared
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store) fn visit_frontier_completion(
     selection: &SelectedResolutionMountInventory<'_>,
     main_requests: &str,
@@ -250,7 +252,9 @@ pub(in crate::analyzer::store) fn visit_frontier_completion(
     Ok(if cancellation.is_cancelled() {
         TypedFactReadOutcome::cancelled(evidence.finish_semantic().0)
     } else {
-        TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
+        TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete).with_inventory_evidence(
+            TypedFactInventoryEvidence::Established(ResolutionCompletion::Complete),
+        )
     })
 }
 

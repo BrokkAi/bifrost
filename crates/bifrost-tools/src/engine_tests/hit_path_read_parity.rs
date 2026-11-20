@@ -12,7 +12,7 @@
 //! | `definition_units` | C | Java `p.Outer` | definition candidate queries |
 //! | package bucket `top_level_class_units_by_package` | C | Java package `p` | package declaration scans |
 //! | class range index `class_ranges` | C | Java `p/Outer.java` | the same shared index returned |
-//! | `analyzed_live_files` | C | Java workspace | `analyzed_live_file_hits` |
+//! | `analyzed_live_files` | R | Java workspace | `analyzed_live_file_hits` |
 //! | `path_synthetic_modules` | C | Python package `pkg` | workspace path scans |
 
 use super::declaration_candidates::{java_analyzer, python_analyzer};
@@ -183,20 +183,15 @@ fn java_request_caches_record_the_reads_their_fills_recorded() {
         // The answer is the analyzed file set, which nothing narrower than the
         // language scope bounds (`analyzed_live_files` records it before the
         // memo answers).
-        rows.row_covering(
+        rows.row(
             "analyzed_live_files",
-            Class::ConsumerKeys,
+            Class::Replay,
             Evidence::Hits(&|| {
                 analyzer
                     .query_read_cache_lock()
                     .analyzed_live_file_hits
                     .load(Ordering::Relaxed) as u64
             }),
-            &[Coverage {
-                claim: "a file's overlay membership is covered by the language scope",
-                covered: &overlay_membership_of_a_file,
-                by: &|key| matches!(key, ReadKey::Scope { .. }),
-            }],
             || analyzer.analyzed_live_files(),
         );
     }
@@ -218,4 +213,68 @@ fn python_path_module_cache_records_the_reads_its_fill_recorded() {
         || analyzer.path_synthetic_modules_for_test(),
     );
     rows.finish();
+}
+
+#[test]
+#[hardwon("#12681: a later capture in one request omitted WorkspaceOverlayMembers")]
+fn analyzed_live_files_hit_records_every_seed_read_before_and_after_an_edit() {
+    use brokk_bifrost_analysis::analyzer::{IAnalyzer, ProjectFile, capture_query_reads};
+    use std::collections::BTreeSet;
+
+    let files = [
+        PYTHON_FILES.as_slice(),
+        &[("tools/Gen.java", "class Gen {}\n")],
+    ]
+    .concat();
+    let (_temp, mut analyzer) = python_analyzer(&files);
+    let _ = analyzer.get_all_declarations();
+    for run in 0..2 {
+        let (cold_files, cold_reads) = {
+            // A then B share a request but have independent capture ledgers.
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            let (cold_files, cold_reads) =
+                capture_query_reads(&analyzer, || analyzer.analyzed_live_files());
+            let hits = analyzer
+                .query_read_cache_lock()
+                .analyzed_live_file_hits
+                .load(Ordering::Relaxed);
+            let (warm_files, warm_reads) =
+                capture_query_reads(&analyzer, || analyzer.analyzed_live_files());
+            assert_eq!(warm_files, cold_files, "run {run}: warm and cold answers");
+            assert_eq!(warm_reads.keys(), cold_reads.keys(), "run {run}: receipts");
+            assert!(
+                analyzer
+                    .query_read_cache_lock()
+                    .analyzed_live_file_hits
+                    .load(Ordering::Relaxed)
+                    > hits,
+                "capture B must use the request memo"
+            );
+            (cold_files, cold_reads)
+        };
+        // A fresh single capture must carry the same keys as the shared hit.
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        let (fresh_files, fresh_reads) =
+            capture_query_reads(&analyzer, || analyzer.analyzed_live_files());
+        assert_eq!(fresh_files, cold_files, "run {run}: fresh answer");
+        assert_eq!(
+            fresh_reads.keys(),
+            cold_reads.keys(),
+            "run {run}: fresh receipt"
+        );
+        let membership = fresh_reads
+            .keys()
+            .into_iter()
+            .filter(overlay_membership_of_a_file)
+            .collect::<Vec<_>>();
+        assert_eq!(membership.len(), PYTHON_FILES.len(), "{membership:?}");
+        drop(_scope);
+        if run == 0 {
+            // An unrelated-language source is present in the project seed and
+            // edited between requests; it is neither a package nor config file.
+            let edited = ProjectFile::new(analyzer.project.root().to_path_buf(), "tools/Gen.java");
+            edited.write("class Gen { int x; }\n").expect("edit");
+            analyzer = analyzer.update(&BTreeSet::from([edited]));
+        }
+    }
 }

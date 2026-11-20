@@ -215,9 +215,10 @@ pub fn inert_drop_query_proofs(
     let Some(slots) = workspace.analyzer().owned_lookup_memo() else {
         return Vec::new();
     };
-    slots
-        .get::<InertDropQueryMemo>()
-        .entries
+    let Some(memo) = slots.memo::<InertDropQueryMemo>() else {
+        return Vec::new();
+    };
+    memo.entries
         .lock()
         .expect("inert Drop query memo poisoned")
         .values()

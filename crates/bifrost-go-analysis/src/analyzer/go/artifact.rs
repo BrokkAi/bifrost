@@ -125,10 +125,11 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer {
+        (Producer {
             name: self.adapter_name().to_owned(),
             version: self.adapter_version().to_owned(),
-        }
+        })
+        .with_dependency_revision()
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -1003,6 +1004,7 @@ fn module_type_drafts(
                 TypeDraft {
                     import_path: package.import_path.clone(),
                     fact: TypeFact {
+                        type_parameter_kinds: Vec::new(),
                         alias_target: None,
                         tuple_fields: None,
                         implemented_traits_complete: false,
@@ -1021,6 +1023,7 @@ fn module_type_drafts(
                         type_kind: TypeKind::Module,
                         visibility: Visibility::Package,
                         is_abstract: false,
+                        is_final: None,
                         is_sealed: false,
                         callable_surface_complete: false,
                         has_explicit_type_terms: false,
@@ -1263,6 +1266,7 @@ fn collect_type_draft(
     types.push(TypeDraft {
         import_path: parsed.import_path.clone(),
         fact: TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -1282,6 +1286,7 @@ fn collect_type_draft(
                 Visibility::Private
             },
             is_abstract: type_kind == TypeKind::Interface,
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: type_kind == TypeKind::Interface
@@ -1391,6 +1396,7 @@ fn collect_struct_members(
                 },
                 exported,
                 Some(Signature {
+                    bounds: None,
                     type_parameters: Vec::new(),
                     parameters: Vec::new(),
                     returns: Some(type_ref.clone()),
@@ -1581,6 +1587,7 @@ fn collect_value_drafts(
             return WalkControl::Continue;
         }
         let signature = spec.child_by_field_name("type").map(|type_node| Signature {
+            bounds: None,
             type_parameters: Vec::new(),
             parameters: Vec::new(),
             returns: Some(
@@ -1682,6 +1689,8 @@ fn push_member(
         .unwrap_or_default();
     members.push(MemberDraft {
         fact: MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -1777,6 +1786,7 @@ fn callable_signature(
         }
     });
     Signature {
+        bounds: None,
         type_parameters,
         parameters,
         returns,
@@ -2938,6 +2948,7 @@ var privateValue int
             shards: vec![AuthoredShard {
                 id: "go".to_owned(),
                 activation: vec![ActivationSelector {
+                    production_input_digest: None,
                     package: None,
                     module: Some(NameSelector {
                         name: "example.com/dep".to_owned(),

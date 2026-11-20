@@ -279,6 +279,12 @@ Counters are unsigned 64-bit integers that saturate at their maximum instead of 
 | `value_flow` | Object, present only when value-flow work happened. |
 | `type_flow` | Object, present only when class-set type-flow work happened. |
 
+Reusing a source-free semantic artifact can charge procedures and program points
+with zero source bytes. On this path the source probe checks identity and the
+cached artifact contributes its retained census. Interpret the source-byte count
+alongside materialization and IR counters. Reuse receipts preserve the actual
+cumulative counts and the identities of the artifacts they paid for.
+
 `cumulative`, `resident_peaks`, and `root_work_peaks` each carry the same sixteen
 lane keys: `source_bytes`, `procedures`, `blocks`, `program_points`, `values`,
 `allocations`, `call_sites`, `memory_locations`, `captures`, `source_mappings`,

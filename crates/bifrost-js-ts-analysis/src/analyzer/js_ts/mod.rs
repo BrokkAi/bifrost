@@ -1441,6 +1441,23 @@ impl LanguageEdgePass for JsTsEdgePass {
         EdgePassId::JsTs
     }
 
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(brokk_bifrost_core::analyzer::model::ProjectFile, String)>,
+    > {
+        // One pass serves both dialects, so it names the refusals of each.
+        let mut excluded = Vec::new();
+        if let Some(javascript) = resolve_analyzer::<JavascriptAnalyzer>(analyzer) {
+            excluded.extend(javascript.inner().selected_graph_source_exclusions()?);
+        }
+        if let Some(typescript) = resolve_analyzer::<TypescriptAnalyzer>(analyzer) {
+            excluded.extend(typescript.inner().selected_graph_source_exclusions()?);
+        }
+        Ok(excluded)
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         build_rooted_jsts_scoped_usage_edges(
@@ -1534,6 +1551,15 @@ mod dependency_packs {
     pub(crate) struct NpmDependencyResolver;
 
     impl DependencyResolver for NpmDependencyResolver {
+        fn is_discovery_candidate(&self, rel_path: &std::path::Path) -> bool {
+            // Acquisition and membership carry must select the same inputs,
+            // including workspace manifests at every depth (#14051).
+            super::dependency_evidence::is_js_ts_dependency_input(rel_path)
+                && !rel_path
+                    .components()
+                    .any(|component| component.as_os_str() == "node_modules")
+        }
+
         fn adapter(&self) -> &'static dyn DependencyPackAdapter {
             &JsTsDependencyPackAdapter
         }
@@ -1551,6 +1577,7 @@ mod dependency_packs {
             config: &AnalyzerConfig,
             project: &dyn Project,
             _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _verifications: &brokk_bifrost_core::analyzer::external_selection::ToolchainVerifications,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {

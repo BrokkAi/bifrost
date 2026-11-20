@@ -484,6 +484,7 @@ mod tests {
             declaration_units: parsed.source_declaration_units.clone(),
             module_names,
             imports: canonical.imports.clone(),
+            impl_spans: HashMap::default(),
         };
         let contexts = RustSourceContextIndex::new(&hierarchy_facts, &|| true).unwrap();
         let binder = contexts

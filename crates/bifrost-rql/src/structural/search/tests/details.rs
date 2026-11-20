@@ -600,8 +600,8 @@ fn cross_file_declaration_hydration_is_charged_or_degrades_to_weak_evidence() {
     assert!(partial.evidence[0].source_slice_sha256.is_none());
     assert!(partial.result.truncated);
     assert!(partial.result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
-            && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+        diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            && diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete
     }));
     assert!(partial.work.scanned_source_bytes <= tight_limit as u64);
 }
@@ -666,7 +666,7 @@ fn cross_file_call_nested_rendering_cannot_retry_an_exhausted_source() {
             .is_some_and(|callee| callee.node_range.is_some())
     );
     assert!(partial.result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        diagnostic.code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
     }));
 }
 
@@ -675,25 +675,25 @@ fn receiver_budget_projects_one_remaining_fact_cap_across_all_work() {
     let base = ReceiverAnalysisBudget::default();
     let fact_axes = |budget: ReceiverAnalysisBudget| {
         budget
-            .max_scope_nodes
-            .checked_add(budget.max_summary_expansions)
-            .and_then(|sum| sum.checked_add(budget.max_hierarchy_order_work))
+            .max_summary_expansions
+            .checked_add(budget.max_hierarchy_order_work)
             .expect("fact axes do not overflow")
     };
-    // Scope and summary are allocated first; hierarchy-order work gets the rest.
-    let full_axes =
-        base.max_scope_nodes + base.max_summary_expansions + base.max_hierarchy_order_work;
+    // Summary is allocated first; hierarchy-order work gets the rest. Visiting
+    // scope reserves no facts (#13216).
+    let full_axes = base.max_summary_expansions + base.max_hierarchy_order_work;
     for facts in [0, 1, 100, full_axes - 1, full_axes] {
         assert!(fact_axes(receiver_budget_for_remaining_work(base, facts, usize::MAX)) <= facts);
     }
 
     let bounded = receiver_budget_for_remaining_work(base, 100, usize::MAX);
-    assert_eq!(bounded.max_scope_nodes, 75);
-    assert_eq!(bounded.max_summary_expansions, 25);
-    assert_eq!(bounded.max_hierarchy_order_work, 0);
+    assert_eq!(bounded.max_summary_expansions, base.max_summary_expansions);
+    assert_eq!(
+        bounded.max_hierarchy_order_work,
+        100 - base.max_summary_expansions
+    );
 
     let short = receiver_budget_for_remaining_work(base, full_axes - 1, usize::MAX);
-    assert_eq!(short.max_scope_nodes, base.max_scope_nodes);
     assert_eq!(short.max_summary_expansions, base.max_summary_expansions);
     assert_eq!(
         short.max_hierarchy_order_work,
@@ -710,20 +710,24 @@ fn receiver_budget_projects_one_remaining_fact_cap_across_all_work() {
     let ample = receiver_budget_for_remaining_work(base, usize::MAX, usize::MAX);
     assert_eq!(ample, base);
 
-    // A custom base whose scope and summary overflow when added takes the
-    // partition branch instead of panicking, and still fits the budget.
+    // A custom base whose summary allowance overflows when added to the
+    // hierarchy allowance still fits the budget.
     let overflowing = ReceiverAnalysisBudget {
-        max_scope_nodes: usize::MAX,
-        max_summary_expansions: 1,
+        max_summary_expansions: usize::MAX,
         ..base
     };
     let bounded = receiver_budget_for_remaining_work(overflowing, usize::MAX, usize::MAX);
-    assert_eq!(fact_axes(bounded), usize::MAX);
+    assert_eq!(bounded.max_summary_expansions, usize::MAX);
     assert_eq!(bounded.max_hierarchy_order_work, 0);
 }
 
 #[test]
 fn tiny_receiver_budget_returns_an_explicit_exceeded_row() {
+    // Visiting scope has no allowance (#13216); the summary axis still stops.
+    let no_summaries = || ReceiverAnalysisBudget {
+        max_summary_expansions: 0,
+        ..ReceiverAnalysisBudget::default()
+    };
     let source = r#"class Service { run() {} value = ""; }
 function makeService() { return new Service(); }
 export function caller(input: string) {
@@ -743,15 +747,14 @@ service.value = input;
     }))
     .expect("query");
 
-    let result =
-        execute_with_receiver_budget_for_test(&analyzer, &query, ReceiverAnalysisBudget::tiny());
+    let result = execute_with_receiver_budget_for_test(&analyzer, &query, no_summaries());
 
-    assert!(result.truncated);
-    assert!(result.render_text().contains("limit -> scope_nodes"));
+    assert!(result.truncated, "{}", result.render_text());
+    assert!(result.render_text().contains("limit -> summary_expansions"));
     assert!(matches!(
         result.results[0].value,
         CodeQueryResultValue::ReceiverAnalysis { ref value }
-            if value.outcome == "exceeded_budget" && value.limit == Some("scope_nodes")
+            if value.outcome == "exceeded_budget" && value.limit == Some("summary_expansions")
     ));
 
     let file_query = CodeQuery::from_json(&json!({
@@ -759,11 +762,7 @@ service.value = input;
         "steps": [{ "op": "receiver_targets" }, { "op": "file_of" }]
     }))
     .expect("file query");
-    let file_result = execute_with_receiver_budget_for_test(
-        &analyzer,
-        &file_query,
-        ReceiverAnalysisBudget::tiny(),
-    );
+    let file_result = execute_with_receiver_budget_for_test(&analyzer, &file_query, no_summaries());
     assert!(file_result.truncated);
     assert!(matches!(
         file_result.results[0].value,
@@ -779,11 +778,7 @@ service.value = input;
         "result_detail": "full"
     }))
     .expect("outcome query");
-    let outcome = execute_with_receiver_budget_for_test(
-        &analyzer,
-        &outcome_query,
-        ReceiverAnalysisBudget::tiny(),
-    );
+    let outcome = execute_with_receiver_budget_for_test(&analyzer, &outcome_query, no_summaries());
     assert!(matches!(
         outcome.results.as_slice(),
         [CodeQueryResultItem {
@@ -803,11 +798,8 @@ service.value = input;
         ]
     }))
     .expect("evidence query");
-    let evidence = execute_with_receiver_budget_for_test(
-        &analyzer,
-        &evidence_query,
-        ReceiverAnalysisBudget::tiny(),
-    );
+    let evidence =
+        execute_with_receiver_budget_for_test(&analyzer, &evidence_query, no_summaries());
     assert!(evidence.results.is_empty());
 
     let field_write_query = CodeQuery::from_json(&json!({
@@ -827,11 +819,8 @@ service.value = input;
         ]
     }))
     .expect("field-write query");
-    let field_write = execute_with_receiver_budget_for_test(
-        &analyzer,
-        &field_write_query,
-        ReceiverAnalysisBudget::tiny(),
-    );
+    let field_write =
+        execute_with_receiver_budget_for_test(&analyzer, &field_write_query, no_summaries());
     assert!(
         field_write.results.is_empty(),
         "{}",
@@ -839,8 +828,8 @@ service.value = input;
     );
     assert!(field_write.truncated, "{}", field_write.render_text());
     assert!(field_write.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::ReceiverAnalysisPartial
-            && diagnostic.message.contains("scope_nodes")
+        diagnostic.code() == CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+            && diagnostic.message().contains("summary_expansions")
     }));
 }
 
@@ -1710,8 +1699,12 @@ fn cancelled_composed_query_retains_no_partial_rows() {
     assert!(result.results.is_empty());
     assert!(result.truncated);
     assert_eq!(result.diagnostics.len(), 1);
-    assert!(result.diagnostics[0].branch.is_empty());
-    assert!(result.diagnostics[0].message.contains("cancelled"));
+    assert!(result.diagnostics.semantic()[0].branch.is_empty());
+    assert!(
+        result.diagnostics.semantic()[0]
+            .message
+            .contains("cancelled")
+    );
 }
 
 #[test]
@@ -1746,7 +1739,7 @@ gamma();
                 .result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled)
+                .any(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::Cancelled)
                 && detailed.work.pipeline_rows >= 3
                 && !detailed.result.results.is_empty()
                 && detailed.result.results.len() < 3)

@@ -13,7 +13,7 @@ pub struct SourceLocationRequest {
     pub end_byte: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedReferenceSite {
     pub path: String,
     pub text: String,

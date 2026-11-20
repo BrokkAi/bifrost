@@ -1458,6 +1458,10 @@ pub(super) fn expansions(
                     .to_string_lossy()
                     .replace('\\', "/"),
             ),
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
     rows.into_iter()

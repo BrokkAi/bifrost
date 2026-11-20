@@ -888,6 +888,7 @@ mod tests {
             ecosystem: "cargo".into(),
             compatibility: Compatibility { bifrost: None, toolchains: vec![serde_json::from_value(json!({"name":"rust","requirement":"=1.100.0-nightly"})).unwrap()] },
             activation: vec![ActivationSelector {
+production_input_digest: None,
                 package: None, module: None,
                 toolchain: Some(NameSelector { name: "rust".into(), version: Some("=1.100.0-nightly".into()) }),
                 targets: Vec::new(), configurations: Vec::new(), artifact_sha256: None,

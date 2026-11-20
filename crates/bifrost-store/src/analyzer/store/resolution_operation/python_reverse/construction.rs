@@ -58,6 +58,7 @@ impl ConstructionFamily {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn python_construction_family(
         &self,
         view: &PythonReverseView,

@@ -5,6 +5,28 @@ use super::*;
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::model::StructuredTypeName;
 
+/// Exercise the writer's explicit-repair envelopes with cancellation and exact
+/// mutation accounting. Both writer backends use this same connection entry.
+#[doc(hidden)]
+pub fn repair_prepared_blobs(
+    store: &AnalyzerStore,
+    prepared: Vec<PreparedParsedBlob>,
+    cancellation: &CancellationToken,
+    limits: PersistBatchTargets,
+) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
+    let counters = store.prepared_write_counters();
+    let cancellation = cancellation.clone();
+    store.conn.execute(move |conn| {
+        super::source_publication::repair_prepared_blobs_on_connection(
+            conn,
+            prepared,
+            counters,
+            cancellation,
+            limits,
+        )
+    })
+}
+
 #[doc(hidden)]
 pub fn blob_id(conn: &Connection, oid: Oid) -> i64 {
     conn.query_row(

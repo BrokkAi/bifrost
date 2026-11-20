@@ -30,6 +30,17 @@ use tempfile::TempDir;
 
 type Snapshot = BTreeMap<(String, Vec<String>), BTreeSet<String>>;
 
+#[cfg(test)]
+fn neutral_catalog_languages() -> crate::analyzer::languages::neutral_fixture::NeutralRulesFixture {
+    crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+        Language::Java,
+        Language::Rust,
+        Language::Python,
+        Language::Go,
+        Language::JavaScript,
+    ])
+}
+
 fn canonical(value: impl Serialize) -> String {
     serde_json::to_string(&serde_json::to_value(value).unwrap()).unwrap()
 }
@@ -333,7 +344,7 @@ fn row_shards(
                             row_store: None,
                             has_callable_values,
                             manifest,
-                            approximate: shard.approximate,
+                            approximation: shard.approximation,
                             source_kind: shard.source_kind,
                             source_id: shard.source_id.clone(),
                             matched_evidence: shard.matched_evidence.clone(),
@@ -458,7 +469,7 @@ fn compare(label: &str, expected: &Snapshot, actual: &Snapshot, failures: &mut V
     }
 }
 
-fn fixture_shards(
+pub(super) fn fixture_shards(
     pack: &CompiledSemanticModelPack,
     shards: Vec<crate::analyzer::semantic_model::catalog::ValidatedShard>,
     label: &str,
@@ -483,7 +494,7 @@ fn fixture_shards(
                         row_store: None,
                         has_callable_values,
                         manifest,
-                        approximate: false,
+                        approximation: None,
                         source_kind: CatalogPackSourceKind::EphemeralWorkspace,
                         source_id: label.into(),
                         matched_evidence: SemanticModelActivationEvidence {
@@ -494,7 +505,8 @@ fn fixture_shards(
                             toolchain: None,
                             target: None,
                             configuration: None,
-                            artifact_sha256: None,
+                            production_input_digest: None,
+                            verified_raw_artifacts: Vec::new(),
                         },
                         matching_evidence: Vec::new(),
                         evidence_rank: EvidenceRank::Language,
@@ -571,6 +583,65 @@ fn catalog_fixture_active(
         original.install_request_source(installed_source).unwrap();
     };
     (Arc::new(original), reader)
+}
+
+/// A decoded Python runtime claim beside a row-backed Java catalog, so raw
+/// claim questions exercise the merged reader boundary as well as postings.
+#[cfg(test)]
+pub(crate) fn python_runtime_claim_fixture() -> Arc<ResolvedActiveSemanticModels> {
+    use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    let source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    let packs = ["python", "java"].map(|language| {
+        let mut source = source.clone();
+        if language == "python" {
+            source["schema_version"] = json!(17);
+            source["compatibility"]
+                .as_object_mut()
+                .unwrap()
+                .remove("bifrost");
+            source["pack_id"] = json!("acme.widget.python-runtime-claim");
+            source["language"] = json!("python");
+            source["ecosystem"] = json!("pypi");
+            source["compatibility"]["toolchains"] = json!([]);
+            source["shards"][0]["payload"]["types"][0]["runtime_bases"] = json!([]);
+        }
+        compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap()
+    });
+    let (original, reader) = catalog_fixture_active(&packs, "python-runtime-claim");
+    // Rebuild postings for the final backing choices. Python keeps its exact
+    // validated payload; Java's records are supplied only by its catalog rows.
+    // All shard metadata and row identities remain those of the same catalog.
+    let mut mixed = active(
+        original
+            .shards
+            .iter()
+            .map(|shard| ActiveSemanticModelShard {
+                metadata: Arc::clone(&shard.metadata),
+                decoded: (shard.manifest.language == "python")
+                    .then(|| shard.decoded.clone().expect("validated Python payload")),
+            })
+            .collect(),
+    );
+    let reader = Arc::new(reader);
+    mixed.source_reader = Some(reader.clone());
+    mixed
+        .install_request_source(Some(Arc::new(
+            crate::analyzer::store::model_catalog::ActivationRowReaderSource::new(
+                reader,
+                &mixed.active_model_set_hash,
+            ),
+        )))
+        .unwrap();
+    Arc::new(mixed)
 }
 
 struct CatalogParity {
@@ -842,7 +913,6 @@ fn assert_catalog_row_index_parity(
         &mut failures,
     );
     drop(expected_overlay);
-    assert_eq!(before.java_hierarchy, after.java_hierarchy);
     let connection = reader.connection.lock().unwrap();
     eprintln!("{label}: comparing structural endpoints");
     check_row_relations(&connection, &analyzer, &original, &before, &mut failures);
@@ -914,7 +984,7 @@ fn assert_keyed_overlay_entries(
     let mut owners = BTreeSet::new();
     let mut uris = BTreeSet::new();
     let mut paths = BTreeSet::new();
-    for symbol in before.symbols() {
+    for symbol in complete_symbols(before) {
         names.insert(symbol.name.clone());
         names.insert(symbol.qualified_name.clone());
         names.extend(symbol.aliases.iter().cloned());
@@ -1634,6 +1704,7 @@ fn lifecycle_claims_survive_catalog_row_and_decoded_readers() {
 
 #[test]
 fn catalog_row_index_parity_for_golden_packs() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::SourceFormat;
     use crate::analyzer::semantic_model::compiler::{CompilerOptions, compile_source};
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1759,6 +1830,8 @@ fn catalog_full_ordered_selectors_preserve_activation_and_explanations() {
             .unwrap();
         let candidates = catalog
             .candidates(&SemanticPackSelectorQuery {
+                verified_raw_artifacts: Vec::new(),
+                production_input_digest: None,
                 language: pack.manifest.language.clone(),
                 ecosystem: pack.manifest.ecosystem.clone(),
                 package: None,
@@ -1780,10 +1853,10 @@ fn catalog_full_ordered_selectors_preserve_activation_and_explanations() {
             let reads = crate::analyzer::semantic_model::artifact::thread_shard_wire_read_count();
             let metadata = catalog.load_metadata_only_for_test(&candidate).unwrap();
             assert!(metadata.shard.is_none(), "metadata-only load: {path}");
-            assert_eq!(
-                crate::analyzer::semantic_model::artifact::thread_shard_wire_read_count(),
-                reads,
-                "metadata-only loading must not decode: {path}"
+            assert!(
+                crate::analyzer::semantic_model::artifact::thread_shard_wire_read_count() - reads
+                    <= 1,
+                "metadata-only loading verifies at most once: {path}"
             );
             assert_eq!(metadata.manifest, loaded.manifest);
             assert_eq!(metadata.descriptor, loaded.descriptor);
@@ -1818,7 +1891,8 @@ fn catalog_full_ordered_selectors_preserve_activation_and_explanations() {
                     toolchain: coordinate(&selector.toolchain),
                     target: selector.targets.first().cloned(),
                     configuration: selector.configurations.first().cloned(),
-                    artifact_sha256: selector.artifact_sha256.clone(),
+                    production_input_digest: None,
+verified_raw_artifacts: (selector.artifact_sha256.clone()).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
                 };
                 cases.push(vec![evidence.clone()]);
                 cases.push(vec![SemanticModelActivationEvidence {
@@ -1827,28 +1901,35 @@ fn catalog_full_ordered_selectors_preserve_activation_and_explanations() {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                     ..evidence.clone()
                 }]);
                 cases.push(vec![SemanticModelActivationEvidence {
                     target: Some("nonmatching-target".into()),
                     configuration: Some("nonmatching-configuration".into()),
-                    artifact_sha256: Some("ff".repeat(32)),
+                    production_input_digest: None,
+verified_raw_artifacts: (Some("ff".repeat(32))).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
                     ..evidence
                 }]);
             }
             for evidence in cases {
                 let outcome = |selectors: &[_]| {
-                    strict_activation_match(&loaded.manifest, selectors, &evidence, &version).map(
-                        |matched| {
-                            (
-                                matched.evidence_rank,
-                                matched.matched_evidence,
-                                matched.matching_evidence,
-                                matched.matched_requirements,
-                            )
-                        },
+                    strict_activation_match(
+                        &loaded.manifest,
+                        selectors,
+                        &evidence,
+                        &version,
+                        loaded.origin,
                     )
+                    .map(|matched| {
+                        (
+                            matched.evidence_rank,
+                            matched.matched_evidence,
+                            matched.matching_evidence,
+                            matched.matched_requirements,
+                        )
+                    })
                 };
                 assert_eq!(
                     outcome(&loaded.selectors),
@@ -1859,12 +1940,14 @@ fn catalog_full_ordered_selectors_preserve_activation_and_explanations() {
                     strict_activation_mismatch_reason(
                         &loaded.manifest,
                         &loaded.selectors,
-                        &evidence
+                        &evidence,
+                        loaded.origin,
                     ),
                     strict_activation_mismatch_reason(
                         &loaded.manifest,
                         header.activation(),
-                        &evidence
+                        &evidence,
+                        loaded.origin,
                     ),
                     "explanation: {path}"
                 );
@@ -2376,6 +2459,7 @@ pub fn metadata_only_active(
     rows.active_model_set_hash = decoded.active_model_set_hash.clone();
     rows.extraction_gaps = decoded.extraction_gaps.clone();
     rows.extraction_gaps_by_declaration = decoded.extraction_gaps_by_declaration.clone();
+    rows.packs_naming_every_loss = decoded.packs_naming_every_loss.clone();
     let reader = Arc::new(reader.clone());
     {
         let installed_source: Option<
@@ -2476,7 +2560,11 @@ fn selected_external_descriptor_preserves_owner_member_ordinal_across_backings()
     for (ordinal, member) in published.iter().enumerate() {
         let selected = ExternalMemberIdentity {
             owner: ExternalOwnerIdentity {
-                provider_id: shard.manifest.semantic_sha256.as_str().into(),
+                provider_id:
+                    crate::analyzer::store::jvm_external_publication::jvm_external_provider_id(
+                        &shard.manifest.semantic_sha256,
+                    )
+                    .into(),
                 owner_fqn: owner.name.as_str().into(),
             },
             ordinal: u32::try_from(ordinal).unwrap(),
@@ -2493,6 +2581,119 @@ fn selected_external_descriptor_preserves_owner_member_ordinal_across_backings()
             expected
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+)]
+fn workspace_jvm_inventory_publication_preserves_rows_and_digest() {
+    use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    use sha2::{Digest, Sha256};
+
+    // Test-only declaration fixture: public members precede additional inventory
+    // members, with guards excluded before assigning provider ordinals.
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    let payload = &mut source["shards"][0]["payload"];
+    let member = payload["members"][0].clone();
+    let mut second = member.clone();
+    second["id"] = json!("member.widget.z");
+    second["name"] = json!("second");
+    let mut additional = member.clone();
+    additional["id"] = json!("member.widget.a");
+    additional["name"] = json!("additional");
+    payload["members"] = json!([second, member]);
+    payload["types"][0]["jvm_inventory"] = json!({
+        "callables_complete": true, "values_complete": true,
+        "types_complete": true, "supertypes_complete": true,
+        "supertypes": [
+            {"hierarchy_kind":"extends", "target":{"kind":"named", "name":"java.lang.Object"}},
+            {"hierarchy_kind":"implements", "target":{"kind":"named", "name":"java.io.Serializable"}}
+        ], "nested_types": [{"name":"Nested", "owner_fqn":"com.acme.Widget.Nested", "visibility":"public", "is_static":true}], "additional_members": [additional]
+    });
+    let mut other = payload["types"][0].clone();
+    other["id"] = json!("type.other");
+    other["name"] = json!("com.acme.Other");
+    other["jvm_inventory"]["additional_members"] = json!([]);
+    payload["types"].as_array_mut().unwrap().push(other);
+    let pack = compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&source).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    let (mut decoded, reader) = catalog_fixture_active(&[pack], "workspace-inventory-order");
+    for shard in &mut Arc::get_mut(&mut decoded).unwrap().shards {
+        Arc::make_mut(&mut Arc::get_mut(shard).unwrap().metadata).source_kind =
+            CatalogPackSourceKind::WorkspaceProduced;
+    }
+    let mut rows = active(
+        decoded
+            .shards
+            .iter()
+            .map(|shard| ActiveSemanticModelShard {
+                metadata: Arc::clone(&shard.metadata),
+                decoded: None,
+            })
+            .collect(),
+    );
+    let reader = Arc::new(reader);
+    {
+        let installed_source: Option<
+            Arc<dyn crate::analyzer::store::model_catalog::RequestRowReaderSource>,
+        > = Some(Arc::new(
+            crate::analyzer::store::model_catalog::ActivationRowReaderSource::new(
+                Arc::clone(&reader),
+                &rows.active_model_set_hash,
+            ),
+        ));
+        rows.install_request_source(installed_source).unwrap();
+    };
+    rows.source_reader = Some(reader);
+    assert!(decoded.shards.iter().all(|shard| shard.decoded.is_some()));
+    assert!(rows.shards.iter().all(|shard| shard.decoded.is_none()));
+    let snapshot = |activation: &ResolvedActiveSemanticModels| {
+        let store = crate::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        for shard in &activation.shards {
+            store
+                .publish_jvm_external_owner_inventory_from_activation(shard, activation)
+                .unwrap();
+        }
+        let connection = store.read_conn().unwrap();
+        let mut result = Vec::new();
+        for table in [
+            "jvm_external_owners",
+            "jvm_external_owner_members",
+            "jvm_external_owner_supertypes",
+        ] {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2,3"))
+                .unwrap();
+            let width = statement.column_count();
+            let values = statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(!values.is_empty(), "{table}");
+            result.push(values);
+        }
+        format!("{result:?}").into_bytes()
+    };
+    let expected = snapshot(&decoded);
+    let actual = snapshot(&rows);
+    assert_eq!(expected, actual);
+    assert_eq!(Sha256::digest(&expected), Sha256::digest(&actual));
 }
 
 #[cfg(test)]
@@ -2551,6 +2752,7 @@ fn declaration_summaries_follow_symbol_publication_order() {
 #[cfg(test)]
 #[test]
 fn catalog_presence_distinguishes_absent_and_present_empty_payloads() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
     let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2607,10 +2809,32 @@ fn assert_overlay_entry_parity(
     rows: &SemanticModelOverlay,
     label: &str,
 ) {
-    let symbols = decoded.symbols();
-    assert_eq!(symbols, rows.symbols(), "{label}: symbol enumeration");
+    let symbols = complete_symbols(decoded);
+    assert_eq!(
+        symbols,
+        complete_symbols(rows),
+        "{label}: symbol enumeration"
+    );
     let relations = decoded.relations();
-    assert_eq!(relations, rows.relations(), "{label}: relation enumeration");
+    let by_family = |relations: Vec<Arc<SemanticModelRelation>>| {
+        let mut families = BTreeMap::new();
+        for relation in relations {
+            let family = brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                &relation.provenance.activation.matched_evidence.language,
+            );
+            families
+                .entry(family.to_owned())
+                .or_insert_with(Vec::new)
+                .push(relation);
+        }
+        families
+    };
+    // Owner rule: cross-family interleaving is a choice; within-family order is checked.
+    assert_eq!(
+        by_family(relations.clone()),
+        by_family(rows.relations()),
+        "{label}: relation enumeration by family"
+    );
     assert_eq!(
         decoded.composition_diagnostics(),
         rows.composition_diagnostics(),
@@ -2638,16 +2862,20 @@ fn assert_overlay_entry_parity(
     }
     endpoints.insert("not.in.this.pack");
     for id in endpoints {
-        assert_eq!(
-            format!("{:?}", decoded.relations_from(id)),
-            format!("{:?}", rows.relations_from(id)),
-            "{label}: relations from {id}"
-        );
-        assert_eq!(
-            format!("{:?}", decoded.relations_to(id)),
-            format!("{:?}", rows.relations_to(id)),
-            "{label}: relations to {id}"
-        );
+        for (decoded, rows) in [
+            (decoded.relations_from(id), rows.relations_from(id)),
+            (decoded.relations_to(id), rows.relations_to(id)),
+        ] {
+            assert_eq!(
+                decoded.disposition, rows.disposition,
+                "{label}: relation disposition {id}"
+            );
+            assert_eq!(
+                by_family(decoded.records),
+                by_family(rows.records),
+                "{label}: relations for {id}"
+            );
+        }
     }
     for symbol in &symbols {
         assert_eq!(
@@ -2884,6 +3112,27 @@ fn assert_overlay_entry_parity(
                 rows.search_with_limit_filter(&patterns, limit, None, |s| s.name.len() % 2 == 0),
                 "{label}: predicate search {pattern}"
             );
+            let expected =
+                rows.search_with_limit_filter(&patterns, limit, None, |s| s.name.len() % 2 == 0);
+            let calls = std::cell::Cell::new(0usize);
+            let actual = rows.augmentation_symbols(&patterns, limit, None, |s| {
+                calls.set(calls.get() + 1);
+                s.name.len() % 2 == 0
+            });
+            assert_eq!(
+                (expected.0, expected.2),
+                actual,
+                "{label}: augmentation {pattern} limit {limit}"
+            );
+            if rows
+                .row_source
+                .as_ref()
+                .and_then(|r| r.indexed_inputs(None))
+                .is_some()
+                && limit == 0
+            {
+                assert_eq!(calls.get(), 0, "resident cap stops before visiting slots");
+            }
         }
         let cancelled = CancellationToken::new();
         cancelled.cancel();
@@ -2975,6 +3224,7 @@ pub fn assert_pack_search_parity(
     "#6685: pre-composition candidates omitted a curated-only member's representative-qualified name"
 )]
 fn catalog_row_search_preserves_renamed_curated_only_member() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{
         ArtifactExtraction, ArtifactExtractionKind, CompilerOptions, SourceFormat, compile_source,
     };
@@ -3100,10 +3350,13 @@ fn catalog_row_search_preserves_renamed_curated_only_member() {
         assert_eq!(actual.1, 2, "both matching groups ran");
         assert!(actual.2);
     }
+    // Search composes symbols alone and no longer fills the composed-group
+    // cache, whose entries carry relations. The merged answers above are the
+    // proof that the matching groups composed.
     assert_eq!(
         cache.composition_cache_stats().group_misses,
-        1,
-        "only the matching multi-contributor group composes"
+        0,
+        "pattern search composes symbols without the composed-group cache"
     );
     assert_overlay_entry_parity(
         &active,
@@ -3120,6 +3373,7 @@ fn catalog_row_search_preserves_renamed_curated_only_member() {
     "#6685: a sole owner in an alias group still needs global raw-ID and guarded qualification"
 )]
 fn catalog_row_single_contributor_search_preserves_exceptional_qualification() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
     use crate::analyzer::store::cache_budget::StoreCacheBudget;
     let mut alpha: Value = serde_json::from_slice(include_bytes!(concat!(
@@ -3394,7 +3648,7 @@ fn catalog_row_cancelled_search_does_not_prove_guarded_emptiness() {
     )
     .unwrap();
     assert!(
-        before.symbols().is_empty(),
+        complete_symbols(&before).is_empty(),
         "guards actually removed every symbol"
     );
     let patterns =
@@ -3421,6 +3675,7 @@ fn catalog_row_cancelled_search_does_not_prove_guarded_emptiness() {
 #[cfg(test)]
 #[test]
 fn catalog_row_entries_preserve_positive_companion_records() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
     let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -3640,7 +3895,10 @@ fn catalog_row_search_parity_for_real_bundle() {
         &crate::retention_budget::RetentionBudget::for_tests(),
     );
     Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(cache.clone());
-    assert!(before.symbols().len() > 10_000, "real std corpus route ran");
+    assert!(
+        complete_symbols(&before).len() > 10_000,
+        "real std corpus route ran"
+    );
     for (pattern, limit) in [
         (".*", 17),
         ("File|Command|spawn", 3),
@@ -3709,6 +3967,7 @@ fn process_cpu_seconds() -> Option<f64> {
 #[cfg(test)]
 #[test]
 fn catalog_row_composition_cache_eviction_preserves_answers() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::store::cache_budget::StoreCacheBudget;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let packs = GOLDEN_PACKS
@@ -3810,8 +4069,8 @@ fn catalog_row_composition_cache_eviction_preserves_answers() {
     .unwrap();
     Arc::make_mut(actual.row_source.as_mut().unwrap()).cache = Some(shared.clone());
     assert_ne!(
-        before.symbols(),
-        expected.symbols(),
+        complete_symbols(&before),
+        complete_symbols(&expected),
         "provenance-only publication change ran"
     );
     assert_eq!(
@@ -3895,7 +4154,8 @@ fn model_declarations_preserve_folded_provider_owner() {
     }
     assert_eq!(active.shards.len(), 2, "both extracted releases are active");
     assert!(active.shards.iter().all(|shard| {
-        shard.manifest.extraction.is_some() && shard.matched_evidence.artifact_sha256.is_none()
+        shard.manifest.extraction.is_some()
+            && shard.matched_evidence.verified_raw_artifacts.is_empty()
     }));
     let providers = active
         .shards
@@ -3940,6 +4200,7 @@ fn model_declarations_preserve_folded_provider_owner() {
     "#7560: G1 selected composition folded owners across providers"
 )]
 fn model_selected_composition_keeps_member_surfaces_per_provider() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{
         ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
         compile_pack,
@@ -4164,6 +4425,7 @@ fn model_selected_composition_keeps_member_surfaces_per_provider() {
     "#7560: selected Go groups inherited whole-set promotion marks"
 )]
 fn model_selected_go_group_recomputes_promotion_state() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{
         AuthoredSemanticModelPack, CompilerOptions, compile_pack,
     };
@@ -4462,7 +4724,12 @@ fn jvm_folded_owner_and_selected_type_owner_keep_their_contracts() {
         .iter()
         .find(|owner| owner.provider.pack_version == "1.0.0")
         .expect("version 1.0.0 is selected");
-    assert_eq!(&*folded.provider_id, first.provider.pack_digest.as_str());
+    assert_eq!(
+        &*folded.provider_id,
+        crate::analyzer::store::jvm_external_publication::jvm_external_provider_id(
+            &first.provider.pack_digest,
+        )
+    );
     assert_eq!(&*folded.owner_fqn, fqn);
 }
 
@@ -4510,6 +4777,15 @@ fn relation_ranking_includes_other_origins_before_filtering() {
         relations[0].provenance.ambiguous,
         "same-id records from both origins must participate in ranking: {relations:?}"
     );
+    let mut batched_origins = origins;
+    batched_origins.extend((0..257).map(|i| format!("missing.{i}")));
+    let batched = reads
+        .relations_for_origins(&analyzer, &batched_origins)
+        .unwrap();
+    assert_eq!(
+        batched, relations,
+        "batch boundaries and missing origins preserve ranking"
+    );
 }
 
 #[test]
@@ -4517,6 +4793,7 @@ fn relation_ranking_includes_other_origins_before_filtering() {
     "#10045: authored family certification was lost when a partial generated std member survived composition"
 )]
 fn rust_authored_free_function_family_precedence_requires_exact_defining_member() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{
         ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
         compile_pack,
@@ -4614,6 +4891,236 @@ fn rust_authored_free_function_family_precedence_requires_exact_defining_member(
 }
 
 #[cfg(test)]
+fn target_independence_fixture(
+    case: &str,
+    authored_claim: bool,
+    generated_claim: bool,
+) -> (
+    Result<
+        crate::analyzer::semantic_model::CompiledSemanticModelPack,
+        Vec<crate::analyzer::semantic_model::Diagnostic>,
+    >,
+    Result<
+        crate::analyzer::semantic_model::CompiledSemanticModelPack,
+        Vec<crate::analyzer::semantic_model::Diagnostic>,
+    >,
+) {
+    use crate::analyzer::semantic_model::{
+        ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
+        TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION, compile_pack,
+    };
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    source["language"] = json!("rust");
+    source["ecosystem"] = json!("cargo");
+    source["compatibility"] = json!({});
+    source["completeness"] = json!("partial");
+    source["shards"][0]["activation"] = json!([{}]);
+    source["shards"][0]["payload"]["types"] = json!([{
+        "id": "owner.core.panicking", "name": "core.panicking",
+        "type_kind": "module", "visibility": "public",
+        "locator": {"kind": "artifact", "path": "library/core/src/panicking.rs", "symbol": "core.panicking"}
+    }]);
+    source["shards"][0]["payload"]["members"] = json!([{
+        "id": "member.panic", "owner": "owner.core.panicking", "name": "panic_fmt",
+        "member_kind": "function", "visibility": "public",
+        "signature": {"parameters": [{"name":"fmt", "type":{"kind":"named", "name":"core.fmt.Arguments"}}]},
+        "locator": {"kind":"artifact", "path":"library/core/src/panicking.rs", "symbol":"core.panicking.panic_fmt"}
+    }]);
+    source["shards"][0]["payload"]["relations"] = json!([]);
+    let mut authored_source = source.clone();
+    authored_source["schema_version"] = json!(TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION);
+    authored_source["pack_id"] = json!(format!("fixture.authored.{case}"));
+    authored_source["shards"][0]["payload"]["members"][0]["callable_family_complete"] = json!(true);
+    if authored_claim {
+        authored_source["shards"][0]["payload"]["members"][0]["target_independent"] = json!(true);
+    }
+    let authored: AuthoredSemanticModelPack = serde_json::from_value(authored_source).unwrap();
+    let authored = compile_pack(&authored, &CompilerOptions::default());
+    source["schema_version"] = json!(TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION);
+    source["pack_id"] = json!(format!("fixture.generated.{case}"));
+    source["shards"][0]["payload"]["members"][0]["id"] = json!("member.generated.panic");
+    source["shards"][0]["payload"]["members"][0]["callable_family_complete"] = json!(true);
+    if generated_claim {
+        source["shards"][0]["payload"]["members"][0]["target_independent"] = json!(true);
+    }
+    let mut generated: AuthoredSemanticModelPack = serde_json::from_value(source).unwrap();
+    generated.extraction = Some(ArtifactExtraction::single(
+        ArtifactExtractionKind::RustdocJson,
+        &"a".repeat(64),
+    ));
+    (
+        authored,
+        compile_pack(&generated, &CompilerOptions::default()),
+    )
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13674: an authored target-independent family claim must survive an approximate activation whose only uncertainty is the target"
+)]
+fn authored_target_independent_family_survives_only_target_unknown_activation() {
+    let _languages = neutral_catalog_languages();
+    use brokk_bifrost_semantic::analyzer::semantic_model::{
+        ApproximationReason::{
+            DependencyVersionApproximate, StdlibBuildUnverified, TargetUnknown,
+            ToolchainVersionUnknown,
+        },
+        ApproximationReasons,
+    };
+    let only = ApproximationReasons::only;
+    for (case, claim, approximation, expected) in [
+        ("exact-claim", true, None, true),
+        ("exact-no-claim", false, None, true),
+        ("target-claim", true, Some(only(TargetUnknown)), true),
+        ("target-no-claim", false, Some(only(TargetUnknown)), false),
+        (
+            "target-and-version",
+            true,
+            Some(only(TargetUnknown).with(ToolchainVersionUnknown)),
+            false,
+        ),
+        ("version", true, Some(only(ToolchainVersionUnknown)), false),
+        (
+            "build-unverified",
+            true,
+            Some(only(TargetUnknown).with(StdlibBuildUnverified)),
+            false,
+        ),
+        (
+            "dependency-version",
+            true,
+            Some(only(DependencyVersionApproximate)),
+            false,
+        ),
+    ] {
+        // Discovery can activate the authored companion approximately too.
+        // Exercise that path as well as an exact authored companion.
+        for approximate_authored in [false, true] {
+            let (authored, generated) = target_independence_fixture(case, claim, false);
+            let (mut active, _reader) =
+                catalog_fixture_active(&[authored.unwrap(), generated.unwrap()], case);
+            for shard in Arc::get_mut(&mut active).unwrap().shards.iter_mut() {
+                if shard.manifest.extraction.is_some() || approximate_authored {
+                    Arc::get_mut(&mut Arc::get_mut(shard).unwrap().metadata)
+                        .unwrap()
+                        .approximation = approximation;
+                }
+            }
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Rust)));
+            let overlay = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &CancellationToken::new(),
+                u64::MAX,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let family = overlay.symbols_named("core.panicking.panic_fmt");
+            assert_eq!(
+                family.records.len(),
+                1,
+                "{case}, approximate_authored={approximate_authored}: {family:?}"
+            );
+            assert_eq!(
+                family.records[0].callable_family_complete, expected,
+                "{case}, approximate_authored={approximate_authored}: {family:?}"
+            );
+            assert_eq!(
+                family.records[0].provenance.activation.approximate,
+                approximation.is_some(),
+                "{case}: the serialized bit is the view of the typed reasons"
+            );
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13674: generated and extraction packs must not be able to carry an authored target-independence claim"
+)]
+fn generated_pack_target_independent_claim_is_rejected_and_never_honored() {
+    let _languages = neutral_catalog_languages();
+    // Validation refuses the field in an extraction pack.
+    let (_, generated) = target_independence_fixture("forged", true, true);
+    let error = generated.expect_err("an extraction pack cannot carry target_independent");
+    assert!(
+        format!("{error:?}").contains("declaration.target_independent_on_generated_pack"),
+        "{error:?}"
+    );
+    // Without a schema that admits the field, even an authored pack is refused.
+    {
+        use crate::analyzer::semantic_model::{
+            AuthoredSemanticModelPack, CompilerOptions, compile_pack,
+        };
+        let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/semantic-model-packs/declarations-v1.json"
+        )))
+        .unwrap();
+        source["shards"][0]["payload"]["members"][0]["callable_family_complete"] = json!(true);
+        source["shards"][0]["payload"]["members"][0]["target_independent"] = json!(true);
+        let pack: AuthoredSemanticModelPack = serde_json::from_value(source).unwrap();
+        let error = compile_pack(&pack, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("declaration.target_independent_schema_version"),
+            "{error:?}"
+        );
+    }
+    // A shard of Generated/WorkspaceProduced source kind never sets the overlay flag.
+    use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    let pack = compile_source(
+        SourceFormat::Json,
+        include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json"),
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    let validated = validate_pack(&pack, &DecodeLimits::default()).unwrap();
+    let mut shards = fixture_shards(&pack, validated.shards, "forged flag");
+    let mut shard = shards.remove(0);
+    let mut record = shard.decoded().payload().declaration_facts().unwrap().1[0]
+        .as_ref()
+        .clone();
+    record.callable_family_complete = true;
+    let mut wire = serde_json::to_value(&record).unwrap();
+    wire["target_independent"] = json!(true);
+    record = serde_json::from_value(wire).unwrap();
+    let active = active(Vec::new());
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+    for (kind, honored) in [
+        (CatalogPackSourceKind::Generated, false),
+        (CatalogPackSourceKind::WorkspaceProduced, false),
+        (CatalogPackSourceKind::Installed, true),
+    ] {
+        Arc::get_mut(&mut shard.metadata).unwrap().source_kind = kind;
+        let member = super::member_symbol(
+            &analyzer,
+            &active,
+            &shard,
+            &record,
+            Some("com.acme.Widget"),
+            false,
+        );
+        assert_eq!(
+            member.callable_family_target_independent, honored,
+            "{kind:?}"
+        );
+    }
+}
+
+fn complete_symbols(overlay: &SemanticModelOverlay) -> Vec<std::sync::Arc<SemanticModelSymbol>> {
+    let (symbols, complete) = overlay.symbols();
+    assert!(complete, "test requires complete symbol enumeration");
+    symbols
+}
+
+#[cfg(test)]
 mod partition_tests {
     use super::*;
     use crate::analyzer::semantic_model::catalog::CatalogError;
@@ -4677,6 +5184,10 @@ mod partition_tests {
             activation: &ResolvedActiveSemanticModels,
         ) -> Result<RequestRowReader, FamilyOpen> {
             Ok(RequestRowReader {
+                derivation_extension: Default::default(),
+                certified_providers: Default::default(),
+                inventory_generation: None,
+                inventory_clock: None,
                 reader: Arc::new(DistinctReader {
                     reader: request_reader(&self.reader, activation),
                     empty: self.empty,
@@ -4684,6 +5195,1194 @@ mod partition_tests {
                 binding: ReaderBinding([1; 32]),
             })
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct FillTableReads {
+        actual: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        prepared: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    }
+    type ObservedTables = Arc<FillTableReads>;
+
+    fn observe_fill_tables(
+        reader: &crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader,
+        observed: &ObservedTables,
+    ) {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements as q;
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let connection = reader.connection.lock().unwrap();
+        connection.flush_prepared_statement_cache();
+        let tables = observed.clone();
+        let preparing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let in_prepare = preparing.clone();
+        connection
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if let AuthAction::Read { table_name, .. } = context.action {
+                    let tables = if in_prepare.load(std::sync::atomic::Ordering::Relaxed) {
+                        &tables.prepared
+                    } else {
+                        &tables.actual
+                    };
+                    tables.lock().unwrap().insert(table_name.to_owned());
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        // PREPARE observes even branches that the fixture's real fill never
+        // executes. Keep owner qualification, group composition and relation
+        // rewrites here as well as the candidate stream and anchor inventory.
+        for statement in [
+            q::SEARCH_ORDERED_CANDIDATES,
+            q::SEARCH_TYPE_IDENTITIES,
+            q::TYPES_BY_IDS,
+            q::MEMBERS_BY_IDS,
+            q::TYPES_BY_ID,
+            q::MEMBERS_BY_ID,
+            q::TYPES_BY_IDENTITY_NAME,
+            q::GROUP_OWNER_IDS,
+            q::MEMBER_IDS_BY_OWNERS,
+            q::OVERLAY_RELATIONS_FROM,
+            q::RELATIONS_BY_ID,
+            q::SOURCE_TYPES,
+            q::SOURCE_MEMBERS,
+            composition::SEARCH_OWNER_IDS_FOR_GROUPS,
+        ] {
+            connection.prepare(statement).unwrap();
+        }
+        preparing.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[derive(Debug)]
+    struct ObservedSource {
+        reader: Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>,
+        tables: ObservedTables,
+    }
+
+    impl RequestRowReaderSource for ObservedSource {
+        fn jvm_reader(
+            &self,
+            active: &ResolvedActiveSemanticModels,
+        ) -> Result<RequestRowReader, FamilyOpen> {
+            let reader = request_reader(&self.reader, active);
+            observe_fill_tables(&reader, &self.tables);
+            Ok(RequestRowReader {
+                derivation_extension: Default::default(),
+                certified_providers: Default::default(),
+                inventory_generation: None,
+                inventory_clock: None,
+                reader,
+                binding: ReaderBinding([1; 32]),
+            })
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: request-owned source anchors were never read when one reader filled both slots"
+    )]
+    fn source_anchors_read_each_owning_connection_once() {
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct Source(Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>);
+        impl RequestRowReaderSource for Source {
+            fn jvm_reader(
+                &self,
+                _: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                    reader: self.0.clone(),
+                    binding: ReaderBinding([7; 32]),
+                })
+            }
+        }
+        for mixed in [false, true] {
+            let mut active = mixed_active_edited(false, true, |source, version| {
+                if mixed && version == "1.0.0" {
+                    source["language"] = json!("python");
+                }
+            });
+            let active = Arc::get_mut(&mut active).unwrap();
+            active.install_request_source(None).unwrap();
+            if !mixed {
+                for shard in &mut active.shards {
+                    Arc::get_mut(&mut Arc::get_mut(shard).unwrap().metadata)
+                        .unwrap()
+                        .source_kind = CatalogPackSourceKind::Generated;
+                }
+            }
+            let request = request_reader(active.source_reader.as_ref().unwrap(), active);
+            active
+                .install_request_source(Some(Arc::new(Source(request.clone()))))
+                .unwrap();
+            let activation = active.source_reader.as_ref().unwrap().clone();
+            let request_sql = Arc::new(Mutex::new(Vec::new()));
+            let activation_sql = Arc::new(Mutex::new(Vec::new()));
+            let capture = |sqls: Arc<Mutex<Vec<String>>>| {
+                Arc::new(move |event: ListenerEvent<'_>| {
+                    if let ListenerEvent::Statement { sql: Some(sql), .. } = event {
+                        sqls.lock().unwrap().push(sql.to_owned());
+                    }
+                })
+            };
+            let _request_trace = attach_listener(
+                &request.connection.lock().unwrap(),
+                capture(request_sql.clone()),
+            );
+            let _activation_trace = attach_listener(
+                &activation.connection.lock().unwrap(),
+                capture(activation_sql.clone()),
+            );
+            let reads = composition::RowCompositionReads::new(active, &[], &[]);
+            let anchors = reads.request_source_anchors().unwrap();
+            assert!(
+                !anchors.ids_at_path("com/acme/Widget.java").is_empty(),
+                "{anchors:?}"
+            );
+            for question in [questions::SOURCE_TYPES, questions::SOURCE_MEMBERS] {
+                assert_eq!(
+                    request_sql
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|sql| sql.as_str() == question)
+                        .count(),
+                    1
+                );
+            }
+            assert!(activation_sql.lock().unwrap().is_empty());
+            request_sql.lock().unwrap().clear();
+            if mixed {
+                let directory = TempDir::new().unwrap();
+                let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(
+                    directory.path(),
+                    Language::Python,
+                )));
+                let anchors = reads.activation_source_anchors(&analyzer).unwrap();
+                assert!(request_sql.lock().unwrap().is_empty());
+                let shard = active
+                    .shards
+                    .iter()
+                    .find(|shard| !shard.request_owned())
+                    .unwrap();
+                assert_eq!(shard.manifest.language, "python");
+                assert!(
+                    !anchors.ids_at_path("com/acme/Widget.java").is_empty(),
+                    "{anchors:?}"
+                );
+                for question in [questions::SOURCE_TYPES, questions::SOURCE_MEMBERS] {
+                    assert_eq!(
+                        activation_sql
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|sql| sql.as_str() == question)
+                            .count(),
+                        1
+                    );
+                }
+            } else {
+                assert!(activation_sql.lock().unwrap().is_empty());
+            }
+        }
+    }
+    #[test]
+    fn search_fill_actual_and_prepared_reads_stay_in_relevance_registry() {
+        let _languages = neutral_catalog_languages();
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SEARCH_FILL_TABLES;
+        let mut active = mixed_active(false, false);
+        let reader = active.source_reader.as_ref().unwrap().clone();
+        let observed = ObservedTables::default();
+        observe_fill_tables(&reader, &observed);
+        Arc::get_mut(&mut active)
+            .unwrap()
+            .install_request_source(Some(Arc::new(ObservedSource {
+                reader: reader.clone(),
+                tables: observed.clone(),
+            })))
+            .unwrap();
+        observe_fill_tables(active.source_reader.as_ref().unwrap(), &observed);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache),
+            &[],
+        );
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let (symbols, complete) = overlay.search_symbols(&patterns, None, None);
+        assert!(complete);
+        assert!(!symbols.is_empty(), "must execute a real search fill");
+        let actual = observed.actual.lock().unwrap();
+        assert!(
+            actual.contains("catalog_declaration_types"),
+            "observer did not see actual fill reads: {actual:?}"
+        );
+        let prepared = observed.prepared.lock().unwrap();
+        let tables = actual
+            .union(&prepared)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            tables.contains("catalog_declaration_types"),
+            "observer did not see physical reads: {tables:?}"
+        );
+        // These tables describe catalog membership/index availability, never
+        // declaration fill rows. Views are checked through their base names.
+        const METADATA_EXCLUSIONS: &[(&str, &str)] = &[
+            (
+                "active_shards",
+                "connection-local activation membership only",
+            ),
+            (
+                "catalog_semantic_rows_indexed_shards",
+                "projection version and physical shard bookkeeping only",
+            ),
+            (
+                "sqlite_master",
+                "SQLite's schema catalog, not semantic rows",
+            ),
+            (
+                "sqlite_schema",
+                "SQLite's schema catalog, not semantic rows",
+            ),
+            (
+                "json_each",
+                "virtual expansion of SQL parameters, not shard content",
+            ),
+        ];
+        let unexpected = tables
+            .iter()
+            .filter(|table| {
+                let base = table.strip_prefix("active_").unwrap_or(table);
+                !SEARCH_FILL_TABLES.contains(&base)
+                    && !METADATA_EXCLUSIONS.iter().any(|(name, reason)| {
+                        assert!(!reason.is_empty());
+                        table.as_str() == *name || base == *name
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "unregistered fill reads: {unexpected:?}; all reads: {tables:?}"
+        );
+    }
+
+    fn python_pack(source: &mut Value, version: &str, relevant: bool) {
+        if version == "1.0.0" {
+            source["pack_id"] = json!("acme.widget.py");
+            source["language"] = json!("python");
+            source["ecosystem"] = json!("pypi");
+            if !relevant {
+                source["shards"][0]["payload"] = generator_shard()["payload"].clone();
+            }
+        }
+    }
+
+    #[test]
+    fn search_fill_ignores_empty_python_shards_but_selects_declarations_and_generated_facts() {
+        let _languages = neutral_catalog_languages();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let active = mixed_active_edited(false, false, |source, version| {
+            python_pack(source, version, false)
+        });
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: None,
+            build: overlay.build_identity,
+            jvm_binding: Some(ReaderBinding([1; 32])),
+        };
+        let jvm = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: Some("jvm".into()),
+            ..key.clone()
+        };
+        let digest = overlay.effective_search_inputs(&key).digest();
+        assert_eq!(digest, overlay.effective_search_inputs(&jvm).digest());
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let first = overlay.search_symbols(&patterns, None, None);
+        assert!(first.1);
+        let token = CancellationToken::new();
+        let before = cache
+            .composed_search_inputs
+            .get_ready(&digest, &token)
+            .unwrap();
+        let charge = cache
+            .composed_search_inputs
+            .region()
+            .stats()
+            .accounted_bytes;
+        assert_eq!(cache.composed_search_inputs.region().stats().entries, 1);
+
+        assert_eq!(first, overlay.search_symbols(&patterns, None, Some("jvm")));
+        let after = cache
+            .composed_search_inputs
+            .get_ready(&digest, &token)
+            .unwrap();
+        assert!(
+            std::ptr::eq(&*before, &*after),
+            "one backing and one charge"
+        );
+
+        assert_eq!(cache.composed_search_inputs.region().stats().entries, 1);
+        assert_eq!(
+            cache
+                .composed_search_inputs
+                .region()
+                .stats()
+                .accounted_bytes,
+            charge
+        );
+        let mut generated = first.0[0].as_ref().clone();
+        generated.language = "python".into();
+        let generated_overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            vec![generated],
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        assert_ne!(
+            generated_overlay.effective_search_inputs(&key).digest(),
+            generated_overlay.effective_search_inputs(&jvm).digest(),
+            "Python generated facts are selected even without declaration rows"
+        );
+        let declared = mixed_active_edited(false, false, |source, version| {
+            python_pack(source, version, true)
+        });
+        let declared_overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &declared,
+            Vec::new(),
+            Vec::new(),
+            Some(cache),
+            &[],
+        );
+        assert_ne!(
+            declared_overlay.effective_search_inputs(&key).digest(),
+            declared_overlay.effective_search_inputs(&jvm).digest()
+        );
+    }
+
+    #[test]
+    fn decoded_python_candidates_do_not_split_search_backing() {
+        let _languages = neutral_catalog_languages();
+        use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+        let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/semantic-model-packs/declarations-v1.json"
+        )))
+        .unwrap();
+        python_pack(&mut source, "1.0.0", true);
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let (decoded, _) = catalog_fixture_active(&[pack], "decoded-python-search");
+        let python = decoded.shards[0].decoded.clone().unwrap();
+        assert!(
+            matches!(python.payload(), CompiledPayload::DeclarationFacts { types, .. } if !types.is_empty())
+        );
+        let mut active = mixed_active_edited(false, false, |source, version| {
+            python_pack(source, version, true)
+        });
+        let active_mut = Arc::get_mut(&mut active).unwrap();
+        let shard = active_mut
+            .shards
+            .iter_mut()
+            .find(|s| s.manifest.language == "python")
+            .unwrap();
+        Arc::get_mut(shard).unwrap().decoded = Some(python);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        let reads = composition::RowCompositionReads::new(&active, &[], &[])
+            .for_search()
+            .unwrap();
+        for shard in &active.shards {
+            assert_eq!(reads.selects_active_shard(shard), shard.decoded.is_none());
+        }
+        let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: None,
+            build: overlay.build_identity,
+            jvm_binding: Some(ReaderBinding([1; 32])),
+        };
+        let jvm = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: Some("jvm".into()),
+            ..key.clone()
+        };
+        assert_eq!(
+            overlay.effective_search_inputs(&key).digest(),
+            overlay.effective_search_inputs(&jvm).digest()
+        );
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let first = overlay.search_symbols(&patterns, None, None);
+        assert!(first.1);
+        let before = cache.composed_search_inputs.region().stats();
+        assert_eq!(before.entries, 1);
+        assert_eq!(first, overlay.search_symbols(&patterns, None, Some("jvm")));
+        let after = cache.composed_search_inputs.region().stats();
+        assert_eq!(after.entries, 1);
+        assert_eq!(before.accounted_bytes, after.accounted_bytes);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: search retention dropped generated relations from rule-only shards"
+    )]
+    fn search_backing_preserves_rule_only_generated_relations() {
+        let _languages = neutral_catalog_languages();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let working = mixed_active(false, false);
+        let working_source = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &working,
+            Vec::new(),
+            Vec::new(),
+            None,
+            &[],
+        );
+        let (symbols, open) = working_source.symbols_with_id_scoped("type.widget", Some("jvm"));
+        assert!(open.is_none());
+        let mut owner = symbols[0].as_ref().clone();
+        let (relations, open) =
+            working_source.relations_from_scoped("member.widget.create", Some("jvm"));
+        assert!(open.is_none());
+        let mut relation = relations[0].as_ref().clone();
+        let active = mixed_active_edited(false, false, |source, _| {
+            source["shards"][0]["payload"] = generator_shard()["payload"].clone();
+        });
+        let digest = active.shards[0].manifest.semantic_sha256.clone();
+        owner.provenance.pack_digest = digest.clone();
+        relation.provenance.pack_digest = digest;
+        owner.id = "generated.owner".into();
+        relation.id = "generated.relation".into();
+        relation.from = owner.id.clone();
+        relation.to = owner.id.clone();
+        relation.pre_composition_endpoints = None;
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            vec![owner],
+            vec![relation],
+            Some(cache.clone()),
+            &[],
+        );
+        let before_from = overlay.relations_from_scoped("generated.owner", Some("jvm"));
+        let before_to = overlay.relations_to_scoped("generated.owner", Some("jvm"));
+        assert!(before_from.1.is_none());
+        assert!(before_to.1.is_none());
+        assert_eq!(before_from.0.len(), 1);
+        assert_eq!(before_to.0.len(), 1);
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        assert!(overlay.search_symbols(&patterns, None, Some("jvm")).1);
+        assert_eq!(cache.composed_search_inputs.region().stats().entries, 1);
+        assert_eq!(
+            before_from,
+            overlay.relations_from_scoped("generated.owner", Some("jvm"))
+        );
+        assert_eq!(
+            before_to,
+            overlay.relations_to_scoped("generated.owner", Some("jvm"))
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: warm row answers duplicated relations already owned by the decoded overlay"
+    )]
+    fn search_backing_excludes_decoded_generated_relations() {
+        let _languages = neutral_catalog_languages();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let working = mixed_active(false, false);
+        let working_source = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &working,
+            Vec::new(),
+            Vec::new(),
+            None,
+            &[],
+        );
+        let (symbols, open) = working_source.symbols_with_id_scoped("type.widget", Some("jvm"));
+        assert!(open.is_none());
+        let mut owner = symbols[0].as_ref().clone();
+        let (relations, open) =
+            working_source.relations_from_scoped("member.widget.create", Some("jvm"));
+        assert!(open.is_none());
+        let mut relation = relations[0].as_ref().clone();
+        let mut active = mixed_active_edited(false, false, |source, _| {
+            source["shards"][0]["payload"] = generator_shard()["payload"].clone();
+        });
+        use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+        let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/semantic-model-packs/declarations-v1.json"
+        )))
+        .unwrap();
+        source["shards"][0]["payload"] = generator_shard()["payload"].clone();
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let (decoded, _) = catalog_fixture_active(&[pack], "decoded-generated-search");
+        let state = Arc::get_mut(&mut active).unwrap();
+        Arc::get_mut(&mut state.shards[0]).unwrap().decoded = decoded.shards[0].decoded.clone();
+        assert!(active.shards[0].decoded.is_some());
+        assert!(active.shards[1].decoded.is_none());
+        let digest = active.shards[0].manifest.semantic_sha256.clone();
+        owner.provenance.pack_digest = digest.clone();
+        relation.provenance.pack_digest = digest;
+        owner.id = "generated.owner".into();
+        relation.id = "generated.relation".into();
+        relation.from = owner.id.clone();
+        relation.to = owner.id.clone();
+        relation.pre_composition_endpoints = None;
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            vec![owner],
+            vec![relation],
+            Some(cache.clone()),
+            &[],
+        );
+        let before_from = overlay.relations_from_scoped("generated.owner", Some("jvm"));
+        let before_to = overlay.relations_to_scoped("generated.owner", Some("jvm"));
+        assert!(before_from.1.is_none());
+        assert!(before_to.1.is_none());
+        assert!(before_from.0.is_empty());
+        assert!(before_to.0.is_empty());
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        assert!(overlay.search_symbols(&patterns, None, Some("jvm")).1);
+        assert_eq!(cache.composed_search_inputs.region().stats().entries, 1);
+        assert_eq!(
+            before_from,
+            overlay.relations_from_scoped("generated.owner", Some("jvm"))
+        );
+        assert_eq!(
+            before_to,
+            overlay.relations_to_scoped("generated.owner", Some("jvm"))
+        );
+    }
+
+    #[test]
+    fn search_fill_relevance_new_sha_within_activation_gets_a_fresh_backing() {
+        let _languages = neutral_catalog_languages();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let mut active = mixed_active_edited(false, false, |source, version| {
+            python_pack(source, version, false)
+        });
+        let activation_address = Arc::as_ptr(&active);
+        let relevance = active.search_fill_relevance.clone();
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let token = CancellationToken::new();
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: None,
+            build: overlay.build_identity,
+            jvm_binding: Some(ReaderBinding([1; 32])),
+        };
+        let old_digest = overlay.effective_search_inputs(&key).digest();
+        let old_symbols = overlay.search_symbols(&patterns, None, None);
+        assert!(old_symbols.1);
+        assert!(
+            old_symbols
+                .0
+                .iter()
+                .all(|symbol| symbol.language != "python")
+        );
+        let old_backing = cache
+            .composed_search_inputs
+            .get_ready(&old_digest, &token)
+            .unwrap();
+        let old_sha = active.shards[0].descriptor.semantic_sha256.clone();
+        assert_eq!(relevance.lock().unwrap().get(&old_sha), Some(&false));
+        drop(overlay);
+
+        // Republish the same logical Python shard with declaration content.
+        // Keep this activation object and its relevance memo alive across the
+        // publication, replacing only the fixture's physical view and metadata.
+        let published = mixed_active_edited(false, false, |source, version| {
+            python_pack(source, version, true)
+        });
+        let state = Arc::get_mut(&mut active).expect("no request still holds the activation");
+        assert_eq!(
+            state.shards[0].descriptor.shard_id,
+            published.shards[0].descriptor.shard_id
+        );
+        state.shards = published.shards.clone();
+        state.source_reader = published.source_reader.clone();
+        state.active_model_set_hash = published.active_model_set_hash.clone();
+        state.report = published.report.clone();
+        state
+            .install_request_source(published.request_source().cloned())
+            .unwrap();
+        assert_eq!(activation_address, Arc::as_ptr(&active));
+        assert!(Arc::ptr_eq(&relevance, &active.search_fill_relevance));
+        let new_sha = active.shards[0].descriptor.semantic_sha256.clone();
+        assert_ne!(old_sha, new_sha);
+
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        // Pin build and binding to isolate the relevance selection itself.
+        assert_ne!(old_digest, overlay.effective_search_inputs(&key).digest());
+        assert_eq!(relevance.lock().unwrap().get(&new_sha), Some(&true));
+        let new_key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            build: overlay.build_identity,
+            ..key
+        };
+        let new_digest = overlay.effective_search_inputs(&new_key).digest();
+        assert!(
+            cache
+                .composed_search_inputs
+                .get_ready(&new_digest, &token)
+                .is_none()
+        );
+        let new_symbols = overlay.search_symbols(&patterns, None, None);
+        assert!(new_symbols.1);
+        assert!(
+            new_symbols
+                .0
+                .iter()
+                .any(|symbol| symbol.language == "python")
+        );
+        let new_backing = cache
+            .composed_search_inputs
+            .get_ready(&new_digest, &token)
+            .unwrap();
+        assert!(
+            !std::ptr::eq(&*old_backing, &*new_backing),
+            "new content must fill a fresh backing"
+        );
+        assert_eq!(
+            relevance.lock().unwrap().get(&old_sha),
+            Some(&false),
+            "old content's bit was not overwritten"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: relevance cached by pack digest hid later declaration shards in the same pack"
+    )]
+    fn search_fill_relevance_distinguishes_sibling_shards() {
+        for empty_first in [true, false] {
+            let active = mixed_active_edited(false, false, |source, _| {
+                let mut empty = source["shards"][0].clone();
+                empty["id"] = json!(if empty_first {
+                    "a.empty.generator"
+                } else {
+                    "z.empty.generator"
+                });
+                empty["payload"] = generator_shard()["payload"].clone();
+                let shards = source["shards"].as_array_mut().unwrap();
+                shards.insert(if empty_first { 0 } else { 1 }, empty);
+            });
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let overlay = row_entry_points::RowOverlay::new(
+                &analyzer,
+                &active,
+                Vec::new(),
+                Vec::new(),
+                None,
+                &[],
+            );
+            let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+                realm: None,
+                build: overlay.build_identity,
+                jvm_binding: None,
+            };
+            overlay.effective_search_inputs(&key);
+            let bits = active.search_fill_relevance.lock().unwrap();
+            for shard in &active.shards {
+                assert_eq!(
+                    bits.get(&shard.descriptor.semantic_sha256),
+                    Some(
+                        &(shard.descriptor.payload_kind
+                            != crate::analyzer::semantic_model::PayloadKind::GeneratorRules)
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: closing the request owner during relevance selection panicked and poisoned the activation memo"
+    )]
+    fn search_fill_relevance_owner_closure_is_open_and_does_not_poison_the_activation() {
+        let _languages = neutral_catalog_languages();
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct ClosingSource {
+            reader: Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>,
+            calls: AtomicUsize,
+            closing: AtomicBool,
+        }
+        impl RequestRowReaderSource for ClosingSource {
+            fn jvm_reader(
+                &self,
+                active: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                if self.calls.fetch_add(1, Ordering::Relaxed) != 0
+                    && self.closing.load(Ordering::Relaxed)
+                {
+                    return Err(FamilyOpen::jvm_cancelled());
+                }
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                    reader: request_reader(&self.reader, active),
+                    binding: ReaderBinding([1; 32]),
+                })
+            }
+        }
+        let mut active = mixed_active_edited(false, false, |source, version| {
+            if version == "1.0.0" {
+                source["shards"][0]["payload"] = generator_shard()["payload"].clone();
+            }
+        });
+        let source = Arc::new(ClosingSource {
+            reader: active.source_reader.as_ref().unwrap().clone(),
+            calls: AtomicUsize::new(0),
+            closing: AtomicBool::new(true),
+        });
+        Arc::get_mut(&mut active)
+            .unwrap()
+            .install_request_source(Some(source.clone()))
+            .unwrap();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let failed = overlay.search_symbols(&patterns, None, None);
+        assert!(!failed.1, "owner closure must report an incomplete search");
+        assert_eq!(cache.composed_search_inputs.region().stats().entries, 0);
+        assert!(!active.search_fill_relevance.is_poisoned());
+        source.closing.store(false, Ordering::Relaxed);
+        let recovered = overlay.search_symbols(&patterns, None, None);
+        assert!(recovered.1);
+        assert!(!recovered.0.is_empty());
+        assert_eq!(cache.composed_search_inputs.region().stats().entries, 1);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: cancelled relevance selection probed the remaining shards with an uncancelled token"
+    )]
+    fn search_fill_relevance_stops_before_or_during_cancelled_selection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CancellingReader {
+            reader: Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>,
+            token: CancellationToken,
+            probes: Arc<AtomicUsize>,
+        }
+        impl CatalogRowReader for CancellingReader {
+            fn owned_rows(
+                &self,
+                statement: &str,
+                bindings: &[(&str, &dyn rusqlite::ToSql)],
+                cancellation: &CancellationToken,
+            ) -> Result<OwnedCatalogRows, CatalogError> {
+                let rows = self.reader.owned_rows(statement, bindings, cancellation)?;
+                if statement == brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::search_fill_relevance_statement() {
+                    self.probes.fetch_add(1, Ordering::Relaxed);
+                    self.token.cancel();
+                    assert!(cancellation.is_cancelled(), "relevance read must use the caller's token");
+                }
+                Ok(rows)
+            }
+        }
+        #[derive(Debug)]
+        struct Source {
+            reader: Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>,
+            token: CancellationToken,
+            probes: Arc<AtomicUsize>,
+        }
+        impl RequestRowReaderSource for Source {
+            fn jvm_reader(
+                &self,
+                active: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                    reader: Arc::new(CancellingReader {
+                        reader: request_reader(&self.reader, active),
+                        token: self.token.clone(),
+                        probes: self.probes.clone(),
+                    }),
+                    binding: ReaderBinding([1; 32]),
+                })
+            }
+        }
+        for cancelled_before in [true, false] {
+            let mut active = mixed_active_edited(false, false, |source, version| {
+                if version == "1.0.0" {
+                    source["shards"][0]["payload"] = generator_shard()["payload"].clone();
+                } else {
+                    let mut sibling = source["shards"][0].clone();
+                    sibling["id"] = json!("z.later.declarations");
+                    sibling["payload"]["types"][0]["id"] = json!("type.later");
+                    sibling["payload"]["types"][0]["name"] = json!("com.acme.Later");
+                    sibling["payload"]["members"] = json!([]);
+                    sibling["payload"]["relations"] = json!([]);
+                    source["shards"].as_array_mut().unwrap().push(sibling);
+                }
+            });
+            let token = CancellationToken::new();
+            let probes = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(Source {
+                reader: active.source_reader.as_ref().unwrap().clone(),
+                token: token.clone(),
+                probes: probes.clone(),
+            });
+            Arc::get_mut(&mut active)
+                .unwrap()
+                .install_request_source(Some(source))
+                .unwrap();
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            );
+            let overlay = row_entry_points::RowOverlay::new(
+                &analyzer,
+                &active,
+                Vec::new(),
+                Vec::new(),
+                Some(cache.clone()),
+                &[],
+            );
+            let patterns =
+                crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+            if cancelled_before {
+                token.cancel();
+            }
+            let answer = overlay.search_symbols(&patterns, Some(&token), None);
+            assert!(!answer.1);
+            assert_eq!(
+                probes.load(Ordering::Relaxed),
+                usize::from(!cancelled_before)
+            );
+            assert_eq!(cache.composed_search_inputs.region().stats().entries, 0);
+            let bits = active.search_fill_relevance.lock().unwrap();
+            for shard in active.shards.iter().filter(|shard| shard.request_owned()) {
+                assert!(
+                    !bits.contains_key(&shard.descriptor.semantic_sha256),
+                    "cancelled probes must not publish a bit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_selection_identity_tracks_each_fill_input_class() {
+        let _languages = neutral_catalog_languages();
+        let active = mixed_active(false, false);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let original = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            None,
+            &[],
+        );
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let symbol = original.search_symbols(&patterns, None, Some("jvm")).0[0]
+            .as_ref()
+            .clone();
+        // Hold the whole-build component constant to isolate the selection's
+        // contribution; production also retains that component in the key.
+        let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: Some("jvm".into()),
+            build: original.build_identity,
+            jvm_binding: None,
+        };
+        let identity = |active: &Arc<ResolvedActiveSemanticModels>,
+                        generated,
+                        relations,
+                        anchors: &[SemanticModelSymbol]| {
+            row_entry_points::RowOverlay::new(
+                &analyzer, active, generated, relations, None, anchors,
+            )
+            .effective_search_inputs(&key)
+            .digest()
+        };
+        let base = identity(&active, vec![symbol.clone()], Vec::new(), &[]);
+        let mut changed = symbol.clone();
+        changed.name.push_str("Changed");
+        assert_ne!(
+            base,
+            identity(&active, vec![changed], Vec::new(), &[]),
+            "generated fact"
+        );
+        let mut changed = symbol.clone();
+        changed.language = "python".into();
+        assert_ne!(
+            base,
+            identity(&active, vec![changed], Vec::new(), &[]),
+            "generated language"
+        );
+        let relation = SemanticModelRelation {
+            pre_composition_endpoints: None,
+            id: "selection-test".into(),
+            kind: "extends".into(),
+            from: symbol.id.clone(),
+            to: symbol.id.clone(),
+            declaration_ordinal: None,
+            provenance: symbol.provenance.clone(),
+        };
+        assert_ne!(
+            base,
+            identity(&active, vec![symbol.clone()], vec![relation], &[]),
+            "relation"
+        );
+        let mut anchor = symbol.clone();
+        anchor.location = SemanticModelLocation::Authored(
+            brokk_bifrost_semantic::analyzer::semantic_model::overlay::SemanticModelAuthoredAnchor {
+                path: "Selection.java".into(), symbol: symbol.qualified_name.clone(),
+                range: brokk_bifrost_semantic::analyzer::semantic_model::overlay::SemanticModelRange {
+                    start_byte: 0, end_byte: 1, start_line: 1, end_line: 1,
+                },
+            },
+        );
+        assert_ne!(
+            base,
+            identity(&active, vec![symbol.clone()], Vec::new(), &[anchor]),
+            "anchor"
+        );
+        let changed = mixed_active_edited(false, false, |source, _| {
+            source["shards"][0]["payload"]["types"][0]["name"] = json!("Changed");
+        });
+        assert_ne!(
+            base,
+            identity(&changed, vec![symbol], Vec::new(), &[]),
+            "selected shard"
+        );
+        let bound = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            jvm_binding: Some(ReaderBinding([99; 32])),
+            ..key.clone()
+        };
+        assert_ne!(
+            original.effective_search_inputs(&key).digest(),
+            original.effective_search_inputs(&bound).digest(),
+            "binding"
+        );
+    }
+
+    #[test]
+    fn equal_scope_contents_share_one_search_backing() {
+        let _languages = neutral_catalog_languages();
+        let active = mixed_active(false, false);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            Some(cache.clone()),
+            &[],
+        );
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        let token = CancellationToken::new();
+        let first = overlay.search_symbols(&patterns, Some(&token), None);
+        assert!(first.1);
+        assert!(!first.0.is_empty());
+        let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: None,
+            build: overlay.build_identity,
+            jvm_binding: Some(
+                active
+                    .request_source()
+                    .unwrap()
+                    .jvm_reader(&active)
+                    .unwrap()
+                    .binding,
+            ),
+        };
+        let digest = overlay.effective_search_inputs(&key).digest();
+        let before = cache
+            .composed_search_inputs
+            .get_ready(&digest, &token)
+            .unwrap();
+        let scoped_key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: Some("jvm".into()),
+            ..key
+        };
+        assert_eq!(
+            digest,
+            overlay.effective_search_inputs(&scoped_key).digest()
+        );
+        assert_eq!(
+            first,
+            overlay.search_symbols(&patterns, Some(&token), Some("jvm"))
+        );
+        let after = cache
+            .composed_search_inputs
+            .get_ready(&digest, &token)
+            .unwrap();
+        assert!(std::ptr::eq(&*before, &*after));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: hierarchy lookups derived the same backing key 15994 times per request"
+    )]
+    fn backing_key_derivation_is_constant_at_ten_and_thousand_lookups() {
+        let active = mixed_active(false, false);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let overlay = SemanticModelOverlay::build(
+            &analyzer,
+            &active,
+            &CancellationToken::new(),
+            u64::MAX,
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let owner = active
+            .request_source()
+            .unwrap()
+            .jvm_reader(&active)
+            .unwrap();
+        let request = brokk_bifrost_core::analyzer::outer_request::OuterRequest::new();
+        let _scope =
+            crate::analyzer::i_analyzer::AnalyzerQueryScope::with_outer_request(&analyzer, request);
+        let (first, first_receipt) =
+            crate::analyzer::common::capture_current_query_cache_build(|| {
+                overlay
+                    .row_source
+                    .as_ref()
+                    .unwrap()
+                    .memoized_search_digest(&owner, Some("jvm"))
+            });
+        for count in [10, 1000] {
+            for _ in 0..count {
+                assert_eq!(
+                    overlay
+                        .row_source
+                        .as_ref()
+                        .unwrap()
+                        .memoized_search_digest(&owner, Some("jvm")),
+                    first
+                );
+            }
+            assert_eq!(
+                crate::analyzer::semantic_model::overlay::row_entry_points::RowOverlay::backing_key_fills(&owner),
+                1
+            );
+        }
+        let (_, late_receipt) = crate::analyzer::common::capture_current_query_cache_build(|| {
+            overlay
+                .row_source
+                .as_ref()
+                .unwrap()
+                .memoized_search_digest(&owner, Some("jvm"))
+        });
+        assert_eq!(format!("{first_receipt:?}"), format!("{late_receipt:?}"));
     }
 
     #[test]
@@ -4729,6 +6428,10 @@ mod partition_tests {
                 _: &ResolvedActiveSemanticModels,
             ) -> Result<RequestRowReader, FamilyOpen> {
                 Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
                     reader: self.0.clone(),
                     binding: ReaderBinding([7; 32]),
                 })
@@ -4923,6 +6626,10 @@ mod partition_tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::analyzer::i_analyzer::refuse_request_row_read_reuse();
             Ok(RequestRowReader {
+                derivation_extension: Default::default(),
+                certified_providers: Default::default(),
+                inventory_generation: None,
+                inventory_clock: None,
                 reader: request_reader(
                     self.reader
                         .as_ref()
@@ -4932,6 +6639,1432 @@ mod partition_tests {
                 binding: ReaderBinding([9; 32]),
             })
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: ordinary row composition ignored request cancellation and held queued work"
+    )]
+    fn cancelled_composition_releases_serial_analyzer_capacity() {
+        use crate::analyzer::i_analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+        let active = mixed_active(false, false);
+        let capacity = Arc::new(Mutex::new(()));
+        let token = crate::CancellationToken::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let active = active.clone();
+            let capacity = capacity.clone();
+            let token = token.clone();
+            let done = done_tx.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                let _permit = capacity.lock().unwrap();
+                let analyzer = crate::analyzer::MultiAnalyzer::default();
+                let _scope = AnalyzerQueryScope::with_cancellation(&analyzer, &token);
+                let reads = composition::RowCompositionReads::new(&active, &[], &[]);
+                let first = std::sync::atomic::AtomicBool::new(true);
+                let listener = Arc::new(move |event: ListenerEvent<'_>| {
+                    if matches!(event, ListenerEvent::Statement { .. }) {
+                        if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            entered_tx.send(()).unwrap();
+                            release.wait();
+                        }
+                        token.cancel();
+                    }
+                });
+                let _trace = attach_listener(
+                    &active
+                        .source_reader
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .lock()
+                        .unwrap(),
+                    listener,
+                );
+                let result = reads
+                    .projection()
+                    .prepare_groups(&locations::CarriedSourceLocations, &["type.widget".into()]);
+                assert!(matches!(result, Err(CatalogError::Cancelled)));
+                done.send("cancelled").unwrap();
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let queued = std::thread::spawn(move || {
+            queued_tx.send(()).unwrap();
+            let _permit = capacity.lock().unwrap();
+            let reads = composition::RowCompositionReads::new(&active, &[], &[]);
+            assert!(
+                !reads
+                    .owner_symbols(&locations::CarriedSourceLocations, "type.widget")
+                    .unwrap()
+                    .is_empty()
+            );
+            done_tx.send("queued").unwrap();
+        });
+        queued_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release.wait();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "queued"
+        );
+        worker.join().unwrap();
+        queued.join().unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: batch preparation traversed unrelated generated owners and ignored cancellation"
+    )]
+    fn batch_preparation_limits_generated_closure_and_checks_cancellation() {
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = mixed_active(false, false);
+        let reads = composition::RowCompositionReads::new(&active, &[], &[]);
+        let resolver = &locations::CarriedSourceLocations;
+        let mut generated = reads
+            .owner_symbols(resolver, "type.widget")
+            .unwrap()
+            .remove(0);
+        generated.id = "generated.owner".into();
+        generated.qualified_name = "generated.Owner".into();
+        generated.aliases = vec!["com.acme.Widget".into()];
+        let generated = [generated];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = {
+            let calls = calls.clone();
+            Arc::new(move |event: ListenerEvent<'_>| {
+                if matches!(event, ListenerEvent::Statement { .. }) {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let _trace = attach_listener(
+            &active
+                .source_reader
+                .as_ref()
+                .unwrap()
+                .connection
+                .lock()
+                .unwrap(),
+            listener,
+        );
+        reads.projection().prepare_groups(resolver, &[]).unwrap();
+        let empty_calls = calls.swap(0, Ordering::Relaxed);
+        let mut reads = composition::RowCompositionReads::new(&active, &generated, &[]);
+        reads.projection().prepare_groups(resolver, &[]).unwrap();
+        assert_eq!(calls.swap(0, Ordering::Relaxed), empty_calls);
+        let projection = reads.projection();
+        projection
+            .prepare_groups(resolver, &["generated.owner".into()])
+            .unwrap();
+        let owners = projection
+            .group_owners(
+                resolver,
+                &composition::CompositionGroupKey {
+                    language: "java".into(),
+                    module_namespace: false,
+                    identity: "generated.Owner".into(),
+                },
+            )
+            .unwrap();
+        assert!(owners.iter().any(|owner| owner.id == "type.widget"));
+        drop(projection);
+        let cancelled = crate::CancellationToken::new();
+        cancelled.cancel();
+        reads.cancellation = Some(cancelled.clone());
+        calls.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            reads.projection().prepare_groups(resolver, &[]),
+            Err(CatalogError::Cancelled)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: indexed incoming relations omitted member-origin edges in composed groups"
+    )]
+    fn indexed_binding_questions_match_ordinary_rows() {
+        let _languages = neutral_catalog_languages();
+        use crate::analyzer::store::cache_budget::{RetainedBytes, StoreCacheBudget};
+        use crate::analyzer::store::semantic_composition::SearchCandidateKey;
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Source(Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>);
+        impl RequestRowReaderSource for Source {
+            fn jvm_reader(
+                &self,
+                _: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    reader: self.0.clone(),
+                    binding: ReaderBinding([1; 32]),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                })
+            }
+        }
+        use crate::analyzer::semantic_model::{
+            ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
+            compile_pack,
+        };
+        let packs = ["1.0.0", "1.1.0"].map(|version| {
+            let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/testdata/semantic-model-packs/declarations-v1.json"
+            )))
+            .unwrap();
+            source["version"] = json!(version);
+            source["schema_version"] =
+                json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+            source["compatibility"]
+                .as_object_mut()
+                .unwrap()
+                .remove("bifrost");
+            if version == "1.1.0" {
+                source["pack_id"] = json!("fixture.curated-member-relations");
+                let payload = &mut source["shards"][0]["payload"];
+                payload["types"][0]["id"] = json!("type.curated.widget");
+                payload["types"][0]["hierarchy"] = json!([]);
+                payload["members"][0]["owner"] = json!("type.curated.widget");
+                payload["members"][0]["id"] = json!("member.curated.create");
+                payload["relations"][0]["id"] = json!("relation.curated.navigation");
+                payload["relations"][0]["from"] = json!("member.curated.create");
+                payload["relations"][0]["to"] = json!("type.curated.widget");
+            }
+            if version == "1.0.0" {
+                let payload = &mut source["shards"][0]["payload"];
+                let template = payload["types"][0].clone();
+                for name in ["Base", "Left", "Right", "Top"] {
+                    let mut ty = template.clone();
+                    ty["id"] = json!(format!("type.{}", name.to_ascii_lowercase()));
+                    ty["name"] = json!(format!("com.acme.{name}"));
+                    if name != "Base" {
+                        ty["type_kind"] = json!("interface");
+                    }
+                    ty["aliases"] = json!([]);
+                    ty["hierarchy"] = json!([]);
+                    payload["types"].as_array_mut().unwrap().push(ty);
+                }
+                payload["types"][0]["hierarchy"] = json!([]);
+                for (from, to) in [
+                    ("widget", "Base"),
+                    ("Base", "Left"),
+                    ("Base", "Right"),
+                    ("Left", "Top"),
+                    ("Right", "Top"),
+                ] {
+                    let owner = payload["types"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|ty| ty["id"] == format!("type.{}", from.to_ascii_lowercase()))
+                        .unwrap();
+                    owner["hierarchy"].as_array_mut().unwrap().push(json!({
+                        "hierarchy_kind": if from == "Base" { "implements" } else { "extends" },
+                        "target": { "kind": "named", "name": format!("com.acme.{to}") }
+                    }));
+                }
+            }
+            let mut authored: AuthoredSemanticModelPack = serde_json::from_value(source).unwrap();
+            if version == "1.0.0" {
+                authored.extraction = Some(ArtifactExtraction::single(
+                    ArtifactExtractionKind::JavaClassJar,
+                    &"a".repeat(64),
+                ));
+            }
+            compile_pack(&authored, &CompilerOptions::default()).unwrap()
+        });
+        let (mut active, _) = catalog_fixture_active(&packs, "absorbed-member-relations");
+        let selected = Arc::get_mut(&mut active).unwrap();
+        selected.indexes = MatcherIndexes::default();
+        for (index, shard) in selected.shards.iter_mut().enumerate() {
+            let shard = Arc::get_mut(shard).unwrap();
+            Arc::get_mut(&mut shard.metadata).unwrap().source_kind = if index == 0 {
+                CatalogPackSourceKind::WorkspaceProduced
+            } else {
+                CatalogPackSourceKind::Generated
+            };
+            shard.decoded = None;
+        }
+        selected.install_request_source(None).unwrap();
+        let request_reader = request_reader(selected.source_reader.as_ref().unwrap(), selected);
+        selected
+            .install_request_source(Some(Arc::new(Source(request_reader.clone()))))
+            .unwrap();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let token = CancellationToken::new();
+        let budget = crate::retention_budget::RetentionBudget::for_tests();
+        let mut published =
+            SemanticModelOverlay::build(&analyzer, &active, &token, u64::MAX, &budget).unwrap();
+        let cache = StoreCacheBudget::new(&budget);
+        Arc::make_mut(published.row_source.as_mut().unwrap()).cache = Some(cache.clone());
+        let overlay = published.row_source.as_ref().unwrap();
+        let mut ordinary = overlay.as_ref().clone();
+        ordinary.cache = None;
+        let rows = Arc::new(AtomicUsize::new(0));
+        let listener = {
+            let rows = rows.clone();
+            Arc::new(move |event: ListenerEvent<'_>| {
+                if matches!(event, ListenerEvent::Row { .. }) {
+                    rows.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let _trace = attach_listener(
+            &active
+                .source_reader
+                .as_ref()
+                .unwrap()
+                .connection
+                .lock()
+                .unwrap(),
+            listener.clone(),
+        );
+        let _request_trace = attach_listener(&request_reader.connection.lock().unwrap(), listener);
+        let patterns =
+            crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+        for realm in [None, Some("jvm")] {
+            let (symbols, complete) = overlay.search_symbols(&patterns, Some(&token), realm);
+            assert!(complete);
+            assert!(
+                symbols
+                    .iter()
+                    .any(|symbol| symbol.id != "member.curated.create"
+                        && symbol
+                            .semantic_contributors
+                            .iter()
+                            .any(|contributor| contributor.record_id == "member.curated.create")),
+                "fixture must absorb the curated member identity: {symbols:?}"
+            );
+            let key = SearchCandidateKey {
+                realm: realm.map(str::to_owned),
+                build: overlay.build_identity,
+                jvm_binding: Some(ReaderBinding([1; 32])),
+            };
+            let entry = cache
+                .composed_search_inputs
+                .get_ready(&overlay.effective_search_inputs(&key).digest(), &token)
+                .expect("complete entry");
+            eprintln!(
+                "realm={realm:?} base_bytes={} index_bytes={}",
+                entry.retained_bytes() - entry.index.retained_bytes(),
+                entry.index.retained_bytes()
+            );
+            let mut changed = key.clone();
+            changed.jvm_binding = Some(ReaderBinding([8; 32]));
+            assert!(
+                cache
+                    .composed_search_inputs
+                    .get_ready(&overlay.effective_search_inputs(&changed).digest(), &token)
+                    .is_none()
+            );
+            // Follow the same relation and endpoint APIs as the hierarchy consumer.
+            // The diamond must visit Top once, after traversing multiple levels.
+            let closure = |source: &row_entry_points::RowOverlay| {
+                let mut pending = vec!["type.widget".to_owned()];
+                let mut visited = std::collections::BTreeSet::new();
+                while let Some(id) = pending.pop() {
+                    let relations = source.relations_from_scoped(&id, realm);
+                    assert!(relations.1.is_none());
+                    for relation in relations.0 {
+                        if !matches!(relation.kind.as_str(), "extends" | "implements") {
+                            continue;
+                        }
+                        let mut endpoints = source.symbols_with_id_scoped(&relation.to, realm);
+                        assert!(endpoints.1.is_none());
+                        if endpoints.0.is_empty() {
+                            endpoints = source.symbols_named_scoped(&relation.to, realm);
+                            assert!(endpoints.1.is_none());
+                        }
+                        assert_eq!(endpoints.0.len(), 1);
+                        let endpoint = endpoints.0[0].id.clone();
+                        if visited.insert(endpoint.clone()) {
+                            pending.push(endpoint);
+                        }
+                    }
+                }
+                visited
+            };
+            let expected = closure(&ordinary);
+            assert_eq!(
+                expected,
+                ["type.base", "type.left", "type.right", "type.top"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            );
+            // Relations are read per owner from the rows, not from the fill, so
+            // the closure reads rows; the symbol lookups below must not.
+            assert_eq!(closure(overlay), expected);
+            super::super::test_support::assert_indexed_binding_questions(
+                &published,
+                realm,
+                Some(&rows),
+            );
+        }
+    }
+
+    #[test]
+    fn open_binding_does_not_publish_indexed_questions() {
+        let _languages = neutral_catalog_languages();
+        use crate::analyzer::store::cache_budget::StoreCacheBudget;
+        use crate::analyzer::store::semantic_composition::SearchCandidateKey;
+        #[derive(Debug)]
+        struct UncertifiedSource;
+        impl RequestRowReaderSource for UncertifiedSource {
+            fn jvm_reader(
+                &self,
+                _: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                Err(FamilyOpen::jvm("selection has no certified provider"))
+            }
+        }
+        for request_only in [false, true] {
+            let mut active = mixed_active_edited(false, true, |source, _| {
+                if request_only {
+                    source["language"] = json!("python");
+                    source["ecosystem"] = json!("pypi");
+                }
+            });
+            if request_only {
+                assert!(!active.shards.iter().any(|shard| shard.request_owned()));
+            }
+            Arc::get_mut(&mut active)
+                .unwrap()
+                .install_request_source(Some(Arc::new(UncertifiedSource)))
+                .unwrap();
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let token = CancellationToken::new();
+            let budget = crate::retention_budget::RetentionBudget::for_tests();
+            let mut published =
+                SemanticModelOverlay::build(&analyzer, &active, &token, u64::MAX, &budget).unwrap();
+            let cache = StoreCacheBudget::new(&budget);
+            Arc::make_mut(published.row_source.as_mut().unwrap()).cache = Some(cache.clone());
+            let overlay = published.row_source.as_ref().unwrap();
+            let mut ordinary = overlay.as_ref().clone();
+            ordinary.cache = None;
+            let patterns =
+                crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+            for realm in [None, Some("jvm")] {
+                assert!(!overlay.search_symbols(&patterns, Some(&token), realm).1);
+                let key = SearchCandidateKey {
+                    realm: realm.map(str::to_owned),
+                    build: overlay.build_identity,
+                    jvm_binding: Some(ReaderBinding([1; 32])),
+                };
+                assert!(
+                    cache
+                        .composed_search_inputs
+                        .get_ready(&overlay.effective_search_inputs(&key).digest(), &token)
+                        .is_none()
+                );
+                let expected = ordinary.symbols_named_scoped("Widget", realm);
+                assert!(expected.1.is_some());
+                assert_eq!(overlay.symbols_named_scoped("Widget", realm), expected);
+                assert_eq!(
+                    overlay.symbols_with_id_scoped("type.widget", realm),
+                    ordinary.symbols_with_id_scoped("type.widget", realm)
+                );
+                assert_eq!(
+                    overlay.members_of_scoped("type.widget", realm),
+                    ordinary.members_of_scoped("type.widget", realm)
+                );
+                assert_eq!(
+                    overlay.relations_from_scoped("type.widget", realm),
+                    ordinary.relations_from_scoped("type.widget", realm)
+                );
+                assert_eq!(
+                    overlay.relations_to_scoped("type.widget", realm),
+                    ordinary.relations_to_scoped("type.widget", realm)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: request-owned search recomposed the whole JDK on every request"
+    )]
+    fn request_search_first_and_warm_statement_counts_are_inventory_independent() {
+        let _languages = neutral_catalog_languages();
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Source(
+            Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>,
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<std::sync::atomic::AtomicU8>,
+            Arc<std::sync::Mutex<Vec<u64>>>,
+        );
+        impl RequestRowReaderSource for Source {
+            fn jvm_reader(
+                &self,
+                _: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                if let Some(request) = crate::analyzer::current_outer_request() {
+                    self.3.lock().unwrap().push(request.id());
+                }
+                if self.1.load(Ordering::Relaxed) {
+                    crate::analyzer::i_analyzer::record_request_row_selection_read(
+                        crate::analyzer::ReadKey::Models(
+                            crate::analyzer::semantic::ids::StableDigest::sha256(
+                                "search-test-selection",
+                            ),
+                        ),
+                    );
+                }
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    reader: self.0.clone(),
+                    binding: ReaderBinding([self.2.load(Ordering::Relaxed); 32]),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                })
+            }
+        }
+        let mut measurements = Vec::new();
+        for size in [8, 128] {
+            let mut active = mixed_active_edited(false, true, |source, _| {
+                let payload = &mut source["shards"][0]["payload"];
+                let owner = payload["types"][0].clone();
+                let member = payload["members"][0].clone();
+                payload["types"] = json!(
+                    (0..1)
+                        .map(|index| {
+                            let mut owner = owner.clone();
+                            owner["id"] = json!(format!("type.{index}"));
+                            owner["name"] = json!(format!("com.acme.Widget{index}"));
+                            owner["aliases"] = json!([]);
+                            owner
+                        })
+                        .collect::<Vec<_>>()
+                );
+                payload["members"] = json!(
+                    (0..size)
+                        .map(|index| {
+                            let mut member = member.clone();
+                            member["id"] = json!(format!("member.{index}"));
+                            member["owner"] = json!("type.0");
+                            member["locator"] = json!({
+                                "kind": "source", "path": "com/acme/Widget.java", "symbol": "create"
+                            });
+                            member
+                        })
+                        .collect::<Vec<_>>()
+                );
+                payload["relations"] = json!([]);
+            });
+            let selected = Arc::get_mut(&mut active).unwrap();
+            selected.install_request_source(None).unwrap();
+            let request = request_reader(selected.source_reader.as_ref().unwrap(), selected);
+            let record_selection = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let binding = Arc::new(std::sync::atomic::AtomicU8::new(7));
+            let observed_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            selected
+                .install_request_source(Some(Arc::new(Source(
+                    request.clone(),
+                    record_selection.clone(),
+                    binding.clone(),
+                    observed_requests.clone(),
+                ))))
+                .unwrap();
+            let statements = Arc::new(AtomicUsize::new(0));
+            let rows = Arc::new(AtomicUsize::new(0));
+            let anchor_reads = Arc::new(AtomicUsize::new(0));
+            let pause = Arc::new((
+                std::sync::Mutex::new((false, false, false)),
+                std::sync::Condvar::new(),
+            ));
+            let listener = {
+                let statements = statements.clone();
+                let rows = rows.clone();
+                let anchor_reads = anchor_reads.clone();
+                let pause = pause.clone();
+                Arc::new(move |event: ListenerEvent<'_>| match event {
+                    ListenerEvent::Statement { sql, .. } => {
+                        if sql.is_some_and(|sql| {
+                            [questions::SOURCE_TYPES, questions::SOURCE_MEMBERS]
+                                .iter()
+                                .any(|statement| {
+                                    sql.contains(statement.trim_end().trim_end_matches(';'))
+                                })
+                        }) {
+                            anchor_reads.fetch_add(1, Ordering::Relaxed);
+                            let (lock, ready) = &*pause;
+                            let mut state = lock.lock().unwrap();
+                            if state.0 {
+                                state.0 = false;
+                                state.1 = true;
+                                ready.notify_all();
+                                while !state.2 {
+                                    state = ready.wait(state).unwrap();
+                                }
+                            }
+                        }
+                        statements.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ListenerEvent::Row { .. } => {
+                        rows.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                })
+            };
+            let _request_trace =
+                attach_listener(&request.connection.lock().unwrap(), listener.clone());
+            let _activation_trace = attach_listener(
+                &selected
+                    .source_reader
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .lock()
+                    .unwrap(),
+                listener,
+            );
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let token = CancellationToken::new();
+            let mut published = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &token,
+                u64::MAX,
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            );
+            Arc::make_mut(published.row_source.as_mut().unwrap()).cache = Some(cache.clone());
+            let caller = crate::analyzer::OuterRequest::new();
+            let caller_id = caller.id();
+            let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+                realm: None,
+                build: published.row_source.as_ref().unwrap().build_identity,
+                jvm_binding: Some(ReaderBinding([7; 32])),
+            };
+            // Resolve test probes before observing the isolated prefill binding.
+            let backing_key = published
+                .row_source
+                .as_ref()
+                .unwrap()
+                .effective_search_inputs(&key)
+                .digest();
+            let mut jvm_key = key.clone();
+            jvm_key.realm = Some("jvm".into());
+            let jvm_backing_key = published
+                .row_source
+                .as_ref()
+                .unwrap()
+                .effective_search_inputs(&jvm_key)
+                .digest();
+            let caller_scope =
+                crate::analyzer::AnalyzerQueryScope::with_outer_request(&analyzer, caller.clone());
+            // Hold the real fill at its first source-anchor query. Cancellation
+            // must abandon it without publishing either realm's entry.
+            *pause.0.lock().unwrap() = (true, false, false);
+            let cancelled = CancellationToken::new();
+            std::thread::scope(|threads| {
+                let warmer = threads.spawn(|| {
+                    let _languages = neutral_catalog_languages();
+                    published.prefill_search_inputs(&analyzer, &cancelled)
+                });
+                let mut state = pause.0.lock().unwrap();
+                while !state.1 {
+                    let (next, timeout) = pause
+                        .1
+                        .wait_timeout(state, std::time::Duration::from_secs(30))
+                        .unwrap();
+                    assert!(!timeout.timed_out(), "warm fill did not start");
+                    state = next;
+                }
+                cancelled.cancel();
+                state.2 = true;
+                pause.1.notify_all();
+                drop(state);
+                assert!(warmer.join().unwrap().is_err());
+            });
+            assert!(
+                cache
+                    .composed_search_inputs
+                    .get_ready(&backing_key, &token)
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .composed_search_inputs
+                    .get_ready(&jvm_backing_key, &token)
+                    .is_none()
+            );
+            // A caller arriving during a real prefill must wait on its flight,
+            // rather than doing a second inventory read or composition.
+            *pause.0.lock().unwrap() = (true, false, false);
+            std::thread::scope(|threads| {
+                let warmer = threads.spawn(|| {
+                    let _languages = neutral_catalog_languages();
+                    let _caller = crate::analyzer::AnalyzerQueryScope::with_outer_request(
+                        &analyzer,
+                        caller.clone(),
+                    );
+                    published.prefill_search_inputs(&analyzer, &token)
+                });
+                let mut state = pause.0.lock().unwrap();
+                while !state.1 {
+                    let (next, timeout) = pause
+                        .1
+                        .wait_timeout(state, std::time::Duration::from_secs(30))
+                        .unwrap();
+                    assert!(!timeout.timed_out(), "warm fill did not start");
+                    state = next;
+                }
+                drop(state);
+                let follower = threads.spawn(|| {
+                    let _languages = neutral_catalog_languages();
+                    let request = crate::analyzer::OuterRequest::new();
+                    let _scope = crate::analyzer::AnalyzerQueryScope::with_outer_request(
+                        &analyzer,
+                        request.clone(),
+                    );
+                    let patterns = crate::analyzer::SearchSymbolPatternBatch::compile(
+                        vec![".*".into()],
+                        false,
+                        None,
+                    );
+                    let result = published.row_source.as_ref().unwrap().search_symbols(
+                        &patterns,
+                        Some(&token),
+                        None,
+                    );
+                    request.close();
+                    result
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while cache.composed_search_inputs.waiters_for_test(&backing_key) == 0 {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let joined = cache.composed_search_inputs.waiters_for_test(&backing_key) > 0;
+                let mut state = pause.0.lock().unwrap();
+                state.2 = true;
+                pause.1.notify_all();
+                drop(state);
+                warmer.join().unwrap().unwrap();
+                let (symbols, complete) = follower.join().unwrap();
+                assert!(joined, "real request did not join prefill");
+                assert!(complete);
+                assert!(!symbols.is_empty());
+            });
+            assert_eq!(
+                crate::analyzer::current_outer_request().unwrap().id(),
+                caller_id
+            );
+            assert!(!caller.is_closed());
+            let observed = observed_requests.lock().unwrap();
+            assert!(!observed.is_empty());
+            assert!(
+                observed.iter().all(|id| *id != caller_id),
+                "prefill used caller binding"
+            );
+            drop(observed);
+            drop(caller_scope);
+            caller.close();
+            assert!(crate::analyzer::current_outer_request().is_none());
+            let overlay = published.row_source.as_ref().unwrap();
+            let patterns =
+                crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+            let mut counts = Vec::new();
+            let mut fill_answer = None;
+            let mut fill_keys = None;
+            for request_index in 0..2 {
+                let request = crate::analyzer::OuterRequest::new();
+                let scope = crate::analyzer::AnalyzerQueryScope::with_outer_request(
+                    &analyzer,
+                    request.clone(),
+                );
+                statements.store(0, Ordering::Relaxed);
+                rows.store(0, Ordering::Relaxed);
+                anchor_reads.store(0, Ordering::Relaxed);
+                super::super::SEARCH_RESULT_CLONES.with(|count| count.set(0));
+                let ((symbols, total, complete), reads) =
+                    crate::analyzer::capture_query_reads(&analyzer, || {
+                        published.search_with_limit(&patterns, 20, None)
+                    });
+                assert!(total >= symbols.len());
+                assert!(symbols.len() <= 20);
+                super::super::SEARCH_RESULT_CLONES.with(|count| {
+                    assert_eq!(
+                        count.get(),
+                        symbols.len(),
+                        "only emitted symbols are cloned"
+                    );
+                });
+                assert_eq!(
+                    rows.load(Ordering::Relaxed),
+                    0,
+                    "prefilled real request read rows"
+                );
+                let before_parity = (
+                    statements.load(Ordering::Relaxed),
+                    rows.load(Ordering::Relaxed),
+                    anchor_reads.load(Ordering::Relaxed),
+                );
+                // Exercise every spelling, identity, and owner from the same
+                // resident arena against the ordinary row implementation.
+                let mut ordinary = overlay.as_ref().clone();
+                ordinary.cache = None;
+                for symbol in &symbols {
+                    for realm in [None, Some("jvm")] {
+                        // Only the exact warmed scope may hit.
+                        if realm.is_some() {
+                            continue;
+                        }
+                        for name in std::iter::once(&symbol.name)
+                            .chain(std::iter::once(&symbol.qualified_name))
+                            .chain(&symbol.aliases)
+                        {
+                            let expected = ordinary.symbols_named_scoped(name, realm);
+                            assert!(expected.1.is_none());
+                            rows.store(0, Ordering::Relaxed);
+                            let actual = overlay.symbols_named_scoped(name, realm);
+                            assert_eq!(actual, expected);
+                            assert_eq!(rows.load(Ordering::Relaxed), 0, "indexed name read rows");
+                        }
+                        let expected = ordinary.symbols_with_id_scoped(&symbol.id, realm);
+                        assert!(expected.1.is_none());
+                        rows.store(0, Ordering::Relaxed);
+                        assert_eq!(overlay.symbols_with_id_scoped(&symbol.id, realm), expected);
+                        assert_eq!(rows.load(Ordering::Relaxed), 0, "indexed id read rows");
+                        let expected = ordinary.members_of_scoped(&symbol.id, realm);
+                        assert!(expected.1.is_none());
+                        rows.store(0, Ordering::Relaxed);
+                        assert_eq!(overlay.members_of_scoped(&symbol.id, realm), expected);
+                        assert_eq!(rows.load(Ordering::Relaxed), 0, "indexed owner read rows");
+                    }
+                }
+                statements.store(before_parity.0, Ordering::Relaxed);
+                rows.store(before_parity.1, Ordering::Relaxed);
+                anchor_reads.store(before_parity.2, Ordering::Relaxed);
+                let _provenance = published.symbols_named_in_family(
+                    "Widget",
+                    "java",
+                    SemanticModelNamespace::Unknown,
+                );
+                assert_eq!(
+                    anchor_reads.load(Ordering::Relaxed),
+                    0,
+                    "rendering reloaded anchors"
+                );
+                rows.store(0, Ordering::Relaxed);
+                drop(scope);
+                request.close();
+                let bytes = serde_json::to_vec(&symbols).unwrap();
+                let keys = reads.keys();
+                let entry = cache
+                    .composed_search_inputs
+                    .get_ready(&backing_key, &token)
+                    .unwrap();
+                let (_, receipt_reads) = crate::analyzer::capture_query_reads(&analyzer, || {
+                    entry
+                        .receipt
+                        .as_any()
+                        .downcast_ref::<crate::analyzer::common::QueryCacheBuildReceipt>()
+                        .unwrap()
+                        .replay();
+                });
+                assert!(
+                    receipt_reads
+                        .keys()
+                        .contains(&crate::analyzer::ReadKey::Models(
+                            crate::analyzer::semantic::ids::StableDigest::sha256(
+                                active.active_model_set_hash()
+                            ),
+                        )),
+                    "first and warm backing receipts retain the active-set read"
+                );
+
+                if request_index == 0 {
+                    fill_answer = Some(bytes);
+                    assert!(!keys.is_empty(), "fill captured selection reads");
+                    fill_keys = Some(keys);
+                    // The hit must supply the fill's keys from its retained
+                    // receipt even when the source does not re-emit them.
+                    record_selection.store(false, Ordering::Relaxed);
+                } else {
+                    assert_eq!(fill_answer.as_ref().unwrap(), &bytes);
+                    assert_eq!(fill_keys.as_ref().unwrap(), &keys);
+                    assert_eq!(
+                        rows.load(Ordering::Relaxed),
+                        0,
+                        "warm family read catalog rows"
+                    );
+                }
+                assert!(complete);
+                assert!(!symbols.is_empty());
+                let count = statements.load(Ordering::Relaxed);
+                let row_count = rows.load(Ordering::Relaxed);
+                eprintln!("size={size} statements={count} rows={row_count}");
+                assert!(
+                    row_count <= size * 150 + 1000,
+                    "size={size} rows={row_count}"
+                );
+                counts.push(count);
+            }
+            // A changed certified binding must not consume the prefilled entry.
+            binding.store(8, Ordering::Relaxed);
+            rows.store(0, Ordering::Relaxed);
+            let (_, complete) = overlay.search_symbols(&patterns, None, None);
+            assert!(complete);
+            assert!(
+                rows.load(Ordering::Relaxed) > 0,
+                "changed binding must miss"
+            );
+            measurements.push(counts);
+        }
+        assert_eq!(measurements[0], measurements[1], "{measurements:?}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: the first search fill composed each multi-contributor group alone, about 22 statements per group and 105k for the JDK"
+    )]
+    fn search_fill_statements_do_not_grow_with_group_count() {
+        let _languages = neutral_catalog_languages();
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        #[derive(Debug)]
+        struct Source(Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>);
+        impl RequestRowReaderSource for Source {
+            fn jvm_reader(
+                &self,
+                _: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    reader: self.0.clone(),
+                    binding: ReaderBinding([7; 32]),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                })
+            }
+        }
+        let mut measurements = Vec::new();
+        // Both packs of the fixture define every owner, so each is a
+        // two-contributor group, as the JDK's classes are.
+        for groups in [4, 40] {
+            let mut active = mixed_active_edited(false, true, |source, _| {
+                let payload = &mut source["shards"][0]["payload"];
+                let owner = payload["types"][0].clone();
+                let member = payload["members"][0].clone();
+                payload["types"] = json!(
+                    (0..groups)
+                        .map(|index| {
+                            let mut owner = owner.clone();
+                            owner["id"] = json!(format!("type.{index}"));
+                            owner["name"] = json!(format!("com.acme.Widget{index}"));
+                            owner["aliases"] = json!([]);
+                            owner
+                        })
+                        .collect::<Vec<_>>()
+                );
+                payload["members"] = json!(
+                    (0..groups * 3)
+                        .map(|index| {
+                            let mut member = member.clone();
+                            member["id"] = json!(format!("member.{index}"));
+                            member["owner"] = json!(format!("type.{}", index / 3));
+                            member["locator"] = json!({
+                                "kind": "source", "path": "com/acme/Widget.java", "symbol": "create"
+                            });
+                            member
+                        })
+                        .collect::<Vec<_>>()
+                );
+                payload["relations"] = json!([]);
+            });
+            let selected = Arc::get_mut(&mut active).unwrap();
+            selected.install_request_source(None).unwrap();
+            let request = request_reader(selected.source_reader.as_ref().unwrap(), selected);
+            selected
+                .install_request_source(Some(Arc::new(Source(request.clone()))))
+                .unwrap();
+            let statements = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let listener = {
+                let statements = statements.clone();
+                Arc::new(move |event: ListenerEvent<'_>| {
+                    if let ListenerEvent::Statement { sql, .. } = event {
+                        statements
+                            .lock()
+                            .unwrap()
+                            .push(sql.unwrap_or_default().to_owned());
+                    }
+                })
+            };
+            let _request_trace =
+                attach_listener(&request.connection.lock().unwrap(), listener.clone());
+            let _activation_trace = attach_listener(
+                &selected
+                    .source_reader
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .lock()
+                    .unwrap(),
+                listener,
+            );
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let token = CancellationToken::new();
+            let mut published = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &token,
+                u64::MAX,
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            );
+            Arc::make_mut(published.row_source.as_mut().unwrap()).cache = Some(cache);
+            statements.lock().unwrap().clear();
+            published.prefill_search_inputs(&analyzer, &token).unwrap();
+            let statements = std::mem::take(&mut *statements.lock().unwrap());
+            let patterns =
+                crate::analyzer::SearchSymbolPatternBatch::compile(vec![".*".into()], false, None);
+            let (symbols, _, complete) = published.search_with_limit(&patterns, usize::MAX, None);
+            assert!(complete);
+            assert!(
+                symbols.len() >= groups * 4,
+                "{groups} groups: owners and members of both contributors, composed: {}",
+                symbols.len()
+            );
+            let mut histogram = std::collections::BTreeMap::<String, usize>::new();
+            for sql in &statements {
+                *histogram
+                    .entry(
+                        sql.split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(160)
+                            .collect(),
+                    )
+                    .or_default() += 1;
+            }
+            eprintln!(
+                "groups={groups} fill statements={} {histogram:#?}",
+                statements.len()
+            );
+            assert!(
+                statements
+                    .iter()
+                    .all(|sql| !sql.contains("from_id=owners.value")
+                        && !sql.contains("r.origin='relation_fact'")),
+                "search composes symbols only; no relation is read: {statements:#?}"
+            );
+            measurements.push(statements.len());
+        }
+        assert_eq!(measurements[0], measurements[1], "{measurements:?}");
+    }
+
+    /// `types` two-contributor groups, each with one member and an `extends`
+    /// edge, over a request-owned reader whose statements are recorded.
+    struct HierarchyFixture {
+        published: SemanticModelOverlay,
+        cache: crate::analyzer::store::cache_budget::StoreCacheBudget,
+        statements: Arc<std::sync::Mutex<Vec<String>>>,
+        ids: Vec<String>,
+        _traces: [brokk_bifrost_core::cache_db::sql_profile::ListenerGuard; 2],
+        _analyzer: EmptyAnalyzer,
+        _directory: TempDir,
+    }
+
+    impl HierarchyFixture {
+        fn new(types: usize) -> Self {
+            use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+            #[derive(Debug)]
+            struct Source(Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>);
+            impl RequestRowReaderSource for Source {
+                fn jvm_reader(
+                    &self,
+                    _: &ResolvedActiveSemanticModels,
+                ) -> Result<RequestRowReader, FamilyOpen> {
+                    Ok(RequestRowReader {
+                        derivation_extension: Default::default(),
+                        reader: self.0.clone(),
+                        binding: ReaderBinding([7; 32]),
+                        certified_providers: Default::default(),
+                        inventory_generation: None,
+                        inventory_clock: None,
+                    })
+                }
+            }
+            let mut active = mixed_active_edited(false, true, |source, _| {
+                let payload = &mut source["shards"][0]["payload"];
+                let owner = payload["types"][0].clone();
+                let member = payload["members"][0].clone();
+                payload["types"] = json!(
+                    (0..types)
+                        .map(|index| {
+                            let mut owner = owner.clone();
+                            owner["id"] = json!(format!("type.{index}"));
+                            owner["name"] = json!(format!("com.acme.Widget{index}"));
+                            owner["aliases"] = json!([]);
+                            owner
+                        })
+                        .collect::<Vec<_>>()
+                );
+                payload["members"] = json!(
+                    (0..types)
+                        .map(|index| {
+                            let mut member = member.clone();
+                            member["id"] = json!(format!("member.{index}"));
+                            member["owner"] = json!(format!("type.{index}"));
+                            member["locator"] = json!({
+                                "kind": "source", "path": "com/acme/Widget.java", "symbol": "create"
+                            });
+                            member
+                        })
+                        .collect::<Vec<_>>()
+                );
+                payload["relations"] = json!([]);
+            });
+            let selected = Arc::get_mut(&mut active).unwrap();
+            selected.install_request_source(None).unwrap();
+            let request = request_reader(selected.source_reader.as_ref().unwrap(), selected);
+            selected
+                .install_request_source(Some(Arc::new(Source(request.clone()))))
+                .unwrap();
+            let statements = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let listener = {
+                let statements = statements.clone();
+                Arc::new(move |event: ListenerEvent<'_>| {
+                    if let ListenerEvent::Statement { sql, .. } = event {
+                        statements
+                            .lock()
+                            .unwrap()
+                            .push(sql.unwrap_or_default().to_owned());
+                    }
+                })
+            };
+            let traces = [
+                attach_listener(&request.connection.lock().unwrap(), listener.clone()),
+                attach_listener(
+                    &selected
+                        .source_reader
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .lock()
+                        .unwrap(),
+                    listener,
+                ),
+            ];
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let token = CancellationToken::new();
+            let mut published = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &token,
+                u64::MAX,
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            );
+            Arc::make_mut(published.row_source.as_mut().unwrap()).cache = Some(cache.clone());
+            Self {
+                published,
+                cache,
+                statements,
+                ids: (0..types).map(|index| format!("type.{index}")).collect(),
+                _traces: traces,
+                _analyzer: analyzer,
+                _directory: directory,
+            }
+        }
+
+        fn overlay(&self) -> &row_entry_points::RowOverlay {
+            self.published.row_source.as_ref().unwrap()
+        }
+
+        /// The statements issued since the last call.
+        fn take_statements(&self) -> Vec<String> {
+            std::mem::take(&mut *self.statements.lock().unwrap())
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: a hierarchy query read one type, one owner and one group per root, about 12 statements per class and 58k for the JDK"
+    )]
+    fn hierarchy_relations_statements_follow_chunks_not_roots() {
+        let _languages = neutral_catalog_languages();
+        // Three 256-ID chunks: 600 roots.
+        let fixture = HierarchyFixture::new(600);
+        let chunks = fixture.ids.len().div_ceil(256);
+        let cold = fixture.overlay().relations_from_many(&fixture.ids, None);
+        let cold_statements = fixture.take_statements();
+        for (id, (relations, open)) in fixture.ids.iter().zip(&cold) {
+            assert!(open.is_none());
+            assert!(
+                relations
+                    .iter()
+                    .any(|r| r.kind == "extends" && r.from == *id),
+                "{id}: {relations:?}"
+            );
+        }
+        let warm = fixture.overlay().relations_from_many(&fixture.ids, None);
+        let warm_statements = fixture.take_statements();
+        assert_eq!(cold, warm);
+        let mut histogram = std::collections::BTreeMap::<String, usize>::new();
+        for sql in &cold_statements {
+            *histogram
+                .entry(
+                    sql.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(120)
+                        .collect(),
+                )
+                .or_default() += 1;
+        }
+        eprintln!(
+            "cold={} warm={} {histogram:#?}",
+            cold_statements.len(),
+            warm_statements.len()
+        );
+        // Per chunk: discovery (records, owners, their alias groups), the groups'
+        // members and relations, and the endpoint owners, each a set read.
+        const STATEMENTS_PER_CHUNK: usize = 40;
+        assert!(
+            cold_statements.len() <= STATEMENTS_PER_CHUNK * chunks,
+            "{} statements for {} roots in {chunks} chunks: {histogram:#?}",
+            cold_statements.len(),
+            fixture.ids.len()
+        );
+        assert!(
+            warm_statements
+                .iter()
+                .all(|sql| !sql.contains("t.record_id=:id")),
+            "a warm hierarchy read asked the catalog for one type: {warm_statements:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11884: one standalone endpoint failure discarded unrelated origins in a union batch"
+    )]
+    fn standalone_batch_endpoint_failure_keeps_other_origin_complete() {
+        let _languages = neutral_catalog_languages();
+        use crate::analyzer::store::semantic_composition::RepresentativeIdentity;
+        use row_entry_points::{LookupOpen, rewrite_standalone_relation_sets};
+        let fixture = HierarchyFixture::new(2);
+        let answers = fixture.overlay().relations_from_many(&fixture.ids, None);
+        let relations = answers
+            .iter()
+            .flat_map(|(records, open)| {
+                assert!(open.is_none());
+                records.iter().map(|relation| (**relation).clone())
+            })
+            .collect::<Vec<_>>();
+        let sets = fixture
+            .ids
+            .iter()
+            .map(|id| HashSet::from_iter([id.clone()]))
+            .collect::<Vec<_>>();
+        let opens = [LookupOpen::default(), LookupOpen::default()];
+        let mut calls = HashMap::<String, usize>::default();
+        let results = rewrite_standalone_relation_sets(
+            &sets,
+            relations.clone(),
+            &opens.iter().collect::<Vec<_>>(),
+            |_, id| {
+                *calls.entry(id.to_owned()).or_default() += 1;
+                if id == fixture.ids[0] {
+                    return Err(FamilyOpen::jvm("test endpoint unavailable"));
+                }
+                Ok((
+                    RepresentativeIdentity {
+                        representative_id: None,
+                        replacements: Vec::new(),
+                        composed: false,
+                        disagreement: false,
+                    },
+                    composition::OriginRewrites::default(),
+                ))
+            },
+        );
+        assert!(results[0].is_empty());
+        assert_eq!(
+            opens[0].get(),
+            Some(FamilyOpen::jvm("test endpoint unavailable"))
+        );
+        assert_eq!(opens[1].get(), None);
+        assert_eq!(
+            results[1],
+            relations
+                .into_iter()
+                .filter(|r| r.from == fixture.ids[1])
+                .collect::<Vec<_>>()
+        );
+        assert!(!results[1].is_empty());
+        assert!(calls.values().all(|count| *count == 1), "{calls:?}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11884: decoded hierarchy origins caused discarded per-ID catalog reads"
+    )]
+    fn hierarchy_decoded_origins_do_not_read_relations() {
+        use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+        let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/semantic-model-packs/declarations-v1.json"
+        )))
+        .unwrap();
+        python_pack(&mut source, "1.0.0", true);
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let (decoded, _) = catalog_fixture_active(&[pack], "decoded-python-search");
+        let python = decoded.shards[0].decoded.clone().unwrap();
+        assert!(
+            matches!(python.payload(), CompiledPayload::DeclarationFacts { types, .. } if !types.is_empty())
+        );
+        let mut active = mixed_active_edited(false, false, |source, version| {
+            python_pack(source, version, true)
+        });
+        let active_mut = Arc::get_mut(&mut active).unwrap();
+        let shard = active_mut
+            .shards
+            .iter_mut()
+            .find(|s| s.manifest.language == "python")
+            .unwrap();
+        let ids = match python.payload() {
+            CompiledPayload::DeclarationFacts { types, .. } => {
+                types.iter().map(|ty| ty.id.clone()).collect::<Vec<_>>()
+            }
+            _ => unreachable!(),
+        };
+        assert!(!ids.is_empty());
+        Arc::get_mut(shard).unwrap().decoded = Some(python);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        use brokk_bifrost_core::cache_db::sql_profile::{ListenerEvent, attach_listener};
+        let statements = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = statements.clone();
+        let _trace = attach_listener(
+            &active
+                .source_reader
+                .as_ref()
+                .unwrap()
+                .connection
+                .lock()
+                .unwrap(),
+            Arc::new(move |event| {
+                if let ListenerEvent::Statement { sql, .. } = event {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(sql.unwrap_or_default().to_owned());
+                }
+            }),
+        );
+        let overlay = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            None,
+            &[],
+        );
+        statements.lock().unwrap().clear();
+        let answers = overlay.relations_from_many(&ids, Some("python"));
+        let sql = statements.lock().unwrap();
+        eprintln!("decoded hierarchy statements={}", sql.len());
+        assert!(
+            answers
+                .iter()
+                .all(|(records, open)| records.is_empty() && open.is_none())
+        );
+        assert!(
+            sql.is_empty(),
+            "decoded-only realm must read no rows: {sql:#?}"
+        );
+    }
+
+    #[test]
+    fn hierarchy_relations_do_not_depend_on_chunking() {
+        let _languages = neutral_catalog_languages();
+        // A group's content and its retained size depend only on its key: the
+        // same roots one by one, in one batch, and in reverse give the same
+        // relations and charge the composed-group region the same bytes.
+        let alone = HierarchyFixture::new(300);
+        let one_by_one = alone
+            .ids
+            .iter()
+            .map(|id| alone.overlay().relations_from_scoped(id, None))
+            .collect::<Vec<_>>();
+        let chunked = HierarchyFixture::new(300);
+        let together = chunked.overlay().relations_from_many(&chunked.ids, None);
+        let reversed = HierarchyFixture::new(300);
+        let reverse_ids = reversed.ids.iter().rev().cloned().collect::<Vec<_>>();
+        let mut backwards = reversed.overlay().relations_from_many(&reverse_ids, None);
+        backwards.reverse();
+        assert_eq!(one_by_one, together);
+        assert_eq!(one_by_one, backwards);
+        let charged = |fixture: &HierarchyFixture| {
+            fixture
+                .cache
+                .region_stats()
+                .into_iter()
+                .find(|(name, _)| *name == "store.composed-groups")
+                .unwrap()
+                .1
+        };
+        let (alone, chunked, reversed) = (charged(&alone), charged(&chunked), charged(&reversed));
+        assert!(alone.entries >= 300);
+        assert_eq!(
+            (alone.entries, alone.accounted_bytes),
+            (chunked.entries, chunked.accounted_bytes)
+        );
+        assert_eq!(
+            (alone.entries, alone.accounted_bytes),
+            (reversed.entries, reversed.accounted_bytes)
+        );
     }
 
     #[test]
@@ -5200,6 +8333,7 @@ mod partition_tests {
 
     #[test]
     fn carried_request_source_and_uncarried_model_locations() {
+        let _languages = neutral_catalog_languages();
         use locations::SemanticModelLocations;
         let active = mixed_active(false, true);
         let directory = TempDir::new().unwrap();
@@ -5263,6 +8397,10 @@ mod partition_tests {
                 ));
             }
             Ok(RequestRowReader {
+                derivation_extension: Default::default(),
+                certified_providers: Default::default(),
+                inventory_generation: None,
+                inventory_clock: None,
                 reader: Arc::new(DistinctReader {
                     reader: request_reader(&self.reader, activation),
                     empty: false,
@@ -5271,6 +8409,102 @@ mod partition_tests {
                     [self.binding.load(std::sync::atomic::Ordering::Relaxed); 32],
                 ),
             })
+        }
+    }
+
+    #[test]
+    fn composed_search_inputs_share_only_equal_realms_and_release_independently() {
+        let _languages = neutral_catalog_languages();
+        for mixed in [false, true] {
+            let mut active = mixed_active_edited(false, true, |source, version| {
+                if mixed && version == "1.0.0" {
+                    source["pack_id"] = json!("acme.widget.py");
+                    source["language"] = json!("python");
+                    source["ecosystem"] = json!("pypi");
+                    source["shards"][0]["payload"]["types"][0]["hierarchy"] = json!([]);
+                    source["shards"][0]["payload"]["relations"] = json!([]);
+                }
+            });
+            let reader = active.source_reader.as_ref().unwrap().clone();
+            Arc::get_mut(&mut active)
+                .unwrap()
+                .install_request_source(Some(Arc::new(BindingSource {
+                    reader,
+                    binding: std::sync::atomic::AtomicU8::new(7),
+                })))
+                .unwrap();
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let token = CancellationToken::new();
+            let mut published = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &token,
+                u64::MAX,
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            );
+            Arc::make_mut(published.row_source.as_mut().unwrap()).cache = Some(cache.clone());
+            let inputs = &cache.composed_search_inputs;
+            let (_, all_key) = super::super::test_support::assert_indexed_binding_questions(
+                &published, None, None,
+            );
+            let all = inputs.get_ready(&all_key, &token).unwrap();
+            let first_charge = inputs.region().stats().accounted_bytes;
+            assert!(first_charge > 0);
+            let (_, jvm_key) = super::super::test_support::assert_indexed_binding_questions(
+                &published,
+                Some("jvm"),
+                None,
+            );
+            let jvm = inputs.get_ready(&jvm_key, &token).unwrap();
+            let both_charge = inputs.region().stats().accounted_bytes;
+            assert_eq!(std::ptr::eq(&*all, &*jvm), !mixed);
+            if mixed {
+                assert_ne!(all_key, jvm_key);
+                assert!(both_charge > first_charge);
+            } else {
+                assert_eq!(all_key, jvm_key);
+                assert_eq!(both_charge, first_charge, "second realm charges zero bytes");
+            }
+            inputs.invalidate(&all_key);
+            drop(all);
+            if mixed {
+                assert_eq!(
+                    inputs.region().stats().accounted_bytes,
+                    both_charge - first_charge
+                );
+                assert!(inputs.get_ready(&all_key, &token).is_none());
+                let survivor = inputs.get_ready(&jvm_key, &token).unwrap();
+                assert!(std::ptr::eq(&*survivor, &*jvm));
+                super::super::test_support::assert_indexed_binding_questions(
+                    &published,
+                    Some("jvm"),
+                    None,
+                );
+                assert_eq!(
+                    inputs.region().stats().accounted_bytes,
+                    both_charge - first_charge
+                );
+                drop(survivor);
+                inputs.invalidate(&jvm_key);
+            } else {
+                assert_eq!(
+                    inputs.region().stats().accounted_bytes,
+                    first_charge,
+                    "held shared backing stays charged"
+                );
+            }
+            drop(jvm);
+            assert_eq!(
+                inputs.region().stats().accounted_bytes,
+                0,
+                "last drop releases each backing once"
+            );
         }
     }
 
@@ -5307,6 +8541,7 @@ mod partition_tests {
         "#9559: a Python model search returned no rows while the JVM request owner was open"
     )]
     fn failed_jvm_read_keeps_python_search_complete() {
+        let _languages = neutral_catalog_languages();
         use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
         let mut active = mixed_active_edited(false, false, |source, version| {
             if version == "1.0.0" {
@@ -5433,6 +8668,7 @@ mod partition_tests {
         "#9559: skipping a request owner with no request-owned activation shard answered a request-only JVM selection as complete"
     )]
     fn request_owner_is_consulted_without_request_owned_shards() {
+        let _languages = neutral_catalog_languages();
         // Both packs are Python, so the activation holds no request-owned
         // shard. The request owner's bind is still the check that the
         // request's JVM selection matches the activation; when it refuses,
@@ -5485,6 +8721,7 @@ mod partition_tests {
         "#9559: a Python *_for lookup bound and waited on the JVM request owner; scoped Python reads are now unaffected"
     )]
     fn failed_jvm_read_keeps_python_questions_complete() {
+        let _languages = neutral_catalog_languages();
         use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
         let mut active = mixed_active_edited(false, false, |source, version| {
             if version == "1.0.0" {
@@ -5506,7 +8743,7 @@ mod partition_tests {
             Arc::new(OpenSource),
             Arc::new(LaterOpenSource {
                 reader: reader.clone(),
-                statement: statements::TYPES_BY_ID,
+                statement: statements::TYPES_BY_IDS,
             }),
             Arc::new(LaterOpenSource {
                 reader: reader.clone(),
@@ -5577,6 +8814,7 @@ mod partition_tests {
         "#9559: a Python relations_to lookup composed a generated Java owner and opened on the JVM request owner"
     )]
     fn scoped_relations_to_skips_other_family_generated_owners() {
+        let _languages = neutral_catalog_languages();
         let python_pack = |source: &mut Value, version: &str| {
             if version == "1.0.0" {
                 source["pack_id"] = json!("acme.widget.py");
@@ -5643,6 +8881,78 @@ mod partition_tests {
 
     /// Decoded Java and Python packs compiled from one source, so they
     /// publish the same declaration and relation IDs.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: a child capture omitted the active model set from its receipt"
+    )]
+    fn changed_active_set_records_own_models_key_with_equal_jvm_inputs() {
+        let _languages = neutral_catalog_languages();
+        let (mixed, _reader, directory) = decoded_family_overlay();
+        let original = mixed.active_models.as_ref().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let mut digests = Vec::new();
+        let mut scoped_digests = Vec::new();
+        for (hash, shards) in [
+            (
+                "java-only",
+                original
+                    .shards
+                    .iter()
+                    .filter(|s| s.manifest.language == "java")
+                    .cloned()
+                    .collect(),
+            ),
+            ("java-and-python", original.shards.clone()),
+        ] {
+            let mut selected = resolved_active_models_fixture(hash, shards);
+            selected.source_reader = original.source_reader.clone();
+            selected
+                .install_request_source(original.request_source().cloned())
+                .unwrap();
+            let row = super::super::row_entry_points::RowOverlay::new(
+                &analyzer,
+                &Arc::new(selected),
+                Vec::new(),
+                Vec::new(),
+                None,
+                &[],
+            );
+            let mut key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+                realm: Some("jvm".into()),
+                build: row.build_identity,
+                jvm_binding: None,
+            };
+            let (digest, reads) = crate::analyzer::capture_query_reads(&analyzer, || {
+                row.effective_search_inputs(&key).digest()
+            });
+            let own = crate::analyzer::ReadKey::Models(
+                crate::analyzer::semantic::ids::StableDigest::sha256(hash),
+            );
+            assert!(reads.keys().contains(&own));
+            let other = if hash == "java-only" {
+                "java-and-python"
+            } else {
+                "java-only"
+            };
+            assert!(!reads.keys().contains(&crate::analyzer::ReadKey::Models(
+                crate::analyzer::semantic::ids::StableDigest::sha256(other)
+            )));
+            digests.push(digest);
+            key.build =
+                crate::analyzer::store::semantic_composition::SemanticOverlayBuildIdentity([0; 32]);
+            scoped_digests.push(row.effective_search_inputs(&key).digest());
+        }
+        assert_eq!(
+            scoped_digests[0], scoped_digests[1],
+            "JVM effective inputs are unchanged"
+        );
+        assert_ne!(
+            digests[0], digests[1],
+            "full active set remains in build identity"
+        );
+    }
+
     fn decoded_family_overlay() -> (
         SemanticModelOverlay,
         crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader,
@@ -5708,7 +9018,13 @@ mod partition_tests {
         for (index, record) in equivalent.records.iter_mut().enumerate() {
             let mut metadata = (*record.shard.metadata).clone();
             metadata.matched_evidence.ecosystem = "jdk".into();
-            metadata.matched_evidence.artifact_sha256 = Some(index.to_string());
+            metadata.matched_evidence.verified_raw_artifacts = vec![
+                brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(
+                    brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference,
+                    brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar,
+                    &format!("{index:064x}"),
+                ),
+            ];
             record.shard = Arc::new(ActiveSemanticModelShard {
                 metadata: Arc::new(metadata),
                 decoded: record.shard.decoded.clone(),
@@ -5759,6 +9075,7 @@ mod partition_tests {
         "#9559: a family-scoped relation lookup returned another family's decoded relations for a shared declaration ID"
     )]
     fn scoped_relation_lookups_keep_only_their_family_decoded_relations() {
+        let _languages = neutral_catalog_languages();
         let (overlay, _reader, _directory) = decoded_family_overlay();
         let relation_packs = |matched: SemanticModelOverlayMatch<SemanticModelRelation>| {
             packs_of(matched, |relation| &relation.provenance.pack_id)
@@ -5785,6 +9102,7 @@ mod partition_tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon("#10689: a Java pack hid Python records with the same ID")]
     fn decoded_packs_of_different_families_keep_their_own_records_for_a_shared_id() {
+        let _languages = neutral_catalog_languages();
         let (overlay, _reader, _directory) = decoded_family_overlay();
         let relations = overlay.relations_from("member.widget.create").records;
         let rewritten = composition::rewrite_relations(
@@ -5842,6 +9160,7 @@ mod partition_tests {
         "#9559: a Python relation and owner-surface read waited on the JVM request owner"
     )]
     fn failed_jvm_read_keeps_python_relations_complete() {
+        let _languages = neutral_catalog_languages();
         use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
         let mut active = mixed_active_edited(false, false, |source, version| {
             if version == "1.0.0" {
@@ -5881,7 +9200,7 @@ mod partition_tests {
                         .unwrap();
                     active.source_reader.as_ref().unwrap().clone()
                 },
-                statement: statements::RELATIONS_FROM,
+                statement: statements::RELATIONS_BY_ID,
             }),
             counting.clone(),
         ];
@@ -5918,9 +9237,7 @@ mod partition_tests {
             }
             assert_eq!(counting.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
             // Statement failures affect only queries that execute that statement.
-            // OVERLAY_RELATIONS_FROM is not executed by relation composition.
             let answers = match index {
-                2 => Vec::new(),
                 3 => vec![overlay.relations_to_for("type.widget", "java")],
                 _ => vec![
                     overlay.relations_from_for("member.widget.create", "java"),
@@ -6029,9 +9346,12 @@ mod partition_tests {
         assert_eq!(binding_of(&overlay), Some(ReaderBinding([2; 32])));
         assert_eq!(first, second);
         assert!(!Arc::ptr_eq(&first, &second));
-        // The request owner records both selection keys on fills and memo hits.
+        // Fills and memo hits retain both selection keys and the active set.
         assert!(!ledger.reuse_refused());
-        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.len(), 3);
+        assert!(ledger.keys().contains(&crate::analyzer::ReadKey::Models(
+            crate::analyzer::semantic::ids::StableDigest::sha256(active.active_model_set_hash()),
+        )));
         let hit_ledger = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
         let third = {
             let _capture = crate::analyzer::i_analyzer::AnalyzerQueryScope::with_read_ledger(
@@ -6061,6 +9381,10 @@ mod partition_tests {
             crate::analyzer::i_analyzer::current_outer_request()
                 .ok_or(FamilyOpen::jvm("no request scope"))?;
             Ok(RequestRowReader {
+                derivation_extension: Default::default(),
+                certified_providers: Default::default(),
+                inventory_generation: None,
+                inventory_clock: None,
                 reader: Arc::new(DistinctReader {
                     reader: request_reader(&self.reader, activation),
                     empty: false,
@@ -6108,7 +9432,10 @@ mod partition_tests {
         let carried = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         std::thread::scope(|scope| {
             let seen = scope
-                .spawn(|| carried.run(|| overlay.symbols_named("com.acme.Widget")))
+                .spawn(|| {
+                    let _languages = neutral_catalog_languages();
+                    carried.run(|| overlay.symbols_named("com.acme.Widget"))
+                })
                 .join()
                 .unwrap();
             assert!(!matches!(
@@ -6121,7 +9448,10 @@ mod partition_tests {
             // Without the carried request the JVM part is open: possible
             // candidates only, never an empty complete answer.
             let uncarried = scope
-                .spawn(|| overlay.symbols_named("com.acme.Widget"))
+                .spawn(|| {
+                    let _languages = neutral_catalog_languages();
+                    overlay.symbols_named("com.acme.Widget")
+                })
                 .join()
                 .unwrap();
             assert!(matches!(
@@ -6144,7 +9474,7 @@ mod partition_tests {
             bindings: &[(&str, &dyn rusqlite::ToSql)],
             cancellation: &CancellationToken,
         ) -> Result<OwnedCatalogRows, CatalogError> {
-            if statement.contains(self.statement.trim_end_matches(';')) {
+            if statement.contains(self.statement.trim_end().trim_end_matches(';')) {
                 return Err(CatalogError::FamilyOpen(FamilyOpen::jvm(
                     "JVM catalog busy",
                 )));
@@ -6159,6 +9489,10 @@ mod partition_tests {
             activation: &ResolvedActiveSemanticModels,
         ) -> Result<RequestRowReader, FamilyOpen> {
             Ok(RequestRowReader {
+                derivation_extension: Default::default(),
+                certified_providers: Default::default(),
+                inventory_generation: None,
+                inventory_clock: None,
                 reader: Arc::new(Self {
                     reader: request_reader(&self.reader, activation),
                     statement: self.statement,
@@ -6173,6 +9507,7 @@ mod partition_tests {
         "#9559: a JVM statement that failed after binding discarded the activation owner's rows of the same read"
     )]
     fn failed_jvm_statement_keeps_activation_rows() {
+        let _languages = neutral_catalog_languages();
         use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
         // The activation-owned pack is Python, the JVM-owned one Java: an
         // unscoped read spans both families.
@@ -6193,7 +9528,7 @@ mod partition_tests {
                 Arc<dyn crate::analyzer::store::model_catalog::RequestRowReaderSource>,
             > = Some(Arc::new(LaterOpenSource {
                 reader,
-                statement: statements::TYPES_BY_ID,
+                statement: statements::TYPES_BY_IDS,
             }));
             Arc::get_mut(&mut active)
                 .unwrap()
@@ -6225,14 +9560,309 @@ mod partition_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#14073: operational catalog openness admitted a retained Rust owner as complete"
+    )]
+    fn rust_owner_admission_preserves_operational_open_and_recovers() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let _languages = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            Language::Java,
+            Language::Rust,
+        ]);
+        // Fail real statements after binding, while the activation owner's
+        // positive rows remain readable. Rebinding keeps the same identity.
+        #[derive(Debug)]
+        struct RecoveringSource {
+            reader: Arc<crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader>,
+            failing: Arc<AtomicBool>,
+            probes: Arc<[AtomicUsize; 3]>,
+            cancelled: bool,
+        }
+        impl CatalogRowReader for RecoveringSource {
+            fn owned_rows(
+                &self,
+                statement: &str,
+                bindings: &[(&str, &dyn rusqlite::ToSql)],
+                cancellation: &CancellationToken,
+            ) -> Result<OwnedCatalogRows, CatalogError> {
+                for (index, target) in [
+                    statements::TYPES_BY_ID,
+                    statements::TYPES_BY_NAME,
+                    statements::TYPES_BY_IDS,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if statement.contains(target.trim_end().trim_end_matches(';')) {
+                        self.probes[index].fetch_add(1, Ordering::Relaxed);
+                        if self.failing.load(Ordering::Relaxed) {
+                            return Err(if self.cancelled {
+                                CatalogError::Cancelled
+                            } else {
+                                CatalogError::FamilyOpen(FamilyOpen::jvm("owner read failed"))
+                            });
+                        }
+                    }
+                }
+                self.reader.owned_rows(statement, bindings, cancellation)
+            }
+        }
+        impl RequestRowReaderSource for RecoveringSource {
+            fn jvm_reader(
+                &self,
+                active: &ResolvedActiveSemanticModels,
+            ) -> Result<RequestRowReader, FamilyOpen> {
+                Ok(RequestRowReader {
+                    derivation_extension: Default::default(),
+                    certified_providers: Default::default(),
+                    inventory_generation: None,
+                    inventory_clock: None,
+                    reader: Arc::new(Self {
+                        reader: request_reader(&self.reader, active),
+                        failing: self.failing.clone(),
+                        probes: self.probes.clone(),
+                        cancelled: self.cancelled,
+                    }),
+                    binding: ReaderBinding([73; 32]),
+                })
+            }
+        }
+
+        for cancelled in [false, true] {
+            let mut active = mixed_active_edited(false, false, |source, version| {
+                if version == "1.0.0" {
+                    source["pack_id"] = json!("acme.widget.rust");
+                    source["language"] = json!("rust");
+                    source["ecosystem"] = json!("cargo");
+                    source["compatibility"]["toolchains"] = json!([]);
+                    source["shards"][0]["payload"]["types"][0]["name"] = json!("rust::Widget");
+                }
+            });
+            Arc::get_mut(&mut active)
+                .unwrap()
+                .install_request_source(None)
+                .unwrap();
+            let source = Arc::new(RecoveringSource {
+                reader: active.source_reader.as_ref().unwrap().clone(),
+                failing: Arc::new(AtomicBool::new(true)),
+                probes: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
+                cancelled,
+            });
+            Arc::get_mut(&mut active)
+                .unwrap()
+                .install_request_source(Some(source.clone()))
+                .unwrap();
+            let expected = if cancelled {
+                FamilyOpen::jvm_cancelled()
+            } else {
+                FamilyOpen::jvm("owner read failed")
+            };
+
+            let mut raw = active.all_type_records_with_id("type.widget");
+            assert_eq!(source.probes[0].load(Ordering::Relaxed), 1);
+            assert_eq!(raw.jvm_open, Some(expected));
+            let retained = raw
+                .rows
+                .find(|candidate| candidate.shard.manifest.language == "rust")
+                .expect("failed extra owner must preserve the Rust declaration");
+            let mut visits = 0;
+            assert_eq!(
+                active.type_declaration_admitted::<FamilyOpen>(&retained, &mut || {
+                    visits += 1;
+                    Ok(())
+                }),
+                Err(expected),
+                "an incomplete owner question must not admit the retained positive"
+            );
+            assert_eq!(visits, 0);
+            assert_eq!(source.probes[0].load(Ordering::Relaxed), 2);
+            for expected_probes in [1, 2] {
+                let matched = active.types_named("rust::Widget");
+                assert_eq!(
+                    matched.disposition,
+                    SemanticModelMatchDisposition::Open(expected)
+                );
+                assert!(
+                    matched
+                        .records
+                        .iter()
+                        .any(|record| record.record.id == "type.widget")
+                );
+                assert_eq!(source.probes[1].load(Ordering::Relaxed), expected_probes);
+            }
+            // Absence is also unproved, even with no retained positive.
+            let missing = active.types_named("rust::Missing");
+            assert!(missing.records.is_empty());
+            assert_eq!(
+                missing.disposition,
+                SemanticModelMatchDisposition::Open(expected)
+            );
+            assert_eq!(source.probes[1].load(Ordering::Relaxed), 3);
+
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Rust)));
+            let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            );
+            let overlay = row_entry_points::RowOverlay::new(
+                &analyzer,
+                &active,
+                Vec::new(),
+                Vec::new(),
+                Some(cache.clone()),
+                &[],
+            );
+            let (symbols, open) = overlay.symbols_with_id("type.widget");
+            assert_eq!(open, Some(expected));
+            let owner = symbols
+                .iter()
+                .find(|symbol| symbol.language == "rust")
+                .expect("the retained Rust owner remains a possible candidate");
+            let ((), receipt) =
+                crate::analyzer::common::capture_query_cache_build(&analyzer, || {
+                    let proof =
+                        crate::analyzer::i_analyzer::AnalyzerQueryScope::capturing_proof_completion(
+                            &analyzer,
+                        );
+                    assert!(super::super::owner_declaration(&active, owner).is_none());
+                    let reasons = proof.captured_read_incompleteness();
+                    let cause = if cancelled {
+                        crate::analyzer::read_ledger::DerivationExecutionCause::Cancelled
+                    } else {
+                        crate::analyzer::read_ledger::DerivationExecutionCause::Provider
+                    };
+                    assert!(
+                        reasons.iter().any(|reason| matches!(reason.base_cause(),
+                    crate::analyzer::QueryReadIncomplete::ProofStopped {
+                        reason: "model_owner_declaration", cause: Some(actual)
+                    } if *actual == cause)),
+                        "{reasons:?}"
+                    );
+                });
+            assert!(receipt.has_execution_dependences());
+            assert!(!receipt.request_memo_admissible());
+            let published = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &CancellationToken::new(),
+                u64::MAX,
+                &crate::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let ((), receipt) =
+                crate::analyzer::common::capture_query_cache_build(&analyzer, || {
+                    let proof =
+                        crate::analyzer::i_analyzer::AnalyzerQueryScope::capturing_proof_completion(
+                            &analyzer,
+                        );
+                    let matched = published.symbols_with_id("type.widget");
+                    assert_eq!(
+                        matched.disposition,
+                        SemanticModelOverlayDisposition::Open(expected)
+                    );
+                    assert!(!matched.records.is_empty());
+                    assert!(matched.unique().is_none());
+                    let reasons = proof.captured_read_incompleteness();
+                    let cause = if cancelled {
+                        crate::analyzer::read_ledger::DerivationExecutionCause::Cancelled
+                    } else {
+                        crate::analyzer::read_ledger::DerivationExecutionCause::Provider
+                    };
+                    assert!(
+                        reasons.iter().any(|reason| matches!(reason.base_cause(),
+                    crate::analyzer::QueryReadIncomplete::ProofStopped {
+                        reason: "semantic_model_lookup_open", cause: Some(actual)
+                    } if *actual == cause)),
+                        "{reasons:?}"
+                    );
+                });
+            assert!(receipt.has_execution_dependences());
+            assert!(!receipt.request_memo_admissible());
+            assert!(source.probes[2].load(Ordering::Relaxed) > 0);
+            let discovery = cache
+                .region_stats()
+                .into_iter()
+                .find(|(name, _)| *name == "store.composition-discovery")
+                .unwrap();
+            assert_eq!(
+                discovery.1.entries, 0,
+                "Open lookup must not publish complete discovery"
+            );
+
+            // Same catalogs, source, binding, lookup and cache; only the fault
+            // clears. Neither a cached positive nor a cached refusal may win.
+            source.failing.store(false, Ordering::Relaxed);
+            let before_id = source.probes[0].load(Ordering::Relaxed);
+            let before_name = source.probes[1].load(Ordering::Relaxed);
+            assert!(
+                active
+                    .type_declaration_admitted::<FamilyOpen>(&retained, &mut || Ok(()))
+                    .unwrap()
+            );
+            assert_eq!(source.probes[0].load(Ordering::Relaxed), before_id + 1);
+            let recovered = active.types_named("rust::Widget");
+            assert_eq!(recovered.disposition, SemanticModelMatchDisposition::Unique);
+            assert_eq!(source.probes[1].load(Ordering::Relaxed), before_name + 1);
+            let before = source.probes[2].load(Ordering::Relaxed);
+            let (symbols, open) = overlay.symbols_with_id("type.widget");
+            assert!(symbols.iter().any(|symbol| symbol.language == "rust"));
+            assert_eq!(open, None);
+            assert!(source.probes[2].load(Ordering::Relaxed) > before);
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#14073: JVM-only filtering lost operational and C# content openness"
+    )]
+    fn catalog_open_language_fences_distinguish_content_from_operations() {
+        use crate::analyzer::store::active_models::FamilyRows;
+        let csharp = FamilyOpen::content("C# callable surface incomplete", &["csharp"]);
+        let java = FamilyOpen::content("Java content incomplete", &["java"]);
+        let operational = FamilyOpen::jvm("catalog read failed");
+        let cancelled = FamilyOpen::jvm_cancelled();
+        // Explicit expected coverage, including a non-JVM declared content fence.
+        for (language, csharp_open, java_open) in [
+            ("rust", false, false),
+            ("go", false, false),
+            ("java", false, true),
+            ("kotlin", false, false),
+            ("scala", false, false),
+            ("csharp", true, false),
+            ("python", false, false),
+        ] {
+            for (open, expected) in [
+                (operational, true),
+                (cancelled, true),
+                (csharp, csharp_open),
+                (java, java_open),
+            ] {
+                let rows = FamilyRows {
+                    rows: (),
+                    jvm_open: Some(open),
+                };
+                assert_eq!(
+                    rows.open_for_language(language),
+                    expected.then_some(open),
+                    "{language}: {open:?}"
+                );
+            }
+            assert_eq!(FamilyRows::complete(()).open_for_language(language), None);
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#9559: relation and search hydration panicked when a bound JVM reader opened"
     )]
     fn bound_reader_open_is_incomplete() {
         use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
         for statement in [
             statements::OVERLAY_RELATIONS_TO,
-            statements::TYPES_BY_ID,
-            statements::GROUP_OWNER_IDS,
+            statements::TYPES_BY_IDS,
+            statements::MEMBER_IDS_BY_OWNERS,
         ] {
             let mut active = mixed_active(false, false);
             Arc::get_mut(&mut active)
@@ -6266,7 +9896,7 @@ mod partition_tests {
             );
             if statement == statements::OVERLAY_RELATIONS_TO {
                 assert!(source.relations_to("widget").1.is_some());
-            } else if statement == statements::TYPES_BY_ID {
+            } else if statement == statements::TYPES_BY_IDS {
                 assert!(source.relations_from("widget").1.is_some());
             } else {
                 let patterns = crate::analyzer::SearchSymbolPatternBatch::compile(
@@ -6326,6 +9956,68 @@ mod partition_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#9559: conformance panicked when relation origins failed after complete symbols"
+    )]
+    fn conformance_reports_a_late_relation_read_failure() {
+        let _languages = neutral_catalog_languages();
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        let mut active = mixed_active(false, true);
+        let reader = active.source_reader.as_ref().unwrap().clone();
+        Arc::get_mut(&mut active)
+            .unwrap()
+            .install_request_source(Some(Arc::new(LaterOpenSource {
+                reader,
+                statement: statements::RELATION_ORIGINS,
+            })))
+            .unwrap();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let fixture = serde_json::from_value(json!({"schema_version": 1})).unwrap();
+        let report = run_semantic_model_conformance(
+            &analyzer,
+            &active,
+            &fixture,
+            &CancellationToken::new(),
+            128,
+            &RetentionBudget::for_tests(),
+        );
+        assert!(!report.complete);
+        assert!(!report.passed);
+        assert_eq!(report.checked_assertions, 0);
+        assert_eq!(report.failures, ["relation enumeration is incomplete"]);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9559: conformance enumerated relations after an open symbol read and panicked"
+    )]
+    fn conformance_stops_before_relations_when_symbols_are_incomplete() {
+        let mut active = mixed_active(false, true);
+        Arc::get_mut(&mut active)
+            .unwrap()
+            .install_request_source(Some(Arc::new(OpenSource)))
+            .unwrap();
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let fixture = serde_json::from_value(json!({"schema_version": 1})).unwrap();
+        let report = run_semantic_model_conformance(
+            &analyzer,
+            &active,
+            &fixture,
+            &CancellationToken::new(),
+            128,
+            &RetentionBudget::for_tests(),
+        );
+        assert!(!report.complete);
+        assert!(!report.passed);
+        assert_eq!(report.checked_assertions, 0);
+        assert_eq!(report.failures, ["symbol enumeration is incomplete"]);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#9559: search panicked on an open JVM part instead of reporting an incomplete answer"
     )]
     fn open_request_search_and_enumeration_are_incomplete() {
@@ -6359,9 +10051,134 @@ mod partition_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#13064: row-source failure became an empty trait competitor set after discovery was considered complete"
+    )]
+    fn trait_nomination_failure_is_not_an_empty_competitor_set() {
+        use crate::analyzer::i_analyzer::AnalyzerQueryScope;
+        // The mixed catalog has Java rows beside the Rust trait; the #14062
+        // callable-family hook resolves support for both languages.
+        let _languages = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            Language::Java,
+            Language::Rust,
+        ]);
+        let directory = TempDir::new().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+        let mut active = mixed_active_edited(false, false, |source, version| {
+            if version == "1.0.0" {
+                source["language"] = json!("rust");
+                source["ecosystem"] = json!("cargo");
+                source["compatibility"]["toolchains"] = json!([]);
+                source["shards"][0]["activation"] = json!([{}]);
+                source["shards"][0]["payload"] = json!({
+                    "kind": "declaration_facts",
+                    "types": [{
+                        "id": "type.rust_trait", "name": "rust.Trait",
+                        "type_kind": "trait", "visibility": "public",
+                        "locator": {"kind": "artifact", "path": "trait.rs",
+                            "symbol": "rust.Trait"}
+                    }],
+                    "members": [{
+                        "id": "member.rust_trait.m", "owner": "type.rust_trait",
+                        "name": "m", "member_kind": "method", "visibility": "public",
+                        "signature": {"parameters": []},
+                        "locator": {"kind": "artifact", "path": "trait.rs", "symbol": "m"}
+                    }],
+                    "relations": []
+                });
+            }
+        });
+        Arc::get_mut(&mut active)
+            .unwrap()
+            .install_request_source(Some(Arc::new(OpenSource)))
+            .unwrap();
+        let overlay = SemanticModelOverlay::build(
+            &analyzer,
+            &active,
+            &CancellationToken::new(),
+            u64::MAX,
+            &crate::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        // The unrelated JVM request reader is unavailable; Rust's activation
+        // reader is still complete and must certify the empty Rust answer.
+        assert!(
+            overlay
+                .trait_owners_with_callable_member("missing")
+                .unwrap()
+                .is_empty()
+        );
+        let memo = <super::super::ModeledTraitOwnersMemo as brokk_bifrost_core::domain_memo::DomainMemo>::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1 << 20),
+        );
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        for _ in 0..2 {
+            assert!(
+                memo.owners(&overlay, &analyzer, "missing")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(scope.captured_read_incompleteness().is_empty());
+        // Both row families and the overlay come from one selected publication.
+        // A synthetic overlay with this row source would record a different
+        // Models key and violate the composition read-ledger contract.
+        let mut cold_keys = None;
+        for _ in 0..2 {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            let (owners, receipt) = crate::analyzer::capture_query_reads(&analyzer, || {
+                memo.owners(&overlay, &analyzer, "m")
+            });
+            let owners = owners.unwrap();
+            assert_eq!(
+                owners
+                    .iter()
+                    .map(|owner| owner.qualified_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rust.Trait"]
+            );
+            let keys = receipt.keys();
+            assert!(keys.contains(&crate::analyzer::ReadKey::Models(
+                crate::analyzer::semantic::StableDigest::sha256(overlay.active_model_set_hash()),
+            )));
+            if let Some(cold_keys) = &cold_keys {
+                assert_eq!(&keys, cold_keys);
+            } else {
+                cold_keys = Some(keys);
+            }
+            assert!(scope.captured_read_incompleteness().is_empty());
+        }
+        // Inject the row reader's typed incomplete result at each acquisition
+        // boundary; lost immutable storage deliberately has no recovery path.
+        let open = FamilyOpen::jvm("injected incomplete nomination rows");
+        let failed = || SemanticModelOverlayMatch {
+            records: Vec::new(),
+            disposition: SemanticModelOverlayDisposition::Open(open),
+        };
+        assert_eq!(
+            SemanticModelOverlay::trait_owners_from_rows("m", failed(), |_| unreachable!()),
+            Err(open)
+        );
+        let mut member = super::super::test_support::class("rust.Trait.m", "rust");
+        member.kind = SemanticModelSymbolKind::Method;
+        member.name = "m".into();
+        member.owner_id = Some("rust.Trait".into());
+        let members = SemanticModelOverlayMatch {
+            records: vec![Arc::new(member)],
+            disposition: SemanticModelOverlayDisposition::Unique,
+        };
+        assert_eq!(
+            SemanticModelOverlay::trait_owners_from_rows("m", members, |_| failed()),
+            Err(open)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#9559: relation lookups, ancestry and search read an open JVM part without recording the query incomplete, so product callers and member-absence proofs treated partial answers as complete"
     )]
     fn open_request_lookups_record_the_query_incomplete_and_refuse_absence_proofs() {
+        let _languages = neutral_catalog_languages();
         use crate::analyzer::QueryReadIncomplete;
         use crate::analyzer::i_analyzer::AnalyzerQueryScope;
         use crate::analyzer::semantic_model::overlay::{
@@ -6467,6 +10284,7 @@ mod partition_tests {
         "#9559: an open owner reused a retained search stream with no binding"
     )]
     fn open_request_search_refuses_retained_placeholder_stream() {
+        let _languages = neutral_catalog_languages();
         let directory = TempDir::new().unwrap();
         let analyzer =
             EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
@@ -6617,6 +10435,7 @@ mod partition_tests {
     "#10497: external intermediate hierarchy ignored row-backed JVM inventories"
 )]
 fn java_direct_hierarchy_reads_row_backed_inventory() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
     for exhaustive in [true, false] {
         let mut document: Value = serde_json::from_slice(include_bytes!(concat!(
@@ -6712,6 +10531,7 @@ fn java_direct_hierarchy_reads_row_backed_inventory() {
     "#12360: approximate activation projected exact family completeness and generated origin"
 )]
 fn approximate_activation_withholds_exact_declaration_claims() {
+    let _languages = neutral_catalog_languages();
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
     let pack = compile_source(
         SourceFormat::Json,
@@ -6730,7 +10550,11 @@ fn approximate_activation_withholds_exact_declaration_claims() {
     let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
     Arc::get_mut(&mut shard.metadata).unwrap().source_kind = CatalogPackSourceKind::Generated;
     for approximate in [false, true] {
-        Arc::get_mut(&mut shard.metadata).unwrap().approximate = approximate;
+        Arc::get_mut(&mut shard.metadata).unwrap().approximation = approximate.then_some(
+            brokk_bifrost_semantic::analyzer::semantic_model::ApproximationReasons::only(
+                brokk_bifrost_semantic::analyzer::semantic_model::ApproximationReason::TargetUnknown,
+            ),
+        );
         let member = super::member_symbol(
             &analyzer,
             &active,

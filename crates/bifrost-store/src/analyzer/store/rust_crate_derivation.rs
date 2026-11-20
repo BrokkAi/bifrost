@@ -211,6 +211,8 @@ const IMPL_BINDINGS_SQL: &str = include_str!("rust_crate_trait_impl_bindings.sql
 // holds; every candidate in an agreeing group names the same declaration, which
 // is all the declaration statement reads from it.
 #[cfg(any(test, feature = "test-support"))]
+// These namespace-specific probes use the complete export key. Keep them on
+// the primary key when namespace-independent gap probes add cr_exports_name.
 const IMPL_GLOB_BINDINGS_SQL: &str = "INSERT INTO cr_impl_bindings
     SELECT * FROM (
 WITH RECURSIVE reach(blob_id, relation_key, module_path, name, crate_key, reached) AS (
@@ -237,7 +239,7 @@ WITH RECURSIVE reach(blob_id, relation_key, module_path, name, crate_key, reache
              exports.crate_key, exports.module_path, exports.name,
              exports.declaration_blob_id, exports.declaration_site
       FROM reach
-      CROSS JOIN cr_exports AS exports ON exports.crate_key=reach.crate_key
+      CROSS JOIN cr_exports AS exports INDEXED BY sqlite_autoindex_cr_exports_1 ON exports.crate_key=reach.crate_key
         AND exports.module_path=reach.reached
         AND exports.namespace='type' AND exports.name=reach.name
       UNION
@@ -247,7 +249,7 @@ WITH RECURSIVE reach(blob_id, relation_key, module_path, name, crate_key, reache
       FROM reach
       CROSS JOIN cr_imports AS imports ON imports.module_path=reach.reached
         AND imports.namespace='type' AND imports.bound_name=reach.name
-      CROSS JOIN cr_exports AS exports ON exports.crate_key=imports.target_crate_key
+      CROSS JOIN cr_exports AS exports INDEXED BY sqlite_autoindex_cr_exports_1 ON exports.crate_key=imports.target_crate_key
         AND exports.module_path=imports.target_module_path
         AND exports.namespace='type' AND exports.name=imports.target_name
       WHERE reach.crate_key=(SELECT crate_key FROM cr_identity)
@@ -1423,7 +1425,7 @@ pub(in crate::analyzer::store) fn source_declaration_scopes_schema_sql() -> &'st
     &SQL
 }
 
-pub(super) fn register_export_functions(conn: &Connection) -> Result<()> {
+pub(crate) fn register_export_functions(conn: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("cr_lookup_digest", 2, flags, |context| {
         use crate::analyzer::resolution::ResolutionLookupSemanticRecipe;
@@ -1886,6 +1888,10 @@ pub fn prepare_tables(conn: &Connection) -> Result<()> {
               OR COALESCE(json_extract(detail,'$.subject_level') IN ('module','binding','public_surface'),0)));
         CREATE INDEX IF NOT EXISTS cr_gaps_subject ON cr_gaps(gap_kind, subject);
         CREATE INDEX IF NOT EXISTS cr_imports_name ON cr_imports(module_path, namespace, bound_name);
+        -- These source/name probes must not scan all bindings in a module.
+        -- Null guards leave broad module walks on their existing indexes.
+        CREATE INDEX IF NOT EXISTS cr_imports_source ON cr_imports(module_path, blob_id, import_ordinal) WHERE blob_id IS NOT NULL AND import_ordinal IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS cr_exports_name ON cr_exports(crate_key, module_path, name) WHERE name IS NOT NULL;
         CREATE INDEX IF NOT EXISTS cr_globs_module ON cr_globs(module_path);
         CREATE TEMP TABLE IF NOT EXISTS cr_impl_sources(blob_id INTEGER NOT NULL,
             relation_key INTEGER NOT NULL, module_path TEXT NOT NULL, impl_site INTEGER NOT NULL,
@@ -2216,7 +2222,8 @@ SELECT candidate.module_path || '::' || candidate.identifier, site.blob_id,
 // enum alternatives can author the same logical variant name, so retain every
 // source bridge but group their exports to one definition-site representative.
 // Ignore keys already written by declarations or an earlier enum candidate;
-// invalid Rust can make distinct authored items share an export key.
+// invalid Rust can make distinct authored items share an export key. The
+// namespace-specific probe stays on the primary key, not cr_exports_name.
 #[doc(hidden)]
 pub  const ENUM_VARIANTS_SQL: &str = "INSERT INTO cr_exports
  SELECT (SELECT crate_key FROM cr_identity), container.container_path, namespace.namespace, candidate.identifier,
@@ -2230,7 +2237,7 @@ pub  const ENUM_VARIANTS_SQL: &str = "INSERT INTO cr_exports
   AND candidate.module_path=container.module_path
  CROSS JOIN resolution_additional_definition_namespaces AS namespace ON namespace.blob_id=site.blob_id AND namespace.definition_semantic_key=site.semantic_key
  WHERE candidate.declaration_kind=9 AND candidate.activation=1
- AND NOT EXISTS(SELECT 1 FROM cr_exports declared WHERE declared.crate_key=(SELECT crate_key FROM cr_identity)
+ AND NOT EXISTS(SELECT 1 FROM cr_exports declared INDEXED BY sqlite_autoindex_cr_exports_1 WHERE declared.crate_key=(SELECT crate_key FROM cr_identity)
  AND declared.module_path=container.container_path AND declared.namespace=namespace.namespace AND declared.name=candidate.identifier)
    AND namespace.namespace IN ('type','value')
  GROUP BY container.container_path, container.blob_id, namespace.namespace, candidate.identifier
@@ -2365,11 +2372,13 @@ pub(super) const OPEN_INVENTORY_SQL: &str = include_str!("rust_crate_open_invent
 // route row survives: the route says where the name was looked for, not that it
 // was found. When the route left this crate the detail names the crate it
 // reached, read from the derived topology row, never from the path text.
+// cr_exports_name serves the namespace-independent name probe; the `type`
+// probe stays on the primary key.
 pub(super) const SQL_CR_GAPS_9: &str = "INSERT INTO cr_gaps
         SELECT CASE WHEN (source.head_segment IS NULL OR NOT EXISTS(SELECT 1 FROM cr_routes AS route
                     WHERE route.blob_id=source.blob_id AND route.import_ordinal=source.import_ordinal
                       AND route.module_path=source.module_path))
-                 AND NOT EXISTS(SELECT 1 FROM cr_exports AS local
+                 AND NOT EXISTS(SELECT 1 FROM cr_exports AS local INDEXED BY sqlite_autoindex_cr_exports_1
                      WHERE local.crate_key=(SELECT crate_key FROM cr_identity)
                        AND local.module_path=source.module_path AND local.namespace='type'
                        AND local.name=COALESCE(source.head_segment, source.imported_name))
@@ -2621,7 +2630,7 @@ pub const MODULE_DECLARATIONS_SQL: &str = "INSERT INTO cr_module_declarations SE
 pub(super) const ROOT_REFERENCES_INSERT_SQL: &str =
     "INSERT INTO rust_crate_root_references VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
 #[cfg(any(test, feature = "test-support"))]
-pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
+pub(crate) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
     let mut statements = vec![
         (
             "rust_crate_public_surface_bindings",

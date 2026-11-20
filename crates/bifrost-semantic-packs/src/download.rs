@@ -29,6 +29,15 @@ use zip::ZipArchive;
 mod semantic_download;
 pub use semantic_download::acquire_semantic_pack;
 
+/// Use the same traversal/link/duplicate/size checks as semantic acquisition.
+pub(crate) fn extract_verified_approval_archive(
+    bytes: &[u8],
+    expected_sha256: &str,
+    destination: &Path,
+) -> Result<PathBuf, String> {
+    semantic_download::extract_verified_approval_archive(bytes, expected_sha256, destination)
+}
+
 const REPOSITORY_URL: &str = "https://github.com/BrokkAi/bifrost-packs";
 const API_ROOT: &str = "https://api.github.com/repos/BrokkAi/bifrost-packs";
 const RULES_PACK_ID: &str = "bifrost.public.rules";
@@ -43,12 +52,6 @@ const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_PAX_BYTES: usize = 1024 * 1024;
-const CACHE_DIRECTORY: &str = "open-pack-releases";
-// Windows intentionally caches under LOCALAPPDATA/Bifrost/AgentPlugin rather
-// than a "bifrost-agent" directory, matching the launcher's historic layout;
-// only the macOS and other-Unix arms of `platform_cache_base` use this name.
-#[cfg(not(target_os = "windows"))]
-const CACHE_AGENT_DIRECTORY: &str = "bifrost-agent";
 const CACHE_CATALOG_DIRECTORY: &str = "semantic-pack-catalog-v1";
 
 /// A versioned, caller-supplied pack acquisition request.
@@ -214,6 +217,9 @@ pub enum OpenPackError {
     Unqualified(String),
     Pending(String),
     OfflineCacheMiss(String),
+    /// A published selection lost a required artifact; runtime must refuse
+    /// bootstrap rather than treating it as an empty offline cache.
+    CachedSelectionArtifactMissing(String),
     NoCompatibleRelease {
         message: String,
         receipt: Value,
@@ -298,7 +304,7 @@ impl OpenPackError {
                 name: "unavailable",
                 retryable: true,
             },
-            Self::OfflineCacheMiss(_) => FailureClass {
+            Self::OfflineCacheMiss(_) | Self::CachedSelectionArtifactMissing(_) => FailureClass {
                 name: "offline-cache-miss",
                 retryable: false,
             },
@@ -346,6 +352,7 @@ impl Display for OpenPackError {
             | Self::Unqualified(message)
             | Self::Pending(message)
             | Self::OfflineCacheMiss(message)
+            | Self::CachedSelectionArtifactMissing(message)
             | Self::UnverifiedAbsence(message)
             | Self::InvalidProfile(message)
             | Self::InvalidManifest(message)
@@ -1613,37 +1620,7 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn default_cache_root() -> Result<PathBuf, OpenPackError> {
-    let base = match std::env::var_os("BIFROST_LAUNCHER_CACHE_DIR") {
-        Some(value) if !value.to_string_lossy().trim().is_empty() => {
-            resolve_absolute(PathBuf::from(value))?
-        }
-        _ => platform_cache_base()?,
-    };
-    Ok(base.join(CACHE_DIRECTORY))
-}
-
-fn platform_cache_base() -> Result<PathBuf, OpenPackError> {
-    #[cfg(target_os = "macos")]
-    let value = std::env::var_os("HOME").map(PathBuf::from).map(|home| {
-        home.join("Library")
-            .join("Caches")
-            .join(CACHE_AGENT_DIRECTORY)
-    });
-    #[cfg(target_os = "windows")]
-    let value = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join("AppData").join("Local"))
-        })
-        .map(|root| root.join("Bifrost").join("AgentPlugin"));
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let value = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .map(|root| root.join(CACHE_AGENT_DIRECTORY));
-    value
-        .map(resolve_absolute)
-        .transpose()?
+    brokk_bifrost_analysis::gitblob::default_open_pack_cache_dir()
         .ok_or_else(|| OpenPackError::Configuration("cannot determine a cache directory".into()))
 }
 
@@ -1962,24 +1939,6 @@ fn prepare_selected_set(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, OpenPackError>>()?;
-    let mut cached_artifacts = Vec::new();
-    for release_index in release_indices.iter().copied() {
-        let release = &inventory.releases[release_index];
-        for artifact in &release.manifest.artifacts {
-            let asset = release.cached.assets.get(&artifact.name).ok_or_else(|| {
-                OpenPackError::integrity(format!(
-                    "release {} is missing declared asset {}",
-                    release.cached.tag, artifact.name
-                ))
-            })?;
-            let artifact_path = cache_artifact(root, artifact, asset, source, offline, transport)?;
-            cached_artifacts.push(CachedArtifact {
-                release_index,
-                artifact: artifact.clone(),
-                path: artifact_path,
-            });
-        }
-    }
     let selection_id = selection_id(profile, request, &inventory, &release_indices)?;
     let selections_root = root.join("selections");
     fs::create_dir_all(&selections_root).map_err(|error| {
@@ -1990,6 +1949,46 @@ fn prepare_selected_set(
     })?;
     let final_root = selections_root.join(&selection_id);
     let receipt_path = final_root.join("receipt.json");
+    let published_selection = path_exists(&final_root)?;
+    if published_selection {
+        require_real_directory(&final_root, "cached open-pack selection")?;
+        // A published selection is immutable. Never repair missing selected
+        // content by downloading it or by consulting a receipt's old locator.
+        for index in &release_indices {
+            for artifact in &inventory.releases[*index].manifest.artifacts {
+                if !path_exists(&artifact_cache_path(root, artifact))? {
+                    return Err(OpenPackError::CachedSelectionArtifactMissing(format!(
+                        "cached open-pack selection {selection_id} is missing artifact {}",
+                        artifact.name
+                    )));
+                }
+            }
+        }
+    }
+    let mut cached_artifacts = Vec::new();
+    for release_index in release_indices.iter().copied() {
+        let release = &inventory.releases[release_index];
+        for artifact in &release.manifest.artifacts {
+            let asset = release.cached.assets.get(&artifact.name).ok_or_else(|| {
+                OpenPackError::integrity(format!(
+                    "release {} is missing declared asset {}",
+                    release.cached.tag, artifact.name
+                ))
+            })?;
+            let artifact_path = if published_selection {
+                let path = artifact_cache_path(root, artifact);
+                verify_cached_artifact(&path, artifact)?;
+                path
+            } else {
+                cache_artifact(root, artifact, asset, source, offline, transport)?
+            };
+            cached_artifacts.push(CachedArtifact {
+                release_index,
+                artifact: artifact.clone(),
+                path: artifact_path,
+            });
+        }
+    }
     let mut extracted_files = BTreeMap::<String, Vec<ExtractedFile>>::new();
     for release_index in &release_indices {
         let release = &inventory.releases[*release_index];
@@ -4088,6 +4087,41 @@ fn validate_rules_source_contents(manifest: &PackRelease) -> Result<(), OpenPack
     Ok(())
 }
 
+fn artifact_cache_path(root: &Path, artifact: &ReleaseArtifact) -> PathBuf {
+    root.join("artifacts").join(&artifact.sha256)
+}
+
+fn verify_cached_artifact(
+    artifact_path: &Path,
+    artifact: &ReleaseArtifact,
+) -> Result<(), OpenPackError> {
+    let metadata = fs::symlink_metadata(artifact_path).map_err(|error| {
+        OpenPackError::integrity(format!(
+            "inspect cached artifact {}: {error}",
+            artifact.name
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(OpenPackError::integrity(format!(
+            "cached artifact {} is not a regular file",
+            artifact.name
+        )));
+    }
+    if metadata.len() != artifact.size_bytes {
+        return Err(OpenPackError::integrity(format!(
+            "cached artifact {} has the wrong declared size",
+            artifact.name
+        )));
+    }
+    if hash_file(artifact_path)? != artifact.sha256 {
+        return Err(OpenPackError::integrity(format!(
+            "cached artifact {} failed its declared SHA-256 check",
+            artifact.name
+        )));
+    }
+    Ok(())
+}
+
 fn cache_artifact(
     root: &Path,
     artifact: &ReleaseArtifact,
@@ -4097,32 +4131,9 @@ fn cache_artifact(
     transport: &dyn HttpTransport,
 ) -> Result<PathBuf, OpenPackError> {
     validate_asset_url(&asset.url, &artifact.name, true, source)?;
-    let artifact_path = root.join("artifacts").join(&artifact.sha256);
+    let artifact_path = artifact_cache_path(root, artifact);
     if path_exists(&artifact_path)? {
-        let metadata = fs::symlink_metadata(&artifact_path).map_err(|error| {
-            OpenPackError::integrity(format!(
-                "inspect cached artifact {}: {error}",
-                artifact.name
-            ))
-        })?;
-        if !metadata.file_type().is_file() {
-            return Err(OpenPackError::integrity(format!(
-                "cached artifact {} is not a regular file",
-                artifact.name
-            )));
-        }
-        if metadata.len() != artifact.size_bytes {
-            return Err(OpenPackError::integrity(format!(
-                "cached artifact {} has the wrong declared size",
-                artifact.name
-            )));
-        }
-        if hash_file(&artifact_path)? != artifact.sha256 {
-            return Err(OpenPackError::integrity(format!(
-                "cached artifact {} failed its declared SHA-256 check",
-                artifact.name
-            )));
-        }
+        verify_cached_artifact(&artifact_path, artifact)?;
         return Ok(artifact_path);
     }
     if offline {
@@ -4274,7 +4285,6 @@ fn build_receipt(selection: &SelectionContext<'_>) -> Result<Value, OpenPackErro
                 "role": cached.artifact.role,
                 "size_bytes": cached.artifact.size_bytes,
                 "sha256": cached.artifact.sha256,
-                "cache_path": cached.path,
             })
         })
         .collect::<Vec<_>>();
@@ -4311,7 +4321,7 @@ fn build_receipt(selection: &SelectionContext<'_>) -> Result<Value, OpenPackErro
         "fetched_online": inventory.fetched_online,
     });
     let receipt = json!({
-        "receipt_schema_version": 3,
+        "receipt_schema_version": 4,
         "status": if fully_qualified { "qualified" } else { "compatible" },
         "selection_id": selection_id,
         "selection_reason": selection_reason,
@@ -4345,7 +4355,7 @@ fn verify_existing_selection(
         ))
     })?;
     let expected = build_receipt(selection)?;
-    if !valid_receipt_shape(&actual) || receipt_identity(&actual) != receipt_identity(&expected) {
+    if receipt_identity(&actual)? != receipt_identity(&expected)? {
         return Err(OpenPackError::integrity(
             "cached open-pack selection receipt does not match the selected releases",
         ));
@@ -4401,7 +4411,36 @@ fn valid_receipt_shape(receipt: &Value) -> bool {
         && receipt
             .get("receipt_schema_version")
             .and_then(Value::as_u64)
-            == Some(3)
+            .is_some_and(|version| matches!(version, 3 | 4))
+        && receipt
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .is_some_and(|artifacts| {
+                artifacts.iter().all(|artifact| {
+                    let Some(object) = artifact.as_object() else {
+                        return false;
+                    };
+                    let fields = [
+                        "pack_id",
+                        "release_version",
+                        "name",
+                        "role",
+                        "size_bytes",
+                        "sha256",
+                    ];
+                    let legacy = receipt["receipt_schema_version"] == 3;
+                    object.len() == fields.len() + usize::from(legacy)
+                        && fields.iter().all(|field| object.contains_key(*field))
+                        && if legacy {
+                            object
+                                .get("cache_path")
+                                .and_then(Value::as_str)
+                                .is_some_and(|path| !path.is_empty())
+                        } else {
+                            !object.contains_key("cache_path")
+                        }
+                })
+            })
         && receipt
             .get("created_at")
             .and_then(Value::as_str)
@@ -4409,11 +4448,31 @@ fn valid_receipt_shape(receipt: &Value) -> bool {
             .is_some()
 }
 
-fn receipt_identity(receipt: &Value) -> Value {
-    let Some(object) = receipt.as_object() else {
-        return Value::Null;
-    };
-    let mut identity = object.clone();
+fn receipt_identity(receipt: &Value) -> Result<Value, OpenPackError> {
+    if !valid_receipt_shape(receipt) {
+        return Err(OpenPackError::integrity(
+            "cached open-pack selection receipt has an invalid shape or unsupported schema",
+        ));
+    }
+    let mut identity = receipt
+        .as_object()
+        .expect("validated receipt object")
+        .clone();
+    if receipt["receipt_schema_version"] == 3 {
+        // Legacy locators are opaque metadata, never paths to open. Verify
+        // content exclusively through the current root and manifest digests.
+        for artifact in identity
+            .get_mut("artifacts")
+            .and_then(Value::as_array_mut)
+            .expect("validated receipt artifacts")
+        {
+            artifact
+                .as_object_mut()
+                .expect("validated artifact object")
+                .remove("cache_path");
+        }
+        identity.insert("receipt_schema_version".into(), json!(4));
+    }
     identity.remove("created_at");
     identity.remove("request");
     identity.remove("selection_reason");
@@ -4423,7 +4482,7 @@ fn receipt_identity(receipt: &Value) -> Value {
         source.remove("fetched_online");
         source.remove("index_sha256");
     }
-    Value::Object(identity)
+    Ok(Value::Object(identity))
 }
 
 /// Build the stable machine-readable result for a single acquisition attempt.

@@ -141,6 +141,8 @@ impl AnalysisOwners {
     pub const ASSERTION: Self = Self(Self::ASSERTION_BIT);
     pub const FLOW: Self = Self(Self::FLOW_BIT);
     pub const TAINT_OR_TYPESTATE: Self = Self(Self::TAINT_BIT | Self::TYPESTATE_BIT);
+    pub const MATCH_OR_TAINT: Self = Self(Self::MATCH_BIT | Self::TAINT_BIT);
+    pub const MATCH_TAINT_OR_FLOW: Self = Self(Self::MATCH_BIT | Self::TAINT_BIT | Self::FLOW_BIT);
     pub const TAINT_OR_FLOW: Self = Self(Self::TAINT_BIT | Self::FLOW_BIT);
     pub const TAINT_TYPESTATE_OR_FLOW: Self =
         Self(Self::TAINT_BIT | Self::TYPESTATE_BIT | Self::FLOW_BIT);
@@ -177,6 +179,10 @@ pub struct OwnerApplicability {
 impl OwnerApplicability {
     pub const POLICY_ALL: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::ALL);
     pub const POLICY_MATCH: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::MATCH);
+    pub const POLICY_MATCH_OR_TAINT: Self =
+        Self::new(DocumentOwners::POLICY, AnalysisOwners::MATCH_OR_TAINT);
+    pub const POLICY_MATCH_TAINT_OR_FLOW: Self =
+        Self::new(DocumentOwners::POLICY, AnalysisOwners::MATCH_TAINT_OR_FLOW);
     pub const POLICY_TAINT: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::TAINT);
     pub const POLICY_TYPESTATE: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::TYPESTATE);
     pub const POLICY_ASSERTION: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::ASSERTION);
@@ -345,7 +351,7 @@ policy_records! {
     Argument { labels: ["argument"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(argument :index N) | (argument :name \"NAME\")", description: "Bind a zero-based argument index or exact formal argument name." }
     ArgumentCondition { labels: ["argument-condition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(argument-condition :argument (argument :index N) :equals true|false)", description: "Require one direct call argument to have an exact Boolean value." }
     Result { labels: ["result"], layout: Mixed, owner: OwnerApplicability::BOTH, signature: "(result :index N) | (result true|false|nil|non-nil [:index N])", description: "Bind one zero-based normal call result, or name the accepting result of a conditional sanitizer." }
-    ReceiverRequirement { labels: ["receiver"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(receiver (:constant true | :equals LITERAL | :result-of SELECTOR))", description: "Require one property of the sanitizer call receiver." }
+    ReceiverRequirement { labels: ["receiver"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: "(receiver (:constant true | :equals LITERAL | :result-of SELECTOR))", description: "Require one property of the sanitizer call receiver." }
     SourceSemantics { labels: ["source-semantics"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(source-semantics :labels [LABEL...] [:evidence EVIDENCE])", description: "Attach diagnostic-neutral taint source semantics to a source endpoint." }
     SinkSemantics { labels: ["sink-semantics"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(sink-semantics :accepts [LABEL...] [:tags [...]] [:impacts [...]])", description: "Attach diagnostic-neutral taint sink semantics to a sink endpoint." }
     Evidence { labels: ["evidence"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(evidence [:trust-boundary VALUE] [:system-entry VALUE])", description: "Record coherent source evidence; at least one field is required." }
@@ -362,6 +368,9 @@ policy_records! {
     EndpointRef { labels: ["endpoint-ref"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(endpoint-ref (:local ID | :catalog CATALOG :entry ID | :match-endpoint ID))", description: "Name one endpoint in the current policy, an explicit catalog, or the endpoint index." }
     Source { labels: ["source"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(source :id ID :display-name TEXT :categories [...] :selector SELECTOR :bind PORT :labels [...] [:threat-model KIND] [:evidence EVIDENCE])", description: "Declare one policy-local taint source." }
     Sink { labels: ["sink"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sink :id ID :display-name TEXT :categories [...] :selector SELECTOR :dangerous-operand PORT :accepts [...] [:tags [...]] [:impacts [...]])", description: "Declare one policy-local taint sink." }
+    GuardBarrier { labels: ["guard-barrier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: "(guard-barrier :id ID :predicate PREDICATE :clean-when BOOL :removes [LABEL...])", description: "Remove labels only on the proven accepting edge for the selected operand definition." }
+    CallGuard { labels: ["call-guard"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: "(call-guard :selector SELECTOR :operand receiver|(argument :index N) [:requires [...]])", description: "Select a statically targeted Boolean call and its guarded operand." }
+    ComparisonGuard { labels: ["comparison-guard"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: "(comparison-guard :relation equality|inequality|ordering :operand either|lesser|greater)", description: "Select comparison operands by their structured relation." }
     Barrier { labels: ["barrier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(barrier :id ID :value-type (intrinsic bool|numeric)|(enum :fieldless true))", description: "Stop this policy's taint at value observations proven to satisfy the type predicate." }
     IntrinsicValueType { labels: ["intrinsic"], layout: Positional, owner: OwnerApplicability::POLICY_TAINT, signature: "(intrinsic bool|numeric)", description: "Require a resolved intrinsic Boolean or integer/floating-point type identity, never a source spelling." }
     FieldlessEnumValueType { labels: ["enum"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(enum :fieldless true)", description: "Require an exhaustive enum variant inventory with no payload fields." }
@@ -387,6 +396,8 @@ policy_records! {
     Uncertainty { labels: ["uncertainty"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(uncertainty :escape inconclusive)", description: "Make escape capability gaps explicit." }
     Automaton { labels: ["automaton"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(automaton :states [...] :initial STATE :accepting-states [...] :error-states [...] :events [...] :transitions [...] [:event-set (event-set ...)] [:terminal-expectations [...]])", description: "Define the public typestate states, events, transitions, and terminal obligations." }
     EventSet { labels: ["event-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event-set :name \"NAMESPACE.NAME\" :version N :effects [\"NAMESPACE.EFFECT\"...])", description: "Declare the versioned semantic effect set covered by typestate events." }
+    TypestateTransfer { labels: ["transfer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(transfer :id ID :calls (calls :selector SELECTOR :from BINDING :to return-value))", description: "Copy protocol state to an independent call result." }
+    TypestateTransferCalls { labels: ["calls"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(calls :selector SELECTOR :from BINDING :to return-value)", description: "Select the source and result of a state transfer." }
     Event { labels: ["event"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event :id ID (:calls CALLS | :matches MATCH-SET | :on SEMANTIC-EVENT) ...)", description: "Define one direct-call, endpoint, or semantic typestate event." }
     Calls { labels: ["calls"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(calls :selector SELECTOR :subject BINDING :phase PHASE)", description: "Observe a direct call selector using one tracked receiver, return, or argument binding." }
     Transition { labels: ["transition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(transition :from STATE :on EVENT :to STATE)", description: "Apply one deterministic typestate transition." }
@@ -645,6 +656,8 @@ macro_rules! value_shapes {
                     Self::OccurrenceNamespace => Some(AtomDomain::OccurrenceNamespace),
                     Self::Boolean => Some(AtomDomain::Boolean),
                     Self::IntrinsicValueType => Some(AtomDomain::IntrinsicValueType),
+                    Self::GuardRelation => Some(AtomDomain::GuardRelation),
+                    Self::GuardOperand => Some(AtomDomain::GuardOperand),
                     Self::FieldlessRequirement => Some(AtomDomain::FieldlessRequirement),
                     Self::PrecedenceTier => Some(AtomDomain::PrecedenceTier),
                     Self::GenerationKind => Some(AtomDomain::GenerationKind),
@@ -730,6 +743,8 @@ macro_rules! value_shapes {
                     | Self::SourceEntries
                     | Self::SinkEntries
                     | Self::SanitizerEntries
+                    | Self::GuardBarriers
+                    | Self::GuardPredicate
                     | Self::BarrierEntries
                     | Self::ValueTypePredicate
                     | Self::StoreEntries
@@ -752,6 +767,8 @@ macro_rules! value_shapes {
                     | Self::EventSetSpec
                     | Self::CallsTrigger
                     | Self::TypestateSubjects
+                    | Self::TypestateTransfers
+                    | Self::TypestateTransferCall
                     | Self::TypestateEvents
                     | Self::TypestateTransitions
                     | Self::TerminalExpectations
@@ -872,6 +889,8 @@ macro_rules! value_shapes {
                     Self::SinkEntries => &[PolicyRecord::Sink],
                     Self::SanitizerEntries => &[PolicyRecord::Sanitizer],
                     Self::BarrierEntries => &[PolicyRecord::Barrier],
+                    Self::GuardBarriers => &[PolicyRecord::GuardBarrier],
+                    Self::GuardPredicate => &[PolicyRecord::CallGuard, PolicyRecord::ComparisonGuard],
                     Self::ValueTypePredicate => &[PolicyRecord::IntrinsicValueType, PolicyRecord::FieldlessEnumValueType],
                     Self::StoreEntries => &[PolicyRecord::StoreWrite, PolicyRecord::StoreRead],
                     Self::EntryPointEntries => &[PolicyRecord::EntryPoint],
@@ -892,6 +911,8 @@ macro_rules! value_shapes {
                     Self::EventSetSpec => &[PolicyRecord::EventSet],
                     Self::CallsTrigger => &[PolicyRecord::Calls],
                     Self::TypestateSubjects => &[PolicyRecord::Subject],
+                    Self::TypestateTransfers => &[PolicyRecord::TypestateTransfer],
+                    Self::TypestateTransferCall => &[PolicyRecord::TypestateTransferCalls],
                     Self::TypestateEvents => &[PolicyRecord::Event],
                     Self::TypestateTransitions => &[PolicyRecord::Transition],
                     Self::TerminalExpectations => &[PolicyRecord::TerminalExpectation],
@@ -944,6 +965,8 @@ macro_rules! value_shapes {
                     | Self::EdgeClassValues
                     | Self::RouteHop
                     | Self::Boolean
+                    | Self::GuardRelation
+                    | Self::GuardOperand
                     | Self::IntrinsicValueType
                     | Self::FieldlessRequirement
                     | Self::RowJoinKind
@@ -1145,6 +1168,10 @@ value_shapes! {
     SinkEntries => "policy-local sink records",
     SanitizerEntries => "policy-local sanitizer records",
     BarrierEntries => "policy-local value-type barriers",
+    GuardBarriers => "policy-local branch guard barriers",
+    GuardPredicate => "a call-guard or comparison-guard record",
+    GuardRelation => "equality, inequality, or ordering",
+    GuardOperand => "either, lesser, or greater",
     ValueTypePredicate => "an intrinsic or fieldless enum type predicate",
     IntrinsicValueType => "an intrinsic bool or numeric type identity",
     FieldlessRequirement => "true (an exhaustive payload-free variant inventory)",
@@ -1168,6 +1195,8 @@ value_shapes! {
     EventSetSpec => "a versioned semantic event-set record",
     CallsTrigger => "a calls record",
     TypestateSubjects => "subject records",
+    TypestateTransfers => "state transfer records",
+    TypestateTransferCall => "state transfer call record",
     TypestateEvents => "event records",
     TypestateTransitions => "transition records",
     TerminalExpectations => "terminal-expectation records",
@@ -1505,6 +1534,17 @@ policy_fields! {
     KillSelector { record: Kill, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_FLOW, signature: ":selector SELECTOR", description: "Select the kill sites." }
     KillInput { record: Kill, labels: ["input"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":input PORT", description: "Bind the value the kill consumes." }
     KillOutput { record: Kill, labels: ["output"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":output PORT", description: "Bind the value the kill establishes; it no longer carries the tracked provenance." }
+    AnalysisGuardBarriers { record: Analysis, labels: ["guard-barriers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 256), shape: GuardBarriers, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":guard-barriers [(guard-barrier ...)...]", description: "Declare policy-owned branch barriers; unresolved proof retains taint and makes the answer incomplete." }
+    WithoutFlowGuardBarriers { record: WithoutFlow, labels: ["guard-barriers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 256), shape: GuardBarriers, owner: OwnerApplicability::POLICY_TAINT, signature: ":guard-barriers [(guard-barrier ...)...]", description: "Declare secondary policy-owned branch barriers." }
+    GuardBarrierId { record: GuardBarrier, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":id ID", description: "Name the local guard barrier." }
+    GuardBarrierPredicate { record: GuardBarrier, labels: ["predicate"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: GuardPredicate, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":predicate (call-guard ...)|(comparison-guard ...)", description: "Select guard evidence and its operand." }
+    GuardBarrierCleanWhen { record: GuardBarrier, labels: ["clean-when"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":clean-when true|false", description: "Choose the Boolean outcome on which the operand is clean." }
+    GuardBarrierRemoves { record: GuardBarrier, labels: ["removes"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":removes [LABEL...]", description: "Remove only these labels." }
+    CallGuardSelector { record: CallGuard, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":selector SELECTOR", description: "Select resolved call targets according to this policy." }
+    CallGuardOperand { record: CallGuard, labels: ["operand"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SanitizerOperand, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":operand receiver|(argument :index N)", description: "Name the operand guarded by the call result." }
+    CallGuardRequires { record: CallGuard, labels: ["requires"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerRequires, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":requires [REQUIREMENT...]", description: "Require structured properties of call operands." }
+    ComparisonGuardRelation { record: ComparisonGuard, labels: ["relation"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: GuardRelation, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":relation equality|inequality|ordering", description: "Select equality, inequality or an ordered comparison." }
+    ComparisonGuardOperand { record: ComparisonGuard, labels: ["operand"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: GuardOperand, owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, signature: ":operand either|lesser|greater", description: "Select the exact operand read(s)." }
     BarrierId { record: Barrier, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id ID", description: "Name this barrier in policy evidence." }
     BarrierValueType { record: Barrier, labels: ["value-type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ValueTypePredicate, owner: OwnerApplicability::POLICY_TAINT, signature: ":value-type (intrinsic bool|numeric)|(enum :fieldless true)", description: "Choose the resolved value-type proof required to stop taint." }
     IntrinsicValueTypeKind { record: IntrinsicValueType, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: IntrinsicValueType, owner: OwnerApplicability::POLICY_TAINT, signature: "bool|numeric", description: "Require a Boolean or numeric intrinsic identity." }
@@ -1520,12 +1560,12 @@ policy_fields! {
     KillSanitizes { record: Kill, labels: ["sanitizes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerOperand, owner: OwnerApplicability::POLICY_FLOW, signature: ":sanitizes receiver|(argument :index N)", description: "Name the call operand cleaned on the accepting branch." }
     KillRequires { record: Kill, labels: ["requires"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerRequires, owner: OwnerApplicability::POLICY_FLOW, signature: ":requires [REQUIREMENT...]", description: "Require constant, equals, or result-of properties of call operands." }
     SanitizerResultValue { record: Result, labels: ["value"], placement: FieldPlacement::Positional { index: 0 }, required: Optional, multiplicity: SCALAR, shape: SanitizerResult, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "true|false|nil|non-nil", description: "The accepting result value for a conditional sanitizer." }
-    ArgumentConstant { record: Argument, labels: ["constant"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":constant true", description: "Require a compile-time constant operand." }
-    ArgumentEquals { record: Argument, labels: ["equals"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerLiteral, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":equals LITERAL", description: "Require an operand equal to the decoded string, number or Boolean literal." }
-    ArgumentResultOf { record: Argument, labels: ["result-of"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":result-of SELECTOR", description: "Require the operand to originate from a call selected by SELECTOR." }
-    ReceiverRequirementConstant { record: ReceiverRequirement, labels: ["constant"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":constant true", description: "Require a compile-time constant operand." }
-    ReceiverRequirementEquals { record: ReceiverRequirement, labels: ["equals"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerLiteral, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":equals LITERAL", description: "Require an operand equal to the decoded string, number or Boolean literal." }
-    ReceiverRequirementResultOf { record: ReceiverRequirement, labels: ["result-of"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":result-of SELECTOR", description: "Require the operand to originate from a call selected by SELECTOR." }
+    ArgumentConstant { record: Argument, labels: ["constant"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: ":constant true", description: "Require a compile-time constant operand." }
+    ArgumentEquals { record: Argument, labels: ["equals"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerLiteral, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: ":equals LITERAL", description: "Require an operand equal to the decoded string, number or Boolean literal." }
+    ArgumentResultOf { record: Argument, labels: ["result-of"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: ":result-of SELECTOR", description: "Require the operand to originate from a call selected by SELECTOR." }
+    ReceiverRequirementConstant { record: ReceiverRequirement, labels: ["constant"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: ":constant true", description: "Require a compile-time constant operand." }
+    ReceiverRequirementEquals { record: ReceiverRequirement, labels: ["equals"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerLiteral, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: ":equals LITERAL", description: "Require an operand equal to the decoded string, number or Boolean literal." }
+    ReceiverRequirementResultOf { record: ReceiverRequirement, labels: ["result-of"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, signature: ":result-of SELECTOR", description: "Require the operand to originate from a call selected by SELECTOR." }
     SanitizerRemoves { record: Sanitizer, labels: ["removes"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":removes [LABEL...]", description: "Declare the non-empty labels removed by the sanitizer." }
     StoreWriteId { record: StoreWrite, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the store-write identity in the shared local taint entry namespace." }
     StoreWriteSelector { record: StoreWrite, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the store-writing calls." }
@@ -1582,6 +1622,12 @@ policy_fields! {
     AutomatonInitial { record: Automaton, labels: ["initial"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StateId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":initial STATE", description: "Select the declared initial state." }
     AutomatonAccepting { record: Automaton, labels: ["accepting-states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":accepting-states [STATE...]", description: "Declare non-absorbing states that satisfy terminal expectations." }
     AutomatonErrors { record: Automaton, labels: ["error-states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":error-states [STATE...]", description: "Declare states whose transitions produce policy violations." }
+    AutomatonTransfers { record: Automaton, labels: ["transfers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: TypestateTransfers, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":transfers [(transfer ...)...]", description: "Copy state from certified call inputs to independent results." }
+    TypestateTransferId { record: TypestateTransfer, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EventId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":id ID", description: "Name this state transfer." }
+    TypestateTransferCallsField { record: TypestateTransfer, labels: ["calls"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateTransferCall, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":calls (calls ...)", description: "Select calls that copy state." }
+    TypestateTransferSelector { record: TypestateTransferCalls, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":selector SELECTOR", description: "Select transfer calls." }
+    TypestateTransferFrom { record: TypestateTransferCalls, labels: ["from"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateCallBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":from receiver|(argument :index N)", description: "Select the source of copied state." }
+    TypestateTransferTo { record: TypestateTransferCalls, labels: ["to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateCallBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":to return-value", description: "Copy state into the call result." }
     AutomatonEvents { record: Automaton, labels: ["events"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: TypestateEvents, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":events [(event ...)...]", description: "Declare the bounded typed event set." }
     AutomatonEventSet { record: Automaton, labels: ["event-set"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EventSetSpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":event-set (event-set :name \"NAME\" :version N :effects [\"EFFECT\"...])", description: "Name the reviewed semantic effect vocabulary for this automaton." }
     EventSetName { record: EventSet, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":name \"NAMESPACE.NAME\"", description: "Stable namespaced event-set identity." }
@@ -1847,6 +1893,8 @@ pub enum AtomDomain {
     RouteHop,
     Boolean,
     IntrinsicValueType,
+    GuardRelation,
+    GuardOperand,
     FieldlessRequirement,
     RowJoinKind,
     RowAggregateOp,
@@ -1925,7 +1973,7 @@ macro_rules! atom_values {
 }
 
 atom_values! {
-    SanitizerReceiver { domain: SanitizerOperand, spellings: ["receiver"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Sanitize the call receiver on its accepting branch." }
+    SanitizerReceiver { domain: SanitizerOperand, spellings: ["receiver"], owner: OwnerApplicability::POLICY_MATCH_TAINT_OR_FLOW, description: "Sanitize the call receiver on its accepting branch." }
     SanitizerTrue { domain: SanitizerResult, spellings: ["true"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is true." }
     SanitizerFalse { domain: SanitizerResult, spellings: ["false"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is false." }
     SanitizerNil { domain: SanitizerResult, spellings: ["nil"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is nil." }
@@ -1945,6 +1993,12 @@ atom_values! {
     EndpointSetSources { domain: EndpointSetKind, spellings: ["sources"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone source endpoint set." }
     EndpointSetSinks { domain: EndpointSetKind, spellings: ["sinks"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone sink endpoint set." }
     EndpointSetBarriers { domain: EndpointSetKind, spellings: ["barriers"], owner: OwnerApplicability::POLICY_TAINT, description: "A standalone value-type barrier set." }
+    GuardEquality { domain: GuardRelation, spellings: ["equality"], owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, description: "Equality comparison." }
+    GuardInequality { domain: GuardRelation, spellings: ["inequality"], owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, description: "Inequality comparison." }
+    GuardOrdering { domain: GuardRelation, spellings: ["ordering"], owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, description: "Ordered comparison." }
+    GuardEither { domain: GuardOperand, spellings: ["either"], owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, description: "Both compared operand reads." }
+    GuardLesser { domain: GuardOperand, spellings: ["lesser"], owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, description: "The lesser-side operand of an ordered comparison." }
+    GuardGreater { domain: GuardOperand, spellings: ["greater"], owner: OwnerApplicability::POLICY_MATCH_OR_TAINT, description: "The greater-side operand of an ordered comparison." }
     IntrinsicNumeric { domain: IntrinsicValueType, spellings: ["numeric"], owner: OwnerApplicability::POLICY_TAINT, description: "Integer and floating-point types; Go includes named numeric underlying types. Excludes complex numbers and untyped constants." }
     IntrinsicBool { domain: IntrinsicValueType, spellings: ["bool"], owner: OwnerApplicability::POLICY_TAINT, description: "The resolved intrinsic Boolean identity." }
     FieldlessTrue { domain: FieldlessRequirement, spellings: ["true"], owner: OwnerApplicability::POLICY_TAINT, description: "Require an exhaustive inventory with no payload fields." }

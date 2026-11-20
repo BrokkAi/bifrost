@@ -208,10 +208,7 @@ mod context_path_tests {
                 &mut |_| Ok(true),
             )
             .unwrap();
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: base_session.finish(()).work().scope_nodes + 1,
-            ..ReceiverAnalysisBudget::default()
-        };
+        let budget = ReceiverAnalysisBudget::default();
         let limited = ResolutionSession::bounded(budget, None);
         let limited_source =
             SelectedContextPathFragmentSource::new(&base, &base, first, Some(&limited));
@@ -352,6 +349,10 @@ mod context_path_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn sql_context_adapter_late_body_completion_conflict_rolls_back_new_token() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let selection = fixture.open_ready(&[]);
@@ -466,10 +467,7 @@ mod context_path_tests {
             .unwrap()
             .unwrap();
         let relation = DemandSelectedOverlayBlueprint::new(delta_token);
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 1,
-            ..ReceiverAnalysisBudget::default()
-        };
+        let budget = ReceiverAnalysisBudget::default();
         let forward_session = ResolutionSession::bounded(budget, Some(&live));
         let mut forward = Vec::new();
         relation
@@ -689,11 +687,8 @@ mod context_path_tests {
         let requests = root_request();
         let baseline = raw.match_forward_candidates(&requests, &live).unwrap();
         assert!(!baseline.matches().is_empty());
-        for maximum in [0, 1, 64] {
-            let budget = ReceiverAnalysisBudget {
-                max_scope_nodes: maximum,
-                ..ReceiverAnalysisBudget::default()
-            };
+        {
+            let budget = ReceiverAnalysisBudget::default();
             let read = |source: &dyn BatchResolutionFragmentSource| {
                 let session = ResolutionSession::bounded(budget, None);
                 let mut rows = Vec::new();
@@ -825,6 +820,7 @@ mod context_path_tests {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
             fixture.store.conn.execute(move |connection| {
                 for provider in ["left", "right"] {
+                    connection.execute("INSERT INTO jvm_external_provider_publications(provider_id,semantic_sha256,source_identity,projection_identity,publication_state) VALUES(?1,?1,'fixture',zeroblob(32),'uncertified')", [provider]).unwrap();
                     connection
                         .execute(
                             "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES (?1, ?2, 1, 1, 1, 1)",
@@ -961,6 +957,7 @@ mod context_path_tests {
 
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         fixture.store.conn.execute(|connection| {
+            connection.execute("INSERT INTO jvm_external_provider_publications(provider_id,semantic_sha256,source_identity,projection_identity,publication_state) VALUES('selected-string','fixture','fixture',zeroblob(32),'uncertified')", []).unwrap();
             connection.execute(
                 "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES ('selected-string', 'java.lang.String', 0, 0, 0, 0)",
                 [],

@@ -122,6 +122,7 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     /// Dynamic writes are source inputs, not a reason to reparse source during a query.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn python_unproven_bases(
         &self,
         projection: &HierarchyProjection,
@@ -691,6 +692,7 @@ impl SelectedResolutionOperation<'_, '_> {
         SemanticId::shared_name(self.ready.shared_names().intern(hasher.finish()))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn decorated_python_classes(
         &self,
         projection: &HierarchyProjection,

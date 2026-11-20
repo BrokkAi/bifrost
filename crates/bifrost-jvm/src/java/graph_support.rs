@@ -1661,6 +1661,18 @@ pub fn java_constructor_context(
     })
 }
 
+/// The type qualifier of `Q.this`, selected from grammar fields.
+pub fn java_qualified_this_qualifier(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "field_access"
+        && !node.has_error()
+        && node.child_by_field_name("field")?.kind() == "this"
+    {
+        node.child_by_field_name("object")
+    } else {
+        None
+    }
+}
+
 /// Classify a method invocation receiver from Java grammar fields and children.
 pub fn java_callable_receiver_origin(node: Node<'_>) -> ResolutionCallableReceiverOrigin {
     let Some(object) = node.child_by_field_name("object") else {

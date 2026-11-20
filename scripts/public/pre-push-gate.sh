@@ -50,8 +50,9 @@ export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 # lib/src.zip makes every JVM workspace parse the whole JDK source archive
 # (about 80 s per test in a debug build, #2399). javac and jar stay on PATH
 # for the fixture tests; only the analyzer's automatic discovery reads
-# JAVA_HOME.
-unset JAVA_HOME
+# JAVA_HOME. The value is empty, not unset: an unset JAVA_HOME lets discovery
+# fall back to `java` on PATH (#13266), and an empty one disables it.
+export JAVA_HOME=
 
 # Cargo can find a rustup-managed compiler while PATH finds a Homebrew rustdoc.
 # Pin both tools to one sysroot so their crate metadata remains compatible.

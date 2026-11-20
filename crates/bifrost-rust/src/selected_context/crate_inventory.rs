@@ -29,7 +29,9 @@ pub struct RustFeatureActivation {
 #[derive(Clone, Debug)]
 pub struct RustCrateTarget {
     pub manifest_path: PathBuf,
+    /// Workspace-relative when normalized_root is available; otherwise the declared unavailable path.
     pub root_path: PathBuf,
+    pub root_unavailable: Option<RustUnavailableTargetRoot>,
     pub kind: RustCallerTargetKind,
     pub name: String,
     pub edition: RustCargoEdition,
@@ -86,7 +88,35 @@ pub fn rust_crate_targets(
     let features = fixed_build_features(&input.manifests, &cargo_manifests, configuration)?;
     let mut targets = Vec::new();
     let mut seen = BTreeSet::new();
-    for profile in inventory.profiles {
+    let library_manifests: HashSet<_> = inventory
+        .profiles
+        .iter()
+        .filter(|profile| profile.target_kind == RustCallerTargetKind::Library)
+        .map(|profile| profile.manifest_path.clone())
+        .chain(
+            inventory
+                .unavailable_roots
+                .iter()
+                .filter(|root| root.target_kind == RustCallerTargetKind::Library)
+                .map(|root| root.manifest_path.clone()),
+        )
+        .collect();
+    let unavailable = inventory.unavailable_roots;
+    let profiles = inventory
+        .profiles
+        .into_vec()
+        .into_iter()
+        .map(|profile| (profile, None));
+    let rejected = unavailable.into_iter().map(|gap| {
+        let profile = default_workspace_profile(
+            &gap.manifest_path,
+            gap.target_kind,
+            gap.declared_root.clone(),
+            false,
+        );
+        (profile, Some(gap))
+    });
+    for (profile, root_unavailable) in profiles.chain(rejected) {
         if !seen.insert((
             profile.manifest_path.clone(),
             profile.target_kind,
@@ -169,7 +199,9 @@ pub fn rust_crate_targets(
             &cargo_manifests,
             configuration,
         );
-        if same_package_library_root(&profile, package, &input.sources)?.is_some() {
+        if has_same_package_library_dependency(kind, package)
+            && library_manifests.contains(&profile.manifest_path)
+        {
             dependencies.push(RustCrateDependency {
                 extern_name: package.library_name.clone(),
                 kind: RustCargoDependencyKind::Normal,
@@ -219,11 +251,21 @@ pub fn rust_crate_targets(
             })
             .collect();
         targets.push(RustCrateTarget {
-            root_path: normalize_selected_path(
-                profile.manifest_path.parent().unwrap_or(Path::new("")),
-                &profile.target_root,
-            )
-            .expect("enumerated target is in workspace"),
+            root_path: root_unavailable.as_ref().map_or_else(
+                || {
+                    normalize_selected_path(
+                        profile.manifest_path.parent().unwrap_or(Path::new("")),
+                        &profile.target_root,
+                    )
+                    .expect("enumerated target is in workspace")
+                },
+                |gap| {
+                    gap.normalized_root
+                        .clone()
+                        .unwrap_or_else(|| gap.declared_root.clone())
+                },
+            ),
+            root_unavailable,
             manifest_path: profile.manifest_path.clone(),
             kind,
             name,

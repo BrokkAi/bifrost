@@ -606,9 +606,10 @@ fn stable_first_reason_does_not_cache_a_later_cancellation() {
         assert_eq!(
             scope.captured_read_incompleteness(),
             vec![
-                QueryReadIncomplete::StructureUnavailable(owner.clone()),
                 QueryReadIncomplete::Cancelled,
-            ]
+                QueryReadIncomplete::StructureUnavailable(owner.clone()),
+            ],
+            "canonical completion order puts execution failures before content gaps"
         );
     }
     assert!(

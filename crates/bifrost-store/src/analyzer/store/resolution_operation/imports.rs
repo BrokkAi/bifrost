@@ -100,6 +100,7 @@ pub(super) type ImportTokenMemo = ExactReadMemo<ImportTokenKey, Arc<ImportTokenM
 
 impl SelectedResolutionOperation<'_, '_> {
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn import_token_metadata(
         &self,
         blob: i64,
@@ -222,6 +223,7 @@ pub(super) fn authored_reference_local_path_evidence(
 /// binder scope equals one of the reference's lexical scopes, using the
 /// minimum matching depth. A language with a different activation or scope
 /// rule extends the rules hook rather than adding a mode flag.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
     ready: &ReadySelectedResolution<'_, '_>,
     rules: &R,
@@ -623,6 +625,7 @@ pub(super) fn selected_import_selector(
     Ok(Some(decode_import_selector(kind, source_name, local_name)))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(super) fn selected_import_route(
     inventory: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
     blob_id: i64,
@@ -760,7 +763,7 @@ pub(super) fn scope_named_routes(
 pub const TOKEN_SITE: &str = "SELECT import_source_site FROM resolution_semantic_catalog
  WHERE blob_id=?1 AND local_key=?2 AND import_source_site IS NOT NULL";
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ImportDemand(
     pub i64,
@@ -770,7 +773,7 @@ pub struct ImportDemand(
     pub Option<String>,
 );
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ImportRoute {
     pub site: u32,
@@ -797,6 +800,14 @@ impl ImportRoute {
 }
 
 fn read_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRoute> {
+    read_route_at(row, 0)
+}
+
+/// The eight route columns of `route_columns!` starting at `first`.
+pub(crate) fn read_route_at(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+) -> rusqlite::Result<ImportRoute> {
     let decode = |column| -> rusqlite::Result<serde_json::Value> {
         let text: String = row.get(column)?;
         serde_json::from_str(&text).map_err(|error| {
@@ -807,19 +818,27 @@ fn read_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRoute> {
             )
         })
     };
-    let segments = serde_json::from_value(decode(6)?).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    let segments = serde_json::from_value(decode(first + 6)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            first + 6,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
     })?;
-    let demands = serde_json::from_value(decode(7)?).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    let demands = serde_json::from_value(decode(first + 7)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            first + 7,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
     })?;
     Ok(ImportRoute {
-        site: row.get(0)?,
-        scope: row.get(1)?,
-        anchor: row.get(2)?,
-        position: row.get(3)?,
-        kind: row.get(4)?,
-        bound_name: row.get(5)?,
+        site: row.get(first)?,
+        scope: row.get(first + 1)?,
+        anchor: row.get(first + 2)?,
+        position: row.get(first + 3)?,
+        kind: row.get(first + 4)?,
+        bound_name: row.get(first + 5)?,
         segments,
         demands,
     })

@@ -425,6 +425,15 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
             out.push(demand);
             return;
         };
+        // This is the preimage of the forward caller identity, using the
+        // original forward-oriented continuation descriptor. Compute once
+        // for the demanded carrier; modeled transfer preimages stay separate.
+        let replaces_identity = self.plan.call_replaces_global_location(
+            call,
+            edge.boundary(),
+            edge.kind(),
+            demand.carrier,
+        );
         // Boundary transfers are structured semantic relations. Enumerating
         // the bounded carrier universe is intentionally conservative but does
         // not fall back to source text or a reversed CFG edge.
@@ -453,10 +462,10 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
                     true
                 },
             );
-            // The caller-side continuation always preserves the incoming
-            // carrier unless RequireModel abstains, in which case that
-            // preserved fact is retained but marked uncertain.
-            if input == demand.carrier {
+            // Only preserve an identity that exists in the forward relation.
+            // RequireModel abstention retains its existing uncertainty, while
+            // explicit modeled transfer preimages above remain independent.
+            if input == demand.carrier && !replaces_identity {
                 out.push(Demand {
                     uncertainty: if application.abstained {
                         demand.uncertainty.with_semantic()
@@ -643,10 +652,10 @@ impl BackwardDistributiveDataflowProblem for BackwardValueFlowProblem<'_> {
         BackwardValueFlowFact::Zero
     }
 
-    /// The forward client takes the caller-side continuation of a resolved
-    /// call, so the preimage relation must take it too, or a carrier the
-    /// callee neither receives nor returns has no backward path past the call
-    /// and the two directions disagree on every pair that spans one (#2782).
+    /// Offer resolved caller-side continuations because the forward client
+    /// preserves unrelated carriers there (#2782). The shared per-carrier
+    /// predicate still decides whether that identity exists for this demand;
+    /// global identities replaced by complete callee transport are suppressed.
     fn resolved_call_to_return(&self) -> bool {
         true
     }
@@ -769,6 +778,22 @@ fn is_weak_update(rule: &LocalRuleView) -> bool {
         ValueFlowRelationKind::MemoryStore => !(rule.strong_update || rule.direct_cell_overwrite),
         _ => true,
     }
+}
+
+/// Test fixtures without capture transports exercise actual callback and
+/// reverse-admission logic without requiring a second snapshot materialization.
+#[cfg(test)]
+pub(super) fn backward_problem_without_captures_for_test(
+    plan: &ValueFlowPlan,
+) -> Result<
+    impl BackwardDistributiveDataflowProblem<Fact = BackwardValueFlowFact> + '_,
+    BackwardValueFlowSolveError,
+> {
+    validate_backward_plan(plan)?;
+    Ok(BackwardValueFlowProblem {
+        plan,
+        capture_edges: HashMap::default(),
+    })
 }
 
 #[cfg(test)]

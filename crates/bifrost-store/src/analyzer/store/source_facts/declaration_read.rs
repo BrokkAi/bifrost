@@ -17,6 +17,20 @@ pub fn read_source_identity_rows(
     expected_declarations: usize,
     keep_going: &dyn Fn() -> bool,
 ) -> Result<Option<SourceFactRows>> {
+    #[cfg(any(debug_assertions, test))]
+    {
+        // C# source facts retire through the bundle epoch. Its readers must use
+        // epoch-gated selection and ownership joins, never this raw blob API.
+        let language: String =
+            tx.query_row("SELECT lang FROM blobs WHERE id = ?1", [blob_id], |row| {
+                row.get(0)
+            })?;
+        assert_ne!(
+            language,
+            brokk_bifrost_core::analyzer::Language::CSharp.config_label(),
+            "C# source facts require epoch-gated selection and ownership joins"
+        );
+    }
     macro_rules! read_rows {
         ($sql:expr, $row:ident, $body:block) => {{
             let mut statement = tx.prepare_cached($sql)?;
@@ -137,4 +151,28 @@ pub fn read_source_identity_rows(
         .with_lexical_declarations(lexical_declarations);
 
     Ok(Some(source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "C# source facts require epoch-gated selection and ownership joins")]
+    fn raw_csharp_identity_read_requires_selected_epoch_authority() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE blobs(id INTEGER PRIMARY KEY, lang TEXT NOT NULL)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(id, lang) VALUES(1, ?1)",
+            [brokk_bifrost_core::analyzer::Language::CSharp.config_label()],
+        )
+        .unwrap();
+        // No source tables exist: the language guard must run before any arena read.
+        assert!(
+            read_source_identity_rows(&conn, 1, 0, 0, &|| true)
+                .unwrap()
+                .is_some()
+        );
+    }
 }

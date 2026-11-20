@@ -236,6 +236,11 @@ pub struct SemanticModelActivationProvenance {
     /// The pack was selected without exact toolchain evidence.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approximate: bool,
+    /// Why the selection was approximate; `approximate` is its serialized
+    /// view and the two are set together, from the selected shard only.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub approximation: Option<crate::analyzer::semantic_model::ApproximationReasons>,
     pub status: String,
     pub reason: String,
     pub source_kind: String,
@@ -434,7 +439,12 @@ pub fn classify_model_type_owner<'a>(
 /// #10045: authored Rust family certification now survives generated std composition.
 /// #10989: an authored family claim survives composition in every language,
 /// checked against the artifact's family of the same declared arity.
-pub const MODEL_COMPOSITION_VERSION: u32 = 4;
+/// #11884: relation rows are admitted by their provenance before composition,
+/// so composed answers for unchanged inputs can change.
+/// #10572: composition carries independent class-finality claims.
+/// An authored target-independent family claim survives an approximate
+/// activation whose every reason is an unknown target.
+pub const MODEL_COMPOSITION_VERSION: u32 = 7;
 
 /// The caller compilation's providers, canonicalized before hashing.
 #[derive(Debug, Clone)]
@@ -562,8 +572,21 @@ pub struct PromotedFrom {
     pub depth: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+/// Language-owned declaration partition within one owner/name/receiver key.
+/// This is a runtime projection of existing model facts, not pack wire data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SemanticModelCallableGroup {
+    #[default]
+    Owner,
+    Trait([u8; 32]),
+    UnknownTrait,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelSymbol {
+    /// The full declaration group is selected before argument filtering.
+    #[serde(skip)]
+    pub callable_group: SemanticModelCallableGroup,
     /// Go promotion provenance reconstructed from the authored declaring site.
     #[serde(skip)]
     pub promoted_from: Option<PromotedFrom>,
@@ -613,6 +636,9 @@ pub struct SemanticModelSymbol {
     pub declaration_is_sealed: bool,
     #[serde(skip)]
     #[doc(hidden)]
+    pub declaration_is_final: Option<bool>,
+    #[serde(skip)]
+    #[doc(hidden)]
     pub callable_surface_complete: bool,
     /// The source pack state before Fenced is projected as partial provenance.
     #[serde(skip)]
@@ -642,6 +668,12 @@ pub struct SemanticModelSymbol {
     pub callable_shape_evidence_complete: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub callable_family_complete: bool,
+    /// The reviewed authored claim that `callable_family_complete` holds on
+    /// every target. Set only from an authored shard (never a generated or
+    /// extraction pack) and read only from the authored side of composition.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub callable_family_target_independent: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exact_return_classes: Vec<TypeRef>,
     pub aliases: Vec<String>,
@@ -685,6 +717,129 @@ pub struct SemanticModelSymbol {
     pub locator_symbol: Option<String>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
+}
+
+// Composition hashes this existing input projection for generated symbols.
+// callable_group is derived from model inputs by the running language support;
+// it is not an additional authored input. Keep the base Debug input fields,
+// including its authored target-independence claim, in their existing order.
+impl std::fmt::Debug for SemanticModelSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // An added input field must make this projection an explicit choice.
+        let Self {
+            callable_group: _,
+            promoted_from,
+            members_state,
+            pre_composition_qualified_name,
+            semantic_contributors,
+            jvm_owner_family_enumerated,
+            python_runtime_bases,
+            rust_generated_scope,
+            id,
+            owner_id,
+            name,
+            qualified_name,
+            language,
+            kind,
+            visibility,
+            is_static,
+            non_overridable,
+            declaration_is_abstract,
+            declaration_is_sealed,
+            declaration_is_final,
+            callable_surface_complete,
+            source_completeness,
+            values_complete,
+            supertypes_complete,
+            signature,
+            structured_signature,
+            has_explicit_type_terms,
+            callable_shape,
+            callable_shape_evidence_complete,
+            callable_family_complete,
+            callable_family_target_independent,
+            exact_return_classes,
+            aliases,
+            type_parameter_constraints,
+            underlying_type,
+            value_semantics,
+            embedded_types,
+            receiver,
+            implicit_operation,
+            explicit_operation,
+            ambient_use,
+            value_type,
+            proxied_type,
+            extension_receiver,
+            extension_receiver_constraints,
+            locator_path,
+            locator_symbol,
+            location,
+            provenance,
+        } = self;
+        f.debug_struct("SemanticModelSymbol")
+            .field("promoted_from", promoted_from)
+            .field("members_state", members_state)
+            .field(
+                "pre_composition_qualified_name",
+                pre_composition_qualified_name,
+            )
+            .field("semantic_contributors", semantic_contributors)
+            .field("jvm_owner_family_enumerated", jvm_owner_family_enumerated)
+            .field("python_runtime_bases", python_runtime_bases)
+            .field("rust_generated_scope", rust_generated_scope)
+            .field("id", id)
+            .field("owner_id", owner_id)
+            .field("name", name)
+            .field("qualified_name", qualified_name)
+            .field("language", language)
+            .field("kind", kind)
+            .field("visibility", visibility)
+            .field("is_static", is_static)
+            .field("non_overridable", non_overridable)
+            .field("declaration_is_abstract", declaration_is_abstract)
+            .field("declaration_is_sealed", declaration_is_sealed)
+            .field("declaration_is_final", declaration_is_final)
+            .field("callable_surface_complete", callable_surface_complete)
+            .field("source_completeness", source_completeness)
+            .field("values_complete", values_complete)
+            .field("supertypes_complete", supertypes_complete)
+            .field("signature", signature)
+            .field("structured_signature", structured_signature)
+            .field("has_explicit_type_terms", has_explicit_type_terms)
+            .field("callable_shape", callable_shape)
+            .field(
+                "callable_shape_evidence_complete",
+                callable_shape_evidence_complete,
+            )
+            .field("callable_family_complete", callable_family_complete)
+            .field(
+                "callable_family_target_independent",
+                callable_family_target_independent,
+            )
+            .field("exact_return_classes", exact_return_classes)
+            .field("aliases", aliases)
+            .field("type_parameter_constraints", type_parameter_constraints)
+            .field("underlying_type", underlying_type)
+            .field("value_semantics", value_semantics)
+            .field("embedded_types", embedded_types)
+            .field("receiver", receiver)
+            .field("implicit_operation", implicit_operation)
+            .field("explicit_operation", explicit_operation)
+            .field("ambient_use", ambient_use)
+            .field("value_type", value_type)
+            .field("proxied_type", proxied_type)
+            .field("extension_receiver", extension_receiver)
+            .field(
+                "extension_receiver_constraints",
+                extension_receiver_constraints,
+            )
+            .field("locator_path", locator_path)
+            .field("locator_symbol", locator_symbol)
+            .field("location", location)
+            .field("provenance", provenance)
+            .finish()
+    }
 }
 
 /// The structured identity of a callable that the semantic oracle resolved
@@ -850,9 +1005,7 @@ pub fn semantic_model_callable_family_id<T: std::borrow::Borrow<SemanticModelSym
     records: &[T],
 ) -> Option<String> {
     let first = records.first()?.borrow();
-    if !member_is_callable(first) {
-        return None;
-    }
+    let record_ids = uniform_callable_family_record_ids(records)?;
     if records.len() == 1 {
         // A generated C function has no overload family within its header
         // owner. Keep its authored owner/member locator as the family
@@ -892,7 +1045,6 @@ pub fn semantic_model_callable_family_id<T: std::borrow::Borrow<SemanticModelSym
     if !certified {
         return None;
     }
-    let record_ids = uniform_callable_family_record_ids(records)?;
     let mut digest = LengthDelimitedDigest::new(b"bifrost.semantic_model.callable_family.v1");
     for record_id in record_ids {
         digest.push(record_id.as_bytes());
@@ -924,6 +1076,21 @@ pub fn semantic_model_possible_callable_family_id<T: std::borrow::Borrow<Semanti
 /// The sorted record IDs of callable records that share one unambiguous
 /// owner/name/call shape and one activation provenance, or `None`.
 fn uniform_callable_family_record_ids<T: std::borrow::Borrow<SemanticModelSymbol>>(
+    records: &[T],
+) -> Option<Vec<&str>> {
+    let record_ids = uniform_callable_key_record_ids(records)?;
+    let first = records.first()?.borrow();
+    (first.callable_group != SemanticModelCallableGroup::UnknownTrait
+        && records
+            .iter()
+            .all(|record| record.borrow().callable_group == first.callable_group))
+    .then_some(record_ids)
+}
+
+/// Validate one owner/name/receiver and activation/provider context, without
+/// choosing a declaration group. No callable identity is granted by this check.
+#[doc(hidden)]
+pub fn uniform_callable_key_record_ids<T: std::borrow::Borrow<SemanticModelSymbol>>(
     records: &[T],
 ) -> Option<Vec<&str>> {
     let first = records.first()?.borrow();
@@ -1612,9 +1779,14 @@ impl SemanticModelSymbol {
         self.declaration_is_abstract
     }
 
-    /// Whether the producer records restricted or closed inheritance. In Java
-    /// this includes both `sealed` and `final`; it does not enumerate permitted
-    /// subclasses or prove that a class has no descendants.
+    /// Independent class-finality evidence; absence is unknown.
+    pub fn declaration_is_final(&self) -> Option<bool> {
+        self.declaration_is_final
+    }
+
+    /// Language-specific restricted inheritance. New JVM records use sealed
+    /// inheritance only; old JVM records may also have folded final into it.
+    /// This bit alone does not prove that a class has no descendants.
     pub fn declaration_is_sealed(&self) -> bool {
         self.declaration_is_sealed
     }
@@ -2891,6 +3063,7 @@ pub fn evaluate_template_signature(
         }
     }
     Some(Signature {
+        bounds: None,
         type_parameters: signature
             .type_parameters
             .iter()
@@ -3159,7 +3332,7 @@ pub fn matched_evidence(
         toolchain: evidence.toolchain.as_ref().map(matched_coordinate),
         target: evidence.target.clone(),
         configuration: evidence.configuration.clone(),
-        artifact_sha256: evidence.artifact_sha256.clone(),
+        artifact_sha256: evidence.single_raw_sha256(),
     }
 }
 

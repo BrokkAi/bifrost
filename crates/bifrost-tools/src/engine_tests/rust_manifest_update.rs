@@ -61,6 +61,10 @@ mod rust_manifest_update_tests {
     /// Rows are keyed by crate name, not by crate key or topology id, so two
     /// workspaces at different times compare equal exactly when the crates they
     /// publish mean the same thing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn observe(workspace: &WorkspaceAnalyzer) -> Observed {
         let store = workspace.store().expect("the workspace has a store");
         let conn = store.read_conn().unwrap();

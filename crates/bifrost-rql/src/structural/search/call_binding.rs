@@ -415,6 +415,8 @@ pub(super) struct CallBindingDispatch {
     pub(super) target_id: Option<String>,
     pub(super) proof: Option<DispatchProof>,
     pub(super) completeness: Option<DispatchCompleteness>,
+    /// The typed cause of a partial singular arm, when the oracle named one.
+    pub(super) partial_cause: Option<crate::analyzer::semantic::DispatchBoundaryPartialCause>,
     pub(super) status: DispatchStatus,
     pub(super) coverage_status: crate::analyzer::semantic::CandidateCoverage,
     pub(super) target_count: usize,
@@ -427,6 +429,7 @@ impl CallBindingDispatch {
             target_id: None,
             proof: None,
             completeness: None,
+            partial_cause: None,
             status: DispatchStatus::Unknown,
             coverage_status: crate::analyzer::semantic::CandidateCoverage::Open,
             target_count: 0,
@@ -438,7 +441,9 @@ impl CallBindingDispatch {
         self.status == DispatchStatus::Resolved
             && self.coverage_status.is_exhaustive()
             && self.proof == Some(DispatchProof::Proven)
-            && self.completeness == Some(DispatchCompleteness::Complete)
+            && self
+                .completeness
+                .is_some_and(|completeness| selects_whole_target(completeness, self.partial_cause))
             && self.target_count > 0
     }
 
@@ -483,6 +488,7 @@ impl CallBindingDispatch {
             target_id: singular.map(|arm| arm.target_id.clone()),
             proof: singular.map(|arm| arm.proof),
             completeness: singular.map(|arm| arm.completeness),
+            partial_cause: singular.and_then(|arm| arm.boundary_reason),
             status: answer.status,
             coverage_status: answer.coverage,
             target_count: answer.arms.len(),
@@ -499,6 +505,7 @@ impl CallBindingDispatch {
             target_id: (target_ids.len() == 1).then(|| target_ids[0].clone()),
             proof: Some(DispatchProof::Proven),
             completeness: Some(DispatchCompleteness::Complete),
+            partial_cause: None,
             status: DispatchStatus::Resolved,
             coverage_status: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
             target_count: target_ids.len(),
@@ -511,6 +518,7 @@ impl CallBindingDispatch {
             target_id: Some(target_id.to_owned()),
             proof: Some(DispatchProof::Proven),
             completeness: Some(DispatchCompleteness::Complete),
+            partial_cause: None,
             status: DispatchStatus::Resolved,
             coverage_status: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
             target_count: 1,
@@ -525,6 +533,28 @@ impl CallBindingDispatch {
             self.proof = Some(DispatchProof::Unproven);
             self.completeness = Some(DispatchCompleteness::Partial);
         }
+        self.partial_cause = None;
+    }
+}
+
+/// Whether an arm's completeness covers the selection of its target.
+///
+/// A selector asks which callee a call binds to, not what the callee does. An
+/// external arm whose only gap is its unavailable body still names one whole
+/// target: the oracle proved that identity, and the missing transfers are a
+/// call-modeling question that summaries and `:call-modeling` answer. Any
+/// other partial arm, or one without a typed cause, leaves selection open.
+fn selects_whole_target(
+    completeness: DispatchCompleteness,
+    partial_cause: Option<crate::analyzer::semantic::DispatchBoundaryPartialCause>,
+) -> bool {
+    match (completeness, partial_cause) {
+        (DispatchCompleteness::Complete, _) => true,
+        (
+            DispatchCompleteness::Partial,
+            Some(crate::analyzer::semantic::DispatchBoundaryPartialCause::ExternalBodyUnavailable),
+        ) => true,
+        (DispatchCompleteness::Partial, None) => false,
     }
 }
 
@@ -777,6 +807,10 @@ fn possible_family_binding_diagnostic(file: &ProjectFile) -> CodeQueryDiagnostic
             .to_owned(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
+        step_index: None,
+        step_op: None,
+        no_rows_reason: None,
+        cause_codes: Vec::new(),
     })
 }
 
@@ -1184,7 +1218,6 @@ fn model_call_binding_for_external_shape(
         modeled_key.has_receiver,
         modeled_key.parameter_count,
     );
-    let mut model_callable_id = overlay.callable_family_id_for_target(key);
     let mut application = structured_model_application(shape);
     // The receiver of a reduced-form extension call is the first positional
     // actual of the declared signature.
@@ -1197,11 +1230,13 @@ fn model_call_binding_for_external_shape(
             .checked_add(1)
             .expect("a written positional count leaves room for the receiver");
     }
-    let Some(mut matched) =
+    let Some(selected) =
         selected_model_callable(analyzer, &overlay, key, selected_descriptor, &application)
     else {
         return ModelCallBinding::Unavailable;
     };
+    let mut matched = selected.matched;
+    let mut model_callable_id = selected.family_id;
     // An overload family that no model certifies complete still answers the
     // call from its known members. Bind that answer under the possible
     // family identity, which never equals a proven one, and let the site
@@ -1213,7 +1248,7 @@ fn model_call_binding_for_external_shape(
             SemanticModelCallableIncompleteReason::PartialModel,
         )
         && let Some(possible) = matched.possible
-        && let Some(possible_id) = overlay.callable_possible_family_id_for_target(key)
+        && let Some(possible_id) = selected.possible_family_id
     {
         matched.disposition = possible;
         model_callable_id = Some(possible_id);
@@ -2160,6 +2195,10 @@ fn authored_summary_selector_proof(
         return None;
     }
     let selected = matched.records.first()?;
+    // This tier names the authored claim that closed an override set, so it
+    // always needs `covers_overrides`, unlike `target_needs_override_claim`'s
+    // admission question (#12846). A receiverless or exact closed arm needs no
+    // claim; its dispatch closed itself, and the selector is `derived` from it.
     if selected.record.completeness != Completeness::Complete || !selected.record.covers_overrides {
         return None;
     }
@@ -2213,7 +2252,11 @@ fn resolver_declaration_selector(
         return false;
     };
     let owners = active.all_type_records_named(&key.owner);
-    if owners.open_for_language("rust").is_some() {
+    if let Some(open) = owners.open_for_language("rust") {
+        let _cause = crate::analyzer::semantic_model::SemanticModelOverlay::record_open_proof(
+            open,
+            "resolver_declaration_selector_owner",
+        );
         return false;
     }
     let owners = owners
@@ -2230,7 +2273,11 @@ fn resolver_declaration_selector(
         return false;
     }
     let records = active.all_member_records_with_id(record_id);
-    if records.open_for_language("rust").is_some() {
+    if let Some(open) = records.open_for_language("rust") {
+        let _cause = crate::analyzer::semantic_model::SemanticModelOverlay::record_open_proof(
+            open,
+            "resolver_declaration_selector_member",
+        );
         return false;
     }
     let records = records.rows.collect::<Vec<_>>();
@@ -2266,8 +2313,8 @@ fn resolver_proven_static_model_selector(answer: &DispatchSiteAnswer) -> bool {
 }
 
 /// Whether the oracle's answer for this one call site is closed on `arm`
-/// alone: resolved, exhaustive, one proven and complete arm, and nothing the
-/// oracle could not name.
+/// alone: resolved, exhaustive, one proven arm that selects its whole target,
+/// and nothing the oracle could not name.
 fn answer_closed_on_arm(answer: &DispatchSiteAnswer, arm: &super::dispatch::DispatchArm) -> bool {
     answer.status == DispatchStatus::Resolved
         && answer.coverage.is_exhaustive()
@@ -2278,14 +2325,14 @@ fn answer_closed_on_arm(answer: &DispatchSiteAnswer, arm: &super::dispatch::Disp
         && answer.unnamed_boundaries.is_empty()
         && matches!(answer.arms.as_slice(), [only] if only.target_id == arm.target_id)
         && arm.proof == DispatchProof::Proven
-        && arm.completeness == DispatchCompleteness::Complete
+        && selects_whole_target(arm.completeness, arm.boundary_reason)
 }
 
 /// A modeled external call whose dispatch answer is already closed on the one
 /// external arm that the unique model binding was keyed from. The oracle can
 /// close such an arm from resolver structure alone, for example a Rust
-/// inherent method on one concrete nominal receiver whose body has one
-/// complete summary. The model binding then names the endpoint that dispatch
+/// inherent method on one concrete nominal receiver, or a final JDK method
+/// whose body is outside the workspace (#14297). The model binding then names the endpoint that dispatch
 /// selected, so the selector is exact without a static-call claim and without
 /// an authored override-coverage claim. The agreement is the arm's resolver
 /// target carrying the same `(language, owner, member, receiver, arity)` as
@@ -2390,6 +2437,10 @@ mod authored_override_residual_tests {
                     message: "call_bindings did not establish complete coverage".into(),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 });
                 push_refusal_subject(diagnostic, bound, native_utf8, &mut diagnostics);
             }
@@ -2741,11 +2792,8 @@ pub(super) fn call_binding_expansions(
             };
             (target, declaration, signature_id, Some(source_target))
         }
-        ResolvedCallTarget::Incomplete {
-            unit,
-            diagnostics: reasons,
-        } => {
-            incomplete_callee_diagnostics = Some(reasons);
+        ResolvedCallTarget::Incomplete { unit, lookup } => {
+            incomplete_callee_diagnostics = Some(lookup);
             let declaration = unit.as_ref().and_then(|unit| indexed.get(analyzer, unit));
             (
                 CallBindingTarget::Incomplete { unit: unit.clone() },
@@ -2922,6 +2970,7 @@ pub(super) fn call_binding_expansions(
                     message: "call_bindings found incomplete or conflicting semantic-model provenance for an exact source target".to_owned(),
                 exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
                 }));
             }
         }
@@ -3163,6 +3212,10 @@ pub(super) fn call_binding_expansions(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }));
             }
             ModelCallBinding::CompatibleLayout {
@@ -3222,6 +3275,10 @@ pub(super) fn call_binding_expansions(
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
+                    step_index: None,
+                    step_op: None,
+                    no_rows_reason: None,
+                    cause_codes: Vec::new(),
                 }));
             }
             ModelCallBinding::Empty | ModelCallBinding::Unavailable => {
@@ -3409,6 +3466,10 @@ pub(super) fn call_binding_expansions(
                 message,
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
         }
         if matches!(
@@ -3430,6 +3491,10 @@ pub(super) fn call_binding_expansions(
                 message: "call_bindings native invocation has open content evidence".to_owned(),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }));
         }
     }
@@ -3614,7 +3679,7 @@ pub(super) fn call_binding_expansions(
                 refusal_sites: Default::default(),
                 call_relation_facts: None,
                 uses_omissions: Vec::new(),
-            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
+            incompleteness: original_gap.incompleteness(),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -3622,10 +3687,11 @@ pub(super) fn call_binding_expansions(
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: incomplete_lookup_diagnostic_message(
-                "native Java or Go call-target binding retained one source candidate with an incomplete selected frontier; original diagnostics: ", original_gap
+                "native Java or Go call-target binding retained one source candidate with an incomplete selected frontier; original diagnostics: ", &original_gap.diagnostics
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+ step_index: None, step_op: None, no_rows_reason: None, cause_codes: Vec::new(),
         }));
     }
     if let Some(original_reasons) = incomplete_callee_diagnostics.as_ref() {
@@ -3634,9 +3700,7 @@ pub(super) fn call_binding_expansions(
             refusal_sites: Default::default(),
             call_relation_facts: None,
             uses_omissions: Vec::new(),
-            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
-                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
-            ),
+            incompleteness: original_reasons.incompleteness(),
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -3645,10 +3709,14 @@ pub(super) fn call_binding_expansions(
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: incomplete_lookup_diagnostic_message(
                 "call_bindings retained an incomplete callee lookup; original diagnostics: ",
-                original_reasons,
+                &original_reasons.diagnostics,
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
+            step_index: None,
+            step_op: None,
+            no_rows_reason: None,
+            cause_codes: Vec::new(),
         }));
     }
     // The initial producer consumes exact source signatures. Model signature
@@ -3884,6 +3952,10 @@ pub(super) fn call_binding_expansions(
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+                        step_index: None,
+                        step_op: None,
+                        no_rows_reason: None,
+                        cause_codes: Vec::new(),
                     }),
                     binding_incompleteness.execution_cause(),
                 ),
@@ -3919,6 +3991,10 @@ pub(super) fn call_binding_expansions(
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
+                        step_index: None,
+                        step_op: None,
+                        no_rows_reason: None,
+                        cause_codes: Vec::new(),
                     }),
                     binding_incompleteness.execution_cause(),
                 ),
@@ -4045,7 +4121,7 @@ enum ResolvedCallTarget {
     Lexical(crate::analyzer::resolution::lexical_definition::LexicalDefinition),
     Incomplete {
         unit: Option<CodeUnit>,
-        diagnostics: Vec<DefinitionLookupDiagnostic>,
+        lookup: IncompleteCalleeLookup,
     },
     Ambiguous,
     /// The selected-native Java operation returned several source candidates.
@@ -4060,7 +4136,27 @@ enum ResolvedCallTarget {
 
 struct ResolvedCallTargetUnit {
     unit: CodeUnit,
-    incomplete_native_diagnostics: Option<Vec<DefinitionLookupDiagnostic>>,
+    incomplete_native_diagnostics: Option<IncompleteCalleeLookup>,
+}
+
+/// Keep the resolver's typed evidence beside presentation diagnostics all the
+/// way to the report producer. Missing or uncertified evidence fails closed.
+struct IncompleteCalleeLookup {
+    diagnostics: Vec<DefinitionLookupDiagnostic>,
+    evidence: Option<crate::analyzer::usages::get_definition::DefinitionLookupEvidence>,
+}
+
+impl IncompleteCalleeLookup {
+    fn incompleteness(&self) -> Incompleteness {
+        self.evidence.as_ref().map_or(
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+            |evidence| {
+                evidence
+                    .execution_cause()
+                    .map_or(Incompleteness::Content, Incompleteness::Operational)
+            },
+        )
+    }
 }
 
 /// Resolve the callee reference of one call shape through the production
@@ -4088,7 +4184,7 @@ fn resolve_call_target(
     let Some(callee_range) = outcome.callee_range else {
         return ResolvedCallTarget::Unresolved;
     };
-    let Some(lookup) =
+    let Some(mut lookup) =
         bindings.resolved_call_target(analyzer, &outcome.file, callee_range, cancellation)
     else {
         return ResolvedCallTarget::Unresolved;
@@ -4099,11 +4195,17 @@ fn resolve_call_target(
             | DefinitionResolutionAuthority::NativeGoSelected
     );
     let status = lookup.outcome.status;
-    let incomplete_diagnostics =
-        (status == DefinitionLookupStatus::Incomplete).then(|| lookup.outcome.diagnostics.clone());
-    let incomplete_native_diagnostics = lookup
-        .unique_incomplete_native_source_candidate()
-        .map(|_| lookup.outcome.diagnostics.clone());
+    let native_incomplete = lookup.unique_incomplete_native_source_candidate().is_some();
+    let mut incomplete_lookup = (status == DefinitionLookupStatus::Incomplete || native_incomplete)
+        .then(|| IncompleteCalleeLookup {
+            diagnostics: std::mem::take(&mut lookup.outcome.diagnostics),
+            evidence: lookup.outcome.incomplete_evidence.take(),
+        });
+    let incomplete_native_diagnostics = native_incomplete.then(|| {
+        incomplete_lookup
+            .take()
+            .expect("a native gap retains its lookup evidence")
+    });
     if lookup.authority == DefinitionResolutionAuthority::NativeJavaSelected
         && lookup.outcome.definitions.is_empty()
         && let Some(selection) = lookup.model_member_selection.as_ref()
@@ -4131,8 +4233,7 @@ fn resolve_call_target(
         0 if native_selected => ResolvedCallTarget::UnresolvedNative,
         0 if status == DefinitionLookupStatus::Incomplete => ResolvedCallTarget::Incomplete {
             unit: None,
-            diagnostics: incomplete_diagnostics
-                .expect("an incomplete lookup retains its typed diagnostics"),
+            lookup: incomplete_lookup.expect("an incomplete lookup retains its typed evidence"),
         },
         0 => ResolvedCallTarget::Unresolved,
         1 if status == DefinitionLookupStatus::Resolved => {
@@ -4149,8 +4250,7 @@ fn resolve_call_target(
         }
         1 if status == DefinitionLookupStatus::Incomplete => ResolvedCallTarget::Incomplete {
             unit: Some(definitions.remove(0)),
-            diagnostics: incomplete_diagnostics
-                .expect("an incomplete lookup retains its typed diagnostics"),
+            lookup: incomplete_lookup.expect("an incomplete lookup retains its typed evidence"),
         },
         _ if native_selected => ResolvedCallTarget::AmbiguousNative,
         _ => ResolvedCallTarget::Ambiguous,

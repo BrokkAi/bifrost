@@ -26,7 +26,7 @@ mod tests {
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use brokk_bifrost_core::analyzer::model::ProjectFile;
-    use brokk_bifrost_rust::graph_support::RustCargoRouteError;
+    use brokk_bifrost_rust::graph_support::{RustCargoRouteError, with_usage_read_frame};
     use brokk_bifrost_rust::usage::{
         Domain, RustMacroInvocationResolution, RustMacroInvocationRoute, RustSymbolIdentity,
         RustSymbolNamespace,
@@ -343,35 +343,203 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
     }
 
     #[test]
+    #[hardwon("#13024: failed-route suppression hid cancellation and prevented resumed progress")]
+    fn cancelled_file_routes_repeat_typed_cancellation_and_retry_after_progress_resumes() {
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+        let (_fixture, analyzer) = project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"routes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub struct Widget;\n"),
+        ]);
+        let root = file(&analyzer, "lib.rs");
+        with_usage_read_frame(&analyzer, || {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let keep_going = AtomicBool::new(true);
+            let progress = || keep_going.load(Ordering::Relaxed);
+            let walks = RustUsageWalks::new_while(&analyzer, scope.token(), &progress).unwrap();
+            keep_going.store(false, Ordering::Relaxed);
+            for attempt in 0..2 {
+                let (routes, receipt) =
+                    QueryReadReceipt::capture(&analyzer, || walks.file_routes(&root));
+                assert!(!routes.is_complete());
+                assert!(
+                    receipt
+                        .incomplete_reasons()
+                        .contains(&QueryReadIncomplete::Cancelled),
+                    "capture {attempt} must observe typed cancellation: {:?}",
+                    receipt.incomplete_reasons()
+                );
+            }
+            // A new request-memo key may stop before its producer runs. Each
+            // consumer still needs the typed cancellation, including packages.
+            use brokk_bifrost_rust::graph_support::RustSource;
+            let (_, package) = QueryReadReceipt::capture(&analyzer, || {
+                assert!(
+                    !walks
+                        .files_in_module_package("routes::uncached")
+                        .is_closed()
+                );
+            });
+            let (_, membership) = QueryReadReceipt::capture(&analyzer, || {
+                assert!(matches!(
+                    analyzer.package_contains(scope.token(), &root, Some(&progress)),
+                    Err(RustCargoRouteError::Cancelled)
+                ));
+            });
+            let (_, libraries) = QueryReadReceipt::capture(&analyzer, || {
+                assert!(matches!(
+                    analyzer.unscoped_libraries("uncached", Some(&progress)),
+                    Err(RustCargoRouteError::Cancelled)
+                ));
+            });
+            for receipt in [package, membership, libraries] {
+                assert!(
+                    receipt
+                        .incomplete_reasons()
+                        .contains(&QueryReadIncomplete::Cancelled)
+                );
+            }
+            keep_going.store(true, Ordering::Relaxed);
+            let (routes, receipt) =
+                QueryReadReceipt::capture(&analyzer, || walks.file_routes(&root));
+            assert!(
+                routes.is_complete(),
+                "the same walker retries resumed progress"
+            );
+            assert!(
+                !receipt
+                    .incomplete_reasons()
+                    .contains(&QueryReadIncomplete::Cancelled)
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon("#13024: suppressed unavailable routes lost nested completion evidence")]
+    fn unavailable_file_routes_replay_failure_without_publishing_closed_walks() {
+        use brokk_bifrost_analysis::analyzer::ReadLedger;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
+        use brokk_bifrost_core::cancellation::CancellationToken;
+
+        let (_fixture, analyzer) = project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"routes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod service;\n"),
+            ("src/service.rs", "pub struct Widget;\n"),
+        ]);
+        let root = file(&analyzer, "lib.rs");
+        let other = file(&analyzer, "service.rs");
+        let operation = match analyzer
+            .open_selected_rust_operation(&CancellationToken::default())
+            .outcome
+            .unwrap()
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("selected operation: {other:?}"),
+        };
+        // This real operation intentionally has no read frame. The route
+        // producer refuses it with Unavailable and records operational work.
+        let ledger = std::sync::Arc::new(ReadLedger::new());
+        let scope = AnalyzerQueryScope::with_read_ledger(&analyzer, ledger.clone());
+        let walks = RustUsageWalks::new(&analyzer, scope.token()).unwrap();
+        let (routes, failure) = QueryReadReceipt::capture(&analyzer, || walks.file_routes(&root));
+        assert!(!routes.is_complete());
+        assert!(!failure.incomplete_reasons().is_empty());
+        let first = ledger.execution_dependences();
+        assert!(first > 0, "the production route guard was exercised");
+        // A later cache fill cannot publish even a purely filesystem answer as
+        // Closed after this walker has observed the unavailable route.
+        let probes = walks.caches.module_probe_computations();
+        for _ in 0..2 {
+            let answer = walks.probed_module_files_from_segments(&root, &["service".to_owned()]);
+            assert!(
+                !answer.is_closed(),
+                "a failed walker cannot publish a Closed fill"
+            );
+        }
+        assert_eq!(walks.caches.module_probe_computations(), probes + 2);
+        for attempt in 0..16 {
+            let (routes, later) = QueryReadReceipt::capture(&analyzer, || walks.file_routes(&root));
+            assert!(!routes.is_complete());
+            assert_eq!(
+                later.incomplete_reasons(),
+                failure.incomplete_reasons(),
+                "capture {attempt} must preserve the suppressed route failure"
+            );
+        }
+        let before_other = ledger.execution_dependences();
+        assert!(!walks.file_routes(&other).is_complete());
+        assert!(
+            ledger.execution_dependences() > before_other,
+            "failure suppression is per file"
+        );
+        assert!(!walks.routes_are_complete());
+
+        // Restoring the operation's frame permits a fresh walker to retry;
+        // the original walk still owns its earlier failed observation.
+        let _frame = analyzer.operation_read_frame(&operation).unwrap();
+        let (routes, suppressed) =
+            QueryReadReceipt::capture(&analyzer, || walks.file_routes(&root));
+        assert!(
+            !routes.is_complete(),
+            "suppression must not re-demand a now-healthy producer"
+        );
+        assert_eq!(
+            suppressed.incomplete_reasons(),
+            failure.incomplete_reasons()
+        );
+        let fresh = RustUsageWalks::new(&analyzer, scope.token()).unwrap();
+        assert!(fresh.file_routes(&root).is_complete());
+        let healthy = fresh.probed_module_files_from_segments(&root, &["service".to_owned()]);
+        assert!(
+            healthy.is_closed(),
+            "a fresh walker can retain the healthy answer"
+        );
+        let repeat = fresh.probed_module_files_from_segments(&root, &["service".to_owned()]);
+        assert!(brokk_bifrost_rust::usage_walks::Walked::ptr_eq(
+            &healthy, &repeat
+        ));
+    }
+
+    #[test]
     fn cancellation_reaches_warm_forward_and_binding_edge_walks() {
         let (_temp, analyzer) = binding_edge_project();
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let keep_going = AtomicBool::new(true);
-        let should_continue = || keep_going.load(Ordering::Relaxed);
-        let walks = RustUsageWalks::new_while(&analyzer, analyzer_scope.token(), &should_continue)
-            .expect("Cargo routes available for the fixture");
-        let service = file(&analyzer, "service.rs");
-        let consumer = file(&analyzer, "consumer.rs");
-        let target = identity_named(&walks, &service, "Widget");
+        with_usage_read_frame(&analyzer, || {
+            let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+            let keep_going = AtomicBool::new(true);
+            let should_continue = || keep_going.load(Ordering::Relaxed);
+            let walks =
+                RustUsageWalks::new_while(&analyzer, analyzer_scope.token(), &should_continue)
+                    .expect("Cargo routes available for the fixture");
+            let service = file(&analyzer, "service.rs");
+            let consumer = file(&analyzer, "consumer.rs");
+            let target = identity_named(&walks, &service, "Widget");
 
-        walks
-            .forward_import_edges_of(&consumer)
-            .expect("healthy forward edge walk");
-        walks
-            .edges_binding_identity(&target)
-            .expect("healthy binding edge walk");
+            walks
+                .forward_import_edges_of(&consumer)
+                .expect("healthy forward edge walk");
+            walks
+                .edges_binding_identity(&target)
+                .expect("healthy binding edge walk");
 
-        keep_going.store(false, Ordering::Relaxed);
-        assert_eq!(
-            walks.forward_import_edges_of(&consumer).unwrap_err(),
-            RustCargoRouteError::Cancelled,
-            "cancellation must win over a warm forward-edge cache"
-        );
-        assert_eq!(
-            walks.edges_binding_identity(&target).unwrap_err(),
-            RustCargoRouteError::Cancelled,
-            "cancellation must win over a warm binding-edge cache"
-        );
+            keep_going.store(false, Ordering::Relaxed);
+            assert_eq!(
+                walks.forward_import_edges_of(&consumer).unwrap_err(),
+                RustCargoRouteError::Cancelled,
+                "cancellation must win over a warm forward-edge cache"
+            );
+            assert_eq!(
+                walks.edges_binding_identity(&target).unwrap_err(),
+                RustCargoRouteError::Cancelled,
+                "cancellation must win over a warm binding-edge cache"
+            );
+        });
     }
 
     /// The module-name supplement exists for imports that do not spell the
@@ -604,52 +772,54 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             ("src/tail.rs", "pub struct Value;\n"),
         ];
         let (_temp, analyzer) = project(&files);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let head = file(&analyzer, "link0.rs");
-        let tail = file(&analyzer, "tail.rs");
-        let head_module = walks.physical_root_of(&head).expect("link0 is analyzed");
+        with_usage_read_frame(&analyzer, || {
+            let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture");
+            let head = file(&analyzer, "link0.rs");
+            let tail = file(&analyzer, "tail.rs");
+            let head_module = walks.physical_root_of(&head).expect("link0 is analyzed");
 
-        let bindings = walks
-            .bindings_at(&head, &head_module)
-            .expect("uncancelled deep export walk");
-        let value = bindings
-            .iter()
-            .find(|binding| binding.name == "Value")
-            .expect("the head of the ladder publishes Value");
-        assert_eq!(
-            value.origin.file, tail,
-            "the whole ladder resolves to the one real declaration"
-        );
-        assert!(
-            walks.recursion_computations() >= LINKS,
-            "the walk must visit every link in the ladder: {} for {LINKS} links",
-            walks.recursion_computations()
-        );
-        assert!(
-            walks.recursion_computations() <= 8 * LINKS + 1,
-            "the explicit worklist must visit each ladder key a bounded number of times: {} for {LINKS} links",
-            walks.recursion_computations()
-        );
-        assert!(
-            walks.import_binding_computations() <= (LINKS + 1) as u64,
-            "the ladder must decode each import-bearing file at most once: {} for {LINKS} links",
-            walks.import_binding_computations()
-        );
-        let classified = walks.queries().path_identity_computations();
-        let _ = walks
-            .bindings_at(&head, &head_module)
-            .expect("repeated uncancelled deep export walk");
-        assert_eq!(
-            walks.queries().path_identity_computations(),
-            classified,
-            "repeating the fixed-point answer must not reclassify path identities"
-        );
-        assert!(
-            classified <= (LINKS + 1) as u64,
-            "the ladder must classify each file at most once: {classified} for {LINKS} links"
-        );
+            let bindings = walks
+                .bindings_at(&head, &head_module)
+                .expect("uncancelled deep export walk");
+            let value = bindings
+                .iter()
+                .find(|binding| binding.name == "Value")
+                .expect("the head of the ladder publishes Value");
+            assert_eq!(
+                value.origin.file, tail,
+                "the whole ladder resolves to the one real declaration"
+            );
+            assert!(
+                walks.recursion_computations() >= LINKS,
+                "the walk must visit every link in the ladder: {} for {LINKS} links",
+                walks.recursion_computations()
+            );
+            assert!(
+                walks.recursion_computations() <= 8 * LINKS + 1,
+                "the explicit worklist must visit each ladder key a bounded number of times: {} for {LINKS} links",
+                walks.recursion_computations()
+            );
+            assert!(
+                walks.import_binding_computations() <= (LINKS + 1) as u64,
+                "the ladder must decode each import-bearing file at most once: {} for {LINKS} links",
+                walks.import_binding_computations()
+            );
+            let classified = walks.queries().path_identity_computations();
+            let _ = walks
+                .bindings_at(&head, &head_module)
+                .expect("repeated uncancelled deep export walk");
+            assert_eq!(
+                walks.queries().path_identity_computations(),
+                classified,
+                "repeating the fixed-point answer must not reclassify path identities"
+            );
+            assert!(
+                classified <= (LINKS + 1) as u64,
+                "the ladder must classify each file at most once: {classified} for {LINKS} links"
+            );
+        });
     }
 
     /// The alias search stops at the longest prefix that has any route and does
@@ -1040,31 +1210,37 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             ("src/lib.rs", "pub mod service;\n"),
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let first = walks.files_in_module_package("service");
-        let second = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture")
-            .files_in_module_package("service");
-        assert!(
-            Walked::ptr_eq(&first, &second),
-            "a second walker in the same generation must hit the cache"
-        );
-        // Both the file whose package IS the module and the file that
-        // declares `mod service;` back it, which is what `RustModuleFiles`
-        // held in its two maps.
-        assert_eq!(
-            first.as_slice(),
-            vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")].as_slice(),
-            "files were {first:?}"
-        );
+        let first = with_usage_read_frame(&analyzer, || {
+            let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture");
+            let first = walks.files_in_module_package("service");
+            let second = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture")
+                .files_in_module_package("service");
+            assert!(
+                Walked::ptr_eq(&first, &second),
+                "a second walker in the same generation must hit the cache"
+            );
+            // Both the file whose package IS the module and the file that
+            // declares `mod service;` back it, which is what `RustModuleFiles`
+            // held in its two maps.
+            assert_eq!(
+                first.as_slice(),
+                vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")].as_slice(),
+                "files were {first:?}"
+            );
+
+            first
+        });
 
         let updated = analyzer.update_all();
-        let updated_scope = AnalyzerQueryScope::new(&updated);
-        let after = RustUsageWalks::new(&updated, updated_scope.token())
-            .expect("Cargo routes available after update")
-            .files_in_module_package("service");
+        let after = with_usage_read_frame(&updated, || {
+            let updated_scope = AnalyzerQueryScope::new(&updated);
+            RustUsageWalks::new(&updated, updated_scope.token())
+                .expect("Cargo routes available after update")
+                .files_in_module_package("service")
+        });
         assert!(
             !Walked::ptr_eq(&first, &after),
             "a generation bump must not serve the previous generation's entry"
@@ -1077,51 +1253,53 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
         const MODULES: usize = 24;
         const NEIGHBOURS: usize = 4;
         let (_temp, analyzer) = cyclic_project(MODULES, NEIGHBOURS);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let head = file(&analyzer, "m0.rs");
-        let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
+        with_usage_read_frame(&analyzer, || {
+            let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture");
+            let head = file(&analyzer, "m0.rs");
+            let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
 
-        let bindings = walks
-            .bindings_at(&head, &head_module)
-            .expect("uncancelled cyclic walk");
+            let bindings = walks
+                .bindings_at(&head, &head_module)
+                .expect("uncancelled cyclic walk");
 
-        // The cycle must still answer, and answer with the real declarations:
-        // `m0` publishes its own `Item0` and the four names it re-exports,
-        // each keeping the module that declares it as its origin.
-        let published: BTreeSet<(String, String)> = bindings
-            .iter()
-            .map(|binding| {
-                (
-                    binding.name.clone(),
-                    binding
-                        .origin
-                        .file
-                        .rel_path()
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            published,
-            (0..=NEIGHBOURS)
-                .map(|index| (format!("Item{index}"), format!("src/m{index}.rs")))
-                .collect::<BTreeSet<_>>(),
-            "the cycle must resolve every re-exported name to its declaration"
-        );
-        assert!(
-            walks.recursion_computations() <= 16 * MODULES,
-            "a cyclic module graph must cost a bounded number of recursions, \
+            // The cycle must still answer, and answer with the real declarations:
+            // `m0` publishes its own `Item0` and the four names it re-exports,
+            // each keeping the module that declares it as its origin.
+            let published: BTreeSet<(String, String)> = bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.name.clone(),
+                        binding
+                            .origin
+                            .file
+                            .rel_path()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                published,
+                (0..=NEIGHBOURS)
+                    .map(|index| (format!("Item{index}"), format!("src/m{index}.rs")))
+                    .collect::<BTreeSet<_>>(),
+                "the cycle must resolve every re-exported name to its declaration"
+            );
+            assert!(
+                walks.recursion_computations() <= 16 * MODULES,
+                "a cyclic module graph must cost a bounded number of recursions, \
              not one per path through the cycle: {} for {MODULES} modules",
-            walks.recursion_computations()
-        );
-        assert!(
-            walks.import_binding_computations() <= (MODULES + 1) as u64,
-            "cyclic fixed-point rounds must decode each import-bearing file once: {} for {MODULES} modules",
-            walks.import_binding_computations()
-        );
+                walks.recursion_computations()
+            );
+            assert!(
+                walks.import_binding_computations() <= (MODULES + 1) as u64,
+                "cyclic fixed-point rounds must decode each import-bearing file once: {} for {MODULES} modules",
+                walks.import_binding_computations()
+            );
+        });
     }
 
     #[hardwon("#11799: the Rust usage walk re-read Cargo.toml for every non-rooted path segment")]
@@ -1160,29 +1338,31 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             .map(|(rel, body)| (rel.as_str(), body.as_str()))
             .collect();
         let (_temp, analyzer) = project(&borrowed);
-        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
-            .expect("Cargo routes available for the fixture");
-        let root = file(&analyzer, "m0.rs").root().to_path_buf();
+        with_usage_read_frame(&analyzer, || {
+            let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture");
+            let root = file(&analyzer, "m0.rs").root().to_path_buf();
 
-        let before = brokk_bifrost_rust::crate_naming::manifest_probes(&root);
-        for index in 0..MODULES {
-            walks
-                .origin_routes_of(&file(&analyzer, &format!("m{index}.rs")))
-                .expect("uncancelled walk");
-        }
-        let probes = brokk_bifrost_rust::crate_naming::manifest_probes(&root) - before;
+            let before = brokk_bifrost_rust::crate_naming::manifest_probes(&root);
+            for index in 0..MODULES {
+                walks
+                    .origin_routes_of(&file(&analyzer, &format!("m{index}.rs")))
+                    .expect("uncancelled walk");
+            }
+            let probes = brokk_bifrost_rust::crate_naming::manifest_probes(&root) - before;
 
-        // The fixture has two manifest directories to ask about, `src` and
-        // the root, and the owner's caches remember each answer. A walk that
-        // built its own caches per path segment probed on every one of the
-        // MODULES * STD_IMPORTS.len() imports instead.
-        assert!(
-            probes <= 2,
-            "{probes} manifest probes for {} imports: the walk must read the \
+            // The fixture has two manifest directories to ask about, `src` and
+            // the root, and the owner's caches remember each answer. A walk that
+            // built its own caches per path segment probed on every one of the
+            // MODULES * STD_IMPORTS.len() imports instead.
+            assert!(
+                probes <= 2,
+                "{probes} manifest probes for {} imports: the walk must read the \
              owner's manifest source, memoized per directory",
-            MODULES * STD_IMPORTS.len()
-        );
+                MODULES * STD_IMPORTS.len()
+            );
+        });
     }
 
     #[test]

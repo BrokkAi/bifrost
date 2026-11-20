@@ -39,8 +39,23 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 22;
 pub const FENCED_COMPLETENESS_MIN_SCHEMA_VERSION: u32 = 27;
 /// Rust artifact approximation provenance first appears in schema 28.
 pub const RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION: u32 = 28;
-/// Latest supported pack schema, including certified Rust API stability.
-pub const SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION: u32 = 40;
+/// Latest supported pack schema, including reviewed interior mutability
+/// and Rust generic-parameter kinds above target-independent claims in 44.
+pub const SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION: u32 =
+    INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION;
+/// First schema that records method type-parameter bounds.
+pub const METHOD_TYPE_PARAMETER_BOUNDS_MIN_SCHEMA_VERSION: u32 = 41;
+/// First schema with reviewed interior-mutability claims.
+pub const INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION: u32 = 45;
+/// Type/const parameter evidence shares the claim contract's schema.
+pub const RUST_GENERIC_PARAMETER_KINDS_MIN_SCHEMA_VERSION: u32 =
+    INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION;
+/// First schema in which a Rust inherent member may record the type arguments
+/// of its declaring impl block (#14209). It shares the working latest number.
+pub const RUST_INHERENT_IMPL_SELF_ARGUMENTS_MIN_SCHEMA_VERSION: u32 =
+    INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION;
+/// First schema for authored target-independent callable-family claims.
+pub const TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION: u32 = 44;
 /// The first schema that admits verified Rust sysroot receipts.
 pub const RUST_SYSROOT_RECEIPT_MIN_SCHEMA_VERSION: u32 = 38;
 /// The first schema in which a Rust trait member's signature may name the
@@ -72,9 +87,46 @@ pub const LIFECYCLE_COVERAGE_MIN_SCHEMA_VERSION: u32 = 26;
 /// `tests/fixtures/golden/semantic-procedure-claims/wire-contract/expected.txt`;
 /// re-bless that golden with `BIFROST_BLESS=1` in the same change.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29, 30,
-    31, 32, 35, 37, 38, 39, 40,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    35,
+    37,
+    38,
+    39,
+    40,
+    METHOD_TYPE_PARAMETER_BOUNDS_MIN_SCHEMA_VERSION,
+    CLASS_FINALITY_MIN_SCHEMA_VERSION,
+    TARGET_INDEPENDENT_CLAIM_MIN_SCHEMA_VERSION,
+    INTERIOR_MUTABILITY_MIN_SCHEMA_VERSION,
 ];
+/// #10572: distinct class finality requires schema 43.
+pub const CLASS_FINALITY_MIN_SCHEMA_VERSION: u32 = 43;
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
 /// Native callable-values facts first appeared in schema ten.
@@ -1073,7 +1125,9 @@ impl RustExternalReexport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactExtractionKind {
     NpmPackageManifest,
@@ -1638,7 +1692,42 @@ pub struct Producer {
     pub version: String,
 }
 
+/// Shared identity lever for every dependency adapter.
+pub fn dependency_production_revision() -> &'static str {
+    static REVISION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let label = brokk_bifrost_core::lever_label!(
+            "dependency-production-revision",
+            "dependency-production-revision.tokens"
+        );
+        let (_, digest) = label
+            .rsplit_once('/')
+            .expect("lever label contains its digest");
+        format!("dependency-production-{digest}")
+    });
+    REVISION.as_str()
+}
+
 impl Producer {
+    /// Rotate dependency productions and read-free aliases without changing
+    /// unrelated artifact producers or the generated-cache format.
+    pub fn with_dependency_revision(mut self) -> Self {
+        let separator = if self.version.contains('+') { "." } else { "+" };
+        self.version = format!(
+            "{}{separator}{}",
+            self.version,
+            dependency_production_revision()
+        );
+        self
+    }
+
+    pub fn has_current_dependency_revision(&self) -> bool {
+        self.version.split_once('+').is_some_and(|(_, metadata)| {
+            metadata
+                .split('.')
+                .any(|field| field == dependency_production_revision())
+        })
+    }
+
     #[doc(hidden)]
     pub fn for_name(name: &str) -> Self {
         Self {
@@ -1830,17 +1919,19 @@ mod compatibility_tests {
         assert!(mixed.validate_for_schema(9).is_err());
         assert!(mixed.validate_for_schema(11).is_err());
         assert!(missing_legacy.matches_engine(11, &engine).unwrap());
-        // The supported set is not contiguous: schema 23-25, 33-34 and 36 are
-        // absent, while 35 (typed input/output
+        // The supported set is not contiguous: schema 23-25, 33-34, 36 and
+        // 42 are absent, while 35 (typed input/output
         // components), 37 (summarized element paths), 38 (verified Rust
-        // sysroot receipts), 39 (trait-member Self signatures), and the latest 40
-        // (certified Rust API stability)
+        // sysroot receipts), 39 (trait-member Self signatures), 40
+        // (certified Rust API stability), 41 (method type-parameter bounds),
+        // 43 (distinct class finality), 44 (target-independent family claims),
+        // and 45 (interior-mutability and generic-parameter claims)
         // are present. Derive the newest entry from the latest-supported
         // constant so a stale maximum fails here.
         assert_eq!(
             SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
             (2..=22)
-                .chain([26, 27, 28, 29, 30, 31, 32, 35, 37, 38, 39])
+                .chain([26, 27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 43, 44])
                 .chain([SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION])
                 .collect::<Vec<_>>()
         );
@@ -3247,6 +3338,14 @@ pub enum AuthoredAtomicOperation {
     ReadModifyWrite,
 }
 
+/// Trusted production/catalog provenance; never read from authored pack JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SemanticPackOrigin {
+    #[default]
+    Authored,
+    Generated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActivationSelector {
@@ -3262,6 +3361,9 @@ pub struct ActivationSelector {
     pub configurations: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_sha256: Option<String>,
+    /// Composite binding reserved for engine-generated dependency selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_input_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3290,6 +3392,9 @@ pub struct TypeFact {
     pub is_abstract: bool,
     #[serde(default)]
     pub is_sealed: bool,
+    /// Exact class finality; absence is unknown, never a negative claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_final: Option<bool>,
     /// Every directly declared externally visible callable and direct
     /// hierarchy edge is represented. This positive inventory claim excludes
     /// inherited members, fields, effects and overload applicability. False
@@ -3305,6 +3410,10 @@ pub struct TypeFact {
     pub has_explicit_type_terms: bool,
     #[serde(default)]
     pub type_parameters: Vec<String>,
+    /// Rust formal kinds, parallel to type_parameters (lifetimes excluded).
+    /// Empty/omitted is Unknown; a name or missing default is not type evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_parameter_kinds: Vec<GenericParameterKind>,
     #[serde(default)]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
     /// Empty means unreviewed; otherwise parallel to type_parameters (lifetimes excluded).
@@ -3410,6 +3519,27 @@ impl TupleFieldSlot {
         match self {
             Self::Public { ordinal, .. } | Self::Opaque { ordinal, .. } => *ordinal,
         }
+    }
+}
+
+/// Structural Rust generic-parameter evidence. Unknown does not certify a
+/// type argument and therefore cannot discharge a dependent type claim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericParameterKind {
+    Type,
+    Const,
+    #[default]
+    Unknown,
+}
+
+impl TypeFact {
+    /// Omitted or incomplete producer evidence never guesses from spelling.
+    pub fn type_parameter_kind(&self, index: usize) -> GenericParameterKind {
+        self.type_parameter_kinds
+            .get(index)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -3676,6 +3806,27 @@ pub struct TypeValueSemantics {
     /// Exact reviewed applicability for either destruction claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_review: Option<TypeDropReview>,
+    /// Interior mutability of the guarded value's data through a shared
+    /// borrow. Missing or older declarations make no claim. This property
+    /// is independent of copyability, drop behavior and binding mutability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior_mutability: Option<TypeInteriorMutability>,
+}
+
+/// Selected type evidence for shared-borrow guard stability. A producer may
+/// claim absence only from an exhaustive transitive field closure without
+/// UnsafeCell, or an individually reviewed declaration with evidence. An
+/// incomplete closure omits the claim. Unknown is represented by omission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeInteriorMutability {
+    Absent,
+    Present,
+    /// Zero-based positions in the owning type's formal type-parameter list.
+    /// The set must be nonempty and every selected argument must be known.
+    DependsOnTypeArguments {
+        which: std::collections::BTreeSet<u32>,
+    },
 }
 
 /// A complete library effect bound; payload and cross-crate fields compose.
@@ -4083,6 +4234,27 @@ pub struct MemberFact {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[schemars(extend("default" = false))]
     pub callable_family_complete: bool,
+    /// The reviewed claim that `callable_family_complete` above holds on
+    /// every target the declared toolchain builds for, so an approximate
+    /// activation whose only uncertainty is the target may keep it. Authored
+    /// packs only: generators cannot construct the value (see
+    /// [`TargetIndependentClaim`]) and validation rejects it in generated or
+    /// extraction packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_independent: Option<TargetIndependentClaim>,
+    /// The type arguments of the Rust inherent impl block that declares this
+    /// member, one per type parameter of the owner and in the owner's order.
+    /// `impl<R: Read> ZipArchive<R>` records `[type_parameter R]`;
+    /// `impl Partial<u8>` records `[named u8]`. A parameter of the impl block
+    /// is a `type_parameter`, whatever its bounds; every other argument is a
+    /// specialization. Absence means the producer did not record the impl
+    /// block, never that the impl applies to every instantiation.
+    ///
+    /// A call whose receiver arguments are unknown selects an inherent member
+    /// only when every same-named inherent member of the owner records
+    /// pairwise distinct impl parameters here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherent_impl_self_arguments: Option<Vec<TypeRef>>,
     /// The complete set of runtime classes this callable can return. Each
     /// entry is a class identity, not a return annotation; absence leaves the
     /// runtime class open.
@@ -4457,6 +4629,13 @@ pub struct ReceiverFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Signature {
+    /// None means not recorded (UNKNOWN). Some(list) is complete for predicates
+    /// declared on this signature. An own parameter with no entry is unbounded:
+    /// implicit Object in Java, default Sized in Rust unless maybe is true.
+    /// Enclosing class or impl parameters remain on their owner; a Rust where
+    /// clause may still bound an enclosing parameter or projection via subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<Vec<GenericTraitBound>>,
     #[serde(default)]
     pub type_parameters: Vec<String>,
     #[serde(default)]
@@ -5161,6 +5340,8 @@ pub enum EmittedDeclaration {
         is_abstract: bool,
         #[serde(default)]
         is_sealed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_final: Option<bool>,
         #[serde(default)]
         type_parameters: Vec<TemplateExpression>,
         #[serde(default)]
@@ -5336,6 +5517,12 @@ pub struct GoPinnedPackage {
     pub files: Vec<String>,
 }
 
+/// Whether a target's complete model must also describe its overrides.
+/// Exact dispatch selects one implementation; receiverless calls have no overrides.
+pub const fn target_needs_override_claim(has_receiver: bool, dispatch_is_exact: bool) -> bool {
+    has_receiver && !dispatch_is_exact
+}
+
 /// Effective regular API stability; const stability is a separate contract.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -5375,3 +5562,171 @@ where
 
 /// First schema carrying native rustdoc effective stability certificates.
 pub const RUST_STABILITY_MIN_SCHEMA_VERSION: u32 = 40;
+
+pub use target_independent_claim::TargetIndependentClaim;
+
+mod target_independent_claim {
+    use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::borrow::Cow;
+
+    /// The wire value `true` of `MemberFact::target_independent`.
+    ///
+    /// The type has no constructor outside this module: generators in other
+    /// crates, and every in-crate producer, can only write `None`. The only
+    /// way to obtain a value is to read it from authored pack bytes, where
+    /// validation additionally refuses it in generated and extraction packs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct TargetIndependentClaim(());
+
+    impl Serialize for TargetIndependentClaim {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bool(true)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for TargetIndependentClaim {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            if bool::deserialize(deserializer)? {
+                Ok(Self(()))
+            } else {
+                Err(serde::de::Error::custom(
+                    "target_independent is a claim: omit it instead of writing false",
+                ))
+            }
+        }
+    }
+
+    impl JsonSchema for TargetIndependentClaim {
+        fn schema_name() -> Cow<'static, str> {
+            Cow::Borrowed("TargetIndependentClaim")
+        }
+
+        fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+            json_schema!({ "type": "boolean", "const": true })
+        }
+    }
+}
+
+#[cfg(test)]
+mod target_independent_construction_tests {
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+
+    /// Whole-word occurrences of `target_independent` (not `callable_family_target_independent`).
+    fn mentions(line: &str) -> usize {
+        let word = "target_independent";
+        line.match_indices(word)
+            .filter(|(at, _)| {
+                let before = line[..*at].chars().next_back();
+                let after = line[at + word.len()..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .count()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13674: generators must not be able to emit an authored target-independence claim"
+    )]
+    fn no_producer_writes_a_target_independent_claim() {
+        // The only places that may name the field beyond writing `None`: the
+        // model and validator that define and check it, and the composition
+        // side that reads the authored flag. Every generator crate, and every
+        // other module, can only write `target_independent: None`.
+        let allowed = [
+            "bifrost-semantic/src/analyzer/semantic_model/model.rs",
+            "bifrost-semantic/src/analyzer/semantic_model/validate.rs",
+            "bifrost-analysis/src/analyzer/semantic_model/overlay.rs",
+            "bifrost-analysis/src/analyzer/semantic_model/overlay/catalog_row_parity.rs",
+        ];
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(crates).unwrap() {
+            let source = entry.unwrap().path().join("src");
+            if source.is_dir() {
+                rust_sources(&source, &mut files);
+            }
+        }
+        assert!(files.len() > 100, "the scan must see the workspace");
+        let mut offenders = Vec::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(crates)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if allowed.contains(&relative.as_str()) {
+                continue;
+            }
+            for (number, line) in std::fs::read_to_string(&file).unwrap().lines().enumerate() {
+                let writes_none = line.contains("target_independent: None");
+                if mentions(line) > 0 && !writes_none || line.contains("TargetIndependentClaim") {
+                    offenders.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+}
+
+#[cfg(test)]
+mod dependency_revision_tests {
+    use super::Producer;
+
+    #[test]
+    fn dependency_revision_preserves_semver_metadata_and_rotates_keys() {
+        use crate::analyzer::semantic_model::{
+            GeneratedProductionKey, SEMANTIC_MODEL_SCHEMA_VERSION,
+        };
+        for version in [
+            "1.2.3",
+            "1.2.3+go-pack-1",
+            "1.2.3+rust-pack-10",
+            "1.2.3+csharp-pack-1",
+        ] {
+            let original = Producer {
+                name: "fixture".into(),
+                version: version.into(),
+            };
+            let revised = original.clone().with_dependency_revision();
+            let parsed = semver::Version::parse(&revised.version)
+                .expect("producer revision must remain semantic-version metadata");
+            assert_eq!((parsed.major, parsed.minor, parsed.patch), (1, 2, 3));
+            let original_build = semver::Version::parse(version).unwrap().build;
+            assert!(parsed.build.as_str().starts_with(original_build.as_str()));
+            assert!(!original.has_current_dependency_revision());
+            assert!(revised.has_current_dependency_revision());
+            // A language-specific revision may follow the shared revision.
+            let composed = Producer {
+                version: format!("{}.language-revision-2", revised.version),
+                ..revised.clone()
+            };
+            assert!(composed.has_current_dependency_revision());
+            let key = |producer: &Producer| {
+                GeneratedProductionKey::new(
+                    "a".repeat(64),
+                    &producer.name,
+                    &producer.version,
+                    SEMANTIC_MODEL_SCHEMA_VERSION,
+                )
+                .unwrap()
+            };
+            assert_ne!(
+                key(&original).production_digest(),
+                key(&revised).production_digest()
+            );
+        }
+    }
+}

@@ -1,5 +1,7 @@
 //! Go call relations projected from selected inverse and forward operations.
 
+use std::sync::Arc;
+
 use brokk_bifrost_analysis::analyzer::usages::call_relations::{
     CallRelationDiagnosticPayload, CallRelationFailure, LocatedCallRelationDiagnostic,
 };
@@ -52,6 +54,14 @@ use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
 
 /// Native Go call-relation projection used by Go production dispatch.
 pub struct GoNativeCallRelations;
+
+/// Whole-file map of bound method-value call callee spans to their
+/// selection's selector spans; `None` when the file's procedure enumeration
+/// is unavailable or incomplete. Computed once per file and dispatch batch or
+/// session, shared through `CallDispatchLanguageRequest::special_dispatch_memos`.
+struct GoBoundMethodValueCallSpans(
+    Option<brokk_bifrost_core::hash::HashMap<(usize, usize), (usize, usize)>>,
+);
 
 impl CallRelationProvider for GoNativeCallRelations {
     fn proof_authority(&self) -> UsageProofAuthority {
@@ -130,6 +140,125 @@ impl CallRelationProvider for GoNativeCallRelations {
             brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
             &cancellation,
         )
+    }
+
+    fn dispatch_special_call_site(
+        &self,
+        request: brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLanguageRequest<'_>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLookup> {
+        let root = request.tree.root_node();
+        let mut node = root.named_descendant_for_byte_range(
+            request.call_span.start_byte,
+            request.call_span.end_byte,
+        )?;
+        let call_node = loop {
+            if node.kind() == "call_expression"
+                && node.start_byte() == request.call_span.start_byte
+                && node.end_byte() == request.call_span.end_byte
+            {
+                break node;
+            }
+            node = node.parent()?;
+        };
+        if call_node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "go_statement")
+        {
+            return None;
+        }
+        let mut function = call_node.child_by_field_name("function")?;
+        while function.kind() == "parenthesized_expression" {
+            let mut cursor = function.walk();
+            function = function.named_children(&mut cursor).next()?;
+        }
+        if function.kind() != "identifier" {
+            return None;
+        }
+        // The whole-file enumeration runs once per dispatch batch or session;
+        // every later identifier call in the same file reuses this memo.
+        let memo = request.special_dispatch_memos.get(&root.id()).cloned();
+        let memo = match memo {
+            Some(memo) => memo,
+            None => {
+                let computed: Arc<dyn std::any::Any + Send + Sync> =
+                    Arc::new(GoBoundMethodValueCallSpans(
+                        crate::analyzer::go::semantic::go_bound_method_value_file_call_selectors(
+                            request.file,
+                            request.tree,
+                            request.source,
+                            request.cancellation,
+                        ),
+                    ));
+                request
+                    .special_dispatch_memos
+                    .insert(root.id(), Arc::clone(&computed));
+                computed
+            }
+        };
+        let spans = memo
+            .downcast_ref::<GoBoundMethodValueCallSpans>()
+            .expect("the Go dispatch hook writes its own memo type")
+            .0
+            .as_ref()?;
+        let (sel_start, sel_end) = *spans.get(&(function.start_byte(), function.end_byte()))?;
+        let mut current = root.named_descendant_for_byte_range(sel_start, sel_end)?;
+        let sel_node = loop {
+            if current.kind() == "selector_expression"
+                && current.start_byte() == sel_start
+                && current.end_byte() == sel_end
+            {
+                break current;
+            }
+            current = current.parent()?;
+        };
+        let field = sel_node.child_by_field_name("field")?;
+        let member_text = request.source.get(field.byte_range())?.to_owned();
+        let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+            path: brokk_bifrost_core::path_utils::rel_path_string(request.file),
+            text: member_text,
+            range: brokk_bifrost_core::analyzer::model::Range {
+                start_byte: field.start_byte(),
+                end_byte: field.end_byte(),
+                start_line: field.start_position().row + 1,
+                end_line: field.end_position().row + 1,
+            },
+            focus_start_byte: field.start_byte(),
+            focus_end_byte: field.end_byte(),
+        };
+        let query = brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+            analyzer: request.analyzer,
+            file: request.file,
+            source: request.source,
+            tree: Some(request.tree),
+            site: &site,
+            budget:
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
+            cancellation: request.cancellation,
+        };
+        let resolution =
+            crate::analyzer::usages::get_definition::go::resolve_go_definition_for_special_dispatch(
+                query,
+            );
+        let mut lookup =
+            brokk_bifrost_analysis::analyzer::usages::call_relations::dispatch_selected_call(
+                request.analyzer,
+                request.file,
+                resolution,
+                request.work,
+            );
+        crate::analyzer::go::selector_calls::apply_go_typed_selector_target_for_call_node(
+            &mut lookup,
+            request.analyzer,
+            request.token,
+            request.file,
+            request.source,
+            request.tree,
+            sel_node,
+            call_node,
+            request.cancellation,
+            request.member_selection,
+        );
+        Some(lookup)
     }
 }
 

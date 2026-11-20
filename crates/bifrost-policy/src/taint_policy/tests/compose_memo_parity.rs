@@ -154,21 +154,21 @@ fn with_composed_batches(
     );
 }
 
-fn with_composed_project(
+fn with_composed_project<Signature>(
     project: &BuiltInlineTestProject,
     workspace: &WorkspaceAnalyzer,
     active_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     policies: &[&str],
     rows_for: impl FnOnce(
         &mut Rows<'_>,
-        &dyn Fn(&CompositionMemo) -> PolicyFlowSignature,
+        &dyn Fn(&CompositionMemo) -> Signature,
         &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
     ),
     run: impl Fn(
         &crate::taint_compose_provider::PolicyCompositionProvider<'_>,
         &brokk_bifrost_flow::taint::TaintAnalysisPlan,
         &mut SemanticRequest<'_>,
-    ) -> PolicyFlowSignature,
+    ) -> Signature,
 ) {
     use crate::registry::test_registry_for_workspace;
     use crate::taint_compose_provider::PolicyCompositionProvider;
@@ -555,7 +555,7 @@ fn composition_openness_sweep_interpretations() {
                     );
                 }
             }
-            Vec::new()
+            PolicyFlowSignature::new()
         },
     );
 }
@@ -586,7 +586,8 @@ fn model_content_certificate_records_hits_and_invalidates_after_pack_content_cha
         toolchain: None,
         target: Some("x86_64-unknown-linux-gnu".into()),
         configuration: None,
-        artifact_sha256: None,
+        production_input_digest: None,
+        verified_raw_artifacts: Vec::new(),
     };
     // Same pack identity, different callable parameter content.
     let before = test_snapshot_from_compiled_pack(
@@ -735,6 +736,200 @@ fn model_content_certificate_records_hits_and_invalidates_after_pack_content_cha
 }
 
 #[test]
+#[hardwon("#12846: returned-member uncertainty must survive a dispatch memo hit")]
+fn returned_member_certainty_and_reason_survive_dispatch_memo_hit() {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+        SemanticModelActivationEvidence, SemanticModelActivationRequest,
+        SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+        SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+        SessionPackSource, SessionPackSourceKind, SourceFormat, acquire_active_semantic_models,
+        compile_source,
+    };
+    use brokk_bifrost_flow::taint::compose::{
+        CompositionBudget, Incompleteness, compose_taint_batch,
+    };
+    use serde_json::json;
+
+    // Inline synthetic declarations keep this source-owned test independent
+    // of private root fixtures. A complete factory describes no return content;
+    // the reader nevertheless projects a member of that return.
+    let locator = |symbol: &str| json!({"kind":"artifact", "path":"fixture.rs", "symbol":symbol});
+    let types: Vec<_> = [
+        ("std", "module"),
+        ("std.memo_fixture", "module"),
+        ("std.memo_fixture.Api", "module"),
+        ("std.memo_fixture.Outcome", "enum"),
+    ]
+    .into_iter()
+    .map(|(name, kind)| {
+        json!({"id":name.to_lowercase(), "name":name,
+            "type_kind":kind, "visibility":"public", "locator":locator(name),
+            "callable_surface_complete":true})
+    })
+    .collect();
+    let members = vec![
+        json!({"id":"ok", "owner":"std.memo_fixture.outcome", "name":"Ok",
+            "member_kind":"constant", "visibility":"public",
+            "signature":{"parameters":[{"type":{"kind":"tuple", "elements":[{"kind":"named", "name":"u64"},{"kind":"named", "name":"u64"}]}}]},
+            "locator":locator("std.memo_fixture.Outcome.Ok")}),
+        json!({"id":"factory", "owner":"std.memo_fixture.api", "name":"factory",
+            "member_kind":"function", "visibility":"public", "callable_family_complete":true,
+            "signature":{"parameters":[], "returns":{"kind":"declared",
+                "id":"std.memo_fixture.outcome", "arguments":[]}},
+            "locator":locator("std.memo_fixture.Api.factory")}),
+        json!({"id":"read", "owner":"std.memo_fixture.outcome", "name":"unwrap",
+            "member_kind":"method", "visibility":"public", "callable_family_complete":true,
+            "receiver":{"pointer":true},
+            "signature":{"parameters":[], "returns":{"kind":"tuple", "elements":[{"kind":"named", "name":"u64"},{"kind":"named", "name":"u64"}]}},
+            "locator":locator("std.memo_fixture.Outcome.unwrap")}),
+    ];
+    let pack = json!({"schema_version":35, "pack_id":"test.memo-return-content",
+    "version":"1.0.0", "producer":{"name":"test", "version":"1.0.0"},
+    "language":"rust", "ecosystem":"cargo", "compatibility":{"toolchains":[]},
+    "provenance":{"source":"test-only synthetic declarations"}, "license":"NOASSERTION",
+    "completeness":"complete", "safety":{"generated_code_only":false,"review_required":false},
+    "shards":[
+        {"id":"declarations", "activation":[{}], "payload":{"kind":"declaration_facts",
+            "types":types, "members":members}},
+        {"id":"summaries", "activation":[{}], "payload":{"kind":"procedure_summaries",
+            "summaries":[
+                {"id":"summary.factory", "target":{"path":"fixture.rs",
+                    "symbol":"std.memo_fixture.Api.factory", "parameter_count":0,"has_receiver":false},
+                    "completeness":"complete", "transfers":[], "effects":[]},
+                {"id":"summary.read", "target":{"path":"fixture.rs",
+                    "symbol":"std.memo_fixture.Outcome.unwrap", "parameter_count":0,"has_receiver":true},
+                    "completeness":"complete", "covers_overrides":true, "effects":[],
+                    "transfers":[{"input":{"kind":"receiver", "path":[
+                        {"variant":{"declaration":"ok"}}, {"tuple":0}]},
+                        "exit_kind":"normal", "output":{"kind":"normal_return"}, "value_transfer":{"kind":{"kind":"aggregate_copy"},"operation":{"kind":"none"}}}]}
+            ]}}
+    ]});
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let mut activation = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+        approximate_standard_libraries: Vec::new(),
+        bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+        evidence: vec![SemanticModelActivationEvidence {
+            language: "rust".into(),
+            ecosystem: "cargo".into(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
+        }],
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    for kind in ["declaration_facts", "procedure_summaries"] {
+        let mut source = pack.clone();
+        let id = format!("test.memo-return-{kind}").replace('_', "-");
+        source["pack_id"] = json!(id);
+        source["shards"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|shard| shard["payload"]["kind"] == kind);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .register_session_pack(
+                &compiled,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: id.clone(),
+                },
+            )
+            .unwrap();
+        activation.controls.push(SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: id,
+                version: None,
+                manifest_digest: None,
+            },
+        });
+    }
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname=\"memo-return\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+        .file("src/lib.rs", "use std::memo_fixture::Api;\npub fn run() { sink(Api::factory().unwrap().0); }\nfn sink(value:u64) {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &activation,
+        &CancellationToken::default(),
+    ) else {
+        panic!("synthetic models activate")
+    };
+
+    let policy = COMPOSED_POLICY
+        .replace(
+            ":schema-version 1\n      :id",
+            ":schema-version 2\n      :id",
+        )
+        .replace("\"source\"", "\"factory\"")
+        .replace(
+            ":bind return-value :labels [attacker-controlled])",
+            r#":bind return-value :labels [attacker-controlled])
+          (source :id unused-projection :display-name "unused projection" :categories [input.user]
+            :selector (rql :schema-version 1 (language rust (call :callee (name "unused"))))
+            :bind (return-value :path [(tuple :index 0)]) :labels [attacker-controlled])"#,
+        );
+
+    with_composed_project(
+        &project,
+        &workspace,
+        Some(snapshot),
+        &[&policy],
+        |_rows, batch, _| {
+            let memo = CompositionMemo::default();
+            let cold = batch(&memo);
+            let before = hit_counter(&memo, "dispatches")();
+            let warm = batch(&memo);
+            assert!(
+                hit_counter(&memo, "dispatches")() > before,
+                "exercise an actual memo hit"
+            );
+            assert_eq!(cold, warm, "certainty and the Model reason survive the hit");
+            assert_eq!(cold, (vec![false], true));
+        },
+        |provider, plan, request| {
+            let outcome = compose_taint_batch(
+                plan,
+                provider,
+                CompositionBudget {
+                    max_procedures: 64,
+                    max_hops: 4096,
+                    max_callers_per_procedure: 64,
+                },
+                request,
+            )
+            .unwrap();
+            let certain: Vec<_> = outcome
+                .report
+                .findings()
+                .iter()
+                .flat_map(|f| f.origins().evidence().iter().map(|o| o.has_certain_path()))
+                .collect();
+            let reason = outcome.incompleteness.iter().any(|note| matches!(note,
+                Incompleteness::Model {reason,..} if reason.as_ref()=="a call model does not describe a returned member"));
+            (certain, reason)
+        },
+    );
+}
+
+#[test]
 #[hardwon(
     "#12986: first initialization of an uninitialized place counted as a droppable replacement"
 )]
@@ -781,7 +976,6 @@ fn first_initialization_keeps_policy_execution_inventory_complete() {
                 "{inventory:?}"
             );
             assert!(inventory.sites.is_empty());
-            Vec::new()
         },
     );
 }

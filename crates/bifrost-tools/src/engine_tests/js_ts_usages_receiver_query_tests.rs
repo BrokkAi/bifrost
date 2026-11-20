@@ -26,8 +26,6 @@ mod js_ts_extraction_root {
 
     use brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverQueryService;
 
-    use brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverSemanticBridge;
-
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverValue;
 
     use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticProviderError;
@@ -38,7 +36,7 @@ mod js_ts_extraction_root {
 
     use brokk_bifrost_analysis::analyzer::usages::receiver_query::SemanticReceiverIncompleteness;
 
-    use brokk_bifrost_analysis::analyzer::usages::receiver_query::test_support::assert_factory_ranges_limited_and_cancellable;
+    use brokk_bifrost_analysis::analyzer::usages::receiver_query::test_support::assert_factory_ranges_cancellable;
 
     use brokk_bifrost_analysis::analyzer::usages::receiver_query::test_support::last_marker_range;
 
@@ -207,7 +205,6 @@ export function caller(flag: boolean) {
             ),
             "unexpected gate evidence, work: {gate_work:#?}"
         );
-        assert!(gate_work.scope_nodes <= ReceiverAnalysisBudget::default().max_scope_nodes);
         assert!(
             gate_work.summary_expansions
                 <= ReceiverAnalysisBudget::default().max_summary_expansions
@@ -329,7 +326,6 @@ export function caller() {
             ),
             "unexpected gate evidence, work: {gate_work:#?}"
         );
-        assert!(gate_work.scope_nodes <= ReceiverAnalysisBudget::default().max_scope_nodes);
 
         let report = service
             .analyze(
@@ -427,117 +423,44 @@ export function caller() {
         assert_eq!(second.work.setup_nodes, 0);
     }
     #[test]
-    fn workspace_semantic_gate_and_compatibility_provider_share_one_budget() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13216: a file with more than 20,000 syntax nodes stopped receiver setup as a scope budget"
+    )]
+    fn a_large_file_prepares_and_answers_without_a_scope_allowance() {
+        use std::fmt::Write as _;
         let mut source = String::from(
             "class Service { run() {} }\nexport function caller() {\n  const service = new Service();\n",
         );
-        for index in 0..32 {
-            source.push_str(&format!("  const local{index} = {index};\n"));
+        for index in 0..8_000 {
+            writeln!(source, "  const filler{index} = {index};").expect("write filler");
         }
         source.push_str("  service.run();\n}\n");
+        let (_temp, file, analyzer) = test_project(&source);
 
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
-        file.write(&source).expect("write source");
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(TestProject::new(root, Language::TypeScript)),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
-        let range = marker_range(&source, "service.run");
-        let workspace_service = ReceiverQueryService::from_workspace(&workspace);
-        let warm = workspace_service
+        let report = ReceiverQueryService::new(&analyzer)
             .analyze(
-                ReceiverQueryOperation::ReceiverTargets,
+                ReceiverQueryOperation::MemberTargets,
                 &file,
-                range,
+                marker_range(&source, "service.run"),
                 ReceiverQueryInput::ContainingSite,
                 ReceiverAnalysisBudget::default(),
                 None,
             )
-            .expect("warm workspace receiver query");
-        assert!(matches!(
-            warm.analysis,
-            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(_))
-        ));
+            .expect("large-file member target query");
 
-        let gate = workspace_service
-            .semantic_receiver_gate(
-                &file,
-                warm.site.range,
-                ReceiverAnalysisBudget::default(),
-                None,
-            )
-            .expect("isolated semantic gate");
-        assert!(gate.exceeded_limit().is_none());
-        let gate_work = gate.work();
-
-        let compatibility_service = ReceiverQueryService::new(workspace.analyzer());
-        let _ = compatibility_service
-            .analyze(
-                ReceiverQueryOperation::ReceiverTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                ReceiverAnalysisBudget::default(),
-                None,
-            )
-            .expect("prepare compatibility receiver query");
-        let compatibility = compatibility_service
-            .analyze(
-                ReceiverQueryOperation::ReceiverTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                ReceiverAnalysisBudget::default(),
-                None,
-            )
-            .expect("measure compatibility receiver query");
-        assert_eq!(compatibility.work.setup_nodes, 0);
-        assert!(gate_work.scope_nodes > 0 && compatibility.work.scope_nodes > 0);
-
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: gate_work
-                .scope_nodes
-                .max(compatibility.work.scope_nodes)
-                .max(ReceiverSemanticBridge::SCOPE_DIMENSIONS),
-            max_summary_expansions: gate_work
-                .summary_expansions
-                .max(compatibility.work.summary_expansions)
-                .max(ReceiverSemanticBridge::SUMMARY_DIMENSIONS),
-            ..ReceiverAnalysisBudget::default()
-        };
         assert!(
-            gate_work
-                .scope_nodes
-                .saturating_add(compatibility.work.scope_nodes)
-                > budget.max_scope_nodes,
-            "fixture must require more combined work than either phase alone"
+            report.work.setup_nodes > 20_000,
+            "the fixture must exceed the removed scope allowance: {:?}",
+            report.work
         );
-
-        let bounded = workspace_service
-            .analyze(
-                ReceiverQueryOperation::ReceiverTargets,
-                &file,
-                range,
-                ReceiverQueryInput::ContainingSite,
-                budget,
-                None,
-            )
-            .expect("aggregate-bounded workspace receiver query");
         assert!(
-            bounded
-                .work
-                .setup_nodes
-                .saturating_add(bounded.work.scope_nodes)
-                <= budget.max_scope_nodes
+            matches!(
+                report.analysis,
+                ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(ref targets))
+                    if targets.len() == 1 && targets[0].fq_name().contains("Service")
+            ),
+            "{report:#?}"
         );
-        assert!(bounded.work.summary_expansions <= budget.max_summary_expansions);
-        assert!(matches!(
-            bounded.analysis,
-            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::ExceededBudget { .. })
-        ));
     }
     #[test]
     fn js_ts_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
@@ -571,10 +494,7 @@ export function caller() {
         let typescript = resolve_analyzer::<TypescriptAnalyzer>(typescript_workspace.analyzer())
             .expect("workspace TypeScript analyzer");
         typescript.reset_full_hydration_count_for_test();
-        assert_factory_ranges_limited_and_cancellable(
-            typescript_workspace.analyzer(),
-            &typescript_factory,
-        );
+        assert_factory_ranges_cancellable(typescript_workspace.analyzer(), &typescript_factory);
         assert_eq!(
             typescript.full_hydration_count_for_test(),
             0,
@@ -611,10 +531,7 @@ export function caller() {
         let javascript = resolve_analyzer::<JavascriptAnalyzer>(javascript_workspace.analyzer())
             .expect("workspace JavaScript analyzer");
         javascript.inner().reset_full_hydration_count_for_test();
-        assert_factory_ranges_limited_and_cancellable(
-            javascript_workspace.analyzer(),
-            &javascript_factory,
-        );
+        assert_factory_ranges_cancellable(javascript_workspace.analyzer(), &javascript_factory);
         assert_eq!(
             javascript.inner().full_hydration_count_for_test(),
             0,

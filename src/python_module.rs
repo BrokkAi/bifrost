@@ -1,7 +1,9 @@
 use crate::{
     Language, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
-    mcp_common::McpRenderOptions, mcp_registry::resolve_server_spec_for_render_options,
-    scoped_project::create_scoped_service, searchtools_render::RenderOptions,
+    mcp_common::McpRenderOptions,
+    mcp_registry::resolve_server_spec_for_render_options,
+    scoped_project::{ScopedProjectOptions, create_scoped_service_with_options},
+    searchtools_render::RenderOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -16,15 +18,21 @@ pub struct SearchToolsNativeSession {
 #[pymethods]
 impl SearchToolsNativeSession {
     #[new]
-    #[pyo3(signature = (root, manual=false, sources=None, revision=None))]
+    #[pyo3(signature = (root, manual=false, sources=None, revision=None, without_project_build=false))]
     fn new(
         py: Python<'_>,
         root: &str,
         manual: bool,
         sources: Option<Vec<String>>,
         revision: Option<String>,
+        without_project_build: bool,
     ) -> PyResult<Self> {
         crate::install_bifrost_semantic_model_packs().map_err(PyRuntimeError::new_err)?;
+        if without_project_build && sources.is_none() {
+            return Err(PyValueError::new_err(
+                "without_project_build requires sources",
+            ));
+        }
         if sources.is_some() && manual {
             return Err(PyValueError::new_err(
                 "manual=True cannot be combined with sources; scoped sessions are already manual",
@@ -39,7 +47,16 @@ impl SearchToolsNativeSession {
         let service = py
             .detach(move || {
                 if let Some(sources) = sources {
-                    create_scoped_service(root, &sources, revision.as_deref())
+                    create_scoped_service_with_options(
+                        root,
+                        &sources,
+                        revision.as_deref(),
+                        // The Python embedding has no host approval inventory.
+                        ScopedProjectOptions {
+                            without_project_build,
+                            ..ScopedProjectOptions::default()
+                        },
+                    )
                 } else if manual {
                     SearchToolsService::new_manual_persisted(root)
                 } else {
@@ -102,6 +119,7 @@ fn service_error_to_py(err: SearchToolsServiceError) -> PyErr {
             PyValueError::new_err(err.message)
         }
         SearchToolsServiceErrorCode::UnknownTool
+        | SearchToolsServiceErrorCode::WorkspaceUnavailable
         | SearchToolsServiceErrorCode::DeadlineExceeded
         | SearchToolsServiceErrorCode::Internal => PyRuntimeError::new_err(err.message),
     }

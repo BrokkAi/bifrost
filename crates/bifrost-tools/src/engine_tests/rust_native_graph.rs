@@ -853,6 +853,10 @@ mod tests {
 
     /// Run `probe` with the store's next pooled reader traced, and return what
     /// that reader executed.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn traced_store_sql(
         store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
         probe: impl FnOnce(),

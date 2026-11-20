@@ -38,6 +38,10 @@ pub(crate) mod go_publication_tests {
         use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
 
         #[doc(hidden)]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         pub fn assert_published_canonical_source<A: LanguageAdapter>(
             fixture: &crate::inline_project::BuiltInlineTestProject,
             relative_path: &str,
@@ -377,8 +381,13 @@ func use(x string) string {
             PreparedSyntaxPreparation::Complete(Some(prepared)) => prepared,
             _ => panic!("Go fixture parses"),
         };
-        let parts = match lowerer.lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
-        {
+        let parts = match lowerer.lower(
+            &file,
+            &prepared,
+            &SemanticBudget::default(),
+            &cancellation,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+        ) {
             Ok(SemanticOutcome::Complete { value, .. }) => value,
             other => panic!("Go fixture lowers completely: {other:?}"),
         };

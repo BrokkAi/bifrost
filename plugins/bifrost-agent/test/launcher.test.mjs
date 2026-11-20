@@ -15,6 +15,7 @@ import {
   MINIMUM_MCP_STARTUP_TIMEOUT_MS,
   STARTUP_MARGIN_MS,
   VERSION_PROBE_TIMEOUT_MS,
+  assertNoPackApprovalFlags,
   buildBifrostArgs,
   cacheRootFor,
   cleanupStaleInstallArtifacts,
@@ -1246,4 +1247,42 @@ test("runs its entry point when reached through a symlinked path", async () => {
 
   await fsp.rm(real, { recursive: true, force: true });
   await fsp.rm(path.dirname(link), { recursive: true, force: true });
+});
+
+test("pack approval flags are rejected in every spelling before any spawn", async () => {
+  const spellings = [
+    ["--pack-approval-inventory", "/x"],
+    ["--pack-approval-inventory=/x"],
+    ["--pack-approval-inventory-sha256", "ab"],
+    ["--pack-approval-inventory-sha256=ab"],
+    ["--pack-approval-config", "/x"],
+    ["--PACK-APPROVAL-INVENTORY=/x"],
+    ["--pack-appr", "/x"],
+    ["--pack-approval"],
+    ["--pack"],
+    ["--root", "/workspace", "--pack-approval-inventory=/x"],
+    ["--mcp", "core", "--pack-approval-inventory", "/x"]
+  ];
+  for (const args of spellings) {
+    assert.throws(
+      () => parseLauncherArgs(args),
+      (error) => error instanceof LauncherError && error.code === "approval_flags_reserved",
+      args.join(" ")
+    );
+    assert.throws(
+      () => buildBifrostArgs("/workspace", "symbol|extended", args),
+      (error) => error instanceof LauncherError && error.code === "approval_flags_reserved"
+    );
+  }
+  let spawned = false;
+  await assert.rejects(
+    resolveBifrostLaunch({
+      root: "/workspace",
+      passThrough: ["--pack-approval-inventory=/x"],
+      spawnImpl: () => { spawned = true; }
+    }),
+    (error) => error.code === "approval_flags_reserved"
+  );
+  assert.equal(spawned, false);
+  assert.doesNotThrow(() => assertNoPackApprovalFlags(["--root", "/workspace", "--extra", "pack-approval"]));
 });

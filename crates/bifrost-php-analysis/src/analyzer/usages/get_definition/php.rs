@@ -2142,7 +2142,10 @@ fn php_canonical_source_bounded(
         return None;
     }
     let Some(source) = php.php_source_facts_while(file, &|| session.scope_step()) else {
-        session.mark_scope_incomplete();
+        // A cancelled `scope_step` also ends the walk; that is a cancellation.
+        if session.observe_cancellation() {
+            session.mark_unavailable("php_source_facts_unavailable");
+        }
         return None;
     };
     for _ in 0..source.facts.declarations.len()
@@ -3697,11 +3700,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
 
 #[cfg(test)]
 mod tests {
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
     use crate::analyzer::usages::get_definition::php::*;
-
-    use brokk_bifrost_analysis::analyzer::usages::test_support::assert_scope_budget_exceeded;
 
     use brokk_bifrost_core::analyzer::model::Language;
 
@@ -4262,7 +4261,7 @@ class Duplicate extends BaseB {}
     }
 
     #[test]
-    fn bounded_relative_return_stops_at_tiny_budget_and_on_cancellation() {
+    fn bounded_relative_return_stops_on_cancellation() {
         let source = r#"<?php
 namespace Demo;
 class RelativeFactory {
@@ -4270,17 +4269,6 @@ class RelativeFactory {
 }
 "#;
         let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("Relative.php", source)]);
-
-        let budget = ReceiverAnalysisBudget::tiny();
-        let budget_outcome =
-            declared_php_type_outcome(&fixture, "Demo.RelativeFactory.make", budget, None);
-        assert!(matches!(
-            budget_outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
 
         let cancellation = CancellationToken::cancel_after_checks_for_test(4);
         let cancellation_outcome = declared_php_type_outcome(
@@ -4293,43 +4281,6 @@ class RelativeFactory {
             cancellation_outcome,
             BoundedResolution::Cancelled { work } if work.scope_nodes > 0
         ));
-    }
-
-    #[test]
-    fn bounded_lookup_stops_on_deep_wide_scope_budget_without_partial_result() {
-        let mut source = String::from(
-            "<?php\nnamespace Demo;\nclass Service { public function run(): void {} }\n",
-        );
-        source.push_str("class Consumer { public function exercise(): void {\n");
-        for _ in 0..48 {
-            source.push_str("if (true) {\n");
-        }
-        for index in 0..96 {
-            source.push_str(&format!("$value{index} = new Service();\n"));
-        }
-        source.push_str("$target = new Service();\n$target->run();\n");
-        for _ in 0..48 {
-            source.push_str("}\n");
-        }
-        source.push_str("} }\n");
-        let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("Wide.php", &source)]);
-        let file = ProjectFile::new(fixture.project_root(), "Wide.php");
-        let tree = parse_php_tree(&source).expect("PHP tree");
-        let site = php_site(&source, &file, "$target->run()", "run");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 32,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let outcome = resolve_php_bounded(
-            fixture.analyzer.analyzer(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            budget,
-            None,
-        );
-        assert_scope_budget_exceeded(&outcome, budget);
     }
 
     #[test]

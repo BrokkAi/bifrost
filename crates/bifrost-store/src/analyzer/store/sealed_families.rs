@@ -15,6 +15,7 @@ pub(super) enum Owner {
 pub(super) const RESOLUTION: &[&str] = &[
     "resolution_gap_reasons",
     "resolution_rust_declaration_authorities",
+    "resolution_rust_impl_declarations",
     "resolution_semantic_sites",
     "resolution_paths",
     "resolution_sites",
@@ -92,6 +93,9 @@ pub(super) const UNIT_SUMMARY: &[&str] = &[
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 pub(super) const CRATE_TOPOLOGY: &[&str] = &[
+    "rust_package_route_versions",
+    "rust_package_target_claims",
+    "rust_package_unavailable_targets",
     "rust_crate_binding_owners",
     "rust_crate_binding_alternatives",
     "rust_crate_binding_names",

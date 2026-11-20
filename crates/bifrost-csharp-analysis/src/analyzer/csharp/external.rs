@@ -52,6 +52,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::ExactDependencyArtifact;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::producer::ExternalArtifactKind;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::HierarchyFact;
@@ -151,7 +152,7 @@ fn csharp_pack_producer_version() -> &'static str {
 
 use brokk_bifrost_core::cancellation::is_cancelled_at_checkpoint;
 
-const MAX_ASSEMBLY_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_ASSEMBLY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ASSETS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_METADATA_ROWS: u32 = 100_000;
 const MAX_METADATA_TOTAL_ROWS: u32 = 250_000;
@@ -510,23 +511,72 @@ impl Default for CSharpExternalDeclarationIndex {
 
 impl CSharpExternalDeclarationIndex {
     pub fn build_for_project(config: &CSharpAnalyzerConfig, project: &dyn Project) -> Self {
-        let discovery = {
-            let _timing = brokk_bifrost_core::profiling::scope("csharp_external_index.discovery");
-            resolve_csharp_semantic_pack_dependencies(
-                config,
-                project,
-                &DependencyPackLimits::default(),
-                None,
-            )
-        };
-        let mut artifacts: Vec<_> = discovery
-            .dependencies
-            .iter()
-            .flat_map(|dependency| dependency.artifacts.iter())
-            .map(|artifact| (artifact.path().to_owned(), artifact.module.clone()))
-            .collect();
-        artifacts.sort();
-        artifacts.dedup();
+        Self::build_from_discovery(Self::discover(config, project))
+    }
+
+    /// The one discovery pass of an index build: the asset walk, the explicit
+    /// assembly paths and the project-output walks. The carry sample and the
+    /// build both read this outcome, so neither enumerates the inputs again.
+    pub(crate) fn discover(
+        config: &CSharpAnalyzerConfig,
+        project: &dyn Project,
+    ) -> DependencyDiscoveryOutcome {
+        let _timing = brokk_bifrost_core::profiling::scope("csharp_external_index.discovery");
+        resolve_csharp_semantic_pack_dependencies(
+            config,
+            project,
+            &DependencyPackLimits::default(),
+            None,
+        )
+    }
+
+    pub(crate) fn build_from_discovery(discovery: DependencyDiscoveryOutcome) -> Self {
+        Self::build_discovery(discovery, |index, path, module| {
+            index.index_assembly(path, module)
+        })
+    }
+
+    pub(super) fn build_from_sample(sample: &mut super::input_identity::Sample) -> (Self, bool) {
+        let mut exact = true;
+        let index = Self::build_discovery(sample.discovery.clone(), |index, path, module| {
+            let expected = sample
+                .artifacts
+                .binary_search_by(|input| {
+                    (input.path.as_path(), input.module.as_deref()).cmp(&(path, module))
+                })
+                .ok()
+                .map(|at| &mut sample.artifacts[at]);
+            let (expected_digest, retained) = match expected {
+                Some(input) => (Some(input.digest), input.exact.take()),
+                None => (None, None),
+            };
+            let mut inspected = false;
+            index.index_assembly_inspected(
+                path,
+                module,
+                |limits| match retained {
+                    Some(artifact) => Ok(artifact),
+                    None => read_exact_artifact_while(path, limits, || false),
+                },
+                |artifact| {
+                    inspected = true;
+                    let digest = brokk_bifrost_core::analyzer::canonical_hash::parse_lower_sha256(
+                        artifact.sha256(),
+                    )
+                    .expect("exact artifact SHA-256");
+                    exact &= expected_digest == Some(digest);
+                },
+            );
+            exact &= inspected;
+        });
+        (index, exact)
+    }
+
+    fn build_discovery(
+        discovery: DependencyDiscoveryOutcome,
+        mut index_artifact: impl FnMut(&mut Self, &Path, Option<&str>),
+    ) -> Self {
+        let artifacts = discovered_artifacts(&discovery);
         let _timing =
             brokk_bifrost_core::profiling::scope("csharp_external_index.build_from_artifacts");
         let mut index = Self {
@@ -540,7 +590,7 @@ impl CSharpExternalDeclarationIndex {
             ..Self::default()
         };
         for (path, declared_assembly) in artifacts {
-            index.index_assembly(&path, declared_assembly.as_deref());
+            index_artifact(&mut index, &path, declared_assembly.as_deref());
         }
         index
             .production_diagnostics
@@ -646,6 +696,21 @@ impl CSharpExternalDeclarationIndex {
         &self.production_diagnostics
     }
     fn index_assembly(&mut self, path: &Path, declared_assembly: Option<&str>) {
+        self.index_assembly_inspected(
+            path,
+            declared_assembly,
+            |limits| read_exact_artifact_while(path, limits, || false),
+            |_| {},
+        );
+    }
+
+    fn index_assembly_inspected(
+        &mut self,
+        path: &Path,
+        declared_assembly: Option<&str>,
+        load: impl FnOnce(&ArtifactProducerLimits) -> Result<ExactArtifact, ProducerDiagnostic>,
+        inspect: impl FnOnce(&ExactArtifact),
+    ) {
         let request = ArtifactProductionRequest {
             path: path.to_path_buf(),
             artifact_kind: ExternalArtifactKind::DotNetAssembly,
@@ -657,6 +722,7 @@ impl CSharpExternalDeclarationIndex {
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: None,
                 module: None,
                 toolchain: Some(NameSelector {
@@ -679,26 +745,23 @@ impl CSharpExternalDeclarationIndex {
             },
         };
         let limits = ArtifactProducerLimits::default();
-        let production = match declared_assembly {
-            None => CSharpAssemblyPackProducer.produce_exact_artifact(&request, &limits),
-            Some(declared) => {
-                let read_limits = ArtifactProducerLimits {
-                    max_artifact_bytes: limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
-                    ..limits
-                };
-                let checked =
-                    read_exact_artifact_while(path, &read_limits, || false).and_then(|artifact| {
-                        match assembly_identity_mismatch(&artifact, declared) {
-                            Some(diagnostic) => Err(diagnostic),
-                            None => Ok(artifact),
-                        }
-                    });
-                match checked {
-                    Ok(artifact) => CSharpAssemblyPackProducer
-                        .produce_loaded_artifact(&request, &limits, None, &artifact),
-                    Err(diagnostic) => ArtifactProduction::failed(diagnostic, &limits),
-                }
+        let read_limits = ArtifactProducerLimits {
+            max_artifact_bytes: limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
+            ..limits
+        };
+        let checked = load(&read_limits).and_then(|artifact| {
+            inspect(&artifact);
+            match declared_assembly
+                .and_then(|declared| assembly_identity_mismatch(&artifact, declared))
+            {
+                Some(diagnostic) => Err(diagnostic),
+                None => Ok(artifact),
             }
+        });
+        let production = match checked {
+            Ok(artifact) => CSharpAssemblyPackProducer
+                .produce_loaded_artifact(&request, &limits, None, &artifact),
+            Err(diagnostic) => ArtifactProduction::failed(diagnostic, &limits),
         };
         self.production_diagnostics
             .extend(production.diagnostics.iter().cloned());
@@ -1751,6 +1814,21 @@ impl CSharpPackCompletenessEvidence<'_> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CSharpDependencyPackAdapter;
 
+/// The assemblies an index build decodes, from one discovery outcome.
+pub(super) fn discovered_artifacts(
+    discovery: &DependencyDiscoveryOutcome,
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut artifacts: Vec<_> = discovery
+        .dependencies
+        .iter()
+        .flat_map(|dependency| dependency.artifacts.iter())
+        .map(|artifact| (artifact.path().to_owned(), artifact.module.clone()))
+        .collect();
+    artifacts.sort();
+    artifacts.dedup();
+    artifacts
+}
+
 pub fn resolve_csharp_semantic_pack_dependencies(
     config: &CSharpAnalyzerConfig,
     project: &dyn Project,
@@ -1898,13 +1976,14 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer {
+        (Producer {
             name: "bifrost-csharp-assembly".to_owned(),
             version: csharp_pack_producer_version().to_owned(),
-        }
+        })
+        .with_dependency_revision()
     }
 
-    fn production_schema_version(&self, _dependency: &ResolvedDependency) -> u32 {
+    fn production_schema_version(&self) -> u32 {
         brokk_bifrost_semantic::analyzer::semantic_model::FENCED_COMPLETENESS_MIN_SCHEMA_VERSION
     }
 
@@ -1956,6 +2035,9 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
                 pack,
                 &format!("sha256-{}.artifact", artifact.sha256()),
             );
+        }
+        if let Some(pack) = production.pack.as_mut() {
+            pack.producer = self.producer();
         }
         DependencyPackProduction {
             pack: production.pack,
@@ -2204,6 +2286,7 @@ impl CSharpAssemblyPackProducer {
             }
             base_edge_omitted |= !supertypes_complete;
             types.push(TypeFact {
+                type_parameter_kinds: Vec::new(),
                 alias_target: None,
                 tuple_fields: None,
                 implemented_traits_complete: false,
@@ -2244,6 +2327,7 @@ impl CSharpAssemblyPackProducer {
                 type_kind: semantic_type_kind(ty.kind),
                 visibility: semantic_visibility(ty.visibility),
                 is_abstract: ty.is_abstract,
+                is_final: None,
                 is_sealed: ty.is_sealed,
                 callable_surface_complete: false,
                 has_explicit_type_terms: false,
@@ -2352,6 +2436,8 @@ impl CSharpAssemblyPackProducer {
                     return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {
+                    target_independent: None,
+                    inherent_impl_self_arguments: None,
                     implemented_trait: None,
                     self_form: None,
                     non_overridable: None,
@@ -2371,6 +2457,7 @@ impl CSharpAssemblyPackProducer {
                     callable_family_complete: false,
                     exact_return_classes: Vec::new(),
                     signature: Some(Signature {
+                        bounds: None,
                         type_parameters: member.type_parameters.clone(),
                         parameters: parameter_types
                             .into_iter()
@@ -2836,7 +2923,8 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             toolchain: None,
             target: assembly.target,
             configuration: assembly.configuration,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
         provenance,
         artifacts: vec![artifact],
@@ -2859,6 +2947,7 @@ fn csharp_dependency_production_request(
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {
+            production_input_digest: None,
             package: dependency
                 .evidence
                 .package
@@ -2930,6 +3019,7 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
             ..CSharpAssetsResolution::default()
         };
     };
+    super::input_identity::content(path, text.as_bytes());
     let Ok(root): Result<Value, _> = serde_json::from_str(&text) else {
         return CSharpAssetsResolution {
             diagnostics: vec![format!("could not parse {}", path.display())],
@@ -2939,14 +3029,14 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
     let workspace_root = path
         .parent()
         .and_then(Path::parent)
-        .and_then(|root| root.canonicalize().ok());
+        .and_then(|root| super::input_identity::canonicalize(root).ok());
     let approved_package_roots = approved_package_roots(workspace_root.as_deref());
     let folders = root
         .get("packageFolders")
         .and_then(Value::as_object)
         .map(|o| {
             o.keys()
-                .filter_map(|folder| PathBuf::from(folder).canonicalize().ok())
+                .filter_map(|folder| super::input_identity::canonicalize(Path::new(folder)).ok())
                 .filter(|folder| approved_package_roots.contains(folder))
                 .collect::<Vec<_>>()
         })
@@ -3020,7 +3110,7 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                     if let Some(package_path) = package_path {
                         for folder in &folders {
                             let candidate = folder.join(package_path).join(relative);
-                            if let Ok(candidate) = candidate.canonicalize()
+                            if let Ok(candidate) = super::input_identity::canonicalize(&candidate)
                                 && candidate.starts_with(folder)
                                 && candidate.is_file()
                             {
@@ -3047,7 +3137,7 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                             .and_then(Path::parent)
                             .unwrap_or(root)
                             .join(project_path);
-                        if let Ok(project_path) = project_path.canonicalize()
+                        if let Ok(project_path) = super::input_identity::canonicalize(&project_path)
                             && project_path.starts_with(root)
                         {
                             let project_root = if project_path.is_dir() {
@@ -3146,7 +3236,7 @@ fn approved_package_roots(workspace_root: Option<&Path>) -> Vec<PathBuf> {
     }
     roots
         .into_iter()
-        .filter_map(|root| root.canonicalize().ok())
+        .filter_map(|root| super::input_identity::canonicalize(&root).ok())
         .collect()
 }
 
@@ -3162,7 +3252,7 @@ fn project_output_candidates(
     let bin = project_root.join("bin");
     // Follow the caller's chosen bin root, then retain canonical containment
     // checks for selected outputs. Only links below that root are omissions.
-    match std::fs::metadata(&bin) {
+    match super::input_identity::metadata(&bin) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return (Vec::new(), TraversalStatus::default()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3178,7 +3268,7 @@ fn project_output_candidates(
             );
         }
     }
-    let bin = match bin.canonicalize() {
+    let bin = match super::input_identity::canonicalize(&bin) {
         Ok(bin) => bin,
         Err(error) => {
             return (
@@ -3190,7 +3280,7 @@ fn project_output_candidates(
             );
         }
     };
-    let workspace_root = match workspace_root.canonicalize() {
+    let workspace_root = match super::input_identity::canonicalize(workspace_root) {
         Ok(root) => root,
         Err(error) => {
             return (
@@ -3259,7 +3349,7 @@ fn project_outputs_from_entries(
         if !entry.file_type().is_file() {
             continue;
         }
-        let candidate = match entry.path().canonicalize() {
+        let candidate = match super::input_identity::canonicalize(entry.path()) {
             Ok(candidate) => candidate,
             Err(error) => {
                 status.record(TraversalEvent::IoError {

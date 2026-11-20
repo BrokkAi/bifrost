@@ -1515,11 +1515,13 @@ impl EdgeDerivationResult {
                     | EdgeIncompleteReason::ForwardMetadataIncomplete => true,
                     EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
                     | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                    | EdgeIncompleteReason::InverseIndexOpenSite(_)
                     | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding
                     | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
                     | EdgeIncompleteReason::InverseIndexMetadataIncomplete
                     | EdgeIncompleteReason::InverseIndexTargetUncovered
                     | EdgeIncompleteReason::TimeBudgetExceeded
+                    | EdgeIncompleteReason::ReceiverBudgetExhausted
                     | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => false,
                 })
             }
@@ -2837,6 +2839,6 @@ class Child extends Base {
 pub mod test_support;
 
 pub use crate::analyzer::resolution::reference_vocabulary::{
-    EDGE_PRODUCER_AXES, EdgeCompleteness, EdgeIncompleteReason, EdgeSite, ReferenceEdgeRow,
-    is_same_owner_member_reference,
+    EDGE_PRODUCER_AXES, EdgeCompleteness, EdgeIncompleteReason, EdgeSite, OpenInventorySite,
+    ReferenceEdgeRow, is_same_owner_member_reference,
 };

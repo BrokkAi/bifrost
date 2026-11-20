@@ -22,7 +22,10 @@ use crate::analyzer::semantic_model::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
-    RustReexportLookup, RustReexportNamespace,
+    RustReexportLookup, RustReexportNamespace, SemanticModelOverlay,
+};
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    FamilyOpen, SemanticModelOverlayDisposition,
 };
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
@@ -308,9 +311,8 @@ fn selected_absolute_root_with_files(
         Ok(routes) => {
             let roots = routes.target_roots(file);
             if !routes.is_complete() {
-                crate::analyzer::rust::std_types::operational_proof_stop(
+                crate::analyzer::rust::std_types::unavailable_proof_input(
                     "absolute root routes incomplete",
-                    brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
                 );
             }
             // No Cargo target reaches a detached file; it is its own crate root,
@@ -333,9 +335,9 @@ fn selected_absolute_root_with_files(
             roots
         }
         Err(error) => {
-            crate::analyzer::rust::std_types::operational_proof_stop(
+            crate::analyzer::rust::std_types::cargo_route_proof_stop(
                 "absolute root routes unavailable",
-                crate::analyzer::rust::std_types::cargo_route_execution_cause(&error),
+                &error,
             );
             return None;
         }
@@ -364,10 +366,7 @@ fn selected_absolute_root_with_files(
         // Provider until certified (#11510): an unavailable absolute root is
         // refused for retention even when the store marks it content-determined,
         // because no read-closure proof covers that decision yet.
-        crate::analyzer::rust::std_types::operational_proof_stop(
-            reason,
-            brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
-        );
+        crate::analyzer::rust::std_types::unavailable_proof_input(reason);
     }
     Some((answer, roots))
 }
@@ -822,10 +821,16 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
         // too, but it stays outside this path (#4317).
         let written_extern_root = rust_path_is_leading_absolute(*root)
             || matches!(rust_node_text(*root, source), "alloc" | "core" | "std");
-        if !(written_extern_root
-            && rust_external_identity_is_unmodeled_std_path(analyzer, &owner_components, member))
-            && !declared
-        {
+        let unmodeled_std = if written_extern_root {
+            consume_unmodeled_std_path_proof(rust_external_identity_is_unmodeled_std_path(
+                analyzer,
+                &owner_components,
+                member,
+            ))?
+        } else {
+            false
+        };
+        if !unmodeled_std && !declared {
             return None;
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1052,6 +1057,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             format!("{}::{member}", owner.replace('.', "::")),
             parameter_count,
         )
+        .with_external_member_identity(declaring_owner.external_member_identity.clone())
     };
     Some((
         proof,
@@ -1182,14 +1188,20 @@ pub(crate) fn rust_import_binder_external_callee(
             operation_factory,
             operation,
         )
-        || (!rust_external_identity_is_unmodeled_std_path(analyzer, owner_components, member)
-            && !rust_external_callable_declaration(
-                analyzer,
-                owner_components,
-                member,
-                parameter_count,
-                cancellation,
-            ))
+    {
+        return None;
+    }
+    let unmodeled_std = consume_unmodeled_std_path_proof(
+        rust_external_identity_is_unmodeled_std_path(analyzer, owner_components, member),
+    )?;
+    if !unmodeled_std
+        && !rust_external_callable_declaration(
+            analyzer,
+            owner_components,
+            member,
+            parameter_count,
+            cancellation,
+        )
     {
         return None;
     }
@@ -1614,53 +1626,72 @@ fn rust_external_callable_declaration(
     }
 }
 
+fn consume_unmodeled_std_path_proof(answer: Result<bool, FamilyOpen>) -> Option<bool> {
+    match answer {
+        Ok(answer) => Some(answer),
+        Err(open) => {
+            let _cause =
+                SemanticModelOverlay::record_open_proof(open, "external_model_unavailable");
+            // An Open cannot establish unmodeled std absence.
+            None
+        }
+    }
+}
+
 /// A std/core/alloc extern-prelude path can supply an identity without an
 /// activated callable declaration only when no active model speaks to that
 /// exact owner/member surface. Any declaration row, extraction gap, or
 /// receiverless summary leaves the declaration gate in control, including
-/// conflicts, private members, and incomplete overload sets.
+/// conflicts, private members, and incomplete overload sets. An Open cannot
+/// establish absence, even when its diagnostic family label is not Rust.
 fn rust_external_identity_is_unmodeled_std_path(
     analyzer: &dyn IAnalyzer,
     owner_components: &[String],
     member: &str,
-) -> bool {
+) -> Result<bool, FamilyOpen> {
     if !owner_components
         .first()
         .is_some_and(|root| matches!(root.as_str(), "alloc" | "core" | "std"))
     {
-        return false;
+        return Ok(false);
     }
     let owner = RustOverlayCrates::pack_name(owner_components);
     let language = LanguageDialect::from(Language::Rust).semantic_pack_label();
-    if analyzer.active_semantic_models().is_some_and(|active| {
+    if let Some(active) = analyzer.active_semantic_models() {
         let modeled = match active
             .has_receiverless_procedure_summary_member(language, &owner, member)
         {
             brokk_bifrost_analysis::analyzer::store::active_models::FamilyPresence::Present => true,
             brokk_bifrost_analysis::analyzer::store::active_models::FamilyPresence::Absent => false,
             brokk_bifrost_analysis::analyzer::store::active_models::FamilyPresence::Open(open) => {
-                unreachable!("a Rust realm question has no JVM-family part: {open:?}")
+                return Err(open);
             }
         };
-        modeled || active.gapped_member_surface(&owner, member).is_some()
-    }) {
-        return false;
+        if modeled || active.gapped_member_surface(&owner, member).is_some() {
+            return Ok(false);
+        }
     }
     let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
-        return true;
+        return Ok(true);
     };
     let member_name = format!("{owner}.{member}");
-    let owner_is_declared = overlay
-        .symbols_named_for(&owner, "rust")
+    let owners = overlay.symbols_named_for(&owner, "rust");
+    if let SemanticModelOverlayDisposition::Open(open) = owners.disposition {
+        return Err(open);
+    }
+    let owner_is_declared = owners
         .records
         .into_iter()
         .any(|symbol| symbol.language == language && symbol.qualified_name == owner);
-    let member_is_declared = overlay
-        .symbols_named_for(&member_name, "rust")
+    let members = overlay.symbols_named_for(&member_name, "rust");
+    if let SemanticModelOverlayDisposition::Open(open) = members.disposition {
+        return Err(open);
+    }
+    let member_is_declared = members
         .records
         .into_iter()
         .any(|symbol| symbol.language == language && symbol.qualified_name == member_name);
-    !owner_is_declared && !member_is_declared
+    Ok(!owner_is_declared && !member_is_declared)
 }
 
 fn rust_external_bound_receiver_callable_declaration(
@@ -1783,6 +1814,313 @@ mod probe_completion_tests {
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
     use brokk_bifrost_analysis::analyzer::{MultiAnalyzer, QueryReadIncomplete};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#14073: operational model Open panicked or certified an unmodeled std identity")]
+    fn open_std_absence_cannot_supply_an_external_identity() {
+        use crate::analyzer::rust::std_types::{RustProofAttempt, completed_proof};
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::{
+            CatalogError, CatalogOptions, SemanticPackCatalog, SessionPackSource,
+            SessionPackSourceKind, statements,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::runtime::{
+            SemanticModelActivationEvidence, SemanticModelActivationRequest,
+            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+            acquire_active_semantic_models,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogCoordinate, CompilerOptions, SourceFormat, compile_source,
+        };
+        use brokk_bifrost_analysis::analyzer::store::model_catalog::{
+            CatalogRowReader, OwnedCatalogRows,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailedSummaryQuestion {
+            open: std::sync::Mutex<Option<FamilyOpen>>,
+            calls: AtomicUsize,
+        }
+
+        impl CatalogRowReader for FailedSummaryQuestion {
+            fn owned_rows(
+                &self,
+                statement: &str,
+                _bindings: &[(&str, &dyn rusqlite::ToSql)],
+                _cancellation: &CancellationToken,
+            ) -> Result<OwnedCatalogRows, CatalogError> {
+                if statement.contains(statements::SUMMARY_MEMBER.trim_end().trim_end_matches(';')) {
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                    if let Some(open) = *self.open.lock().unwrap() {
+                        return Err(CatalogError::FamilyOpen(open));
+                    }
+                }
+                Ok(OwnedCatalogRows {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let analyzer = MultiAnalyzer::new(std::collections::BTreeMap::from([(
+            Language::Rust,
+            brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate::new(
+                crate::RustAnalyzer::from_project(brokk_bifrost_analysis::TestProject::new(
+                    root.path(),
+                    Language::Rust,
+                )),
+            ),
+        )]));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        // Test-only declarations: a real row owner must be present before the
+        // extra reader can fail a merged question. A decoded-only snapshot
+        // would bypass that question and make this regression vacuous.
+        let pack = serde_json::json!({
+            "schema_version": 2, "pack_id": "test.rust-open", "version": "1.0.0",
+            "producer": {"name":"test-only", "version":"1.0.0"},
+            "language":"rust", "ecosystem":"cargo", "compatibility":{"bifrost":"*"},
+            "provenance":{"source":"test-only #14073", "revision":"reviewed"},
+            "license":"NOASSERTION", "completeness":"complete",
+            "safety":{"generated_code_only":false, "review_required":false},
+            "shards":[{"id":"main", "activation":[{"package":{"name":"app"}}], "payload":{
+                "kind":"declaration_facts", "types":[{
+                    "id":"std.marker", "name":"std.Marker", "type_kind":"struct", "visibility":"public",
+                    "locator":{"kind":"artifact", "path":"fixture.json", "symbol":"std.Marker"}
+                }], "members":[], "relations":[]
+            }}]
+        });
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .register_compiled_pack(
+                &compiled,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::EphemeralWorkspace,
+                    source_id: "test-only #14073".into(),
+                },
+            )
+            .unwrap();
+        let request = SemanticModelActivationRequest {
+            host_activation:
+                brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            approximate_standard_libraries: Vec::new(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "rust".into(),
+                ecosystem: "cargo".into(),
+                package: Some(CatalogCoordinate {
+                    name: "app".into(),
+                    version: Some(semver::Version::new(0, 1, 0)),
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = acquire_active_semantic_models(
+            &analyzer,
+            &catalog,
+            None,
+            &request,
+            &CancellationToken::new(),
+        ) else {
+            panic!("the test-only Rust declaration pack must activate");
+        };
+        assert!(
+            snapshot
+                .active_models()
+                .shards()
+                .iter()
+                .any(|shard| shard.decoded.is_none()),
+            "the fault must exercise the row-backed production question"
+        );
+        for (owner, eligible) in [
+            (vec!["std".into(), "io".into()], true),
+            (vec!["std".into(), "Marker".into()], false),
+            (vec!["other".into()], false),
+        ] {
+            let outer = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                &analyzer,
+                Some(Arc::clone(&snapshot)),
+            );
+            assert_eq!(
+                rust_external_identity_is_unmodeled_std_path(&analyzer, &owner, "stdout"),
+                Ok(eligible)
+            );
+            assert_eq!(outer.read_completion(), Ok(()));
+        }
+        let owner = ["std".to_owned(), "io".to_owned()];
+        let fault = Arc::new(FailedSummaryQuestion {
+            open: std::sync::Mutex::new(None),
+            calls: AtomicUsize::new(0),
+        });
+        let selected = snapshot.test_with_question_reader(fault.clone());
+        let cell = brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new();
+        let cache = brokk_bifrost_analysis::analyzer::common::build_replayable_query_cache(
+            |_: &Option<bool>| 0,
+        );
+        let key = ("std.io", "stdout");
+        // One reader, activation, key and cache survive cancellation, a failed
+        // read, and recovery. Neither stopped value may become a warm hit.
+        for open in [
+            Some(FamilyOpen::jvm_cancelled()),
+            Some(FamilyOpen::jvm("provider read failed")),
+            None,
+        ] {
+            *fault.open.lock().unwrap() = open;
+            let _outer = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                &analyzer,
+                Some(Arc::clone(&selected)),
+            );
+            let before = fault.calls.load(Ordering::Relaxed);
+            let fill = || {
+                let capture = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+                let attempt = completed_proof(&analyzer, None, || {
+                    let answer =
+                        rust_external_identity_is_unmodeled_std_path(&analyzer, &owner, "stdout");
+                    assert_eq!(answer, open.map_or(Ok(true), Err));
+                    if !consume_unmodeled_std_path_proof(answer)? {
+                        return None;
+                    }
+                    external_call_proof_and_identity(&analyzer, &owner, "stdout", 0, None)
+                        .map(|_| true)
+                });
+                match (open, &attempt) {
+                    (
+                        Some(open),
+                        RustProofAttempt::Incomplete {
+                            value,
+                            reason,
+                            cause,
+                        },
+                    ) => {
+                        assert!(value.is_none());
+                        assert_eq!(*reason, "external_model_unavailable");
+                        assert_eq!(
+                            *cause,
+                            Some(if open.is_cancellation() {
+                                DerivationExecutionCause::Cancelled
+                            } else {
+                                DerivationExecutionCause::Provider
+                            })
+                        );
+                        let original = SemanticModelOverlay::open_read_incompleteness(open);
+                        let reasons = capture.captured_read_incompleteness();
+                        assert!(
+                            reasons
+                                .iter()
+                                .any(|reason| reason.base_cause() == original.base_cause()),
+                            "{reasons:?}"
+                        );
+                        assert!(
+                            reasons
+                                .iter()
+                                .all(|reason| !reason.has_stable_replay_reason()),
+                            "transient causes must not become stable replay records: {reasons:?}"
+                        );
+                    }
+                    (None, RustProofAttempt::Complete(Some(true))) => {}
+                    (_, unexpected) => panic!("unexpected model proof: {unexpected:?}"),
+                }
+                attempt.into_value()
+            };
+            let answer = brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(
+                &analyzer, &cell, fill,
+            );
+            assert_eq!(answer, open.is_none().then_some(true));
+            let entry = brokk_bifrost_analysis::analyzer::common::read_replayable_query_cache(
+                &cache,
+                &key,
+                || {
+                    brokk_bifrost_analysis::analyzer::common::replayable_query_cache_value(
+                        &analyzer, fill,
+                    )
+                },
+            );
+            assert_eq!(*entry.replay(), answer);
+            assert!(
+                fault.calls.load(Ordering::Relaxed) > before,
+                "every stopped retry must reach the actual SUMMARY_MEMBER question"
+            );
+            if open.is_some() {
+                assert!(
+                    cell.get().is_none(),
+                    "a stopped proof must not fill the complete-only memo"
+                );
+                assert!(
+                    cache.get(&key).is_none(),
+                    "a stopped proof must not publish a replayable key"
+                );
+                assert!(
+                    entry
+                        .incomplete_reasons()
+                        .iter()
+                        .all(|reason| !reason.has_stable_replay_reason())
+                );
+            } else {
+                assert_eq!(cell.get(), Some(&Some(true)));
+                assert!(cache.get(&key).is_some());
+                assert!(entry.incomplete_reasons().is_empty());
+                let before_hit = fault.calls.load(Ordering::Relaxed);
+                assert_eq!(
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(
+                        &analyzer,
+                        &cell,
+                        || panic!("healthy memo must hit")
+                    ),
+                    Some(true)
+                );
+                let hit = brokk_bifrost_analysis::analyzer::common::read_replayable_query_cache(
+                    &cache,
+                    &key,
+                    || panic!("healthy replay cache must hit"),
+                );
+                assert_eq!(*hit.replay(), Some(true));
+                assert_eq!(fault.calls.load(Ordering::Relaxed), before_hit);
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#14073: Open handling must preserve complete std absence and nonstd controls")]
+    fn complete_std_absence_still_supplies_an_external_identity() {
+        use crate::analyzer::rust::std_types::{RustProofAttempt, completed_proof};
+
+        for (root, eligible) in [
+            ("std", true),
+            ("core", true),
+            ("alloc", true),
+            ("other", false),
+        ] {
+            let analyzer = MultiAnalyzer::default();
+            let outer = AnalyzerQueryScope::new(&analyzer);
+            let owner = [root.to_owned(), "unmodeled".to_owned()];
+            let attempt = completed_proof(&analyzer, None, || {
+                if !consume_unmodeled_std_path_proof(rust_external_identity_is_unmodeled_std_path(
+                    &analyzer, &owner, "call",
+                ))? {
+                    return None;
+                }
+                external_call_proof_and_identity(&analyzer, &owner, "call", 0, None)
+            });
+            let RustProofAttempt::Complete(identity) = attempt else {
+                panic!("a complete model read must not acquire an operational stop");
+            };
+            assert_eq!(identity.is_some(), eligible);
+            assert_eq!(outer.read_completion(), Ok(()));
+        }
+    }
 
     #[test]
     #[hardwon("#11145: optional external probes hid stops without a successful fallback")]

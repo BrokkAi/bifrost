@@ -485,6 +485,15 @@ pub fn replay(conn: &Connection) -> crate::analyzer::store::Result<Vec<Compariso
                     summary_id,
                 });
             }
+            // Restore captured rows exactly. Replaying notification triggers here
+            // would populate dirty queues before their captured rows are restored
+            // (#12898). The outer savepoint also restores triggers on failure.
+            let triggers = conn.prepare_cached("SELECT name,sql FROM temp.sqlite_schema WHERE type='trigger' AND substr(tbl_name,1,3)='cr_' ORDER BY name")?
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (name, _) in &triggers {
+                conn.execute_batch(&format!("DROP TRIGGER temp.{}", quote(name)))?;
+            }
             // Clear all inputs before restoring any, preserving cross-table
             // constraints and the schema supplied by the production preparer.
             for input in &boundary.inputs {
@@ -505,6 +514,10 @@ pub fn replay(conn: &Connection) -> crate::analyzer::store::Result<Vec<Compariso
                 for row in input.rows {
                     insert.execute(params_from_iter(row))?;
                 }
+            }
+            for (_, sql) in triggers {
+                // sqlite_schema omits TEMP from the recorded CREATE statement.
+                conn.execute_batch(&sql.replacen("CREATE TRIGGER", "CREATE TEMP TRIGGER", 1))?;
             }
             let pair = pairs(&frontier)
                 .into_iter()

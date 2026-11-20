@@ -50,6 +50,8 @@ pub(super) fn produce(
             p.omitted_reference(leaf.leaf, scope);
             continue;
         }
+        // A MISSING token has no spelling; the whole import stays an omitted
+        // reference rather than a route with a hole.
         let local_name = binding.map(|token| {
             p.facts
                 .intern_name(&mut p.names, &p.source[token.byte_range()])
@@ -60,7 +62,13 @@ pub(super) fn produce(
                 p.facts
                     .intern_name(&mut p.names, &p.source[token.byte_range()])
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>();
+        let (Some(local_name), Some(names)) =
+            (local_name.map_or(Some(None), |name| name.map(Some)), names)
+        else {
+            p.omitted_reference(leaf.leaf, scope);
+            continue;
+        };
         p.facts.import_routes.push(ResolutionImportRouteFact {
             site,
             root_scope: scope,

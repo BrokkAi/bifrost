@@ -197,6 +197,7 @@ mod tests {
                 origin: SemanticModelOriginKind::DependencySource,
                 activation: SemanticModelActivationProvenance {
                     approximate: false,
+                    approximation: None,
                     status: "active".into(),
                     reason: "test".into(),
                     source_kind: "test".into(),

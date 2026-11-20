@@ -8,3 +8,6 @@
 # Replaced the literal: JVM_EXTERNAL_PROJECTION_VERSION = 2.
 11570-slice2b-derivation-identity
 12385-m1-external-generic-surfaces
+9559-verified-jvm-external-projection
+12385-m2-method-type-parameter-bounds
+12245-identity-scoped-jvm-providers

@@ -138,11 +138,9 @@ pub(super) fn target_discovery_reasons(
                 .as_ref()
                 .is_none_or(|target| !target.starts_with(directory))
             {
-                Some(format!(
-                    "{}: target path {} escapes package",
-                    path.display(),
-                    candidate.display()
-                ))
+                // Discovery returns a typed unavailable target for this case.
+                // It is not a failure of the package's other healthy targets.
+                None
             } else if required
                 && target
                     .as_ref()
@@ -161,24 +159,9 @@ pub(super) fn target_discovery_reasons(
                     .entry(path.clone())
                     .or_default()
                     .insert(reason.clone());
-                if target
-                    .as_ref()
-                    .is_some_and(|target| target.starts_with(directory))
-                {
-                    return;
-                }
-                // add_selected_target_profiles rejects roots outside the declaring
-                // package. A destination belongs to its enclosing package's
-                // context, but #[path] and include routes can also make it a source
-                // of sibling contexts. The selected listing cannot exclude those
-                // module-path owners. Fail closed for every candidate closure;
-                // directory enclosure alone cannot prove ownership is absent.
-                for owner in manifests.keys() {
-                    reasons
-                        .entry(owner.clone())
-                        .or_default()
-                        .insert(reason.clone());
-                }
+                // The target's owning package retains this discovery reason.
+                // Other packages consume intentional target availability only
+                // when the question ranges over workspace members (#13410).
             }
         };
         if super::cargo_library_target_enabled(package) {

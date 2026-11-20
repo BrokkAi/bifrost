@@ -25,3 +25,13 @@
 12159-vec-result-type
 12778-rust-valuejoin-panic
 12956-nonnominal-trait-impls
+13081-deferred-owner-receiver
+13333-enum-variant-visibility
+13540-expected-result-coercion
+12964-impl-anonymous-owners
+13146-pattern-binder-types
+11183-r4-1a-impl-enclosing-scopes
+13315-enum-variant-scope
+13934-discriminant-block-visibility
+13259-census-macro-paths
+12159-closure-signatures

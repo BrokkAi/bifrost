@@ -603,6 +603,7 @@ fn import_semantic_document(
             .cloned()
             .unwrap_or_else(|| symbol.id.clone());
         types.push(TypeFact {
+            type_parameter_kinds: Vec::new(),
             alias_target: None,
             tuple_fields: None,
             implemented_traits_complete: false,
@@ -626,6 +627,7 @@ fn import_semantic_document(
             },
             visibility: Visibility::Public,
             is_abstract: false,
+            is_final: None,
             is_sealed: false,
             callable_surface_complete: false,
             has_explicit_type_terms: false,
@@ -768,6 +770,8 @@ fn import_semantic_document(
             .collect::<Result<Vec<_>, _>>()?;
         member_ids.insert(declaration.symbol.clone(), member_id.clone());
         members.push(MemberFact {
+            target_independent: None,
+            inherent_impl_self_arguments: None,
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -914,6 +918,8 @@ fn import_semantic_document(
                 })
                 .transpose()?;
             members.push(MemberFact {
+                target_independent: None,
+                inherent_impl_self_arguments: None,
                 implemented_trait: None,
                 self_form: None,
                 non_overridable: None,
@@ -2345,6 +2351,7 @@ fn selector_from_csmi(
         // retained envelope. Native catalog selectors cannot represent VERS;
         // an artifact digest is optional for portable runtime contracts.
         return Ok(ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: selector.purl.clone(),
                 version: None,
@@ -2376,6 +2383,7 @@ fn selector_from_csmi(
                 )
             })?;
         return Ok(ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: selector.purl.clone(),
                 version: None,
@@ -2419,6 +2427,7 @@ fn selector_from_csmi(
     }
     let digest = Some(selector.digests[0].value.clone());
     Ok(ActivationSelector {
+        production_input_digest: None,
         package: Some(NameSelector {
             name: format!("{group}:{artifact}"),
             version: Some(version.to_owned()),
@@ -2532,6 +2541,7 @@ fn signature_from_shape(
         })
         .transpose()?;
     Ok(Signature {
+        bounds: None,
         type_parameters: Vec::new(),
         parameters,
         returns,
@@ -2930,6 +2940,7 @@ fn import_value_transfer_facts(
                     drop_glue: None,
                     drop_effects: None,
                     drop_review: None,
+                    interior_mutability: None,
                 });
                 match (payload.aspect, payload.semantics) {
                     (CsmiTypeValueSemanticsAspect::Copy, CsmiTypeSemantics::Trivial {}) => {

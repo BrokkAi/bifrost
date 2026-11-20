@@ -533,6 +533,20 @@ impl BoundTypestateSubjectSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct TypestateStateTransferSpec {
+    pub call: crate::analyzer::semantic::CallSiteHandle,
+    pub source: Option<TypestateSubjectKey>,
+    pub result: TypestateSubjectKey,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundTypestateStateTransfer {
+    pub call: crate::analyzer::semantic::CallSiteHandle,
+    pub source: Option<TypestateSubjectId>,
+    pub result: TypestateSubjectId,
+}
+
+#[derive(Debug, Clone)]
 pub struct TypestateInitialSeedSpec {
     subject: TypestateSubjectKey,
     state: ProtocolStateKey,
@@ -807,6 +821,9 @@ pub struct CoverageCandidateSpec {
     pub semantic_effect: Option<Arc<str>>,
     pub quality: TypestateBindingQuality,
     pub alias_derived: bool,
+    /// The selected operand that bound the subject: a receiver claim can only
+    /// be discharged through candidates bound by the call's receiver.
+    pub role: TypestateObjectRole,
 }
 
 impl CoverageCandidateSpec {
@@ -857,6 +874,7 @@ pub enum CoverageRefusalReason {
     WitnessCountMismatch,
     WitnessEffectMismatch,
     WitnessNotDefinite,
+    PhaseOutsideClaim,
     ReceiverTransportUnproven,
 }
 
@@ -869,6 +887,12 @@ pub enum CoverageDecisionKind {
     Refused {
         reason: CoverageRefusalReason,
         record: Option<CoverageRecordKey>,
+    },
+    /// The claim accounts for every event-set effect on the subject at this
+    /// exit, and the receiver-transport certificate holds: the call's dispatch
+    /// boundary is modeled for this subject on this arm only.
+    Covered {
+        record: CoverageRecordKey,
     },
 }
 
@@ -1210,6 +1234,11 @@ impl BoundTypestateTerminal {
 pub struct TypestateBindingPlan {
     protocol_hash: TypestateProtocolHash,
     subjects: Box<[BoundTypestateSubject]>,
+    state_transfers: Box<[BoundTypestateStateTransfer]>,
+    transfers_by_call: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
+    transfers_by_point: HashMap<ProgramPointHandle, Box<[usize]>>,
+    transfers_by_source: HashMap<TypestateSubjectId, Box<[usize]>>,
+    transfers_by_result: HashMap<TypestateSubjectId, Box<[usize]>>,
     initial_seeds: Box<[BoundTypestateInitialSeed]>,
     event_bindings: Box<[BoundTypestateEvent]>,
     event_templates: Box<[BoundTypestateEvent]>,
@@ -1654,6 +1683,11 @@ impl TypestateBindingPlan {
         Ok(Self {
             protocol_hash: protocol.hash(),
             subjects: compiled_subjects.into_boxed_slice(),
+            state_transfers: Box::new([]),
+            transfers_by_call: HashMap::default(),
+            transfers_by_point: HashMap::default(),
+            transfers_by_source: HashMap::default(),
+            transfers_by_result: HashMap::default(),
             initial_seeds: compiled_seeds.into_boxed_slice(),
             event_bindings: compiled_events.into_boxed_slice(),
             event_templates: compiled_templates.into_boxed_slice(),
@@ -1729,6 +1763,9 @@ impl TypestateBindingPlan {
             visit_access_path_root_artifacts(root, &mut visit)
         });
         self.for_each_retained_site(|site| visit_observation_site_artifacts(site, &mut visit));
+        for transfer in &self.state_transfers {
+            visit(transfer.call.procedure().artifact().key());
+        }
     }
 
     /// Visit every concrete semantic artifact allocation retained by handles
@@ -1740,6 +1777,9 @@ impl TypestateBindingPlan {
         self.for_each_retained_site(|site| {
             visit_observation_site_artifact_values(site, &mut visit)
         });
+        for transfer in &self.state_transfers {
+            visit(transfer.call.procedure().artifact());
+        }
     }
 
     fn for_each_retained_subject_root(&self, mut visit: impl FnMut(&AccessPathRoot)) {
@@ -1782,6 +1822,265 @@ impl TypestateBindingPlan {
             .binary_search_by(|subject| subject.key().cmp(key))
             .ok()
             .map(|index| self.subjects[index].id())
+    }
+
+    pub fn state_transfers(&self) -> &[BoundTypestateStateTransfer] {
+        &self.state_transfers
+    }
+
+    pub(crate) fn state_transfers_at_edge(
+        &self,
+        origin: Option<&crate::analyzer::semantic::CallSiteHandle>,
+        point: &ProgramPointHandle,
+    ) -> impl Iterator<Item = &BoundTypestateStateTransfer> {
+        let indexes = match origin {
+            Some(call) => self.transfers_by_call.get(call),
+            None => self.transfers_by_point.get(point),
+        };
+        indexes
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .map(|index| &self.state_transfers[*index])
+    }
+
+    pub(crate) fn state_transfers_from(
+        &self,
+        source: TypestateSubjectId,
+    ) -> impl Iterator<Item = &BoundTypestateStateTransfer> {
+        self.transfers_by_source
+            .get(&source)
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .map(|index| &self.state_transfers[*index])
+    }
+
+    pub fn state_transfers_to(
+        &self,
+        result: TypestateSubjectId,
+    ) -> impl Iterator<Item = &BoundTypestateStateTransfer> {
+        self.transfers_by_result
+            .get(&result)
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .map(|index| &self.state_transfers[*index])
+    }
+
+    pub fn with_state_transfers(
+        mut self,
+        protocol: &CompiledProtocol,
+        transfers: Vec<TypestateStateTransferSpec>,
+    ) -> Result<Self, TypestateBindingPlanError> {
+        check_count(
+            "state_transfers",
+            transfers.len(),
+            MAX_TYPESTATE_EVENT_BINDINGS,
+        )?;
+        if transfers.is_empty() {
+            return Ok(self);
+        }
+        let mut rows = Vec::new();
+        let mut compiled = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut by_procedure =
+            HashMap::<crate::analyzer::semantic::ProcedureHandle, Vec<serde_json::Value>>::new();
+        for transfer in transfers {
+            let result = self
+                .subject_id(&transfer.result)
+                .expect("transfer result is bound");
+            let source = transfer
+                .source
+                .as_ref()
+                .map(|key| self.subject_id(key).expect("transfer source is bound"));
+            if !seen.insert((transfer.call.clone(), source, result)) {
+                continue;
+            }
+            let site = TypestateObservationSite::call_site(
+                transfer.call.clone(),
+                TypestateBindingContext::root(),
+            );
+            let row = serde_json::json!({
+                "call": canonical_site(&site),
+                "source": transfer.source.as_ref().map(TypestateSubjectKey::public_canonical_rendering),
+                "result": transfer.result.public_canonical_rendering(),
+            });
+            by_procedure
+                .entry(transfer.call.procedure().clone())
+                .or_default()
+                .push(row.clone());
+            rows.push(row);
+            compiled.push(BoundTypestateStateTransfer {
+                call: transfer.call,
+                source,
+                result,
+            });
+        }
+        rows.sort_by_key(serde_json::Value::to_string);
+        rows.dedup();
+        let mut canonical: serde_json::Value = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(TypestateBindingPlanError::Canonicalization)?;
+        canonical["state_transfers"] = serde_json::Value::Array(rows);
+        // Only procedure summaries containing transfer calls acquire this relation.
+        for (procedure, mut rows) in by_procedure {
+            rows.sort_by_key(serde_json::Value::to_string);
+            let old = self.summary_hash_for(
+                procedure.artifact().key(),
+                procedure.semantics().locator().declaration(),
+            );
+            let bytes = serde_json::to_vec(&(old, rows))
+                .map_err(TypestateBindingPlanError::Canonicalization)?;
+            self.summary_hashes
+                .entry(procedure.artifact().key().clone())
+                .or_default()
+                .insert(
+                    procedure.semantics().locator().declaration().clone(),
+                    TypestateBindingSummaryHash::from_canonical_bytes(&bytes),
+                );
+        }
+        // Replace only acquisitions at this call's invocation or normal-result
+        // site. An earlier acquisition of the same subject still establishes
+        // the state consumed by events before this transfer. These are exact
+        // semantic handles, including context, rather than source positions.
+        let mut replaced = std::collections::HashSet::new();
+        for transfer in &compiled {
+            if transfer.source == Some(transfer.result) {
+                continue;
+            }
+            let procedure = transfer.call.procedure();
+            let call = procedure
+                .semantics()
+                .call_site(transfer.call.id())
+                .expect("transfer call exists");
+            for point in std::iter::once(call.point).chain(call.normal_continuation.target()) {
+                replaced.insert((
+                    transfer.result,
+                    TypestateObservationSite::program_point(
+                        procedure
+                            .point_handle(point)
+                            .expect("transfer point exists"),
+                        TypestateBindingContext::root(),
+                    ),
+                ));
+            }
+        }
+        let mut seeds = self.initial_seeds.into_vec();
+        seeds.retain(|seed| !replaced.contains(&(seed.subject, seed.site.clone())));
+        for transfer in &compiled {
+            if transfer.source.is_some() {
+                continue;
+            }
+            let procedure = transfer.call.procedure();
+            let call = procedure
+                .semantics()
+                .call_site(transfer.call.id())
+                .expect("transfer call exists");
+            let Some(point) = call.normal_continuation.target().map(|id| {
+                procedure
+                    .point_handle(id)
+                    .expect("normal continuation belongs to the procedure")
+            }) else {
+                continue;
+            };
+            check_count(
+                "initial_seeds",
+                seeds.len().saturating_add(protocol.states().len()),
+                MAX_TYPESTATE_INITIAL_SEEDS,
+            )?;
+            for (state, _) in protocol.states() {
+                seeds.push(BoundTypestateInitialSeed {
+                    subject: transfer.result,
+                    state,
+                    site: TypestateObservationSite::program_point(
+                        point.clone(),
+                        TypestateBindingContext::root(),
+                    ),
+                    activation_edge: None,
+                    role: TypestateObjectRole::CurrentObject,
+                    quality: TypestateBindingQuality::new(
+                        ProofStatus::Unproven("uncertified state transfer source".into()),
+                        EvidenceCompleteness::Partial("unknown transferred state".into()),
+                        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1)
+                            .expect("one transfer result"),
+                    ),
+                    reviewed_fresh_result: false,
+                });
+            }
+        }
+        self.initial_seeds_by_point_all_contexts = index_initial_seed_points(&seeds);
+        self.initial_seeds = seeds.into();
+        let mut seed_values = self
+            .initial_seeds
+            .iter()
+            .map(|seed| {
+                serde_json::to_value(CanonicalSeed {
+                    subject: canonical_subject_key(
+                        self.subject(seed.subject)
+                            .expect("seed subject is bound")
+                            .key(),
+                    ),
+                    state: protocol
+                        .state_key(seed.state)
+                        .expect("seed state is declared")
+                        .as_str(),
+                    site: canonical_site(&seed.site),
+                    activation_edge: seed.activation_edge.as_ref().map(canonical_activation_edge),
+                    role: seed.role,
+                    quality: canonical_quality(&seed.quality),
+                    reviewed_fresh_result: seed.reviewed_fresh_result,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(TypestateBindingPlanError::Canonicalization)?;
+        seed_values.sort_by_key(serde_json::Value::to_string);
+        canonical["initial_seeds"] = serde_json::Value::Array(seed_values);
+        self.canonical_bytes = serde_json::to_vec(&canonical)
+            .map_err(TypestateBindingPlanError::Canonicalization)?
+            .into();
+        self.canonical_rendering = serde_json::to_string_pretty(&canonical)
+            .map_err(TypestateBindingPlanError::Canonicalization)?
+            .into();
+        self.hash = TypestateBindingPlanHash::from_canonical_bytes(&self.canonical_bytes);
+        let mut by_call = HashMap::<_, Vec<usize>>::default();
+        let mut by_point = HashMap::<_, Vec<usize>>::default();
+        let mut by_source = HashMap::<_, Vec<usize>>::default();
+        let mut by_result = HashMap::<_, Vec<usize>>::default();
+        for (index, transfer) in compiled.iter().enumerate() {
+            by_call
+                .entry(transfer.call.clone())
+                .or_default()
+                .push(index);
+            let procedure = transfer.call.procedure();
+            let point = procedure
+                .semantics()
+                .call_site(transfer.call.id())
+                .expect("transfer call exists")
+                .point;
+            by_point
+                .entry(procedure.point_handle(point).expect("call point exists"))
+                .or_default()
+                .push(index);
+            if let Some(source) = transfer.source {
+                by_source.entry(source).or_default().push(index);
+            }
+            by_result.entry(transfer.result).or_default().push(index);
+        }
+        self.transfers_by_call = by_call
+            .into_iter()
+            .map(|(key, indexes)| (key, indexes.into_boxed_slice()))
+            .collect();
+        self.transfers_by_point = by_point
+            .into_iter()
+            .map(|(key, indexes)| (key, indexes.into_boxed_slice()))
+            .collect();
+        self.transfers_by_source = by_source
+            .into_iter()
+            .map(|(key, indexes)| (key, indexes.into_boxed_slice()))
+            .collect();
+        self.transfers_by_result = by_result
+            .into_iter()
+            .map(|(key, indexes)| (key, indexes.into_boxed_slice()))
+            .collect();
+        self.state_transfers = compiled.into();
+        Ok(self)
     }
 
     pub fn initial_seeds(&self) -> &[BoundTypestateInitialSeed] {
@@ -3416,6 +3715,7 @@ fn canonical_coverage_candidate(
         semantic_effect: candidate.semantic_effect.as_deref(),
         quality: canonical_quality(&candidate.quality),
         alias_derived: candidate.alias_derived,
+        role: candidate.role,
     }
 }
 
@@ -3449,6 +3749,7 @@ struct CanonicalCoverageCandidate<'a> {
     semantic_effect: Option<&'a str>,
     quality: CanonicalQuality,
     alias_derived: bool,
+    role: TypestateObjectRole,
 }
 
 #[derive(Serialize)]
@@ -3876,6 +4177,489 @@ const fn coverage_label(coverage: CandidateCoverage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[hardwon("#12769: self-transfer removed its own seed and hid a later violation")]
+    fn self_transfer_keeps_source_seed_and_later_violation() {
+        use crate::analyzer::semantic::{
+            AbstractObject, AccessPathRoot, IcfgEdgeKind, ObjectCardinality, SemanticBudget,
+            SemanticRequest,
+        };
+        use crate::cancellation::CancellationToken;
+        use crate::dataflow::{DataflowEdge, DataflowOutput, DistributiveDataflowProblem};
+        use crate::inline_project::InlineTestProject;
+        use crate::typestate::*;
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "root.ts",
+                "function root(value: object) { touch(value); }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("root.ts"),
+                &mut SemanticRequest::new(
+                    &mut SemanticBudget::default(),
+                    &CancellationToken::default(),
+                ),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|p| !p.call_sites().is_empty())
+            .unwrap();
+        let root = artifact.procedure_handle(procedure.id()).unwrap();
+        let call = root.call_site_handle(procedure.call_sites()[0].id).unwrap();
+        let object = AbstractObject::new(
+            AccessPathRoot::Value(
+                root.value_handle(procedure.call_sites()[0].arguments[0].value)
+                    .unwrap(),
+            ),
+            ObjectCardinality::Singleton,
+        )
+        .unwrap();
+        let class = TypestateSubjectClassKey::new("cookie").unwrap();
+        let key = TypestateSubjectKey::for_object(class.clone(), &object);
+        let protocol = ProtocolSpec::from_json(br#"{
+          "schema_version":1,"states":["ready","marked","violated"],"initial_state":"ready",
+          "accepting_states":["ready","marked"],"error_states":["violated"],
+          "events":[{"id":"mark","observation":{"occurrence":{"type":"endpoint","phase":"after_normal_return"}}},{"id":"use","observation":{"occurrence":{"type":"endpoint","phase":"at_match"}}}],
+          "transitions":[{"from":"ready","on":"mark","to":"marked"},{"from":"marked","on":"mark","to":"ready"},{"from":"ready","on":"use","to":"ready"},{"from":"marked","on":"use","to":"violated"}],"terminal_expectations":[],
+          "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state","uncertainty":{"ambiguous_dispatch":"preserve_uncertainty","unknown_call":"preserve_uncertainty","external_call":"preserve_uncertainty","escape":"preserve_uncertainty","incomplete_analysis":"preserve_uncertainty"}}
+        }"#).unwrap().compile().unwrap();
+        let row = root.semantics().call_site(call.id()).unwrap();
+        let call_point = root.point_handle(row.point).unwrap();
+        let returned_point = root
+            .point_handle(row.normal_continuation.target().unwrap())
+            .unwrap();
+        let exit = root.point_handle(procedure.normal_exit_point()).unwrap();
+        let site =
+            |point| TypestateObservationSite::program_point(point, TypestateBindingContext::root());
+        let bindings = TypestateBindingPlan::try_new(
+            &protocol,
+            vec![BoundTypestateSubjectSpec::new(
+                class,
+                object,
+                TypestateBindingQuality::proven_unique(),
+            )],
+            vec![TypestateInitialSeedSpec::new(
+                key.clone(),
+                ProtocolStateKey::new("ready").unwrap(),
+                site(call_point.clone()),
+                TypestateObjectRole::MatchedValue,
+                TypestateBindingQuality::proven_unique(),
+            )],
+            vec![
+                TypestateEventBindingSpec::new(
+                    ProtocolEventKey::new("mark").unwrap(),
+                    key.clone(),
+                    TypestateObservationSite::call_site(
+                        call.clone(),
+                        TypestateBindingContext::root(),
+                    ),
+                    0,
+                    TypestateObjectRole::NormalReturn,
+                    TypestateBindingQuality::proven_unique(),
+                ),
+                TypestateEventBindingSpec::new(
+                    ProtocolEventKey::new("use").unwrap(),
+                    key.clone(),
+                    site(exit.clone()),
+                    0,
+                    TypestateObjectRole::MatchedValue,
+                    TypestateBindingQuality::proven_unique(),
+                ),
+            ],
+            vec![],
+        )
+        .unwrap()
+        .with_state_transfers(
+            &protocol,
+            vec![TypestateStateTransferSpec {
+                call: call.clone(),
+                source: Some(key.clone()),
+                result: key,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bindings.initial_seeds().len(), 1);
+        #[derive(Default)]
+        struct Facts(Vec<TypestateFact>);
+        impl DataflowOutput<TypestateFact> for Facts {
+            fn emit(&mut self, fact: TypestateFact) -> bool {
+                self.0.push(fact);
+                true
+            }
+        }
+        let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+        let proof = ProofStatus::Proven;
+        let complete = EvidenceCompleteness::Complete;
+        let mut returned = Facts::default();
+        problem.normal_flow(
+            DataflowEdge::new(
+                IcfgEdgeKind::Intraprocedural(crate::analyzer::semantic::ControlEdgeKind::Normal),
+                None,
+                &call_point,
+                &returned_point,
+                &proof,
+                &complete,
+            ),
+            TypestateFact::zero(),
+            &mut returned,
+        );
+        // Applying the return event twice toggles marked back to ready.
+        let states = returned
+            .0
+            .iter()
+            .filter_map(|fact| fact.protocol_state())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            states,
+            [protocol
+                .state_id(&ProtocolStateKey::new("marked").unwrap())
+                .unwrap()]
+            .into_iter()
+            .collect()
+        );
+        let mut observed = Facts::default();
+        for fact in returned.0 {
+            problem.normal_flow(
+                DataflowEdge::new(
+                    IcfgEdgeKind::Intraprocedural(
+                        crate::analyzer::semantic::ControlEdgeKind::Normal,
+                    ),
+                    None,
+                    &exit,
+                    &exit,
+                    &proof,
+                    &complete,
+                ),
+                fact,
+                &mut observed,
+            );
+        }
+        assert!(
+            observed.0.iter().any(|fact| fact.violation().is_some()),
+            "{:?}",
+            observed.0
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#13098: composition applied events to abstained facts while the ICFG solver skipped them"
+    )]
+    fn abstained_event_keeps_the_same_state_in_both_solvers() {
+        use crate::analyzer::semantic::{
+            AbstractObject, AccessPathRoot, IcfgEdgeKind, ObjectCardinality, SemanticBudget,
+            SemanticRequest,
+        };
+        use crate::cancellation::CancellationToken;
+        use crate::dataflow::{DataflowEdge, DataflowOutput, DistributiveDataflowProblem};
+        use crate::inline_project::InlineTestProject;
+        use crate::taint::compose::ComposeLabels;
+        use crate::typestate::*;
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "root.ts",
+                "function root(value: object) { touch(value); }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("root.ts"),
+                &mut SemanticRequest::new(
+                    &mut SemanticBudget::default(),
+                    &CancellationToken::default(),
+                ),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .unwrap();
+        let root = artifact.procedure_handle(procedure.id()).unwrap();
+        let object = AbstractObject::new(
+            AccessPathRoot::Value(
+                root.value_handle(procedure.call_sites()[0].arguments[0].value)
+                    .unwrap(),
+            ),
+            ObjectCardinality::Singleton,
+        )
+        .unwrap();
+        let class = TypestateSubjectClassKey::new("cookie").unwrap();
+        let key = TypestateSubjectKey::for_object(class.clone(), &object);
+        let protocol = ProtocolSpec::from_json(
+            br#"{
+          "schema_version":1,"states":["insecure","violated"],"initial_state":"insecure",
+          "accepting_states":["insecure"],"error_states":["violated"],
+          "events":[{"id":"seal","observation":{"occurrence":{"type":"endpoint","phase":"at_match"}}}],
+          "transitions":[{"from":"insecure","on":"seal","to":"violated"}],"terminal_expectations":[],
+          "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state","uncertainty":{"ambiguous_dispatch":"preserve_uncertainty","unknown_call":"preserve_uncertainty","external_call":"preserve_uncertainty","escape":"preserve_uncertainty","incomplete_analysis":"preserve_uncertainty"}}
+        }"#,
+        )
+        .unwrap()
+        .compile()
+        .unwrap();
+        let exit = root.point_handle(procedure.normal_exit_point()).unwrap();
+        let bindings = TypestateBindingPlan::try_new(
+            &protocol,
+            vec![BoundTypestateSubjectSpec::new(
+                class,
+                object,
+                TypestateBindingQuality::proven_unique(),
+            )],
+            vec![],
+            vec![TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("seal").unwrap(),
+                key,
+                TypestateObservationSite::program_point(
+                    exit.clone(),
+                    TypestateBindingContext::root(),
+                ),
+                0,
+                TypestateObjectRole::MatchedValue,
+                TypestateBindingQuality::proven_unique(),
+            )],
+            vec![],
+        )
+        .unwrap();
+        let subject = bindings.subjects()[0].id();
+        let insecure = protocol
+            .state_id(&ProtocolStateKey::new("insecure").unwrap())
+            .unwrap();
+        let violated = protocol
+            .state_id(&ProtocolStateKey::new("violated").unwrap())
+            .unwrap();
+        let uncertainty =
+            TypestateUncertaintySet::default().with(TypestateUncertainty::IncompleteAnalysis);
+        let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+        let labels = TypestateComposeLabels::new(&protocol, &bindings);
+        let function = TypestateComposeFunction::event(bindings.event_bindings()[0].id());
+        let proof = ProofStatus::Proven;
+        let complete = EvidenceCompleteness::Complete;
+        #[derive(Default)]
+        struct Facts(Vec<TypestateFact>);
+        impl DataflowOutput<TypestateFact> for Facts {
+            fn emit(&mut self, fact: TypestateFact) -> bool {
+                self.0.push(fact);
+                true
+            }
+        }
+        let apply = |fact: TypestateFact| {
+            let mut icfg = Facts::default();
+            problem.normal_flow(
+                DataflowEdge::new(
+                    IcfgEdgeKind::Intraprocedural(ControlEdgeKind::Normal),
+                    None,
+                    &exit,
+                    &exit,
+                    &proof,
+                    &complete,
+                ),
+                fact,
+                &mut icfg,
+            );
+            let composed = labels.apply(&function, &TypestateComposeFact::new([fact]));
+            (icfg.0, composed.alternatives().to_vec())
+        };
+        let project = |facts: &[TypestateFact]| {
+            let mut states = facts
+                .iter()
+                .filter_map(|fact| fact.state_observation())
+                .map(|(_, state, uncertainty, abstained)| (state, uncertainty, abstained))
+                .collect::<Vec<_>>();
+            let mut violations = facts
+                .iter()
+                .filter_map(|fact| {
+                    fact.violation()
+                        .map(|violation| (violation.from(), violation.to(), fact.abstained()))
+                })
+                .collect::<Vec<_>>();
+            states.sort();
+            violations.sort();
+            (states, violations)
+        };
+        let live =
+            TypestateFact::summary_state(bindings.hash(), subject, insecure, uncertainty, false);
+        let (icfg_live, composed_live) = apply(live);
+        assert_eq!(
+            project(&icfg_live),
+            project(&composed_live),
+            "a live fact must take seal in both solvers: icfg {icfg_live:?} composition {composed_live:?}"
+        );
+        assert!(
+            project(&icfg_live)
+                .0
+                .iter()
+                .any(|(state, _, abstained)| { *state == violated && !*abstained }),
+            "seal moves a live insecure fact to violated: {icfg_live:?}"
+        );
+        assert!(
+            !project(&icfg_live).1.is_empty(),
+            "the error transition is a violation in both solvers: {icfg_live:?}"
+        );
+        let frozen =
+            TypestateFact::summary_state(bindings.hash(), subject, insecure, uncertainty, true);
+        let (icfg_frozen, composed_frozen) = apply(frozen);
+        assert_eq!(
+            project(&icfg_frozen),
+            project(&composed_frozen),
+            "abstained input diverged: icfg {icfg_frozen:?} composition {composed_frozen:?}"
+        );
+        assert_eq!(
+            project(&icfg_frozen).0,
+            vec![(insecure, uncertainty, true)],
+            "seal must leave the abstained state frozen: {icfg_frozen:?}"
+        );
+        assert!(
+            project(&icfg_frozen).1.is_empty(),
+            "an abstained fact must not gain a violation: {icfg_frozen:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#12769: later transfer removed an earlier acquisition seed and hid a preceding violation"
+    )]
+    fn later_transfer_preserves_earlier_acquisition_and_violation() {
+        use crate::analyzer::semantic::{
+            AbstractObject, AccessPathRoot, IcfgEdgeKind, ObjectCardinality, SemanticBudget,
+            SemanticRequest,
+        };
+        use crate::cancellation::CancellationToken;
+        use crate::dataflow::{DataflowEdge, DataflowOutput, DistributiveDataflowProblem};
+        use crate::inline_project::InlineTestProject;
+        use crate::typestate::*;
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "root.ts",
+                "function root(value: object) { touch(value); }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("root.ts"),
+                &mut SemanticRequest::new(
+                    &mut SemanticBudget::default(),
+                    &CancellationToken::default(),
+                ),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|p| !p.call_sites().is_empty())
+            .unwrap();
+        let root = artifact.procedure_handle(procedure.id()).unwrap();
+        let call = root.call_site_handle(procedure.call_sites()[0].id).unwrap();
+        let object = AbstractObject::new(
+            AccessPathRoot::Value(
+                root.value_handle(procedure.call_sites()[0].arguments[0].value)
+                    .unwrap(),
+            ),
+            ObjectCardinality::Singleton,
+        )
+        .unwrap();
+        let class = TypestateSubjectClassKey::new("cookie").unwrap();
+        let key = TypestateSubjectKey::for_object(class.clone(), &object);
+        let protocol = ProtocolSpec::from_json(br#"{
+          "schema_version":1,"states":["ready","violated"],"initial_state":"ready",
+          "accepting_states":["ready"],"error_states":["violated"],
+          "events":[{"id":"use","observation":{"occurrence":{"type":"endpoint","phase":"at_match"}}}],
+          "transitions":[{"from":"ready","on":"use","to":"violated"}],"terminal_expectations":[],
+          "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state","uncertainty":{"ambiguous_dispatch":"preserve_uncertainty","unknown_call":"preserve_uncertainty","external_call":"preserve_uncertainty","escape":"preserve_uncertainty","incomplete_analysis":"preserve_uncertainty"}}
+        }"#).unwrap().compile().unwrap();
+        let entry = root.point_handle(procedure.entry_point()).unwrap();
+        let site =
+            |point| TypestateObservationSite::program_point(point, TypestateBindingContext::root());
+        let source_class = TypestateSubjectClassKey::new("source").unwrap();
+        let source_key = TypestateSubjectKey::for_object(source_class.clone(), &object);
+        let bindings = TypestateBindingPlan::try_new(
+            &protocol,
+            vec![
+                BoundTypestateSubjectSpec::new(
+                    class,
+                    object.clone(),
+                    TypestateBindingQuality::proven_unique(),
+                ),
+                BoundTypestateSubjectSpec::new(
+                    source_class,
+                    object,
+                    TypestateBindingQuality::proven_unique(),
+                ),
+            ],
+            vec![TypestateInitialSeedSpec::new(
+                key.clone(),
+                ProtocolStateKey::new("ready").unwrap(),
+                site(entry.clone()),
+                TypestateObjectRole::MatchedValue,
+                TypestateBindingQuality::proven_unique(),
+            )],
+            vec![TypestateEventBindingSpec::new(
+                ProtocolEventKey::new("use").unwrap(),
+                key.clone(),
+                site(entry.clone()),
+                0,
+                TypestateObjectRole::MatchedValue,
+                TypestateBindingQuality::proven_unique(),
+            )],
+            vec![],
+        )
+        .unwrap()
+        .with_state_transfers(
+            &protocol,
+            vec![TypestateStateTransferSpec {
+                call,
+                source: Some(source_key),
+                result: key,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bindings.initial_seeds().len(), 1);
+        #[derive(Default)]
+        struct Facts(Vec<TypestateFact>);
+        impl DataflowOutput<TypestateFact> for Facts {
+            fn emit(&mut self, fact: TypestateFact) -> bool {
+                self.0.push(fact);
+                true
+            }
+        }
+        let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+        let proof = ProofStatus::Proven;
+        let complete = EvidenceCompleteness::Complete;
+        let mut seeded = Facts::default();
+        problem.normal_flow(
+            DataflowEdge::new(
+                IcfgEdgeKind::Intraprocedural(crate::analyzer::semantic::ControlEdgeKind::Normal),
+                None,
+                &entry,
+                &entry,
+                &proof,
+                &complete,
+            ),
+            TypestateFact::zero(),
+            &mut seeded,
+        );
+        assert!(
+            seeded.0.iter().any(|fact| fact.violation().is_some()),
+            "{:?}",
+            seeded.0
+        );
+    }
     use crate::analyzer::Language;
     use crate::analyzer::semantic::{
         DeclarationSegment, DeclarationSegmentKind, SemanticLanguage, SemanticRole,
@@ -4034,6 +4818,7 @@ mod tests {
                         },
                     ),
                     alias_derived: false,
+                    role: TypestateObjectRole::Receiver,
                 }],
             }
         });

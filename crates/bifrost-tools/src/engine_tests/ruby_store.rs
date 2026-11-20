@@ -192,6 +192,10 @@ mod ruby_extraction_tests {
             .expect("invalid metadata/signature coordinate must panic during preparation");
     }
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn signature_metadata_unbounded_reader_preserves_rows_beyond_bounded_byte_budget() {
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
             .file(

@@ -1,4 +1,17 @@
 use super::*;
+
+/// Explicit test-only access for cross-crate batch/cache regression tests.
+pub fn resolve_definition_requests<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
+    context: &mut DefinitionBatchContext<'a, '_>,
+    requests: Vec<DefinitionLookupRequest>,
+    cancellation: Option<&CancellationToken>,
+    operation: Option<NavigationOperation>,
+) -> Vec<DefinitionLookupOutcome> {
+    super::resolve_definition_requests(analyzer, token, context, requests, cancellation, operation)
+}
+
 #[doc(hidden)]
 pub fn navigation(
     analyzer: &dyn IAnalyzer,

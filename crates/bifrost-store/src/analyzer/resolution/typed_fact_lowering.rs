@@ -1024,6 +1024,8 @@ pub enum LoweredSupertypeArguments {
 /// A declared hierarchy edge and its honest source or external target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredSupertypeProperty {
+    // Selected-header provenance only: never encoded or part of raw identity.
+    producer_language: Language,
     definition: SemanticId,
     reference: SemanticId,
     frontier: SemanticId,
@@ -1076,9 +1078,18 @@ impl LoweredSourceSupertypeProperty {
     }
 }
 
-impl From<LoweredSourceSupertypeProperty> for LoweredSupertypeProperty {
-    fn from(source: LoweredSourceSupertypeProperty) -> Self {
+impl LoweredSupertypeProperty {
+    pub fn from_source(
+        source: LoweredSourceSupertypeProperty,
+        producer_language: Language,
+    ) -> Self {
+        assert_ne!(
+            producer_language,
+            Language::None,
+            "selected source parent has a producer language"
+        );
         Self {
+            producer_language,
             definition: source.definition,
             reference: source.reference,
             frontier: source.frontier,
@@ -1088,6 +1099,10 @@ impl From<LoweredSourceSupertypeProperty> for LoweredSupertypeProperty {
             applied_arguments: None,
         }
     }
+
+    pub const fn producer_language(&self) -> Language {
+        self.producer_language
+    }
 }
 
 impl super::mounted::SpliceMount for LoweredSupertypeProperty {
@@ -1096,6 +1111,7 @@ impl super::mounted::SpliceMount for LoweredSupertypeProperty {
         translation: &T,
     ) -> Self {
         Self {
+            producer_language: self.producer_language,
             definition: translation.semantic(self.definition),
             reference: translation.semantic(self.reference),
             frontier: translation.semantic(self.frontier),
@@ -1135,13 +1151,20 @@ impl super::mounted::SpliceMount for LoweredSupertypeProperty {
 impl LoweredSupertypeProperty {
     /// A query-local model edge, never an authored source reference.
     pub fn resolved(
+        producer_language: Language,
         definition: SemanticId,
         reference: SemanticId,
         frontier: SemanticId,
         parent_ordinal: u32,
         target: SemanticId,
     ) -> Self {
+        assert_ne!(
+            producer_language,
+            Language::None,
+            "selected parent provider has a language"
+        );
         Self {
+            producer_language,
             definition,
             reference,
             frontier,
@@ -1153,13 +1176,20 @@ impl LoweredSupertypeProperty {
     }
 
     pub fn external(
+        producer_language: Language,
         definition: SemanticId,
         reference: SemanticId,
         frontier: SemanticId,
         parent_ordinal: u32,
         target: super::ExternalOwnerIdentity,
     ) -> Self {
+        assert_ne!(
+            producer_language,
+            Language::None,
+            "selected parent provider has a language"
+        );
         Self {
+            producer_language,
             definition,
             reference,
             frontier,
@@ -2758,6 +2788,17 @@ impl LoweredTypedFragment {
                     ),
                     "unwrap transfer input must retain the unwrapped operand's value"
                 ),
+                ResolutionTypeTransferKind::BindingMode
+                | ResolutionTypeTransferKind::BindingModeScrutinee => {
+                    validate_binding_mode_transfer(
+                        transfer.kind,
+                        source_role,
+                        output_role,
+                        transfer.rule.indirection_delta(),
+                        transfer.rule.reference_indirection_delta(),
+                        transfer.rule.value_transform(),
+                    )
+                }
                 ResolutionTypeTransferKind::Assignment
                 | ResolutionTypeTransferKind::Construction
                 | ResolutionTypeTransferKind::Receiver
@@ -5524,6 +5565,7 @@ enum TypedOutputProducerFamily {
     NumericPromotion,
     StringConcatenation,
     UnaryIndirection,
+    BindingMode,
     Transfer,
     TypeUnion,
     Intrinsic,
@@ -5553,6 +5595,7 @@ fn validate_output_producer_rows<Slot>(
                         | TypedOutputProducerFamily::StringConcatenation
                         | TypedOutputProducerFamily::TypeUnion
                         | TypedOutputProducerFamily::UnaryIndirection
+                        | TypedOutputProducerFamily::BindingMode
                 ))
         {
             panic!(
@@ -5578,6 +5621,10 @@ fn validate_output_producer_rows<Slot>(
                 }
                 ResolutionTypeTransferKind::UnaryIndirection => {
                     TypedOutputProducerFamily::UnaryIndirection
+                }
+                ResolutionTypeTransferKind::BindingMode
+                | ResolutionTypeTransferKind::BindingModeScrutinee => {
+                    TypedOutputProducerFamily::BindingMode
                 }
                 ResolutionTypeTransferKind::ExpressionResult => {
                     TypedOutputProducerFamily::ExpressionResult
@@ -5845,6 +5892,15 @@ fn validate_transfer_roles(
             ),
             "unwrap transfer input must retain the unwrapped operand's value: {fact:?}"
         ),
+        ResolutionTypeTransferKind::BindingMode
+        | ResolutionTypeTransferKind::BindingModeScrutinee => validate_binding_mode_transfer(
+            fact.kind,
+            input,
+            output,
+            i64::from(fact.indirection_delta),
+            i64::from(fact.reference_indirection_delta),
+            lower_value_transform(fact.value_transform),
+        ),
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
         | ResolutionTypeTransferKind::ComponentValue
@@ -6017,6 +6073,44 @@ pub(crate) fn validate_type_identity_transfer(
     );
 }
 
+/// A binding-mode output has a `BindingMode` component row, which adds the
+/// reference layer a reference-typed matched value imposes (the
+/// borrowed-reference `AddressOf` tuple), and a `BindingModeScrutinee` row,
+/// which names that matched value without contributing a value of its own.
+pub(crate) fn validate_binding_mode_transfer(
+    kind: ResolutionTypeTransferKind,
+    input: ResolutionTypeSlotRole,
+    output: ResolutionTypeSlotRole,
+    delta: i64,
+    reference_delta: i64,
+    transform: TypeTransferValueTransform,
+) {
+    assert!(
+        matches!(
+            input,
+            ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+        ),
+        "binding-mode transfer input must retain a runtime value"
+    );
+    assert_eq!(output, ResolutionTypeSlotRole::ExpressionValue);
+    let expected = match kind {
+        ResolutionTypeTransferKind::BindingMode => (
+            1,
+            1,
+            TypeTransferValueTransform::ToRuntime { addressable: false },
+        ),
+        ResolutionTypeTransferKind::BindingModeScrutinee => {
+            (0, 0, TypeTransferValueTransform::ToNoValue)
+        }
+        _ => unreachable!("binding-mode validation takes a binding-mode kind: {kind:?}"),
+    };
+    assert_eq!(
+        (delta, reference_delta, transform),
+        expected,
+        "binding-mode transfer {kind:?} has an unapproved tuple"
+    );
+}
+
 fn validate_address_of_transfer(
     delta: i64,
     reference_delta: i64,
@@ -6057,7 +6151,11 @@ fn transfer_accepts_output_role(
         ResolutionTypeTransferKind::ExpressionResult
         | ResolutionTypeTransferKind::NumericPromotion
         | ResolutionTypeTransferKind::StringConcatenation
-        | ResolutionTypeTransferKind::ValueJoin => ResolutionTypeSlotRole::ExpressionValue,
+        | ResolutionTypeTransferKind::ValueJoin
+        | ResolutionTypeTransferKind::BindingMode
+        | ResolutionTypeTransferKind::BindingModeScrutinee => {
+            ResolutionTypeSlotRole::ExpressionValue
+        }
         ResolutionTypeTransferKind::ComponentElement
         | ResolutionTypeTransferKind::ComponentKey
         | ResolutionTypeTransferKind::ComponentValue
@@ -6140,7 +6238,7 @@ fn validate_projection(
         && reference.namespace == ResolutionNamespace::TypeOrValue
         && reference_site.kind == ResolutionSiteKind::CallableReference;
     let non_invoking_constructor_reference = fact.kind
-        == BindingProjectionKind::NonInvokingMemberReference
+        == BindingProjectionKind::BindingOnlyMemberReference
         && reference.namespace == ResolutionNamespace::Constructor;
     let bare_term_binding = fact.kind.is_bare_term_binding()
         && matches!(
@@ -6155,7 +6253,7 @@ fn validate_projection(
         assert_eq!(output.site, fact.reference);
         assert!(facts.calls.iter().all(|call| call.callee != fact.reference));
     }
-    if fact.kind == BindingProjectionKind::NonInvokingMemberReference {
+    if fact.kind == BindingProjectionKind::BindingOnlyMemberReference {
         assert_eq!(output.site, fact.reference);
         assert!(matches!(
             reference_site.kind,
@@ -6167,7 +6265,10 @@ fn validate_projection(
             reference_site.kind == ResolutionSiteKind::ConstructorReference,
             non_invoking_constructor_reference
         );
-        assert!(facts.calls.iter().all(|call| call.callee != fact.reference));
+        assert!(
+            facts.calls.iter().all(|call| call.callee != fact.reference),
+            "binding-only member projection cannot coexist with an invocation"
+        );
     }
     assert!(
         reference.namespace == namespace
@@ -6233,7 +6334,7 @@ const fn projection_contract(
             ResolutionNamespace::Constructor,
             ResolutionTypeSlotRole::CallResult,
         ),
-        BindingProjectionKind::NonInvokingMemberReference => (
+        BindingProjectionKind::BindingOnlyMemberReference => (
             ResolutionNamespace::Callable,
             ResolutionTypeSlotRole::ExpressionValue,
         ),
@@ -6366,7 +6467,8 @@ fn validate_supertype(
     let reference = index.reference_identifier(fact.supertype_reference);
     assert_eq!(reference.namespace, ResolutionNamespace::Type);
     let slot = index.slot(fact.supertype_slot);
-    assert_eq!(slot.site, fact.supertype_reference);
+    // A whole structured type slot can have a different site from its terminal
+    // reference. The exact binding projection below proves their pairing.
     assert_eq!(slot.role, ResolutionTypeSlotRole::TargetTypeIdentity);
     assert!(
         facts.binding_projections.iter().any(|projection| {
@@ -6617,7 +6719,7 @@ fn assert_source_lowerable_qualified_routes(
                 .is_some_and(|support| support.qualified_type_lookups_use_value_namespace())
         {
             lookup_routes(ResolutionNamespace::Value)
-        } else if kind == BindingProjectionKind::NonInvokingMemberReference {
+        } else if kind == BindingProjectionKind::BindingOnlyMemberReference {
             // Callable and constructor references share binding-only projection
             // semantics; the producer's namespace is the language hook.
             assert!(matches!(
@@ -6933,11 +7035,10 @@ fn construction_requirement_sort_key(
 fn supertype_sort_key(
     row: &LoweredSourceSupertypeProperty,
 ) -> (SemanticId, u32, Option<u8>, SemanticId, SemanticId) {
-    let row = LoweredSupertypeProperty::from(*row);
     (
         row.definition,
         row.parent_ordinal,
-        row.source_kind().map(supertype_kind_rank),
+        Some(supertype_kind_rank(row.kind)),
         row.reference,
         row.frontier,
     )
@@ -7038,6 +7139,10 @@ const fn namespace_rank(namespace: ResolutionNamespace) -> u8 {
     }
 }
 
+/// Ranks of the binding-mode kinds in transfer identities. Final; append-only.
+const BINDING_MODE_TRANSFER_RANK: u8 = 28;
+const BINDING_MODE_SCRUTINEE_TRANSFER_RANK: u8 = 29;
+
 const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
     match kind {
         ResolutionTypeTransferKind::TypeIdentity => 0,
@@ -7075,6 +7180,8 @@ const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
         ResolutionTypeTransferKind::ElementOperand => 26,
         // Semantic hashing ranks are append-only and must never be reordered.
         ResolutionTypeTransferKind::ConditionalPayload => 27,
+        ResolutionTypeTransferKind::BindingMode => BINDING_MODE_TRANSFER_RANK,
+        ResolutionTypeTransferKind::BindingModeScrutinee => BINDING_MODE_SCRUTINEE_TRANSFER_RANK,
     }
 }
 
@@ -7109,6 +7216,7 @@ const fn supertype_kind_rank(kind: ResolutionSupertypeKind) -> u8 {
         ResolutionSupertypeKind::ImplicitSuperclass => 3,
         ResolutionSupertypeKind::SelfType => 4,
         ResolutionSupertypeKind::ImplicitInterfaceMembers => 5,
+        ResolutionSupertypeKind::AuthoredNominalParent => 6,
     }
 }
 
@@ -7534,6 +7642,24 @@ mod tests {
             visibility_eligibilities: visibility_eligibilities([0, 1]),
             ..FileResolutionFacts::default()
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7314: binding-only member lookup must not certify an invocation"
+    )]
+    #[should_panic(expected = "binding-only member projection cannot coexist with an invocation")]
+    fn binding_only_member_projection_rejects_same_callee_call() {
+        let mut facts = constructor_facts();
+        facts.type_slots[1].site = ResolutionSiteId::new(3);
+        facts.type_slots[1].role = ResolutionTypeSlotRole::ExpressionValue;
+        let projection = BindingProjectionFact {
+            reference: ResolutionSiteId::new(3),
+            output: ResolutionTypeSlotId::new(1),
+            kind: BindingProjectionKind::BindingOnlyMemberReference,
+        };
+        let index = TypedFactIndex::new(&facts);
+        validate_projection(projection, &index, &facts);
     }
 
     fn initialization_facts() -> FileResolutionFacts {

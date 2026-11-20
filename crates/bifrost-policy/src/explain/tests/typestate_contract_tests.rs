@@ -1,4 +1,9 @@
 use super::*;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayStatus;
+
+/// The status these explanations state. These tests check evidence projection,
+/// not semantic-model coverage.
+const NO_MODELS: &SemanticModelOverlayStatus = &SemanticModelOverlayStatus::NoModels;
 
 #[test]
 fn active_close_match_shard_marks_complete_typestate_finding_without_changing_identity() {
@@ -103,8 +108,13 @@ fn typestate_explanation_reports_a_single_cut_child_family() {
     let finding = &run.findings()[0];
     assert!(finding.related_truncated());
     assert!(!finding.witnesses_truncated());
-    let explanation = explain_finding(&run, &finding.id(), &ExplanationLimits::default())
-        .expect("explain truncated related locations");
+    let explanation = explain_finding(
+        &run,
+        &finding.id(),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("explain truncated related locations");
     assert!(explanation.root().children_truncated());
     assert!(explanation.root().omitted_children_lower_bound() >= 1);
 }
@@ -120,8 +130,13 @@ fn typestate_explanation_keeps_the_related_source_location() {
         },
     );
     let finding = &run.findings()[0];
-    let explanation = explain_finding(&run, &finding.id(), &ExplanationLimits::default())
-        .expect("explain retained typestate finding");
+    let explanation = explain_finding(
+        &run,
+        &finding.id(),
+        NO_MODELS,
+        &ExplanationLimits::default(),
+    )
+    .expect("explain retained typestate finding");
     let related = explanation
         .root()
         .children()

@@ -146,6 +146,8 @@ pub fn explain_flow_candidate(
     budget: &PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    let semantic_models = limits.stating_semantic_models_of(context.analyzer)?;
+    let limits = semantic_models.limits();
     let analysis_type = policy.definition().analysis.analysis_type();
     let vocabulary = match &policy.definition().analysis {
         PolicyAnalysis::Flow { .. } => &FLOW_VOCABULARY,
@@ -258,10 +260,17 @@ pub fn explain_flow_candidate(
             stages.push(region_stage(&authored));
         }
         let mut decided = decided_by(&stages);
-        if decided.is_none()
-            && let Some(solve) = &authored.solve
+        // The propagation stage explains the retained path whenever both sites
+        // are bound and solved, including under a global selection gap. When a
+        // stage already holds the verdict, propagation is shown but never
+        // decides: the root keeps the held stage, and no attribution runs.
+        let undecided = decided.is_none();
+        if !stages
+            .iter()
+            .any(|stage| stage.outcome == ExplanationOutcome::Failed)
+            && let Some(solve) = authored.solve.as_ref().filter(|_| bound)
         {
-            let propagation = propagation_stage(
+            let projected = propagation_stage(
                 policy,
                 context,
                 &authored,
@@ -269,8 +278,42 @@ pub fn explain_flow_candidate(
                 vocabulary,
                 budget,
                 snapshot.clone(),
-            )?;
-            let negative = propagation.outcome == ExplanationOutcome::Failed;
+            );
+            let propagation = if undecided {
+                projected?
+            } else {
+                // Name the stages that hold the verdict, whichever they are.
+                let held_by = stages
+                    .iter()
+                    .filter(|stage| stage.outcome != ExplanationOutcome::Satisfied)
+                    .map(|stage| stage.label.as_str())
+                    .collect::<Vec<_>>();
+                let held = format!("the verdict stays unknown because of {held_by:?}");
+                match projected {
+                    Ok(mut node) => {
+                        // A run that misses the withheld rows cannot prove the
+                        // pair unreported, so a negative projection stays open.
+                        if node.outcome == ExplanationOutcome::Failed {
+                            node.outcome = ExplanationOutcome::Unknown;
+                        }
+                        node.actual = Some(match node.actual.take() {
+                            Some(actual) => format!("{actual}; {held}"),
+                            None => held,
+                        });
+                        node
+                    }
+                    // The verdict is already held; a projection that could not
+                    // run leaves this stage open instead of the whole answer.
+                    Err(ExplainError::PolicyUnavailable { message }) => RawNode::new(
+                        ExplanationNodeKind::Derivation,
+                        ExplanationOutcome::Unknown,
+                        "propagation",
+                    )
+                    .with_actual(format!("{message}; {held}")),
+                    Err(error) => return Err(error),
+                }
+            };
+            let negative = undecided && propagation.outcome == ExplanationOutcome::Failed;
             stages.push(propagation);
             if negative && solve.kill_sites().next().is_some() {
                 authored.discard_negative_display();
@@ -288,6 +331,8 @@ pub fn explain_flow_candidate(
                     input_retention.as_mut(),
                 )?);
             }
+            // Under a held verdict propagation is never Failed and comes after
+            // the holding stage, so this still returns the holding stage.
             decided = decided_by(&stages);
         }
         let outcome = match decided {
@@ -350,7 +395,7 @@ fn position(candidate: &ExplanationCandidate) -> ExplanationPosition {
 
 /// One typed limit as an `unknown` coverage obligation.
 fn boundary_node(boundary: &CandidateBoundary) -> RawNode {
-    RawNode::new(
+    let mut node = RawNode::new(
         ExplanationNodeKind::CoverageObligation,
         ExplanationOutcome::Unknown,
         format!("boundary:{}", boundary.kind.label()),
@@ -358,7 +403,21 @@ fn boundary_node(boundary: &CandidateBoundary) -> RawNode {
     .with_expected("the analysis covers this stage exhaustively")
     .with_actual(boundary.detail.clone())
     .with_location(boundary.location.clone())
-    .with_reasons(boundary.reasons.clone())
+    .with_reasons(boundary.reasons.clone());
+    // Every stored cause is a child; `build_explanation` applies the shared
+    // child limit and reports what it omits.
+    for cause in &boundary.causes {
+        node.push_child(
+            RawNode::new(
+                ExplanationNodeKind::CoverageObligation,
+                ExplanationOutcome::Unknown,
+                format!("cause:{}", cause.family),
+            )
+            .with_actual(cause.message.clone())
+            .with_location(cause.location.clone()),
+        );
+    }
+    node
 }
 
 fn boundary_reasons<'a>(

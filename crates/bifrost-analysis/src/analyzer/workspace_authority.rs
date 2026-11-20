@@ -570,6 +570,144 @@ mod tests {
     }
 
     #[test]
+    fn deferred_memo_partitions_keep_failure_channels_private_on_both_backends() {
+        use crate::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
+        use brokk_bifrost_core::analyzer::internal_memo_partitions;
+        for project_backend in [false, true] {
+            for cause in [
+                QueryReadIncomplete::StoreFailure(crate::analyzer::store::StoreError::new(
+                    "partition store failure",
+                )),
+                QueryReadIncomplete::Cancelled,
+            ] {
+                let analyzer: Arc<dyn IAnalyzer> = Arc::new(MultiAnalyzer::default());
+                let (capability, _project_owner) = if project_backend {
+                    let (capability, owner) =
+                        super::super::tree_sitter_analyzer::memo_partition_test_project_backend();
+                    (capability, Some(owner))
+                } else {
+                    (erased_read_capability(Arc::clone(&analyzer)), None)
+                };
+                let completion =
+                    AnalyzerQueryScope::capturing_read_incompleteness(analyzer.as_ref());
+                let key = ReadKey::Configuration(StableDigest::sha256(b"failure partition"));
+                let run = || {
+                    let outer = super::super::i_analyzer::innermost_read_ledger().unwrap();
+                    let before = outer.channels();
+                    let ((), partition) = internal_memo_partitions::capture(&capability, || {
+                        analyzer.record_read(key.clone());
+                        analyzer.mark_runtime_cache_touched();
+                        analyzer.record_query_incomplete(cause.clone());
+                    });
+                    // Completion remains visible during the computation so
+                    // failures abort the same walk. Only input channels defer.
+                    assert_eq!(
+                        completion.captured_read_incompleteness(),
+                        vec![cause.clone()]
+                    );
+                    assert!(outer.keys().is_empty());
+                    assert!(
+                        !outer.runtime_cache_touched(),
+                        "the leaf marker remains deferred"
+                    );
+                    assert_eq!(
+                        outer.channels(),
+                        before,
+                        "backend={project_backend}, cause={cause:?}"
+                    );
+                    assert_eq!(partition.forwarded_to, None);
+                    let expected = partition.channels;
+                    let entry = Arc::new(ReplayingMemoEntry::from_parts(
+                        (),
+                        CapturedMemoReads {
+                            runtime_cache_touched: false,
+                            keys: Arc::from([partition.receipt]),
+                            channels: partition.channels,
+                            first_refusal: partition.first_refusal,
+                            first_execution_refusal: partition.first_execution_refusal,
+                        },
+                    ));
+                    ReplayingMemo::new(())
+                        .read(&capability.memo_attribution(), |_, _| {
+                            Ok::<_, Infallible>(entry)
+                        })
+                        .unwrap();
+                    assert!(
+                        outer.runtime_cache_touched(),
+                        "backend replay restores the leaf's marker"
+                    );
+                    assert_eq!(
+                        outer.channels(),
+                        expected,
+                        "replay exactly once backend={project_backend}"
+                    );
+                    assert_eq!(
+                        completion.captured_read_incompleteness(),
+                        vec![cause.clone()]
+                    );
+                };
+                let (_, selected) = if let Some(owner) = &_project_owner {
+                    owner.capture_judged(|| {
+                        (
+                            run(),
+                            brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                        )
+                    })
+                } else {
+                    capture_query_reads(analyzer.as_ref(), run)
+                };
+                assert_eq!(selected.keys(), vec![key]);
+                assert!(!selected.channels().is_bounded());
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_memo_partition_forwards_only_when_selected() {
+        use brokk_bifrost_core::analyzer::internal_memo_partitions;
+        let analyzer: Arc<dyn IAnalyzer> = Arc::new(MultiAnalyzer::default());
+        let capability = erased_read_capability(Arc::clone(&analyzer));
+        let key = ReadKey::Configuration(StableDigest::sha256(b"partition input"));
+        let ((answer, partition), untouched) = capture_query_reads(analyzer.as_ref(), || {
+            internal_memo_partitions::capture(&capability, || {
+                analyzer.record_read(key.clone());
+                for _ in 0..16 {
+                    analyzer.record_unattributed_read();
+                }
+                Err::<(), _>("a failed build still carries executed reads")
+            })
+        });
+        assert!(answer.is_err());
+        assert!(untouched.keys().is_empty());
+        assert_eq!(untouched.unattributed_reads(), 0);
+        assert_eq!(partition.channels.unattributed_reads, 16);
+        assert_eq!(partition.forwarded_to, None);
+        // The ordinary memo accessor owns replay; the internal seam has not
+        // re-encoded or replaced the backend's opaque leaf.
+        let entry = Arc::new(
+            brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemoEntry::from_parts(
+                (),
+                CapturedMemoReads {
+                    runtime_cache_touched: false,
+                    keys: Arc::from([partition.receipt]),
+                    channels: partition.channels,
+                    first_refusal: partition.first_refusal,
+                    first_execution_refusal: partition.first_execution_refusal,
+                },
+            ),
+        );
+        let memo = ReplayingMemo::new(());
+        let (_, selected) = capture_query_reads(analyzer.as_ref(), || {
+            memo.read(&capability.memo_attribution(), |_, _| {
+                Ok::<_, Infallible>(Arc::clone(&entry))
+            })
+            .unwrap()
+        });
+        assert_eq!(selected.keys(), vec![key]);
+        assert_eq!(selected.unattributed_reads(), 16);
+    }
+
+    #[test]
     fn memo_reads_replay_after_an_uncaptured_build() {
         let analyzer = MultiAnalyzer::default();
         let attribution = memo_attribution(&analyzer);
@@ -918,6 +1056,20 @@ pub fn workspace_read_capability(workspace: &super::WorkspaceAnalyzer) -> ReadCa
 struct OwnedReadAttribution {
     analyzer: Arc<dyn IAnalyzer>,
 }
+impl brokk_bifrost_core::analyzer::internal_memo_partitions::DeferredMemoAttribution
+    for OwnedReadAttribution
+{
+    fn capture_deferred(
+        &self,
+        build: &mut dyn FnMut(),
+    ) -> brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
+        let ((), reads) = super::i_analyzer::capture_memo_partition(self.analyzer.as_ref(), || {
+            checked_read_ledger_attachment(self.analyzer.as_ref());
+            build();
+        });
+        erased_captured_reads(&reads, None)
+    }
+}
 impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for OwnedReadAttribution {
     fn is_live(&self) -> bool {
         true
@@ -962,9 +1114,21 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Owne
             let keys = receipt
                 .downcast_ref::<CapturedMemoReads<ReadKey>>()
                 .expect("only analysis constructs read receipts");
+            if keys.runtime_cache_touched {
+                self.analyzer.mark_runtime_cache_touched();
+            }
             self.analyzer.record_read_receipt(&keys.keys);
         }
         super::i_analyzer::replay_query_read_receipt(self.analyzer.as_ref(), [], channels);
+    }
+    fn record_inventory(
+        &self,
+        receipt: &brokk_bifrost_core::analyzer::project_reads::InventoryReadReceipt,
+    ) {
+        self.record_keys(
+            project_inventory_read_key(receipt, self.analyzer.project().root())
+                .map(|key| vec![key]),
+        );
     }
     fn record(
         &self,
@@ -972,13 +1136,18 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Owne
         read: brokk_bifrost_core::analyzer::project_reads::ProjectRead<'_>,
         receipt: brokk_bifrost_core::analyzer::project_reads::ProjectReadReceipt,
     ) {
-        match project_read_keys(
+        self.record_keys(project_read_keys(
             &|file| self.analyzer.selected_parse_variant(file),
             project,
             self.analyzer.project().root(),
             read,
             receipt,
-        ) {
+        ));
+    }
+}
+impl OwnedReadAttribution {
+    fn record_keys(&self, keys: std::io::Result<Vec<ReadKey>>) {
+        match keys {
             Ok(keys) => {
                 for key in keys {
                     self.analyzer.record_read(key);
@@ -1102,7 +1271,11 @@ pub(super) fn replay_erased_reads(
         |key| super::i_analyzer::record_read_on_active_ledgers(contexts, key),
         |count| super::i_analyzer::record_unattributed_on_active_ledgers(contexts, count),
         |count| super::i_analyzer::record_execution_dependence_on_active_ledgers(contexts, count),
-        |count| super::i_analyzer::record_budget_dependence_on_active_ledgers(contexts, count),
+        |record, count| {
+            super::i_analyzer::record_attributed_dependence_on_active_ledgers(
+                contexts, record, count,
+            )
+        },
         |verdict| {
             super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
                 ledger.join_verdict(verdict)
@@ -1126,6 +1299,30 @@ pub(super) fn replay_erased_reads(
     );
 }
 
+/// Inventory attribution needs only the completed source's lexical root and
+/// scalar certificate. Direct getters and request-local replay share this path.
+pub(super) fn project_inventory_read_key(
+    receipt: &brokk_bifrost_core::analyzer::project_reads::InventoryReadReceipt,
+    workspace_root: &std::path::Path,
+) -> std::io::Result<ReadKey> {
+    if let Some(cause) = &receipt.incomplete {
+        return Err(std::io::Error::other(cause.clone()));
+    }
+    if receipt.source_root != workspace_root {
+        return Err(std::io::Error::other(
+            "a whole-workspace fact cannot certify a different Project root",
+        ));
+    }
+    Ok(workspace_fact_key(
+        WorkspaceFactFamily::WorkspaceFileInventory,
+        FactSubject::Whole,
+        receipt
+            .inventory
+            .map(StableDigest::from_array)
+            .ok_or_else(|| std::io::Error::other("inventory getter omitted its receipt"))?,
+    ))
+}
+
 pub(super) fn project_read_keys(
     variant_for_file: &dyn Fn(
         &super::ProjectFile,
@@ -1137,6 +1334,17 @@ pub(super) fn project_read_keys(
 ) -> std::io::Result<Vec<ReadKey>> {
     use brokk_bifrost_core::analyzer::project_reads::{ProjectRead, without_project_reads};
     without_project_reads(|| {
+        if matches!(read, ProjectRead::Inventory) {
+            return project_inventory_read_key(
+                &brokk_bifrost_core::analyzer::project_reads::InventoryReadReceipt {
+                    source_root: project.root().to_path_buf(),
+                    inventory: receipt.inventory,
+                    incomplete: receipt.incomplete,
+                },
+                workspace_root,
+            )
+            .map(|key| vec![key]);
+        }
         if let Some(cause) = &receipt.incomplete {
             return Err(std::io::Error::other(cause.clone()));
         }
@@ -1171,14 +1379,7 @@ pub(super) fn project_read_keys(
                     .map(StableDigest::from_array)
                     .ok_or_else(|| std::io::Error::other("listing getter omitted its receipt"))?,
             )]),
-            ProjectRead::Inventory => Ok(vec![workspace_fact_key(
-                WorkspaceFactFamily::WorkspaceFileInventory,
-                FactSubject::Whole,
-                receipt
-                    .inventory
-                    .map(StableDigest::from_array)
-                    .ok_or_else(|| std::io::Error::other("inventory getter omitted its receipt"))?,
-            )]),
+            ProjectRead::Inventory => unreachable!("inventory uses its scalar source certificate"),
             ProjectRead::GitIgnore { rel_path } => {
                 let mut keys = if receipt.inventory.is_some() {
                     project_read_keys(variant_for_file, project, workspace_root, ProjectRead::Inventory, receipt.clone())?
@@ -1303,4 +1504,15 @@ pub(super) fn project_read_keys(
             )),
         }
     })
+}
+
+/// Evidence readers report the exact selected content to the current capture.
+pub struct QueryEvidenceReadRecorder;
+impl super::store::dependency_file_evidence::EvidenceReadRecorder for QueryEvidenceReadRecorder {
+    fn record(&self, key: ReadKey) {
+        super::i_analyzer::record_request_row_selection_read(key);
+    }
+    fn refuse_reuse(&self) {
+        super::i_analyzer::refuse_request_row_read_reuse();
+    }
 }

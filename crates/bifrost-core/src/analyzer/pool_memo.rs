@@ -29,6 +29,7 @@
 //! read-through memos whose stampede it exists to stop (issue #1748).
 
 use crate::analyzer::config::default_parallelism;
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::hash::HashMap;
 use std::any::Any;
 use std::cell::Cell;
@@ -116,7 +117,25 @@ pub fn install_on_dedicated_build_pool<R: Send>(task: impl FnOnce() -> R + Send)
     }
 }
 
-type FailureWave<T, E> = PoolSafeMemo<Result<Arc<T>, Arc<E>>>;
+type WaveResult<T, E> = Result<Arc<T>, Arc<E>>;
+type FailureWave<T, E> = PoolSafeMemo<WaveResult<T, E>>;
+
+/// Only input-determined errors may cross request boundaries as a completed
+/// wave value. An execution failure belongs to its caller. PoolSafeMemo's
+/// fallible-build guard wakes one new claimant; Moka waiters instead run their
+/// own unused initializer once. Both use this one typed classifier (#11997).
+#[doc(hidden)]
+pub fn shareable_wave_result<T, E: CarriesReuseVerdict>(
+    result: WaveResult<T, E>,
+) -> Result<WaveResult<T, E>, Arc<E>> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(error) => match error.reuse_verdict() {
+            ReuseVerdict::Content => Ok(Err(error)),
+            ReuseVerdict::ExecutionDependent(_) => Err(error),
+        },
+    }
+}
 
 #[derive(Debug)]
 pub struct PoolSafeMemo<T> {
@@ -466,7 +485,7 @@ impl<T> PoolSafeMemo<T> {
         result.clone()
     }
 
-    /// Share a typed failure with callers waiting on this attempt. Only a
+    /// Share a deterministic failure with callers waiting on this attempt. Only a
     /// successful value survives the attempt; later waves retry failures.
     /// Rayon workers retain the serial duplicate escape hatch for pool safety.
     /// The original memo still owns builder claims and completed publication,
@@ -478,7 +497,7 @@ impl<T> PoolSafeMemo<T> {
     ) -> Result<Arc<T>, Arc<E>>
     where
         T: Send + Sync + 'static,
-        E: Send + Sync + 'static,
+        E: CarriesReuseVerdict + Send + Sync + 'static,
     {
         if let Some(value) = self.get() {
             return Ok(value);
@@ -487,24 +506,28 @@ impl<T> PoolSafeMemo<T> {
         let parallel_build = std::cell::RefCell::new(Some(parallel));
         let serial_build = std::cell::RefCell::new(Some(serial));
         let build = || {
-            self.get_or_try_build(
-                || {
-                    parallel_build
-                        .borrow_mut()
-                        .take()
-                        .expect("one parallel initializer")()
-                },
-                || {
-                    serial_build
-                        .borrow_mut()
-                        .take()
-                        .expect("one serial initializer")()
-                },
+            shareable_wave_result(
+                self.get_or_try_build(
+                    || {
+                        parallel_build
+                            .borrow_mut()
+                            .take()
+                            .expect("one parallel initializer")()
+                    },
+                    || {
+                        serial_build
+                            .borrow_mut()
+                            .take()
+                            .expect("one serial initializer")()
+                    },
+                )
+                .map_err(Arc::new),
             )
-            .map_err(Arc::new)
         };
-        let attempt = wave.get_or_build(build, build);
-        self.finish_wave(&wave, attempt.as_ref())
+        let result = wave
+            .get_or_try_build(build, build)
+            .and_then(|attempt| attempt.as_ref().clone());
+        self.finish_wave(&wave, &result)
     }
 
     /// Run this caller's initializer inline. Unlike OnceLock, a rayon caller
@@ -515,7 +538,7 @@ impl<T> PoolSafeMemo<T> {
     ) -> Result<Arc<T>, Arc<E>>
     where
         T: Send + Sync + 'static,
-        E: Send + Sync + 'static,
+        E: CarriesReuseVerdict + Send + Sync + 'static,
     {
         let build = std::cell::RefCell::new(Some(build));
         let run = || {
@@ -528,7 +551,7 @@ impl<T> PoolSafeMemo<T> {
     }
 
     /// A waiting caller may stop under its own deadline. A failed builder's
-    /// typed result is shared only by the callers still in this wave.
+    /// deterministic result is shared only by the callers still in this wave.
     pub fn get_or_try_build_wave_while<E>(
         &self,
         keep_going: &impl Fn() -> bool,
@@ -537,7 +560,7 @@ impl<T> PoolSafeMemo<T> {
     ) -> Result<Option<Arc<T>>, Arc<E>>
     where
         T: Send + Sync + 'static,
-        E: Send + Sync + 'static,
+        E: CarriesReuseVerdict + Send + Sync + 'static,
     {
         if let Some(value) = self.get() {
             return Ok(Some(value));
@@ -562,33 +585,39 @@ impl<T> PoolSafeMemo<T> {
                 .map(Some)
             },
         ) {
-            Ok(Some(value)) => Some(Ok(value)),
-            Ok(None) => None,
-            Err(error) => Some(Err(Arc::new(error))),
+            Ok(Some(value)) => Ok(Some(Ok(value))),
+            Ok(None) => Ok(None),
+            Err(error) => shareable_wave_result(Err(Arc::new(error))).map(Some),
         };
-        wave.get_or_build_while(keep_going, build, build)
-            .map(|attempt| self.finish_wave(&wave, attempt.as_ref()))
-            .transpose()
+        match wave.get_or_try_build_while(keep_going, build, build) {
+            Ok(Some(attempt)) => self.finish_wave(&wave, attempt.as_ref()).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => self.finish_wave(&wave, &Err(error)).map(Some),
+        }
     }
 
-    /// The store-only variant lets every waiter share this attempt's failure.
+    /// The store-only variant shares only deterministic errors with waiters.
     pub fn get_or_try_build_pool_independent_wave<E>(
         &self,
         build: impl FnOnce() -> Result<T, E>,
     ) -> Result<Arc<T>, Arc<E>>
     where
         T: Send + Sync + 'static,
-        E: Send + Sync + 'static,
+        E: CarriesReuseVerdict + Send + Sync + 'static,
     {
         if let Some(value) = self.get() {
             return Ok(value);
         }
         let wave = self.failure_wave();
-        let attempt = wave.get_or_build_pool_independent(|| {
-            self.get_or_try_build_pool_independent(build)
-                .map_err(Arc::new)
-        });
-        self.finish_wave(&wave, attempt.as_ref())
+        let result = wave
+            .get_or_try_build_pool_independent(|| {
+                shareable_wave_result(
+                    self.get_or_try_build_pool_independent(build)
+                        .map_err(Arc::new),
+                )
+            })
+            .and_then(|attempt| attempt.as_ref().clone());
+        self.finish_wave(&wave, &result)
     }
 
     /// The dedicated-pool variant preserves its execution and wait policy.
@@ -598,17 +627,21 @@ impl<T> PoolSafeMemo<T> {
     ) -> Result<Arc<T>, Arc<E>>
     where
         T: Send + Sync + 'static,
-        E: Send + Sync + 'static,
+        E: CarriesReuseVerdict + Send + Sync + 'static,
     {
         if let Some(value) = self.get() {
             return Ok(value);
         }
         let wave = self.failure_wave();
-        let attempt = wave.get_or_build_on_dedicated_pool(|| {
-            self.get_or_try_build_on_dedicated_pool(build)
-                .map_err(Arc::new)
-        });
-        self.finish_wave(&wave, attempt.as_ref())
+        let result = wave
+            .get_or_try_build_on_dedicated_pool(|| {
+                shareable_wave_result(
+                    self.get_or_try_build_on_dedicated_pool(build)
+                        .map_err(Arc::new),
+                )
+            })
+            .and_then(|attempt| attempt.as_ref().clone());
+        self.finish_wave(&wave, &result)
     }
 
     pub fn get_or_try_build<E>(
@@ -758,6 +791,11 @@ impl<T> PoolSafeMemo<T> {
     pub fn invalidate(&self) {
         self.state.lock().expect("pool memo poisoned").value = None;
     }
+
+    /// The stored value, removed so that the caller drops it outside the lock.
+    pub(crate) fn take_value(&self) -> Option<Arc<T>> {
+        self.state.lock().expect("pool memo poisoned").value.take()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -809,6 +847,16 @@ where
         Self {
             cells: RwLock::new(HashMap::default()),
         }
+    }
+
+    /// Every cell, removed so that the caller drops them outside the lock.
+    pub(crate) fn take_cells(&self) -> HashMap<K, Arc<PoolSafeMemo<V>>> {
+        std::mem::take(
+            &mut *self
+                .cells
+                .write()
+                .expect("keyed pool memo write lock poisoned"),
+        )
     }
 
     /// The single-flight cell for `key`, created on first ask. Only the map
@@ -891,13 +939,119 @@ impl<K, V> std::fmt::Debug for KeyedPoolSafeMemo<K, V> {
 #[cfg(test)]
 mod tests {
     use super::{KeyedPoolSafeMemo, PoolSafeMemo, spawn_on_dedicated_build_pool};
+    use crate::analyzer::reuse_verdict::{ExecutionCause, Judged, ReuseVerdict};
     use brokk_bifrost_test_macros::hardwon;
+    use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    fn content_failure(value: &'static str) -> Judged<&'static str> {
+        Judged {
+            value,
+            reuse: ReuseVerdict::Content,
+        }
+    }
+
+    #[test]
+    #[hardwon("#11997: a shared wave replayed its leader's execution failure to healthy followers")]
+    fn wave_followers_share_content_errors_and_rebuild_execution_errors_once() {
+        const FOLLOWERS: usize = 4;
+        for reuse in [
+            ReuseVerdict::Content,
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+        ] {
+            let memo = PoolSafeMemo::<usize>::new();
+            let rebuilds = AtomicUsize::new(0);
+            let (started_tx, started_rx) = mpsc::sync_channel(0);
+            let (release_tx, release_rx) = mpsc::sync_channel(0);
+            let (joined_tx, joined_rx) = mpsc::sync_channel(0);
+            thread::scope(|threads| {
+                let memo_ref = &memo;
+                let leader = threads.spawn(move || {
+                    memo_ref.get_or_try_build_wave_while(
+                        &|| true,
+                        || {
+                            started_tx.send(()).expect("leader entered");
+                            release_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("followers release leader");
+                            Err(Judged {
+                                value: "leader failure",
+                                reuse,
+                            })
+                        },
+                        || panic!("off-pool caller uses its parallel initializer"),
+                    )
+                });
+                started_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("leader building");
+                let followers: Vec<_> = (0..FOLLOWERS)
+                    .map(|_| {
+                        let joined_tx = joined_tx.clone();
+                        let rebuilds = &rebuilds;
+                        threads.spawn(move || {
+                            let joined = Cell::new(false);
+                            // The wave is held before the first predicate call.
+                            let keep_going = || {
+                                if !joined.replace(true) {
+                                    joined_tx.send(()).expect("follower holds wave");
+                                }
+                                true
+                            };
+                            memo_ref.get_or_try_build_wave_while(
+                                &keep_going,
+                                || {
+                                    rebuilds.fetch_add(1, Ordering::SeqCst);
+                                    Ok::<_, Judged<&'static str>>(42)
+                                },
+                                || panic!("off-pool follower cannot duplicate the build"),
+                            )
+                        })
+                    })
+                    .collect();
+                for _ in 0..FOLLOWERS {
+                    joined_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("follower joined");
+                }
+                release_tx.send(()).expect("release failed leader");
+                let error = leader
+                    .join()
+                    .expect("leader thread")
+                    .expect_err("leader failed");
+                assert_eq!(error.value, "leader failure");
+                assert_eq!(error.reuse, reuse);
+                for follower in followers {
+                    let result = follower.join().expect("follower thread");
+                    match reuse {
+                        ReuseVerdict::Content => {
+                            let error = result.expect_err("the deterministic error is shared");
+                            assert_eq!(error.value, "leader failure");
+                            assert_eq!(error.reuse, ReuseVerdict::Content);
+                        }
+                        ReuseVerdict::ExecutionDependent(_) => {
+                            assert_eq!(result.expect("healthy follower").as_deref(), Some(&42));
+                        }
+                    }
+                }
+            });
+            match reuse {
+                ReuseVerdict::Content => {
+                    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+                    assert!(memo.get().is_none());
+                }
+                ReuseVerdict::ExecutionDependent(_) => {
+                    assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+                    assert_eq!(memo.get().as_deref(), Some(&42));
+                }
+            }
+        }
+    }
 
     #[test]
     fn failed_wave_is_shared_and_retired_before_the_next_wave() {
@@ -909,16 +1063,16 @@ mod tests {
                 .map(|_| {
                     threads.spawn(|| {
                         // Pin the same attempt before any caller begins its build.
-                        let wave = memo.failure_wave::<&'static str>();
+                        let wave = memo.failure_wave::<Judged<&'static str>>();
                         acquired.wait();
                         let attempt = wave.get_or_build_pool_independent(|| {
                             builds.fetch_add(1, Ordering::SeqCst);
-                            Err(Arc::new("failed attempt"))
+                            Err(Arc::new(content_failure("failed attempt")))
                         });
                         let error = memo
                             .finish_wave(&wave, attempt.as_ref())
                             .expect_err("failed wave");
-                        assert_eq!(*error, "failed attempt");
+                        assert_eq!(error.value, "failed attempt");
                         assert!(!memo.is_ready());
                         acquired.wait();
                         drop(wave);
@@ -934,7 +1088,7 @@ mod tests {
         let value = memo
             .get_or_try_build_pool_independent_wave(|| {
                 builds.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, &'static str>(7)
+                Ok::<_, Judged<&'static str>>(7)
             })
             .expect("new wave retries");
         assert_eq!(*value, 7);
@@ -944,25 +1098,25 @@ mod tests {
     #[test]
     fn published_failure_retires_its_slot_without_detaching_a_replacement() {
         let memo = PoolSafeMemo::<usize>::new();
-        let old = memo.failure_wave::<&'static str>();
+        let old = memo.failure_wave::<Judged<&'static str>>();
         assert_eq!(
-            *memo
-                .get_or_try_build_pool_independent_wave(|| Err("failed attempt"))
-                .expect_err("failed wave"),
+            memo.get_or_try_build_pool_independent_wave(|| Err(content_failure("failed attempt")))
+                .expect_err("failed wave")
+                .value,
             "failed attempt",
         );
         // Keep an old holder alive: slot retirement must not wait for its drop.
         assert!(memo.failure_wave.lock().expect("wave lock").is_none());
-        let replacement = memo.failure_wave::<&'static str>();
+        let replacement = memo.failure_wave::<Judged<&'static str>>();
         assert!(!Arc::ptr_eq(&old, &replacement));
         let old_result = old.get().expect("old failure was published");
         assert!(memo.finish_wave(&old, old_result.as_ref()).is_err());
         assert!(Arc::ptr_eq(
             &replacement,
-            &memo.failure_wave::<&'static str>()
+            &memo.failure_wave::<Judged<&'static str>>()
         ));
         let value = memo
-            .get_or_try_build_pool_independent_wave(|| Ok::<_, &'static str>(7))
+            .get_or_try_build_pool_independent_wave(|| Ok::<_, Judged<&'static str>>(7))
             .expect("the replacement retries");
         assert_eq!(*value, 7);
     }
@@ -991,11 +1145,11 @@ mod tests {
             started_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("plain builder started");
-            let wave = memo.failure_wave::<&'static str>();
+            let wave = memo.failure_wave::<Judged<&'static str>>();
             let follower = threads.spawn(|| {
                 memo.get_or_try_build_pool_independent_wave(|| {
                     builds.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, &'static str>(99)
+                    Ok::<_, Judged<&'static str>>(99)
                 })
                 .expect("wave consumes the plain build")
             });

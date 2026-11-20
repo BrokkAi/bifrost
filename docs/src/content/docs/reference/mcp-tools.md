@@ -77,21 +77,84 @@ environment variables that affect analysis and caching in every mode, see
 
 ### Request budget and limits
 
+Analyzer-backed MCP calls do not wait for initial workspace preparation.
+While preparation runs, synchronous calls (including `search_symbols` and
+`run_policy`) return `isError: true` with no `structuredContent` and
+`_meta["io.bifrost/incomplete"]` containing status `inconclusive`, completion
+`{type: "inconclusive", reasons: ["workspace_not_ready"]}`, stage
+`workspace_readiness`, the current `phase`, `partial: false`, and
+`workspace_preparation: "continues"`. This is not a deadline expiry and does
+not cancel the shared build. Check `get_active_workspace` or retry; named
+workspace mode exposes only retry. A failed build reports its real error.
+
+`get_active_workspace` also reports the full `retiring_workspaces` list, with
+`root`, `generation`, and the teardown `phase` for every retained workspace.
+Each service permits the installed session plus one replacement in flight.
+A further activation returns `workspace_not_ready` at stage
+`workspace_activation` without changing the active root or generation; retry
+when retirement drains. Revocation is always permitted. Existing semantic warm
+and build cancellation tokens are cancelled on retirement. Index and usage
+warms retain their slot until they finish; cancellable teardown is tracked by
+#13507.
+
+The probe never waits for the connection, session, or lifecycle locks. An unbound
+probe may await its own client roots reply, with no server guard held during
+that round trip; it rechecks the binding after the reply and returns `busy` if
+the binding changes during observation. On platforms where a queued writer
+prevents a read attempt, or while the lifecycle lock is busy, it returns an
+inconclusive tool result with reason `busy` and stage `workspace_activation`.
+Retry the probe; writer preference depends on the platform. These activation
+results include the full `retiring_workspaces` list in incomplete metadata.
+
+`get_active_workspace` is a non-blocking readiness probe. `analyzer_ready`
+means the analyzer has been installed. `workspace_build` reports `status`
+(`running`, `completed`, or `failed`), `generation`, optional `phase`, and an
+`error` on failure. Before installation, usage and semantic readiness are
+false and the semantic overlay is pending. `activate_workspace` binds and
+starts preparation, returning success without waiting. Re-activating the same
+workspace after preparation failed starts a fresh generation; ordinary probes
+retain failures, and activation never restarts a building or ready workspace. A cold `refresh` or
+`update_paths` returns not-ready without applying the operation; retry it.
+Once warm, both operations complete their publication fences before success.
+
+This contract concerns initial analyzer construction only. Later snapshot
+settling, usage catch-up, and semantic warm-up retain their correctness waits.
+Durable Tasks return a handle immediately and their workers may wait for
+initial preparation.
+
 Bifrost picks one budget for each tool call when it accepts the call. The
-budget covers the wait for workspace readiness, the wait for an analyzer slot,
-and execution. The first matching row applies:
+budget covers readiness observation, the wait for an analyzer slot, and execution. Readiness observation does not wait for an unfinished build. The first matching row applies:
 
 | Condition | Budget |
 | --- | --- |
-| `BIFROST_MCP_REQUEST_BUDGET_SECS` is set | That many seconds, for every tool |
+| `BIFROST_MCP_REQUEST_BUDGET_SECS` is set | That many seconds, except `list_policies` |
 | Tool is `run_policy` | 240 seconds |
-| Tool is `refresh`, `activate_workspace`, `get_active_workspace`, or `list_policies` | No budget |
-| The workspace is still building, and the tool is not `search_symbols` | 4.5 seconds |
+| Tool is `refresh`, `activate_workspace`, `get_active_workspace`, or `update_paths` | No budget |
 | Any other call | 60 seconds |
 
-When a budget expires, the call returns a typed error. On a workspace that is
-still building, the error says the workspace is not ready and that the call
-can be retried. A `run_policy` call asks its analyzer to stop early, by 5
+`list_policies` bypasses the request budget, including a configured budget.
+
+When the host deadline expires, the call returns a normal tool result with
+`isError: true`, one text content line naming the stage and current phase, and
+no `structuredContent`. Its `_meta["io.bifrost/incomplete"]` is:
+
+```json
+{
+  "status": "inconclusive",
+  "completion": {"type": "inconclusive", "reasons": ["deadline_exceeded"]},
+  "stage": "analyzer_admission",
+  "phase": "waiting for analyzer admission",
+  "partial": false
+}
+```
+
+The deadline stage is `workspace_readiness`, `analyzer_admission`, or
+`execution`. Scheduling a readiness observation or installing a finished build
+honors the same deadline and cancellation; an unfinished build instead returns
+the immediate not-ready response above. Readiness deadlines include
+`workspace_preparation: "continues"` and never cancel shared preparation.
+A host deadline result reports no partial answer. Families that deliver their own partial before the
+host deadline keep that result unchanged. A `run_policy` call asks its analyzer to stop early, by 5
 seconds or a quarter of its budget, whichever is less. This lets it return the
 canonical report with its termination state instead of a bare timeout.
 `scan_usages_by_location` and `scan_usages_by_reference` use the same early
@@ -132,7 +195,7 @@ protocol details.
 | Instructions | Routing text for the selected toolsets. A named-workspace server adds a sentence that tells the agent to set `workspace`. |
 | Resources | One resource: `bifrost://agent-guidance/agents.md` (`text/markdown`), the text shown on [Agent Instructions](/agents/) |
 | Annotations | Every tool has `readOnlyHint: true`, except `refresh` and `activate_workspace`, which have `readOnlyHint: false`. Every tool has `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`. |
-| Output schemas | JSON Schema 2020-12 `outputSchema` for `search_symbols`, `get_definitions_by_location`, `get_symbol_locations`, `get_symbol_ancestors`, `get_active_workspace`, `list_function_sources`, `analyze_diff`, `score_diff`, `relation_brief`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `list_policies`, `report_test_assertion_smells`, and `report_structural_clone_smells`. Other tools return `structuredContent` without a published schema. |
+| Output schemas | JSON Schema 2020-12 `outputSchema` for `search_symbols`, `get_definitions_by_location`, `get_symbol_locations`, `get_symbol_ancestors`, `get_active_workspace`, `list_function_sources`, `analyze_diff`, `score_diff`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `list_policies`, `report_test_assertion_smells`, and `report_structural_clone_smells`. Other tools return `structuredContent` without a published schema. |
 | Cache hints (`2026-07-28` clients) | `tools/list` is `private` for five minutes. The agent-guidance resource is `public` for one hour. Tool results are not cacheable. |
 
 ## Result conventions
@@ -459,9 +522,9 @@ lists symbols with more than 1,000 call sites (`fqn`, `total_callsites`,
 
 | Tool | Arguments | Output |
 | --- | --- | --- |
-| `refresh` | None | `analyzed_files`, `declarations`, `languages`. Rebuilds the code index from scratch. Normal calls already apply file changes that the watcher detects. |
-| `activate_workspace` | `workspace_path` (string, required): absolute path | Same fields as `get_active_workspace`. Switches the active root, normalized to the enclosing Git root when one exists. It cannot bind a server that has no workspace yet; start the server with `--root` or let the client supply roots. Unavailable when client roots or Codex sandbox metadata control the workspace. |
-| `get_active_workspace` | None | `workspace_path`; `usage_index_ready` (false while background usage analysis is catching up, so usage tools would wait); `semantic_packs_ready` (false while semantic packs are still resolving); `session_subset` when the session covers a named subset of files. |
+| `refresh` | None | `analyzed_files`, `declarations`, `languages`. Returns not-ready without executing during initial preparation; retry it. When ready, rebuilds the code index from scratch. Normal calls already apply file changes that the watcher detects. |
+| `activate_workspace` | `workspace_path` (string, required): absolute path | Same fields as `get_active_workspace`. Binds and starts preparation without waiting. Switches the active root, normalized to the enclosing Git root when one exists. It cannot bind a server that has no workspace yet; start the server with `--root` or let the client supply roots. Unavailable when client roots or Codex sandbox metadata control the workspace. |
+| `get_active_workspace` | None | `analyzer_ready`; `workspace_build` (`status`, `generation`, optional `phase` and `error`); `workspace_path`; `retiring_workspaces` (`root`, `generation`, `phase`); `usage_index_ready` (false while background usage analysis is catching up, so usage tools would wait); `semantic_packs_ready` (false while semantic packs are still resolving); `session_subset` when the session covers a named subset of files. |
 
 ## diff toolset
 
@@ -630,31 +693,6 @@ Incomplete reasons: `target_graph_cancelled`, `compilation_scope_unresolved`,
 `reference_graph_stale`. Only `missing_functions` supports "no test reaches
 this function", and only as static evidence, not runtime coverage.
 
-### relation_brief
-
-`relation_brief(base?, target?, include_tests=false, max_items=25, max_chars=7000)`
-returns a bounded review brief with Affected callers, Paths, and Value flow
-sections. Caller references and two-hop incoming use chains use the target snapshot; every
-item cites at least one location outside the changed lines. Added and removed
-outgoing calls cite surviving target declarations. Subjects and items report
-typed completeness; incomplete scans remain visible even when they find no
-relations. The top-level `incomplete` list preserves changed-symbol inventory
-diagnostics separately from relation scans. `deleted_subjects` lists deleted
-declarations at their base positions with `deleted_symbol_not_scanned`; their
-former users are not examined, so both computed sections remain incomplete.
-Moved declarations are handled through their target positions. Value flow is not computed in this
-version.
-
-Selection alternates between sections; within a section, round-robin across
-changed symbols in diff order.
-Budget omissions are counted per section. `max_items` accepts 1 through 200;
-`max_chars` accepts 1000 through 100000. The defaults follow BrokkAi/mjolnir
-b1aed1fe's review-arms brief WRITER.md and brief_driver.py. Headings and
-incompleteness notes remain when the item budget is exhausted. When the size
-budget requires it, per-symbol scan notes are summarized before items are
-removed; `notes_summarized` records this while structured notes keep the detail. Endpoint
-resolution follows `analyze_diff`.
-
 ### score_diff
 
 Return raw maintenance-cost features for a diff, with no weights and no single
@@ -760,10 +798,11 @@ error. An opt-in policy runs only when `policy_ids` names it. Unknown pack,
 category, or ID values are invalid-params errors. No other property is
 allowed.
 
-Output: `status` (`clean`, `finding`, `unreliable`), `exit_status` (`0`, `1`,
-`2`), `report` (the schema-18 policy report), `request_correlation_id`
+Output: `status` (`clean`, `inconclusive`, `finding`, `unreliable`), `exit_status` (`0`, `1`,
+`2`), `report` (the schema-25 policy report), `request_correlation_id`
 (`sha256:` of the JSON-RPC request ID), and `stage_timings` when requested.
-Each run in `report.runs` has a `completion` state; see
+An advisory inconclusive run gives `status: inconclusive` and `exit_status: 0`
+when no finding gates the report. Each run in `report.runs` has a `completion` state; see
 [Agent Result Safety](/agent-result-safety/). With no budget configured, a
 synchronous call has 240 seconds. Run it as an MCP Task for a longer window.
 
@@ -782,10 +821,95 @@ Explain one policy's result. It returns no status and no exit code.
 Output: a `bifrost_policy_explanation/v2` document for `finding_id` and
 `candidate`, or a `bifrost_policy_near_miss/v1` document for `near_misses`.
 Every node has an outcome of `satisfied`, `failed`, or `unknown`; `unknown`
-is never evidence of absence. Every answer includes `workspace_generation`.
+is never evidence of absence. Every answer includes `workspace_generation`
+and `semantic_models`, the state of the workspace's semantic-model activation
+when the answer was computed: `ready`, `no_models`, `pending` (with a `stage`
+of `activating_installed_packs`, `activating_configured_packs`,
+`acquisition_pending`, or `selected_not_published`, the last meaning the
+analyzer selected models and has not published them), `partial`, or
+`unavailable`. Anything other than `ready` or `no_models` makes the root and
+every failed node `unknown`, and a leading `coverage_obligation` node states
+the cause and the action to take. Positive findings and source facts keep their
+outcome. The same field appears on a near-miss ranking, whose entries are all
+`unknown` in that case.
 `finding_id` works for match, taint, typestate, assertion, and flow policies;
 `candidate` and `near_misses` work for match and assertion policies. See
 [Static-Analysis Policies](/static-analysis-policies/).
+
+### flow_query
+
+Ask a flow or reachability question between program points that you select by
+file and position. The MCP server and `bifrost --tool flow_query --args '<json>'`
+run the same code and return the same answer. The tool never waits for workspace
+preparation: while the workspace is still preparing it returns the typed
+not-ready result at once, and a running query stops at the request deadline with
+a typed deadline result. There is no budget or cap argument; each engine runs
+with its own defaults.
+
+| Argument | Type | Required | Default | Bounds | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `question` | string | Yes | - | `value_flow`, `control_path`, `call_path` | The question to answer. |
+| `from` | array of points | Yes | - | At least 1 | Origin points. |
+| `to` | array of points | Yes | - | At least 1 | Destination points. |
+
+A point is an object with `path` (workspace-relative, required) and a position:
+either `line` with `column` (both 1-based; columns count characters) or
+`byte_offset`. An optional `role` is `value` (the default), `call`, `binding`,
+`argument` (with `argument_index`), `receiver`, or `return`. The role chooses
+which kind of syntax node the position may select and when the value is
+observed: a produced value (an expression, a call's result, a return, a binding)
+is observed after its effects, and an argument or receiver is observed before the
+call. A position selects the innermost node of the right kind. If that node does
+not map to exactly one program point, the answer is `unsupported` with the reason
+(see below); the tool never picks the nearest point. Today only some language
+lowerings record the syntax identity a selection needs: C# invocations, Rust
+`await`, and Java formal parameters. A Rust call, argument, binding, return or
+field access cannot be selected yet (#13639).
+
+The questions:
+
+| `question` | Points | What it asks | Engine |
+| --- | --- | --- | --- |
+| `value_flow` | One `from` and one or more `to` candidates, or several `from` candidates and one `to` | Does the value at `from` reach `to`? One answer per `from`/`to` pair. | The composition search, which follows callers, so `to` may be in a caller of `from`'s procedure. Served for languages with a certified caller inventory (Rust, Go). |
+| `control_path` | One and one | Is there a control path from `from` to `to`? Both points must be in one procedure; points in different procedures are `unsupported` (interprocedural control reachability is #13528). | Shortest path over the procedure's control-flow graph. |
+| `call_path` | One and one | Can the callable that owns `from` reach the call at `to` through certified static calls? | RQL `call_reachability`. |
+
+Output, for an answered question: `kind: "answered"`, the `question`, the
+`engine` that answered (`composition_search`, `cfg_shortest_path`,
+`call_reachability`), the `granularity`, and `results`, one entry per pair. Each
+entry has `from` and `to` (the selected sites), `answer`, `witness` when
+reached, and `completeness`.
+
+- `answer` is `reached`, `not_reached` or `incomplete`. `not_reached` is
+  reported only from a search that finished completely. An `incomplete` answer
+  always carries at least one engine reason.
+- `completeness` is `{"kind": "complete"}`, or `{"kind": "incomplete",
+  "reasons": [...]}`. The reasons are the engine's own typed outcomes, passed
+  through unchanged: composition search incompleteness with its cause, CFG
+  algorithm stops with their counts, call-path coverage gaps and the call
+  reachability query's diagnostics. Nothing is merged or relabelled. A reached
+  answer can still list reasons: the path exists, and the search was not
+  exhaustive. An absent path is not proof when the answer is `incomplete`; see
+  [Agent Result Safety](/agent-result-safety/).
+- `witness` is the engine's own evidence, never a path reconstructed by the
+  tool: `{"kind": "steps", "steps": [...]}`, or `{"kind": "witness_unavailable",
+  "cause": ...}` with the engine's typed cause when it kept no path. Each step
+  has a `site` in the same shape as a code-query site (`kind`, `path`, byte
+  range, line and column range, `text`), a `step` kind that names the engine's
+  hop, control edge or call, the hop's `proof` where the engine records one
+  (`proven`, `complete`), the `summary` a model hop used, the `edge_in` kind for
+  control paths, and the `static_call` edge for call paths.
+- `granularity` is `point` for value flow and control paths. It is `callable`
+  for `call_path`: the answer says that the origin's callable reaches the call,
+  and says nothing about order from the selected position (#13528).
+
+For a question outside what the tool answers, the result is `kind:
+"unsupported"` with a typed `reason`: `point_refused` (the point's `refusal` is
+`no_node_at_position`, `ambiguous`, `unsupported_node`, `file_not_analyzed` or
+`procedure_unavailable`), `point_count`, `control_path_across_procedures`,
+`composition_language`, `composition_no_rows`, `composition_exclusion`,
+`no_observable_value`, `plan_refused` or `call_path_endpoints`. It is never an
+empty answer.
 
 ### get_symbol_locations
 

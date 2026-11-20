@@ -108,6 +108,19 @@ impl NativeWorkspaceGraphProvider for RustNativeWorkspaceGraphProvider {
         }
     }
 
+    /// Files that source admission refused hold references this provider
+    /// never reads. Naming them keeps a graph, a dead-code proof or a
+    /// workspace graph built without them from claiming completeness (#10334).
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+            return Ok(Vec::new());
+        };
+        rust.inner.selected_graph_source_exclusions()
+    }
+
     /// A Rust caller reaches a target only when one of its crates has the
     /// target's crate in its dependency closure; see
     /// `SelectedResolutionOperation::rust_callers_reaching`. A selection that

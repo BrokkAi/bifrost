@@ -59,7 +59,7 @@ WHERE mount.mount_ordinal=?1 AND mount.storage_language=?2
         )
     });
 
-pub(crate) const JVM_REVERSE_CANDIDATE_MOUNTS_SQL: &str = r#"
+pub(crate) const NOMINAL_REVERSE_CANDIDATE_MOUNTS_SQL: &str = r#"
 SELECT mount.mount_ordinal, mount.storage_language, mount.persisted_relative_path, mount.blob_id,
        meta.content_package,
        EXISTS(
@@ -123,6 +123,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Fully qualified references do not require an import, so no importer
     /// filter is applied here.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn nominal_reverse_candidate_sites(
         &self,
         target: &CodeUnit,
@@ -132,12 +133,11 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(NominalReverseCandidateOutcome::Cancelled);
         }
         let language = language_for_target(target);
-        let Some(language_rules) = nominal_language_rules(language) else {
+        let Some(rules) = nominal_reverse_rules(language) else {
             return Ok(NominalReverseCandidateOutcome::TargetUncovered(format!(
                 "non-JVM target: {target:?}"
             )));
         };
-        let rules = language_rules.reverse_target_rules();
         let Some((_, target_storage_language)) = rules
             .candidate_languages()
             .iter()
@@ -148,11 +148,9 @@ impl SelectedResolutionOperation<'_, '_> {
             )));
         };
         let relative_path = crate::path_utils::rel_path_string(target.source());
-        let Some(target_mount) = self
-            .ready
-            .inventory
-            .mount_record_for_path(target_storage_language, &relative_path)?
-        else {
+        let target_placements =
+            rules.target_placements(self, target_storage_language, &relative_path)?;
+        let Some(target_mount) = target_placements.first().cloned() else {
             return Ok(NominalReverseCandidateOutcome::TargetUncovered(format!(
                 "JVM target is outside the selected source mounts: {relative_path}"
             )));
@@ -160,23 +158,19 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let mut statement =
             connection.prepare_cached(JVM_REVERSE_DEFINITION_SEMANTICS_SQL.as_str())?;
-        let target_semantics = statement
-            .query_map(
-                rusqlite::params![
-                    i64::from(target_mount.ordinal().get()),
-                    target_storage_language
-                ],
+        let mut target_semantics = Vec::new();
+        for placement in &target_placements {
+            let ordinal = placement.ordinal().get();
+            for key in statement.query_map(
+                rusqlite::params![i64::from(ordinal), target_storage_language],
                 |row| row.get::<_, i64>(0),
-            )?
-            .map(|key| {
-                key.map(|key| {
-                    SemanticId::local(
-                        target_mount.ordinal().get(),
-                        u32::try_from(key).expect("JVM definition key fits u32"),
-                    )
-                })
-            })
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            )? {
+                target_semantics.push(SemanticId::local(
+                    ordinal,
+                    u32::try_from(key?).expect("JVM definition key fits u32"),
+                ));
+            }
+        }
         drop(statement);
         let target_definitions = match native_units::project_native_definition_units(
             &self.ready,
@@ -549,8 +543,8 @@ impl SelectedResolutionOperation<'_, '_> {
                         || (storage_language == descriptor.storage_language
                             && path == relative_path)
                 }
-                PeerNaming::WithinPackage(region) => {
-                    package.is_none_or(|package| region.contains(package))
+                PeerNaming::WithinRegion(region) => {
+                    region.admits(package)
                         || subclass_paths.contains(&(storage_language.clone(), path.clone()))
                 }
                 PeerNaming::Open if hierarchy_route.is_some() => {
@@ -586,7 +580,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 ]),
             );
         }
-        let completion = jvm_reverse_completion(&evidence, cancellation);
+        let completion = nominal_reverse_completion(&evidence, cancellation);
         #[cfg(test)]
         if std::env::var_os("BIFROST_REVERSE_EVIDENCE").is_some() {
             let mut physical = result.iter().map(|row| &row.locator).collect::<Vec<_>>();
@@ -617,6 +611,7 @@ impl SelectedResolutionOperation<'_, '_> {
         ))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_peer_language_may_name_target(
         &self,
         target: &NominalReverseTarget<'_>,
@@ -636,12 +631,9 @@ impl SelectedResolutionOperation<'_, '_> {
              WHERE mount.mount_ordinal=?1 AND mount.storage_language=?2
                AND meta.is_complete=1",
         )?;
-        for &(_, storage_language) in nominal_language_rules(language_for_target(target.unit))
+        for storage_language in nominal_reverse_rules(language_for_target(target.unit))
             .expect("admitted nominal target")
-            .reverse_target_rules()
-            .candidate_languages()
-            .iter()
-            .filter(|(_, language)| *language != target.storage_language)
+            .peer_storage_languages(target.storage_language)
         {
             if cancellation.is_cancelled() {
                 return Ok(false);
@@ -652,7 +644,7 @@ impl SelectedResolutionOperation<'_, '_> {
             {
                 // Protected declarations can also be named through a
                 // subclass outside the explicit lexical package region.
-                if let PeerNaming::WithinPackage(region) = naming
+                if let PeerNaming::WithinRegion(region) = naming
                     && hierarchy_route.is_none()
                 {
                     let package = package_statement
@@ -662,10 +654,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         )
                         .optional()?
                         .flatten();
-                    if package
-                        .as_deref()
-                        .is_some_and(|package| !region.contains(package))
-                    {
+                    if !region.admits(package.as_deref()) {
                         continue;
                     }
                 }
@@ -680,6 +669,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
     // Mount discovery is also an evidence inventory: keep mounts with no sites.
     // Shared reading batches their keys without changing that inventory.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_reverse_candidate_mounts(
         &self,
         lookup: SemanticId,
@@ -692,7 +682,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let identity = lookup
             .shared_name_id()
             .expect("reverse lookup is a shared name");
-        let mut statement = connection.prepare_cached(JVM_REVERSE_CANDIDATE_MOUNTS_SQL)?;
+        let mut statement = connection.prepare_cached(NOMINAL_REVERSE_CANDIDATE_MOUNTS_SQL)?;
         let mounts = statement
             .query_map(
                 rusqlite::params![identity.get(), storage_language, semantic_language],
@@ -756,6 +746,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(result))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn jvm_reverse_subclass_source_paths(
         &self,
         root_semantic: SemanticId,
@@ -779,9 +770,8 @@ impl SelectedResolutionOperation<'_, '_> {
             let mut nominations =
                 HashMap::<SelectedSemanticLocator, Vec<ReverseNomination>>::default();
             for (input_ordinal, (semantic_language, storage_language)) in
-                nominal_language_rules(language_for_target(&base_unit))
+                nominal_reverse_rules(language_for_target(&base_unit))
                     .expect("admitted nominal base")
-                    .reverse_target_rules()
                     .candidate_languages()
                     .iter()
                     .copied()
@@ -1082,7 +1072,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 self.drain_consumed_root_presence(),
             ));
         }
-        let completion = jvm_reverse_completion(&evidence, cancellation);
+        let completion = nominal_reverse_completion(&evidence, cancellation);
         let references = reducer.references;
         let root_reads = self.drain_consumed_root_presence();
         let result = self.ready.finish(
@@ -1116,7 +1106,7 @@ fn explain_jvm_reverse_candidate_plan(
     semantic_language: &str,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(&format!(
-        "EXPLAIN QUERY PLAN {JVM_REVERSE_CANDIDATE_MOUNTS_SQL}"
+        "EXPLAIN QUERY PLAN {NOMINAL_REVERSE_CANDIDATE_MOUNTS_SQL}"
     ))?;
     statement
         .query_map(
@@ -1134,7 +1124,7 @@ pub fn last_jvm_reverse_candidate_plan_for_test() -> Vec<String> {
 // The public JVM result already reports peer-language absence through its
 // inventory-boundary flag. Keep the obligation, but preserve that projection
 // instead of adding a second resolution-incomplete diagnostic for the boundary.
-fn jvm_reverse_completion(
+fn nominal_reverse_completion(
     evidence: &ReverseEvidence,
     cancellation: &CancellationToken,
 ) -> ResolutionCompletion {
@@ -1320,9 +1310,8 @@ impl ReverseFileEvaluator for NominalReverseAdapter {
         cancellation: &CancellationToken,
         metrics: &SelectedResolutionContextMetrics,
     ) -> Result<ReverseBatch<ReverseFileSession<Self::Answer>, std::convert::Infallible>> {
-        nominal_language_rules(language)
+        nominal_reverse_rules(language)
             .expect("admitted nominal caller")
-            .reverse_target_rules()
             .file_evaluator()
             .session(
                 operation,

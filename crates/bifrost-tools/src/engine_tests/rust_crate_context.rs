@@ -2713,6 +2713,10 @@ mod tests {
 
     #[test]
     #[hardwon("#2767: an extern alias in an included member keeps its crate-root route")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn crate_point_root_extern_alias_is_visible_in_include_member() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n[dependencies]\ndep={path='dep'}\n")
@@ -4721,6 +4725,10 @@ mod tests {
     /// path still resolves through the bound.
     #[test]
     #[hardwon("f2faba63346c: a synthetic Self lower bound published a fake source span")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn a_traits_self_lower_bound_publishes_no_reference_row() {
         let source = "pub trait Model {\n    type Fact;\n    fn fact(&self) -> Self::Fact;\n}\n";
         let outcome = qualified_member_outcome(&[("t.rs", source)], "t.rs", "Self::Fact");

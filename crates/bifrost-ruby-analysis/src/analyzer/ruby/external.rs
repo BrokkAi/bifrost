@@ -217,7 +217,7 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
     }
 
     fn producer(&self) -> Producer {
-        Producer::for_name("bifrost-ruby-gem")
+        (Producer::for_name("bifrost-ruby-gem")).with_dependency_revision()
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -274,6 +274,7 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
+                production_input_digest: None,
                 package: dependency
                     .evidence
                     .package
@@ -307,7 +308,7 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
                 review_required: false,
             },
         };
-        let production = RubyGemArchivePackProducer.produce_loaded_artifact(
+        let mut production = RubyGemArchivePackProducer.produce_loaded_artifact(
             &request,
             limits,
             cancellation,
@@ -317,6 +318,9 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
             production.artifact_sha256.as_deref(),
             Some(artifact.sha256())
         );
+        if let Some(pack) = production.pack.as_mut() {
+            pack.producer = self.producer();
+        }
         DependencyPackProduction {
             pack: production.pack,
             diagnostics: production.diagnostics,
@@ -809,7 +813,7 @@ mod tests {
         parameter_type: TypeRef,
         return_type: TypeRef,
     ) -> brokk_bifrost_analysis::analyzer::semantic_model::model::MemberFact {
-        brokk_bifrost_analysis::analyzer::semantic_model::model::MemberFact {
+        brokk_bifrost_analysis::analyzer::semantic_model::model::MemberFact { target_independent: None, inherent_impl_self_arguments: None,
             id: "member.Widget.call".to_owned(),
             owner: "type.Widget".to_owned(),
             name: "call".to_owned(),
@@ -829,6 +833,7 @@ mod tests {
             callable_family_complete: false,
             exact_return_classes: Vec::new(),
             signature: Some(brokk_bifrost_analysis::analyzer::semantic_model::model::Signature {
+                bounds: None,
                 type_parameters: Vec::new(),
                 parameters: vec![brokk_bifrost_analysis::analyzer::semantic_model::model::Parameter {
                     name: Some("value".to_owned()),

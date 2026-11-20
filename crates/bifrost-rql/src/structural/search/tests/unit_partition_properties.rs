@@ -601,7 +601,7 @@ proptest! {
                 for evidence in &mut actual_evidence { evidence.result_index = 0; }
                 for evidence in &mut expected_evidence { evidence.result_index = 0; }
                 prop_assert_eq!(actual_evidence, expected_evidence, "{}: ordered evidence", label);
-                prop_assert_eq!(&merged.diagnostics, &whole.result.diagnostics, "{}: diagnostics", label);
+                prop_assert_eq!(&merged.diagnostics, &whole.result.diagnostics.semantic(), "{}: diagnostics", label);
             }
             prop_assert_eq!(
                 merged.completion(),
@@ -632,7 +632,16 @@ proptest! {
             let distinct = |diagnostics: &[CodeQueryDiagnostic]| {
                 let mut rendered: Vec<String> = diagnostics
                     .iter()
-                    .filter(|diagnostic| diagnostic.code != CodeQueryDiagnosticCode::BroadQuery)
+                    .filter(|diagnostic| {
+                        // StepProducedNoRows is a whole-execution advisory too: one
+                        // seed-file unit's empty step is normal, so only the whole
+                        // execution reports it.
+                        !matches!(
+                            diagnostic.code,
+                            CodeQueryDiagnosticCode::BroadQuery
+                                | CodeQueryDiagnosticCode::StepProducedNoRows
+                        )
+                    })
                     .map(|diagnostic| {
                         format!(
                             "{:?}/{:?}/{}",
@@ -646,7 +655,7 @@ proptest! {
             };
             prop_assert_eq!(
                 distinct(&merged.diagnostics),
-                distinct(&whole.result.diagnostics),
+                distinct(whole.result.diagnostics.semantic()),
                 "{}: diagnostics",
                 label
             );
@@ -822,7 +831,7 @@ fn root_union_of_excepts_keeps_first_native_payload_and_both_paths() {
     });
     let merged = merge_unit_rows(&query, units);
     assert_eq!(merged.completion(), whole.result.completion());
-    assert_eq!(merged.diagnostics, whole.result.diagnostics);
+    assert_eq!(merged.diagnostics, whole.result.diagnostics.semantic());
     let whole_items = whole
         .result
         .results
@@ -933,7 +942,7 @@ fn root_union_enumerates_subtrahend_only_empty_minuend_files() {
     }
     assert_eq!(merged_evidence, whole_evidence);
     assert_eq!(merged.completion(), whole.result.completion());
-    assert_eq!(merged.diagnostics, whole.result.diagnostics);
+    assert_eq!(merged.diagnostics, whole.result.diagnostics.semantic());
 }
 
 #[test]
@@ -1069,15 +1078,21 @@ fn intersect_minuends_keep_the_whole_execution_and_late_budget_gap() {
                 assert!(
                     whole.result.truncated,
                     "{label}: {:?}",
-                    whole.result.diagnostics
+                    whole.result.diagnostics.semantic()
                 );
                 assert!(
-                    whole.result.diagnostics.iter().any(|diagnostic| {
-                        diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
-                            || diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
-                    }),
+                    whole
+                        .result
+                        .diagnostics
+                        .semantic()
+                        .iter()
+                        .any(|diagnostic| {
+                            diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+                                || diagnostic.code
+                                    == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                        }),
                     "{label}: {:?}",
-                    whole.result.diagnostics
+                    whole.result.diagnostics.semantic()
                 );
             }
             if capped && !should_gap {
@@ -1085,7 +1100,11 @@ fn intersect_minuends_keep_the_whole_execution_and_late_budget_gap() {
             }
             assert_eq!(unit.completion, whole.result.completion(), "{label}");
             assert_eq!(unit.work, whole.work, "{label}");
-            assert_eq!(unit.diagnostics, whole.result.diagnostics, "{label}");
+            assert_eq!(
+                unit.diagnostics,
+                whole.result.diagnostics.semantic(),
+                "{label}"
+            );
             let merged = merge_unit_rows(&query, vec![unit]);
             let whole_items = whole
                 .result

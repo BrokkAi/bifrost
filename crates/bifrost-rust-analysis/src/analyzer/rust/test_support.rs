@@ -169,3 +169,28 @@ pub(crate) fn rustdoc_item(
         inner,
     }
 }
+
+// Inject the stopped provider answer at the demand boundary, while retaining
+// the real selection, Main bridge and deferred completion machinery (#12928).
+thread_local! {
+    pub(super) static LOCAL_GLOB_DEMAND_FAULT: std::cell::RefCell<Option<Result<(), brokk_bifrost_analysis::analyzer::store::StoreError>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_local_glob_demand_fault<T>(
+    fault: Result<(), brokk_bifrost_analysis::analyzer::store::StoreError>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LOCAL_GLOB_DEMAND_FAULT.with(|slot| {
+                slot.take();
+            });
+        }
+    }
+    LOCAL_GLOB_DEMAND_FAULT.with(|slot| {
+        assert!(slot.replace(Some(fault)).is_none());
+    });
+    let _reset = Reset;
+    run()
+}

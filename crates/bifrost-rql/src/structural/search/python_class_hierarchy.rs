@@ -32,6 +32,11 @@ pub(super) fn hierarchy_incompleteness(reason: Option<PythonHierarchyReason>) ->
         Some(PythonHierarchyReason::Cancelled) => {
             Incompleteness::Operational(DerivationExecutionCause::Cancelled)
         }
+        Some(PythonHierarchyReason::ModelCatalogOpen(open)) => {
+            crate::analyzer::semantic_model::SemanticModelOverlay::open_read_incompleteness(open)
+                .execution_cause()
+                .map_or(Incompleteness::Content, Incompleteness::Operational)
+        }
         Some(PythonHierarchyReason::VisitLimit) => {
             Incompleteness::Operational(DerivationExecutionCause::Budget)
         }

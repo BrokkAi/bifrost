@@ -10,6 +10,8 @@ use crate::analyzer::semantic::ids::CallSiteId;
 
 use crate::analyzer::semantic::ids::CaptureId;
 
+use crate::analyzer::semantic::ids::DeclarationSegmentKind;
+
 use crate::analyzer::semantic::ids::EvidenceId;
 
 use crate::analyzer::semantic::ids::GuardId;
@@ -515,6 +517,11 @@ impl SemanticIrErrorKind {
 pub struct SemanticIrError {
     kind: SemanticIrErrorKind,
     procedure: Option<ProcedureId>,
+    /// The source construct that violated the invariant: the offending row's
+    /// own source mapping when the check has one, otherwise the procedure's
+    /// locator. Procedure and row IDs are artifact-local, so without this the
+    /// message cannot be traced back to source (#13027).
+    source: Option<Box<SemanticLocator>>,
     detail: Box<str>,
 }
 
@@ -526,6 +533,7 @@ impl SemanticIrError {
         Self {
             kind,
             procedure: None,
+            source: None,
             detail: detail.into().into_boxed_str(),
         }
     }
@@ -538,8 +546,40 @@ impl SemanticIrError {
         Self {
             kind,
             procedure: Some(procedure),
+            source: None,
             detail: detail.into().into_boxed_str(),
         }
+    }
+
+    /// Name the source construct of this error unless a more specific one is
+    /// already attached.
+    pub(in crate::analyzer::semantic::ir) fn at_source(
+        mut self,
+        locator: &SemanticLocator,
+    ) -> Self {
+        if self.source.is_none() {
+            self.source = Some(Box::new(locator.clone()));
+        }
+        self
+    }
+
+    /// Name the source of a procedure-scoped error by the locator of the
+    /// procedure it names, when that procedure is one of `procedures`.
+    pub(in crate::analyzer::semantic::ir) fn at_procedure_source(
+        self,
+        procedures: &[ProcedureSemanticsParts],
+    ) -> Self {
+        match self
+            .procedure
+            .and_then(|procedure| procedures.get(procedure.index()))
+        {
+            Some(procedure) => self.at_source(&procedure.locator),
+            None => self,
+        }
+    }
+
+    pub fn source_locator(&self) -> Option<&SemanticLocator> {
+        self.source.as_deref()
     }
 
     pub const fn kind(&self) -> SemanticIrErrorKind {
@@ -557,22 +597,41 @@ impl SemanticIrError {
 
 impl fmt::Display for SemanticIrError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "semantic IR {} error", self.kind.label())?;
         if let Some(procedure) = self.procedure {
-            write!(
-                formatter,
-                "semantic IR {} error in procedure {}: {}",
-                self.kind.label(),
-                procedure,
-                self.detail
-            )
-        } else {
-            write!(
-                formatter,
-                "semantic IR {} error: {}",
-                self.kind.label(),
-                self.detail
-            )
+            write!(formatter, " in procedure {procedure}")?;
         }
+        if let Some(source) = &self.source {
+            // Positions are zero-based in the IR; render them one-based. The
+            // column counts UTF-8 bytes, so on a line with multi-byte text
+            // before the construct it can exceed an editor's column.
+            let start = source.anchor().span().start();
+            write!(
+                formatter,
+                " at {}:{}:{} (",
+                source.path().as_str(),
+                start.line() + 1,
+                start.byte_column() + 1
+            )?;
+            // The path already names the file segment.
+            let declarations = source
+                .declaration()
+                .segments()
+                .iter()
+                .filter(|segment| segment.kind() != DeclarationSegmentKind::File);
+            for (index, segment) in declarations.enumerate() {
+                if index > 0 {
+                    formatter.write_str(" > ")?;
+                }
+                let kind = segment.kind().stable_label();
+                match segment.name() {
+                    Some(name) => write!(formatter, "{kind} {name}")?,
+                    None => write!(formatter, "anonymous {kind}")?,
+                }
+            }
+            formatter.write_str(")")?;
+        }
+        write!(formatter, ": {}", self.detail)
     }
 }
 
@@ -1117,8 +1176,22 @@ pub enum StaticTypeOrigin {
     CallResult { call: CallSiteId, ordinal: u32 },
 }
 
+/// The actual expression-level borrow emitted by the language adapter.
+/// Declaration passing modes do not establish this fact. Missing and old
+/// persisted rows are Unknown, including every non-address value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ActualBorrowKind {
+    #[default]
+    Unknown = 0,
+    Shared = 1,
+    Mutable = 2,
+    Raw = 3,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticValue {
+    pub actual_borrow: ActualBorrowKind,
     pub id: ValueId,
     pub kind: SemanticValueKind,
     pub source: SourceMappingId,
@@ -2121,9 +2194,11 @@ impl SemanticGapImpacts {
 /// propagation as successors and runs no user code to select among them. A consumer may discharge it only for a
 /// positive proof that depends on the retained parent successor topology, not
 /// on liveness, evaluation effects, or spawned work.
-/// `CanonicalIndexIdentity` marks a memory-location-scoped index gap where the
-/// producer retained one exact value and numeric magnitude for every
-/// occurrence of the same literal index. Consumers such as value flow may
+/// `CanonicalIndexIdentity` marks a memory-location-scoped index gap where every
+/// occurrence names one canonical identity: either one exact value and numeric
+/// magnitude for every occurrence of the same literal index, or the one
+/// aggregate cell (`Index { index: None, constant_index: None, identity:
+/// Aggregate }`) that stands for every element of its base. Consumers such as value flow may
 /// discharge the identity question after verifying that structured location
 /// and constant value. The marker does not claim that flow state projects
 /// indexed properties, so the raw gap remains available to consumers that
@@ -2232,6 +2307,11 @@ pub enum SemanticGapDischarge {
     /// The producer of this value is withheld. A query can set this obligation
     /// aside only when none of its requested data dependencies uses the value.
     DataDependency = 15,
+    /// Only the lexical-parent creation binding is absent in this realization.
+    /// A consumer holding an exact creation may discharge this obligation after
+    /// proving that its capture rows bind every slot with complete evidence.
+    /// This never proves that an unresolved capture prepass found every slot.
+    CreatingRealizationBindsCaptures = 16,
 }
 
 /// One Go predeclared builtin whose call lowering relies on package-level
@@ -2376,9 +2456,11 @@ impl SemanticGap {
 ///
 /// The discharge marker is the producer's cross-occurrence guarantee. The
 /// structural checks keep that guarantee scoped to an indexed memory location
-/// whose retained index is a constant value and whose exact access remains at
-/// the gap point. A dynamic, rebound, missing, or retargeted access therefore
-/// cannot acquire the proof merely by carrying the marker.
+/// whose identity is either a retained constant index value or the one
+/// aggregate cell (`index: None`, `constant_index: None`, `Aggregate`), and
+/// whose exact access remains at the gap point. A dynamic element, rebound,
+/// missing, or retargeted access therefore cannot acquire the proof merely by
+/// carrying the marker.
 #[doc(hidden)]
 pub fn gap_certifies_canonical_index_identity(
     gap: &SemanticGap,
@@ -2398,8 +2480,9 @@ pub fn gap_certifies_canonical_index_identity(
     let Some(MemoryLocation {
         kind:
             MemoryLocationKind::Index {
-                index: Some(index),
-                constant_index: Some(_),
+                index,
+                constant_index,
+                identity,
                 ..
             },
         ..
@@ -2407,10 +2490,16 @@ pub fn gap_certifies_canonical_index_identity(
     else {
         return false;
     };
-    let constant_index_value = values
-        .get(index.index())
-        .is_some_and(|value| value.kind.is_constant());
-    constant_index_value
+    let names_one_identity = match (index, constant_index, identity) {
+        // One exact literal value and magnitude.
+        (Some(index), Some(_), _) => values
+            .get(index.index())
+            .is_some_and(|value| value.kind.is_constant()),
+        // The one aggregate cell standing for every element.
+        (None, None, IndexedLocationIdentity::Aggregate) => true,
+        _ => false,
+    };
+    names_one_identity
         && points.get(gap.point.index()).is_some_and(|point| {
             point.events.iter().any(|event| {
                 matches!(
@@ -3582,6 +3671,21 @@ pub enum GuardPredicate {
     Truthy { value: ValueId },
     /// The decision is represented, but its condition was not normalizable.
     Opaque { digest: GuardConditionDigest },
+    /// A syntactic equality between two exact value reads. Unlike
+    /// ConstantEquality this does not assert a scalar or constant operand.
+    /// Policy-owned guards may consume it; scalar refinement must not.
+    ValueEquality {
+        left: ValueId,
+        right: ValueId,
+        negated: bool,
+    },
+    /// A syntactic ordered comparison between exact value reads, without a
+    /// claim that the operation is an intrinsic integer or floating order.
+    ValueOrdering {
+        left: ValueId,
+        right: ValueId,
+        relation: IntegerComparison,
+    },
 }
 
 impl GuardPredicate {
@@ -3599,6 +3703,8 @@ impl GuardPredicate {
         "has_member",
         "truthy",
         "opaque",
+        "value_equality",
+        "value_ordering",
     ];
 
     pub const fn label(self) -> &'static str {
@@ -3614,6 +3720,8 @@ impl GuardPredicate {
             Self::HasMember { .. } => "has_member",
             Self::Truthy { .. } => "truthy",
             Self::Opaque { .. } => "opaque",
+            Self::ValueEquality { .. } => "value_equality",
+            Self::ValueOrdering { .. } => "value_ordering",
         }
     }
 
@@ -3631,6 +3739,8 @@ impl GuardPredicate {
             | Self::ExactClass { .. }
             | Self::HasMember { .. }
             | Self::Truthy { .. }
+            | Self::ValueEquality { .. }
+            | Self::ValueOrdering { .. }
             | Self::Opaque { .. } => None,
         }
     }

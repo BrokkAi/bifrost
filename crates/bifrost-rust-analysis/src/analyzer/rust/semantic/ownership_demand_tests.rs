@@ -53,7 +53,8 @@ fn snapshot(revision: &str) -> Arc<crate::analyzer::semantic_model::ActiveSemant
             }),
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         },
         CatalogPackSourceKind::EphemeralWorkspace,
     )
@@ -114,6 +115,7 @@ fn forged_ownership_handle(
         &prepared,
         &SemanticBudget::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
         lower_lexical_procedure,
     )
     .unwrap() else {
@@ -138,7 +140,13 @@ fn ordinary_println_keeps_native_budget_profile() {
     let file = ProjectFile::new(std::env::temp_dir(), "capture.rs");
     let cancellation = CancellationToken::default();
     let native = RustSemanticLowerer
-        .lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
+        .lower(
+            &file,
+            &prepared,
+            &SemanticBudget::default(),
+            &cancellation,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+        )
         .unwrap();
     let parts = native.available_value().unwrap();
     assert!(parts[0].candidate_macro_alternate_parts().is_none());
@@ -146,7 +154,13 @@ fn ordinary_println_keeps_native_budget_profile() {
     limits.program_points = parts[0].points.len();
     let budget = SemanticBudget::new(limits).unwrap();
     let bounded = RustSemanticLowerer
-        .lower(&file, &prepared, &budget, &cancellation)
+        .lower(
+            &file,
+            &prepared,
+            &budget,
+            &cancellation,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
+        )
         .unwrap();
     assert!(matches!(bounded, SemanticOutcome::Complete { .. }));
     assert_eq!(budget.refusal_count(), 0);
@@ -162,6 +176,7 @@ fn ordinary_println_keeps_native_budget_profile() {
         &prepared,
         &SemanticBudget::default(),
         &cancellation,
+        &brokk_bifrost_core::retention_budget::RetentionBudget::new(64 * 1024 * 1024),
         |prepared, inputs, spec, budget, cancellation| {
             let mut candidates = LoweredCandidates::default();
             let result = lower_procedure_with_macro_pass(

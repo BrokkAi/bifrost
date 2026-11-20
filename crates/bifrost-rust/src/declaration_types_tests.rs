@@ -82,6 +82,7 @@ fn fixture_facts(
             declaration_units: parsed.source_declaration_units.clone(),
             module_names,
             imports: canonical.imports.clone(),
+            impl_spans: Default::default(),
         },
     ))
 }

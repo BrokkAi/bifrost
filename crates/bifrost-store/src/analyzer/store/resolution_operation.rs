@@ -9,12 +9,17 @@
 use brokk_bifrost_rust::cfg::RustMacroDefinitionOutcome;
 
 mod services;
-pub(in crate::analyzer::store) use services::selected_jvm_declaration_owner;
+pub(in crate::analyzer::store) use services::{
+    selected_jvm_declaration_owner, selected_jvm_declaration_owner_with_memo_proof,
+};
 pub(in crate::analyzer::store) mod python_models;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use services::UnrecordedSelectedServices;
 pub use services::{
     ConfigurationCertificate, ModelRuntimeBases, SelectedAnalyzerServices,
     SelectedExternalBindingRead, SelectedExternalBindingRequest, SelectedMacroFrontierReads,
-    SelectedModelAuthority,
+    SelectedModelAuthority, SelectedSourceFileCertificate,
 };
 
 #[doc(hidden)]
@@ -33,6 +38,7 @@ pub use go_named::GoPreparedImportContextOutcome;
 pub mod go_demand;
 use go_demand::GoForwardOperationContext;
 
+mod csharp_access;
 pub(crate) mod declaration_access;
 #[doc(hidden)]
 pub mod go_method_family;
@@ -54,9 +60,12 @@ mod inherited_member_walk;
 fn missing_read_reuse_authority(context: &str) -> StoreError {
     StoreError::new(format!("{context} read reuse authority is unavailable"))
 }
+
+#[doc(hidden)]
+pub mod direct_supertypes;
+mod java_qualified_super;
 #[doc(hidden)]
 pub mod jvm_demand;
-#[doc(hidden)]
 pub mod jvm_direct_supertypes;
 mod jvm_hierarchy_order;
 #[cfg(any(test, feature = "test-support"))]
@@ -133,7 +142,7 @@ enum NativeLanguageDemand<'a> {
     None,
     Go {
         demand: Box<go_named::GoDemandContext>,
-        receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+        receiver_overlay: Option<crate::analyzer::resolution::SelectedReceiverSlotOverride>,
     },
     Python {
         environment: &'a super::python_unit_summaries::PythonSelectedEnvironment,
@@ -163,9 +172,11 @@ pub mod rust_crate_access;
 pub(crate) use rust_crate_access::RustBlobActivity;
 
 mod root_bridges;
+pub mod rust_closure_literals;
 #[doc(hidden)]
 pub mod rust_crate_context;
 pub(super) mod rust_derive_helpers;
+pub mod rust_function_shapes;
 pub mod rust_macro_types;
 pub use super::resolution_stage::SelectedResolutionStageOutcome;
 
@@ -180,6 +191,9 @@ pub mod csharp_imports;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod csharp_namespaces;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod csharp_parts;
 #[doc(hidden)]
 pub mod demand;
 #[doc(hidden)]
@@ -299,7 +313,9 @@ use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
 
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
+};
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
@@ -1428,6 +1444,113 @@ impl SelectedResolutionOperation<'_, '_> {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    /// Immediate parents under a language's selected-root capability. Uses
+    /// its existing caller installer and the shared asynchronous edge frame.
+    /// Unavailable selection/installation is explicit, never an empty answer.
+    #[doc(hidden)]
+    pub fn selected_normalized_direct_parents(
+        &self,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<
+        SelectedResolutionOperationOutcome<crate::analyzer::resolution::NormalizedDirectParents>,
+    > {
+        let language = brokk_bifrost_core::analyzer::common::language_for_file(target.source());
+        let path = crate::path_utils::rel_path_string(target.source());
+        let unavailable = || {
+            SelectedResolutionOperationOutcome::Unavailable(
+                SelectedResolutionUnavailable::NativeDemandUnavailable {
+                    storage_language: language.config_label().to_owned(),
+                    persisted_relative_path: path.clone(),
+                },
+            )
+        };
+        let Some(support) = super::store_language_support(language) else {
+            return Ok(unavailable());
+        };
+        if support.selected_implicit_root_rules().is_none() {
+            return Ok(unavailable());
+        }
+        let Some(installer) = support.demand_installer() else {
+            return Ok(unavailable());
+        };
+        let owner = match self.selected_hierarchy_definition(target, cancellation, session)? {
+            LocatedSemantic::Found(owner) => owner,
+            LocatedSemantic::Missing => return Ok(unavailable()),
+            LocatedSemantic::Cancelled => {
+                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                    cancelled_completion(),
+                ));
+            }
+        };
+        let preparation = match self.native_demand_preparation(
+            installer,
+            language,
+            Path::new(&path),
+            cancellation,
+            session,
+        )? {
+            NativeDemandPreparationOutcome::Ready(preparation) => preparation,
+            NativeDemandPreparationOutcome::Unavailable => return Ok(unavailable()),
+            NativeDemandPreparationOutcome::Cancelled => {
+                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                    cancelled_completion(),
+                ));
+            }
+        };
+        let context = self.empty_contexts(&ResolutionCompletion::Complete)?;
+        let context =
+            match self.prepare_context(context, cancellation, &SelectedResolutionContextMetrics)? {
+                SelectedResolutionContextValidationOutcome::Ready(context) => context,
+                SelectedResolutionContextValidationOutcome::Cancelled => {
+                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                        cancelled_completion(),
+                    ));
+                }
+            };
+        let blueprint =
+            match self
+                .ready
+                .collect_blueprint_in_session(context, cancellation, session)?
+            {
+                SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
+                SelectedFactOperationBlueprintConstruction::Cancelled {
+                    cancellation_completion,
+                    ..
+                } => {
+                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                        cancellation_completion,
+                    ));
+                }
+            };
+        if matches!(
+            self.ready.register_context(&blueprint, cancellation)?,
+            ContextRegistrationOutcome::Cancelled
+        ) {
+            return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                cancelled_completion(),
+            ));
+        }
+        let lexical = self.ready.lexical_source();
+        let typed = self.ready.typed_source();
+        let answer = installer.run_point(
+            preparation.as_ref(),
+            NativeDemandPointRequest {
+                ready: &self.ready,
+                blueprint: &blueprint,
+                lexical: &lexical,
+                paths: &lexical,
+                typed: &typed,
+                cancellation,
+                session,
+                artifacts: None,
+            },
+            |facts, provider| facts.normalized_direct_parents_by_demand(owner, provider),
+        )?;
+        Ok(SelectedResolutionOperationOutcome::Native(answer))
+    }
+
     fn native_demand_preparation(
         &self,
         installer: NativeDemandInstaller,
@@ -1496,7 +1619,7 @@ pub struct QueryResolutionPreparation {
 enum MacroRetention {
     /// No consumer has reported yet.
     Pending,
-    /// Every consumer that reported was complete.
+    /// Every consumer that reported completed without an operation failure.
     Completed,
     /// A consumer failed, was cancelled or exceeded its budget.
     Invalidated,
@@ -1633,25 +1756,128 @@ struct RustReversePrepared {
     contexts: SelectedResolutionContextSet,
 }
 
+/// Each site keeps the accumulating allowance it had as its own request.
+/// Batching sites must change what the reverse pays, not what it is allowed to
+/// prove. Every charged axis scales: a round limit left at its per-request
+/// value made a file's answers depend on how many candidate sites it held
+/// (#13145). `max_targets` is a cap on one query's target set, never charged
+/// by a session, so it stays.
+fn reverse_session_budget(
+    site_count: usize,
+    mut budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisBudget {
+    let sites = site_count.max(1);
+    budget.max_summary_expansions = budget.max_summary_expansions.saturating_mul(sites);
+    budget.max_hierarchy_order_work = budget.max_hierarchy_order_work.saturating_mul(sites);
+    budget.max_resolution_rounds = budget.max_resolution_rounds.saturating_mul(sites);
+    budget
+}
+
 /// Run a caller-built reverse lifecycle with a per-site accumulating allowance.
 /// The callback constructs borrowed language hooks and calls confirm_reverse_session;
 /// keeping that construction inside the scope avoids self-referential hook state.
 fn confirm_reverse_session_bounded<A, L>(
     site_count: usize,
-    mut budget: ReceiverAnalysisBudget,
+    budget: ReceiverAnalysisBudget,
     cancellation: &CancellationToken,
     run: impl FnOnce(&ResolutionSession, &CancellationToken) -> reverse::ReverseSessionOutcome<A, L>,
 ) -> Result<BoundedResolution<reverse::ReverseBatch<Vec<reverse::ReverseSessionReport<A>>, L>>> {
-    // Each site keeps the accumulating allowance it had as its own request.
-    // Batching sites must change what the reverse pays, not what it is
-    // allowed to prove.
-    let sites = site_count.max(1);
-    budget.max_summary_expansions = budget.max_summary_expansions.saturating_mul(sites);
-    budget.max_scope_nodes = budget.max_scope_nodes.saturating_mul(sites);
-    budget.max_hierarchy_order_work = budget.max_hierarchy_order_work.saturating_mul(sites);
-    let session = ResolutionSession::bounded(budget, Some(cancellation));
+    let session = ResolutionSession::bounded(
+        reverse_session_budget(site_count, budget),
+        Some(cancellation),
+    );
     let outcome = run(&session, session.cancellation().unwrap_or(cancellation))?;
     Ok(session.finish(outcome))
+}
+
+/// How a reverse session that keeps its finished locators ended.
+pub(crate) enum PartialReverseSession<A, L> {
+    /// The session's own value, or the outcome that stopped it for a reason
+    /// other than its receiver budget.
+    Resolved(reverse::ReverseBatch<Vec<reverse::ReverseSessionReport<A>>, L>),
+    /// The receiver budget ran out. `finished` holds the reports of the
+    /// locators that finished before the stop, in locator order. The session
+    /// itself is execution dependent: it is never a complete answer, and only
+    /// these per-locator reports may be published from it.
+    BudgetStopped {
+        finished: Vec<reverse::ReverseSessionReport<A>>,
+        limit: ReceiverBudgetLimit,
+    },
+    Cancelled,
+}
+
+pub(crate) struct BoundedPartialReverseSession<A, L> {
+    pub(crate) session: PartialReverseSession<A, L>,
+    pub(crate) work: ReceiverAnalysisWork,
+}
+
+/// Like [`confirm_reverse_session_bounded`], but a receiver-budget stop keeps
+/// the reports of the locators that finished before it. The latched
+/// [`ResolutionSession`] verdict, not the in-flight locator's `Cancelled`
+/// batch, tells a budget stop from a real cancellation.
+fn confirm_reverse_session_bounded_partial<A, L>(
+    site_count: usize,
+    budget: ReceiverAnalysisBudget,
+    cancellation: &CancellationToken,
+    run: impl FnOnce(
+        &ResolutionSession,
+        &CancellationToken,
+    ) -> Result<reverse::ReverseBatch<reverse::ReverseSessionEnd<A, L>, L>>,
+) -> Result<BoundedPartialReverseSession<A, L>> {
+    use reverse::{ReverseBatch, ReverseSessionEnd};
+    let session = ResolutionSession::bounded(
+        reverse_session_budget(site_count, budget),
+        Some(cancellation),
+    );
+    let ended = run(&session, session.cancellation().unwrap_or(cancellation))?;
+    // The finished reports are usable only when the evaluation stopped on the
+    // cancellation its own budget latch raised. Any other stop keeps its
+    // outcome whole, as a whole-session stop always has.
+    let (value, finished) = match ended.into_stop() {
+        Ok(ReverseSessionEnd::Finished(reports)) => (ReverseBatch::Ready(reports), None),
+        Ok(ReverseSessionEnd::Stopped { reports, stop }) => {
+            let kept = matches!(stop, ReverseBatch::Cancelled { .. }).then_some(reports);
+            (stop.widen(), kept)
+        }
+        Err(stop) => (stop.widen(), None),
+    };
+    Ok(match session.finish(()) {
+        BoundedResolution::Complete { work, .. } => BoundedPartialReverseSession {
+            session: PartialReverseSession::Resolved(value),
+            work,
+        },
+        BoundedResolution::Exceeded { limit, work } => BoundedPartialReverseSession {
+            session: PartialReverseSession::BudgetStopped {
+                finished: finished.unwrap_or_default(),
+                limit,
+            },
+            work,
+        },
+        BoundedResolution::Unavailable { .. } => {
+            unreachable!("a session's own verdict is never unavailable")
+        }
+        BoundedResolution::Cancelled { work } => BoundedPartialReverseSession {
+            session: PartialReverseSession::Cancelled,
+            work,
+        },
+    })
+}
+
+/// The combined completion of every answer the finished reports carry.
+fn reverse_reports_completion<T>(
+    reports: &[reverse::ReverseSessionReport<SelectedRustReferenceAnswer<T>>],
+) -> ResolutionCompletion {
+    let mut completion = ResolutionCompletion::Complete;
+    for report in reports {
+        if let reverse::ReverseSessionReport::Found { meanings, .. } = report {
+            for (_, answers) in meanings {
+                for answer in answers {
+                    completion = completion.combine(answer.resolution.completion());
+                }
+            }
+        }
+    }
+    completion
 }
 
 struct RustReverseLifecycle<'a, 'store, 'input, T, Setup, Project> {
@@ -1830,17 +2056,8 @@ where
         &mut self,
         reports: Vec<reverse::ReverseSessionReport<Self::Answer>>,
     ) -> reverse::ReverseSessionOutcome<Self::Answer, Self::Limit> {
-        use reverse::{ReverseBatch, ReverseCancellationStage, ReverseSessionReport};
-        let mut completion = ResolutionCompletion::Complete;
-        for report in &reports {
-            if let ReverseSessionReport::Found { meanings, .. } = report {
-                for (_, answers) in meanings {
-                    for answer in answers {
-                        completion = completion.combine(answer.resolution.completion());
-                    }
-                }
-            }
-        }
+        use reverse::{ReverseBatch, ReverseCancellationStage};
+        let completion = reverse_reports_completion(&reports);
         note_rust_point_work("search_answers", self.session);
         if !self.session.scope_step() {
             return Ok(ReverseBatch::Cancelled {
@@ -2673,6 +2890,7 @@ impl Drop for SelectedMacroInputRows {
 }
 
 pub struct ReadySelectedResolution<'store, 'input> {
+    jvm_inventory_generation: std::cell::RefCell<super::jvm_external_publication::PublicationClock>,
     store: &'store AnalyzerStore,
     #[doc(hidden)]
     pub inventory: Rc<SelectedResolutionMountInventory<'store>>,
@@ -2853,6 +3071,14 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 }
 
 impl<'store> ReadySelectedResolution<'store, '_> {
+    /// The services whose certification built a C# handle; a handle exists only
+    /// when the operation has them.
+    pub(super) fn csharp_services(&self) -> Result<&dyn SelectedAnalyzerServices> {
+        self.analyzer
+            .ok_or_else(|| StoreError::corrupt("C# selected reads need analyzer services"))
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn certified_csharp_view(
         &self,
     ) -> Result<Option<super::csharp_compilation::CertifiedCSharpHandle<'_>>> {
@@ -2998,39 +3224,130 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         }
     }
 
+    fn jvm_publication_clock(&self) -> super::jvm_external_publication::PublicationClock {
+        let captured = self.jvm_inventory_generation.borrow().clone();
+        let authority = self.model_authority();
+        let Some(models) = authority
+            .as_ref()
+            .and_then(|authority| authority.active_models())
+        else {
+            return captured;
+        };
+        let reader = super::jvm_external_publication::with_jvm_inventory_publication_clock(
+            self.store,
+            &captured,
+            || super::jvm_external_publication::request_jvm_inventory_reader(&models),
+        );
+        match reader {
+            Ok(Some(reader)) => {
+                if let Some(shared) = reader.inventory_clock {
+                    let span = shared.snapshot();
+                    assert_eq!(
+                        reader.inventory_generation,
+                        Some(span.captured_generation())
+                    );
+                    // A later independent certificate cannot refresh an earlier
+                    // frame. An older certificate instead retains its verified
+                    // own-write history across all frames in the same request.
+                    if span.captured_generation() <= captured.snapshot().generation() {
+                        drop(self.jvm_inventory_generation.replace(shared.clone()));
+                        return shared;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(open) => {
+                // Provider gating reports this same closed failure. Retain the
+                // original clock, so a failed bind can never refresh it; typed
+                // reads also propagate the reader refusal before reading rows.
+                self.analyzer
+                    .expect("request-owned JVM models have analyzer services")
+                    .record_model_family_open(open);
+            }
+        }
+        captured
+    }
+
     fn selected_external_provider_families(
         &self,
     ) -> std::collections::HashMap<String, super::resolution_typed::ExternalProviderFamily> {
-        use super::resolution_typed::{ExternalProviderFamily, insert_external_provider_family};
-        let mut families = std::collections::HashMap::new();
-        insert_external_provider_family(
-            &mut families,
-            "jvm-intrinsic".to_owned(),
-            ExternalProviderFamily::Jvm,
-        );
-        for provider in nominal_rules::jvm_external_owner_relations().providers(self.analyzer) {
-            insert_external_provider_family(&mut families, provider, ExternalProviderFamily::Jvm);
-        }
-        let authority = self.model_authority();
-        if let Some(models) = authority
-            .as_ref()
-            .and_then(|authority| authority.active_models())
-        {
-            for shard in models.shards() {
-                let family = Language::from_config_label(&shard.manifest.language)
-                    .map(ExternalProviderFamily::from_language)
-                    .unwrap_or(ExternalProviderFamily::Unknown);
+        let clock = self.jvm_publication_clock();
+        super::jvm_external_publication::with_jvm_inventory_publication_clock(
+            self.store,
+            &clock,
+            || {
+                use super::resolution_typed::{
+                    ExternalProviderFamily, insert_external_provider_family,
+                };
+                let mut families = std::collections::HashMap::new();
                 insert_external_provider_family(
                     &mut families,
-                    shard.manifest.semantic_sha256.clone(),
-                    family,
+                    "jvm-intrinsic".to_owned(),
+                    ExternalProviderFamily::Jvm,
                 );
-            }
-        }
-        families
-            .into_iter()
-            .filter_map(|(id, family)| family.map(|family| (id, family)))
-            .collect()
+                // One owner for every model read below: the operation's own
+                // authority. Without active models there is nothing to gate, so
+                // the empty set leaves providers ungated exactly as before.
+                let models = self
+                    .model_authority()
+                    .and_then(|authority| authority.active_models());
+                let no_models = Default::default();
+                let models = models.as_deref().unwrap_or(&no_models);
+                for provider in
+                    nominal_rules::jvm_external_owner_relations().providers(self.analyzer, models)
+                {
+                    insert_external_provider_family(
+                        &mut families,
+                        provider,
+                        ExternalProviderFamily::Jvm,
+                    );
+                }
+                for shard in models.shards() {
+                    let family = Language::from_config_label(&shard.manifest.language)
+                        .map(ExternalProviderFamily::from_language)
+                        .unwrap_or(ExternalProviderFamily::Unknown);
+                    insert_external_provider_family(
+                        &mut families,
+                        shard.inventory_provider_id(),
+                        family,
+                    );
+                }
+                let mut providers = families.keys().cloned().collect::<Vec<_>>();
+                if let Some(open) = models.gate_inventory_providers(&mut providers) {
+                    self.analyzer
+                        .expect("model inventory has analyzer services")
+                        .record_model_family_open(open);
+                }
+                // Linear in the provider count: dependency-heavy JVM
+                // workspaces reach this for every typed source.
+                let kept = providers
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::HashSet<_>>();
+                families.retain(|id, _| kept.contains(id.as_str()));
+                families
+                    .into_iter()
+                    .filter_map(|(id, family)| family.map(|family| (id, family)))
+                    .collect()
+            },
+        )
+    }
+
+    fn jvm_inventory_generation(&self) -> Result<i64> {
+        let clock = self.jvm_publication_clock();
+        let authority = self.model_authority();
+        let source_generation =
+            if let Some(models) = authority.as_ref().and_then(|a| a.active_models()) {
+                super::jvm_external_publication::request_jvm_inventory_reader(&models)
+                    .map_err(|open| StoreError::new(open.reason))?
+                    .and_then(|reader| reader.inventory_generation)
+            } else {
+                None
+            };
+        Ok(clock
+            .snapshot()
+            .with_source_generation(source_generation)
+            .generation())
     }
 
     fn selected_jvm_external_providers(&self) -> Vec<String> {
@@ -3046,6 +3363,154 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         providers.sort_unstable();
         providers.dedup();
         providers
+    }
+
+    /// Re-observe a retained typed source question without resolving members or slots.
+    #[doc(hidden)]
+    pub fn read_selected_receiver_proof(
+        &self,
+        question: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>> {
+        let typed = self.typed_source();
+        let Some(binding) = typed.resolve_receiver_proof_question(question, cancellation)? else {
+            if let Some(services) = self.analyzer {
+                services.refuse_read_reuse();
+            }
+            return Ok(None);
+        };
+        let lexical = self.lexical_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            session.receiver_inventory_question_for_test(question.clone());
+            let attempted = match binding {
+                super::resolution_typed::ResolvedReceiverProofQuestion::OwnerApplication {
+                    application,
+                } => Some((application, None)),
+                super::resolution_typed::ResolvedReceiverProofQuestion::CurrentInstanceTransfer {
+                    application,
+                    receiver,
+                    transfer_rule,
+                } => Some((application, Some((receiver, transfer_rule)))),
+                super::resolution_typed::ResolvedReceiverProofQuestion::BaseReceiverContext {
+                    ..
+                } => None,
+            };
+            crate::analyzer::resolution::fact_resolution::receiver_proof_tests::with_receiver_proof_test_decorator(|decorator| {
+                if let Some((application, transfer)) = attempted {
+                    decorator.proof_attempted(Some(question.source().rel_path.as_ref()), application, transfer);
+                }
+                decorator.proof_recordable(question);
+            });
+        }
+        let answer = match binding {
+            super::resolution_typed::ResolvedReceiverProofQuestion::OwnerApplication {
+                application,
+            } => {
+                session
+                    .read_owner_application_observation(application)?
+                    .answer
+            }
+            super::resolution_typed::ResolvedReceiverProofQuestion::CurrentInstanceTransfer {
+                application,
+                receiver,
+                transfer_rule,
+            } => {
+                session
+                    .read_current_instance_transfer_proof(application, receiver, transfer_rule)?
+                    .answer
+            }
+            super::resolution_typed::ResolvedReceiverProofQuestion::BaseReceiverContext {
+                reference,
+            } => {
+                session
+                    .read_base_receiver_context_observation(reference)?
+                    .canonical_answer
+            }
+        };
+        if typed
+            .resolve_receiver_proof_question(question, cancellation)?
+            .is_none()
+        {
+            if let Some(services) = self.analyzer {
+                services.refuse_read_reuse();
+            }
+            return Ok(None);
+        }
+        Ok(answer)
+    }
+
+    /// Exercise batch cache attribution using the same shared proof and receipt path.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_selected_receiver_proofs_after_transfer_batch_for_test(
+        &self,
+        questions: &[crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>>>
+    {
+        let typed = self.typed_source();
+        let mut bindings = Vec::with_capacity(questions.len());
+        for question in questions {
+            bindings.push(typed.resolve_receiver_proof_question(question, cancellation)?);
+        }
+        let receivers = bindings
+            .iter()
+            .flatten()
+            .filter_map(|binding| {
+                match binding {
+                super::resolution_typed::ResolvedReceiverProofQuestion::CurrentInstanceTransfer {
+                    receiver,
+                    ..
+                } => Some(*receiver),
+                _ => None,
+            }
+            })
+            .collect::<Vec<_>>();
+        let lexical = self.lexical_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        if !session.warm_receiver_transfer_batch_for_test(&receivers)? {
+            return Ok(vec![None; questions.len()]);
+        }
+        let mut answers = Vec::with_capacity(questions.len());
+        for (question, binding) in questions.iter().zip(bindings) {
+            let Some(binding) = binding else {
+                answers.push(None);
+                continue;
+            };
+            session.receiver_inventory_question_for_test(question.clone());
+            answers.push(match binding {
+                super::resolution_typed::ResolvedReceiverProofQuestion::OwnerApplication {
+                    application,
+                } => session.read_receiver_proof_memo_for_test(application, None)?,
+                super::resolution_typed::ResolvedReceiverProofQuestion::CurrentInstanceTransfer {
+                    application,
+                    receiver,
+                    transfer_rule,
+                } => session.read_receiver_proof_memo_for_test(
+                    application,
+                    Some((receiver, transfer_rule)),
+                )?,
+                super::resolution_typed::ResolvedReceiverProofQuestion::BaseReceiverContext {
+                    reference,
+                } => Some(
+                    session
+                        .consume_base_receiver_context_proof(reference)?
+                        .answer
+                        .expect("replayable base context has canonical answer"),
+                ),
+            });
+        }
+        Ok(answers)
     }
 
     #[doc(hidden)]
@@ -3064,12 +3529,17 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         let external_models = authority
             .as_ref()
             .and_then(|authority| authority.active_models());
+        let inventory_clock = Some(self.jvm_inventory_generation.borrow().clone());
         SelectedResolutionTypedSource::new_on_demand(&self.inventory)
             .with_binding_cache(&self.store.cache_budget)
             .with_go_context_binder(self)
+            .with_nominal_kind_provider(self)
+            .with_receiver_proof_services(self.analyzer)
+            .with_source_project_root(self.project.root())
             .with_type_heads(self, self.binary_operation_type_provider.as_deref())
             .with_context_identities(self.context_identities.clone())
             .with_external_providers(providers)
+            .with_external_inventory_clock(inventory_clock)
             .with_external_provider_families(families)
             .with_external_models(external_models)
             .with_model_authority(authority)
@@ -3112,8 +3582,29 @@ pub fn take_rebaser_identities_at_handback_for_test() -> [usize; 4] {
     REBASER_IDENTITIES_AT_HANDBACK.with(std::cell::Cell::take)
 }
 
+// Suite workers can prepare frontiers on different threads from their harness.
+#[cfg(any(test, feature = "test-support"))]
+static PENDING_MACRO_FRONTIER_DROPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_pending_macro_frontier_drops_for_test() -> usize {
+    PENDING_MACRO_FRONTIER_DROPS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Drop for ReadySelectedResolution<'_, '_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.first_macro_frontier_request_seen.get()
+            && self.macro_retention.get() == MacroRetention::Pending
+        {
+            PENDING_MACRO_FRONTIER_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         debug_assert_eq!(
             Rc::strong_count(&self.inventory),
             1,
@@ -3683,8 +4174,12 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     jvm_declared_type_memo: RefCell<jvm_context::JvmDeclaredTypeMemo>,
     jvm_declared_owner_memo: RefCell<jvm_context::JvmDeclaredOwnerMemo>,
     jvm_declaration_package_memo: RefCell<jvm_context::JvmDeclarationPackageMemo>,
-    jvm_indexed_type_memo:
-        RefCell<ExactReadMemo<crate::analyzer::resolution::ExternalOwnerIdentity, bool>>,
+    jvm_indexed_type_memo: RefCell<
+        ExactReadMemo<
+            crate::analyzer::resolution::ExternalOwnerIdentity,
+            super::jvm_external_publication::JvmInventoryMemoValue<bool>,
+        >,
+    >,
     jvm_external_provider_ids: std::cell::OnceCell<Vec<String>>,
     jvm_on_demand_type_ranks: RefCell<ExactReadMemo<SemanticId, jvm_demand::JvmBindingPrecedence>>,
     /// Complete node/visibility reads for distinct selected JVM inputs.
@@ -3694,6 +4189,53 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     /// Repeated member continuations retain the full input and owner-found effect.
     jvm_member_import_memo: RefCell<jvm_context::JvmMemberImportMemo>,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct SelectedRawBaseReceiverProofCycleForTest {
+    pub fill: crate::analyzer::resolution::fact_source::ReceiptUse<
+        crate::analyzer::resolution::BaseReceiverContextObservation,
+    >,
+    pub hit: crate::analyzer::resolution::fact_source::ReceiptUse<
+        crate::analyzer::resolution::BaseReceiverContextObservation,
+    >,
+    pub node_receipt: crate::analyzer::resolution::fact_source::SelectedReceiverProofReceipt,
+    pub owner_node_receipt:
+        Option<crate::analyzer::resolution::fact_source::SelectedReceiverProofReceipt>,
+    pub head: Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct SelectedBaseReceiverContextProofCycleForTest {
+    pub question: crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+    pub owner_application_question:
+        crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+    pub fill: crate::analyzer::resolution::fact_source::ReceiptUse<
+        crate::analyzer::resolution::BaseReceiverContextObservation,
+    >,
+    pub node_replay_usable: bool,
+    pub node_replay_receipt: crate::analyzer::resolution::fact_source::SelectedReceiverProofReceipt,
+    pub owner_application_node_replay_receipt:
+        Option<crate::analyzer::resolution::fact_source::SelectedReceiverProofReceipt>,
+    pub same_session_hit: crate::analyzer::resolution::fact_source::ReceiptUse<
+        crate::analyzer::resolution::BaseReceiverContextObservation,
+    >,
+    pub head_replay_answer:
+        Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+    pub owner_application_head_replay_answer:
+        Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type SelectedBaseReceiverContextProofStateForTest = (
+    crate::analyzer::resolution::fact_source::ReceiptUse<
+        crate::analyzer::resolution::BaseReceiverContextObservation,
+    >,
+    Vec<[u8; 32]>,
+    bool,
+);
 
 thread_local! {
     static OPEN_RUST_SELECTED_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3833,8 +4375,9 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
         self
     }
 
-    /// Only a completed consumer may hand its frontier snapshot to the reader.
-    /// Any failed, cancelled or exceeded site rejects the entire operation.
+    /// Report the downstream consumer for legacy would-drop diagnostics.
+    /// The builder's certificate controls retention independently. A semantic
+    /// incomplete answer alone is not a failed operation.
     pub fn observe_macro_retention_result(&self, complete: bool) {
         let retention = &self.ready.macro_retention;
         retention.set(match (retention.get(), complete) {
@@ -3843,6 +4386,27 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
                 MacroRetention::Completed
             }
         });
+    }
+
+    /// Typed missing/incomplete answers and unsupported caller profiles count as
+    /// answered consumers. Err, non-Complete bounded results, and operation
+    /// variants Unavailable, Stale and Cancelled count as failed consumers.
+    fn observe_typed_macro_retention_result(
+        &self,
+        result: &Result<
+            BoundedResolution<SelectedRustCallerReferenceOutcome<SelectedRustTypeProjection>>,
+        >,
+    ) {
+        self.observe_macro_retention_result(matches!(
+            result,
+            Ok(BoundedResolution::Complete {
+                value: SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile
+                    | SelectedRustCallerReferenceOutcome::Operation(
+                        SelectedResolutionOperationOutcome::Native(_)
+                    ),
+                ..
+            })
+        ));
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3856,6 +4420,456 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
     pub fn with_point_read_memos(mut self, memos: std::rc::Rc<SelectedPointReadMemos>) -> Self {
         self.ready.point_read_memos = memos;
         self
+    }
+
+    /// Replay the exact selected source question without invoking resolution.
+    #[doc(hidden)]
+    pub fn read_selected_receiver_proof(
+        &self,
+        question: &crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>> {
+        self.ready
+            .read_selected_receiver_proof(question, cancellation)
+    }
+
+    /// Exercise a real selected base-reference fill, same-session receipt hit,
+    /// and canonical head replay. This is test support only; it uses the
+    /// operation's ordinary selected source readers and read ledger.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn base_receiver_context_proof_cycle_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SelectedBaseReceiverContextProofCycleForTest>> {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = self.ready.typed_source();
+        let Some(question) =
+            typed.selected_base_receiver_context_question(reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        let fill = session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        let Some(application) = fill.observation.owner_application else {
+            return Ok(None);
+        };
+        let (node_replay_receipt, owner_application_node_replay_receipt, node_replay_usable) =
+            session.replay_receiver_proof_node_with_usability_for_test(
+                question.canonical_digest().as_bytes(),
+            )?;
+        let Some(owner_application_question) =
+            typed.selected_receiver_proof_question(application, None, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let same_session_hit =
+            session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        drop(session);
+        let head_replay_answer = self
+            .ready
+            .read_selected_receiver_proof(&question, cancellation)?;
+        let owner_application_head_replay_answer = self
+            .ready
+            .read_selected_receiver_proof(&owner_application_question, cancellation)?;
+        Ok(Some(SelectedBaseReceiverContextProofCycleForTest {
+            question,
+            owner_application_question,
+            fill,
+            node_replay_usable,
+            node_replay_receipt,
+            owner_application_node_replay_receipt,
+            same_session_hit,
+            head_replay_answer,
+            owner_application_head_replay_answer,
+        }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn raw_base_receiver_proof_cycle_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SelectedRawBaseReceiverProofCycleForTest>> {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = self.ready.typed_source();
+        let Some(question) =
+            typed.selected_base_receiver_context_question(reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        let fill = session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        let (node_receipt, owner_node_receipt) =
+            session.replay_receiver_proof_node_for_test(question.canonical_digest().as_bytes())?;
+        let hit = session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        drop(session);
+        let head = self
+            .ready
+            .read_selected_receiver_proof(&question, cancellation)?;
+        Ok(Some(SelectedRawBaseReceiverProofCycleForTest {
+            fill,
+            hit,
+            node_receipt,
+            owner_node_receipt,
+            head,
+        }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn owner_application_seed_cycle_for_test(
+        &self,
+        application: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<[Vec<crate::analyzer::resolution::ConditionalTypeSeedRead>; 2]> {
+        let lexical = self.ready.lexical_source();
+        let typed = self.ready.typed_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        session.owner_seed_cycle_for_test(application)
+    }
+
+    /// Read the normal base context through the query's selected source,
+    /// including stopped and cancelled outcomes, for negative controls.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_owner_application_clean_reuse_for_test<R>(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        application: SemanticId,
+        cancellation: &CancellationToken,
+        exercise: impl FnOnce(
+            &mut dyn FnMut()
+                -> Result<Option<Vec<crate::analyzer::resolution::ResolutionSlotValue>>>,
+        ) -> R,
+    ) -> Result<R> {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            panic!("normal receiver reference selected");
+        };
+        let typed = self.ready.typed_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        session.with_clean_owner_reuse_for_test(reference, application, exercise)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_base_receiver_hit_for_test<R>(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+        exercise: impl FnOnce(
+            &mut dyn FnMut() -> Result<
+                crate::analyzer::resolution::fact_source::ReceiptUse<
+                    crate::analyzer::resolution::BaseReceiverContextObservation,
+                >,
+            >,
+        ) -> R,
+    ) -> Result<R> {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            panic!("normal Base reference selected");
+        };
+        let typed = self.ready.typed_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        let fill = session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        assert!(fill.usable_receipt.is_some(), "normal initial Base receipt");
+        Ok(exercise(&mut || {
+            session.consume_base_receiver_context_proof_with_receipt(reference)
+        }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_base_receiver_context_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<
+            crate::analyzer::resolution::fact_source::ReceiptUse<
+                crate::analyzer::resolution::BaseReceiverContextObservation,
+            >,
+        >,
+    > {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        self.read_base_receiver_context_reference_for_test(reference, cancellation)
+            .map(Some)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn admit_base_receiver_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<
+            std::result::Result<
+                crate::analyzer::resolution::DeferredBaseReceiverRequest,
+                crate::analyzer::resolution::BaseReceiverRejection,
+            >,
+        >,
+    > {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = self.ready.typed_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        crate::analyzer::resolution::admit_base_receiver_for_test(&mut session, reference).map(Some)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_base_receiver_context_with_state_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SelectedBaseReceiverContextProofStateForTest>> {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = self.ready.typed_source();
+        let Some(question) =
+            typed.selected_base_receiver_context_question(reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        let proof = session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        Ok(Some((
+            proof,
+            session.pending_receiver_proof_nodes_for_test(),
+            session.receiver_proof_memo_retained_for_test(&question),
+        )))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn replay_base_receiver_context_after_question_change_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        replacement_locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SelectedBaseReceiverContextProofStateForTest>> {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let LocatedSemantic::Found(replacement_reference) =
+            self.ready
+                .lookup_locator(&lexical, replacement_locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = self.ready.typed_source();
+        let Some(replacement) =
+            typed.selected_base_receiver_context_question(replacement_reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        Ok(Some(session.replay_base_after_question_change_for_test(
+            reference,
+            replacement,
+        )?))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_base_receiver_context_reference_for_test(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        crate::analyzer::resolution::fact_source::ReceiptUse<
+            crate::analyzer::resolution::BaseReceiverContextObservation,
+        >,
+    > {
+        let typed = self.ready.typed_source();
+        let lexical = self.ready.lexical_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        session.consume_base_receiver_context_proof_with_receipt(reference)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_base_receiver_context_with_unestablished_routes_for_test(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        crate::analyzer::resolution::fact_source::ReceiptUse<
+            crate::analyzer::resolution::BaseReceiverContextObservation,
+        >,
+    > {
+        let typed = self.ready.typed_source();
+        let lexical = self.ready.lexical_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        session.consume_base_receiver_context_with_unestablished_routes_for_test(reference)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_base_receiver_context_without_owner_application_for_test(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        crate::analyzer::resolution::fact_source::ReceiptUse<
+            crate::analyzer::resolution::BaseReceiverContextObservation,
+        >,
+    > {
+        let typed = self.ready.typed_source();
+        let lexical = self.ready.lexical_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        session.consume_base_receiver_context_without_owner_application_for_test(reference)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_base_receiver_context_without_frontier_for_test(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        crate::analyzer::resolution::fact_source::ReceiptUse<
+            crate::analyzer::resolution::BaseReceiverContextObservation,
+        >,
+    > {
+        let typed = self.ready.typed_source();
+        let lexical = self.ready.lexical_source();
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        session.consume_base_receiver_context_without_frontier_for_test(reference)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn replay_base_receiver_context_node_after_owner_change_for_test(
+        &self,
+        locator: &crate::analyzer::resolution::SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(
+            crate::analyzer::resolution::fact_source::SelectedReceiverProofReceipt,
+            Option<crate::analyzer::resolution::fact_source::SelectedReceiverProofReceipt>,
+        )>,
+    > {
+        let lexical = self.ready.lexical_source();
+        let LocatedSemantic::Found(reference) =
+            self.ready.lookup_locator(&lexical, locator, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let typed = self.ready.typed_source();
+        let Some(question) =
+            typed.selected_base_receiver_context_question(reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let mut session = crate::analyzer::resolution::FactReadSession::from_split_sources(
+            &lexical,
+            &typed,
+            cancellation,
+        );
+        let fill = session.consume_base_receiver_context_proof_with_receipt(reference)?;
+        if fill.observation.owner_application.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            session.replay_receiver_proof_node_after_owner_change_for_test(
+                question.canonical_digest().as_bytes(),
+            )?,
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn read_selected_receiver_proofs_after_transfer_batch_for_test(
+        &self,
+        questions: &[crate::analyzer::semantic::read_ledger::SelectedReceiverProofQuestion],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Option<crate::analyzer::semantic::read_ledger::SelectedReceiverProofAnswer>>>
+    {
+        self.ready
+            .read_selected_receiver_proofs_after_transfer_batch_for_test(questions, cancellation)
     }
 
     #[doc(hidden)]
@@ -4927,6 +5941,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// parser-unit row, including locals and parameters, are intentionally
     /// absent.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_binding_definition_units(
         &self,
         cancellation: &CancellationToken,
@@ -5104,6 +6119,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn selected_rust_usage_facts(
         &self,
         file: &Path,
@@ -5204,6 +6220,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(shared)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_selected_rust_module_walk_facts(
         &self,
         file: &Path,
@@ -5310,6 +6327,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// that breaks an import cycle records nothing: where such a walk enters
     /// the cycle decides which member is answered `None`, so its frames are
     /// not a property of the question alone.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn select_visible_textual_macro(
         &self,
         caller: &Path,
@@ -5678,6 +6696,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// Every file the read reaches has had all of its parents read, so a
     /// reached file with no edge of its own has none. A file's parents depend
     /// on the file alone, so a later read that reaches it again adds nothing.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_selected_macro_walk_ancestry(&self, files: &[&str]) -> Result<()> {
         let missing = {
             let memo = self.ready.macro_walk.borrow();
@@ -5725,6 +6744,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn match_selected_textual_macro(
         &self,
         caller: &std::path::Path,
@@ -5833,6 +6853,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         ))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_selected_macro_reference_overlay(
         &self,
         files: &[String],
@@ -5888,6 +6909,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     }
 
     /// Locate a declaration already selected by Rust's textual macro walk.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn selected_macro_binding_target(
         &self,
         file: &Path,
@@ -5933,6 +6955,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     /// An unqualified use target can name a textually visible macro_rules
     /// declaration. It does not make that private declaration a general module
     /// export: retain the source-order proof for this exact import reference.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_selected_textual_macro_imports(
         &self,
         file: &Path,
@@ -6937,6 +7960,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
 
     /// Prepare generated frontiers only for files admitted by this query.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn prepare_selected_macro_frontiers_for_files(
         &self,
         files: &[&Path],
@@ -6946,6 +7970,11 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         let reader =
             brokk_bifrost_core::cache_db::sql_profile::connection_tag(inventory.connection());
         let reads = self.macro_frontier_reads.as_deref();
+        let active_model_set_hash = self
+            .ready
+            .model_authority
+            .as_ref()
+            .map(|authority| authority.active_model_set_hash());
         let note = |hit, reason| macro_frontier_cache_note(reads, reader, hit, reason);
         crate::profiling::note_with(|| {
             format!("rust_caller::macro_front_request reader={reader:?}")
@@ -7022,7 +8051,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         }
         let mut cache = inventory.retained_macro_frontier.borrow_mut();
         let cache = cache.as_mut().expect("macro region initialized");
-        let miss_reason = cache.miss_reason(&key);
+        let mut miss_reason = cache.miss_reason(&key);
         if cache
             .main_data_version
             .is_some_and(|prior| prior != data_version)
@@ -7030,7 +8059,19 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             cache.region.invalidate_all();
         }
         cache.main_data_version = Some(data_version);
-        if let Some(retained) = cache.region.get(&key) {
+        let retained = match cache.region.get(&key) {
+            Some(retained)
+                if reads.receipt_is_reusable(retained.receipt.as_ref(), active_model_set_hash) =>
+            {
+                Some(retained)
+            }
+            Some(_) => {
+                miss_reason = "receipt_changed";
+                None
+            }
+            None => None,
+        };
+        if let Some(retained) = retained {
             if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
                 note(false, reason);
                 return Ok(terminal);
@@ -7073,7 +8114,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             format!("rust_caller::macro_front_lookup_miss reader={reader:?} reason={miss_reason}")
         });
         let mut prepare = || self.prepare_selected_macro_frontiers_uncached(files, cancellation);
-        let (outcome, receipt) = reads.capture(&mut prepare);
+        let (outcome, receipt) = reads.capture(active_model_set_hash, &mut prepare);
         match &outcome {
             Ok(SelectedResolutionStageOutcome::Ready) => {}
             Ok(SelectedResolutionStageOutcome::Cancelled) => {
@@ -7098,7 +8139,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             note(false, reason);
             return Ok(terminal);
         }
-        if !reads.receipt_is_reusable(receipt.as_ref()) {
+        if !reads.receipt_is_reusable(receipt.as_ref(), active_model_set_hash) {
             note(false, "receipt_uncertifiable");
             return outcome;
         }
@@ -7228,6 +8269,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         self.ready.inventory.publication_data_version()
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_selected_macro_frontiers_uncached(
         &self,
         files: &[&Path],
@@ -7364,6 +8406,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         self.prepare_selected_macro_frontiers_for_files(&[caller], cancellation)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn selected_macro_input_rows(
         &self,
         capsule: &SelectedMacroCapsule,
@@ -7415,6 +8458,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         ))
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_selected_macro_file_frontiers(
         &self,
         caller: &Path,
@@ -7623,6 +8667,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(SelectedResolutionStageOutcome::Ready)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn select_imported_macro_definition(
         &self,
         caller: &Path,
@@ -7667,6 +8712,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     pub(crate) fn attach_active_reverse_sql_work_trace(&self) {
         if !rust_reverse_rows::reverse_sql_work_trace_active() {
             return;
@@ -7737,6 +8786,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(outcome)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn build_rust_demand_preparation_for_caller(
         &self,
         caller: &Path,
@@ -8116,6 +9166,7 @@ fn inventory_macro_gaps(
     Ok(gaps)
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn unexpanded_item_macro_gaps(
     ready: &ReadySelectedResolution<'_, '_>,
     completion: &ResolutionCompletion,
@@ -8287,6 +9338,7 @@ const ITEM_MACRO_INVOCATION_NAME_SQL: &str = "SELECT head.macro_name
   AND head.occurrence_id = input.invocation_occurrence_id
  WHERE gap.blob_id = ?1 AND gap.reason = ?2 AND gap.origin = ?3";
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn item_macro_invocation_name(
     ready: &ReadySelectedResolution<'_, '_>,
     semantic: SemanticId,
@@ -8320,6 +9372,7 @@ fn item_macro_invocation_name(
 /// The native macro-input join is the same producer fact used by Rust reverse
 /// candidate discovery: it separates an explicit invocation that can invent
 /// arbitrary items from an attribute-generated surface.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn persisted_gap_frontier(
     ready: &ReadySelectedResolution<'_, '_>,
     ordinal: u32,
@@ -9153,6 +10206,7 @@ const STAGED_REASON_GAP_ORIGIN: &str = "SELECT origin FROM temp.selected_resolut
 const STAGED_CAPSULE_REASON: &str = "StagedCapsuleReason";
 
 /// Import paths proved by the selected external-boundary binding rows.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn boundary_import_names(
     ready: &ReadySelectedResolution<'_, '_>,
     completion: &ResolutionCompletion,
@@ -9188,6 +10242,7 @@ fn boundary_import_names(
 }
 
 /// Project the parser-selected site; source text is used only to render its spelling.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn obligation_site_details(
     ready: &ReadySelectedResolution<'_, '_>,
     ordinal: u32,
@@ -9243,6 +10298,7 @@ fn obligation_site_details(
     ))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn persisted_obligation_details(
     ready: &ReadySelectedResolution<'_, '_>,
     semantic: SemanticId,
@@ -9340,6 +10396,7 @@ pub(super) fn snapshot_stop_semantics(
     stops
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn named_reason_details(
     ready: &ReadySelectedResolution<'_, '_>,
     completion: &ResolutionCompletion,
@@ -9428,6 +10485,7 @@ fn named_reason_details(
 
 /// Replace store blob keys only when evidence crosses into a public answer.
 /// The original JSON still supplies the persisted reason's identity and joins.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn public_rust_evidence(ready: &ReadySelectedResolution<'_, '_>, evidence: &str) -> Result<String> {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(evidence) else {
         return Ok(evidence.to_owned());
@@ -9527,6 +10585,7 @@ fn project_rust_reference_unit(
     Ok(SelectedResolutionOperationOutcome::Native(()))
 }
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn assemble_rust_reference_answer<T>(
     context: &RustReferenceAnswerContext<'_, '_, '_>,
     operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
@@ -9885,6 +10944,7 @@ pub(super) const RUST_RECEIVER_KIND_SQL: &str = "SELECT property.declaration_kin
           AND property.declaration_id = native.declaration_id
          WHERE mount.mount_ordinal = ?1";
 
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn project_rust_member_attributions(
     ready: &ReadySelectedResolution<'_, '_>,
     mounts: SelectedMountTable<'_, '_>,
@@ -10166,6 +11226,7 @@ impl RustRootHalfScope {
 
 /// The workspace crate a Rust reference spelled in the Type namespace names
 /// in its own module, if any (`rust_crate_rows::REFERENCE_NAMES_WORKSPACE_CRATE`).
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn rust_reference_workspace_crate(
     ready: &ReadySelectedResolution<'_, '_>,
     lexical: &SelectedResolutionLexicalSource<'_, '_>,
@@ -10226,6 +11287,7 @@ fn rust_reference_workspace_crate(
 /// the lookup found nothing only because a crate-declared module has no
 /// lexical binder (`lower_capsule_module_declaration`). That root answers
 /// incomplete, with a reason that names it, rather than the boundary.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn rust_path_root_boundary(
     ready: &ReadySelectedResolution<'_, '_>,
     lexical: &SelectedResolutionLexicalSource<'_, '_>,
@@ -10324,6 +11386,7 @@ fn rust_path_root_boundary(
 ///   macros such an edge moves into scope are invisible to it. A target the
 ///   walk did find is no proof either: the added file can define a later macro
 ///   of the same name that shadows it (textual scope is order-dependent).
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn rust_added_edge_scope_completion(
     ready: &ReadySelectedResolution<'_, '_>,
     mount: SelectedResolutionMountOrdinal,
@@ -10635,6 +11698,7 @@ fn rust_type_parameter_member_reason(
 /// broke 22 library tests. The question belongs to the reference whose lexical
 /// lookup ended empty, not to every macro name, so it is asked here, once,
 /// after that answer is in hand.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 fn rust_macro_use_binding_targets(
     ready: &ReadySelectedResolution<'_, '_>,
     mounts: SelectedMountTable<'_, '_>,
@@ -11324,6 +12388,7 @@ impl AnalyzerStore {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn prepare_selected_resolution<'store, 'project, 'selection>(
         &'store self,
         input: SelectedResolutionOperationInput<'project, 'selection>,
@@ -11420,6 +12485,10 @@ impl AnalyzerStore {
                 return Ok(PreparedSelectedResolution::Cancelled);
             }
         };
+        // Proof preparation must share the selected provider snapshot; a later clock could hide eviction.
+        let jvm_inventory_generation = self.jvm_inventory_publication_clock(
+            AnalyzerStore::jvm_external_inventory_generation_in_snapshot(inventory.connection())?,
+        );
         let query_preparation = Box::new(QueryResolutionPreparation {
             macro_overlay: RefCell::default(),
             prepared_macro_files: RefCell::default(),
@@ -11454,11 +12523,17 @@ impl AnalyzerStore {
                 inventory.staged_read_epoch(),
             ),
         ));
-        let model_authority = input.explicit_model_authority.clone().unwrap_or_else(|| {
-            input
-                .analyzer
-                .and_then(SelectedAnalyzerServices::model_authority)
-        });
+        let model_authority = super::jvm_external_publication::with_jvm_inventory_publication_clock(
+            self,
+            &jvm_inventory_generation,
+            || {
+                input.explicit_model_authority.clone().unwrap_or_else(|| {
+                    input
+                        .analyzer
+                        .and_then(SelectedAnalyzerServices::model_authority)
+                })
+            },
+        );
         Ok(PreparedSelectedResolution::Ready(Box::new(
             ReadySelectedResolution {
                 store: self,
@@ -11492,6 +12567,7 @@ impl AnalyzerStore {
                 graph_stage_candidate_cache: RefCell::new(None),
                 boundary_candidate_read_memo: std::rc::Rc::new(RefCell::default()),
                 jvm_root_presence_memo: root_presence_memo,
+                jvm_inventory_generation: std::cell::RefCell::new(jvm_inventory_generation),
                 point_read_memos: std::rc::Rc::default(),
                 persisted_gap_frontiers: RefCell::default(),
                 unexpanded_item_macro_gaps: RefCell::default(),
@@ -11798,7 +12874,7 @@ impl SelectedResolutionOperation<'_, '_> {
             }
         };
         let family = nominal_rules::nominal_package_rules_for_storage(locator.storage_language());
-        let go_receiver_overlay = match &mut language_demand {
+        let selected_receiver_override = match &mut language_demand {
             NativeLanguageDemand::Go {
                 receiver_overlay, ..
             } => receiver_overlay.take(),
@@ -11866,8 +12942,8 @@ impl SelectedResolutionOperation<'_, '_> {
                             &mut dyn crate::analyzer::resolution::DemandRootProvider,
                         >,
                          selected: Option<(&dyn DemandInstall, &dyn std::any::Any)>| {
-                            if let Some(overlay) = go_receiver_overlay {
-                                operation.set_go_receiver_slot_type_overlay(overlay);
+                            if let Some(overlay) = selected_receiver_override {
+                                operation.set_selected_receiver_slot_override(overlay);
                             }
                             if let Some(slot) = query_result_slot {
                                 if locator.role()
@@ -11893,6 +12969,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     &mut resolution_metrics,
                                 )?,
                             };
+                            operation.finish_java_qualified_super(reference, &mut answer)?;
                             if let Some(coverage) = &python_coverage {
                                 answer.combine_binding_completion(coverage);
                             }
@@ -11931,6 +13008,21 @@ impl SelectedResolutionOperation<'_, '_> {
                             session,
                             selected_import_gap,
                             |operation| {
+                                if let Some(override_) = self.java_qualified_super_override(
+                                    jvm_demand::JvmForwardOperationContext {
+                                        storage_language: locator.storage_language(),
+                                        blueprint: &blueprint,
+                                        caller_path: locator.relative_path(),
+                                        import_gaps: &[],
+                                        lexical: &observed_lexical,
+                                        typed: &observed_typed,
+                                        cancellation,
+                                        session,
+                                    },
+                                    reference,
+                                )? {
+                                    operation.set_selected_receiver_slot_override(override_);
+                                }
                                 resolve_with_provider(operation, None, None).map(resolve_plain)
                             },
                         )?
@@ -12211,6 +13303,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Selected crate prelude evidence for one caller. Multiple compilation
     /// contexts must agree; callers cannot assume std from the file's spelling.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_prelude_for_caller(
         &self,
         caller: &Path,
@@ -12246,6 +13339,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(selected)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(crate) fn rust_cfg_activation_for_caller(
         &self,
         caller: &Path,
@@ -12280,6 +13374,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// undecidable literals. The Boolean reports whether the answer depends
     /// on one of those assignments.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_cfg_activation_for_caller_under_site_cfg(
         &self,
         caller: &Path,
@@ -12462,29 +13557,23 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
         point_metrics: &mut ResolutionBatchMetrics,
-    ) -> Result<
-        BoundedResolution<
-            reverse::ReverseBatch<
-                Vec<reverse::ReverseSessionReport<SelectedRustReferenceAnswer>>,
-                std::convert::Infallible,
-            >,
-        >,
-    > {
+    ) -> Result<BoundedPartialReverseSession<SelectedRustReferenceAnswer, std::convert::Infallible>>
+    {
         assert_eq!(
             point_metrics,
             &ResolutionBatchMetrics::default(),
             "selected Rust point metrics must be fresh and default-valued"
         );
-        confirm_reverse_session_bounded(
+        confirm_reverse_session_bounded_partial(
             locators.len(),
             budget,
             cancellation,
-            |session, cancellation| {
+            |session, session_cancellation| {
                 let mut lifecycle = RustReverseLifecycle {
                     selected: self,
                     caller,
                     access: RustDeclarationAccessKind::CrateSet,
-                    cancellation,
+                    cancellation: session_cancellation,
                     session,
                     context_metrics,
                     setup: |_: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
@@ -12499,9 +13588,31 @@ impl SelectedResolutionOperation<'_, '_> {
                     },
                     marker: std::marker::PhantomData::<()>,
                 };
-                reverse::confirm_reverse_session(locators, &mut lifecycle)
+                reverse::confirm_reverse_session_partial(locators, &mut lifecycle)
             },
         )
+    }
+
+    /// The final authority check of a session that kept its finished locators
+    /// across a receiver-budget stop. The ordinary lifecycle `finish` cannot
+    /// run: it charges the stopped session and observes the cancellation its
+    /// own budget latch raised. The caller's token, not the session's, decides
+    /// here whether the request itself was cancelled.
+    pub(crate) fn finish_budget_stopped_reverse_reports(
+        &mut self,
+        finished: Vec<reverse::ReverseSessionReport<SelectedRustReferenceAnswer>>,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        reverse::ReverseBatch<
+            Vec<reverse::ReverseSessionReport<SelectedRustReferenceAnswer>>,
+            std::convert::Infallible,
+        >,
+    > {
+        let completion = reverse_reports_completion(&finished);
+        Ok(self
+            .ready
+            .finish(finished, &completion, cancellation)?
+            .into())
     }
 
     #[doc(hidden)]
@@ -12770,26 +13881,29 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> Result<BoundedResolution<SelectedRustCallerReferenceOutcome<SelectedRustTypeProjection>>>
     {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
-        let outcome = self.resolve_rust_references_for_caller_in_session(
-            caller,
-            &[locator],
-            cancellation,
-            context_metrics,
-            point_metrics,
-            &session,
-            RustDeclarationAccessKind::Caller,
-            |operation, resolution, ready, mounts, session, cancellation| {
-                project_rust_reference_types(
-                    operation,
-                    resolution,
-                    ready,
-                    mounts,
-                    session,
-                    cancellation,
-                )
-            },
-        )?;
-        Ok(session.finish(outcome.into_single()))
+        let outcome = self
+            .resolve_rust_references_for_caller_in_session(
+                caller,
+                &[locator],
+                cancellation,
+                context_metrics,
+                point_metrics,
+                &session,
+                RustDeclarationAccessKind::Caller,
+                |operation, resolution, ready, mounts, session, cancellation| {
+                    project_rust_reference_types(
+                        operation,
+                        resolution,
+                        ready,
+                        mounts,
+                        session,
+                        cancellation,
+                    )
+                },
+            )
+            .map(|outcome| session.finish(outcome.into_single()));
+        self.observe_typed_macro_retention_result(&outcome);
+        outcome
     }
 
     /// Whether the reference at `locator` spells, in the Type namespace, a
@@ -12802,6 +13916,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// the same, which is what the point route's route-head boundary claim
     /// must not deny.
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_reference_names_macro_module(
         &self,
         locator: &SelectedSemanticLocator,
@@ -12888,6 +14003,7 @@ impl SelectedResolutionOperation<'_, '_> {
     /// under another name finds no staged definition and answers incomplete
     /// (`rust_crate_context::unstaged_macro_item`).
     #[doc(hidden)]
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn rust_macro_item_hosts(&self, files: &[&Path]) -> Result<Vec<PathBuf>> {
         let connection = self.ready.inventory.connection();
         if !connection
@@ -13010,6 +14126,9 @@ impl SelectedResolutionOperation<'_, '_> {
                             )
                         }
                         ReverseSessionReport::Missing { .. } => SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
+                        ReverseSessionReport::Unattempted { .. } => {
+                            unreachable!("a whole-session confirmation reports no unattempted locator")
+                        }
                     })
                     .collect(),
             ),
@@ -15283,6 +16402,133 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
     ) -> Result<Option<Vec<native_units::SelectedDiagnosticIdentity>>> {
         native_units::diagnostic_definition_units(&self.ready, definitions, cancellation)
+    }
+}
+
+#[cfg(test)]
+mod partial_reverse_session_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use reverse::{
+        ReverseBatch, ReverseCancellationStage, ReverseSessionEnd, ReverseSessionReport,
+    };
+
+    fn locator(site: u32) -> SelectedSemanticLocator {
+        SelectedSemanticLocator::new(
+            "fixture",
+            "src/shared.rs",
+            ResolutionSiteId::new(site),
+            LoweredSemanticRole::Reference,
+        )
+    }
+
+    /// Evaluate `sites` locators, each charging one round, and report the
+    /// batch an evaluator returns when its charge is refused.
+    fn run_sites(
+        sites: u32,
+        session: &ResolutionSession,
+    ) -> Result<ReverseBatch<ReverseSessionEnd<(), ()>, ()>> {
+        let mut reports = Vec::new();
+        for site in 0..sites {
+            if !session.round_step() {
+                return Ok(ReverseBatch::Ready(ReverseSessionEnd::Stopped {
+                    reports,
+                    stop: ReverseBatch::Cancelled {
+                        stage: ReverseCancellationStage::Context,
+                        completion: cancelled_completion(),
+                    },
+                }));
+            }
+            reports.push(ReverseSessionReport::Found {
+                locator: locator(site),
+                meanings: Vec::new(),
+            });
+        }
+        Ok(ReverseBatch::Ready(ReverseSessionEnd::Finished(reports)))
+    }
+
+    fn budget(rounds: usize) -> ReceiverAnalysisBudget {
+        ReceiverAnalysisBudget {
+            max_resolution_rounds: rounds,
+            ..ReceiverAnalysisBudget::default()
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13145: a session whose round budget ran out part-way discarded the sites it had finished"
+    )]
+    fn budget_stop_keeps_the_sites_finished_before_it() {
+        let cancellation = CancellationToken::new();
+        let partial = confirm_reverse_session_bounded_partial::<(), ()>(
+            1,
+            budget(3),
+            &cancellation,
+            |session, _| run_sites(5, session),
+        )
+        .unwrap();
+        let PartialReverseSession::BudgetStopped { finished, limit } = partial.session else {
+            panic!("five sites cannot fit a three-round budget");
+        };
+        assert_eq!(limit, ReceiverBudgetLimit::ResolutionRounds);
+        assert_eq!(
+            finished.len(),
+            3,
+            "the sites charged before the refusal finish"
+        );
+        assert!(
+            !cancellation.is_cancelled(),
+            "a budget stop is not the caller's cancellation"
+        );
+    }
+
+    #[test]
+    #[hardwon("#13145: the round budget did not grow with the number of sites in the batch")]
+    fn round_budget_scales_with_the_site_count() {
+        let cancellation = CancellationToken::new();
+        let partial = confirm_reverse_session_bounded_partial::<(), ()>(
+            5,
+            budget(1),
+            &cancellation,
+            |session, _| run_sites(5, session),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                partial.session,
+                PartialReverseSession::Resolved(ReverseBatch::Ready(ref reports)) if reports.len() == 5
+            ),
+            "five sites keep five times the per-site round allowance"
+        );
+    }
+
+    #[test]
+    #[hardwon("#13145: a real cancellation must still cancel the whole reverse session")]
+    fn a_real_cancellation_is_not_a_budget_stop() {
+        let cancellation = CancellationToken::new();
+        let partial = confirm_reverse_session_bounded_partial::<(), ()>(
+            1,
+            budget(100),
+            &cancellation,
+            |session, _| {
+                let ended = run_sites(2, session)?;
+                cancellation.cancel();
+                Ok(match ended.into_stop() {
+                    Ok(ReverseSessionEnd::Finished(reports)) => {
+                        ReverseBatch::Ready(ReverseSessionEnd::Stopped {
+                            reports,
+                            stop: ReverseBatch::Cancelled {
+                                stage: ReverseCancellationStage::Context,
+                                completion: cancelled_completion(),
+                            },
+                        })
+                    }
+                    _ => unreachable!("two sites fit a hundred-round budget"),
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(partial.session, PartialReverseSession::Cancelled));
     }
 }
 

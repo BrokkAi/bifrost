@@ -61,6 +61,24 @@ fn measured_cold_refresh_matches_producers_and_warm_refresh_does_not_reparse() {
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let mut stderr = DrainedStderr::spawn(child.stderr.take().unwrap());
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+    // Poll initial installation separately. A cold refresh no longer waits
+    // or applies a mutation; it must be retried once the analyzer is ready.
+    call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        1,
+        "get_active_workspace",
+        json!({}),
+    );
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+        "name":"get_active_workspace", "arguments":{}, "_meta":{"progressToken":"initial-build"}}}),
+    );
+    let (probe, initial_progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(probe["result"]["structuredContent"]["analyzer_ready"], true);
+    assert_progress_is_monotonic(&initial_progress);
     write_line(
         &mut stdin,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
@@ -70,8 +88,9 @@ fn measured_cold_refresh_matches_producers_and_warm_refresh_does_not_reparse() {
     let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
     assert_eq!(response["result"]["isError"], false, "{response}");
     assert_progress_is_monotonic(&progress);
-    let snapshots = progress
+    let snapshots = initial_progress
         .iter()
+        .chain(&progress)
         .filter_map(|notification| notification["_meta"].get(KEY))
         .collect::<Vec<_>>();
     assert!(!snapshots.is_empty(), "{progress:?}");
@@ -278,7 +297,7 @@ fn measured_tasks_preserve_original_request_and_task_identity() {
 }
 
 #[test]
-fn a_cancelled_readiness_observer_stops_while_the_shared_build_remains_pending() {
+fn a_late_cancellation_of_a_not_ready_call_does_not_cancel_the_shared_build() {
     let workspace = fixture();
     drop(
         SearchToolsService::new_manual_persisted_for_project(
@@ -295,77 +314,49 @@ fn a_cancelled_readiness_observer_stops_while_the_shared_build_remains_pending()
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     write_line(
         &mut stdin,
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-            "name":"search_symbols","arguments":{"patterns":["private_source_1"]},"_meta":{"progressToken":"cancel-build"}
-        }}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+        "name":"search_symbols", "arguments":{"patterns":["private_source_1"]}, "_meta":{"progressToken":"cancel-build"}}}),
     );
-    loop {
-        let notification = read_line(&mut reader, &mut stderr);
-        assert_eq!(
-            notification["method"], "notifications/progress",
-            "{notification}"
-        );
-        if notification["params"]["_meta"][KEY]["status"] == "running" {
-            break;
-        }
-    }
-    // Leave the subscriber unread across several delivery ticks. An unchanged
-    // snapshot must not be re-enqueued on every tick.
-    thread::sleep(Duration::from_millis(250));
-    write_line(
-        &mut stdin,
-        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}),
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(
+        response["result"]["_meta"]["io.bifrost/incomplete"]["completion"]["reasons"],
+        json!(["workspace_not_ready"])
     );
-    // Cancellation can suppress the cancelled request's response. A stateless
-    // tool supplies a barrier without waiting for the held analyzer build.
-    write_line(
-        &mut stdin,
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-            "name":"list_policies","arguments":{}
-        }}),
-    );
-    let mut observations = Vec::new();
-    loop {
-        let message = read_line(&mut reader, &mut stderr);
-        if message["id"] == 3 {
-            break;
-        }
-        if message["id"] == 2 {
-            continue;
-        }
-        assert_eq!(message["method"], "notifications/progress", "{message}");
-        observations.push(message["params"].clone());
-    }
-    assert!(
-        observations.len() <= 1,
-        "unchanged snapshots should be coalesced: {observations:?}"
-    );
-    for observation in observations {
-        assert_eq!(observation["_meta"][KEY]["request_status"], "cancelled");
-        assert_eq!(
-            observation["_meta"][KEY]["status"], "running",
-            "a waiter must not cancel the shared producer"
+    for snapshot in progress.iter().filter_map(|n| n["_meta"].get(KEY)) {
+        assert_eq!(snapshot["status"], "running", "{snapshot}");
+        assert!(
+            snapshot["request_status"].is_null(),
+            "a not-ready result is not cancellation: {snapshot}"
         );
     }
+    write_line(
+        &mut stdin,
+        json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":2}}),
+    );
+    let probe = common::mcp_wire::round_trip_json_line(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"get_active_workspace", "arguments":{}}}),
+    );
+    assert_eq!(
+        probe["result"]["structuredContent"]["analyzer_ready"], false,
+        "{probe}"
+    );
+    assert_eq!(
+        probe["result"]["structuredContent"]["workspace_build"]["status"], "running",
+        "{probe}"
+    );
     drop(held);
-    write_line(
+    let response = call_tool(
         &mut stdin,
-        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
-            "name":"search_symbols","arguments":{"patterns":["private_source_1"]}
-        }}),
+        &mut reader,
+        &mut stderr,
+        4,
+        "search_symbols",
+        json!({"patterns":["private_source_1"]}),
     );
-    loop {
-        let message = read_line(&mut reader, &mut stderr);
-        if message["id"] == 2 {
-            continue;
-        }
-        assert_eq!(
-            message["id"], 4,
-            "cancelled observers must not survive the request: {message}"
-        );
-        assert_eq!(message["result"]["isError"], false, "{message}");
-        break;
-    }
+    assert_eq!(response["result"]["isError"], false, "{response}");
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }

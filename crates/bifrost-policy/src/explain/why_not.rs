@@ -81,6 +81,8 @@ pub fn explain_candidate(
     budget: &PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    let semantic_models = limits.stating_semantic_models_of(context.analyzer)?;
+    let limits = semantic_models.limits();
     match &policy.definition().analysis {
         PolicyAnalysis::Match { .. } => {
             explain_match_candidate(policy, context, candidate, budget, limits)
@@ -263,6 +265,8 @@ pub fn explain_match_candidate(
     budget: &PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    let semantic_models = limits.stating_semantic_models_of(context.analyzer)?;
+    let limits = semantic_models.limits();
     let analysis_type = policy.definition().analysis.analysis_type();
     if !matches!(policy.definition().analysis, PolicyAnalysis::Match { .. }) {
         return Err(ExplainError::adapter_unavailable(

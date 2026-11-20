@@ -35,7 +35,8 @@ impl Typed<'_, '_, '_, '_> {
         let name = self
             .p
             .facts
-            .intern_name(&mut self.p.names, "types.NoneType");
+            .intern_name(&mut self.p.names, "types.NoneType")
+            .expect("static non-empty literal");
         self.p
             .facts
             .intrinsic_type_seeds
@@ -151,7 +152,12 @@ impl Typed<'_, '_, '_, '_> {
         };
         // The route's first segment is the prefix identifier's semantic
         // name, including Python's class-private name mangling.
-        let name = self.p.semantic_name(token);
+        let Some(name) = self.p.semantic_name(token) else {
+            self.p
+                .facts
+                .add_gap(reference, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
         self.p
             .facts
             .root_references
@@ -350,7 +356,11 @@ impl Typed<'_, '_, '_, '_> {
             self.scopes[&node.id()],
             ResolutionSiteKind::MemberReference,
         );
-        let name = self.p.facts.intern_name(&mut self.p.names, "__getitem__");
+        let name = self
+            .p
+            .facts
+            .intern_name(&mut self.p.names, "__getitem__")
+            .expect("static non-empty literal");
         self.p.facts.identifiers.push(PositionedIdentifierFact {
             site: reference,
             name,
@@ -1402,7 +1412,8 @@ pub(super) fn produce(
                 for (written_ordinal, operand) in named_children_iter(bases).enumerate() {
                     if matches!(operand.kind(), "keyword_argument" | "dictionary_splat") {
                         let value = t.expression(argument_value(operand));
-                        let name = operand.child_by_field_name("name").map(|name| {
+                        // A MISSING keyword name leaves the keyword unnamed.
+                        let name = operand.child_by_field_name("name").and_then(|name| {
                             t.p.facts
                                 .intern_name(&mut t.p.names, &t.p.source[name.byte_range()])
                         });

@@ -162,6 +162,25 @@ pub struct PythonModuleMutationFacts {
     dynamic_hazards: Vec<Range>,
 }
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for PythonModuleMutationFacts {
+    /// Physical heap: the set's table, each boxed name, and the hazard vector.
+    fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        use brokk_bifrost_core::domain_memo::hash_table_allocation_bytes;
+        std::mem::size_of::<Self>()
+            + hash_table_allocation_bytes(
+                self.global_binding_events.capacity(),
+                std::mem::size_of::<Box<str>>(),
+            )
+            + self
+                .global_binding_events
+                .iter()
+                .map(|name| allocation_size(name.len()))
+                .sum::<usize>()
+            + allocation_size(self.dynamic_hazards.capacity() * std::mem::size_of::<Range>())
+    }
+}
+
 impl PythonModuleMutationFacts {
     /// Collect all hazards before publishing facts. A stopped collection has
     /// no usable partial result, even if an earlier hazard already refused.

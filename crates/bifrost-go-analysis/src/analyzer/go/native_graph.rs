@@ -70,8 +70,10 @@ impl NativeWorkspaceGraphProvider for GoNativeWorkspaceGraphProvider {
         &self,
         analyzer: &dyn IAnalyzer,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<(ProjectFile, String)>> {
-        resolve_analyzer::<GoAnalyzer>(analyzer)
-            .map_or_else(|| Ok(Vec::new()), GoAnalyzer::graph_source_exclusions)
+        resolve_analyzer::<GoAnalyzer>(analyzer).map_or_else(
+            || Ok(Vec::new()),
+            |go| go.inner.selected_graph_source_exclusions(),
+        )
     }
 
     fn input_failure(

@@ -253,6 +253,7 @@ pub mod go_extraction_tests {
             config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
             config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -263,7 +264,8 @@ pub mod go_extraction_tests {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: Vec::new(),
                 limits: SemanticModelRuntimeLimits::default(),
@@ -305,6 +307,13 @@ pub mod go_extraction_tests {
         #[hardwon(
             "b610cdc85704: cancellation allowed later ecosystem discovery to publish a partial activation transaction"
         )]
+        #[brokk_bifrost_test_macros::hardwon(
+            "1f9a577111bd: a cancelled Go discovery mutated shared build selection state"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn cancelled_dependency_discovery_stops_the_whole_activation_transaction() {
             let project = InlineTestProject::with_language(Language::Go)
                 .file("main.go", "package main\n")
@@ -313,8 +322,43 @@ pub mod go_extraction_tests {
             config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
             config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
             let workspace = project.workspace_analyzer(config.clone());
+            let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                brokk_bifrost_go_analysis::GoAnalyzer,
+            >(workspace.analyzer())
+            .unwrap();
+            let selection_error = go.build_selection_error();
+            let profile = go.context_profile_for_test();
+            let inventory = || {
+                let conn = workspace.store().unwrap().read_conn().unwrap();
+                let mut rows = Vec::new();
+                for table in [
+                    "go_context_publications",
+                    "go_context_selections",
+                    "go_package_instances",
+                    "go_package_imports",
+                ] {
+                    let mut statement = conn
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    rows.push(
+                        statement
+                            .query_map([], |row| {
+                                (0..columns)
+                                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                            .unwrap()
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap(),
+                    );
+                }
+                rows
+            };
+            let previous_inventory = inventory();
             let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: Vec::new(),
@@ -342,11 +386,49 @@ pub mod go_extraction_tests {
             assert_eq!(outcome.ecosystems.len(), 1, "{outcome:#?}");
             assert!(outcome.ecosystems[0].discovery.cancelled, "{outcome:#?}");
             assert!(outcome.ecosystems[0].preparation.is_none(), "{outcome:#?}");
-            assert!(outcome.runtime.is_none(), "{outcome:#?}");
+            assert!(
+                matches!(
+                    outcome.runtime,
+                    Some(SemanticModelRuntimeOutcome::Cancelled(_))
+                ),
+                "{outcome:#?}"
+            );
+            assert_eq!(go.build_selection_error(), selection_error);
+            assert_eq!(go.context_profile_for_test(), profile);
+            assert_eq!(inventory(), previous_inventory);
+            assert!(workspace.analyzer().active_semantic_models().is_none());
             assert!(!outcome.diagnostic_refresh_required, "{outcome:#?}");
             assert!(!outcome.complete(), "{outcome:#?}");
+            let retry = workspace.activate_dependency_packs(
+                &config,
+                &[DependencyPackEcosystem::Go],
+                DependencyPackWorkspaceContext {
+                    catalog: &catalog,
+                    persistence: None,
+                    activation: &request,
+                    limits: DependencyPackLimits::default(),
+                    cancellation: &brokk_bifrost_core::cancellation::CancellationToken::new(),
+                },
+            );
+            assert!(
+                matches!(
+                    retry.runtime,
+                    Some(SemanticModelRuntimeOutcome::Ready { .. })
+                ),
+                "{retry:#?}"
+            );
+            assert!(!retry.ecosystems[0].discovery.cancelled);
+            assert!(
+                !go.build_selection_error()
+                    .unwrap_or_default()
+                    .contains("cancelled")
+            );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_native_activation_disabled_never_invokes_configured_tool() {
             let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
                 .file("go.mod", "module example.test/root\n")
@@ -1640,6 +1722,7 @@ func caller() {
             }))
             .expect("serialize Go declaration fixture");
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("crate version"),
@@ -1654,7 +1737,8 @@ func caller() {
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 }],
                 controls: vec![SemanticModelActivationControl {
                     scope: SemanticModelControlScope::Workspace,
@@ -2872,6 +2956,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
         fn activate_go_context_with(workspace: &WorkspaceAnalyzer, config: &AnalyzerConfig) {
             let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
             let activation = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: Vec::new(),
@@ -2911,6 +2996,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             Some((fixture, workspace))
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_package_peer_relation_decodes_ordered_mount_ordinals() {
             let (_fixture, workspace) = published_go_workspace(&[
                 ("go.mod", "module example.test/packageplan\n\ngo 1.22\n"),
@@ -3015,6 +3104,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             unresolved_imports: usize,
             dependency_keys: std::collections::BTreeSet<String>,
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn assert_summaries_match_incumbent_readers(
             workspace: &WorkspaceAnalyzer,
         ) -> DifferentialCounts {
@@ -3552,6 +3645,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             summary_digest: Vec<u8>,
             output_digest: Vec<u8>,
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn open_units(
             workspace: &WorkspaceAnalyzer,
         ) -> std::collections::BTreeMap<String, OpenUnit> {
@@ -3684,6 +3781,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
         }
         /// How many live summaries record `profile` as the context profile they derive
         /// from, in their read ledger.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn live_summaries_of_profile(workspace: &WorkspaceAnalyzer, profile: [u8; 32]) -> usize {
             let conn = workspace.store().unwrap().read_conn().unwrap();
             conn.query_row(
@@ -3702,6 +3803,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             "800772caaffe: an alias to an anonymous Go type was misclassified as an incomplete provider"
         )]
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_unit_summaries_equal_the_incumbent_member_and_import_readers() {
             let Some((_fixture, workspace)) = published_go_workspace(GO_FIXTURE) else {
                 return;
@@ -3819,6 +3924,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             "51e2e4668128: test package summaries lost alias targets imported by ordinary Go files"
         )]
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_test_unit_aliases_reach_imports_from_package_files() {
             let Some((_fixture, workspace)) = published_go_workspace(GO_FIXTURE) else {
                 return;
@@ -3979,6 +4088,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "#4994: retained summary statistics let Go reverse completeness scan source imports"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_unit_summary_readers_seek_in_both_statistics_states() {
             use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::explain_pin;
@@ -4524,6 +4637,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
         /// context as `FullProduction` without preparing dependency packs.
         #[test]
         #[ignore = "operator measurement: needs BIFROST_UNIT_SUMMARY_CORPUS, a writable copy of a Go repository"]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn measure_go_unit_summary_reconcile_on_a_corpus() {
             use std::sync::Arc;
             use std::sync::atomic::AtomicUsize;
@@ -4737,7 +4854,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
                 generation,
                 &GoAdapter,
-                state,
+                std::sync::Arc::clone(&state),
             )
             .unwrap();
             let (outcomes, _) =
@@ -4750,6 +4867,20 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     .map(|outcome| &outcome.error)
                     .collect::<Vec<_>>()
             );
+
+            assert_eq!(
+                open_units(&workspace),
+                before,
+                "ordinary publication preserves summaries"
+            );
+            let repair = AnalyzerStore::prepare_parsed_blob(
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                generation,
+                &GoAdapter,
+                state,
+            )
+            .unwrap();
+            store.repair_prepared_blob(repair).unwrap();
 
             let hollow = open_units(&workspace);
             assert_eq!(before, hollow, "equal facts preserve every live version");
@@ -4879,6 +5010,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn a_summary_records_the_profile_of_the_publication_it_derives_from() {
             use brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile;
             let mut project = InlineTestProject::with_language(Language::Go);
@@ -4928,6 +5063,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
             "#5147: same-revision tool publication withdrew a retained inventory snapshot's summary"
         )]
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_summary_profiles_survive_same_revision_publication() {
             use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -5030,6 +5169,10 @@ func main() { api.Public() }
             "#5147: summary replacement, cancellation and revision guards crossed Go context profiles"
         )]
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_summary_profile_interleavings_reopen_and_withdraw() {
             use brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId;
 
@@ -6646,10 +6789,15 @@ type Item struct{ Decoy bool }
                 // stage family. Its TEMP table and unique/seek indexes add three
                 // cold-open statements and three decoded schema rows in both
                 // profiles.
+                // #12245: readiness reads the JVM inventory generation in the
+                // selected snapshot for every language (+1 statement/+1 row).
                 // #13339 installs the three shared Rust source-scope TEMP views
                 // in selected-resolution schema setup: +3 cold-open statements
                 // and decoded schema rows in both profiles. Search and warm work
                 // are unchanged.
+                // #14245 keeps admission-count validation local to its row and
+                // removes the selected-resolution admission count TEMP view:
+                // -1 cold-open statement and decoded schema row in both profiles.
                 let cold_open = if cfg!(debug_assertions) {
                     (310, 267)
                 } else {
@@ -6688,8 +6836,8 @@ type Item struct{ Decoy bool }
                 // 0427 alone leaves the search unchanged; Definition's scope
                 // step adds no SQL, and #12735 does not move these pins.
                 let (cold_search, warm_open, warm_search) = match kind {
-                    ProductionGoPointKind::Definition => ((163, 147), (5, 4), (131, 100)),
-                    ProductionGoPointKind::Type => ((184, 147), (5, 4), (152, 100)),
+                    ProductionGoPointKind::Definition => ((163, 147), (6, 5), (131, 100)),
+                    ProductionGoPointKind::Type => ((184, 147), (6, 5), (152, 100)),
                 };
                 let production_schema = cold
                     .open
@@ -6827,6 +6975,10 @@ type Item struct{ Decoy bool }
         #[test]
         #[hardwon(
             "#6803: a Go placement gap reason had no provenance row, so workers could not authenticate it"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_memberless_placement_reason_authenticates_after_persistence() {
             use brokk_bifrost_analysis::analyzer::resolution::{
@@ -7293,6 +7445,10 @@ type Item struct{ Decoy bool }
             assert!(reverse.references().contains(&reference));
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_package_context_without_references_reads_no_members() {
             let fixture = GoRootResolutionOperationFixture::with_consumer("package consumer\n");
             let context_id =
@@ -7349,6 +7505,10 @@ type Item struct{ Decoy bool }
         }
 
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn selected_go_package_rows_compose_dot_import_without_manual_bridges() {
             let fixture = GoRootResolutionOperationFixture::new();
             let context_id =
@@ -7788,7 +7948,7 @@ type Item struct{ Decoy bool }
 
                 fn verified_declaration(&self, expected: &brokk_bifrost_analysis::analyzer::CodeUnit) -> Option<brokk_bifrost_analysis::analyzer::CodeUnit> { self.0.declarations_named(expected.source(), expected.identifier()).into_iter().find(|unit| unit == expected) }
                 fn declarations_named(&self, file: &brokk_bifrost_analysis::analyzer::ProjectFile, name: &str) -> Vec<brokk_bifrost_analysis::analyzer::CodeUnit> { self.0.declarations_named(file, name) }
-                fn external_inventory_providers(&self) -> Vec<String> { Vec::new() }
+                fn external_inventory_providers(&self, _: &brokk_bifrost_analysis::analyzer::semantic_model::ResolvedActiveSemanticModels) -> Vec<String> { Vec::new() }
                 fn active_models(&self) -> Option<std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ResolvedActiveSemanticModels>> { self.0.active_semantic_models() }
                 fn model_authority(&self) -> Option<std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>> { self.0.semantic_model_overlay().map(|overlay| overlay as _) }
             }
@@ -8028,11 +8188,13 @@ type Item struct{ Decoy bool }
                 let workspace = project.workspace_analyzer(AnalyzerConfig::default());
                 let cancellation = CancellationToken::new();
                 let activation = SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                     evidence: vec![brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence {
                         language:"go".into(), ecosystem:"go-module".into(), package:None, module:None,
-                        toolchain:None, target:None, configuration:None, artifact_sha256:None,
+                        toolchain:None, target:None, configuration:None, production_input_digest: None,
+verified_raw_artifacts: Vec::new(),
                     }], controls:Vec::new(), limits:SemanticModelRuntimeLimits::default(),
                 };
                 assert!(matches!(
@@ -9448,6 +9610,10 @@ func use() { provider.Rewrites.ReadFile() }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn selected_go_import_readers_seek_populated_selected_rows() {
             use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::explain_pin;
 
@@ -9606,6 +9772,10 @@ func use() { provider.Rewrites.ReadFile() }
             }
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_definition_package_anchor_seeks_exact_selected_version() {
             use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::explain_pin;
 
@@ -9667,6 +9837,10 @@ func use() { provider.Rewrites.ReadFile() }
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "#5316: Go context snapshots and hydration reread identical request facts"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_context_reads_reuse_only_one_request_revision_and_stage() {
             use brokk_bifrost_analysis::analyzer::resolution::model::EndpointSignature;
@@ -9896,6 +10070,10 @@ func use() { provider.Rewrites.ReadFile() }
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "658ae20982ef: Go member lookup demanded unrelated same-name receiver frontiers"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_owner_proof_reads_exact_source_receivers_and_reuses_only_the_current_stage() {
             use brokk_bifrost_analysis::analyzer::resolution::fact_source::DeferredMemberOwnerProof;
@@ -10311,6 +10489,10 @@ func use() { provider.Rewrites.ReadFile() }
         #[brokk_bifrost_test_macros::hardwon(
             "#6650: a source that admission refused left every Go input observation changed"
         )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn refused_source_is_a_recorded_input_and_a_named_package_gap() {
             // Shaped like ollama's embedded WAV test data: one line over the
             // default 16,000-byte structural line limit.
@@ -10491,6 +10673,10 @@ func use() { provider.Rewrites.ReadFile() }
         #[brokk_bifrost_test_macros::hardwon(
             "#6650: an incremental update selected a refused source that a full build omits"
         )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn incremental_update_records_a_refused_source_instead_of_selecting_it() {
             use rusqlite::OptionalExtension;
             let fixture = Fixture::new();
@@ -10568,6 +10754,10 @@ func use() { provider.Rewrites.ReadFile() }
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "#5020: failed Go tool roots erased inventory placements while explicit exclusions must survive"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn failed_tool_root_keeps_inventory_without_overriding_file_records() {
             let fixture = Fixture::from_project(
@@ -10667,6 +10857,10 @@ func use() { provider.Rewrites.ReadFile() }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_canonical_test_variants_use_compiled_files_and_exact_package_clauses() {
             let fixture = test_variant_fixture();
             let mut discovery = fixture.discovery();
@@ -10779,6 +10973,10 @@ func use() { provider.Rewrites.ReadFile() }
             }
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_rejects_unproven_test_variants_and_conflicting_package_clauses() {
             let fixture = test_variant_fixture();
             let mut discovery = fixture.discovery();
@@ -10883,6 +11081,10 @@ func use() { provider.Rewrites.ReadFile() }
             ));
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_source_inventory_is_partial_selected_and_incremental() {
             let fixture = Fixture::new();
             let profile = source_inventory_profile();
@@ -10997,6 +11199,10 @@ func use() { provider.Rewrites.ReadFile() }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_source_inventory_separates_external_test_package_clause() {
             let fixture = test_variant_fixture();
             let context = fixture
@@ -11031,6 +11237,10 @@ func use() { provider.Rewrites.ReadFile() }
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
             "#2771: build-constrained Go files must not mark a provider inventory incomplete"
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
         )]
         fn go_source_inventory_keeps_build_constrained_files_without_an_inventory_gap() {
             let fixture = Fixture::from_project(
@@ -11094,6 +11304,10 @@ func use() { provider.Rewrites.ReadFile() }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_source_inventory_preserves_roles_and_vendor_ambiguity() {
             let project = InlineTestProject::with_language(Language::Go)
                 .file("go.mod", "module example.test/root\n")
@@ -11155,6 +11369,10 @@ func use() { provider.Rewrites.ReadFile() }
             }
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_active_tool_profile_never_falls_back_after_source_update() {
             let fixture = Fixture::new_with_config(AnalyzerConfig::default());
             let discovery = fixture.discovery();
@@ -11475,6 +11693,10 @@ func use() { provider.Rewrites.ReadFile() }
             }
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_publishes_fileless_standard_and_module_import_targets() {
             let fixture = Fixture::new();
             let mut discovery = fixture.discovery();
@@ -11618,6 +11840,10 @@ func use() { provider.Rewrites.ReadFile() }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_maps_source_spelling_and_keeps_missing_provider_partial() {
             let fixture = Fixture::new();
             let mut discovery = fixture.discovery();
@@ -11667,6 +11893,10 @@ func use() { provider.Rewrites.ReadFile() }
             );
         }
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn go_context_conflicting_tool_identities_are_withheld() {
             let fixture = Fixture::new();
             let mut discovery = fixture.discovery();
@@ -11720,6 +11950,10 @@ func use() { provider.Rewrites.ReadFile() }
         use crate::engine_tests::go_extraction::go_extraction_tests::go_move_11::GoRootResolutionOperationFixture;
         use brokk_bifrost_analysis::native_resolution_test_support::SelectedTypedFactSource;
         #[test]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+        )]
         fn selected_go_member_metadata_preserves_embeddings_receivers_and_indexed_access() {
             use brokk_bifrost_analysis::analyzer::resolution::fact_source::GoMemberDeclarationKind;
 
@@ -12336,7 +12570,8 @@ func use() { provider.Rewrites.ReadFile() }
                     toolchain: None,
                     target: None,
                     configuration: None,
-                    artifact_sha256: None,
+                    production_input_digest: None,
+                    verified_raw_artifacts: Vec::new(),
                 },
                 vec![DependencyProvenance {
                     key: "go.packages".to_owned(),
@@ -12483,12 +12718,14 @@ func use() { provider.Rewrites.ReadFile() }
                     compiled.compiled.manifest.content_sha256
                 );
                 assert_eq!(
-                    prepared.evidence.artifact_sha256.as_deref(),
+                    prepared.evidence.single_raw_sha256().as_deref(),
                     Some(GO_SOURCE_SHA256)
                 );
                 assert_eq!(outcome.evidence, vec![prepared.evidence.clone()]);
 
                 let query = SemanticPackSelectorQuery {
+                    verified_raw_artifacts: prepared.evidence.verified_raw_artifacts.clone(),
+                    production_input_digest: prepared.evidence.production_input_digest.clone(),
                     language: prepared.evidence.language.clone(),
                     ecosystem: prepared.evidence.ecosystem.clone(),
                     package: prepared.evidence.package.clone(),
@@ -12496,19 +12733,26 @@ func use() { provider.Rewrites.ReadFile() }
                     toolchain: prepared.evidence.toolchain.clone(),
                     target: prepared.evidence.target.clone(),
                     configuration: prepared.evidence.configuration.clone(),
-                    artifact_sha256: prepared.evidence.artifact_sha256.clone(),
+                    artifact_sha256: prepared.evidence.single_raw_sha256(),
                     bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 };
                 let candidates = catalog.candidates(&query).unwrap();
                 assert_eq!(candidates.len(), 1);
                 let loaded = catalog.load(&candidates[0]).unwrap();
+                // The generated selector binds the composite production input
+                // digest; the raw source digest is consumed evidence only.
+                assert_eq!(loaded.selectors.as_slice()[0].artifact_sha256, None);
                 assert_eq!(
-                    loaded.selectors.as_slice()[0].artifact_sha256.as_deref(),
-                    Some(GO_SOURCE_SHA256)
+                    loaded.selectors.as_slice()[0]
+                        .production_input_digest
+                        .as_deref(),
+                    Some(compiled.key.input_digest())
                 );
                 assert!(
                     catalog
                         .candidates(&SemanticPackSelectorQuery {
+                            verified_raw_artifacts: Vec::new(),
+                            production_input_digest: None,
                             artifact_sha256: Some(compiled.key.input_digest().to_owned()),
                             ..query
                         })
@@ -12600,7 +12844,7 @@ func use() { provider.Rewrites.ReadFile() }
             );
             assert_ne!(changed.packs[0].production.key, compiled.key);
             assert_eq!(
-                changed.evidence[0].artifact_sha256.as_deref(),
+                changed.evidence[0].single_raw_sha256().as_deref(),
                 Some(changed_artifact.sha256())
             );
             let reader = catalog
@@ -12735,6 +12979,7 @@ func use() { provider.Rewrites.ReadFile() }
             let active = match resolve_active_semantic_models(
                 &catalog,
                 &SemanticModelActivationRequest {
+                    host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                     approximate_standard_libraries: Vec::new(),
                     bifrost_version: semver::Version::new(0, 12, 0),
                     evidence: vec![SemanticModelActivationEvidence {
@@ -12748,7 +12993,8 @@ func use() { provider.Rewrites.ReadFile() }
                         toolchain: None,
                         target: None,
                         configuration: None,
-                        artifact_sha256: Some(artifact_a),
+                        production_input_digest: None,
+verified_raw_artifacts: (Some(artifact_a)).into_iter().map(|sha256: String| brokk_bifrost_semantic::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_semantic::analyzer::semantic_model::ExternalArtifactKind::GoSourceSet, &sha256)).collect(),
                     }],
                     controls: Vec::new(),
                     limits: SemanticModelRuntimeLimits::default(),
@@ -12771,8 +13017,9 @@ func use() { provider.Rewrites.ReadFile() }
                 &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
             )
             .unwrap();
-            let factory = overlay
-                .symbols()
+            let (symbols, complete) = overlay.symbols();
+            assert!(complete, "fixture requires complete symbols");
+            let factory = symbols
                 .into_iter()
                 .find(|symbol| symbol.provenance.record_id == "member.widget.create")
                 .expect("activated factory symbol");
@@ -14180,6 +14427,7 @@ func use() { provider.Rewrites.ReadFile() }
             let key = key();
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.push(SemanticValue {
+                actual_borrow: Default::default(),
                 static_type_origin: None,
                 static_type_class: Default::default(),
                 id: ValueId::new(0),

@@ -35,6 +35,7 @@ fn activate_rust_pack(
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
@@ -45,7 +46,8 @@ fn activate_rust_pack(
                 toolchain: None,
                 target: None,
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             }],
             controls: Vec::new(),
             limits: SemanticModelRuntimeLimits::default(),
@@ -405,7 +407,7 @@ pub fn process_control() {
     assert!(unresolved_tokio.results.is_empty(), "{unresolved_tokio:#?}");
     assert!(
         unresolved_tokio.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            diagnostic.code() == CodeQueryDiagnosticCode::SemanticAnalysisPartial
         }),
         "the unmodeled Tokio target retains a typed gap: {unresolved_tokio:#?}"
     );

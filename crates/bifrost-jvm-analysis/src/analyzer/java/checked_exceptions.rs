@@ -1,4 +1,4 @@
-//! Whether a Java call can throw an exception a catch clause catches.
+//! Which exceptions a Java catch clause receives.
 //!
 //! A checked exception is a `Throwable` that is not a `RuntimeException` or
 //! an `Error`. A method or constructor may throw one only if its `throws`
@@ -7,6 +7,10 @@
 //! callee declares nothing cannot deliver a checked exception, and a catch
 //! clause whose one type is a checked exception class cannot receive anything
 //! that call throws.
+//!
+//! Every exception is an instance of `java.lang.Throwable` (JLS 11.1.1), so
+//! a `try` with a catch clause for that class lets no exception thrown in its
+//! body leave the statement without entering a handler (JLS 14.20.1).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -38,6 +42,155 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
 use brokk_bifrost_core::hash::HashSet;
+
+use brokk_bifrost_analysis::analyzer::semantic::ControlEdgeId;
+
+use brokk_bifrost_analysis::analyzer::semantic::ControlEdgeKind;
+
+use brokk_bifrost_analysis::analyzer::semantic::ProcedureSemantics;
+
+use brokk_bifrost_analysis::analyzer::semantic::ProgramPoint;
+
+use brokk_bifrost_analysis::analyzer::semantic::SourceMappingKind;
+
+use brokk_bifrost_analysis::analyzer::semantic::type_flow::source_span_for_node;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+
+/// Each point of `semantics` with the successor shape of a `try` statement's
+/// handler dispatcher, and its edge on which no catch clause matched.
+///
+/// Lowering gives a `try` with catch clauses one dispatcher: a `SwitchCase`
+/// edge to each catch body and one `Exceptional` edge that rethrows out of
+/// the statement. The shape alone does not prove the point is a dispatcher;
+/// [`uncaught_edges_of_total_handlers`] checks its syntax.
+fn handler_dispatcher_candidates(
+    semantics: &ProcedureSemantics,
+) -> impl Iterator<Item = (&ProgramPoint, ControlEdgeId)> + '_ {
+    semantics.points().iter().filter_map(|point| {
+        let mut enters_handler = false;
+        let mut uncaught = None;
+        for (id, edge) in semantics.successor_edges(point.id) {
+            match edge.kind {
+                ControlEdgeKind::SwitchCase => enters_handler = true,
+                ControlEdgeKind::Exceptional if uncaught.is_none() => uncaught = Some(id),
+                // A dispatcher has one uncaught edge; a second means another shape.
+                ControlEdgeKind::Exceptional => return None,
+                _ => {}
+            }
+        }
+        uncaught
+            .filter(|_| enters_handler)
+            .map(|uncaught| (point, uncaught))
+    })
+}
+
+/// Whether [`uncaught_edges_of_total_handlers`] has a point to examine.
+pub(crate) fn has_handler_dispatcher_candidate(semantics: &ProcedureSemantics) -> bool {
+    handler_dispatcher_candidates(semantics).next().is_some()
+}
+
+/// The uncaught-exception edge of every `try` statement in `semantics` that
+/// has a catch clause for `java.lang.Throwable`, in ascending order.
+///
+/// `syntax` is the exact tree of `file` the procedure was lowered from. A
+/// dispatcher whose syntax is not an exact `try` statement, and a catch type
+/// that does not provably resolve to `java.lang.Throwable`, keep their edge.
+/// A catch clause for `Exception` keeps it too, because an `Error` passes it.
+pub(crate) fn uncaught_edges_of_total_handlers(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    syntax: &PreparedSyntaxTree,
+    semantics: &ProcedureSemantics,
+) -> Vec<ControlEdgeId> {
+    let root = syntax.tree().root_node();
+    let mut source = None;
+    let mut infeasible = Vec::new();
+    for (point, uncaught) in handler_dispatcher_candidates(semantics) {
+        let Some(mapping) = semantics.source_mapping(point.source) else {
+            continue;
+        };
+        if mapping.kind != SourceMappingKind::Exact {
+            continue;
+        }
+        let span = mapping.locator.anchor().span();
+        let Some(statement) = root
+            .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
+        else {
+            continue;
+        };
+        if source_span_for_node(statement) != span
+            || !matches!(
+                statement.kind(),
+                "try_statement" | "try_with_resources_statement"
+            )
+        {
+            continue;
+        }
+        if catches_every_throwable(analyzer, file, syntax, &mut source, statement) {
+            infeasible.push(uncaught);
+        }
+    }
+    infeasible.sort_unstable();
+    infeasible
+}
+
+/// Whether one catch clause of the `try` statement `statement` names
+/// `java.lang.Throwable`, alone or as a multi-catch alternative.
+fn catches_every_throwable(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    syntax: &PreparedSyntaxTree,
+    source: &mut Option<Arc<str>>,
+    statement: Node<'_>,
+) -> bool {
+    let mut cursor = statement.walk();
+    let mut written_types = Vec::new();
+    for clause in statement.named_children(&mut cursor) {
+        if clause.kind() != "catch_clause" {
+            continue;
+        }
+        let mut cursor = clause.walk();
+        for parameter in clause.named_children(&mut cursor) {
+            if parameter.kind() != "catch_formal_parameter" {
+                continue;
+            }
+            let mut cursor = parameter.walk();
+            for catch_type in parameter.named_children(&mut cursor) {
+                if catch_type.kind() != "catch_type" {
+                    continue;
+                }
+                let mut cursor = catch_type.walk();
+                written_types.extend(
+                    catch_type
+                        .named_children(&mut cursor)
+                        .filter(|child| !child.is_extra()),
+                );
+            }
+        }
+    }
+    written_types.into_iter().any(|written| {
+        // Java has no import alias, so only a type whose last identifier is
+        // `Throwable` can resolve to `java.lang.Throwable`. The name selects
+        // which types to resolve; the resolver decides what they are.
+        let name = match written.kind() {
+            "type_identifier" => Some(written),
+            "scoped_type_identifier" => {
+                let mut cursor = written.walk();
+                written.named_children(&mut cursor).last()
+            }
+            _ => None,
+        };
+        if name.and_then(|name| syntax.source().get(name.byte_range())) != Some("Throwable") {
+            return false;
+        }
+        let source = source.get_or_insert_with(|| Arc::from(syntax.source()));
+        matches!(
+            resolve_type_at(analyzer, file, source, written),
+            TypeResolution::JavaLang("Throwable")
+        )
+    })
+}
 
 /// Whether the call whose source mapping spans `call` provably cannot throw an
 /// exception the catch parameter whose name spans `catch_parameter` catches.

@@ -6,6 +6,8 @@
 //! (#4438); hosts install a released packs bundle.
 
 #[cfg(feature = "download")]
+pub mod approval;
+#[cfg(feature = "download")]
 pub mod download;
 #[cfg(any(feature = "release-tooling", feature = "download"))]
 pub mod release_bundle;

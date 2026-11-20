@@ -62,6 +62,7 @@ struct Preparation {
 }
 
 impl PythonRules<'_, '_, '_> {
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub(super) fn registry_import_roots(&self, ordinal: u32, site: u32) -> Result<Vec<ImportRoot>> {
         let mount = self
             .ready
@@ -162,6 +163,7 @@ impl PythonRules<'_, '_, '_> {
         Ok(state)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn read_registry_state(&self, container: &str) -> Result<ModuleState> {
         let (ordinal, blob, rows) = match self.module_bindings(container)? {
             Read::Ready {
@@ -347,6 +349,7 @@ impl PythonRules<'_, '_, '_> {
             .is_some_and(|latest| *latest > point)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn build_initialization(&self, blob: i64, rows: &PythonBindingRows) -> Result<Initialization> {
         let connection = self.ready.inventory.connection();
         let references = connection.prepare_cached(
@@ -675,6 +678,7 @@ impl PythonRules<'_, '_, '_> {
             .contains_key(endpoint)
     }
 
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     fn registry_children(&self, container: &str, name: &str) -> Result<Vec<String>> {
         let key = (container.to_owned(), name.to_owned());
         if let Some(children) = self.module_registry.children.borrow().get(&key).cloned() {
@@ -955,6 +959,7 @@ impl PythonRules<'_, '_, '_> {
 
 // Reflective mutations in a deferred invocation belong on the query ledger,
 // independently of whether initialization can bind the original module exactly.
+#[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
 pub(in crate::analyzer::store::resolution_operation) fn deferred_registry_obligation(
     ready: &ReadySelectedResolution<'_, '_>,
     summary: i64,

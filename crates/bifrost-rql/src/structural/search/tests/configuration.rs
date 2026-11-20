@@ -55,11 +55,11 @@ fn assert_scoped_configuration_path(
 fn diagnostic_with_code(
     result: &CodeQueryResult,
     code: CodeQueryDiagnosticCode,
-) -> &CodeQueryDiagnostic {
+) -> DiagnosticRef<'_> {
     result
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == code)
+        .find(|diagnostic| diagnostic.code() == code)
         .unwrap_or_else(|| panic!("missing diagnostic {code:?}: {:?}", result.diagnostics))
 }
 
@@ -83,7 +83,7 @@ fn assert_seed_reports_row_budget_and_cancellation(
             &bounded,
             CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
         )
-        .impact,
+        .impact(),
         CodeQueryDiagnosticImpact::Incomplete
     );
 
@@ -104,7 +104,7 @@ fn assert_seed_reports_row_budget_and_cancellation(
         cancelled
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete),
+            .any(|diagnostic| diagnostic.impact() == CodeQueryDiagnosticImpact::Incomplete),
         "{:?}",
         cancelled.diagnostics
     );
@@ -153,8 +153,8 @@ fn malformed_json_preserves_recovered_rows_as_incomplete() {
     assert_eq!(rows[0].completeness, "incomplete");
     let diagnostic =
         diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial);
-    assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
-    assert!(diagnostic.message.contains("partly recovered"));
+    assert_eq!(diagnostic.impact(), CodeQueryDiagnosticImpact::Incomplete);
+    assert!(diagnostic.message().contains("partly recovered"));
 }
 
 #[test]
@@ -549,10 +549,10 @@ fn rejected_toml_documents_report_a_typed_gap_instead_of_a_clean_empty() {
         );
         let diagnostic =
             diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial);
-        assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+        assert_eq!(diagnostic.impact(), CodeQueryDiagnosticImpact::Incomplete);
         assert!(
-            diagnostic.message.contains("config.toml")
-                && diagnostic.message.contains("malformed syntax"),
+            diagnostic.message().contains("config.toml")
+                && diagnostic.message().contains("malformed syntax"),
             "{diagnostic:?}"
         );
     }
@@ -760,10 +760,10 @@ fn yaml_recovered_multi_document_and_empty_files_report_typed_gaps() {
     );
     let diagnostic =
         diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial);
-    assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+    assert_eq!(diagnostic.impact(), CodeQueryDiagnosticImpact::Incomplete);
     assert!(
-        diagnostic.message.contains("compose.yaml")
-            && diagnostic.message.contains("malformed syntax"),
+        diagnostic.message().contains("compose.yaml")
+            && diagnostic.message().contains("malformed syntax"),
         "{diagnostic:?}"
     );
 
@@ -783,7 +783,7 @@ fn yaml_recovered_multi_document_and_empty_files_report_typed_gaps() {
     let diagnostic =
         diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial);
     assert!(
-        diagnostic.message.contains("unsupported construct"),
+        diagnostic.message().contains("unsupported construct"),
         "{diagnostic:?}"
     );
 
@@ -794,7 +794,7 @@ fn yaml_recovered_multi_document_and_empty_files_report_typed_gaps() {
     let result = configuration_result(&workspace, &["host"], &["yaml"]);
     assert!(configuration_rows(&result).is_empty());
     assert_eq!(
-        diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial).impact,
+        diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial).impact(),
         CodeQueryDiagnosticImpact::Incomplete
     );
 }
@@ -922,7 +922,7 @@ fn json_document_root_cardinality_reaches_the_query_surface() {
         let result = configuration_result(&workspace, &["host"], &["json"]);
         let diagnostic =
             diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial);
-        assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+        assert_eq!(diagnostic.impact(), CodeQueryDiagnosticImpact::Incomplete);
         assert!(
             configuration_rows(&result)
                 .iter()
@@ -999,8 +999,8 @@ fn one_execution_ingests_each_configuration_document_once() {
     let mut branches = result
         .diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial)
-        .map(|diagnostic| diagnostic.branch.clone())
+        .filter(|diagnostic| diagnostic.code() == CodeQueryDiagnosticCode::SemanticAnalysisPartial)
+        .map(|diagnostic| diagnostic.branch().to_vec())
         .collect::<Vec<_>>();
     branches.sort();
     assert_eq!(branches, [vec![0], vec![1]], "{:?}", result.diagnostics);
@@ -1091,7 +1091,7 @@ fn properties_key_filter_returns_exact_entries_and_excludes_near_misses() {
         expanded_route
             .diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.impact != CodeQueryDiagnosticImpact::Incomplete),
+            .all(|diagnostic| diagnostic.impact() != CodeQueryDiagnosticImpact::Incomplete),
         "{:?}",
         expanded_route.diagnostics
     );
@@ -1127,10 +1127,10 @@ fn malformed_properties_escapes_report_a_typed_gap_with_surviving_rows() {
     assert_eq!(rows[0].completeness, "incomplete");
     let diagnostic =
         diagnostic_with_code(&result, CodeQueryDiagnosticCode::SemanticAnalysisPartial);
-    assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+    assert_eq!(diagnostic.impact(), CodeQueryDiagnosticImpact::Incomplete);
     assert!(
-        diagnostic.message.contains("application.properties")
-            && diagnostic.message.contains("malformed syntax"),
+        diagnostic.message().contains("application.properties")
+            && diagnostic.message().contains("malformed syntax"),
         "{diagnostic:?}"
     );
 }
@@ -1338,7 +1338,7 @@ fn yaml_near_miss_axes_return_no_rows_and_stay_complete() {
             result
                 .diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.impact != CodeQueryDiagnosticImpact::Incomplete),
+                .all(|diagnostic| diagnostic.impact() != CodeQueryDiagnosticImpact::Incomplete),
             "{axis}: {:?}",
             result.diagnostics
         );
@@ -1477,7 +1477,7 @@ fn configuration_seed_reports_budget_and_cancellation_rather_than_clean_rows() {
             &capped,
             CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
         )
-        .impact,
+        .impact(),
         CodeQueryDiagnosticImpact::Incomplete
     );
 

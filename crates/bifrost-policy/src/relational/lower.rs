@@ -25,7 +25,12 @@ use super::ir::{
     query_schema,
 };
 use super::validate::RelationalAssertionPlanError;
-use brokk_bifrost_rql::DomainKind;
+
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryRowField};
+use brokk_bifrost_rql::{
+    CodeQueryPlan, DomainKind, QueryRowLiteral, QueryRowPredicate, QueryRowPredicateOp,
+    QueryRowPredicateOperand, QueryStep,
+};
 
 /// One name the plan can still address, and the relation it currently stands
 /// for.
@@ -65,10 +70,12 @@ fn lower_bindings(
                     }
                 })?;
                 let schema = query_schema(&name, &fields);
+                let undecided_selections = undecided_selections(&name, query, &fields)?;
                 (
                     IrRelationOp::Source {
                         binding: binding.name.clone(),
                         schema: schema.clone(),
+                        undecided_selections,
                     },
                     schema,
                     kind.domain_kind(),
@@ -92,6 +99,118 @@ fn lower_bindings(
     }
 
     Ok((relations, slots))
+}
+
+/// The `(field, label)` pairs where a `filter` over the binding's whole row
+/// set names, with `eq` or `in`, a label that is undecided in that field's
+/// domain. Each field is given under every name the binding's terminal rows
+/// carry it, after projections; `fields` is that visible terminal schema.
+/// Sorted.
+///
+/// The field and its domain are read from the schema at the filter's own step,
+/// so a projection before the filter is accounted for. A filter inside a union
+/// branch or another nested query that names an undecided label is rejected:
+/// its selection would apply only to some of the binding's rows, and a row
+/// cannot tell which branch produced it. A projection after the filter that
+/// drops the selected field is rejected too, since the selected undecided row
+/// could no longer be told from a decided one. Either way the alternative would
+/// publish an undecided row as a definite finding.
+fn undecided_selections(
+    binding: &str,
+    query: &CodeQuery,
+    fields: &[(String, CodeQueryRowField)],
+) -> Result<Vec<(String, String)>, RelationalAssertionPlanError> {
+    let invalid = |message: String| RelationalAssertionPlanError::InvalidQuery {
+        binding: binding.to_owned(),
+        message,
+    };
+    let mut selections = Vec::new();
+    for (index, step) in query.plan.steps.iter().enumerate() {
+        let QueryStep::Filter(predicates) = step else {
+            continue;
+        };
+        for (field, label) in undecided_labels(query, &query.plan, index, predicates) {
+            let visible = fields
+                .iter()
+                .filter(|(_, visible)| visible.name == field.name)
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            if visible.is_empty() {
+                return Err(invalid(format!(
+                    "the filter selects the undecided label `{label}` of `{0}`, but a projection \
+                     removes `{0}` from the rows, so a selected undecided row could not be told \
+                     from a decided one; keep `{0}` in the projection",
+                    field.name
+                )));
+            }
+            selections.extend(visible.into_iter().map(|name| (name, label.clone())));
+        }
+    }
+    let mut nested = query.plan.source.child_plans();
+    while let Some(plan) = nested.pop() {
+        for (index, step) in plan.steps.iter().enumerate() {
+            let QueryStep::Filter(predicates) = step else {
+                continue;
+            };
+            if let Some((field, label)) = undecided_labels(query, plan, index, predicates).first() {
+                return Err(invalid(format!(
+                    "a filter inside a nested query selects the undecided label `{label}` of \
+                     `{}`, which would make only that branch's rows possible findings; select \
+                     undecided labels in a filter over the binding's whole row set",
+                    field.name
+                )));
+            }
+        }
+        nested.extend(plan.source.child_plans());
+    }
+    selections.sort();
+    selections.dedup();
+    Ok(selections)
+}
+
+/// The fields and labels `predicates`, the filter at `steps[index]` of `plan`,
+/// names with `eq` or `in` where the label is undecided in the field's domain.
+/// Each field is the native field the filter reads, resolved from the schema of
+/// the rows that reach the filter, so projections before it are accounted for.
+fn undecided_labels(
+    query: &CodeQuery,
+    plan: &CodeQueryPlan,
+    index: usize,
+    predicates: &[QueryRowPredicate],
+) -> Vec<(CodeQueryRowField, String)> {
+    let mut prefix = query.clone();
+    prefix.plan = CodeQueryPlan {
+        source: plan.source.clone(),
+        steps: plan.steps[..index].to_vec(),
+    };
+    let (_, schema) = prefix
+        .validate_row_fields()
+        .expect("the rows reaching a filter of a validated query form a validated query");
+    let mut labels = Vec::new();
+    for predicate in predicates {
+        let literals = match (predicate.op, &predicate.operand) {
+            (QueryRowPredicateOp::Eq, QueryRowPredicateOperand::Literal(literal)) => {
+                std::slice::from_ref(literal)
+            }
+            (QueryRowPredicateOp::In, QueryRowPredicateOperand::Set(literals)) => {
+                literals.as_slice()
+            }
+            _ => continue,
+        };
+        let Some((_, field)) = schema.iter().find(|(name, _)| *name == predicate.field) else {
+            continue;
+        };
+        for literal in literals {
+            if let QueryRowLiteral::ConstrainedEnum(label) = literal
+                && field
+                    .value_domain
+                    .is_some_and(|domain| domain.is_undecided(label))
+            {
+                labels.push((*field, label.clone()));
+            }
+        }
+    }
+    labels
 }
 
 fn lower_joins(

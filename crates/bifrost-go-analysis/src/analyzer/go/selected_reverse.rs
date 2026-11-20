@@ -2189,6 +2189,10 @@ func Use(value api.Client, httpClient *Client) {}
     #[brokk_bifrost_test_macros::hardwon(
         "#5197: a file in both a package unit and its test variant sent one demand root twice"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
+    )]
     fn selected_go_reverse_shares_forward_answers_with_test_variants() {
         use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
 
@@ -2265,6 +2269,10 @@ func Use(value api.Client, httpClient *Client) {}
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "75d62428435a: method usages repeated point confirmation for package test variants"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#12820: non-answer (writer, schema, GC or diagnostics); must not produce answers"
     )]
     fn selected_go_reverse_batches_unknown_members_once_per_physical_file() {
         use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;

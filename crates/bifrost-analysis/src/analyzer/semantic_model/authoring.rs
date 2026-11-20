@@ -92,7 +92,8 @@ pub fn register_workspace_semantic_models(
             toolchain: None,
             target: None,
             configuration: Some(compiled.manifest.pack_id.clone()),
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         });
         registration.models.push(RegisteredWorkspaceSemanticModel {
             path: file.path,

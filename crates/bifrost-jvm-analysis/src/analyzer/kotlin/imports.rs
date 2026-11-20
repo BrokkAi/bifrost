@@ -463,7 +463,7 @@ mod tests {
         let outer_scope = AnalyzerQueryScope::new(&java);
         let outer = java
             .inner()
-            .active_query_request_memo::<AtomicUsize>()
+            .active_query_bookkeeping_slot::<AtomicUsize>()
             .unwrap();
         outer.store(19, Ordering::Relaxed);
         for iteration in 0..4 {
@@ -485,7 +485,7 @@ mod tests {
                 );
                 let own = java
                     .inner()
-                    .active_query_request_memo::<AtomicUsize>()
+                    .active_query_bookkeeping_slot::<AtomicUsize>()
                     .unwrap();
                 // Fills started in one request share one retained domain,
                 // apart from the request's ordinary domain (#8191).

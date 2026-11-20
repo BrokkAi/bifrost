@@ -1080,7 +1080,7 @@ pub fn inventory_evidence(
         toolchain: evidence.toolchain.as_ref().map(inventory_coordinate),
         target: evidence.target.clone(),
         configuration: evidence.configuration.clone(),
-        artifact_sha256: evidence.artifact_sha256.clone(),
+        artifact_sha256: evidence.single_raw_sha256(),
     }
 }
 

@@ -245,24 +245,10 @@ pub(super) fn schema_sql() -> &'static str {
 }
 
 fn admission_schema_sql() -> String {
-    let stage = STAGE_SCHEMA_SQL.replace(
+    STAGE_SCHEMA_SQL.replace(
         "{manifest_count}",
         &RESOLUTION_MANIFEST_COUNT_COLUMNS.len().to_string(),
-    );
-    format!("{stage}{}", admission_count_projection_sql())
-}
-
-// The descriptor is the sole ordinal contract for both admission comparisons.
-fn admission_count_projection_sql() -> &'static str {
-    static SQL: OnceLock<String> = OnceLock::new();
-    SQL.get_or_init(|| {
-        let names = RESOLUTION_MANIFEST_COUNT_COLUMNS
-            .iter()
-            .map(|column| format!("'{column}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("CREATE TEMP VIEW IF NOT EXISTS selected_resolution_admission_count_projection AS SELECT admission.admission_id, family.key AS family, family.value AS family_name, actual.value AS count, actual.type AS count_type FROM temp.selected_resolution_admissions admission JOIN json_each(admission.manifest_counts) actual JOIN json_each(json_array({names})) family ON family.key=actual.key;")
-    })
+    )
 }
 
 pub(super) fn generic_formals_schema_sql() -> &'static str {
@@ -403,6 +389,7 @@ impl<'selection, 'store> SelectedResolutionStage<'selection, 'store> {
             drop(runtime);
             assert_eq!(assigned.lexical().fragment(), assigned.typed().fragment());
             assert_eq!(assigned.lexical().language(), assigned.typed().language());
+            assert_eq!(assigned.typed().language(), host.semantic_language(), "staged facts retain their host's producer language");
             assert_eq!(assigned.lexical().fragment(), assigned.identities().fragment());
             assert_eq!(assigned.identities().fragment().ordinal(), host.ordinal().get());
             let Some(coordinates) = coordinates::PreparedStageCoordinates::new(assigned.identities(), &assigned.common().root_import_provenance, cancellation) else {
@@ -568,14 +555,24 @@ fn insert_admission(
     Ok(Some(admission))
 }
 
+// Both arrays use RESOLUTION_MANIFEST_COUNT_COLUMNS order. Shape, length and
+// element-type checks make each ordinal an exact family comparison. Keep the
+// array read correlated to this admission: a view over all admissions can be
+// materialized in full by the revalidation query (#14201).
+pub(super) const ADMISSION_COUNTS_MATCH_SQL: &str = "SELECT json_valid(manifest_counts,8)=1 AND json_type(manifest_counts)='array' AND json_array_length(manifest_counts)=?3 AND NOT EXISTS(SELECT 1 FROM json_each(?2) expected LEFT JOIN json_each(manifest_counts) actual ON actual.key=expected.key WHERE actual.type IS NOT 'integer' OR actual.value < 0 OR actual.value IS NOT expected.value) FROM temp.selected_resolution_admissions WHERE admission_id=?1";
+
 fn admission_counts_match(
     connection: &Connection,
     admission: i64,
     counts_json: &str,
 ) -> Result<bool> {
     Ok(connection.query_row(
-        "SELECT json_valid(manifest_counts,8)=1 AND json_type(manifest_counts)='array' AND json_array_length(manifest_counts)=?3 AND (SELECT COUNT(*) FROM temp.selected_resolution_admission_count_projection WHERE admission_id=?1)=?3 AND NOT EXISTS(SELECT 1 FROM json_each(?2) expected LEFT JOIN temp.selected_resolution_admission_count_projection actual ON actual.admission_id=?1 AND actual.family=expected.key WHERE actual.count_type IS NOT 'integer' OR actual.count < 0 OR actual.count IS NOT expected.value) FROM temp.selected_resolution_admissions WHERE admission_id=?1",
-        params![admission, counts_json, RESOLUTION_MANIFEST_COUNT_COLUMNS.len()],
+        ADMISSION_COUNTS_MATCH_SQL,
+        params![
+            admission,
+            counts_json,
+            RESOLUTION_MANIFEST_COUNT_COLUMNS.len()
+        ],
         |row| row.get(0),
     )?)
 }
@@ -594,15 +591,23 @@ fn validate_admission(
     admission: i64,
     cancellation: &CancellationToken,
 ) -> Result<SelectedResolutionRevalidationOutcome> {
+    let parameters: [&dyn rusqlite::ToSql; 1] = [&admission];
+    validate_admission_rows(
+        connection,
+        single_admission_validation_sql(),
+        &parameters,
+        cancellation,
+    )
+}
+
+pub(super) fn single_admission_validation_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
-    let sql = SQL.get_or_init(|| {
+    SQL.get_or_init(|| {
         let sql = format!("WITH requested_admissions AS (SELECT * FROM temp.selected_resolution_admissions WHERE admission_id=?1) {}", admission_validation_body());
         #[cfg(any(test, feature = "test-support"))]
         crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(6, sql.capacity());
         sql
-    });
-    let parameters: [&dyn rusqlite::ToSql; 1] = [&admission];
-    validate_admission_rows(connection, sql, &parameters, cancellation)
+    })
 }
 
 fn validate_admission_rows(
@@ -663,7 +668,7 @@ fn validation_outcome(
     }))
 }
 
-fn admission_validation_sql() -> &'static str {
+pub(super) fn admission_validation_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
     SQL.get_or_init(|| {
         let sql = {
@@ -682,7 +687,7 @@ fn admission_validation_body() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
     SQL.get_or_init(|| {
         let sql = {
-        let counts = RESOLUTION_MANIFEST_COUNT_COLUMNS.iter().map(|column| format!("json_array('{column}',manifest.{column})")).collect::<Vec<_>>().join(",");
+        let counts = RESOLUTION_MANIFEST_COUNT_COLUMNS.iter().map(|column| format!("manifest.{column}")).collect::<Vec<_>>().join(",");
         format!(r#"
 SELECT admission.storage_language,
  CASE WHEN COALESCE(epoch.generation,0) IS NOT admission.generation THEN 1
@@ -719,12 +724,10 @@ WHERE COALESCE(epoch.generation,0) IS NOT admission.generation
  OR json_valid(admission.manifest_counts,8) IS NOT 1
  OR json_type(admission.manifest_counts) IS NOT 'array'
  OR json_array_length(admission.manifest_counts) IS NOT {count}
- OR (SELECT COUNT(*) FROM temp.selected_resolution_admission_count_projection c WHERE c.admission_id=admission.admission_id)<>{count}
  OR EXISTS(SELECT 1 FROM json_each(json_array({counts})) actual
- LEFT JOIN temp.selected_resolution_admission_count_projection expected
-   ON expected.admission_id=admission.admission_id AND expected.family=actual.key
- WHERE expected.count_type IS NOT 'integer' OR expected.count < 0
-    OR expected.family_name IS NOT actual.value->>0 OR expected.count IS NOT actual.value->>1)
+ LEFT JOIN json_each(admission.manifest_counts) expected ON expected.key=actual.key
+ WHERE expected.type IS NOT 'integer' OR expected.value < 0
+    OR expected.value IS NOT actual.value)
 LIMIT 1
 "#, count=RESOLUTION_MANIFEST_COUNT_COLUMNS.len())
     };
@@ -736,10 +739,12 @@ LIMIT 1
 
 #[cfg(test)]
 mod admission_count_tests {
+    use super::super::planner_statistics::pinned_plans::{pinned, plan_rows};
     use super::*;
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use brokk_bifrost_test_macros::hardwon;
 
-    #[test]
-    fn packed_counts_preserve_admission_validation_and_refuse_malformed_values() {
+    fn fixture(admissions: i64) -> (Connection, Vec<i64>) {
         let connection = Connection::open_in_memory().unwrap();
         let columns = RESOLUTION_MANIFEST_COUNT_COLUMNS.join(",");
         let definitions = RESOLUTION_MANIFEST_COUNT_COLUMNS
@@ -747,170 +752,269 @@ mod admission_count_tests {
             .map(|name| format!("{name} INTEGER NOT NULL"))
             .collect::<Vec<_>>()
             .join(",");
+        // Preserve the production join keys; unindexed fixture tables would
+        // confound admission-array work with unrelated full-table joins.
         connection.execute_batch(&format!(
-            "CREATE TABLE analysis_epochs(lang TEXT,generation INTEGER);
-             CREATE TABLE resolution_producer_epochs(lang TEXT,producer_epoch TEXT);
-             CREATE TABLE workspace_revisions(workspace_id TEXT,lang TEXT,generation INTEGER,revision INTEGER);
-             CREATE TABLE workspace_resolution_content_roots(workspace_id TEXT,lang TEXT,generation INTEGER,revision INTEGER,blob_id INTEGER);
-             CREATE TABLE blobs(id INTEGER,blob_oid TEXT,lang TEXT,parse_variant BLOB,generation INTEGER);
-             CREATE TABLE resolution_fragment_interiors(blob_id INTEGER,publication_state TEXT,producer_epoch TEXT,interior_digest BLOB,logical_rows INTEGER,payload_bytes INTEGER,semantic_language TEXT,{definitions});
-             CREATE TABLE resolution_capsule_inputs(blob_id INTEGER,host_content_oid TEXT,invocation INTEGER,definition_content_oid TEXT,selected_declaration INTEGER,matched_arm_index INTEGER,producer_epoch TEXT,derivation_digest BLOB,checkpoint_digest BLOB,host_module_scope INTEGER);
+            "CREATE TABLE analysis_epochs(lang TEXT PRIMARY KEY,generation INTEGER) WITHOUT ROWID;
+             CREATE TABLE resolution_producer_epochs(lang TEXT PRIMARY KEY,producer_epoch TEXT) WITHOUT ROWID;
+             CREATE TABLE workspace_revisions(workspace_id TEXT,lang TEXT,generation INTEGER,revision INTEGER,PRIMARY KEY(workspace_id,lang,generation,revision)) WITHOUT ROWID;
+             CREATE TABLE workspace_resolution_content_roots(workspace_id TEXT,lang TEXT,generation INTEGER,revision INTEGER,blob_id INTEGER,PRIMARY KEY(workspace_id,lang,generation,revision,blob_id)) WITHOUT ROWID;
+             CREATE TABLE blobs(id INTEGER PRIMARY KEY,blob_oid TEXT,lang TEXT,parse_variant BLOB,generation INTEGER);
+             CREATE TABLE resolution_fragment_interiors(blob_id INTEGER PRIMARY KEY,publication_state TEXT,producer_epoch TEXT,interior_digest BLOB,logical_rows INTEGER,payload_bytes INTEGER,semantic_language TEXT,{definitions});
+             CREATE TABLE resolution_capsule_inputs(blob_id INTEGER PRIMARY KEY,host_content_oid TEXT,invocation INTEGER,definition_content_oid TEXT,selected_declaration INTEGER,matched_arm_index INTEGER,producer_epoch TEXT,derivation_digest BLOB,checkpoint_digest BLOB,host_module_scope INTEGER);
              INSERT INTO analysis_epochs VALUES('rust',1);
              INSERT INTO resolution_producer_epochs VALUES('rust','e');
              INSERT INTO workspace_revisions VALUES('w','rust',1,1);
-             INSERT INTO workspace_resolution_content_roots VALUES('w','rust',1,1,1);
-             INSERT INTO blobs VALUES(1,'oid','rust',x'',1);
-             CREATE TEMP TABLE old_counts(admission_id INTEGER,family INTEGER,family_name TEXT,count INTEGER);
-             {}",
-            admission_schema_sql()
+             {}", admission_schema_sql()
         )).unwrap();
-        let mut counts = vec![0_i64; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()];
-        counts[35] = 3;
+        // Distinct ordinals detect reorder/duplicate mistakes, including zero
+        // and the largest SQLite integer without a floating-point conversion.
+        let mut counts = (0..RESOLUTION_MANIFEST_COUNT_COLUMNS.len() as i64).collect::<Vec<_>>();
+        *counts.last_mut().unwrap() = i64::MAX;
+        let packed = serde_json::to_string(&counts).unwrap();
         let values = counts
             .iter()
             .map(i64::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        connection.execute_batch(&format!(
-            "INSERT INTO resolution_fragment_interiors(blob_id,publication_state,producer_epoch,interior_digest,logical_rows,payload_bytes,semantic_language,{columns}) VALUES(1,'complete','e',zeroblob(32),0,0,'rust',{values});"
-        )).unwrap();
-        let packed = serde_json::to_string(&counts).unwrap();
-        connection.execute(
-            "INSERT INTO temp.selected_resolution_admissions(workspace_id,storage_language,generation,revision,blob_id,blob_oid,manifest_digest,manifest_counts,producer_epoch,logical_rows,payload_bytes,input_kind,semantic_language) VALUES('w','rust',1,1,1,'oid',zeroblob(32),jsonb(?1),'e',0,0,0,'rust')",
-            [&packed],
-        ).unwrap();
-        for (family, (&family_name, &count)) in RESOLUTION_MANIFEST_COUNT_COLUMNS
-            .iter()
-            .zip(&counts)
-            .enumerate()
-        {
+        for id in 1..=admissions {
             connection
                 .execute(
-                    "INSERT INTO old_counts VALUES(1,?1,?2,?3)",
-                    params![family, family_name, count],
+                    "INSERT INTO workspace_resolution_content_roots VALUES('w','rust',1,1,?1)",
+                    [id],
                 )
                 .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blobs VALUES(?1,?2,'rust',x'',1)",
+                    params![id, format!("oid{id}")],
+                )
+                .unwrap();
+            connection.execute(&format!("INSERT INTO resolution_fragment_interiors(blob_id,publication_state,producer_epoch,interior_digest,logical_rows,payload_bytes,semantic_language,{columns}) VALUES(?1,'complete','e',zeroblob(32),0,0,'rust',{values})"), [id]).unwrap();
+            connection.execute("INSERT INTO temp.selected_resolution_admissions(admission_id,workspace_id,storage_language,generation,revision,blob_id,blob_oid,manifest_digest,manifest_counts,producer_epoch,logical_rows,payload_bytes,input_kind,semantic_language) VALUES(?1,'w','rust',1,1,?1,?2,zeroblob(32),jsonb(?3),'e',0,0,0,'rust')", params![id, format!("oid{id}"), packed]).unwrap();
         }
-        let cancellation = CancellationToken::default();
-        let old_matches = |connection: &Connection| -> bool {
-            let manifest = RESOLUTION_MANIFEST_COUNT_COLUMNS
-                .iter()
-                .map(|name| format!("json_array('{name}',manifest.{name})"))
-                .collect::<Vec<_>>()
-                .join(",");
-            connection.query_row(&format!("SELECT (SELECT COUNT(*) FROM old_counts)=?1 AND NOT EXISTS(SELECT 1 FROM json_each(json_array({manifest})) durable LEFT JOIN old_counts prior ON prior.family=durable.key WHERE prior.family_name IS NOT durable.value->>0 OR prior.count IS NOT durable.value->>1) FROM resolution_fragment_interiors manifest"), [counts.len()], |row| row.get(0)).unwrap()
-        };
-        let current = || validate_admission(&connection, 1, &cancellation).unwrap();
-        assert!(old_matches(&connection));
-        assert!(admission_counts_match(&connection, 1, &packed).unwrap());
-        assert!(matches!(
-            current(),
-            SelectedResolutionRevalidationOutcome::Current
-        ));
-        assert!(matches!(
-            validate_admissions(&connection, &cancellation).unwrap(),
-            SelectedResolutionRevalidationOutcome::Current
-        ));
-        let projected = connection.prepare("SELECT family,family_name,count FROM temp.selected_resolution_admission_count_projection WHERE admission_id=1 ORDER BY family").unwrap().query_map([], |row| Ok((row.get::<_,usize>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        let old = connection
-            .prepare("SELECT family,family_name,count FROM old_counts ORDER BY family")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, usize>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(projected, old);
-        for &index in &[0, 35, RESOLUTION_MANIFEST_COUNT_COLUMNS.len() - 1] {
-            let column = RESOLUTION_MANIFEST_COUNT_COLUMNS[index];
-            connection
-                .execute(
-                    &format!("UPDATE resolution_fragment_interiors SET {column}={column}+1"),
-                    [],
-                )
-                .unwrap();
-            assert!(!old_matches(&connection));
-            assert!(matches!(
-                current(),
-                SelectedResolutionRevalidationOutcome::Stale(_)
-            ));
-            assert!(matches!(
-                validate_admissions(&connection, &cancellation).unwrap(),
-                SelectedResolutionRevalidationOutcome::Stale(_)
-            ));
-            connection
-                .execute(
-                    &format!("UPDATE resolution_fragment_interiors SET {column}={column}-1"),
-                    [],
-                )
-                .unwrap();
-        }
-        for malformed in [
-            "[]".to_owned(),
-            format!("[{values},0]"),
-            format!(
-                "[null,{}]",
-                counts[1..]
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            format!(
-                "[\"0\",{}]",
-                counts[1..]
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            format!(
-                "[-1,{}]",
-                counts[1..]
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            format!(
-                "[9223372036854775808,{}]",
-                counts[1..]
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        ] {
-            connection.execute_batch("SAVEPOINT malformed").unwrap();
-            let changed = connection.execute(
-                "UPDATE temp.selected_resolution_admissions SET manifest_counts=jsonb(?1)",
-                [&malformed],
+        (connection, counts)
+    }
+
+    #[test]
+    #[hardwon(
+        "#14201: local count comparisons must retain malformed and reordered admission refusals"
+    )]
+    fn packed_counts_preserve_admission_validation_and_refuse_malformed_values() {
+        for state in PlannerStatisticsState::BOTH {
+            let (connection, counts) = fixture(1);
+            state.install(&connection);
+            let packed = serde_json::to_string(&counts).unwrap();
+            let cancellation = CancellationToken::default();
+            let current = || validate_admission(&connection, 1, &cancellation).unwrap();
+            assert!(
+                admission_counts_match(&connection, 1, &packed).unwrap(),
+                "{state}"
             );
-            if changed.is_ok() {
-                assert!(!admission_counts_match(&connection, 1, &packed).unwrap());
-                assert!(
-                    matches!(current(), SelectedResolutionRevalidationOutcome::Stale(_)),
-                    "{malformed}"
+            assert_eq!(
+                current(),
+                SelectedResolutionRevalidationOutcome::Current,
+                "{state}"
+            );
+
+            let values = counts
+                .iter()
+                .map(|count| serde_json::json!(count))
+                .collect::<Vec<_>>();
+            let mut cases = Vec::new();
+            for (name, value) in [
+                ("mismatch", serde_json::json!(900)),
+                ("duplicate ordinal", serde_json::json!(counts[1])),
+                ("negative", serde_json::json!(-1)),
+                ("string", serde_json::json!("0")),
+                ("real", serde_json::json!(0.0)),
+                ("boolean", serde_json::json!(false)),
+                ("null", serde_json::Value::Null),
+                ("nested array", serde_json::json!([0])),
+                ("nested object", serde_json::json!({"count":0})),
+                (
+                    "overflow",
+                    serde_json::from_str("9223372036854775808").unwrap(),
+                ),
+            ] {
+                let mut changed = values.clone();
+                changed[0] = value;
+                cases.push((name, serde_json::to_string(&changed).unwrap(), true));
+            }
+            let mut reordered = values.clone();
+            reordered.swap(0, 35);
+            cases.extend([
+                (
+                    "reordered",
+                    serde_json::to_string(&reordered).unwrap(),
+                    true,
+                ),
+                (
+                    "missing",
+                    serde_json::to_string(&values[1..]).unwrap(),
+                    false,
+                ),
+                (
+                    "extra",
+                    serde_json::to_string(&[values.clone(), vec![serde_json::json!(0)]].concat())
+                        .unwrap(),
+                    false,
+                ),
+                ("object", "{}".to_owned(), false),
+                ("null array", "null".to_owned(), false),
+                ("invalid JSON", "[".to_owned(), false),
+            ]);
+            for (name, stored, accepted) in cases {
+                connection.execute_batch("SAVEPOINT malformed").unwrap();
+                let changed = connection.execute(
+                    "UPDATE temp.selected_resolution_admissions SET manifest_counts=jsonb(?1)",
+                    [&stored],
+                );
+                assert_eq!(changed.is_ok(), accepted, "{state}: {name}: {changed:?}");
+                if accepted {
+                    assert!(
+                        !admission_counts_match(&connection, 1, &packed).unwrap(),
+                        "{state}: {name}"
+                    );
+                    let stale = SelectedResolutionRevalidationOutcome::Stale(
+                        SelectedResolutionStale::MountInventoryChanged,
+                    );
+                    assert_eq!(current(), stale, "{state}: {name}");
+                    assert_eq!(
+                        validate_admissions(&connection, &cancellation).unwrap(),
+                        stale,
+                        "{state}: {name}"
+                    );
+                }
+                connection
+                    .execute_batch("ROLLBACK TO malformed; RELEASE malformed")
+                    .unwrap();
+                assert_eq!(
+                    current(),
+                    SelectedResolutionRevalidationOutcome::Current,
+                    "{state}: restored {name}"
                 );
             }
-            connection
-                .execute_batch("ROLLBACK TO malformed; RELEASE malformed")
-                .unwrap();
-            assert!(matches!(
-                current(),
-                SelectedResolutionRevalidationOutcome::Current
-            ));
+            assert!(
+                connection
+                    .execute(
+                        "UPDATE temp.selected_resolution_admissions SET manifest_counts=?1",
+                        [vec![0xff_u8]]
+                    )
+                    .is_err(),
+                "{state}: invalid JSONB"
+            );
+            for &index in &[0, 35, counts.len() - 1] {
+                let column = RESOLUTION_MANIFEST_COUNT_COLUMNS[index];
+                connection.execute_batch("SAVEPOINT drift").unwrap();
+                connection
+                    .execute(
+                        &format!("UPDATE resolution_fragment_interiors SET {column}=-1"),
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    current(),
+                    SelectedResolutionRevalidationOutcome::Stale(
+                        SelectedResolutionStale::MountInventoryChanged
+                    ),
+                    "{state}: {column}"
+                );
+                connection
+                    .execute_batch("ROLLBACK TO drift; RELEASE drift")
+                    .unwrap();
+            }
+            let cancelled = CancellationToken::default();
+            cancelled.cancel();
+            assert_eq!(
+                validate_admission(&connection, 1, &cancelled).unwrap(),
+                SelectedResolutionRevalidationOutcome::Cancelled,
+                "{state}"
+            );
+            assert_eq!(
+                validate_admissions(&connection, &cancelled).unwrap(),
+                SelectedResolutionRevalidationOutcome::Cancelled,
+                "{state}"
+            );
         }
-        let cancelled = CancellationToken::default();
-        cancelled.cancel();
-        assert!(matches!(
-            validate_admission(&connection, 1, &cancelled).unwrap(),
-            SelectedResolutionRevalidationOutcome::Cancelled
-        ));
+    }
+
+    #[test]
+    #[hardwon(
+        "#14201: revalidating one admission materialized every earlier admission count array"
+    )]
+    fn one_admission_validation_does_not_scan_other_admissions() {
+        for state in PlannerStatisticsState::BOTH {
+            let mut work = Vec::new();
+            for admissions in [1, 128] {
+                let (connection, counts) = fixture(admissions);
+                state.install(&connection);
+                let mut query = pinned("stage_single_admission_validation");
+                query.params[0] = Value::Integer(admissions);
+                let plan = plan_rows(&connection, &query).unwrap();
+                assert!(
+                    plan.iter().all(|row| !row.contains("MATERIALIZE")),
+                    "{state}, {admissions}: {plan:?}"
+                );
+                let mut statement = connection.prepare(&query.sql).unwrap();
+                assert!(
+                    statement
+                        .query(params_from_iter(&query.params))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .is_none(),
+                    "{state}, {admissions}"
+                );
+                let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+                work.push(steps);
+                eprintln!(
+                    "#14201 state={state} admissions={admissions} vm-steps={steps} plan={plan:?}"
+                );
+                let mut count_query = pinned("stage_admission_counts_match");
+                count_query.params[0] = Value::Integer(admissions);
+                count_query.params[1] = Value::Text(serde_json::to_string(&counts).unwrap());
+                let plan = plan_rows(&connection, &count_query).unwrap();
+                assert!(
+                    plan.iter().all(|row| !row.contains("MATERIALIZE")),
+                    "{state}, counts, {admissions}: {plan:?}"
+                );
+                assert!(
+                    connection
+                        .query_row(
+                            &count_query.sql,
+                            params_from_iter(&count_query.params),
+                            |row| row.get::<_, bool>(0)
+                        )
+                        .unwrap(),
+                    "{state}, {admissions}"
+                );
+                let cancellation = CancellationToken::default();
+                assert_eq!(
+                    validate_admissions(&connection, &cancellation).unwrap(),
+                    SelectedResolutionRevalidationOutcome::Current,
+                    "{state}, {admissions}"
+                );
+                if admissions > 1 {
+                    connection.execute("UPDATE temp.selected_resolution_admissions SET manifest_counts=jsonb_set(manifest_counts,'$[0]',-1) WHERE admission_id=1", []).unwrap();
+                    assert_eq!(
+                        validate_admission(&connection, admissions, &cancellation).unwrap(),
+                        SelectedResolutionRevalidationOutcome::Current,
+                        "{state}: unrelated admission"
+                    );
+                    assert_eq!(
+                        validate_admissions(&connection, &cancellation).unwrap(),
+                        SelectedResolutionRevalidationOutcome::Stale(
+                            SelectedResolutionStale::MountInventoryChanged
+                        ),
+                        "{state}: final validation still checks earlier admissions"
+                    );
+                }
+            }
+            assert!(
+                work[1] <= 2 * work[0],
+                "{state}: single-admission work grew with unrelated admissions: {work:?}"
+            );
+        }
     }
 }

@@ -51,6 +51,10 @@ pub(crate) mod parsed_tree;
 
 pub mod python_class_hierarchy;
 
+#[doc(hidden)]
+pub mod prepared_macro_source;
+pub mod rust_source;
+
 pub mod receiver_query;
 #[doc(hidden)]
 pub mod receiver_sites;

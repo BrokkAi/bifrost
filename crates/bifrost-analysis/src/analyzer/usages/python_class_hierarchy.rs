@@ -1,7 +1,7 @@
 //! Query-time Python class hierarchy facts using the ordered bases and C3.
 
 use crate::analyzer::semantic::type_flow::ClassIdentity;
-use crate::analyzer::semantic_model::{SemanticModelProvenance, TypeRef};
+use crate::analyzer::semantic_model::{FamilyOpen, SemanticModelProvenance, TypeRef};
 use crate::analyzer::{CapabilityProvider, CodeUnit};
 use crate::cancellation::CancellationToken;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ pub enum PythonHierarchyReason {
     ExternalBase,
     ImplicitGenericUndecidedSourceBase,
     ImplicitGenericUndecidedFactory,
+    ModelCatalogOpen(FamilyOpen),
     MissingRuntimeBases,
     ConflictingRuntimeBases,
     AmbiguousRuntimeBase,
@@ -55,6 +56,7 @@ impl PythonHierarchyReason {
             Self::ExternalBase => "external_base",
             Self::ImplicitGenericUndecidedSourceBase => "implicit_generic_undecided_source_base",
             Self::ImplicitGenericUndecidedFactory => "implicit_generic_undecided_factory",
+            Self::ModelCatalogOpen(_) => "model_catalog_open",
             Self::MissingRuntimeBases => "missing_runtime_bases",
             Self::ConflictingRuntimeBases => "conflicting_runtime_bases",
             Self::AmbiguousRuntimeBase => "ambiguous_runtime_base",

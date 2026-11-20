@@ -478,6 +478,7 @@ ORDER BY v.rel_path,v.input_kind";
 
 impl AnalyzerStore {
     /// Select the live summary for one exact snapshot and environment profile.
+    #[expect(clippy::disallowed_methods, reason = "#12820: unmigrated answer read")]
     pub fn python_selected_summary(
         &self,
         snapshot: &WorkspaceSnapshotId,

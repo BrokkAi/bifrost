@@ -47,13 +47,18 @@ failure, and interrupted writers leave an unusable candidate. Readers select
 only committed facts marked complete in the active analysis generation.
 
 For Rust, the lowered semantic IR and each procedure's partial flows are
-content facts as well. They are written in the blob's parse transaction under
-a publication head and a semantic producer epoch, and they depend on nothing
-outside the file. A blob without a current publication is reparsed by the
+content facts as well. The first parse writes them in the blob's transaction
+under a publication head and a semantic producer epoch. They depend on nothing
+outside the file. A later resolution or semantic IR producer upgrade replaces
+only its derived products, preserving healthy canonical source facts and their
+publication identity. A blob without a current publication is reparsed by the
 startup reconcile. Until then, and for unsaved overlays, the artifact is
 lowered on demand in memory, and that lowering writes no rows. The
 byte-capped semantic artifact cache holds complete artifacts of both kinds:
-decoded from rows or lowered on demand. The [Dataflow
+decoded from rows or lowered on demand. If an actual source decoder detects
+corruption, it withdraws only the exact publication it read. A concurrent newer
+repair survives that withdrawal, and ordinary synchronization repairs missing
+or withdrawn source. The [Dataflow
 Engine](../dataflow-engine/#composed-taint-over-stored-partial-flows) chapter
 describes what the rows contain and how taint queries compose them.
 
@@ -149,6 +154,17 @@ demand-scoped revalidation. Changed output recomputes demanded parents, while
 equal output only rebinds evidence; incomplete, corrupt, cancelled, or
 over-budget reuse falls back to a fresh witness-capable solve.
 
+Rust usage-walk memory distinguishes in-flight work from a settled fixed point
+whose evidence remains open. A settled-open entry carries typed gap reasons
+and is reusable only in its analyzer generation under an exactly matching,
+currently validated live reader binding. A hit replays its read dependencies,
+refusal channels and completion before exposing the value. Each alias selects
+its own reachable evidence from one shared immutable graph; a closed alias
+therefore does not inherit an independent sibling's gap. Closed-only consumers
+require a closed projection. Failed, cancelled and unfinished walks retain no
+entry, and caller-held values keep their shared allocation charged until their
+last holder drops.
+
 #### Required process memory
 
 Independent services in one process can have separate retention allowances. Each
@@ -165,6 +181,30 @@ computed values without retaining them; indexing and queries continue.
 Caller-held allocations remain accounted until their last holder releases
 them. Request working memory and allocator overhead remain separate from the
 retained-allocation allowance.
+
+#### Retained site presentation
+
+Call-site presentation admits its new text, decoded values and demand bookkeeping
+against the existing analyzer retention owner before copying. Structural lookup
+opens one demanded file window at a time and releases its facts before moving
+to the next file. It keeps compact demanded projections rather than a render-pass
+map of full facts and every node span. Provider-owned facts keep their existing
+accounting while a window holds them; the renderer does not charge that backing
+again or memoize facts whose provider admission was refused.
+
+Presentation examines the generation's selected bytes before applying the
+source text byte limit. It derives requested values from those bytes or from
+coherent held facts, and releases acquired facts at the end of each file window.
+Conflicting source identities cause the engine to withhold the unpublished batch
+with a snapshot diagnostic. Scalar predicates, provenance references and policy
+selectors read native values directly.
+
+Immutable admitted text shares both its bytes and accounting through row
+extraction and cloning. Its final owning handle releases the reservation.
+The CLI serializes borrowed typed results directly through its final write;
+it does not first build another retained site JSON value or display string.
+MCP and Python adapter copies remain a separate lifecycle boundary. This
+contract does not charge an independent copy by sharing the original's lease.
 
 #### Reads of stored semantic IR publications
 
@@ -320,6 +360,14 @@ the workspace and request determine applicability. The modeling contract is
 described in [Semantic Model Packs](/semantic-model-packs/) and
 [Semantic Models and Summaries](../semantic-models/).
 
+JVM composed-search inputs are process-local derived values (#9559). Request
+ownership and cross-request retention serve different purposes: a request pins
+its selected reader, while the store budget governs retained search inputs.
+A request-local mapping to a backing key must not become another owner that
+keeps an evicted backing alive. If these inputs are ever persisted, their key
+must also include engine build identity; the current in-memory identity alone
+is not a durable reuse contract.
+
 ## Invalidation and garbage collection
 
 New revisions, epochs, or validity keys immediately stop old state from
@@ -337,6 +385,12 @@ must preserve every live fact set and leave incomplete candidates unpublished.
 A collection a workspace build has scheduled belongs to that workspace: it
 runs to completion, and closing the workspace waits for it, so no maintenance
 write follows a close and a short-lived session still advances the cadence.
+
+Switching workspace roots retires the previous session asynchronously, so
+activation does not wait for that session's optional warms. One tracked worker
+per service tears down retired sessions in order, joining their owned workers.
+Explicit close and service shutdown join that retirement worker as well; moving
+teardown off the activation request does not detach its scheduled work.
 
 ## Current decisions and trade-offs
 

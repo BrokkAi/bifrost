@@ -50,12 +50,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredSemanticModelPack, CatalogCoordinate, CatalogLeaseToken, CatalogOptions, Compatibility,
     CompiledPackManifest, CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits,
-    DependencyArtifactRole, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
-    ExactArtifact, ExactDependencyArtifact, ExpectedReleaseInstall, ExternalArtifactKind,
-    GENERATED_PRODUCTION_CACHE_VERSION, GeneratedProductionKey, PackExtractionAccounting,
-    PackExtractionGap, PackExtractionSourceEntry, ProcedureSummaryMemberKey, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels, ReuseDecision,
-    SEMANTIC_MODEL_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, Safety,
+    DependencyArtifactRole, DependencyPackAdapter, DependencyPackLimits, DurablePackSource,
+    DurablePackSourceKind, ExactArtifact, ExactDependencyArtifact, ExpectedReleaseInstall,
+    ExternalArtifactKind, GENERATED_PRODUCTION_CACHE_VERSION, GeneratedProductionKey,
+    PackExtractionAccounting, PackExtractionGap, PackExtractionSourceEntry,
+    ProcedureSummaryMemberKey, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedActiveSemanticModels, ReuseDecision, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, Safety,
     SemanticModelActivationControl, SemanticModelActivationEvidence,
     SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
     SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeOutcome,
@@ -94,12 +94,13 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionCons
 use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptRequest;
 
 pub const PACK_SPEC_SCHEMA_VERSION: u32 = 3;
+/// Schema 5 transports verified consumed slots for generated productions.
 /// Schema 4 added the `rule` and `runtime_exposure` measurement lookups
 /// (#8324). Readers that know only schema 3 reject them, so a packs release
 /// declares the schema in its `release_index` axis and older engines skip it.
-pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 4;
+pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 5;
 /// Schema 3 bundles are schema 4 bundles without the new lookup kinds.
-pub const READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS: &[u32] = &[3, RELEASE_BUNDLE_SCHEMA_VERSION];
+pub const READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS: &[u32] = &[3, 4, RELEASE_BUNDLE_SCHEMA_VERSION];
 
 fn current_release_generator() -> ReleaseGenerator {
     ReleaseGenerator {
@@ -424,6 +425,49 @@ pub struct ReleasePack {
     pub shards: Vec<ReleaseShard>,
 }
 
+impl ReleaseGeneratedProduction {
+    fn install_in(
+        &self,
+        catalog: &SemanticPackCatalog,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::semantic_model::catalog::GeneratedInstallOutcome,
+        brokk_bifrost_analysis::analyzer::semantic_model::CatalogError,
+    > {
+        match self.input_slots.as_deref() {
+            Some(slots) => catalog.install_release_generated(key, pack, source, extraction, slots),
+            None => catalog.install_legacy_release_generated(key, pack, source, extraction),
+        }
+    }
+    fn install_with_receipt(
+        &self,
+        catalog: &SemanticPackCatalog,
+        release: &AcquisitionReceiptRelease,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<
+        (
+            brokk_bifrost_analysis::analyzer::semantic_model::catalog::GeneratedInstallOutcome,
+            Vec<AcquisitionReceiptSource>,
+        ),
+        brokk_bifrost_analysis::analyzer::semantic_model::CatalogError,
+    > {
+        match self.input_slots.as_deref() {
+            Some(slots) => catalog.install_release_generated_for_receipt(
+                release, key, pack, source, extraction, slots,
+            ),
+            None => catalog.install_legacy_release_generated_for_receipt(
+                release, key, pack, source, extraction,
+            ),
+        }
+    }
+}
+
 /// One exact dependency production emitted by the runtime adapter during
 /// release qualification. This is intentionally separate from [`ReleasePack`]
 /// so a curated pack can retain its upstream producer identity and exhaustive
@@ -435,6 +479,9 @@ pub struct ReleaseGeneratedProduction {
     pub source_pack_id: String,
     pub source_pack_version: String,
     pub artifact_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_slots:
+        Option<Vec<brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact>>,
     pub input_digest: String,
     pub producer_name: String,
     pub producer_version: String,
@@ -712,6 +759,7 @@ pub(crate) fn jdk_generated_bundle_input(
     fs::write(fixture_root.join("NOTICE.txt"), "fixture notice\n").unwrap();
     let (artifact_sha256, _) = sha256_file(&artifact_path).unwrap();
     let activation = ActivationSelector {
+        production_input_digest: None,
         package: None,
         module: None,
         toolchain: Some(NameSelector {
@@ -723,6 +771,7 @@ pub(crate) fn jdk_generated_bundle_input(
         artifact_sha256: None,
     };
     let measurement_activation = ActivationSelector {
+        production_input_digest: None,
         package: None,
         module: Some(NameSelector {
             name: "java.base".to_owned(),
@@ -821,17 +870,31 @@ pub(crate) struct BundleInstallationProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BundleError(String);
+pub enum BundleError {
+    Message(String),
+    GeneratedExtractionInputMismatch { production_digest: String },
+    UnsupportedSchema { found: u32, readable: Vec<u32> },
+}
 
 impl BundleError {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self::Message(message.into())
     }
 }
 
 impl Display for BundleError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        crate::fmt_string_error(&self.0, formatter)
+        match self {
+            Self::Message(message) => crate::fmt_string_error(message, formatter),
+            Self::GeneratedExtractionInputMismatch { production_digest } => write!(
+                formatter,
+                "generated extraction input mismatch for production {production_digest}"
+            ),
+            Self::UnsupportedSchema { found, readable } => write!(
+                formatter,
+                "unsupported release bundle schema {found}; readable {readable:?}"
+            ),
+        }
     }
 }
 
@@ -1373,6 +1436,10 @@ fn generate_jdk_production(
         ..DependencyPackLimits::default()
     };
     let cancellation = CancellationToken::default();
+    let input_slots =
+        brokk_bifrost_analysis::analyzer::semantic_model::dependency::verified_raw_slots(
+            std::slice::from_ref(&exact),
+        );
     let production = compile_exact_dependency_production(
         &JvmDependencyPackAdapter,
         &dependency,
@@ -1397,6 +1464,7 @@ fn generate_jdk_production(
         source_pack_id: curated.pack_id.clone(),
         source_pack_version: curated.pack_version.clone(),
         artifact_sha256: spec.artifact.sha256.clone(),
+        input_slots: Some(input_slots),
         input_digest: production.key.input_digest().to_owned(),
         producer_name: production.key.producer_name().to_owned(),
         producer_version: production.key.producer_version().to_owned(),
@@ -2428,15 +2496,18 @@ fn measure_runtime(
             toolchain: selector.toolchain.as_ref().map(catalog_coordinate),
             target,
             configuration,
-            artifact_sha256: Some(
+            production_input_digest: None,
+verified_raw_artifacts: (Some(
                 selector
                     .artifact_sha256
                     .clone()
                     .unwrap_or_else(|| spec.artifact.sha256.clone()),
-            ),
+            )).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
         })
         .collect();
     let request = SemanticModelActivationRequest {
+        host_activation:
+            brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
         approximate_standard_libraries: Vec::new(),
         bifrost_version: env!("CARGO_PKG_VERSION")
             .parse()
@@ -2650,6 +2721,29 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
     count.try_into().unwrap_or(u64::MAX)
 }
 
+/// Installer approval uses full distribution verification, accepting released
+/// generator versions as installation does. It also verifies stale generated
+/// manifests rather than allowing their source labels to mint publication proof.
+#[cfg(feature = "download")]
+pub(crate) fn verify_release_bundle_for_approval(
+    output_root: &Path,
+) -> Result<ReleaseBundle, BundleError> {
+    let verified =
+        verify_release_bundle_for_cache_version(output_root, GENERATED_PRODUCTION_CACHE_VERSION)?;
+    for (generated, decoded) in verified
+        .bundle
+        .index
+        .generated_productions
+        .iter()
+        .zip(&verified.generated_packs)
+    {
+        if decoded.is_none() {
+            verify_generated_production_pack(output_root, generated)?;
+        }
+    }
+    Ok(verified.bundle)
+}
+
 pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
     verify_release_bundle_for_generation(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
 }
@@ -2848,30 +2942,48 @@ fn verify_release_pack_metadata(
 
 /// Read `index.json` and run the index-level gates: bundle schema, generator
 /// identity, and pack and generated-production uniqueness.
+fn check_bundle_schema(found: u32, readable: &[u32]) -> Result<(), BundleError> {
+    if !readable.contains(&found) {
+        return Err(BundleError::UnsupportedSchema {
+            found,
+            readable: readable.to_vec(),
+        });
+    }
+    Ok(())
+}
+
 fn read_release_bundle_index(output_root: &Path) -> Result<ReleaseBundleIndex, BundleError> {
+    read_release_bundle_index_with_schemas(output_root, READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS)
+}
+
+fn read_release_bundle_index_with_schemas(
+    output_root: &Path,
+    readable: &[u32],
+) -> Result<ReleaseBundleIndex, BundleError> {
     let index_path = safe_asset_path(output_root, Path::new("index.json"))?;
     let index_bytes = fs::read(&index_path)
         .map_err(|error| BundleError::new(format!("read {}: {error}", index_path.display())))?;
     let index: ReleaseBundleIndex = serde_json::from_slice(&index_bytes)
         .map_err(|error| BundleError::new(format!("parse {}: {error}", index_path.display())))?;
-    if !READABLE_RELEASE_BUNDLE_SCHEMA_VERSIONS.contains(&index.schema_version) {
-        return Err(BundleError::new(format!(
-            "unsupported release bundle schema {}",
-            index.schema_version
-        )));
-    }
+    check_bundle_schema(index.schema_version, readable)?;
     ensure_unique_pack_identities(&index.packs)?;
     ensure_unique_generated_productions(&index.generated_productions)?;
     Ok(index)
 }
 
 /// Decide from the index alone whether each generated production can be
-/// installed by this build. A schema this build cannot decode is a hard
-/// error; a decodable but stale entry is reported for the caller to skip.
+/// installed by this build. Currentness belongs to the producer: the JDK
+/// source recipe is the only release recipe that emits generated productions
+/// (`generate_jdk_production`), and its producer is the JVM dependency
+/// adapter, so an entry is current when it carries that adapter's production
+/// schema and this build's cache version. A schema this build cannot decode
+/// is a hard error; a decodable but stale entry is reported for the caller to
+/// skip.
 fn generated_production_reuse(
     generated_productions: &[ReleaseGeneratedProduction],
     current_cache_version: u32,
 ) -> Result<Vec<GeneratedProductionReuse>, BundleError> {
+    let current_schema = JvmDependencyPackAdapter.production_schema_version();
     generated_productions
         .iter()
         .map(|generated| {
@@ -2881,21 +2993,19 @@ fn generated_production_reuse(
                     generated.schema_version
                 )));
             }
-            Ok(
-                if generated.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
-                    GeneratedProductionReuse::StaleSchema {
-                        recorded: generated.schema_version,
-                        current: SEMANTIC_MODEL_SCHEMA_VERSION,
-                    }
-                } else if generated.cache_version == current_cache_version {
-                    GeneratedProductionReuse::Eligible
-                } else {
-                    GeneratedProductionReuse::StaleCache {
-                        recorded: generated.cache_version,
-                        current: current_cache_version,
-                    }
-                },
-            )
+            Ok(if generated.schema_version != current_schema {
+                GeneratedProductionReuse::StaleSchema {
+                    recorded: generated.schema_version,
+                    current: current_schema,
+                }
+            } else if generated.cache_version == current_cache_version {
+                GeneratedProductionReuse::Eligible
+            } else {
+                GeneratedProductionReuse::StaleCache {
+                    recorded: generated.cache_version,
+                    current: current_cache_version,
+                }
+            })
         })
         .collect()
 }
@@ -3233,6 +3343,15 @@ fn verify_generated_production_identity(
     index: &ReleaseBundleIndex,
     generated: &ReleaseGeneratedProduction,
 ) -> Result<(), BundleError> {
+    match (&generated.input_slots, index.schema_version) {
+        (Some(slots), 5..) if !slots.is_empty() && slots.windows(2).all(|p| p[0] < p[1]) => {}
+        (None, 3 | 4) => {}
+        _ => {
+            return Err(BundleError::GeneratedExtractionInputMismatch {
+                production_digest: generated.production_digest.clone(),
+            });
+        }
+    }
     validate_sha256("generated artifact", &generated.artifact_sha256)?;
     validate_sha256("generated input digest", &generated.input_digest)?;
     validate_sha256("generated production digest", &generated.production_digest)?;
@@ -3343,6 +3462,17 @@ fn verify_generated_manifest_metadata(
     generated: &ReleaseGeneratedProduction,
     manifest: &CompiledPackManifest,
 ) -> Result<(), BundleError> {
+    if let Some(slots) = &generated.input_slots {
+        let valid = manifest.extraction.as_ref().is_some_and(|extraction| {
+            let expected = brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_verified_slots(extraction.kind,slots);
+            extraction.inputs == expected.inputs
+        });
+        if !valid {
+            return Err(BundleError::GeneratedExtractionInputMismatch {
+                production_digest: generated.production_digest.clone(),
+            });
+        }
+    }
     if manifest.pack_id != generated.pack_id
         || manifest.version != generated.pack_version
         || manifest.language != generated.language
@@ -3803,8 +3933,8 @@ fn install_startup_bundle(
                 manifest_bytes,
                 &generated.shards,
             )?;
-            let installation = catalog
-                .install_release_generated(&key, &compiled, &source, &extraction)
+            let installation = generated
+                .install_in(catalog, &key, &compiled, &source, &extraction)
                 .map_err(|error| {
                     BundleError::new(format!(
                         "install generated {}@{}: {error}",
@@ -3922,8 +4052,9 @@ pub(crate) fn install_verified_acquisition_bundle(
                 generated.production_digest
             ),
         };
-        let (_, proof) = catalog
-            .install_release_generated_for_receipt(
+        let (_, proof) = generated
+            .install_with_receipt(
+                catalog,
                 release,
                 &key,
                 &compiled,
@@ -4038,14 +4169,8 @@ fn install_verified_release_bundle(
         };
         let extraction = extraction_accounting(&generated.rejects, generated.suppressed_rejects);
         let (installation, generated_sources) = if let Some(release) = receipt_release {
-            let (installation, sources) = catalog
-                .install_release_generated_for_receipt(
-                    release,
-                    &key,
-                    &compiled,
-                    &source,
-                    &extraction,
-                )
+            let (installation, sources) = generated
+                .install_with_receipt(catalog, release, &key, &compiled, &source, &extraction)
                 .map_err(|error| {
                     BundleError::new(format!(
                         "install generated {}@{}: {error}",
@@ -4054,8 +4179,8 @@ fn install_verified_release_bundle(
                 })?;
             (installation, sources)
         } else {
-            let installation = catalog
-                .install_release_generated(&key, &compiled, &source, &extraction)
+            let installation = generated
+                .install_in(catalog, &key, &compiled, &source, &extraction)
                 .map_err(|error| {
                     BundleError::new(format!(
                         "install generated {}@{}: {error}",
@@ -4665,7 +4790,9 @@ mod tests {
     #[cfg(feature = "download")]
     use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode;
     use brokk_bifrost_analysis::analyzer::semantic_model::decode_validated_shard_for_manifest;
-    use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionConstraint};
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        NameSelector, SEMANTIC_MODEL_SCHEMA_VERSION, VersionConstraint,
+    };
     use brokk_bifrost_analysis::test_support::ruby_gem_archive;
     use brokk_bifrost_analysis::test_support::write_zip;
     use brokk_bifrost_test_macros::hardwon;
@@ -4805,7 +4932,8 @@ mod tests {
             toolchain: None,
             target: None,
             configuration: None,
-            artifact_sha256: None,
+            production_input_digest: None,
+            verified_raw_artifacts: Vec::new(),
         }];
         let scoped = release_coverage(&languages, Some(&narrowed), &evidence);
         assert!(scoped.covers_entry("java", "jdk"));
@@ -4836,7 +4964,8 @@ mod tests {
                 }),
                 target: Some("jvm".to_owned()),
                 configuration: None,
-                artifact_sha256: None,
+                production_input_digest: None,
+                verified_raw_artifacts: Vec::new(),
             });
             let SemanticModelResolutionOutcome::Ready(models) =
                 resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
@@ -5410,6 +5539,7 @@ mod tests {
             )
             .unwrap();
             let request = SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -5426,7 +5556,8 @@ mod tests {
                     }),
                     target: Some("jvm".to_owned()),
                     configuration: None,
-                    artifact_sha256: Some(artifact_sha256.to_owned()),
+                    production_input_digest: None,
+verified_raw_artifacts: (Some(artifact_sha256.to_owned())).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
                 }],
                 controls: Vec::new(),
                 limits: Default::default(),
@@ -5650,6 +5781,7 @@ mod tests {
 
     fn selector(package: &str, toolchain: &str, version: &str) -> ActivationSelector {
         ActivationSelector {
+            production_input_digest: None,
             package: Some(NameSelector {
                 name: package.to_owned(),
                 version: Some(format!("={version}")),
@@ -7168,6 +7300,193 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11374: release-generated productions omitted consumed input slots and could never be reused"
+    )]
+    fn generated_release_slots_v5_and_legacy_v4_regeneration() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::{
+            DependencyPackPreparationStatus, DependencyPreparationFailureCause,
+            prepare_dependency_semantic_packs,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::runtime::strict_activation_match;
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogOpenMode, model::SemanticPackOrigin,
+        };
+        let fixture = tempdir().unwrap();
+        let (input, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let bundle_root = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &bundle_root,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let generated = &bundle.index.generated_productions[0];
+        let slots = generated.input_slots.as_ref().unwrap();
+        let verified = verify_release_bundle_for_install(&bundle_root).unwrap();
+        let compiled = verified.generated_packs[0].as_ref().unwrap();
+        let validated = brokk_bifrost_analysis::analyzer::semantic_model::catalog::validate_pack(
+            compiled,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let key = GeneratedProductionKey::new(
+            &generated.input_digest,
+            &generated.producer_name,
+            &generated.producer_version,
+            generated.schema_version,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_release_bundle_index_with_schemas(&bundle_root, &[3, 4]),
+            Err(BundleError::UnsupportedSchema { found: 5, .. })
+        ));
+        let root = fixture.path().join("v5-catalog");
+        let dependency = JvmDependencyPackAdapter::jdk_source_dependency(
+            JdkVersion::parse("21.0.8").unwrap(),
+            input.artifact_path.clone(),
+        );
+        let alias = "e".repeat(64);
+        {
+            let catalog = SemanticPackCatalog::open(
+                &root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            install_release_bundle(&bundle_root, &catalog).unwrap();
+            assert_eq!(
+                catalog.generated_input_slots(&key).unwrap().as_ref(),
+                Some(slots)
+            );
+            catalog
+                .install_generated_source_identity(&alias, &key)
+                .unwrap();
+        }
+        let catalog =
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadOnly, CatalogOptions::default())
+                .unwrap();
+        let production = catalog
+            .generated_production_by_source_identity(
+                &alias,
+                &compiled.manifest.producer,
+                compiled.manifest.schema_version,
+            )
+            .unwrap()
+            .unwrap();
+        let restored = catalog
+            .generated_input_slots(&production.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&restored, slots);
+        let mut evidence = dependency.evidence.clone();
+        evidence.verified_raw_artifacts = restored.clone();
+        evidence.production_input_digest = Some(key.input_digest().into());
+        let matches = |evidence: &SemanticModelActivationEvidence| {
+            strict_activation_match(
+                &compiled.manifest,
+                &validated.shards[0].selectors,
+                std::slice::from_ref(evidence),
+                &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                SemanticPackOrigin::Generated,
+            )
+            .is_some()
+        };
+        assert!(matches(&evidence));
+        drop(catalog);
+        // Re-create an old transport, preserving every compiled asset unchanged.
+        let mut old = bundle.index.clone();
+        old.schema_version = 4;
+        old.generated_productions[0].input_slots = None;
+        rewrite_test_bundle_headers(&bundle_root, &old);
+        let curated = &old.packs[0];
+        let curated_source = DurablePackSource {
+            kind: DurablePackSourceKind::PreShipped,
+            source_id: format!(
+                "release:{}@{}:{}",
+                curated.pack_id, curated.pack_version, curated.manifest.sha256
+            ),
+        };
+        let legacy = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        install_release_bundle(&bundle_root, &legacy).unwrap();
+        assert!(legacy.generated_input_slots(&key).unwrap().is_none());
+        assert!(legacy.generated_production(&key).unwrap().is_none());
+        assert!(
+            legacy.durable_source_present(&curated_source).unwrap(),
+            "old authored release still installs"
+        );
+        // Exercise the generated acceleration independently of the curated provider.
+        legacy.remove_source(&curated_source).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &legacy,
+            &JvmDependencyPackAdapter,
+            std::slice::from_ref(&dependency),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(prepared.failures.is_empty(), "{prepared:#?}");
+        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.verified_raw_artifacts, restored);
+        assert_eq!(prepared.packs[0].production.key, key);
+        assert_eq!(matches(&prepared.packs[0].evidence), matches(&evidence));
+        assert_eq!(
+            legacy.generated_input_slots(&key).unwrap().as_ref(),
+            Some(slots)
+        );
+        let absent = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        install_release_bundle(&bundle_root, &absent).unwrap();
+        absent.remove_source(&curated_source).unwrap();
+        fs::remove_file(&input.artifact_path).unwrap();
+        let unavailable = prepare_dependency_semantic_packs(
+            &absent,
+            &JvmDependencyPackAdapter,
+            std::slice::from_ref(&dependency),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(unavailable.packs.is_empty());
+        assert_eq!(unavailable.failures.len(), 1, "{unavailable:#?}");
+        assert_eq!(
+            unavailable.failures[0].cause,
+            DependencyPreparationFailureCause::Rejected
+        );
+        assert!(
+            unavailable
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "artifact.metadata"),
+            "{unavailable:#?}"
+        );
+        // A checksum-consistent lie about consumed bytes is rejected by validation.
+        let mut bad = bundle.index.clone();
+        bad.generated_productions[0].input_slots.as_mut().unwrap()[0].sha256[0] ^= 1;
+        rewrite_test_bundle_headers(&bundle_root, &bad);
+        assert!(matches!(
+            verify_release_bundle_for_install(&bundle_root),
+            Err(BundleError::GeneratedExtractionInputMismatch { .. })
+        ));
+    }
+
+    fn rewrite_test_bundle_headers(root: &Path, index: &ReleaseBundleIndex) {
+        fs::write(root.join("index.json"), json_bytes(index).unwrap()).unwrap();
+        for name in ["rejects.json", "measurements.json"] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(root.join(name)).unwrap()).unwrap();
+            value["schema_version"] = serde_json::json!(index.schema_version);
+            fs::write(root.join(name), json_bytes(&value).unwrap()).unwrap();
+        }
+        fs::remove_file(root.join("SHA256SUMS")).unwrap();
+        write_checksums(root, index).unwrap();
+    }
+
+    #[test]
+    #[hardwon(
+        "#12385: release bundles rejected fresh JVM productions minted at the producer's schema"
+    )]
     fn jdk_generated_production_is_deterministic_verifiable_and_installable() {
         let fixture = tempdir().unwrap();
         let version = "21.0.8";
@@ -7259,6 +7578,23 @@ mod tests {
             "curated and generated JDK packs install"
         );
         assert!(catalog.generated_production(&key).unwrap().is_some());
+        assert_eq!(
+            generated.schema_version,
+            JvmDependencyPackAdapter.production_schema_version()
+        );
+        assert!(generated.schema_version > SEMANTIC_MODEL_SCHEMA_VERSION);
+        let prepared =
+            brokk_bifrost_analysis::analyzer::semantic_model::prepare_dependency_semantic_packs(
+                &catalog,
+                &JvmDependencyPackAdapter,
+                std::slice::from_ref(&runtime_dependency),
+                &DependencyPackLimits::default(),
+                None,
+            );
+        assert!(prepared.complete, "{prepared:#?}");
+        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
+        assert_eq!(prepared.packs[0].status,
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus::Reused);
 
         // Model this honestly generated bundle as a prior release relative to
         // a subsequent runtime cache epoch. Its recorded digest remains bound
@@ -7320,6 +7656,8 @@ mod tests {
                 .unwrap()
         );
         let query = brokk_bifrost_analysis::analyzer::semantic_model::SemanticPackSelectorQuery {
+            verified_raw_artifacts: Vec::new(),
+            production_input_digest: None,
             language: "java".to_owned(),
             ecosystem: "jdk".to_owned(),
             package: None,
@@ -7397,6 +7735,7 @@ mod tests {
         let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
             &stale_catalog,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -7407,7 +7746,8 @@ mod tests {
                     toolchain: query.toolchain.clone(),
                     target: query.target.clone(),
                     configuration: query.configuration.clone(),
-                    artifact_sha256: query.artifact_sha256.clone(),
+                    production_input_digest: None,
+verified_raw_artifacts: (query.artifact_sha256.clone()).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
                 }],
                 controls: Vec::new(),
                 limits: Default::default(),
@@ -7439,7 +7779,7 @@ mod tests {
         );
 
         let mut incompatible_schema = first_bundle.index.clone();
-        incompatible_schema.generated_productions[0].schema_version += 1;
+        incompatible_schema.generated_productions[0].schema_version = u32::MAX;
         fs::write(
             first.join("index.json"),
             json_bytes(&incompatible_schema).unwrap(),
@@ -7515,6 +7855,8 @@ mod tests {
                         downgraded_callable_surfaces += 1;
                     }
                     fact.callable_surface_complete = false;
+                    // Schema 2 predates class finality (43).
+                    fact.is_final = None;
                 }
             }
         }
@@ -7547,7 +7889,7 @@ mod tests {
             verified.generated_reuse,
             vec![GeneratedProductionReuse::StaleSchema {
                 recorded: 2,
-                current: SEMANTIC_MODEL_SCHEMA_VERSION,
+                current: generated.schema_version,
             }]
         );
         assert!(
@@ -7631,6 +7973,7 @@ mod tests {
                 source_pack_id: "bifrost.jdk".to_owned(),
                 source_pack_version: "21.0.8".to_owned(),
                 artifact_sha256: "a".repeat(64),
+                input_slots: None,
                 input_digest: "b".repeat(64),
                 producer_name: "fixture-producer".to_owned(),
                 producer_version: "1.0.0".to_owned(),
@@ -7663,10 +8006,7 @@ mod tests {
     #[test]
     #[hardwon("#3364: incompatible generated schemas must fail before any release asset is read")]
     fn an_undecodable_generated_schema_is_reported_before_any_asset_is_read() {
-        let (_guard, root) = index_only_bundle(
-            SEMANTIC_MODEL_SCHEMA_VERSION + 1,
-            GENERATED_PRODUCTION_CACHE_VERSION,
-        );
+        let (_guard, root) = index_only_bundle(u32::MAX, GENERATED_PRODUCTION_CACHE_VERSION);
         let error = verify_release_bundle_for_install(&root)
             .unwrap_err()
             .to_string();
@@ -7680,7 +8020,7 @@ mod tests {
     #[hardwon("#3364: stale generated productions must be rejected before asset reads")]
     fn a_stale_generated_production_is_reported_before_any_asset_is_read() {
         let (_guard, root) = index_only_bundle(
-            SEMANTIC_MODEL_SCHEMA_VERSION,
+            JvmDependencyPackAdapter.production_schema_version(),
             GENERATED_PRODUCTION_CACHE_VERSION - 1,
         );
         let error = verify_release_bundle(&root).unwrap_err().to_string();
@@ -7718,6 +8058,7 @@ mod tests {
         let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
         let version = "21.0.8";
         let activation = ActivationSelector {
+            production_input_digest: None,
             package: None,
             module: None,
             toolchain: Some(NameSelector {
@@ -7762,6 +8103,7 @@ mod tests {
             },
             notices: vec!["NOTICE.txt".to_owned()],
             measurement_activation: ActivationSelector {
+                production_input_digest: None,
                 module: Some(NameSelector {
                     name: "java.base".to_owned(),
                     version: None,
@@ -7794,7 +8136,7 @@ mod tests {
         .unwrap();
         let stale_schema = *SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS
             .iter()
-            .filter(|schema| **schema != SEMANTIC_MODEL_SCHEMA_VERSION)
+            .filter(|schema| **schema < original.schema_version)
             .max()
             .expect("a supported schema version must precede the current one");
 
@@ -7821,7 +8163,7 @@ mod tests {
             verified.generated_reuse,
             vec![GeneratedProductionReuse::StaleSchema {
                 recorded: stale_schema,
-                current: SEMANTIC_MODEL_SCHEMA_VERSION,
+                current: original.schema_version,
             }]
         );
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -7840,6 +8182,26 @@ mod tests {
         assert_eq!(
             catalog.inventory_bounded(usize::MAX).unwrap().packs.len(),
             1
+        );
+        let dependency = JvmDependencyPackAdapter::jdk_source_dependency(
+            JdkVersion::parse(version).unwrap(),
+            fixture.path().join("src.zip"),
+        );
+        let prepared =
+            brokk_bifrost_analysis::analyzer::semantic_model::prepare_dependency_semantic_packs(
+                &catalog,
+                &JvmDependencyPackAdapter,
+                &[dependency],
+                &DependencyPackLimits::default(),
+                None,
+            );
+        assert!(prepared.complete, "{prepared:#?}");
+        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
+        assert_eq!(prepared.packs[0].status,
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus::Generated);
+        assert_eq!(
+            prepared.packs[0].production.key.schema_version(),
+            original.schema_version
         );
     }
 
@@ -7879,6 +8241,7 @@ mod tests {
         let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
         let version = "21.0.9";
         let activation = ActivationSelector {
+            production_input_digest: None,
             package: None,
             module: None,
             toolchain: Some(NameSelector {
@@ -7924,6 +8287,7 @@ mod tests {
             },
             notices: vec!["NOTICE.txt".to_owned()],
             measurement_activation: ActivationSelector {
+                production_input_digest: None,
                 module: Some(NameSelector {
                     name: "java.base".to_owned(),
                     version: None,
@@ -8227,6 +8591,7 @@ mod tests {
         let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
             &catalog,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -8243,7 +8608,8 @@ mod tests {
                     }),
                     target: None,
                     configuration: None,
-                    artifact_sha256: Some(artifact_sha256),
+                    production_input_digest: None,
+verified_raw_artifacts: (Some(artifact_sha256)).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::PythonSource, &sha256)).collect(),
                 }],
                 controls: Vec::new(),
                 limits: Default::default(),
@@ -8531,6 +8897,7 @@ mod tests {
     ) -> SemanticModelActivationRequest {
         let version = Version::parse(version).unwrap();
         SemanticModelActivationRequest {
+            host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
             approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
@@ -8547,7 +8914,7 @@ mod tests {
                 }),
                 target: target.map(str::to_owned),
                 configuration: None,
-                artifact_sha256,
+                production_input_digest: None, verified_raw_artifacts: artifact_sha256.into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::JavaClassJar, &sha256)).collect(),
             }],
             controls: Vec::new(),
             limits: Default::default(),
@@ -9023,6 +9390,7 @@ mod tests {
         let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
             &catalog,
             &SemanticModelActivationRequest {
+                host_activation: brokk_bifrost_analysis::analyzer::semantic_model::HostActivationContext::library_none(),
                 approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -9039,7 +9407,8 @@ mod tests {
                     }),
                     target: None,
                     configuration: None,
-                    artifact_sha256: Some(artifact_sha256),
+                    production_input_digest: None,
+verified_raw_artifacts: (Some(artifact_sha256)).into_iter().map(|sha256: String| brokk_bifrost_analysis::analyzer::semantic_model::runtime::VerifiedRawArtifact::from_sha256(brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyArtifactRole::Reference, brokk_bifrost_analysis::analyzer::semantic_model::ExternalArtifactKind::KotlinSourceJar, &sha256)).collect(),
                 }],
                 controls: Vec::new(),
                 limits: Default::default(),

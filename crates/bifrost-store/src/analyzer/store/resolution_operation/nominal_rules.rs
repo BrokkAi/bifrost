@@ -343,11 +343,6 @@ pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
     fn package_access_anchor(&self) -> PackageAccessAnchor;
     /// Required: source languages whose package needs no directory agreement.
     fn lexical_package_languages(&self) -> &'static [Language];
-    /// Required: reverse target policy; algorithms stay shared.
-    #[cfg(any(test, feature = "test-support"))]
-    fn reverse_target_rules(
-        &self,
-    ) -> &'static dyn super::nominal_reverse::NominalReverseTargetRules;
     /// Feature entry: selected ownership supplies access endpoints; absent by default.
     fn has_declaration_access_endpoints(&self) -> bool {
         false
@@ -577,8 +572,6 @@ struct JvmLanguageRules {
     >,
     package_access_anchor: PackageAccessAnchor,
     lexical_package_languages: &'static [Language],
-    #[cfg(any(test, feature = "test-support"))]
-    reverse_target: &'static dyn super::nominal_reverse::NominalReverseTargetRules,
     access_endpoints: bool,
     lexical_access: bool,
     implicit_project_access: bool,
@@ -758,12 +751,6 @@ impl NominalLanguageRules for JvmLanguageRules {
     fn lexical_package_languages(&self) -> &'static [Language] {
         self.lexical_package_languages
     }
-    #[cfg(any(test, feature = "test-support"))]
-    fn reverse_target_rules(
-        &self,
-    ) -> &'static dyn super::nominal_reverse::NominalReverseTargetRules {
-        self.reverse_target
-    }
     fn has_declaration_access_endpoints(&self) -> bool {
         self.access_endpoints
     }
@@ -942,8 +929,6 @@ static JAVA_RULES: JvmLanguageRules = JvmLanguageRules {
     access_source: no_declaration_access_source,
     package_access_anchor: PackageAccessAnchor::ImportToken,
     lexical_package_languages: &[],
-    #[cfg(any(test, feature = "test-support"))]
-    reverse_target: &super::jvm_reverse_rows::JavaReverseTargetRules,
     access_endpoints: true,
     lexical_access: false,
     implicit_project_access: false,
@@ -1011,8 +996,6 @@ static KOTLIN_RULES: JvmLanguageRules = JvmLanguageRules {
     access_source: selected_declaration_access_source,
     package_access_anchor: PackageAccessAnchor::LexicalSource,
     lexical_package_languages: &[Language::Kotlin],
-    #[cfg(any(test, feature = "test-support"))]
-    reverse_target: &super::jvm_reverse_rows::KotlinReverseTargetRules,
     access_endpoints: false,
     lexical_access: false,
     implicit_project_access: true,
@@ -1079,8 +1062,6 @@ static SCALA_RULES: JvmLanguageRules = JvmLanguageRules {
     access_source: selected_declaration_access_source,
     package_access_anchor: PackageAccessAnchor::LexicalSource,
     lexical_package_languages: &[Language::Scala],
-    #[cfg(any(test, feature = "test-support"))]
-    reverse_target: &super::jvm_reverse_rows::ScalaReverseTargetRules,
     access_endpoints: true,
     lexical_access: true,
     implicit_project_access: true,
@@ -1253,9 +1234,13 @@ pub(in crate::analyzer) struct ExternalOwnerRelations {
 }
 
 impl ExternalOwnerRelations {
-    pub fn providers(&self, analyzer: Option<&dyn super::SelectedAnalyzerServices>) -> Vec<String> {
+    pub fn providers(
+        &self,
+        analyzer: Option<&dyn super::SelectedAnalyzerServices>,
+        models: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+    ) -> Vec<String> {
         analyzer
-            .map(|analyzer| analyzer.external_inventory_providers())
+            .map(|analyzer| analyzer.external_inventory_providers(models))
             .unwrap_or_default()
     }
 }

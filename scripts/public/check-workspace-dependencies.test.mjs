@@ -232,7 +232,12 @@ test("test macros are permitted only as path-only development dependencies", () 
 });
 
 test("facade parser and identity dependencies are confined to development", () => {
-  const direct = ["brokk-bifrost-core", "brokk-bifrost-js-ts", "brokk-bifrost-jvm"];
+  const direct = [
+    "brokk-bifrost-core",
+    "brokk-bifrost-js-ts",
+    "brokk-bifrost-jvm",
+    "brokk-bifrost-rust",
+  ];
   for (const kind of ["dev", null, "build"]) {
     const errors = validateWorkspaceGraph(metadata({
       dependencies: {

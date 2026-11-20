@@ -138,6 +138,7 @@ mod python_extraction_tests {
                 range,
                 name: None,
                 position: Some(0),
+                written_position: Some(0),
                 formal_index: None,
                 formal_name: None,
                 variadic: false,

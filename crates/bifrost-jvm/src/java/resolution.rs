@@ -1880,13 +1880,19 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
 
         let terminal = self.slot(qualifier).site;
-        let mut route_segments = vec![self.intern_name(node_text(current, self.source))];
-        route_segments.extend(
-            members
-                .iter()
-                .rev()
-                .map(|(_, name)| self.intern_name(node_text(*name, self.source))),
-        );
+        let route_segments = std::iter::once(current)
+            .chain(members.iter().rev().map(|(_, name)| *name))
+            .map(|segment| self.intern_name(node_text(segment, self.source)))
+            .collect::<Option<Vec<_>>>();
+        let Some(mut route_segments) = route_segments else {
+            // A segment without a spelling leaves the written route unread.
+            self.add_gap(terminal, ResolutionGapKind::MalformedSyntax);
+            self.add_gap(root_reference, ResolutionGapKind::AmbiguousQualifiedType);
+            for site in qualified_sites {
+                self.add_gap(site, ResolutionGapKind::AmbiguousQualifiedType);
+            }
+            return qualifier;
+        };
         route_segments
             .pop()
             .expect("qualified type name has a terminal name");
@@ -1968,7 +1974,16 @@ impl<'source> JavaResolutionBuilder<'source> {
             annotation_has_error |= malformed;
         }
 
-        let Some(segments) = syntax.segments.as_ref() else {
+        // A MISSING identifier segment has no spelling: the route is as
+        // unreadable as a malformed one.
+        let resolved = syntax.segments.as_ref().and_then(|segments| {
+            let names = segments
+                .iter()
+                .map(|(_, spelling)| self.intern_name(spelling))
+                .collect::<Option<Vec<_>>>()?;
+            Some((segments, names))
+        });
+        let Some((segments, package_names)) = resolved else {
             self.facts
                 .add_route_gap(declaration, ResolutionRouteGap::UnknownPlacement);
             self.add_reference_enumeration_gap_if_omitted(
@@ -1991,10 +2006,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             !segments.is_empty(),
             "package directive collector must return at least one segment"
         );
-        self.package_segment_names = segments
-            .iter()
-            .map(|(_, spelling)| self.intern_name(spelling))
-            .collect();
+        self.package_segment_names = package_names;
         if node.has_error() && !annotation_has_error {
             self.add_gap(declaration, ResolutionGapKind::MalformedSyntax);
             self.add_reference_enumeration_gap_if_omitted(
@@ -2024,7 +2036,14 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionGapKind::MalformedSyntax,
             );
         }
-        let Some(segments) = syntax.segments.as_ref() else {
+        let resolved = syntax.segments.as_ref().and_then(|segments| {
+            let names = segments
+                .iter()
+                .map(|(_, spelling)| self.intern_name(spelling))
+                .collect::<Option<Vec<_>>>()?;
+            Some((segments, names))
+        });
+        let Some((segments, names)) = resolved else {
             self.facts.add_route_gap(
                 site,
                 ResolutionRouteGap::UnknownBinder {
@@ -2050,10 +2069,6 @@ impl<'source> JavaResolutionBuilder<'source> {
             (true, false) => ResolutionImportRouteKind::SingleStatic,
             (true, true) => ResolutionImportRouteKind::StaticOnDemand,
         };
-        let names = segments
-            .iter()
-            .map(|(_, spelling)| self.intern_name(spelling))
-            .collect::<Vec<_>>();
         let bound_name = matches!(
             kind,
             ResolutionImportRouteKind::SingleType | ResolutionImportRouteKind::SingleStatic
@@ -2235,8 +2250,22 @@ impl<'source> JavaResolutionBuilder<'source> {
                 }
             }
         }
+        // A static import publishes no Type demand for a name a single-type
+        // import binds: JLS 6.4.1 shadows an on-demand static member type of
+        // that name, and JLS 7.5.3 makes a single-static import of a type with
+        // that name a compile-time error. Other namespaces keep their demands.
+        let single_type_names = self
+            .facts
+            .import_routes
+            .iter()
+            .filter(|route| route.kind == ResolutionImportRouteKind::SingleType)
+            .filter_map(|route| route.bound_name)
+            .collect::<HashSet<_>>();
         for &(import_site, bound_name) in &self.pending_static_imports {
             for &(namespace, name) in &demands {
+                if namespace == ResolutionNamespace::Type && single_type_names.contains(&name) {
+                    continue;
+                }
                 if bound_name.is_none_or(|bound| bound == name) {
                     self.facts
                         .root_import_demands
@@ -2570,8 +2599,16 @@ impl<'source> JavaResolutionBuilder<'source> {
         declaration
     }
 
-    fn intern_name(&mut self, spelling: &str) -> ResolutionNameId {
+    /// An empty spelling (a MISSING token, empty backticks) is not a name.
+    fn intern_name(&mut self, spelling: &str) -> Option<ResolutionNameId> {
         self.facts.intern_name(&mut self.name_ids, spelling)
+    }
+
+    /// A name the producer synthesizes (a literal, a `format!` of non-empty
+    /// parts, or a declaration's own checked name) is non-empty by construction.
+    fn intern_synthetic(&mut self, spelling: &str) -> ResolutionNameId {
+        self.intern_name(spelling)
+            .expect("synthetic resolution name is non-empty")
     }
 
     fn add_identifier_to_site(
@@ -2582,7 +2619,10 @@ impl<'source> JavaResolutionBuilder<'source> {
         namespace: ResolutionNamespace,
         qualifier: Option<ResolutionTypeSlotId>,
     ) {
-        let name = self.record_identifier_to_site(site, node, role, namespace, qualifier);
+        let Some(name) = self.record_identifier_to_site(site, node, role, namespace, qualifier)
+        else {
+            return;
+        };
         if role == ResolutionIdentifierRole::Reference
             && qualifier.is_none()
             && matches!(
@@ -2642,14 +2682,14 @@ impl<'source> JavaResolutionBuilder<'source> {
         role: ResolutionIdentifierRole,
         namespace: ResolutionNamespace,
         qualifier: Option<ResolutionTypeSlotId>,
-    ) -> ResolutionNameId {
+    ) -> Option<ResolutionNameId> {
         let spelling = node_text(node, self.source).trim();
-        assert!(
-            !spelling.is_empty(),
-            "identifier token must have a spelling"
-        );
         self.claimed_identifier_nodes.insert(node.id());
-        let name = self.intern_name(spelling);
+        let Some(name) = self.intern_name(spelling) else {
+            // A MISSING or zero-width identifier has no spelling.
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            return None;
+        };
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -2671,7 +2711,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                 });
             self.pending_execution_sites.push((site, node.id()));
         }
-        name
+        Some(name)
     }
 
     fn add_identifier_site(
@@ -2743,6 +2783,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             }
             ResolutionTypeTransferKind::ConditionalPayload => {
                 unreachable!("Java has no conditional wrapper payload transfer")
+            }
+            ResolutionTypeTransferKind::BindingMode
+            | ResolutionTypeTransferKind::BindingModeScrutinee => {
+                unreachable!("Java has no default binding mode transfer")
             }
         };
         self.add_transfer_with_transform(input, output, kind, value_transform);
@@ -2817,14 +2861,17 @@ impl<'source> JavaResolutionBuilder<'source> {
                     slot: identity,
                     role: DeclarationTypeRole::Identity,
                 });
-            let name = self.intern_name(node_text(name_node, self.source));
             let position = dense_ordinal(position, "Java type parameter");
-            let previous = self
-                .type_parameter_positions
-                .entry(owner)
-                .or_default()
-                .insert(name, position);
-            assert!(previous.is_none(), "Java type-parameter names are unique");
+            if let Some(name) = self.intern_name(node_text(name_node, self.source)) {
+                let previous = self
+                    .type_parameter_positions
+                    .entry(owner)
+                    .or_default()
+                    .insert(name, position);
+                assert!(previous.is_none(), "Java type-parameter names are unique");
+            } else {
+                self.add_gap(declaration, ResolutionGapKind::MalformedSyntax);
+            }
             lowered.push((parameter, declaration, identity));
         }
 
@@ -2886,7 +2933,9 @@ impl<'source> JavaResolutionBuilder<'source> {
         if result_type.kind() != "type_identifier" {
             return;
         }
-        let name = self.intern_name(node_text(result_type, self.source));
+        let Some(name) = self.intern_name(node_text(result_type, self.source)) else {
+            return;
+        };
         if let Some(&position) = self
             .type_parameter_positions
             .get(&callable)
@@ -2949,7 +2998,8 @@ impl<'source> JavaResolutionBuilder<'source> {
         let is_local_type = binding_scope != ResolutionScopeId::new(0) && !is_member_type;
         let is_static_nested =
             is_member_type && enclosing_type.is_some_and(|_| source_type_shape.is_static);
-        let type_name = self.intern_name(node_text(name, self.source));
+        // A type declaration without a spelled name is not lowered.
+        let type_name = self.intern_name(node_text(name, self.source))?;
         let declaration = self.add_identifier_site(
             name,
             ResolutionSiteKind::TypeDeclaration,
@@ -3134,7 +3184,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         let enclosing = self.type_contexts.last().copied();
         let declaration = self.add_site(body, ResolutionSiteKind::TypeDeclaration);
         let synthetic_name =
-            self.intern_name(&crate::anonymous_type::AnonymousTypeBody::name(body));
+            self.intern_synthetic(&crate::anonymous_type::AnonymousTypeBody::name(body));
         let anonymous = crate::anonymous_type::AnonymousTypeBody {
             site: declaration,
             name: synthetic_name,
@@ -3919,14 +3969,15 @@ impl<'source> JavaResolutionBuilder<'source> {
                                 .count();
                             format!("<record component {}>", ordinal + 1)
                         });
-                    let name = self.intern_name(&spelling);
-                    self.facts.identifiers.push(PositionedIdentifierFact {
-                        site,
-                        name,
-                        role: ResolutionIdentifierRole::Declaration,
-                        namespace: ResolutionNamespace::Value,
-                        qualifier: None,
-                    });
+                    if let Some(name) = self.intern_name(&spelling) {
+                        self.facts.identifiers.push(PositionedIdentifierFact {
+                            site,
+                            name,
+                            role: ResolutionIdentifierRole::Declaration,
+                            namespace: ResolutionNamespace::Value,
+                            qualifier: None,
+                        });
+                    }
                     self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
                     self.add_reference_enumeration_gap(
                         site,
@@ -4650,10 +4701,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionSiteKind::SyntheticReference,
             self.site(subtype).scope,
         );
-        let name = self.intern_name(parent_name);
-        let mut prefix = vec![self.intern_name("java"), self.intern_name("lang")];
+        let name = self.intern_synthetic(parent_name);
+        let mut prefix = vec![self.intern_synthetic("java"), self.intern_synthetic("lang")];
         if parent_name == "Annotation" {
-            prefix.push(self.intern_name("annotation"));
+            prefix.push(self.intern_synthetic("annotation"));
         }
         crate::implicit_supertype::publish_implicit_supertype(
             &mut self.facts,
@@ -4987,7 +5038,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         assert!(dimensions > 0, "Java arrays have at least one dimension");
         let site = self.add_site(node, ResolutionSiteKind::TypeReference);
         let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-        let name = self.intern_name("structural-type");
+        let name = self.intern_synthetic("structural-type");
         self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
             output: container,
             name,
@@ -5044,7 +5095,10 @@ impl<'source> JavaResolutionBuilder<'source> {
                 }
                 (scope, name)
             };
-            segments.push(self.intern_name(node_text(name, self.source)));
+            let Some(segment) = self.intern_name(node_text(name, self.source)) else {
+                return;
+            };
+            segments.push(segment);
             current = scope;
         }
         if !matches!(current.kind(), "type_identifier" | "identifier")
@@ -5070,7 +5124,11 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionSiteKind::ValueReference
             }
         );
-        segments.push(self.intern_name(node_text(current, self.source)));
+        let Some(terminal) = self.intern_name(node_text(current, self.source)) else {
+            self.add_gap(reference, ResolutionGapKind::MalformedSyntax);
+            return;
+        };
+        segments.push(terminal);
         segments.reverse();
         segments.pop().expect("qualified type has a terminal name");
         self.record_rooted_type_route(
@@ -5147,7 +5205,11 @@ impl<'source> JavaResolutionBuilder<'source> {
         let site = self.add_site(node, ResolutionSiteKind::TypeReference);
         let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
         let spelling = node_text(node, self.source).trim();
-        let name = self.intern_name(spelling);
+        let Some(name) = self.intern_name(spelling) else {
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+            self.type_slots_by_node.insert(node.id(), slot);
+            return slot;
+        };
         self.facts
             .intrinsic_type_seeds
             .push(IntrinsicTypeSeedFact::direct(slot, name, kind));
@@ -5946,12 +6008,15 @@ impl<'source> JavaResolutionBuilder<'source> {
                 .or_else(|| (receiver.kind() == "identifier").then_some(receiver))
                 .or_else(|| receiver.child_by_field_name("field"))
             {
-                let name = self.intern_name(node_text(name, self.source));
-                self.facts
-                    .identifiers
-                    .last_mut()
-                    .expect("new constructor reference")
-                    .name = name;
+                if let Some(name) = self.intern_name(node_text(name, self.source)) {
+                    self.facts
+                        .identifiers
+                        .last_mut()
+                        .expect("new constructor reference")
+                        .name = name;
+                } else {
+                    self.add_gap(reference, ResolutionGapKind::MalformedSyntax);
+                }
             } else {
                 self.add_gap(reference, ResolutionGapKind::UnsupportedTypeSyntax);
             }
@@ -5971,7 +6036,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         self.facts.binding_projections.push(BindingProjectionFact {
             reference,
             output: binding,
-            kind: BindingProjectionKind::NonInvokingMemberReference,
+            kind: BindingProjectionKind::BindingOnlyMemberReference,
         });
         // The receiver and callable are navigable independently of the target
         // functional interface, whose value type has not been inferred here.
@@ -6144,6 +6209,43 @@ impl<'source> JavaResolutionBuilder<'source> {
             .map(|object| {
                 if object.kind() == "super" {
                     self.lower_super_receiver(call)
+                } else if super::graph_support::java_callable_receiver_origin(node)
+                    == ResolutionCallableReceiverOrigin::Super
+                {
+                    // Qualified super needs a selected receiver override before
+                    // binding. Do not bind the qualifier's own implementation.
+                    let input = self.lower_named_type_reference(object);
+                    let qualifier = self.slot(input).site;
+                    // A call-owned qualifier projection records the exact association
+                    // without feeding the unsupported receiver. Unsupported qualifier
+                    // syntax has no reference projection and keeps only the gap.
+                    if self
+                        .scan_index
+                        .has_projection(&self.facts, qualifier, input)
+                    {
+                        let qualifier_slot =
+                            self.add_slot(call, ResolutionTypeSlotRole::TargetTypeIdentity);
+                        self.facts.binding_projections.push(BindingProjectionFact {
+                            reference: qualifier,
+                            output: qualifier_slot,
+                            kind: BindingProjectionKind::TargetTypeIdentity,
+                        });
+                    }
+                    let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
+                    self.add_gap(call, ResolutionGapKind::UnsupportedExpression);
+                    output
+                } else if let Some(qualifier) =
+                    super::graph_support::java_qualified_this_qualifier(object)
+                {
+                    let input = self.lower_named_type_reference(qualifier);
+                    let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
+                    self.add_transfer_with_transform(
+                        input,
+                        output,
+                        ResolutionTypeTransferKind::Receiver,
+                        ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                    );
+                    output
                 } else {
                     let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
                     let input = self.expression_slot(object);
@@ -6187,6 +6289,33 @@ impl<'source> JavaResolutionBuilder<'source> {
             .zip(receiver)
             .and_then(|(object, receiver)| self.non_owning_field_chain(object, receiver));
         let typed_receiver = object.zip(receiver).is_some_and(|(object, receiver)| {
+            if object.kind() != "super"
+                && super::graph_support::java_callable_receiver_origin(node)
+                    == ResolutionCallableReceiverOrigin::Super
+            {
+                return self
+                    .type_slots_by_node
+                    .get(&object.id())
+                    .copied()
+                    .is_some_and(|input| {
+                        self.scan_index
+                            .has_projection(&self.facts, self.slot(input).site, input)
+                    });
+            }
+            if let Some(qualifier) = super::graph_support::java_qualified_this_qualifier(object) {
+                return self
+                    .type_slots_by_node
+                    .get(&qualifier.id())
+                    .copied()
+                    .is_some_and(|input| {
+                        self.scan_index.has_transfer(
+                            &self.facts,
+                            input,
+                            receiver,
+                            ResolutionTypeTransferKind::Receiver,
+                        )
+                    });
+            }
             if object.kind() == "super" {
                 // The pending supertype projection feeds this receiver slot
                 // after hierarchy facts are complete. A missing supertype
@@ -6538,7 +6667,7 @@ impl<'source> JavaResolutionBuilder<'source> {
     fn lower_literal(&mut self, node: Node<'_>, spelling: &str, kind: IntrinsicTypeKind) {
         let site = self.add_site(node, ResolutionSiteKind::Literal);
         let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-        let name = self.intern_name(spelling);
+        let name = self.intern_synthetic(spelling);
         self.facts
             .intrinsic_type_seeds
             .push(IntrinsicTypeSeedFact::direct(output, name, kind));
@@ -6593,7 +6722,15 @@ impl<'source> JavaResolutionBuilder<'source> {
     ) {
         self.push_argument_dependencies(node, stack);
         if let Some(object) = node.child_by_field_name("object") {
-            if matches!(object.kind(), "this" | "super") {
+            if let Some(qualifier) = super::graph_support::java_qualified_this_qualifier(object) {
+                // Only the call receiver gains this identity. General Q.this
+                // expressions need their own enclosing-instance validity gate.
+                let keyword = object
+                    .child_by_field_name("field")
+                    .expect("qualified this keyword");
+                assert!(self.claimed_identifier_nodes.insert(keyword.id()));
+                self.lower_named_type_reference(qualifier);
+            } else if matches!(object.kind(), "this" | "super") {
                 // The current instance is represented by the callable
                 // receiver origin and lexical type scope. It is not an
                 // unsupported expression whose value needs a guessed type.
@@ -6668,7 +6805,9 @@ impl<'source> JavaResolutionBuilder<'source> {
         activation_end: usize,
     ) {
         let spelling = node_text(name, self.source).trim();
-        let name = self.intern_name(spelling);
+        let Some(name) = self.intern_name(spelling) else {
+            return;
+        };
         self.local_value_binders_by_scope
             .entry((scope, name))
             .or_default()
@@ -11184,5 +11323,37 @@ class A {
             .find(|parameter| parameter.callable == add.site)
             .expect("FieldElement.add returns its owner's type parameter");
         assert_eq!(result_parameter.position, 0);
+    }
+
+    /// A MISSING, zero-width or empty-backtick name leaves a gap and no empty
+    /// spelling (counterpart of Rust's `missing_names_leave_gaps_not_empty_spellings`,
+    /// #4286).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13682: a MISSING or empty-backtick Java name panicked the producer on an empty spelling"
+    )]
+    fn missing_names_leave_gaps_not_empty_spellings() {
+        let mut saw_missing = false;
+        for source in [
+            "class C { void () {} }",
+            "class C<> {}",
+            "import a.;\nclass C {}",
+        ] {
+            let sexp = super::super::declarations::parse_tree(source)
+                .expect("java tree")
+                .root_node()
+                .to_sexp();
+            saw_missing |= sexp.contains("MISSING");
+            let facts = parse(source);
+            assert!(
+                facts.names.iter().all(|name| !name.spelling.is_empty()),
+                "no empty spelling is interned for {source:?}"
+            );
+            assert!(
+                !facts.gaps.is_empty(),
+                "the recovered tree keeps gap evidence for {source:?}"
+            );
+        }
+        assert!(saw_missing, "recovery inserts a MISSING node in this table");
     }
 }

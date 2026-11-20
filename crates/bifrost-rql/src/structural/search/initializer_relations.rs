@@ -15,9 +15,10 @@ use brokk_bifrost_flow::flow_state::{FlowStateAxis, FlowSubject, StateEventClass
 const INITIALIZER_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.self_initializer.v1";
 const INITIALIZER_RELATION_AXES: &[FlowStateAxis] = &[FlowStateAxis::BindingEvents];
 
-pub(super) fn initializer_relation_expansions(
-    workspace: &WorkspaceAnalyzer,
-    flow_state_cache: &mut FlowStateTraversalCache<'_>,
+pub(super) fn initializer_relation_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
+    semantic: &mut semantic::SemanticQueryContext<'_>,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
@@ -82,6 +83,10 @@ pub(super) fn initializer_relation_expansions(
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
+                step_index: None,
+                step_op: None,
+                no_rows_reason: None,
+                cause_codes: Vec::new(),
             }),
             CodeQueryDiagnosticCode::from_execution_reason(
                 CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -97,6 +102,7 @@ pub(super) fn initializer_relation_expansions(
     }
     let Some((file_state, procedure_index, procedure_id, _file)) = row_relations::seed_derivation(
         workspace,
+        semantic,
         flow_state_cache,
         procedure,
         INITIALIZER_RELATION_AXES,

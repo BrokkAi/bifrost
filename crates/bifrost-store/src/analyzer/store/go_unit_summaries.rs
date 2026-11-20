@@ -129,13 +129,18 @@ const STAGE_TEST_EDGES_SQL: &str =
        ON plain_unit.package_id = plain.package_id AND plain_unit.source_role = 'go'
      WHERE units.source_role IN ('test', 'xtest')";
 
-const UNIT_INSTANCE_SQL: &str =
-    "SELECT units.package_id, units.source_role, packages.tool_import_path,
+macro_rules! unit_instances_sql {
+    () => {
+        "SELECT units.package_id, units.source_role, packages.tool_import_path,
        packages.package_name, packages.for_test, packages.provider_digest, packages.complete,
        json(packages.gaps)
      FROM temp.go_unit_summary_units AS units
      JOIN main.go_package_instances AS packages ON packages.package_id = units.package_id
-     WHERE units.unit_id = ?1";
+"
+    };
+}
+pub(crate) const UNIT_INSTANCE_SQL: &str =
+    concat!(unit_instances_sql!(), " WHERE units.unit_id = ?1");
 
 pub(crate) const UNIT_MEMBERS_SQL: &str =
     "SELECT blobs.id, files.blob_oid, files.rel_path, files.source_role
@@ -168,6 +173,23 @@ const UNIT_DEPENDENCIES_SQL: &str = "SELECT targets.tool_import_path, targets.fo
          AND imports.target_package_id IS NOT NULL)
      ORDER BY targets.tool_import_path, targets.for_test";
 
+// The external and standard packages of one context, with the role their unit
+// key carries (the same CASE as UNIT_DEPENDENCIES_SQL).
+const CURRENT_PROVIDERS_SQL: &str = "SELECT targets.tool_import_path, targets.for_test,
+       CASE WHEN targets.for_test = '' THEN 'go'
+            WHEN EXISTS (SELECT 1 FROM main.go_package_files AS tests
+                         WHERE tests.package_id = targets.package_id AND tests.source_role = 'xtest')
+              THEN 'xtest'
+            ELSE 'test' END,
+       targets.provider_digest
+     FROM main.go_package_instances AS targets
+     WHERE targets.context_id = ?1 AND targets.provider_kind IN ('module', 'standard')
+       AND targets.package_id IN (
+         SELECT imports.target_package_id FROM main.go_package_imports AS imports
+         JOIN temp.go_unit_summary_units AS units
+           ON units.package_id = imports.importer_package_id
+          AND imports.import_role IN ('go', units.source_role))";
+
 // The plain package a test unit tests. Absent from the unit set when the plain
 // package has no selected files.
 const TESTED_PACKAGE_SQL: &str =
@@ -180,13 +202,6 @@ const TESTED_PACKAGE_SQL: &str =
       AND ((plain.tool_import_path = tested.for_test AND plain.for_test = '')
         OR (tested.provider_provenance = 'source_inventory' AND plain.package_id = tested.package_id))
      WHERE tested.package_id = ?1";
-
-// The unit's slice of the tool publication: its own import rows.
-const UNIT_IMPORT_ROWS_SQL: &str = "SELECT imports.import_role, imports.source_spelling, targets.tool_import_path, targets.for_test, imports.complete, targets.package_name
-     FROM main.go_package_imports AS imports
-     LEFT JOIN main.go_package_instances AS targets ON targets.package_id = imports.target_package_id
-     WHERE imports.importer_package_id = ?1 AND imports.import_role IN ('go', ?2)
-     ORDER BY imports.import_role, imports.source_spelling";
 
 // Members whose resolution bundle is missing or sealed under another epoch
 // publish no names, so the summary is incomplete.
@@ -547,41 +562,307 @@ struct UnitInstance {
     gaps: String,
 }
 
+impl UnitInstance {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            package_id: row.get(0)?,
+            source_role: row.get(1)?,
+            tool_import_path: row.get(2)?,
+            package_name: row.get(3)?,
+            for_test: row.get(4)?,
+            provider_digest: row
+                .get::<_, Vec<u8>>(5)?
+                .try_into()
+                .expect("schema checks provider digest width"),
+            complete: row.get(6)?,
+            gaps: row.get(7)?,
+        })
+    }
+}
+
+struct ContextImport {
+    role: String,
+    spelling: String,
+    target: String,
+    for_test: String,
+    complete: bool,
+    package_name: String,
+}
+
+// The single existing Go context-slice recipe. Both full and retained passes
+// compute it once per package-role, before any per-unit work.
+fn context_slice(instance: &UnitInstance, imports: &[ContextImport]) -> [u8; 32] {
+    let mut slice = CanonicalHasher::new(b"bifrost-go-unit-context-slice:v1");
+    slice.field("tool-import-path", instance.tool_import_path.as_bytes());
+    slice.field("for-test", instance.for_test.as_bytes());
+    slice.field("package-name", instance.package_name.as_bytes());
+    slice.field("source-role", instance.source_role.as_bytes());
+    slice.field("provider", &instance.provider_digest);
+    slice.field("complete", &[u8::from(instance.complete)]);
+    slice.field("gaps", instance.gaps.as_bytes());
+    for import in imports {
+        slice.field("import-role", import.role.as_bytes());
+        slice.field("import-spelling", import.spelling.as_bytes());
+        slice.field("import-target", import.target.as_bytes());
+        slice.field("import-target-for-test", import.for_test.as_bytes());
+        slice.field("import-complete", &[u8::from(import.complete)]);
+        slice.field("import-target-package-name", import.package_name.as_bytes());
+    }
+    slice.finish()
+}
+
+fn stage_context_slices(conn: &Connection) -> Result<()> {
+    use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS go_unit_summary_contexts(
+        unit_id INTEGER PRIMARY KEY,unit_key BLOB NOT NULL,instance_read_key BLOB NOT NULL,
+        profile_read_key BLOB NOT NULL,slice_digest BLOB NOT NULL) STRICT;
+        DELETE FROM temp.go_unit_summary_contexts;
+        CREATE TEMP TABLE IF NOT EXISTS go_unit_summary_providers(
+        unit_key BLOB PRIMARY KEY,digest BLOB NOT NULL) STRICT;
+        DELETE FROM temp.go_unit_summary_providers;",
+    )?;
+    let mut query = conn.prepare_cached(concat!(
+        "WITH instances AS (",
+        unit_instances_sql!(),
+        ")
+         SELECT instances.*, units.unit_id, imports.import_role,imports.source_spelling,
+           targets.tool_import_path,targets.for_test,imports.complete,targets.package_name
+         FROM instances JOIN temp.go_unit_summary_units units USING(package_id,source_role)
+         LEFT JOIN main.go_package_imports imports ON imports.importer_package_id=units.package_id
+           AND imports.import_role IN ('go',units.source_role)
+         LEFT JOIN main.go_package_instances targets ON targets.package_id=imports.target_package_id
+         ORDER BY units.unit_id,imports.import_role,imports.source_spelling"
+    ))?;
+    let mut rows = query.query([])?;
+    let mut group: Option<(i64, UnitInstance, Vec<ContextImport>)> = None;
+    let mut staged = Vec::new();
+    let mut finish = |(id, instance, imports): (i64, UnitInstance, Vec<ContextImport>)| {
+        let key = go_unit_key(
+            &instance.tool_import_path,
+            &instance.for_test,
+            &instance.source_role,
+        );
+        staged.push(serde_json::json!([
+            id,
+            lower_hex_string(&key),
+            lower_hex_string(&read_key("go-package-instance", Some(&key))),
+            lower_hex_string(&go_profile_read_key(&key)),
+            lower_hex_string(&context_slice(&instance, &imports))
+        ]));
+    };
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(8)?;
+        if group.as_ref().is_some_and(|(current, _, _)| *current != id) {
+            finish(group.take().expect("a changed group exists"));
+        }
+        if group.is_none() {
+            group = Some((id, UnitInstance::read(row)?, Vec::new()));
+        }
+        if let Some(role) = row.get::<_, Option<String>>(9)? {
+            group
+                .as_mut()
+                .expect("a group exists")
+                .2
+                .push(ContextImport {
+                    role,
+                    spelling: row.get(10)?,
+                    target: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                    for_test: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    complete: row.get(13)?,
+                    package_name: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                });
+        }
+    }
+    if let Some(group) = group {
+        finish(group);
+    }
+    conn.prepare_cached(
+        "INSERT INTO temp.go_unit_summary_contexts SELECT value->>0,unhex(value->>1),
+        unhex(value->>2),unhex(value->>3),unhex(value->>4) FROM json_each(?1)",
+    )?
+    .execute([serde_json::to_string(&staged).expect("context digests serialize")])?;
+    Ok(())
+}
+
+/// A fresh comparison certified the selected context unchanged. Admission still
+/// validates persisted member inputs, context reads and dependencies in bulk.
+#[doc(hidden)]
+pub struct RetainedGoUnitSummaries(pub GoUnitSummaries);
+
+impl UnitSummaryLanguage for RetainedGoUnitSummaries {
+    fn lang(&self) -> &'static str {
+        self.0.lang()
+    }
+    fn unit_kind(&self) -> &'static str {
+        self.0.unit_kind()
+    }
+    fn derivation_identity(&self) -> [u8; 32] {
+        self.0.derivation_identity()
+    }
+    fn profile_digest(&self) -> [u8; 32] {
+        self.0.profile_digest()
+    }
+    fn stage(&self, c: &Connection, s: &WorkspaceSnapshotId) -> Result<()> {
+        self.0.stage(c, s)
+    }
+    fn clear_stage(&self, c: &Connection) -> Result<()> {
+        self.0.clear_stage(c)
+    }
+    fn live_summary(
+        &self,
+        c: &Connection,
+        s: &WorkspaceSnapshotId,
+        e: &str,
+        k: &[u8; 32],
+    ) -> Result<Option<(i64, Vec<u8>)>> {
+        self.0.live_summary(c, s, e, k)
+    }
+    fn inputs(&self, c: &Connection, s: &WorkspaceSnapshotId, u: i64) -> Result<UnitInputs> {
+        self.0.inputs(c, s, u)
+    }
+    fn derive(
+        &self,
+        c: &Connection,
+        s: &WorkspaceSnapshotId,
+        u: &UnitInputs,
+        d: &[ConsumedDependency],
+        e: &str,
+        r: &mut ForeignReader<'_>,
+    ) -> Result<UnitOutputs> {
+        self.0.derive(c, s, u, d, e, r)
+    }
+
+    fn fixpoint_rounds(&self) -> i64 {
+        self.0.fixpoint_rounds()
+    }
+    fn write_language_rows(
+        &self,
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit: &UnitInputs,
+        dependencies: &[ConsumedDependency],
+        summary_id: i64,
+        reader: &mut ForeignReader<'_>,
+    ) -> Result<usize> {
+        self.0
+            .write_language_rows(conn, snapshot, unit, dependencies, summary_id, reader)
+    }
+    fn output_supplement(&self, conn: &Connection, summary_id: i64) -> Result<Option<[u8; 32]>> {
+        self.0.output_supplement(conn, summary_id)
+    }
+    fn write_language_version(
+        &self,
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit: &UnitInputs,
+        summary_id: i64,
+    ) -> Result<usize> {
+        self.0
+            .write_language_version(conn, snapshot, unit, summary_id)
+    }
+
+    fn stage_unchanged(
+        &self,
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        epoch: &str,
+    ) -> Result<usize> {
+        use super::unit_summaries::{bulk_dependencies_current_sql, summary_intact};
+        let members = super::surface_relations::members_current_sql(
+            "go",
+            "candidate.summary_id",
+            "?1",
+            "?3",
+            "?5",
+        );
+        let membership = super::surface_relations::member_set_current_sql(
+            "candidate.summary_id",
+            "SELECT rel_path,source_role FROM temp.go_summary_source_files files
+             WHERE files.context_id=?4 AND files.package_id=units.package_id
+               AND files.source_role IN ('go',units.source_role)",
+        );
+        // Every staged unit is a candidate key, so a dependency check can tell
+        // a unit staged in this pass from one whose open version is only left
+        // over from an earlier revision.
+        let staged = conn
+            .prepare_cached(
+                "INSERT INTO temp.unit_summary_candidates(unit_id,unit_key,summary_id)
+             SELECT unit_id,unit_key,NULL FROM temp.go_unit_summary_contexts",
+            )?
+            .execute([])?;
+        // The current provider digest of every external or standard package a
+        // staged unit imports, by the unit key `inputs` derives for it: the
+        // digest a recorded external dependency must still equal. A context
+        // holds one instance per tool import path and the key hashes that path,
+        // so a plain INSERT below can only collide on a corrupt store.
+        use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
+        let mut providers = Vec::new();
+        {
+            let mut query = conn.prepare_cached(CURRENT_PROVIDERS_SQL)?;
+            let mut rows = query.query([self.0.context_id])?;
+            while let Some(row) = rows.next()? {
+                let key = go_unit_key(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get::<_, String>(2)?,
+                );
+                providers.push(serde_json::json!([
+                    lower_hex_string(&key),
+                    lower_hex_string(&digest_of(row.get(3)?)?)
+                ]));
+            }
+        }
+        conn.prepare_cached(
+            "INSERT INTO temp.go_unit_summary_providers
+             SELECT unhex(value->>0),unhex(value->>1) FROM json_each(?1)",
+        )?
+        .execute([serde_json::to_string(&providers).expect("provider digests serialize")])?;
+        let sql = format!(
+            "UPDATE temp.unit_summary_candidates SET summary_id=versions.summary_id
+          FROM temp.go_unit_summary_units units
+          JOIN temp.go_unit_summary_contexts contexts USING(unit_id)
+          JOIN resolution_unit_summary_versions versions
+            ON versions.workspace_id=?1 AND versions.lang=?2 AND versions.generation=?3
+              AND versions.profile_digest=?8 AND versions.unit_key=contexts.unit_key
+              AND versions.valid_until IS NULL
+          JOIN resolution_unit_summaries candidate ON candidate.summary_id=versions.summary_id
+          WHERE unit_summary_candidates.unit_id=units.unit_id AND versions.valid_from<=?5
+            AND candidate.producer_epoch=?6 AND candidate.derivation_identity=?7
+            AND {intact} AND {members} AND {membership}
+            AND EXISTS(SELECT 1 FROM resolution_unit_summary_reads read
+              WHERE read.summary_id=candidate.summary_id AND read.kind='context_publication'
+                AND read.key_digest=contexts.instance_read_key AND read.digest=contexts.slice_digest)
+            AND EXISTS(SELECT 1 FROM resolution_unit_summary_reads read
+              WHERE read.summary_id=candidate.summary_id AND read.kind='context_publication'
+                AND read.key_digest=contexts.profile_read_key AND read.digest=?8)
+            AND {dependencies}",
+            intact = summary_intact!(),
+            dependencies = bulk_dependencies_current_sql!(
+                "EXISTS (SELECT 1 FROM temp.go_unit_summary_providers provider
+                   WHERE provider.unit_key=dependency.dependency_unit_key
+                     AND provider.digest=dependency.consumed_output_digest)"
+            )
+        );
+        conn.prepare_cached(&sql)?.execute(params![
+            snapshot.workspace_id.as_str(),
+            "go",
+            snapshot.generation.get(),
+            self.0.context_id,
+            snapshot.revision,
+            epoch,
+            self.derivation_identity(),
+            self.profile_digest()
+        ])?;
+        Ok(staged)
+    }
+}
+
 impl GoUnitSummaries {
     fn instance(&self, conn: &Connection, unit_id: i64) -> Result<UnitInstance> {
-        let (
-            package_id,
-            source_role,
-            tool_import_path,
-            package_name,
-            for_test,
-            digest,
-            complete,
-            gaps,
-        ) = conn
+        Ok(conn
             .prepare_cached(UNIT_INSTANCE_SQL)?
-            .query_row([unit_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, bool>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })?;
-        Ok(UnitInstance {
-            package_id,
-            source_role,
-            tool_import_path,
-            package_name,
-            for_test,
-            provider_digest: digest_of(digest)?,
-            complete,
-            gaps,
-        })
+            .query_row([unit_id], UnitInstance::read)?)
     }
 }
 
@@ -629,10 +910,15 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         )?;
         conn.prepare_cached(STAGE_IMPORT_EDGES_SQL)?.execute([])?;
         conn.prepare_cached(STAGE_TEST_EDGES_SQL)?.execute([])?;
+        stage_context_slices(conn)?;
         Ok(())
     }
 
     fn clear_stage(&self, conn: &Connection) -> Result<()> {
+        conn.prepare_cached("DELETE FROM temp.go_unit_summary_contexts")?
+            .execute([])?;
+        conn.prepare_cached("DELETE FROM temp.go_unit_summary_providers")?
+            .execute([])?;
         conn.prepare_cached("DELETE FROM temp.go_unit_summary_units")?
             .execute([])?;
         Ok(())
@@ -762,44 +1048,11 @@ impl UnitSummaryLanguage for GoUnitSummaries {
             }
         }
 
-        // The unit's slice of the tool publication. The publication digest folds
-        // the selected source inventory, so it moves on content edits; the slice moves
-        // only when this package's own instance row or import rows move.
-        let mut slice = CanonicalHasher::new(b"bifrost-go-unit-context-slice:v1");
-        slice.field("tool-import-path", instance.tool_import_path.as_bytes());
-        slice.field("for-test", instance.for_test.as_bytes());
-        slice.field("package-name", instance.package_name.as_bytes());
-        slice.field("source-role", instance.source_role.as_bytes());
-        slice.field("provider", &instance.provider_digest);
-        slice.field("complete", &[u8::from(instance.complete)]);
-        slice.field("gaps", instance.gaps.as_bytes());
-        {
-            let mut statement = conn.prepare_cached(UNIT_IMPORT_ROWS_SQL)?;
-            let mut rows = statement.query(params![instance.package_id, instance.source_role])?;
-            while let Some(row) = rows.next()? {
-                slice.field("import-role", row.get::<_, String>(0)?.as_bytes());
-                slice.field("import-spelling", row.get::<_, String>(1)?.as_bytes());
-                slice.field(
-                    "import-target",
-                    row.get::<_, Option<String>>(2)?
-                        .unwrap_or_default()
-                        .as_bytes(),
-                );
-                slice.field(
-                    "import-target-for-test",
-                    row.get::<_, Option<String>>(3)?
-                        .unwrap_or_default()
-                        .as_bytes(),
-                );
-                slice.field("import-complete", &[u8::from(row.get::<_, bool>(4)?)]);
-                slice.field(
-                    "import-target-package-name",
-                    row.get::<_, Option<String>>(5)?
-                        .unwrap_or_default()
-                        .as_bytes(),
-                );
-            }
-        }
+        let context_slice: Vec<u8> = conn
+            .prepare_cached(
+                "SELECT slice_digest FROM temp.go_unit_summary_contexts WHERE unit_id=?1",
+            )?
+            .query_row([unit_id], |row| row.get(0))?;
         Ok(UnitInputs {
             dependency_names: Vec::new(),
             containers: Vec::new(),
@@ -813,7 +1066,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                 UnitRead {
                     kind: "context_publication",
                     key_digest: read_key("go-package-instance", Some(&unit_key)),
-                    digest: slice.finish(),
+                    digest: digest_of(context_slice)?,
                 },
                 // Which profile's publication this summary derives from. A reader
                 // that selected a context profile matches this digest, so the

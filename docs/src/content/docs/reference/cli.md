@@ -243,7 +243,7 @@ Bifrost rejects these combinations before it does any work:
 
 | Mode | 0 | 1 | 2 |
 | --- | --- | --- | --- |
-| `bifrost scan` | The run was reliable, no active unsuppressed finding met `--fail-on`, and no suppression record is orphaned. Also a build that ships no policy packs. | The run was reliable, and at least one active unsuppressed finding met `--fail-on` or at least one suppression record is orphaned. | The run was unreliable: for example, a policy was inconclusive, unsupported, failed, or cancelled, or there was a suppression, scope, baseline, schema, output, or argument error. |
+| `bifrost scan` | Every run supplied a verdict (including advisory inconclusive), no active unsuppressed finding met `--fail-on`, and no suppression record is orphaned. Also a build that ships no policy packs. | No run was unreliable, and at least one active unsuppressed finding met `--fail-on` or at least one suppression record is orphaned. | The run was unreliable: for example, a policy was unsupported, failed, or inconclusive under `--on-inconclusive unreliable` or its rule deadline, or there was a suppression, scope, baseline, schema, output, or argument error. |
 | Policy evaluation (`--policy`, `--policy-file`, selectors) | Same as scan. | Same as scan. | Same as scan. Status 2 takes precedence over status 1. |
 | `--accept-current` | The run was reliable and complete, and the baseline was written. | At least one suppression record is orphaned, so nothing was written. | The run was not reliable and complete, so nothing was written; or the write failed. |
 | `--diff-base` | As policy evaluation, counting only new findings. | As policy evaluation, counting only new findings. | As policy evaluation; also when the root is not in a Git repository or `REV` does not resolve. |
@@ -265,8 +265,9 @@ parent process has exited. If it has, Bifrost cancels the run, waits 20
 seconds, and exits with status 3.
 
 `--fail-on never` turns off only the finding threshold. An orphaned
-suppression record still gives status 1, and an inconclusive, failed, or
-unsupported policy still gives status 2. [Policies Reference](/reference/policies/)
+suppression record still gives status 1, and a failed or unsupported policy still gives status 2. An inconclusive
+run is advisory by default; `--on-inconclusive unreliable` or a rule deadline
+makes it unreliable, subject to the policy's `on-unknown` declaration. [Policies Reference](/reference/policies/)
 lists every condition that makes a run unreliable.
 
 ## Development Helper: `most_relevant_files`

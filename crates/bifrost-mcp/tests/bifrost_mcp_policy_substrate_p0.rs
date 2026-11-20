@@ -26,10 +26,9 @@ use std::path::Path;
 use std::process::Child;
 
 use brokk_bifrost_analysis::Language;
-use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-};
+use brokk_bifrost_mcp::benchmark_api::MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV;
 use common::InlineTestProject;
+use common::mcp_server::FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS;
 use serde_json::{Value, json};
 
 const EFFECT_POLICY: &str =
@@ -46,7 +45,7 @@ const MODEL_PATH: &str = ".bifrost/semantic-models/acme-http-client.json";
 fn spawn_server(root: &Path) -> Child {
     // Policy assertions use a generous request budget; production cold-start
     // behavior is covered separately by the reserved budget guards.
-    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
+    let request_budget = FUNCTIONAL_TEST_MCP_REQUEST_BUDGET_SECS.to_string();
     common::mcp_server::spawn_mcp_server(
         common::mcp_server::mcp_server_binary(),
         root,

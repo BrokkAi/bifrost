@@ -8,3 +8,16 @@ ignore-interior-mutability = [
     "brokk_bifrost_core::retention_budget::AllocationCharge",
     "brokk_bifrost_semantic::analyzer::semantic::ir::artifact::ArtifactCachePins",
 ]
+
+disallowed-methods = [
+    { path = "brokk_bifrost_store::analyzer::store::resolution_selection::SelectedResolutionMountInventory::connection", reason = "#12820: use SelectedRead for recorded selected reads" },
+    { path = "brokk_bifrost_store::analyzer::store::resolution_authority::SelectedResolutionAuthority::new", reason = "#12820: use SelectedRead for recorded selected reads" },
+    { path = "brokk_bifrost_store::analyzer::store::AnalyzerStore::read_conn", reason = "#12820: use SelectedRead for recorded selected reads" },
+    { path = "brokk_bifrost_store::analyzer::store::AnalyzerStore::read_conn_for_workspace", reason = "#12820: use SelectedRead for recorded selected reads" },
+    { path = "git2::Repository::statuses", reason = "#13703: call through gitblob's live-store-hiding helper" },
+    { path = "git2::Repository::status_file", reason = "#13703: call through gitblob's live-store-hiding helper" },
+    { path = "git2::Repository::diff_index_to_workdir", reason = "#13703: call through gitblob's live-store-hiding helper" },
+    { path = "git2::Repository::diff_tree_to_workdir", reason = "#13703: call through gitblob's live-store-hiding helper" },
+    { path = "git2::Repository::diff_tree_to_workdir_with_index", reason = "#13703: call through gitblob's live-store-hiding helper" },
+    { path = "git2::Oid::hash_file", reason = "#13703: call gitblob::working_tree_file_oid, which skips live stores" },
+]

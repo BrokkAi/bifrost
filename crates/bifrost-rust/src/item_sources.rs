@@ -61,6 +61,8 @@ pub(crate) struct RustItemSourceCollector {
     /// One entry for every enter call, including anonymous syntax nodes. This
     /// keeps exit synchronized with the shared iterative tree walk.
     context_frames: Vec<Option<SourceOccurrenceId>>,
+    /// Built on the first macro invocation of the file, for the census.
+    macro_import_inventory: Option<crate::lexical_scope::RustMacroImportInventory>,
 }
 
 impl RustItemSourceCollector {
@@ -70,24 +72,183 @@ impl RustItemSourceCollector {
 
     pub(crate) fn record_primary_census_node(&mut self, node: Node<'_>, source: &str) {
         if node.kind() == "macro_invocation" {
-            self.facts
-                .impl_census_boundaries
-                .push(RustImplCensusBoundary {
-                    kind: RustImplCensusBoundaryKind::Macro,
-                    start_byte: node.start_byte(),
-                });
+            self.record_census_macro(node, source);
         }
         if node.is_error() || node.is_missing() || (node.parent().is_none() && node.has_error()) {
             self.facts
                 .impl_census_boundaries
-                .push(RustImplCensusBoundary {
-                    kind: RustImplCensusBoundaryKind::SyntaxError,
-                    start_byte: node.start_byte(),
-                });
+                .push(RustImplCensusBoundary::without_macro_path(
+                    RustImplCensusBoundaryKind::SyntaxError,
+                    node.start_byte(),
+                ));
         }
         if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
             self.record_census_attribute(node, source);
         }
+    }
+
+    /// Records the census boundary of a macro invocation and of every macro
+    /// nested in the operands of a certifiable standard macro. The grammar
+    /// leaves macro arguments as an unparsed `token_tree`, so an item, an
+    /// attribute, an import or another macro inside `println!("{}", { .. })`
+    /// is invisible to the file walk; the operands are parsed with the macro
+    /// operand machinery (original coordinates, so `source` backs them) and
+    /// walked here. Anything that could hide an item holds the census open.
+    fn record_census_macro(&mut self, node: Node<'_>, source: &str) {
+        let outer_start_byte = node.start_byte();
+        let mut outer_root = node;
+        while let Some(parent) = outer_root.parent() {
+            outer_root = parent;
+        }
+        // A nested invocation lives in its operand's tree, which dies with the
+        // step that parsed it, so the worklist keeps a tree handle (cheap
+        // reference-counted clone) and finds the node again by id.
+        let mut pending = self.record_census_macro_step(node, source, outer_root, outer_start_byte);
+        while let Some((tree, start, end, id)) = pending.pop() {
+            let mut invocation = tree
+                .root_node()
+                .descendant_for_byte_range(start, end)
+                .expect("a nested macro invocation keeps its range");
+            while invocation.id() != id {
+                invocation = invocation
+                    .parent()
+                    .expect("a nested macro invocation is an ancestor of its range's node");
+            }
+            pending.extend(self.record_census_macro_step(
+                invocation,
+                source,
+                outer_root,
+                outer_start_byte,
+            ));
+        }
+    }
+
+    /// Records one invocation and returns the macros nested in its operands.
+    fn record_census_macro_step(
+        &mut self,
+        invocation: Node<'_>,
+        source: &str,
+        outer_root: Node<'_>,
+        outer_start_byte: usize,
+    ) -> Vec<(tree_sitter::Tree, usize, usize, usize)> {
+        let open = |kind| RustImplCensusBoundary::without_macro_path(kind, outer_start_byte);
+        let mut nested = Vec::new();
+        {
+            // The path comes from the grammar's `macro` field; a shape that is
+            // not a path leaves it empty, which no reader can certify.
+            let path_node = invocation.child_by_field_name("macro");
+            let macro_path = path_node
+                .and_then(crate::graph_support::rust_path_segments)
+                .map(|segments| {
+                    segments
+                        .into_iter()
+                        .map(|segment| {
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                crate::declarations::rust_node_text(segment, source).trim(),
+                            )
+                            .to_owned()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            // An import may rebind the terminal name (`use std::vec as v`) or
+            // the qualifier of a longer path (`use other as std`).
+            let macro_shadow_possible = match macro_path.as_slice() {
+                [] => true,
+                [first, .., terminal] | [first @ terminal] => {
+                    let inventory = self.macro_import_inventory.get_or_insert_with(|| {
+                        crate::lexical_scope::RustMacroImportInventory::new(outer_root, source)
+                    });
+                    inventory.may_shadow(outer_root, outer_start_byte, terminal)
+                        || inventory.may_shadow(outer_root, outer_start_byte, first)
+                }
+            };
+            let macro_absolute =
+                path_node.is_some_and(crate::graph_support::rust_path_is_leading_absolute);
+            let certifiable = !macro_absolute
+                && !macro_shadow_possible
+                && macro_path
+                    .last()
+                    .is_some_and(|name| crate::macro_matcher::rust_item_free_macro_candidate(name));
+            self.facts
+                .impl_census_boundaries
+                .push(RustImplCensusBoundary {
+                    kind: RustImplCensusBoundaryKind::Macro,
+                    start_byte: outer_start_byte,
+                    macro_path,
+                    macro_absolute,
+                    macro_shadow_possible,
+                });
+            if !certifiable {
+                return nested;
+            }
+            // A macro-body template (`$x`, `$(..)*`) could stand for items.
+            let templated = invocation.has_error()
+                || crate::declarations::rust_macro_invocation_arguments(invocation).is_some_and(
+                    |arguments| {
+                        descendants_any(arguments, |n| {
+                            matches!(n.kind(), "metavariable" | "token_repetition")
+                        })
+                    },
+                );
+            let operands = if templated {
+                None
+            } else {
+                crate::macro_matcher::parse_macro_operands(invocation, source)
+            };
+            let Some(operands) = operands else {
+                self.facts
+                    .impl_census_boundaries
+                    .push(open(RustImplCensusBoundaryKind::Macro));
+                return nested;
+            };
+            for operand in &operands {
+                let mut stack = vec![operand.node()];
+                while let Some(desc) = stack.pop() {
+                    if desc.is_error() || desc.is_missing() {
+                        self.facts
+                            .impl_census_boundaries
+                            .push(open(RustImplCensusBoundaryKind::SyntaxError));
+                    }
+                    match desc.kind() {
+                        "attribute_item" | "inner_attribute_item" => {
+                            self.record_census_attribute(desc, source);
+                        }
+                        "impl_item"
+                        | "trait_item"
+                        | "struct_item"
+                        | "enum_item"
+                        | "union_item"
+                        | "type_item"
+                        | "function_item"
+                        | "const_item"
+                        | "static_item"
+                        | "mod_item"
+                        | "foreign_mod_item"
+                        | "use_declaration"
+                        | "extern_crate_declaration"
+                        | "macro_definition" => {
+                            self.facts
+                                .impl_census_boundaries
+                                .push(open(RustImplCensusBoundaryKind::Macro));
+                        }
+                        "macro_invocation" => {
+                            nested.push((
+                                operand.tree.clone(),
+                                desc.start_byte(),
+                                desc.end_byte(),
+                                desc.id(),
+                            ));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let mut cursor = desc.walk();
+                    stack.extend(desc.children(&mut cursor));
+                }
+            }
+        }
+        nested
     }
 
     pub(crate) fn enter(
@@ -203,12 +364,22 @@ impl RustItemSourceCollector {
         let Some(attributes) =
             crate::resolution::rust_effective_attributes(std::iter::once(node), source)
         else {
+            self.facts.macro_arguments.push(
+                brokk_bifrost_core::analyzer::rust_facts::RustMacroAttributeSourceFact {
+                    boundary_ordinal: self.facts.impl_census_boundaries.len(),
+                    path: Vec::new(),
+                    from_cfg_attr: false,
+                    keys: vec![
+                        brokk_bifrost_core::analyzer::rust_facts::RustMacroArgumentKey::Unparsed,
+                    ],
+                },
+            );
             self.facts
                 .impl_census_boundaries
-                .push(RustImplCensusBoundary {
-                    kind: RustImplCensusBoundaryKind::ExpandingAttribute,
-                    start_byte: node.start_byte(),
-                });
+                .push(RustImplCensusBoundary::without_macro_path(
+                    RustImplCensusBoundaryKind::ExpandingAttribute,
+                    node.start_byte(),
+                ));
             return;
         };
         for attribute in attributes {
@@ -245,13 +416,152 @@ impl RustItemSourceCollector {
                 None
             };
             if let Some(kind) = kind {
+                let boundary_ordinal = self.facts.impl_census_boundaries.len();
+                if kind == RustImplCensusBoundaryKind::Derive {
+                    self.record_derive_arguments(node, &attribute, source, boundary_ordinal);
+                } else if kind == RustImplCensusBoundaryKind::ExpandingAttribute {
+                    self.record_attribute_arguments(&attribute, source, boundary_ordinal);
+                }
                 self.facts
                     .impl_census_boundaries
-                    .push(RustImplCensusBoundary {
+                    .push(RustImplCensusBoundary::without_macro_path(
                         kind,
-                        start_byte: node.start_byte(),
-                    });
+                        node.start_byte(),
+                    ));
             }
+        }
+    }
+
+    fn record_attribute_arguments(
+        &mut self,
+        attribute: &crate::resolution::RustEffectiveItemAttribute<'_>,
+        source: &str,
+        boundary_ordinal: usize,
+    ) {
+        use brokk_bifrost_core::analyzer::rust_facts::{
+            RustMacroArgumentKey, RustMacroAttributeSourceFact,
+        };
+        // `#[helper = value]` carries input that no key list describes.
+        let keys = if attribute.has_value {
+            vec![RustMacroArgumentKey::Unparsed]
+        } else {
+            attribute.arguments.map_or_else(Vec::new, |arguments| {
+                let Some(groups) = crate::resolution::rust_attribute_argument_groups(arguments)
+                else {
+                    return vec![RustMacroArgumentKey::Unparsed];
+                };
+                groups
+                    .into_iter()
+                    .map(|group| {
+                        let Some((ident, remaining)) = group.split_first() else {
+                            return RustMacroArgumentKey::Unparsed;
+                        };
+                        if ident.kind() == "boolean_literal"
+                            || !crate::syntax::rust_token_is_identifier(
+                                ident.kind(),
+                                rust_node_text(*ident, source),
+                            )
+                        {
+                            return RustMacroArgumentKey::Unparsed;
+                        }
+                        let parsed = match remaining {
+                            [] => true,
+                            [equals, value @ ..] if equals.kind() == "=" && !value.is_empty() => {
+                                true
+                            }
+                            [tree]
+                                if tree.kind() == "token_tree"
+                                    && tree.child(0).is_some_and(|open| open.kind() == "(") =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        };
+                        if parsed {
+                            RustMacroArgumentKey::Ident(rust_node_text(*ident, source).to_owned())
+                        } else {
+                            RustMacroArgumentKey::Unparsed
+                        }
+                    })
+                    .collect()
+            })
+        };
+        self.facts
+            .macro_arguments
+            .push(RustMacroAttributeSourceFact {
+                boundary_ordinal,
+                path: attribute
+                    .path
+                    .iter()
+                    .map(|node| rust_node_text(*node, source).to_owned())
+                    .collect(),
+                from_cfg_attr: attribute.from_cfg_attr,
+                keys,
+            });
+    }
+
+    fn record_derive_arguments(
+        &mut self,
+        derive: Node<'_>,
+        derive_attribute: &crate::resolution::RustEffectiveItemAttribute<'_>,
+        source: &str,
+        boundary_ordinal: usize,
+    ) {
+        // Outer attributes are grouped under the declaration wrapper. Walk that
+        // wrapper so container attributes and field/variant attributes share
+        // one source order, without crossing into another declaration's body.
+        let mut owner = derive;
+        while let Some(parent) = owner.parent() {
+            owner = parent;
+            if matches!(
+                owner.kind(),
+                "declaration_with_attribute" | "field_declaration" | "enum_variant"
+            ) {
+                break;
+            }
+        }
+        let mut pending = vec![owner];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+                if let Some(attributes) =
+                    crate::resolution::rust_effective_attributes(std::iter::once(node), source)
+                {
+                    for attribute in attributes {
+                        if attribute.path[0].id() != derive_attribute.path[0].id() {
+                            self.record_attribute_arguments(&attribute, source, boundary_ordinal);
+                        }
+                    }
+                } else {
+                    // Malformed meta syntax must never look like an empty list.
+                    self.facts.macro_arguments.push(brokk_bifrost_core::analyzer::rust_facts::RustMacroAttributeSourceFact {
+                        boundary_ordinal,
+                        path: Vec::new(),
+                        from_cfg_attr: false,
+                        keys: vec![brokk_bifrost_core::analyzer::rust_facts::RustMacroArgumentKey::Unparsed],
+                    });
+                }
+                continue;
+            }
+            if !matches!(
+                node.kind(),
+                "declaration_with_attribute"
+                    | "attributes"
+                    | "struct_item"
+                    | "enum_item"
+                    | "union_item"
+                    | "field_declaration_list"
+                    | "ordered_field_declaration_list"
+                    | "enum_variant_list"
+                    | "enum_variant"
+            ) {
+                continue;
+            }
+            pending.extend(
+                node.named_children(&mut node.walk())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
         }
     }
 
@@ -635,4 +945,16 @@ fn source_name(
         occurrence: sink.intern_node(node),
         name: name.to_string(),
     })
+}
+
+fn descendants_any(root: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if predicate(node) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    false
 }
